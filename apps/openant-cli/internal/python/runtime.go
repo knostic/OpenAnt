@@ -174,8 +174,9 @@ func CheckOpenantInstalled(pythonPath string) error {
 }
 
 // EnsureRuntime is a convenience that detects a runtime, ensures openant
-// is installed (creating a venv if necessary), and returns the final
-// RuntimeInfo pointing to the correct Python binary.
+// is installed (creating a venv if necessary), installs JS parser npm
+// dependencies if needed, and returns the final RuntimeInfo pointing to
+// the correct Python binary.
 func EnsureRuntime() (*RuntimeInfo, error) {
 	rt, err := DetectRuntime()
 	if err != nil {
@@ -184,6 +185,12 @@ func EnsureRuntime() (*RuntimeInfo, error) {
 
 	if err := CheckOpenantInstalled(rt.Path); err != nil {
 		return nil, err
+	}
+
+	// Ensure JS parser npm dependencies are installed.
+	if err := ensureNodeDeps(); err != nil {
+		// Non-fatal: only affects JavaScript/TypeScript scanning.
+		fmt.Fprintf(os.Stderr, "Warning: JS parser deps not installed: %v\n", err)
 	}
 
 	// After CheckOpenantInstalled, the venv may have been created.
@@ -196,6 +203,48 @@ func EnsureRuntime() (*RuntimeInfo, error) {
 	}
 
 	return rt, nil
+}
+
+// ensureNodeDeps checks whether the JavaScript parser's npm dependencies
+// are installed and runs `npm install` if they are not.
+//
+// The JS parser (parsers/javascript/) requires ts-morph and other npm
+// packages listed in its package.json. Unlike Python dependencies which
+// are installed via pip during venv setup, these npm packages must be
+// installed separately.
+func ensureNodeDeps() error {
+	corePath, err := findOpenantCore()
+	if err != nil {
+		return nil // Can't locate core — skip silently, will fail later if JS is used.
+	}
+
+	parserDir := filepath.Join(corePath, "parsers", "javascript")
+	packageJSON := filepath.Join(parserDir, "package.json")
+	if !fileExists(packageJSON) {
+		return nil // No JS parser — nothing to install.
+	}
+
+	// Fast path: check if node_modules already exists with key dependency.
+	marker := filepath.Join(parserDir, "node_modules", "ts-morph")
+	if info, err := os.Stat(marker); err == nil && info.IsDir() {
+		return nil // Already installed.
+	}
+
+	// Check that npm is available.
+	npmPath, err := exec.LookPath("npm")
+	if err != nil {
+		return fmt.Errorf("npm not found on PATH (required for JavaScript/TypeScript scanning)")
+	}
+
+	fmt.Fprintln(os.Stderr, "Installing JS parser dependencies...")
+	cmd := exec.Command(npmPath, "install", "--prefix", parserDir)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("npm install failed in %s: %w", parserDir, err)
+	}
+
+	return nil
 }
 
 // createVenv creates a new venv at ~/.openant/venv/ using the given Python.
