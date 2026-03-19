@@ -1,0 +1,34 @@
+{
+  "skip_dirs": [
+    "node_modules",
+    "__pycache__",
+    "venv",
+    ".venv",
+    "dist",
+    "build",
+    ".git",
+    "vendor"
+  ],
+  "extensions": {
+    ".py": "python",
+    ".js": "javascript",
+    ".ts": "javascript",
+    ".jsx": "javascript",
+    ".tsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".go": "go",
+    ".c": "c",
+    ".h": "c",
+    ".cpp": "c",
+    ".hpp": "c",
+    ".cc": "c",
+    ".cxx": "c",
+    ".hxx": "c",
+    ".hh": "c",
+    ".rb": "ruby",
+    ".rake": "ruby",
+    ".php": "php",
+    ".zig": "zig"
+  }
+}
