@@ -2,6 +2,8 @@
 package python
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -198,6 +200,12 @@ func CheckOpenantInstalled(pythonPath string) error {
 		)
 	}
 
+	// Save dependency hash so CheckDepsStale knows this is the baseline.
+	pyprojectPath := filepath.Join(corePath, "pyproject.toml")
+	if h, err := hashFile(pyprojectPath); err == nil {
+		_ = writeStoredHash(h)
+	}
+
 	fmt.Fprintln(os.Stderr, "openant installed successfully.")
 	return nil
 }
@@ -220,11 +228,86 @@ func EnsureRuntime() (*RuntimeInfo, error) {
 	vp := venvPython()
 	if rt.Path != vp && fileExists(vp) && isOpenantImportable(vp) {
 		if info, err := checkPython(vp); err == nil {
-			return info, nil
+			rt = info
 		}
 	}
 
+	// Check if dependencies have changed since last install.
+	if err := CheckDepsStale(rt.Path); err != nil {
+		return nil, err
+	}
+
 	return rt, nil
+}
+
+// depsHashPath returns the path to the stored dependency hash inside the venv.
+func depsHashPath() string {
+	return filepath.Join(venvDir(), ".deps-hash")
+}
+
+// hashFile returns the hex-encoded SHA-256 of a file's contents.
+func hashFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// readStoredHash reads the previously stored dependency hash, or "" if absent.
+func readStoredHash() string {
+	data, err := os.ReadFile(depsHashPath())
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// writeStoredHash saves the dependency hash to the venv marker file.
+func writeStoredHash(hash string) error {
+	return os.WriteFile(depsHashPath(), []byte(hash+"\n"), 0644)
+}
+
+// CheckDepsStale checks if pyproject.toml has changed since the last install.
+// If stale, it re-runs pip install -e and updates the stored hash.
+// Returns nil if deps are up-to-date or were successfully refreshed.
+func CheckDepsStale(pythonPath string) error {
+	corePath, err := findOpenantCore()
+	if err != nil {
+		// Can't find source — skip staleness check
+		return nil
+	}
+
+	pyprojectPath := filepath.Join(corePath, "pyproject.toml")
+	currentHash, err := hashFile(pyprojectPath)
+	if err != nil {
+		// Can't read pyproject.toml — skip check
+		return nil
+	}
+
+	storedHash := readStoredHash()
+	if currentHash == storedHash {
+		return nil // deps are up-to-date
+	}
+
+	fmt.Fprintln(os.Stderr, "Dependencies changed, updating openant installation...")
+	if err := installOpenant(pythonPath, corePath); err != nil {
+		return fmt.Errorf(
+			"failed to update openant dependencies: %w\n"+
+				"Try manually: %s -m pip install -e %s",
+			err, pythonPath, corePath,
+		)
+	}
+
+	// Store the new hash
+	if err := writeStoredHash(currentHash); err != nil {
+		// Non-fatal — install succeeded, just can't cache the hash
+		fmt.Fprintf(os.Stderr, "Warning: could not save dependency hash: %v\n", err)
+	}
+
+	fmt.Fprintln(os.Stderr, "Dependencies updated successfully.")
+	return nil
 }
 
 // createVenv creates a new venv at ~/.openant/venv/ using the given Python.
