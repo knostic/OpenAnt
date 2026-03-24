@@ -534,14 +534,25 @@ For typical web applications, entry-point filtering achieves 60-95% reduction.
 
 Classifies the repository type to reduce false positives.
 
-**Location:** `context/generate_context.py`
+**Location:** `context/application_context.py`, `openant/cli.py`
 
-**Command:**
+**Command (via CLI):**
+```bash
+openant generate-context                           # Uses active project
+openant generate-context /path/to/repo             # Explicit repo path
+openant generate-context /path/to/repo -o ctx.json # Custom output path
+openant generate-context --force                   # Skip OPENANT.md override
+openant generate-context --show-prompt             # Include prompt format in output
+```
+
+**Command (via Python module):**
 ```bash
 python -m context.generate_context /path/to/repo
 python -m context.generate_context /path/to/repo -o application_context.json
 python -m context.generate_context --list-types  # Show supported types
 ```
+
+When using a project (`openant init`), the output defaults to the project scan directory and is automatically discovered by `analyze` and `verify` — no need to pass `--app-context`.
 
 **Supported Application Types:**
 
@@ -885,7 +896,7 @@ python parsers/python/parse_repository.py /path/to/flask-app \
 python validate_dataset_schema.py datasets/flask-app/dataset.json
 
 # 3. Generate application context
-python -m context.generate_context /path/to/flask-app
+openant generate-context /path/to/flask-app
 
 # 4. Run Stage 1 + Stage 2 on first 20 units
 python experiment.py --dataset flask-app --verify --limit 20
@@ -907,7 +918,7 @@ python parsers/javascript/test_pipeline.py /path/to/node-app \
 python validate_dataset_schema.py datasets/node-app/dataset.json
 
 # 3. Generate application context
-python -m context.generate_context /path/to/node-app
+openant generate-context /path/to/node-app
 
 # 4. Run full analysis
 python experiment.py --dataset node-app --verify
@@ -953,7 +964,7 @@ python parsers/python/parse_repository.py /repo --output datasets/name/dataset.j
 python parsers/javascript/test_pipeline.py /repo --analyzer-path /analyzer.js --output datasets/name --processing-level codeql
 
 # Generate app context
-python -m context.generate_context /repo
+openant generate-context /repo
 
 # Run Stage 1
 python experiment.py --dataset name

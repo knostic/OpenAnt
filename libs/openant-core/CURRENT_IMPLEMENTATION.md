@@ -227,13 +227,17 @@ Unsupported types (desktop apps, mobile apps, games, embedded systems) are rejec
 
 **Usage:**
 ```bash
+# Generate context via CLI (recommended)
+openant generate-context /path/to/repo
+
+# Generate context via Python module
+python -m context.generate_context /path/to/repo
+
 # List supported types
 python -m context.generate_context --list-types
 
-# Generate context for a repository
-python -m context.generate_context /path/to/repo
-
-# Context is saved to application_context.json in the dataset directory
+# Context is saved to application_context.json in the scan/dataset directory
+# analyze and verify auto-discover it when using a project
 ```
 
 **Generated Context Structure:**
