@@ -19,14 +19,19 @@ jobs:
           persist-credentials: false
       - name: Set scan range
         id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          FORCED: ${{ github.event.forced }}
         run: |
           NULL_SHA="0000000000000000000000000000000000000000"
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "log_opts=${{ github.event.pull_request.base.sha }}..HEAD" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.before }}" = "$NULL_SHA" ] || [ -z "${{ github.event.before }}" ] || [ "${{ github.event.forced }}" = "true" ]; then
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "log_opts=${BASE_SHA}..HEAD" >> $GITHUB_OUTPUT
+          elif [ "$BEFORE_SHA" = "$NULL_SHA" ] || [ -z "$BEFORE_SHA" ] || [ "$FORCED" = "true" ]; then
             echo "log_opts=" >> $GITHUB_OUTPUT
           else
-            echo "log_opts=${{ github.event.before }}..HEAD" >> $GITHUB_OUTPUT
+            echo "log_opts=${BEFORE_SHA}..HEAD" >> $GITHUB_OUTPUT
           fi
       - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
