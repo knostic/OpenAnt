@@ -104,7 +104,7 @@ def collect_result(
         status = "INCONCLUSIVE"
 
     evidence = []
-    for e in parsed.get("evidence", []):
+    for e in (parsed.get("evidence") or []):
         if isinstance(e, dict) and "type" in e and "content" in e:
             evidence.append(TestEvidence(type=e["type"], content=str(e["content"])[:5000]))
 

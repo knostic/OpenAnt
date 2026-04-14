@@ -5,4 +5,5 @@ __pycache__/
 .venv/
 node_modules/
 apps/openant-cli/bin/
-docs/
+libs/openant-core/parsers/go/go_parser/go_parser
+# docs/

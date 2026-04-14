@@ -6,7 +6,7 @@ Tests the PHP parser pipeline components:
 1. RepositoryScanner - Enumerates .rb/.rake files
 2. FunctionExtractor - Extracts functions via tree-sitter
 3. CallGraphBuilder  - Builds bidirectional call graphs
-4. UnitGenerator     - Creates Sastinel dataset format
+4. UnitGenerator     - Creates OpenAnt dataset format
 5. CodeQL (optional) - Static analysis pre-filter
 6. ContextEnhancer (optional) - LLM enhancement using Claude Sonnet
 

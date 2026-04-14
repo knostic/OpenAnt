@@ -9,6 +9,10 @@ For each finding, generates:
 import json
 import os
 import re
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utilities.llm_client import AnthropicClient, TokenTracker
 
@@ -43,9 +47,26 @@ DEPENDENCY INSTALLATION:
 - Do NOT pin exact versions unless the vulnerability is version-specific. Use >= or no version pin.
 - For Python: put ALL dependencies in requirements.txt, use `pip install --no-cache-dir -r requirements.txt`.
 - For Node.js: put ALL dependencies in package.json.
+- For Go: do NOT write go.mod or go.sum yourself. Instead, the Dockerfile MUST initialize
+  the module inside the container using `RUN go mod init <name> && go mod tidy`. This works
+  whether the test uses stdlib only or third-party packages. Use golang:1.25-alpine as the
+  base image to support modern k8s and cloud-native packages. Example Dockerfile for Go:
+      FROM golang:1.25-alpine
+      WORKDIR /test
+      COPY test_exploit.go .
+      RUN go mod init openant-test && go mod tidy
+      RUN go build -o test_exploit test_exploit.go
+      CMD ["./test_exploit"]
 - The Dockerfile MUST install dependencies from the requirements/package file, NOT inline in RUN commands.
 - If a package has many transitive dependencies, only install the specific sub-package you need
   (e.g., `langchain-core` instead of `langchain`).
+
+CONTAINER FILESYSTEM:
+- The container runs with a read-only root filesystem. Only /tmp is writable.
+- Do NOT write files to $HOME, /root, /app/data, or any other location outside /tmp.
+- If the test needs a writable cache (e.g., Go build cache), set env vars to redirect
+  to /tmp: `ENV GOCACHE=/tmp/.gocache GOMODCACHE=/tmp/.gomodcache`.
+- For Python, use `PYTHONDONTWRITEBYTECODE=1` to avoid writing .pyc files.
 
 ATTACKER CAPTURE SERVER (for SSRF/callback/exfiltration tests):
 - The attacker server is provided locally and listens on port 9999.
@@ -264,29 +285,58 @@ def regenerate_test(
     return parsed
 
 
+def _generate_one(finding, repo_info, tracker):
+    """Generate a test for a single finding, tracking cost."""
+    cost_before = tracker.total_cost_usd
+    result = generate_test(finding, repo_info, tracker)
+    cost_after = tracker.total_cost_usd
+    cost = cost_after - cost_before
+    worker = threading.current_thread().name
+    return finding, result, cost, worker
+
+
 def generate_tests_batch(
     findings: list[dict],
     repo_info: dict,
     tracker: TokenTracker = None,
+    workers: int = 10,
 ) -> list[tuple[dict, dict | None, float]]:
     """Generate tests for multiple findings.
+
+    Uses ThreadPoolExecutor for parallel generation when workers > 1.
 
     Args:
         findings: List of finding dicts
         repo_info: Repository info
         tracker: Optional TokenTracker
+        workers: Number of parallel workers (default: 10).
 
     Returns:
         List of (finding, generation_result_or_None, cost_usd) tuples
     """
     tracker = tracker or TokenTracker()
-    results = []
+    total = len(findings)
 
-    for finding in findings:
-        cost_before = tracker.total_cost_usd
-        result = generate_test(finding, repo_info, tracker)
-        cost_after = tracker.total_cost_usd
-        cost = cost_after - cost_before
-        results.append((finding, result, cost))
+    mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
+    print(f"[DynamicTest] Generating tests for {total} findings, mode: {mode}", file=sys.stderr, flush=True)
+
+    if workers <= 1:
+        results = []
+        for i, finding in enumerate(findings):
+            _finding, result, cost, _worker = _generate_one(finding, repo_info, tracker)
+            print(f"[DynamicTest] {i+1}/{total}  ${cost:.2f}", file=sys.stderr, flush=True)
+            results.append((_finding, result, cost))
+        return results
+
+    # Parallel mode
+    results = []
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_generate_one, finding, repo_info, tracker) for finding in findings]
+        for future in as_completed(futures):
+            _finding, result, cost, worker = future.result()
+            completed += 1
+            print(f"[DynamicTest] {completed}/{total}  ${cost:.2f}  [{worker}]", file=sys.stderr, flush=True)
+            results.append((_finding, result, cost))
 
     return results

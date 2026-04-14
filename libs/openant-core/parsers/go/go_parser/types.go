@@ -91,7 +91,7 @@ type PrimaryOrigin struct {
 	EndLine        int      `json:"end_line"`
 	FunctionName   string   `json:"function_name"`
 	ClassName      string   `json:"class_name,omitempty"`
-	Enhanced       bool     `json:"enhanced"`
+	DepsInlined    bool     `json:"deps_inlined"`
 	FilesIncluded  []string `json:"files_included"`
 	OriginalLength int      `json:"original_length"`
 	EnhancedLength int      `json:"enhanced_length"`

@@ -4,7 +4,7 @@
 
 ## Quick Context
 
-This is the Ruby code parser for Sastinel (a SAST tool). It mirrors the C parser's tree-sitter approach and the Python parser's pipeline structure.
+This is the Ruby code parser for OpenAnt (a SAST tool). It mirrors the C parser's tree-sitter approach and the Python parser's pipeline structure.
 
 **Goal:** Parse Ruby repositories into self-contained analysis units for vulnerability detection.
 

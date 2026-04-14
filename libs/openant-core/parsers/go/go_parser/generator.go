@@ -53,7 +53,7 @@ func (g *Generator) Generate() *Dataset {
 			unitsWithDownstream++
 			totalDownstream += downstream
 		}
-		if unit.Code.PrimaryOrigin.Enhanced {
+		if unit.Code.PrimaryOrigin.DepsInlined {
 			unitsEnhanced++
 		}
 	}
@@ -108,7 +108,7 @@ func (g *Generator) createUnit(funcID string, funcInfo FunctionInfo) Unit {
 	primaryCode, filesIncluded := g.assembleEnhancedCode(funcInfo, upstream)
 	originalLength := len(funcInfo.Code)
 	enhancedLength := len(primaryCode)
-	enhanced := enhancedLength > originalLength
+	depsInlined := enhancedLength > originalLength
 
 	return Unit{
 		ID:       funcID,
@@ -121,7 +121,7 @@ func (g *Generator) createUnit(funcID string, funcInfo FunctionInfo) Unit {
 				EndLine:        funcInfo.EndLine,
 				FunctionName:   funcInfo.Name,
 				ClassName:      funcInfo.ClassName,
-				Enhanced:       enhanced,
+				DepsInlined:    depsInlined,
 				FilesIncluded:  filesIncluded,
 				OriginalLength: originalLength,
 				EnhancedLength: enhancedLength,

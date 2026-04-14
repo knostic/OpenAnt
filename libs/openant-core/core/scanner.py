@@ -4,7 +4,7 @@ All-in-one scanner orchestrator.
 Runs the full pipeline:
 
     Parse → App Context → Enhance → Detect → Verify
-        → Build pipeline_output → Report → Dynamic Test
+        → Build pipeline_output → Dynamic Test → Report
 
 This is the implementation behind ``open-ant scan <path>``.
 
@@ -53,6 +53,8 @@ def scan_repository(
     enhance: bool = True,
     enhance_mode: str = "agentic",
     dynamic_test: bool = False,
+    workers: int = 8,
+    backoff_seconds: int = 30,
 ) -> ScanResult:
     """Scan a repository for vulnerabilities.
 
@@ -64,8 +66,8 @@ def scan_repository(
     4. **Detect** — Stage 1 vulnerability detection
     5. **Verify** — Stage 2 attacker simulation (optional)
     6. **Build pipeline_output.json** — bridge format for reports + dynamic tests
-    7. **Report** — summary + disclosure documents (optional)
-    8. **Dynamic Test** — Docker-isolated exploit testing (optional, off by default)
+    7. **Dynamic Test** — Docker-isolated exploit testing (optional, off by default)
+    8. **Report** — summary + disclosure documents (optional, merges dynamic test results)
 
     Args:
         repo_path: Path to the repository to scan.
@@ -81,6 +83,8 @@ def scan_repository(
         enhance: If True, run agentic/single-shot context enhancement.
         enhance_mode: ``"agentic"`` (thorough) or ``"single-shot"`` (fast).
         dynamic_test: If True, run Docker-isolated dynamic testing (requires Docker).
+        workers: Number of parallel workers for LLM steps (default: 8).
+        backoff_seconds: Seconds to wait when rate-limited (default: 30).
 
     Returns:
         ScanResult with paths to all generated files and metrics.
@@ -108,7 +112,7 @@ def scan_repository(
 
     _print_banner(repo_path, output_dir, language, processing_level,
                   verify, generate_context, enhance, enhance_mode,
-                  generate_report, dynamic_test)
+                  generate_report, dynamic_test, workers, backoff_seconds)
 
     # ---------------------------------------------------------------
     # Step 1: Parse
@@ -210,6 +214,9 @@ def scan_repository(
                 analyzer_output_path=parse_result.analyzer_output_path,
                 repo_path=repo_path,
                 mode=enhance_mode,
+                workers=workers,
+                backoff_seconds=backoff_seconds,
+                # checkpoint_path auto-derived from output_path
             )
 
             ctx.summary = {
@@ -218,6 +225,8 @@ def scan_repository(
                 "classifications": enhance_result.classifications,
                 "mode": enhance_mode,
             }
+            if enhance_result.error_summary:
+                ctx.summary["error_summary"] = enhance_result.error_summary
             ctx.outputs = {
                 "enhanced_dataset_path": enhance_result.enhanced_dataset_path,
             }
@@ -228,6 +237,8 @@ def scan_repository(
 
         print(f"  Enhanced: {enhance_result.units_enhanced} units", file=sys.stderr)
         print(f"  Classifications: {enhance_result.classifications}", file=sys.stderr)
+        if enhance_result.error_summary:
+            print(f"  Errors: {enhance_result.error_count} ({enhance_result.error_summary})", file=sys.stderr)
     else:
         print(_step_label("Skipping enhancement (--no-enhance)."), file=sys.stderr)
         result.skipped_steps.append("enhance")
@@ -253,6 +264,8 @@ def scan_repository(
             repo_path=repo_path,
             limit=limit,
             model=model,
+            workers=workers,
+            backoff_seconds=backoff_seconds,
         )
 
         ctx.summary = {
@@ -300,6 +313,8 @@ def scan_repository(
                 analyzer_output_path=parse_result.analyzer_output_path,
                 app_context_path=app_context_path,
                 repo_path=repo_path,
+                workers=workers,
+                backoff_seconds=backoff_seconds,
             )
 
             ctx.summary = {
@@ -374,54 +389,7 @@ def scan_repository(
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
-    # Step 7: Report (optional)
-    # ---------------------------------------------------------------
-    if generate_report:
-        from core.reporter import generate_summary_report, generate_disclosure_docs
-
-        print(_step_label("Generating reports..."), file=sys.stderr)
-
-        with step_context("report", output_dir, inputs={
-            "pipeline_output_path": pipeline_output_path,
-        }) as ctx:
-            report_dir = os.path.join(output_dir, "report")
-            os.makedirs(report_dir, exist_ok=True)
-
-            summary_path = os.path.join(report_dir, "SUMMARY_REPORT.md")
-            disclosures_dir = os.path.join(report_dir, "disclosures")
-
-            outputs = {}
-
-            try:
-                generate_summary_report(pipeline_output_path, summary_path)
-                result.summary_path = summary_path
-                outputs["summary_path"] = summary_path
-                print(f"  Summary: {summary_path}", file=sys.stderr)
-            except Exception as e:
-                print(f"  WARNING: Summary report failed: {e}", file=sys.stderr)
-                ctx.errors.append(f"Summary report: {e}")
-
-            # Only generate disclosures if there are findings
-            if has_findings:
-                try:
-                    generate_disclosure_docs(pipeline_output_path, disclosures_dir)
-                    outputs["disclosures_dir"] = disclosures_dir
-                    print(f"  Disclosures: {disclosures_dir}", file=sys.stderr)
-                except Exception as e:
-                    print(f"  WARNING: Disclosure docs failed: {e}", file=sys.stderr)
-                    ctx.errors.append(f"Disclosure docs: {e}")
-
-            ctx.summary = {"formats_generated": list(outputs.keys())}
-            ctx.outputs = outputs
-
-        collected_step_reports.append(_load_step_report(output_dir, "report"))
-    else:
-        print(_step_label("Skipping report generation (--no-report)."), file=sys.stderr)
-        result.skipped_steps.append("report")
-    print(file=sys.stderr)
-
-    # ---------------------------------------------------------------
-    # Step 8: Dynamic Test (optional, off by default)
+    # Step 7: Dynamic Test (optional, off by default)
     # ---------------------------------------------------------------
     if dynamic_test and has_findings:
         if not shutil.which("docker"):
@@ -468,6 +436,53 @@ def scan_repository(
     else:
         print(_step_label("Skipping dynamic test (not enabled)."), file=sys.stderr)
         result.skipped_steps.append("dynamic-test")
+    print(file=sys.stderr)
+
+    # ---------------------------------------------------------------
+    # Step 8: Report (optional)
+    # ---------------------------------------------------------------
+    if generate_report:
+        from core.reporter import generate_summary_report, generate_disclosure_docs
+
+        print(_step_label("Generating reports..."), file=sys.stderr)
+
+        with step_context("report", output_dir, inputs={
+            "pipeline_output_path": pipeline_output_path,
+        }) as ctx:
+            report_dir = os.path.join(output_dir, "report")
+            os.makedirs(report_dir, exist_ok=True)
+
+            summary_path = os.path.join(report_dir, "SUMMARY_REPORT.md")
+            disclosures_dir = os.path.join(report_dir, "disclosures")
+
+            outputs = {}
+
+            try:
+                generate_summary_report(pipeline_output_path, summary_path)
+                result.summary_path = summary_path
+                outputs["summary_path"] = summary_path
+                print(f"  Summary: {summary_path}", file=sys.stderr)
+            except Exception as e:
+                print(f"  WARNING: Summary report failed: {e}", file=sys.stderr)
+                ctx.errors.append(f"Summary report: {e}")
+
+            # Only generate disclosures if there are findings
+            if has_findings:
+                try:
+                    generate_disclosure_docs(pipeline_output_path, disclosures_dir)
+                    outputs["disclosures_dir"] = disclosures_dir
+                    print(f"  Disclosures: {disclosures_dir}", file=sys.stderr)
+                except Exception as e:
+                    print(f"  WARNING: Disclosure docs failed: {e}", file=sys.stderr)
+                    ctx.errors.append(f"Disclosure docs: {e}")
+
+            ctx.summary = {"formats_generated": list(outputs.keys())}
+            ctx.outputs = outputs
+
+        collected_step_reports.append(_load_step_report(output_dir, "report"))
+    else:
+        print(_step_label("Skipping report generation (--no-report)."), file=sys.stderr)
+        result.skipped_steps.append("report")
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
@@ -587,6 +602,8 @@ def _print_banner(
     enhance_mode: str,
     generate_report: bool,
     dynamic_test: bool,
+    workers: int = 8,
+    backoff_seconds: int = 30,
 ) -> None:
     """Print the scan configuration banner."""
     print("=" * 60, file=sys.stderr)
@@ -601,6 +618,9 @@ def _print_banner(
     print(f"  App context:   {generate_context}", file=sys.stderr)
     print(f"  Report:        {generate_report}", file=sys.stderr)
     print(f"  Dynamic test:  {dynamic_test}", file=sys.stderr)
+    workers_label = f"{workers} (parallel)" if workers > 1 else "1 (sequential)"
+    print(f"  Workers:       {workers_label}", file=sys.stderr)
+    print(f"  Rate backoff:  {backoff_seconds}s", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     print(file=sys.stderr)
 

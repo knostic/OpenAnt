@@ -29,6 +29,8 @@ class DynamicTestResult:
     docker_compose: str = ""  # Generated docker-compose.yml (if multi-service)
     elapsed_seconds: float = 0.0
     generation_cost_usd: float = 0.0
+    generation_input_tokens: int = 0
+    generation_output_tokens: int = 0
     retry_count: int = 0
 
     def to_dict(self) -> dict:
@@ -42,5 +44,7 @@ class DynamicTestResult:
             "docker_compose": self.docker_compose,
             "elapsed_seconds": round(self.elapsed_seconds, 2),
             "generation_cost_usd": round(self.generation_cost_usd, 6),
+            "generation_input_tokens": self.generation_input_tokens,
+            "generation_output_tokens": self.generation_output_tokens,
             "retry_count": self.retry_count,
         }

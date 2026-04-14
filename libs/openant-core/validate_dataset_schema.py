@@ -34,11 +34,13 @@ def validate_unit(unit, index):
         errors.append(f"Unit {index}: 'code.primary_origin' must be dict")
         return errors
 
-    # 5. CRITICAL: Check enhanced flag (experiment.py line 191)
-    if "enhanced" not in primary_origin:
-        errors.append(f"Unit {index}: MISSING 'code.primary_origin.enhanced'")
-    elif not isinstance(primary_origin.get("enhanced"), bool):
-        errors.append(f"Unit {index}: 'code.primary_origin.enhanced' must be bool")
+    # 5. CRITICAL: Check deps_inlined flag (formerly "enhanced")
+    # Accept either "deps_inlined" (new) or "enhanced" (legacy) for backward compat
+    deps_inlined_key = "deps_inlined" if "deps_inlined" in primary_origin else "enhanced"
+    if deps_inlined_key not in primary_origin:
+        errors.append(f"Unit {index}: MISSING 'code.primary_origin.deps_inlined'")
+    elif not isinstance(primary_origin.get(deps_inlined_key), bool):
+        errors.append(f"Unit {index}: 'code.primary_origin.deps_inlined' must be bool")
 
     # 6. CRITICAL: Check files_included (experiment.py line 192)
     if "files_included" not in primary_origin:
@@ -46,12 +48,12 @@ def validate_unit(unit, index):
     elif not isinstance(primary_origin.get("files_included"), list):
         errors.append(f"Unit {index}: 'code.primary_origin.files_included' must be list")
 
-    # 7. If enhanced=true, files_included must have entries
-    if primary_origin.get("enhanced") and not primary_origin.get("files_included"):
-        errors.append(f"Unit {index}: enhanced=true but files_included is empty")
+    # 7. If deps_inlined=true, files_included must have entries
+    if primary_origin.get(deps_inlined_key) and not primary_origin.get("files_included"):
+        errors.append(f"Unit {index}: deps_inlined=true but files_included is empty")
 
-    # 8. Check file boundaries in primary_code when enhanced with multiple files
-    if primary_origin.get("enhanced") and len(primary_origin.get("files_included", [])) > 1:
+    # 8. Check file boundaries in primary_code when deps_inlined with multiple files
+    if primary_origin.get(deps_inlined_key) and len(primary_origin.get("files_included", [])) > 1:
         if "// ========== File Boundary ==========" not in primary_code:
             errors.append(f"Unit {index}: enhanced with multiple files but no file boundaries")
 
@@ -65,19 +67,19 @@ def validate_dataset(path):
     all_errors = []
     units = data.get("units", [])
 
-    enhanced_count = 0
+    deps_inlined_count = 0
     for i, unit in enumerate(units):
         errors = validate_unit(unit, i)
         all_errors.extend(errors)
 
-        # Count enhanced units
+        # Count units with dependencies inlined
         code_field = unit.get("code", {})
         if isinstance(code_field, dict):
             primary_origin = code_field.get("primary_origin", {})
-            if primary_origin.get("enhanced"):
-                enhanced_count += 1
+            if primary_origin.get("deps_inlined", primary_origin.get("enhanced")):
+                deps_inlined_count += 1
 
-    return all_errors, len(units), enhanced_count
+    return all_errors, len(units), deps_inlined_count
 
 
 if __name__ == "__main__":
@@ -85,11 +87,11 @@ if __name__ == "__main__":
         print("Usage: python validate_dataset_schema.py <dataset.json>")
         sys.exit(1)
 
-    errors, total, enhanced = validate_dataset(sys.argv[1])
+    errors, total, deps_inlined = validate_dataset(sys.argv[1])
 
     print(f"Dataset: {sys.argv[1]}")
     print(f"Total units: {total}")
-    print(f"Enhanced units: {enhanced}")
+    print(f"Units with deps inlined: {deps_inlined}")
     print()
 
     if errors:

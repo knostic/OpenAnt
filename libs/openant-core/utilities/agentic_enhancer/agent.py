@@ -17,6 +17,7 @@ from typing import Optional, Set, List
 import anthropic
 
 from ..llm_client import TokenTracker, get_global_tracker
+from ..rate_limiter import get_rate_limiter
 from .repository_index import RepositoryIndex
 from .tools import TOOL_DEFINITIONS, ToolExecutor
 from .prompts import SYSTEM_PROMPT, get_user_prompt
@@ -46,7 +47,10 @@ class AgentResult:
         total_tokens: int,
         is_entry_point: bool = False,
         reachable_from_entry: Optional[bool] = None,
-        entry_point_path: Optional[List[str]] = None
+        entry_point_path: Optional[List[str]] = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost_usd: float = 0.0,
     ):
         self.include_functions = include_functions
         self.usage_context = usage_context
@@ -58,6 +62,9 @@ class AgentResult:
         self.is_entry_point = is_entry_point
         self.reachable_from_entry = reachable_from_entry
         self.entry_point_path = entry_point_path
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cost_usd = cost_usd
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -69,7 +76,10 @@ class AgentResult:
             "confidence": self.confidence,
             "agent_metadata": {
                 "iterations": self.iterations,
-                "total_tokens": self.total_tokens
+                "total_tokens": self.total_tokens,
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "cost_usd": self.cost_usd,
             },
             "reachability": {
                 "is_entry_point": self.is_entry_point,
@@ -95,7 +105,8 @@ class ContextAgent:
         tracker: TokenTracker = None,
         verbose: bool = False,
         entry_points: Optional[Set[str]] = None,
-        reachability: Optional[ReachabilityAnalyzer] = None
+        reachability: Optional[ReachabilityAnalyzer] = None,
+        client: Optional[anthropic.Anthropic] = None,
     ):
         """
         Initialize the agent.
@@ -106,6 +117,8 @@ class ContextAgent:
             verbose: If True, print debug information
             entry_points: Set of func_ids that are entry points (optional)
             reachability: ReachabilityAnalyzer for checking user input paths (optional)
+            client: Shared Anthropic client (reuse across workers to avoid FD exhaustion).
+                    If not provided, creates a new one (only for standalone/test use).
         """
         self.index = index
         self.tracker = tracker or get_global_tracker()
@@ -113,9 +126,7 @@ class ContextAgent:
         self.tool_executor = ToolExecutor(index)
         self.entry_points = entry_points or set()
         self.reachability = reachability
-
-        # Initialize Anthropic client
-        self.client = anthropic.Anthropic()
+        self.client = client or anthropic.Anthropic(max_retries=5)
 
     def analyze_unit(
         self,
@@ -176,14 +187,42 @@ class ContextAgent:
             if self.verbose:
                 print(f"  Iteration {iterations}...")
 
-            # Call Claude
-            response = self.client.messages.create(
-                model=AGENT_MODEL,
-                max_tokens=MAX_TOKENS_PER_RESPONSE,
-                system=SYSTEM_PROMPT,
-                tools=TOOL_DEFINITIONS,
-                messages=messages
-            )
+            # Call Claude with rate limiting
+            try:
+                # Wait if we're in a global backoff period
+                rate_limiter = get_rate_limiter()
+                rate_limiter.wait_if_needed()
+
+                response = self.client.messages.create(
+                    model=AGENT_MODEL,
+                    max_tokens=MAX_TOKENS_PER_RESPONSE,
+                    system=SYSTEM_PROMPT,
+                    tools=TOOL_DEFINITIONS,
+                    messages=messages
+                )
+            except anthropic.RateLimitError as exc:
+                # Report to global rate limiter so all workers back off
+                retry_after = float(exc.response.headers.get("retry-after", 0))
+                get_rate_limiter().report_rate_limit(retry_after)
+                # Attach agent state so the caller knows how far we got
+                exc.agent_state = {
+                    "iteration": iterations,
+                    "max_iterations": MAX_ITERATIONS,
+                    "tokens_used": total_input_tokens + total_output_tokens,
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                }
+                raise
+            except Exception as exc:
+                # Attach agent state so the caller knows how far we got
+                exc.agent_state = {
+                    "iteration": iterations,
+                    "max_iterations": MAX_ITERATIONS,
+                    "tokens_used": total_input_tokens + total_output_tokens,
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                }
+                raise
 
             # Track tokens
             total_input_tokens += response.usage.input_tokens
@@ -259,7 +298,7 @@ class ContextAgent:
             # If finish was called, return result
             if finish_result:
                 # Record token usage
-                self.tracker.record_call(
+                call_record = self.tracker.record_call(
                     model=AGENT_MODEL,
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens
@@ -275,19 +314,42 @@ class ContextAgent:
                     total_tokens=total_input_tokens + total_output_tokens,
                     is_entry_point=is_entry_point,
                     reachable_from_entry=reachable_from_entry,
-                    entry_point_path=entry_point_path
+                    entry_point_path=entry_point_path,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    cost_usd=call_record.get("cost_usd", 0.0),
                 )
 
             # Add assistant message and tool results to conversation
             messages.append({"role": "assistant", "content": assistant_content})
-            messages.append({"role": "user", "content": tool_results})
+            
+            # Only add user message with tool results if there are results
+            # (empty content triggers API error: "user messages must have non-empty content")
+            if tool_results:
+                messages.append({"role": "user", "content": tool_results})
+            else:
+                # No tool calls but model didn't end — treat as incomplete
+                if self.verbose:
+                    print("  No tool calls in response, treating as incomplete")
+                return AgentResult(
+                    include_functions=[],
+                    usage_context="Agent response had no tool calls",
+                    security_classification="neutral",
+                    classification_reasoning="Analysis incomplete - no tool calls",
+                    confidence=0.3,
+                    iterations=iterations,
+                    total_tokens=total_input_tokens + total_output_tokens,
+                    is_entry_point=is_entry_point,
+                    reachable_from_entry=reachable_from_entry,
+                    entry_point_path=entry_point_path
+                )
 
         # Max iterations reached
         if self.verbose:
             print(f"  Max iterations ({MAX_ITERATIONS}) reached")
 
         # Record token usage
-        self.tracker.record_call(
+        call_record = self.tracker.record_call(
             model=AGENT_MODEL,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens
@@ -303,7 +365,10 @@ class ContextAgent:
             total_tokens=total_input_tokens + total_output_tokens,
             is_entry_point=is_entry_point,
             reachable_from_entry=reachable_from_entry,
-            entry_point_path=entry_point_path
+            entry_point_path=entry_point_path,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            cost_usd=call_record.get("cost_usd", 0.0),
         )
 
 
@@ -313,7 +378,8 @@ def enhance_unit_with_agent(
     tracker: TokenTracker = None,
     verbose: bool = False,
     entry_points: Optional[Set[str]] = None,
-    reachability: Optional[ReachabilityAnalyzer] = None
+    reachability: Optional[ReachabilityAnalyzer] = None,
+    client: Optional[anthropic.Anthropic] = None,
 ) -> dict:
     """
     Enhance a single unit using the agentic approach.
@@ -325,6 +391,7 @@ def enhance_unit_with_agent(
         verbose: Print debug info
         entry_points: Set of func_ids that are entry points (optional)
         reachability: ReachabilityAnalyzer for checking user input paths (optional)
+        client: Shared Anthropic client (reuse across workers to avoid FD exhaustion).
 
     Returns:
         Enhanced unit with agent_context field including reachability info
@@ -334,7 +401,8 @@ def enhance_unit_with_agent(
         tracker=tracker,
         verbose=verbose,
         entry_points=entry_points,
-        reachability=reachability
+        reachability=reachability,
+        client=client,
     )
 
     # Extract unit info
@@ -385,7 +453,7 @@ def enhance_unit_with_agent(
             origin = unit["code"].get("primary_origin", {})
             current_files = set(origin.get("files_included", []))
             origin["files_included"] = list(current_files | additional_files)
-            origin["enhanced"] = True
+            origin["deps_inlined"] = True
             origin["enhanced_length"] = len(assembled)
             unit["code"]["primary_origin"] = origin
 

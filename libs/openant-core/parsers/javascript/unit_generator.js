@@ -277,9 +277,9 @@ class UnitGenerator {
         const directCalls = this.resolver.callGraph[functionId] || [];
         const directCallers = this.resolver.reverseCallGraph[functionId] || [];
 
-        // Assemble enhanced code with dependencies (Sastinel standard format)
+        // Assemble enhanced code with dependencies (OpenAnt standard format)
         const filesIncluded = this._collectFilesIncluded(filePath, upstreamDependencies, downstreamCallers);
-        const isEnhanced = upstreamDependencies.length > 0 || downstreamCallers.length > 0;
+        const hasDepsInlined = upstreamDependencies.length > 0 || downstreamCallers.length > 0;
         const assembledCode = this._assembleEnhancedCode(funcData, upstreamDependencies, downstreamCallers);
 
         // Build the unit
@@ -294,7 +294,7 @@ class UnitGenerator {
                     end_line: funcData.endLine || null,
                     function_name: funcData.name,
                     class_name: funcData.className || null,
-                    enhanced: isEnhanced,
+                    deps_inlined: hasDepsInlined,
                     files_included: filesIncluded,
                     original_length: funcData.code.length,
                     enhanced_length: assembledCode.length

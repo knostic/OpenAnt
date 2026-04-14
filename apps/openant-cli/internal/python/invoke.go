@@ -8,7 +8,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/knostic/open-ant-cli/internal/types"
 )
@@ -57,6 +60,32 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 		return nil, fmt.Errorf("failed to start Python process: %w", err)
 	}
 
+	// Forward SIGINT/SIGTERM to the Python subprocess so Ctrl+C kills it.
+	sigChan := make(chan os.Signal, 1)
+	interrupted := false
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig, ok := <-sigChan
+		if !ok {
+			return // channel closed, normal exit
+		}
+		interrupted = true
+		// Forward signal to Python subprocess
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(sig)
+		}
+		// Give Python a few seconds to exit gracefully, then force kill
+		time.AfterFunc(5*time.Second, func() {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		})
+	}()
+	defer func() {
+		signal.Stop(sigChan)
+		close(sigChan)
+	}()
+
 	// Stream stderr in a goroutine
 	stderrDone := make(chan struct{})
 	go func() {
@@ -87,6 +116,16 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	// Parse JSON from stdout
 	rawJSON := strings.TrimSpace(stdoutBuf.String())
 	if rawJSON == "" {
+		if interrupted {
+			// User interrupted with Ctrl+C — not an error
+			return &InvokeResult{
+				Envelope: types.Envelope{
+					Status: "interrupted",
+					Errors: []string{},
+				},
+				ExitCode: 130, // standard SIGINT exit code
+			}, nil
+		}
 		return &InvokeResult{
 			Envelope: types.Envelope{
 				Status: "error",

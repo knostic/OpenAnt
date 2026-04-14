@@ -86,7 +86,7 @@ python call_graph_builder.py functions.json --output call_graph.json
 Creates self-contained analysis units with full context.
 
 **Input:** Call graph data
-**Output:** Dataset compatible with Sastinel
+**Output:** OpenAnt dataset format
 
 **Each unit contains:**
 ```json

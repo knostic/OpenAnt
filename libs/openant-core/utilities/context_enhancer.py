@@ -15,13 +15,28 @@ All LLM calls are now centralized in Python.
 import json
 import argparse
 import logging
+import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
+import anthropic
+
 from .llm_client import AnthropicClient, TokenTracker, get_global_tracker, reset_global_tracker
 from .agentic_enhancer import RepositoryIndex, enhance_unit_with_agent, load_index_from_file
+from .rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
+
+# Avoid circular import — import checkpoint at usage site
+_StepCheckpoint = None
+def _get_step_checkpoint():
+    global _StepCheckpoint
+    if _StepCheckpoint is None:
+        from core.checkpoint import StepCheckpoint
+        _StepCheckpoint = StepCheckpoint
+    return _StepCheckpoint
 
 
 # Null logger that discards all messages (used when no logger provided)
@@ -31,6 +46,45 @@ _null_logger.addHandler(logging.NullHandler())
 
 # Use Sonnet for context enhancement (cost-effective auxiliary task)
 CONTEXT_ENHANCEMENT_MODEL = "claude-sonnet-4-20250514"
+
+
+def _build_error_info(exc: Exception) -> dict:
+    """Build a structured error dict from an exception.
+
+    Captures exception type, message, HTTP status, request ID, and
+    any agent iteration state attached by agent.py.
+    """
+    info = {
+        "type": "unknown",
+        "exception_class": type(exc).__name__,
+        "message": str(exc),
+    }
+
+    # Anthropic SDK specific exceptions
+    if isinstance(exc, anthropic.APIConnectionError):
+        info["type"] = "connection"
+    elif isinstance(exc, anthropic.APITimeoutError):
+        info["type"] = "timeout"
+    elif isinstance(exc, anthropic.RateLimitError):
+        info["type"] = "rate_limit"
+        info["status_code"] = exc.status_code
+        if hasattr(exc, "response") and exc.response is not None:
+            info["request_id"] = exc.response.headers.get("request-id")
+            retry_after = exc.response.headers.get("retry-after")
+            if retry_after:
+                info["retry_after"] = retry_after
+    elif isinstance(exc, anthropic.APIStatusError):
+        info["type"] = "api_status"
+        info["status_code"] = exc.status_code
+        if hasattr(exc, "response") and exc.response is not None:
+            info["request_id"] = exc.response.headers.get("request-id")
+
+    # Agent iteration state (attached by agent.py)
+    agent_state = getattr(exc, "agent_state", None)
+    if agent_state:
+        info["agent_state"] = agent_state
+
+    return info
 
 
 def get_context_enhancement_prompt(
@@ -270,15 +324,19 @@ class ContextEnhancer:
         dataset: dict,
         batch_size: int = 10,
         progress_callback: Optional[Callable] = None,
+        workers: int = 10,
     ) -> dict:
         """
         Enhance all units in a dataset (single-shot mode).
+
+        Uses ThreadPoolExecutor for parallel processing when workers > 1.
 
         Args:
             dataset: The dataset from unit_generator.js
             batch_size: Number of units to process before printing progress
             progress_callback: Optional callback(unit_id, classification, unit_elapsed)
                 called after each unit completes.
+            workers: Number of parallel workers (default: 10).
 
         Returns:
             Enhanced dataset
@@ -288,22 +346,55 @@ class ContextEnhancer:
 
         self._log("info", f"Enhancing {total} units with LLM context (single-shot mode)", units=total)
         self._log("info", f"Model: {CONTEXT_ENHANCEMENT_MODEL}")
+        mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
+        self._log("info", f"Mode: {mode}")
 
         # Build lookup dict for context gathering
         units_by_id = {u.get("id"): u for u in units}
 
-        for i, unit in enumerate(units):
-            if (i + 1) % batch_size == 0 or i == 0:
-                self._log("info", f"Processing unit {i + 1}/{total}", unit_id=unit.get("id"))
-
+        def _process_one(unit):
+            """Process a single unit. Mutates unit in-place."""
             unit_start = time.monotonic()
             self.enhance_unit(unit, units_by_id)
             unit_elapsed = time.monotonic() - unit_start
+            ctx = unit.get("llm_context", {})
+            classification = ctx.get("confidence", "unknown")
+            worker = threading.current_thread().name
+            return unit.get("id", "?"), str(classification), unit_elapsed, worker
 
-            if progress_callback:
-                ctx = unit.get("llm_context", {})
-                classification = ctx.get("confidence", "unknown")
-                progress_callback(unit.get("id", "?"), str(classification), unit_elapsed)
+        if workers <= 1:
+            for unit in units:
+                uid, classification, elapsed, _worker = _process_one(unit)
+                if progress_callback:
+                    progress_callback(uid, classification, elapsed)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_process_one, unit): unit for unit in units}
+                for future in as_completed(futures):
+                    uid, classification, elapsed, worker = future.result()
+                    if progress_callback:
+                        progress_callback(uid, f"{classification}  [{worker}]", elapsed)
+
+        # Recompute stats from unit results (thread-safe)
+        self.stats = {
+            "units_processed": 0,
+            "units_enhanced": 0,
+            "dependencies_added": 0,
+            "callers_added": 0,
+            "data_flows_extracted": 0,
+            "errors": 0,
+        }
+        for unit in units:
+            ctx = unit.get("llm_context", {})
+            self.stats["units_processed"] += 1
+            if ctx.get("reasoning") != "LLM analysis failed, using static analysis only":
+                self.stats["units_enhanced"] += 1
+                self.stats["dependencies_added"] += len(ctx.get("missing_dependencies", []))
+                self.stats["callers_added"] += len(ctx.get("additional_callers", []))
+                if ctx.get("data_flow", {}).get("security_relevant_flows"):
+                    self.stats["data_flows_extracted"] += 1
+            if ctx.get("confidence", 1.0) <= 0.3 and ctx.get("reasoning", "").startswith("LLM analysis failed"):
+                self.stats["errors"] += 1
 
         # Get token usage stats
         token_stats = self.tracker.get_totals()
@@ -341,6 +432,8 @@ class ContextEnhancer:
         verbose: bool = False,
         checkpoint_path: str = None,
         progress_callback: Optional[Callable] = None,
+        restored_callback: Optional[Callable] = None,
+        workers: int = 10,
     ) -> dict:
         """
         Enhance all units using agentic approach with tool use.
@@ -348,8 +441,11 @@ class ContextEnhancer:
         This mode traces call paths iteratively to understand code intent.
         More accurate but slower and more expensive than single-shot mode.
 
-        Supports checkpoint/resume: if checkpoint_path is provided, saves progress
-        after each unit and skips already-processed units on resume.
+        Uses ThreadPoolExecutor for parallel processing when workers > 1.
+
+        Supports checkpoint/resume: if checkpoint_path is provided, each completed
+        unit is saved to a separate file under a checkpoints directory. On resume,
+        completed units are loaded from their individual checkpoint files.
 
         Args:
             dataset: The dataset from unit_generator.js
@@ -357,9 +453,13 @@ class ContextEnhancer:
             repo_path: Repository root path (for file reading)
             batch_size: Number of units to process before printing progress
             verbose: Print debug information
-            checkpoint_path: Path to save/load checkpoint file (enables resume)
+            checkpoint_path: Path to checkpoint directory (enables resume).
+                If provided, per-unit results are saved under this directory.
             progress_callback: Optional callback(unit_id, classification, unit_elapsed)
                 called after each unit completes.
+            restored_callback: Optional callback(count) called after checkpoint
+                loading with the number of restored units.
+            workers: Number of parallel workers (default: 10).
 
         Returns:
             Enhanced dataset with agent_context field
@@ -367,38 +467,96 @@ class ContextEnhancer:
         units = dataset.get("units", [])
         total = len(units)
 
-        # Check for existing checkpoint
-        checkpoint_data = None
+        # Checkpoint directory setup
+        checkpoint_dir = None
         processed_ids = set()
         if checkpoint_path:
-            checkpoint_file = Path(checkpoint_path)
-            if checkpoint_file.exists():
-                self._log("info", f"Found checkpoint at {checkpoint_path}, resuming...")
-                with open(checkpoint_file, 'r') as f:
-                    checkpoint_data = json.load(f)
+            # Use checkpoint_path as a directory for per-unit files
+            checkpoint_dir = checkpoint_path if os.path.isdir(checkpoint_path) or not checkpoint_path.endswith(".json") else os.path.splitext(checkpoint_path)[0] + "_checkpoints"
+            os.makedirs(checkpoint_dir, exist_ok=True)
 
-                # Build set of already-processed unit IDs
-                for cp_unit in checkpoint_data.get("units", []):
-                    if cp_unit.get("agent_context") and not cp_unit["agent_context"].get("error"):
-                        processed_ids.add(cp_unit.get("id"))
+            # Check for legacy single-file checkpoint and migrate
+            if os.path.isfile(checkpoint_path) and checkpoint_path.endswith(".json"):
+                self._migrate_legacy_checkpoint(checkpoint_path, checkpoint_dir, units)
 
-                # Restore units from checkpoint
-                cp_units_by_id = {u.get("id"): u for u in checkpoint_data.get("units", [])}
-                for unit in units:
-                    unit_id = unit.get("id")
-                    if unit_id in cp_units_by_id and cp_units_by_id[unit_id].get("agent_context"):
-                        unit["agent_context"] = cp_units_by_id[unit_id]["agent_context"]
-                        if "code" in cp_units_by_id[unit_id]:
-                            unit["code"] = cp_units_by_id[unit_id]["code"]
+            # Load completed unit IDs from per-unit checkpoint files
+            processed_ids = self._load_completed_units(checkpoint_dir)
 
-                self._log("info", f"Restored {len(processed_ids)} already-processed units", units=len(processed_ids))
+            # Restore agent_context from checkpoint files into units
+            for unit in units:
+                unit_id = unit.get("id")
+                if unit_id in processed_ids:
+                    cp_file = os.path.join(checkpoint_dir, f"{self._safe_filename(unit_id)}.json")
+                    if os.path.exists(cp_file):
+                        with open(cp_file, 'r') as f:
+                            cp_data = json.load(f)
+                        unit["agent_context"] = cp_data.get("agent_context", {})
+                        if "code" in cp_data:
+                            unit["code"] = cp_data["code"]
+
+            if processed_ids:
+                self._log("info", f"Restored {len(processed_ids)} already-processed units from checkpoints", units=len(processed_ids))
+                if restored_callback:
+                    restored_callback(len(processed_ids))
+
+        # Initialize summary tracking for _summary.json
+        # Counts are updated in the main thread (as_completed loop) — no lock needed.
+        _summary_cp = None
+        _summary_completed = len(processed_ids)
+        _summary_errors = 0
+        _summary_error_breakdown = {}
+        _summary_input_tokens = 0
+        _summary_output_tokens = 0
+        _summary_cost_usd = 0.0
+
+        if checkpoint_dir:
+            SC = _get_step_checkpoint()
+            _summary_cp = SC.__new__(SC)
+            _summary_cp.step_name = "enhance"
+            _summary_cp.dir = checkpoint_dir
+
+            # Count errors and sum usage from already-loaded checkpoints
+            for unit in units:
+                uid = unit.get("id", "")
+                cp_file = os.path.join(checkpoint_dir, f"{self._safe_filename(uid)}.json")
+                if not os.path.exists(cp_file):
+                    continue
+                try:
+                    with open(cp_file, 'r') as f:
+                        cp_data = json.load(f)
+                    # Sum usage from all existing checkpoints (completed + errored)
+                    cp_usage = cp_data.get("usage", {})
+                    _summary_input_tokens += cp_usage.get("input_tokens", 0)
+                    _summary_output_tokens += cp_usage.get("output_tokens", 0)
+                    _summary_cost_usd += cp_usage.get("cost_usd", 0.0)
+                    # Count errors for non-completed units
+                    if uid not in processed_ids and cp_data.get("agent_context", {}).get("error"):
+                        _summary_errors += 1
+                        err = cp_data["agent_context"]["error"]
+                        err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
+                        _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            _summary_cp.write_summary(total, _summary_completed, _summary_errors,
+                                      _summary_error_breakdown, phase="in_progress",
+                                      usage={"input_tokens": _summary_input_tokens,
+                                             "output_tokens": _summary_output_tokens,
+                                             "cost_usd": round(_summary_cost_usd, 6)})
+
+            # Inject prior usage into tracker so step_report captures the total
+            if _summary_input_tokens or _summary_output_tokens:
+                self.tracker.add_prior_usage(
+                    _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
 
         remaining = total - len(processed_ids)
         self._log("info", f"Enhancing {remaining} units with agentic analysis ({len(processed_ids)} already done)", units=remaining)
         self._log("info", "Mode: Iterative tool use (traces call paths)")
         self._log("info", "Model: claude-sonnet-4-20250514")
-        if checkpoint_path:
-            self._log("info", f"Checkpoint: {checkpoint_path}")
+        mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
+        self._log("info", f"Workers: {mode}")
+        if checkpoint_dir:
+            self._log("info", f"Checkpoint dir: {checkpoint_dir}")
 
         # Load repository index
         self._log("info", f"Loading repository index from {analyzer_output_path}")
@@ -406,83 +564,160 @@ class ContextEnhancer:
         stats = index.get_statistics()
         self._log("info", f"Indexed {stats['total_functions']} functions from {stats['total_files']} files")
 
-        # Track stats
-        agentic_stats = {
-            "units_processed": len(processed_ids),  # Start from checkpoint count
-            "units_with_context": 0,
-            "total_iterations": 0,
-            "functions_added": 0,
-            "security_controls_found": 0,
-            "vulnerable_found": 0,
-            "neutral_found": 0,
-            "errors": 0
-        }
+        # Create a single shared Anthropic client for all workers.
+        # Each ContextAgent previously created its own anthropic.Anthropic() instance,
+        # which spawns a new httpx connection pool. With 1000+ units and 8 workers,
+        # this exhausted file descriptors (macOS limit ~256). The httpx.Client
+        # underlying anthropic.Anthropic is thread-safe, so sharing is correct.
+        shared_client = anthropic.Anthropic(max_retries=5)
 
-        # Count stats from restored units
-        for unit in units:
-            agent_ctx = unit.get("agent_context", {})
-            if agent_ctx and unit.get("id") in processed_ids:
-                if agent_ctx.get("include_functions"):
-                    agentic_stats["units_with_context"] += 1
-                    agentic_stats["functions_added"] += len(agent_ctx["include_functions"])
-                classification = agent_ctx.get("security_classification", "neutral")
-                if classification == "security_control":
-                    agentic_stats["security_controls_found"] += 1
-                elif classification == "vulnerable":
-                    agentic_stats["vulnerable_found"] += 1
-                else:
-                    agentic_stats["neutral_found"] += 1
-                agentic_stats["total_iterations"] += agent_ctx.get("agent_metadata", {}).get("iterations", 0)
+        # Filter to unprocessed units
+        units_to_process = [(i, unit) for i, unit in enumerate(units) if unit.get("id") not in processed_ids]
 
-        processed_this_run = 0
-        for i, unit in enumerate(units):
+        def _enhance_one(unit):
+            """Enhance a single unit. Mutates unit in-place, returns metadata."""
             unit_id = unit.get("id")
-
-            # Skip already-processed units
-            if unit_id in processed_ids:
-                continue
-
-            processed_this_run += 1
-            if processed_this_run % batch_size == 1 or processed_this_run == 1:
-                self._log("info", f"Processing unit {agentic_stats['units_processed'] + 1}/{total}", unit_id=unit_id)
-
             unit_start = time.monotonic()
+            classification = "neutral"
             try:
-                enhance_unit_with_agent(unit, index, self.tracker, verbose)
-                agentic_stats["units_processed"] += 1
+                enhance_unit_with_agent(unit, index, self.tracker, verbose, client=shared_client)
 
                 agent_ctx = unit.get("agent_context", {})
-                if agent_ctx.get("include_functions"):
-                    agentic_stats["units_with_context"] += 1
-                    agentic_stats["functions_added"] += len(agent_ctx["include_functions"])
-
                 classification = agent_ctx.get("security_classification", "neutral")
-                if classification == "security_control":
-                    agentic_stats["security_controls_found"] += 1
-                elif classification == "vulnerable":
-                    agentic_stats["vulnerable_found"] += 1
-                else:
-                    agentic_stats["neutral_found"] += 1
-
-                agentic_stats["total_iterations"] += agent_ctx.get("agent_metadata", {}).get("iterations", 0)
 
             except Exception as e:
                 classification = "error"
-                agentic_stats["errors"] += 1
-                self._log("error", f"Error processing unit", unit_id=unit_id, error=str(e))
+                error_info = _build_error_info(e)
+                self._log("error", f"Error processing unit",
+                          unit_id=unit_id,
+                          error=error_info.get("message", str(e)),
+                          error_type=error_info.get("type", "unknown"))
                 unit["agent_context"] = {
-                    "error": str(e),
+                    "error": error_info,
                     "security_classification": "neutral",
                     "confidence": 0.0
                 }
 
             unit_elapsed = time.monotonic() - unit_start
-            if progress_callback:
-                progress_callback(unit_id or "?", classification, unit_elapsed)
+            worker = threading.current_thread().name
 
-            # Save checkpoint after each unit
-            if checkpoint_path:
-                self._save_checkpoint(dataset, checkpoint_path, agentic_stats)
+            # Save per-unit checkpoint (no lock — each file is unique)
+            if checkpoint_dir:
+                self._save_unit_checkpoint(unit, checkpoint_dir)
+
+            return unit_id or "?", classification, unit_elapsed, worker
+
+        def _update_summary(classification, unit):
+            """Update summary counters after a unit completes. Called from main thread."""
+            nonlocal _summary_completed, _summary_errors, _summary_error_breakdown
+            nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
+            if _summary_cp is None:
+                return
+            if classification == "error":
+                _summary_errors += 1
+                err = unit.get("agent_context", {}).get("error", {})
+                err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
+                _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
+            else:
+                _summary_completed += 1
+            # Accumulate per-unit usage
+            meta = unit.get("agent_context", {}).get("agent_metadata", {})
+            _summary_input_tokens += meta.get("input_tokens", 0)
+            _summary_output_tokens += meta.get("output_tokens", 0)
+            _summary_cost_usd += meta.get("cost_usd", 0.0)
+            _summary_cp.write_summary(total, _summary_completed, _summary_errors,
+                                      _summary_error_breakdown, phase="in_progress",
+                                      usage={"input_tokens": _summary_input_tokens,
+                                             "output_tokens": _summary_output_tokens,
+                                             "cost_usd": round(_summary_cost_usd, 6)})
+
+        if workers <= 1:
+            # Sequential mode
+            try:
+                for _, unit in units_to_process:
+                    uid, classification, elapsed, _worker = _enhance_one(unit)
+                    _update_summary(classification, unit)
+                    if progress_callback:
+                        progress_callback(uid, classification, elapsed)
+            except KeyboardInterrupt:
+                self._log("warning", "Interrupted — progress saved to checkpoints")
+                return dataset
+        else:
+            # Parallel mode
+            executor = ThreadPoolExecutor(max_workers=workers)
+            futures = {executor.submit(_enhance_one, unit): unit for _, unit in units_to_process}
+            try:
+                for future in as_completed(futures):
+                    unit = futures[future]
+                    uid, classification, elapsed, worker = future.result()
+                    _update_summary(classification, unit)
+                    if progress_callback:
+                        progress_callback(uid, f"{classification}  [{worker}]", elapsed)
+            except KeyboardInterrupt:
+                self._log("warning", "Interrupted — cancelling pending work...")
+                executor.shutdown(wait=False, cancel_futures=True)
+                self._log("info", "Progress saved to checkpoints")
+                return dataset
+            executor.shutdown(wait=False)
+
+        # Auto-retry failed units with transient errors (rate limit, connection, timeout, 5xx)
+        retryable_units = [
+            (i, unit) for i, unit in enumerate(units)
+            if is_retryable_error(unit.get("agent_context", {}).get("error"))
+        ]
+        if retryable_units:
+            rate_limiter = get_rate_limiter()
+            backoff = rate_limiter.time_until_ready()
+            if backoff > 0:
+                self._log("info",
+                    f"Retrying {len(retryable_units)} failed units "
+                    f"(waiting {backoff:.0f}s for rate limit to clear)...")
+                rate_limiter.wait_if_needed()
+            else:
+                self._log("info",
+                    f"Retrying {len(retryable_units)} failed units (transient errors)...")
+
+            # Retry sequentially to avoid re-triggering rate limit
+            for i, unit in retryable_units:
+                # Clear previous error
+                unit["agent_context"] = {}
+                uid, classification, elapsed, _ = _enhance_one(unit)
+
+                # Update summary: retry succeeded → flip error to completed
+                if classification != "error":
+                    _summary_errors = max(0, _summary_errors - 1)
+                    _summary_completed += 1
+                    # Decrement the old error type count (best effort)
+                    # The error was already counted in _update_summary during initial pass
+                # Accumulate retry usage
+                meta = unit.get("agent_context", {}).get("agent_metadata", {})
+                _summary_input_tokens += meta.get("input_tokens", 0)
+                _summary_output_tokens += meta.get("output_tokens", 0)
+                _summary_cost_usd += meta.get("cost_usd", 0.0)
+                if _summary_cp is not None:
+                    _summary_cp.write_summary(total, _summary_completed, _summary_errors,
+                                              _summary_error_breakdown, phase="in_progress",
+                                              usage={"input_tokens": _summary_input_tokens,
+                                                     "output_tokens": _summary_output_tokens,
+                                                     "cost_usd": round(_summary_cost_usd, 6)})
+
+                # Save checkpoint (overwrite error with result)
+                if checkpoint_dir:
+                    self._save_unit_checkpoint(unit, checkpoint_dir)
+
+                if progress_callback:
+                    progress_callback(uid, f"{classification} (retry)", elapsed)
+
+        # Write final summary with phase="done"
+        if _summary_cp is not None:
+            _summary_cp.write_summary(total, _summary_completed, _summary_errors,
+                                      _summary_error_breakdown, phase="done",
+                                      usage={"input_tokens": _summary_input_tokens,
+                                             "output_tokens": _summary_output_tokens,
+                                             "cost_usd": round(_summary_cost_usd, 6)})
+
+        # Compute stats from all units (including previously checkpointed ones)
+        agentic_stats = self._compute_agentic_stats(units)
 
         # Get token usage stats
         token_stats = self.tracker.get_totals()
@@ -503,7 +738,8 @@ class ContextEnhancer:
                       "units_with_context": agentic_stats['units_with_context'],
                       "avg_iterations_per_unit": round(avg_iterations, 1),
                       "security_controls": agentic_stats['security_controls_found'],
-                      "vulnerable": agentic_stats['vulnerable_found'],
+                      "exploitable": agentic_stats['exploitable_found'],
+                      "vulnerable_internal": agentic_stats['vulnerable_found'],
                       "neutral": agentic_stats['neutral_found'],
                       "errors": agentic_stats['errors']
                   })
@@ -515,16 +751,111 @@ class ContextEnhancer:
 
         return dataset
 
-    def _save_checkpoint(self, dataset: dict, checkpoint_path: str, agentic_stats: dict):
-        """Save checkpoint to disk after each unit is processed."""
-        # Update metadata before saving
-        dataset["metadata"] = dataset.get("metadata", {})
-        dataset["metadata"]["checkpoint"] = True
-        dataset["metadata"]["agentic_stats"] = agentic_stats
-        dataset["metadata"]["token_usage"] = self.tracker.get_totals()
+    @staticmethod
+    def _safe_filename(unit_id: str) -> str:
+        from utilities.safe_filename import safe_filename
+        return safe_filename(unit_id)
 
-        with open(checkpoint_path, 'w') as f:
-            json.dump(dataset, f, indent=2)
+    def _save_unit_checkpoint(self, unit: dict, checkpoint_dir: str):
+        """Save a single unit's result to its own checkpoint file."""
+        unit_id = unit.get("id", "unknown")
+        filename = self._safe_filename(unit_id) + ".json"
+        filepath = os.path.join(checkpoint_dir, filename)
+        cp_data = {
+            "id": unit_id,
+            "agent_context": unit.get("agent_context", {}),
+        }
+        # Include code if it was modified by the agent
+        if "code" in unit:
+            cp_data["code"] = unit["code"]
+        # Include per-unit usage from agent_metadata
+        meta = cp_data["agent_context"].get("agent_metadata", {})
+        if meta.get("input_tokens") or meta.get("output_tokens"):
+            cp_data["usage"] = {
+                "input_tokens": meta.get("input_tokens", 0),
+                "output_tokens": meta.get("output_tokens", 0),
+                "cost_usd": meta.get("cost_usd", 0.0),
+            }
+        with open(filepath, 'w') as f:
+            json.dump(cp_data, f, indent=2)
+
+    def _load_completed_units(self, checkpoint_dir: str) -> set:
+        """Load the set of completed unit IDs from per-unit checkpoint files."""
+        completed = set()
+        if not os.path.isdir(checkpoint_dir):
+            return completed
+        for filename in os.listdir(checkpoint_dir):
+            if not filename.endswith(".json"):
+                continue
+            filepath = os.path.join(checkpoint_dir, filename)
+            try:
+                with open(filepath, 'r') as f:
+                    cp_data = json.load(f)
+                unit_id = cp_data.get("id")
+                agent_ctx = cp_data.get("agent_context", {})
+                if unit_id and agent_ctx and not agent_ctx.get("error"):
+                    completed.add(unit_id)
+            except (json.JSONDecodeError, OSError):
+                continue
+        return completed
+
+    def _migrate_legacy_checkpoint(self, checkpoint_path: str, checkpoint_dir: str, units: list):
+        """Migrate a legacy single-file checkpoint to per-unit checkpoint files."""
+        try:
+            with open(checkpoint_path, 'r') as f:
+                checkpoint_data = json.load(f)
+            for cp_unit in checkpoint_data.get("units", []):
+                if cp_unit.get("agent_context") and not cp_unit["agent_context"].get("error"):
+                    self._save_unit_checkpoint(cp_unit, checkpoint_dir)
+            self._log("info", f"Migrated legacy checkpoint to per-unit files in {checkpoint_dir}")
+        except Exception as e:
+            self._log("warning", f"Could not migrate legacy checkpoint: {e}")
+
+    @staticmethod
+    def _compute_agentic_stats(units: list) -> dict:
+        """Compute agentic stats from all units."""
+        stats = {
+            "units_processed": 0,
+            "units_with_context": 0,
+            "total_iterations": 0,
+            "functions_added": 0,
+            "security_controls_found": 0,
+            "exploitable_found": 0,
+            "vulnerable_found": 0,
+            "neutral_found": 0,
+            "errors": 0,
+            "error_summary": {},
+        }
+        for unit in units:
+            agent_ctx = unit.get("agent_context")
+            if not agent_ctx:
+                continue
+            if agent_ctx.get("error"):
+                stats["errors"] += 1
+                # Tally errors by type
+                err = agent_ctx["error"]
+                if isinstance(err, dict):
+                    err_type = err.get("type", "unknown")
+                else:
+                    # Legacy string errors (from older runs)
+                    err_type = "legacy_string"
+                stats["error_summary"][err_type] = stats["error_summary"].get(err_type, 0) + 1
+                continue
+            stats["units_processed"] += 1
+            if agent_ctx.get("include_functions"):
+                stats["units_with_context"] += 1
+                stats["functions_added"] += len(agent_ctx["include_functions"])
+            classification = agent_ctx.get("security_classification", "neutral")
+            if classification == "security_control":
+                stats["security_controls_found"] += 1
+            elif classification == "exploitable":
+                stats["exploitable_found"] += 1
+            elif classification == "vulnerable_internal":
+                stats["vulnerable_found"] += 1
+            else:
+                stats["neutral_found"] += 1
+            stats["total_iterations"] += agent_ctx.get("agent_metadata", {}).get("iterations", 0)
+        return stats
 
     def get_token_stats(self) -> dict:
         """

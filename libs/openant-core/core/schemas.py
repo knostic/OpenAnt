@@ -13,7 +13,7 @@ standardized metadata (timing, cost, inputs, outputs).
 import json
 import os
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -104,9 +104,14 @@ class ReportResult:
     """Result of `open-ant report`."""
     output_path: str
     format: str = "html"
+    usage: UsageInfo = field(default_factory=UsageInfo)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {
+            "output_path": self.output_path,
+            "format": self.format,
+            "usage": self.usage.to_dict(),
+        }
 
 
 @dataclass
@@ -162,17 +167,21 @@ class EnhanceResult:
     enhanced_dataset_path: str
     units_enhanced: int = 0
     error_count: int = 0
+    error_summary: dict = field(default_factory=dict)
     classifications: dict = field(default_factory=dict)
     usage: UsageInfo = field(default_factory=UsageInfo)
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "enhanced_dataset_path": self.enhanced_dataset_path,
             "units_enhanced": self.units_enhanced,
             "error_count": self.error_count,
             "classifications": self.classifications,
             "usage": self.usage.to_dict(),
         }
+        if self.error_summary:
+            result["error_summary"] = self.error_summary
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +259,7 @@ class StepReport:
 
     def __post_init__(self):
         if not self.timestamp:
-            self.timestamp = datetime.utcnow().isoformat() + "Z"
+            self.timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     def to_dict(self) -> dict:
         return asdict(self)

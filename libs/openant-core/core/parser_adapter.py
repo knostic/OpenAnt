@@ -30,7 +30,7 @@ def detect_language(repo_path: str) -> str:
         "python", "javascript", or "go"
     """
     repo = Path(repo_path)
-    counts = {"python": 0, "javascript": 0, "go": 0, "c": 0, "ruby": 0, "php": 0}
+    counts = {"python": 0, "javascript": 0, "go": 0, "c": 0, "ruby": 0, "php": 0, "zig": 0}
 
     for f in repo.rglob("*"):
         if not f.is_file():
@@ -56,11 +56,13 @@ def detect_language(repo_path: str) -> str:
             counts["ruby"] += 1
         elif suffix == ".php":
             counts["php"] += 1
+        elif suffix == ".zig":
+            counts["zig"] += 1
 
     if not any(counts.values()):
         raise ValueError(
             f"No supported source files found in {repo_path}. "
-            "Supported languages: Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP."
+            "Supported languages: Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Zig."
         )
 
     return max(counts, key=counts.get)
@@ -116,6 +118,8 @@ def parse_repository(
         return _parse_ruby(repo_path, output_dir, processing_level, skip_tests, name)
     elif language == "php":
         return _parse_php(repo_path, output_dir, processing_level, skip_tests, name)
+    elif language == "zig":
+        return _parse_zig(repo_path, output_dir, processing_level, skip_tests, name)
     else:
         raise ValueError(f"Unsupported language: {language}")
 
@@ -592,5 +596,65 @@ def _parse_php(repo_path: str, output_dir: str, processing_level: str, skip_test
         analyzer_output_path=analyzer_output_path if os.path.exists(analyzer_output_path) else None,
         units_count=units_count,
         language="php",
+        processing_level=processing_level,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Zig parser
+# ---------------------------------------------------------------------------
+
+def _parse_zig(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None) -> ParseResult:
+    """Invoke the Zig parser.
+
+    The Zig parser uses tree-sitter for function extraction and call graph
+    building.  Invoked via subprocess (same pattern as other parsers).
+
+    Requires: tree-sitter, tree-sitter-zig
+    """
+    print("[Parser] Running Zig parser...", file=sys.stderr)
+
+    parser_script = _CORE_ROOT / "parsers" / "zig" / "test_pipeline.py"
+
+    cmd = [
+        sys.executable, str(parser_script),
+        repo_path,
+        "--output", output_dir,
+        "--processing-level", processing_level,
+    ]
+
+    if name:
+        cmd.extend(["--name", name])
+    if skip_tests:
+        cmd.append("--skip-tests")
+
+    result = subprocess.run(
+        cmd,
+        stdout=sys.stderr,
+        stderr=sys.stderr,
+        cwd=str(_CORE_ROOT),
+        timeout=1800,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Zig parser failed with exit code {result.returncode}")
+
+    dataset_path = os.path.join(output_dir, "dataset.json")
+    analyzer_output_path = os.path.join(output_dir, "analyzer_output.json")
+
+    # Count units
+    units_count = 0
+    if os.path.exists(dataset_path):
+        with open(dataset_path) as f:
+            data = json.load(f)
+        units_count = len(data.get("units", []))
+
+    print(f"  Zig parser complete: {units_count} units", file=sys.stderr)
+
+    return ParseResult(
+        dataset_path=dataset_path,
+        analyzer_output_path=analyzer_output_path if os.path.exists(analyzer_output_path) else None,
+        units_count=units_count,
+        language="zig",
         processing_level=processing_level,
     )

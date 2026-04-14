@@ -30,7 +30,7 @@ Output (JSON):
                         "end_line": 25,
                         "function_name": "function_name",
                         "class_name": null,
-                        "enhanced": true,
+                        "deps_inlined": true,
                         "files_included": ["file.py", "utils.py"]
                     },
                     "dependencies": [...],
@@ -276,7 +276,7 @@ class UnitGenerator:
         # Assemble enhanced code
         enhanced_code = self.assemble_enhanced_code(func_data, upstream_deps, downstream_callers)
         files_included = self.collect_files_included(file_path, upstream_deps, downstream_callers)
-        is_enhanced = len(upstream_deps) > 0 or len(downstream_callers) > 0
+        has_deps_inlined = len(upstream_deps) > 0 or len(downstream_callers) > 0
 
         # Get direct calls/callers (depth 1 only)
         direct_calls = self.call_graph.get(func_id, [])
@@ -294,7 +294,7 @@ class UnitGenerator:
                     'end_line': func_data.get('end_line'),
                     'function_name': func_name,
                     'class_name': class_name,
-                    'enhanced': is_enhanced,
+                    'deps_inlined': has_deps_inlined,
                     'files_included': files_included,
                     'original_length': len(func_data.get('code', '')),
                     'enhanced_length': len(enhanced_code),
@@ -341,7 +341,7 @@ class UnitGenerator:
             self.statistics['units_with_upstream'] += 1
         if dep_meta.get('total_downstream', 0) > 0:
             self.statistics['units_with_downstream'] += 1
-        if unit.get('code', {}).get('primary_origin', {}).get('enhanced', False):
+        if unit.get('code', {}).get('primary_origin', {}).get('deps_inlined', False):
             self.statistics['units_enhanced'] += 1
 
     def generate_units(self) -> Dict:

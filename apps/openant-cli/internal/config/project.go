@@ -97,7 +97,12 @@ func SetActiveProject(name string) error {
 }
 
 // ListProjects returns the names of all initialized projects.
-// It walks ~/.openant/projects/ looking for project.json files.
+// It looks for project.json at exactly one or two levels deep:
+//   - ~/.openant/projects/<name>/project.json         → local projects
+//   - ~/.openant/projects/<org>/<repo>/project.json   → remote (org/repo) projects
+//
+// It does NOT recurse deeper, to avoid picking up project.json files
+// inside cloned repositories (e.g. Grafana's plugin project.json files).
 func ListProjects() ([]string, error) {
 	projsDir, err := ProjectsDir()
 	if err != nil {
@@ -108,23 +113,39 @@ func ListProjects() ([]string, error) {
 		return nil, nil
 	}
 
-	var names []string
-	err = filepath.WalkDir(projsDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil // skip errors
-		}
-		if d.Name() == "project.json" && !d.IsDir() {
-			// Extract project name from path:
-			// ~/.openant/projects/org/repo/project.json → org/repo
-			rel, err := filepath.Rel(projsDir, filepath.Dir(path))
-			if err == nil {
-				names = append(names, rel)
-			}
-		}
-		return nil
-	})
+	// Read first-level directories (e.g. "grafana", "ghostty-org", "openant")
+	level1Entries, err := os.ReadDir(projsDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list projects: %w", err)
+	}
+
+	var names []string
+	for _, l1 := range level1Entries {
+		if !l1.IsDir() {
+			continue
+		}
+		l1Path := filepath.Join(projsDir, l1.Name())
+
+		// Check for project.json at level 1 (local projects: "openant")
+		if _, err := os.Stat(filepath.Join(l1Path, "project.json")); err == nil {
+			names = append(names, l1.Name())
+			continue // don't also scan subdirs — this is the project
+		}
+
+		// Check level 2 (org/repo projects: "grafana/grafana")
+		l2Entries, err := os.ReadDir(l1Path)
+		if err != nil {
+			continue
+		}
+
+		for _, l2 := range l2Entries {
+			if !l2.IsDir() {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(l1Path, l2.Name(), "project.json")); err == nil {
+				names = append(names, l1.Name()+"/"+l2.Name())
+			}
+		}
 	}
 
 	return names, nil

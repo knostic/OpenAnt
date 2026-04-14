@@ -1,5 +1,7 @@
 """
 Report Generator - generates security reports and disclosure documents from pipeline output.
+
+Returns (text, usage_dict) tuples from LLM functions so callers can track costs.
 """
 
 import json
@@ -16,6 +18,39 @@ load_dotenv()
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 MODEL = "claude-opus-4-6"
 
+# Pricing per million tokens
+_PRICING = {
+    "claude-opus-4-6": {"input": 15.00, "output": 75.00},
+    "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
+    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+}
+_DEFAULT_PRICING = {"input": 3.00, "output": 15.00}
+
+
+def _extract_usage(response, model: str = MODEL) -> dict:
+    """Extract usage info from an Anthropic API response."""
+    usage = response.usage
+    pricing = _PRICING.get(model, _DEFAULT_PRICING)
+    input_cost = (usage.input_tokens / 1_000_000) * pricing["input"]
+    output_cost = (usage.output_tokens / 1_000_000) * pricing["output"]
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.input_tokens + usage.output_tokens,
+        "cost_usd": round(input_cost + output_cost, 6),
+    }
+
+
+def _merge_usage(usages: list[dict]) -> dict:
+    """Merge multiple usage dicts into one."""
+    merged = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+    for u in usages:
+        merged["input_tokens"] += u["input_tokens"]
+        merged["output_tokens"] += u["output_tokens"]
+        merged["total_tokens"] += u["total_tokens"]
+        merged["cost_usd"] = round(merged["cost_usd"] + u["cost_usd"], 6)
+    return merged
+
 
 def _check_api_key():
     """Check that ANTHROPIC_API_KEY is set."""
@@ -28,6 +63,44 @@ def _check_api_key():
 def load_prompt(name: str) -> str:
     """Load a prompt template from the prompts directory."""
     return (PROMPTS_DIR / f"{name}.txt").read_text()
+
+
+def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
+    """Merge dynamic test results into pipeline findings if available.
+
+    Looks for dynamic_test_results.json next to the pipeline_output.json file
+    and adds a 'dynamic_testing' key to each matching finding.
+    """
+    dynamic_path = Path(pipeline_path).parent / "dynamic_test_results.json"
+    if not dynamic_path.exists():
+        return pipeline_data
+
+    dynamic_data = json.loads(dynamic_path.read_text())
+    results_by_id = {}
+    for result in dynamic_data.get("results", []):
+        fid = result.get("finding_id")
+        if fid:
+            results_by_id[fid] = result
+
+    if not results_by_id:
+        return pipeline_data
+
+    from datetime import datetime
+    date_str = datetime.fromtimestamp(dynamic_path.stat().st_mtime).strftime("%B %Y")
+
+    for finding in pipeline_data.get("findings", []):
+        fid = finding.get("id")
+        if fid and fid in results_by_id:
+            r = results_by_id[fid]
+            finding["dynamic_testing"] = {
+                "status": r.get("status"),
+                "details": r.get("details"),
+                "evidence": r.get("evidence", []),
+                "tested": f"Docker container, {date_str}",
+            }
+
+    print(f"  Merged {len(results_by_id)} dynamic test results from {dynamic_path.name}", file=sys.stderr)
+    return pipeline_data
 
 
 def _compact_for_summary(pipeline_data: dict) -> dict:
@@ -48,13 +121,19 @@ def _compact_for_summary(pipeline_data: dict) -> dict:
             "cwe_name": f.get("cwe_name"),
             "stage1_verdict": f.get("stage1_verdict"),
             "stage2_verdict": f.get("stage2_verdict"),
+            "dynamic_testing": f.get("dynamic_testing"),
             "impact": f.get("impact"),
         })
     return compact
 
 
-def generate_summary_report(pipeline_data: dict) -> str:
-    """Generate a summary report from pipeline data."""
+def generate_summary_report(pipeline_data: dict) -> tuple[str, dict]:
+    """Generate a summary report from pipeline data.
+
+    Returns:
+        (report_text, usage_dict) where usage_dict has input_tokens,
+        output_tokens, total_tokens, cost_usd.
+    """
     _check_api_key()
     client = anthropic.Anthropic()
 
@@ -69,11 +148,15 @@ def generate_summary_report(pipeline_data: dict) -> str:
         messages=[{"role": "user", "content": user_prompt}]
     )
 
-    return response.content[0].text
+    return response.content[0].text, _extract_usage(response)
 
 
-def generate_disclosure(vulnerability_data: dict, product_name: str) -> str:
-    """Generate a disclosure document for a single vulnerability."""
+def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[str, dict]:
+    """Generate a disclosure document for a single vulnerability.
+
+    Returns:
+        (disclosure_text, usage_dict)
+    """
     _check_api_key()
     client = anthropic.Anthropic()
 
@@ -92,7 +175,7 @@ def generate_disclosure(vulnerability_data: dict, product_name: str) -> str:
         messages=[{"role": "user", "content": user_prompt}]
     )
 
-    return response.content[0].text
+    return response.content[0].text, _extract_usage(response)
 
 
 def generate_all(pipeline_path: str, output_dir: str) -> None:
@@ -110,7 +193,7 @@ def generate_all(pipeline_path: str, output_dir: str) -> None:
 
     # Generate summary report
     print("Generating summary report...")
-    summary = generate_summary_report(pipeline_data)
+    summary, _usage = generate_summary_report(pipeline_data)
     (output_path / "SUMMARY_REPORT.md").write_text(summary)
     print(f"  -> {output_path / 'SUMMARY_REPORT.md'}")
 
@@ -125,7 +208,7 @@ def generate_all(pipeline_path: str, output_dir: str) -> None:
             continue
 
         print(f"Generating disclosure for {finding['short_name']}...")
-        disclosure = generate_disclosure(finding, product_name)
+        disclosure, _usage = generate_disclosure(finding, product_name)
 
         safe_name = finding["short_name"].replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"

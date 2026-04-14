@@ -4,7 +4,7 @@
 
 ## Quick Context
 
-This is the PHP code parser for Sastinel (a SAST tool). It mirrors the Ruby/C parser's tree-sitter approach and the Python parser's pipeline structure.
+This is the PHP code parser for OpenAnt (a SAST tool). It mirrors the Ruby/C parser's tree-sitter approach and the Python parser's pipeline structure.
 
 **Goal:** Parse PHP repositories into self-contained analysis units for vulnerability detection.
 

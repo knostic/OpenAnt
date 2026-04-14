@@ -343,13 +343,13 @@ def analyze_unit(
     code_field = unit.get("code", {})
     if isinstance(code_field, dict):
         code = code_field.get("primary_code", "")
-        # Check if this is an enhanced dataset with file metadata
+        # Check if dependencies were inlined into this unit's primary_code
         primary_origin = code_field.get("primary_origin", {})
-        is_enhanced = primary_origin.get("enhanced", False)
+        has_deps_inlined = primary_origin.get("deps_inlined", primary_origin.get("enhanced", False))
         files_included = primary_origin.get("files_included", [])
     else:
         code = code_field
-        is_enhanced = False
+        has_deps_inlined = False
         files_included = []
 
     # Extract agent context (security classification from agentic parser)
@@ -424,7 +424,7 @@ def analyze_unit(
     result["response_length"] = len(response)
     result["code_length"] = len(code)
     result["files_included"] = files_included
-    result["is_enhanced"] = is_enhanced
+    result["has_deps_inlined"] = has_deps_inlined
     result["context_reviewed"] = context_enhanced
     if additional_files_added:
         result["files_added_by_review"] = additional_files_added
@@ -622,7 +622,7 @@ def run_experiment(
                 # Preserve route_key and other metadata from original result
                 corrected_result["route_key"] = result.get("route_key")
                 corrected_result["code_length"] = result.get("code_length")
-                corrected_result["is_enhanced"] = result.get("is_enhanced")
+                corrected_result["has_deps_inlined"] = result.get("has_deps_inlined")
                 result = corrected_result
 
             results.append(result)

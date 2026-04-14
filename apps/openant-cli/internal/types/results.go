@@ -27,20 +27,24 @@ type AnalyzeData struct {
 
 // AnalysisMetrics holds vulnerability counts from analysis.
 type AnalysisMetrics struct {
-	TotalUnits          int `json:"total_units"`
-	VulnerableUnits     int `json:"vulnerable_units"`
-	SafeUnits           int `json:"safe_units"`
-	UnclearUnits        int `json:"unclear_units"`
-	VerifiedVulnerable  int `json:"verified_vulnerable"`
-	FalsePositives      int `json:"false_positives"`
-	VerificationSkipped int `json:"verification_skipped"`
+	Total        int `json:"total"`
+	Vulnerable   int `json:"vulnerable"`
+	Bypassable   int `json:"bypassable"`
+	Inconclusive int `json:"inconclusive"`
+	Protected    int `json:"protected"`
+	Safe         int `json:"safe"`
+	Errors       int `json:"errors"`
+	// Stage 2 metrics (optional)
+	Verified        int `json:"verified"`
+	Stage2Agreed    int `json:"stage2_agreed"`
+	Stage2Disagreed int `json:"stage2_disagreed"`
 }
 
 // ReportData is returned by the `report` command.
 type ReportData struct {
-	HTMLPath    string `json:"html_path"`
-	CSVPath     string `json:"csv_path"`
-	SummaryPath string `json:"summary_path"`
+	OutputPath string    `json:"output_path"`
+	Format     string    `json:"format"`
+	Usage      UsageInfo `json:"usage"`
 }
 
 // ScanData is returned by the `scan` command (all-in-one pipeline).

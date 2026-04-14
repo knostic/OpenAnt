@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/knostic/open-ant-cli/internal/checkpoint"
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/knostic/open-ant-cli/internal/python"
 	"github.com/spf13/cobra"
@@ -31,6 +32,9 @@ var (
 	analyzeExploitOnly    bool
 	analyzeLimit          int
 	analyzeModel          string
+	analyzeWorkers        int
+	analyzeCheckpoint     string
+	analyzeBackoff        int
 )
 
 func init() {
@@ -42,6 +46,9 @@ func init() {
 	analyzeCmd.Flags().BoolVar(&analyzeExploitOnly, "exploitable-only", false, "Only analyze units classified as exploitable by enhancer")
 	analyzeCmd.Flags().IntVar(&analyzeLimit, "limit", 0, "Max units to analyze (0 = no limit)")
 	analyzeCmd.Flags().StringVar(&analyzeModel, "model", "opus", "Model: opus or sonnet")
+	analyzeCmd.Flags().IntVar(&analyzeWorkers, "workers", 8, "Number of parallel workers for LLM steps (default: 8)")
+	analyzeCmd.Flags().StringVar(&analyzeCheckpoint, "checkpoint", "", "Path to checkpoint directory for save/resume")
+	analyzeCmd.Flags().IntVar(&analyzeBackoff, "backoff", 30, "Seconds to wait when rate-limited (default: 30)")
 }
 
 func runAnalyze(cmd *cobra.Command, args []string) {
@@ -74,6 +81,17 @@ func runAnalyze(cmd *cobra.Command, args []string) {
 		os.Exit(2)
 	}
 
+	// Auto-detect checkpoints from a previous interrupted run
+	if analyzeCheckpoint == "" && ctx != nil {
+		if cpInfo := checkpoint.DetectViaPython(rt.Path, ctx.ScanDir, "analyze"); cpInfo != nil {
+			if checkpoint.PromptResume(cpInfo, "analyze", quiet) {
+				analyzeCheckpoint = cpInfo.Dir
+			} else {
+				_ = checkpoint.Clean(cpInfo.Dir)
+			}
+		}
+	}
+
 	pyArgs := []string{"analyze", datasetPath, "--output", analyzeOutput}
 	if analyzeVerify {
 		pyArgs = append(pyArgs, "--verify")
@@ -96,6 +114,15 @@ func runAnalyze(cmd *cobra.Command, args []string) {
 	if analyzeModel != "opus" {
 		pyArgs = append(pyArgs, "--model", analyzeModel)
 	}
+	if analyzeWorkers != 8 {
+		pyArgs = append(pyArgs, "--workers", fmt.Sprintf("%d", analyzeWorkers))
+	}
+	if analyzeCheckpoint != "" {
+		pyArgs = append(pyArgs, "--checkpoint", analyzeCheckpoint)
+	}
+	if analyzeBackoff != 30 {
+		pyArgs = append(pyArgs, "--backoff", fmt.Sprintf("%d", analyzeBackoff))
+	}
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())
 	if err != nil {
@@ -103,7 +130,9 @@ func runAnalyze(cmd *cobra.Command, args []string) {
 		os.Exit(2)
 	}
 
-	if jsonOutput {
+	if result.Envelope.Status == "interrupted" {
+		os.Exit(130)
+	} else if jsonOutput {
 		output.PrintJSON(result.Envelope)
 	} else if result.Envelope.Status == "success" {
 		if data, ok := result.Envelope.Data.(map[string]any); ok {

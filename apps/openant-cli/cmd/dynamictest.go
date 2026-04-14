@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/knostic/open-ant-cli/internal/checkpoint"
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/knostic/open-ant-cli/internal/python"
 	"github.com/spf13/cobra"
@@ -41,6 +42,12 @@ func runDynamicTest(cmd *cobra.Command, args []string) {
 		os.Exit(2)
 	}
 
+	// Check pipeline_output.json exists before launching Python
+	if _, err := os.Stat(pipelineOutputPath); err != nil {
+		output.PrintError("pipeline_output.json not found. Run 'openant build-output' first.")
+		os.Exit(2)
+	}
+
 	// Apply project defaults
 	if ctx != nil {
 		if dynamicTestOutput == "" {
@@ -52,6 +59,17 @@ func runDynamicTest(cmd *cobra.Command, args []string) {
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)
+	}
+
+	// Auto-detect checkpoints from a previous interrupted run
+	if ctx != nil {
+		if cpInfo := checkpoint.DetectViaPython(rt.Path, ctx.ScanDir, "dynamic_test"); cpInfo != nil {
+			if checkpoint.PromptResume(cpInfo, "dynamic-test", quiet) {
+				// Resume — Python auto-detects checkpoint dir in output dir
+			} else {
+				_ = checkpoint.Clean(cpInfo.Dir)
+			}
+		}
 	}
 
 	pyArgs := []string{"dynamic-test", pipelineOutputPath}
@@ -68,7 +86,9 @@ func runDynamicTest(cmd *cobra.Command, args []string) {
 		os.Exit(2)
 	}
 
-	if jsonOutput {
+	if result.Envelope.Status == "interrupted" {
+		os.Exit(130)
+	} else if jsonOutput {
 		output.PrintJSON(result.Envelope)
 	} else if result.Envelope.Status == "success" {
 		if data, ok := result.Envelope.Data.(map[string]any); ok {

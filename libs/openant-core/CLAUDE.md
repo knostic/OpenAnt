@@ -6,6 +6,19 @@
 - If unsure about scope, ask first
 - After any context compaction, re-read this file and referenced docs before taking any action
 
+# Go CLI Build Rules
+
+**NEVER run `make install` in `apps/openant-cli/`** — it overwrites the symlink with a copy.
+
+The system uses a symlink: `/usr/local/bin/openant` → `apps/openant-cli/bin/openant`
+
+To rebuild the Go CLI:
+```bash
+cd apps/openant-cli && go build -o bin/openant .
+```
+
+The symlink automatically picks up the new binary. Running `make install` would replace the symlink with a copied file, breaking the dev workflow.
+
 # Project Context
 
 This is OpenAnt, a two-stage SAST tool using Claude for vulnerability analysis. Supports Python, JavaScript/TypeScript, and Go codebases with 4-level cost optimization.
@@ -93,7 +106,7 @@ python -m autopilot --repo owner/repo --api   # API mode (JSON protocol)
 2. Assess - Score for vuln-hunting potential (skip in --repo/--path modes)
 3. Parse - Clone, parse, filter to reachable units
 4. Enhance - Add call path context
-5. Detect - Stage 1 vulnerability detection
+5. Analyze - Stage 1 vulnerability analysis
 6. Verify - Stage 2 attacker simulation
 7. Dynamic Test - Docker-isolated exploit testing (requires Docker)
 8. Report - Generate security reports

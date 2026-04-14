@@ -152,11 +152,76 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
     return response.content[0].text
 
 
+def _build_pipeline_costs_html(step_reports: list[dict]) -> str:
+    """Build an HTML table with pipeline step costs and durations."""
+    if not step_reports:
+        return ""
+
+    # Sort by timestamp (or keep as-is)
+    rows = ""
+    total_cost = 0.0
+    total_duration = 0.0
+
+    for sr in sorted(step_reports, key=lambda s: s.get("timestamp", "")):
+        step = sr.get("step", "unknown")
+        duration = sr.get("duration_seconds", 0)
+        cost = sr.get("cost_usd", 0)
+        status = sr.get("status", "unknown")
+
+        total_cost += cost
+        total_duration += duration
+
+        # Format duration
+        if duration >= 60:
+            dur_str = f"{duration / 60:.1f}m"
+        else:
+            dur_str = f"{duration:.1f}s"
+
+        cost_str = f"${cost:.4f}" if cost > 0 else "-"
+        status_color = "#28a745" if status == "success" else "#dc3545" if status == "error" else "#6c757d"
+
+        rows += f"""
+        <tr>
+            <td>{html.escape(step)}</td>
+            <td>{dur_str}</td>
+            <td>{cost_str}</td>
+            <td><span style="color: {status_color}">{html.escape(status)}</span></td>
+        </tr>"""
+
+    # Total row
+    total_dur_str = f"{total_duration / 60:.1f}m" if total_duration >= 60 else f"{total_duration:.1f}s"
+
+    return f"""
+        <section class="section">
+            <h2>Pipeline Costs &amp; Timing</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Step</th>
+                        <th>Duration</th>
+                        <th>Cost</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows}
+                    <tr style="border-top: 2px solid var(--border); font-weight: bold">
+                        <td>Total</td>
+                        <td>{total_dur_str}</td>
+                        <td>${total_cost:.4f}</td>
+                        <td></td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>"""
+
+
 def generate_html_report(
     experiment: dict,
     dataset: dict,
     remediation_html: str,
-    output_path: str
+    output_path: str,
+    step_reports: list[dict] | None = None,
 ):
     """Generate the HTML report."""
     # Prepare data
@@ -556,6 +621,8 @@ def generate_html_report(
             </div>
         </section>
 
+        {_build_pipeline_costs_html(step_reports or [])}
+
         <section class="section">
             <h2>All Findings</h2>
             <table>
@@ -647,17 +714,39 @@ def generate_html_report(
     print(f"Report generated: {output_path}")
 
 
+def _load_step_reports_from_dir(directory: str) -> list[dict]:
+    """Load all {step}.report.json files from a directory."""
+    import glob
+    reports = []
+    for path in glob.glob(os.path.join(directory, "*.report.json")):
+        try:
+            reports.append(load_json(path))
+        except Exception:
+            continue
+    return reports
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate HTML security report')
     parser.add_argument('experiment', help='Path to experiment results JSON')
     parser.add_argument('dataset', help='Path to dataset JSON')
     parser.add_argument('output', nargs='?', default='report.html', help='Output HTML path (default: report.html)')
+    parser.add_argument('--step-reports-dir', help='Directory containing *.report.json step reports')
 
     args = parser.parse_args()
 
     print("Loading data...")
     experiment = load_json(args.experiment)
     dataset = load_json(args.dataset)
+
+    # Load step reports if available
+    step_reports = []
+    if args.step_reports_dir:
+        step_reports = _load_step_reports_from_dir(args.step_reports_dir)
+    else:
+        # Try to auto-detect from experiment path's directory
+        exp_dir = os.path.dirname(os.path.abspath(args.experiment))
+        step_reports = _load_step_reports_from_dir(exp_dir)
 
     print("Preparing findings...")
     findings = prepare_findings_summary(experiment, dataset)
@@ -666,7 +755,7 @@ def main():
     remediation_html = generate_remediation_guidance(findings)
 
     print("Building HTML report...")
-    generate_html_report(experiment, dataset, remediation_html, args.output)
+    generate_html_report(experiment, dataset, remediation_html, args.output, step_reports=step_reports)
 
     # Print summary
     verdict_counts = {}

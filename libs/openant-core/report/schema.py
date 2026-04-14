@@ -17,7 +17,7 @@ class Finding:
     cwe_name: str
     stage1_verdict: str
     stage2_verdict: str
-    dynamic_testing: bool = False
+    dynamic_testing: dict | bool = False
     description: Optional[str] = None
     vulnerable_code: Optional[str] = None
     impact: Optional[list] = None

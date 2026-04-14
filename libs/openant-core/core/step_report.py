@@ -16,7 +16,7 @@ import sys
 import time
 import traceback
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 from core.schemas import StepReport
 
@@ -38,7 +38,7 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
     """
     report = StepReport(
         step=step,
-        timestamp=datetime.utcnow().isoformat() + "Z",
+        timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         inputs=inputs or {},
     )
 

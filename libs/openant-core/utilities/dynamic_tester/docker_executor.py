@@ -66,13 +66,17 @@ def _write_test_files(work_dir: str, generation: dict) -> None:
 
     # Write test script
     test_filename = generation.get("test_filename", "test_exploit.py")
-    with open(os.path.join(work_dir, test_filename), "w") as f:
+    test_path = os.path.join(work_dir, test_filename)
+    os.makedirs(os.path.dirname(test_path), exist_ok=True)
+    with open(test_path, "w") as f:
         f.write(generation["test_script"])
 
     # Write requirements/dependencies file
     if generation.get("requirements"):
         req_filename = generation.get("requirements_filename", "requirements.txt")
-        with open(os.path.join(work_dir, req_filename), "w") as f:
+        req_path = os.path.join(work_dir, req_filename)
+        os.makedirs(os.path.dirname(req_path), exist_ok=True)
+        with open(req_path, "w") as f:
             f.write(generation["requirements"])
 
     # Copy attacker server if needed (before docker-compose so it's available)
@@ -127,18 +131,28 @@ def run_single_container(
     result = DockerExecutionResult()
     start_time = time.time()
 
-    # Sanitize finding_id for use as Docker image tag
-    image_tag = f"openant-test-{finding_id.lower().replace(' ', '-')}"
-    network_name = f"openant-net-{finding_id.lower().replace(' ', '-')}"
+    # Sanitize finding_id for use as Docker image tag.
+    # Docker tags must match [a-z0-9][a-z0-9._-]*, so strip anything else.
+    safe_id = re.sub(r"[^a-z0-9-]", "-", finding_id.lower()).strip("-_.")
+    image_tag = f"openant-test-{safe_id}"
+    network_name = f"openant-net-{safe_id}"
 
-    work_dir = tempfile.mkdtemp(prefix=f"openant-test-{finding_id}-")
+    # Use a deterministic, sanitized work_dir name so docker compose project
+    # names (derived from the dir name) are always valid Docker references.
+    # We still use mkdtemp for uniqueness but strip any non-alphanumeric chars.
+    raw_work_dir = tempfile.mkdtemp(prefix=f"openant-test-{safe_id}-")
+    parent = os.path.dirname(raw_work_dir)
+    safe_basename = re.sub(r"[^a-z0-9-]", "", os.path.basename(raw_work_dir).lower()).strip("-")
+    work_dir = os.path.join(parent, safe_basename)
+    if work_dir != raw_work_dir:
+        os.rename(raw_work_dir, work_dir)
 
     try:
         _write_test_files(work_dir, generation)
 
         if generation.get("docker_compose") and generation.get("needs_attacker_server"):
-            # Multi-service: use docker compose
-            result = _run_compose(work_dir, container_timeout, build_timeout)
+            # Multi-service: use docker compose with explicit project name
+            result = _run_compose(work_dir, safe_id, container_timeout, build_timeout)
         else:
             # Single container: docker build + run
             result = _run_single(work_dir, image_tag, network_name,
@@ -178,7 +192,9 @@ def _run_single(
     # Create isolated network
     _run_command(["docker", "network", "create", network_name], timeout=10)
 
-    # Run with timeout, no host mounts, no privileged mode
+    # Run with timeout, no host mounts, no privileged mode.
+    # tmpfs for /tmp (writable workspace) and /root (for build caches like
+    # ~/.cache/go-build that some test runners write to even at runtime).
     stdout, stderr, code, timed_out = _run_command(
         [
             "docker", "run",
@@ -187,7 +203,8 @@ def _run_single(
             "--memory", "512m",
             "--cpus", "1",
             "--read-only",
-            "--tmpfs", "/tmp",
+            "--tmpfs", "/tmp:size=256m",
+            "--tmpfs", "/root:size=128m",
             "--security-opt", "no-new-privileges",
             image_tag,
         ],
@@ -205,15 +222,22 @@ def _run_single(
 
 def _run_compose(
     work_dir: str,
+    project_name: str,
     container_timeout: int,
     build_timeout: int,
 ) -> DockerExecutionResult:
-    """Build and run multi-service test via docker compose."""
+    """Build and run multi-service test via docker compose.
+
+    Uses an explicit project name to ensure image tags are always valid
+    Docker references, independent of the temp dir name.
+    """
     result = DockerExecutionResult()
+
+    compose_base = ["docker", "compose", "-p", project_name]
 
     # Build all services
     stdout, stderr, code, timed_out = _run_command(
-        ["docker", "compose", "build"],
+        compose_base + ["build"],
         timeout=build_timeout,
         cwd=work_dir,
     )
@@ -225,7 +249,7 @@ def _run_compose(
 
     # Start services
     _run_command(
-        ["docker", "compose", "up", "-d"],
+        compose_base + ["up", "-d"],
         timeout=60,
         cwd=work_dir,
     )
@@ -233,7 +257,7 @@ def _run_compose(
     try:
         # Wait for the test container to exit (it should be the main service)
         stdout, stderr, code, timed_out = _run_command(
-            ["docker", "compose", "logs", "--no-log-prefix", "-f", "test"],
+            compose_base + ["logs", "--no-log-prefix", "-f", "test"],
             timeout=container_timeout,
             cwd=work_dir,
         )
@@ -244,7 +268,7 @@ def _run_compose(
     finally:
         # Always tear down
         _run_command(
-            ["docker", "compose", "down", "--volumes", "--remove-orphans"],
+            compose_base + ["down", "--volumes", "--remove-orphans"],
             timeout=30,
             cwd=work_dir,
         )

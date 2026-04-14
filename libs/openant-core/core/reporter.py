@@ -191,7 +191,7 @@ def build_pipeline_output(
     print(f"  pipeline_output.json: {len(findings_data)} findings", file=sys.stderr)
     print(f"  Written to {output_path}", file=sys.stderr)
 
-    return output_path
+    return output_path, len(findings_data)
 
 
 def generate_html_report(
@@ -213,8 +213,14 @@ def generate_html_report(
     """
     print("[Report] Generating HTML report...", file=sys.stderr)
 
+    # Pass step reports dir so the HTML report can include cost/time breakdown
+    step_reports_dir = os.path.dirname(os.path.abspath(results_path))
+
     script = _CORE_ROOT / "generate_report.py"
-    cmd = [sys.executable, str(script), results_path, dataset_path, output_path]
+    cmd = [
+        sys.executable, str(script), results_path, dataset_path, output_path,
+        "--step-reports-dir", step_reports_dir,
+    ]
 
     result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, cwd=str(_CORE_ROOT))
 
@@ -262,31 +268,45 @@ def generate_summary_report(
 ) -> ReportResult:
     """Generate LLM-based summary report (Markdown).
 
-    Wraps report/generator.py. Requires ANTHROPIC_API_KEY.
+    Calls report/generator.py directly (in-process) for proper cost tracking.
 
     Args:
-        results_path: Path to results JSON (pipeline output format).
+        results_path: Path to pipeline_output.json or results JSON.
         output_path: Path for the output Markdown file.
 
     Returns:
-        ReportResult with the output path.
+        ReportResult with the output path and usage info.
     """
+    import json
+    from report.generator import generate_summary_report as _generate_summary, merge_dynamic_results
+    from report.schema import validate_pipeline_output, ValidationError
+
     print("[Report] Generating summary report (LLM)...", file=sys.stderr)
 
-    # Use the report module via subprocess
-    cmd = [
-        sys.executable, "-m", "report",
-        "summary", results_path,
-        "-o", output_path,
-    ]
+    with open(results_path) as f:
+        pipeline_data = json.load(f)
 
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, cwd=str(_CORE_ROOT))
+    # Merge dynamic test results if available
+    pipeline_data = merge_dynamic_results(pipeline_data, results_path)
 
-    if result.returncode != 0:
-        raise RuntimeError(f"Summary report generation failed (exit code {result.returncode})")
+    try:
+        validate_pipeline_output(pipeline_data)
+    except ValidationError as e:
+        raise RuntimeError(f"Invalid pipeline output: {e}")
+
+    report_text, usage = _generate_summary(pipeline_data)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "w") as f:
+        f.write(report_text)
 
     print(f"  Summary report: {output_path}", file=sys.stderr)
-    return ReportResult(output_path=output_path, format="summary")
+    print(f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)", file=sys.stderr)
+
+    # Record in global tracker so step_context picks it up
+    _record_usage_in_tracker(usage)
+
+    return ReportResult(output_path=output_path, format="summary", usage=_usage_to_info(usage))
 
 
 def generate_disclosure_docs(
@@ -295,27 +315,111 @@ def generate_disclosure_docs(
 ) -> ReportResult:
     """Generate per-vulnerability disclosure documents.
 
-    Wraps report/generator.py disclosures command. Requires ANTHROPIC_API_KEY.
+    Calls report/generator.py directly (in-process) for proper cost tracking.
 
     Args:
-        results_path: Path to results JSON (pipeline output format).
+        results_path: Path to pipeline_output.json or results JSON.
         output_dir: Directory for disclosure Markdown files.
 
     Returns:
-        ReportResult with the output directory path.
+        ReportResult with the output directory path and usage info.
     """
+    import json
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from report.generator import generate_disclosure as _generate_disclosure, _merge_usage, merge_dynamic_results
+    from report.schema import validate_pipeline_output, ValidationError
+
     print("[Report] Generating disclosure documents (LLM)...", file=sys.stderr)
 
-    cmd = [
-        sys.executable, "-m", "report",
-        "disclosures", results_path,
-        "-o", output_dir,
+    with open(results_path) as f:
+        pipeline_data = json.load(f)
+
+    # Merge dynamic test results if available
+    pipeline_data = merge_dynamic_results(pipeline_data, results_path)
+
+    try:
+        validate_pipeline_output(pipeline_data)
+    except ValidationError as e:
+        raise RuntimeError(f"Invalid pipeline output: {e}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    product_name = pipeline_data["repository"]["name"]
+    all_usages = []
+    count = 0
+
+    # Collect confirmed findings first
+    confirmed = [
+        (i, finding) for i, finding in enumerate(pipeline_data["findings"], 1)
+        if finding.get("stage2_verdict") in ("confirmed", "agreed", "vulnerable")
     ]
 
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, cwd=str(_CORE_ROOT))
+    if not confirmed:
+        print("  No confirmed vulnerabilities to generate disclosures for.", file=sys.stderr)
+    else:
+        print(f"  Generating {len(confirmed)} disclosures in parallel (8 workers)...",
+              file=sys.stderr)
 
-    if result.returncode != 0:
-        raise RuntimeError(f"Disclosure generation failed (exit code {result.returncode})")
+        def _one(args):
+            i, finding = args
+            disclosure_text, usage = _generate_disclosure(finding, product_name)
+            safe_name = finding["short_name"].replace(" ", "_").upper()
+            filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
+            filepath = os.path.join(output_dir, filename)
+            with open(filepath, "w") as f:
+                f.write(disclosure_text)
+            return finding["short_name"], filepath, usage
 
-    print(f"  Disclosures: {output_dir}", file=sys.stderr)
-    return ReportResult(output_path=output_dir, format="disclosure")
+        executor = ThreadPoolExecutor(max_workers=8)
+        futures = {executor.submit(_one, item): item for item in confirmed}
+        try:
+            for future in as_completed(futures):
+                name, filepath, usage = future.result()
+                all_usages.append(usage)
+                count += 1
+                print(f"  [{count}/{len(confirmed)}] {name} -> {filepath}",
+                      file=sys.stderr)
+        except KeyboardInterrupt:
+            print("\n[Report] Interrupted — cancelling pending disclosures...",
+                  file=sys.stderr, flush=True)
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        executor.shutdown(wait=False)
+
+    merged_usage = _merge_usage(all_usages) if all_usages else {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+
+    print(f"  Disclosures: {count} files in {output_dir}", file=sys.stderr)
+    print(f"  Cost: ${merged_usage['cost_usd']:.4f} ({merged_usage['total_tokens']:,} tokens)", file=sys.stderr)
+
+    # Record in global tracker so step_context picks it up
+    _record_usage_in_tracker(merged_usage)
+
+    return ReportResult(output_path=output_dir, format="disclosure", usage=_usage_to_info(merged_usage))
+
+
+def _record_usage_in_tracker(usage: dict):
+    """Record usage in the global TokenTracker so step_context captures it."""
+    try:
+        from utilities.llm_client import get_global_tracker
+        tracker = get_global_tracker()
+        # Record as a single aggregated call
+        if usage.get("total_tokens", 0) > 0:
+            tracker.record_call(
+                model="claude-opus-4-6",
+                input_tokens=usage["input_tokens"],
+                output_tokens=usage["output_tokens"],
+            )
+    except Exception:
+        pass  # Best effort — don't break report generation
+
+
+def _usage_to_info(usage: dict):
+    """Convert a usage dict to a UsageInfo dataclass."""
+    from core.schemas import UsageInfo
+    return UsageInfo(
+        total_calls=1,
+        total_input_tokens=usage.get("input_tokens", 0),
+        total_output_tokens=usage.get("output_tokens", 0),
+        total_tokens=usage.get("total_tokens", 0),
+        total_cost_usd=usage.get("cost_usd", 0.0),
+    )

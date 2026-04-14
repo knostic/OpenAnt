@@ -18,9 +18,12 @@ Usage:
 """
 
 import os
+import threading
 from typing import Optional
 import anthropic
 from dotenv import load_dotenv
+
+from .rate_limiter import get_rate_limiter
 
 
 # Pricing per million tokens (as of December 2024)
@@ -38,14 +41,17 @@ class TokenTracker:
     """
 
     def __init__(self):
+        self._lock = threading.Lock()
+        self._thread_local = threading.local()
         self.reset()
 
     def reset(self):
         """Reset all counters."""
-        self.calls = []
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
-        self.total_cost_usd = 0.0
+        with self._lock:
+            self.calls = []
+            self.total_input_tokens = 0
+            self.total_output_tokens = 0
+            self.total_cost_usd = 0.0
 
     @property
     def total_tokens(self) -> int:
@@ -79,13 +85,53 @@ class TokenTracker:
             "cost_usd": round(total_cost, 6)
         }
 
-        # Update totals
-        self.calls.append(call_record)
-        self.total_input_tokens += input_tokens
-        self.total_output_tokens += output_tokens
-        self.total_cost_usd += total_cost
+        # Update totals (thread-safe)
+        with self._lock:
+            self.calls.append(call_record)
+            self.total_input_tokens += input_tokens
+            self.total_output_tokens += output_tokens
+            self.total_cost_usd += total_cost
+
+        # Accumulate to thread-local unit tracking if active
+        tl = self._thread_local
+        if hasattr(tl, "unit_input"):
+            tl.unit_input += input_tokens
+            tl.unit_output += output_tokens
+            tl.unit_cost += total_cost
 
         return call_record
+
+    def add_prior_usage(self, input_tokens: int, output_tokens: int, cost_usd: float):
+        """Inject usage from a prior run (e.g. restored checkpoints).
+
+        This ensures step reports capture the total cost across all runs,
+        not just the current run's API calls.
+        """
+        with self._lock:
+            self.total_input_tokens += input_tokens
+            self.total_output_tokens += output_tokens
+            self.total_cost_usd += cost_usd
+
+    def start_unit_tracking(self):
+        """Start tracking usage for the current unit on this thread.
+
+        Call before processing a unit, then call ``get_unit_usage()``
+        after to get the accumulated usage for just that unit. Thread-safe
+        because each thread has its own ``threading.local()`` storage.
+        """
+        tl = self._thread_local
+        tl.unit_input = 0
+        tl.unit_output = 0
+        tl.unit_cost = 0.0
+
+    def get_unit_usage(self) -> dict:
+        """Return usage accumulated since ``start_unit_tracking()`` on this thread."""
+        tl = self._thread_local
+        return {
+            "input_tokens": getattr(tl, "unit_input", 0),
+            "output_tokens": getattr(tl, "unit_output", 0),
+            "cost_usd": round(getattr(tl, "unit_cost", 0.0), 6),
+        }
 
     def get_summary(self) -> dict:
         """
@@ -94,14 +140,15 @@ class TokenTracker:
         Returns:
             Dict with totals and per-call breakdown
         """
-        return {
-            "total_calls": len(self.calls),
-            "total_input_tokens": self.total_input_tokens,
-            "total_output_tokens": self.total_output_tokens,
-            "total_tokens": self.total_input_tokens + self.total_output_tokens,
-            "total_cost_usd": round(self.total_cost_usd, 6),
-            "calls": self.calls
-        }
+        with self._lock:
+            return {
+                "total_calls": len(self.calls),
+                "total_input_tokens": self.total_input_tokens,
+                "total_output_tokens": self.total_output_tokens,
+                "total_tokens": self.total_input_tokens + self.total_output_tokens,
+                "total_cost_usd": round(self.total_cost_usd, 6),
+                "calls": list(self.calls),
+            }
 
     def get_totals(self) -> dict:
         """
@@ -110,13 +157,14 @@ class TokenTracker:
         Returns:
             Dict with totals only
         """
-        return {
-            "total_calls": len(self.calls),
-            "total_input_tokens": self.total_input_tokens,
-            "total_output_tokens": self.total_output_tokens,
-            "total_tokens": self.total_input_tokens + self.total_output_tokens,
-            "total_cost_usd": round(self.total_cost_usd, 6)
-        }
+        with self._lock:
+            return {
+                "total_calls": len(self.calls),
+                "total_input_tokens": self.total_input_tokens,
+                "total_output_tokens": self.total_output_tokens,
+                "total_tokens": self.total_input_tokens + self.total_output_tokens,
+                "total_cost_usd": round(self.total_cost_usd, 6),
+            }
 
 
 # Global tracker instance for session-wide tracking
@@ -156,7 +204,7 @@ class AnthropicClient:
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in environment")
 
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.client = anthropic.Anthropic(api_key=api_key, max_retries=5)
         self.model = model
         self.tracker = tracker or _global_tracker
         self.last_call = None  # Store last call details
@@ -172,13 +220,23 @@ class AnthropicClient:
         Returns:
             Response text from Claude
         """
-        message = self.client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
+        # Wait if we're in a global backoff period
+        rate_limiter = get_rate_limiter()
+        rate_limiter.wait_if_needed()
+
+        try:
+            message = self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+        except anthropic.RateLimitError as exc:
+            # Report to global rate limiter so all workers back off
+            retry_after = float(exc.response.headers.get("retry-after", 0))
+            get_rate_limiter().report_rate_limit(retry_after)
+            raise
 
         # Track token usage
         self.last_call = self.tracker.record_call(
@@ -214,7 +272,17 @@ class AnthropicClient:
         if system:
             kwargs["system"] = system
 
-        message = self.client.messages.create(**kwargs)
+        # Wait if we're in a global backoff period
+        rate_limiter = get_rate_limiter()
+        rate_limiter.wait_if_needed()
+
+        try:
+            message = self.client.messages.create(**kwargs)
+        except anthropic.RateLimitError as exc:
+            # Report to global rate limiter so all workers back off
+            retry_after = float(exc.response.headers.get("retry-after", 0))
+            get_rate_limiter().report_rate_limit(retry_after)
+            raise
 
         # Track token usage
         self.last_call = self.tracker.record_call(

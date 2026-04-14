@@ -73,12 +73,12 @@ func PrintScanSummary(data map[string]any) {
 
 	PrintHeader("Scan Results")
 
-	total := intFromAny(metrics["total_units"])
-	vulnerable := intFromAny(metrics["vulnerable_units"])
-	safe := intFromAny(metrics["safe_units"])
-	unclear := intFromAny(metrics["unclear_units"])
-	verified := intFromAny(metrics["verified_vulnerable"])
-	falsePos := intFromAny(metrics["false_positives"])
+	total := intFromAny(metrics["total"])
+	vulnerable := intFromAny(metrics["vulnerable"])
+	safe := intFromAny(metrics["safe"])
+	unclear := intFromAny(metrics["inconclusive"])
+	verified := intFromAny(metrics["verified"])
+	falsePos := intFromAny(metrics["stage2_disagreed"])
 
 	PrintKeyValue("Total units analyzed", fmt.Sprintf("%d", total))
 
@@ -108,7 +108,7 @@ func PrintScanSummary(data map[string]any) {
 	// Usage info
 	if usage, ok := data["usage"].(map[string]any); ok {
 		PrintHeader("Usage")
-		cost := floatFromAny(usage["total_cost"])
+		cost := floatFromAny(usage["total_cost_usd"])
 		inputTokens := intFromAny(usage["total_input_tokens"])
 		outputTokens := intFromAny(usage["total_output_tokens"])
 
@@ -171,17 +171,30 @@ func PrintAnalyzeSummary(data map[string]any) {
 	}
 
 	PrintHeader("Analysis Results")
-	total := intFromAny(metrics["total_units"])
-	vulnerable := intFromAny(metrics["vulnerable_units"])
-	safe := intFromAny(metrics["safe_units"])
+	total := intFromAny(metrics["total"])
+	vulnerable := intFromAny(metrics["vulnerable"])
+	bypassable := intFromAny(metrics["bypassable"])
+	protected := intFromAny(metrics["protected"])
+	safe := intFromAny(metrics["safe"])
+	inconclusive := intFromAny(metrics["inconclusive"])
+	errors := intFromAny(metrics["errors"])
 
 	PrintKeyValue("Total units", fmt.Sprintf("%d", total))
-	if vulnerable > 0 {
-		red.Printf("  Vulnerable: %d\n", vulnerable)
+
+	combined := vulnerable + bypassable
+	if combined > 0 {
+		red.Printf("  Vulnerable: %d\n", combined)
 	} else {
 		green.Printf("  Vulnerable: 0\n")
 	}
+	PrintKeyValue("Protected", fmt.Sprintf("%d", protected))
 	PrintKeyValue("Safe", fmt.Sprintf("%d", safe))
+	if inconclusive > 0 {
+		yellow.Printf("  Inconclusive: %d\n", inconclusive)
+	}
+	if errors > 0 {
+		yellow.Printf("  Errors: %d\n", errors)
+	}
 
 	if path, ok := data["results_path"].(string); ok {
 		PrintKeyValue("Output", path)
@@ -191,15 +204,21 @@ func PrintAnalyzeSummary(data map[string]any) {
 
 // PrintReportSummary outputs a formatted summary of report generation.
 func PrintReportSummary(data map[string]any) {
-	PrintHeader("Reports Generated")
-	if html, ok := data["html_path"].(string); ok && html != "" {
-		PrintKeyValue("HTML", html)
+	PrintHeader("Report Generated")
+	if format, ok := data["format"].(string); ok && format != "" {
+		PrintKeyValue("Format", format)
 	}
-	if csv, ok := data["csv_path"].(string); ok && csv != "" {
-		PrintKeyValue("CSV", csv)
+	if path, ok := data["output_path"].(string); ok && path != "" {
+		PrintKeyValue("Output", path)
 	}
-	if summary, ok := data["summary_path"].(string); ok && summary != "" {
-		PrintKeyValue("Summary", summary)
+	if path, ok := data["reskin_path"].(string); ok && path != "" {
+		PrintKeyValue("Reskin", path)
+	}
+	if usage, ok := data["usage"].(map[string]any); ok {
+		cost := floatFromAny(usage["total_cost_usd"])
+		if cost > 0 {
+			PrintKeyValue("Cost", fmt.Sprintf("$%.4f", cost))
+		}
 	}
 	fmt.Println()
 }

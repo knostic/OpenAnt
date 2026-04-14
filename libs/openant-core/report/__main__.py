@@ -28,12 +28,13 @@ def cmd_summary(args):
         sys.exit(1)
 
     print("Generating summary report...")
-    report = generate_summary_report(pipeline_data)
+    report, usage = generate_summary_report(pipeline_data)
 
     output_path = Path(args.output) if args.output else Path("SUMMARY_REPORT.md")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(report)
     print(f"  -> {output_path}")
+    print(f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)")
 
 
 def cmd_disclosures(args):
@@ -57,7 +58,7 @@ def cmd_disclosures(args):
             continue
 
         print(f"Generating disclosure for {finding['short_name']}...")
-        disclosure = generate_disclosure(finding, product_name)
+        disclosure, _usage = generate_disclosure(finding, product_name)
 
         safe_name = finding["short_name"].replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"

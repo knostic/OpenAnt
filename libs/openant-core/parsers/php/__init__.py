@@ -1,1 +1,1 @@
-# PHP parser for Sastinel
+# PHP parser for OpenAnt
