@@ -345,6 +345,7 @@ def generate_disclosure_docs(
     os.makedirs(output_dir, exist_ok=True)
 
     product_name = pipeline_data["repository"]["name"]
+    repo_url = pipeline_data["repository"].get("url", "")
     all_usages = []
     count = 0
 
@@ -362,7 +363,7 @@ def generate_disclosure_docs(
 
         def _one(args):
             i, finding = args
-            disclosure_text, usage = _generate_disclosure(finding, product_name)
+            disclosure_text, usage = _generate_disclosure(finding, product_name, repo_url=repo_url)
             safe_name = finding["short_name"].replace(" ", "_").upper()
             filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
             filepath = os.path.join(output_dir, filename)

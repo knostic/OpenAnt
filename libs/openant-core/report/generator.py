@@ -151,7 +151,7 @@ def generate_summary_report(pipeline_data: dict) -> tuple[str, dict]:
     return response.content[0].text, _extract_usage(response)
 
 
-def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[str, dict]:
+def generate_disclosure(vulnerability_data: dict, product_name: str, repo_url: str = "") -> tuple[str, dict]:
     """Generate a disclosure document for a single vulnerability.
 
     Returns:
@@ -162,7 +162,7 @@ def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[st
 
     system_prompt = load_prompt("system")
 
-    vuln_with_product = {**vulnerability_data, "product_name": product_name}
+    vuln_with_product = {**vulnerability_data, "product_name": product_name, "repo_url": repo_url}
     user_prompt = load_prompt("disclosure").replace(
         "{vulnerability_data}",
         json.dumps(vuln_with_product, indent=2)

@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scan — Knostic OpenAnt</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #1a1a1a; min-height: 100vh; }
+  header { background: #0d1117; padding: 16px 32px; display: flex; align-items: center; gap: 16px; }
+  header a { color: #8b949e; text-decoration: none; font-size: 0.85rem; }
+  header a:hover { color: #fff; }
+  header .sep { color: #8b949e; }
+  header .title { color: #fff; font-size: 0.9rem; font-weight: 600; font-family: monospace; word-break: break-all; }
+  .main { max-width: 900px; margin: 0 auto; padding: 28px 24px; }
+
+  /* Pipeline steps */
+  .steps { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; align-items: flex-start; }
+  .step-item { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .step {
+    padding: 6px 16px; border-radius: 20px; font-size: 0.82rem; font-weight: 600;
+    border: 2px solid #d0d7de; background: #f8f8f8; color: #999;
+    transition: all 0.2s;
+  }
+  .step.active { border-color: #1a1a1a; background: #fff; color: #1a1a1a; }
+  .step.done   { border-color: #1a7f37; background: #1a7f37; color: #fff; }
+  .step-count { font-size: 0.72rem; color: #888; font-variant-numeric: tabular-nums; min-height: 1em; }
+
+  /* Log terminal */
+  .log-panel {
+    background: #0d1117; border-radius: 8px; overflow: hidden;
+    margin-bottom: 20px; border: 1px solid #30363d;
+  }
+  .log-header { padding: 8px 14px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 8px; }
+  .log-header span { color: #8b949e; font-size: 0.78rem; font-family: monospace; }
+  .log-body {
+    height: 360px; overflow-y: auto; padding: 12px 14px;
+    font-family: "SF Mono", "Fira Code", monospace; font-size: 0.8rem;
+    line-height: 1.6; scroll-behavior: smooth;
+  }
+  .log-line { white-space: pre-wrap; word-break: break-all; }
+  .log-line .ts { color: #484f58; }
+  .log-line.ok      .body { color: #3fb950; }
+  .log-line.finding .body { color: #f0883e; font-weight: 700; }
+  .log-line.step-tag .body { color: #79c0ff; }
+  .log-line.progress .body { color: #e3b341; }
+  .log-line .body { color: #e6edf3; }
+
+  /* Status bar */
+  .status-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #e3b341; flex-shrink: 0; }
+  .dot.running { animation: pulse 1.4s ease-in-out infinite; }
+  .dot.done    { background: #3fb950; }
+  .dot.error   { background: #f85149; }
+  @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.3} }
+  .status-text { font-size: 0.9rem; color: #444; }
+
+  /* Error banner */
+  .error-banner { display: none; background: #ffebe9; border: 1px solid #ff818266; border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: #cf222e; font-size: 0.875rem; }
+
+  /* Buttons */
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+  .btn {
+    padding: 8px 18px; border-radius: 6px; font-size: 0.875rem; font-weight: 600;
+    text-decoration: none; cursor: pointer; border: 1px solid #d0d7de;
+    background: #f5f5f5; color: #999; pointer-events: none;
+    transition: all 0.15s; display: inline-block;
+  }
+  .btn.ready {
+    background: #1a1a1a; color: #fff; border-color: #1a1a1a; pointer-events: auto;
+  }
+  .btn.ready:hover { background: #333; border-color: #333; }
+
+  /* Disclosure reports */
+  .disclosures { margin-top: 20px; }
+  .disclosures-label {
+    font-size: 0.78rem; font-weight: 600; color: #666;
+    text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px;
+  }
+  .disclosure-links { display: flex; flex-direction: column; gap: 8px; }
+  .btn-disclosure {
+    padding: 7px 16px; border-radius: 6px; font-size: 0.82rem; font-weight: 600;
+    text-decoration: none; border: 1px solid #cf222e; color: #cf222e;
+    background: #fff5f5; transition: all 0.15s; display: block;
+  }
+  .btn-disclosure:hover { background: #cf222e; color: #fff; }
+</style>
+</head>
+<body>
+<header>
+  <a href="/">← Home</a>
+  <span class="sep">/</span>
+  <span class="title">{{.Repo}}</span>
+</header>
+<div class="main">
+  <!-- Pipeline step tracker -->
+  <div class="steps">
+    <div class="step-item">
+      <div class="step" id="step-parse">Parse</div>
+      <div class="step-count" id="count-parse"></div>
+    </div>
+    <div class="step-item">
+      <div class="step" id="step-enhance">Enhance</div>
+      <div class="step-count" id="count-enhance"></div>
+    </div>
+    <div class="step-item">
+      <div class="step" id="step-analyze">Analyze</div>
+      <div class="step-count" id="count-analyze"></div>
+    </div>
+    <div class="step-item">
+      <div class="step" id="step-verify">Verify</div>
+      <div class="step-count" id="count-verify"></div>
+    </div>
+    <div class="step-item">
+      <div class="step" id="step-report">Report</div>
+      <div class="step-count" id="count-report"></div>
+    </div>
+  </div>
+
+  <!-- Error banner -->
+  <div class="error-banner" id="error-banner">Scan failed. Check the log above for details.</div>
+
+  <!-- Status bar -->
+  <div class="status-bar">
+    <div class="dot running" id="status-dot"></div>
+    <span class="status-text" id="status-text">Scanning…</span>
+  </div>
+
+  <!-- Log terminal -->
+  <div class="log-panel">
+    <div class="log-header">
+      <span>scan / {{.ID}}</span>
+    </div>
+    <div class="log-body" id="log-body"></div>
+  </div>
+
+  <!-- Report/Summary buttons -->
+  <div class="actions">
+    <a class="btn" id="btn-summary" href="/summary/{{.ID}}" target="_blank">View Summary</a>
+    <a class="btn" id="btn-report"  href="/report/{{.ID}}"  target="_blank">View HTML Report</a>
+  </div>
+
+  <!-- Disclosure report links (populated on scan complete) -->
+  <div class="disclosures" id="disclosures" style="display:none">
+    <div class="disclosures-label">Disclosure Reports</div>
+    <div class="disclosure-links" id="disclosure-links"></div>
+  </div>
+</div>
+
+<script>
+const jobID = '{{.ID}}';
+
+const steps = ['parse','enhance','analyze','verify','report'];
+const stepEls = {};
+const countEls = {};
+steps.forEach(s => {
+  stepEls[s] = document.getElementById('step-' + s);
+  countEls[s] = document.getElementById('count-' + s);
+});
+
+let streamClosed = false;
+const stageCounts = {};
+
+function setCount(stage, n) {
+  stageCounts[stage] = n;
+  if (countEls[stage]) countEls[stage].textContent = n.toLocaleString();
+}
+
+function markActive(name) {
+  const el = stepEls[name];
+  if (el && !el.classList.contains('done')) {
+    el.classList.add('active');
+  }
+}
+function markDone(name) {
+  const el = stepEls[name];
+  if (el) {
+    el.classList.remove('active');
+    el.classList.add('done');
+    el.textContent = '✓ ' + el.textContent.replace(/^✓ /, '');
+  }
+}
+function markAllDone() {
+  steps.forEach(s => {
+    if (!stepEls[s].classList.contains('done')) markDone(s);
+  });
+}
+
+function parseNum(s) {
+  return parseInt(s.replace(/,/g, ''), 10);
+}
+
+function tryExtractCounts(line) {
+  let m;
+  // Parse: total units extracted
+  m = line.match(/[Pp]arsed[:\s]+([\d,]+)\s+(?:code\s+)?units?/);
+  if (!m) m = line.match(/([\d,]+)\s+(?:code\s+)?units?\s+(?:parsed|extracted|found)/i);
+  if (!m) m = line.match(/\b([\d,]+)\s+functions?\s+(?:parsed|extracted|found)/i);
+  if (m) { setCount('parse', parseNum(m[1])); return; }
+
+  // Enhance: units being enhanced / sent for enhancement
+  m = line.match(/[Ee]nhanc(?:ing|ed|ement)[:\s]+([\d,]+)/);
+  if (!m) m = line.match(/([\d,]+)\s+units?\s+(?:to\s+)?enhanc/i);
+  if (m) { setCount('enhance', parseNum(m[1])); return; }
+
+  // Analyze: units being analyzed
+  m = line.match(/[Aa]nalyz(?:ing|ed)[:\s]+([\d,]+)/);
+  if (!m) m = line.match(/([\d,]+)\s+(?:units?|functions?)\s+(?:to\s+)?analyz/i);
+  if (m) { setCount('analyze', parseNum(m[1])); return; }
+
+  // Analyze: potential findings (also show in analyze bucket)
+  m = line.match(/(\d[\d,]*)\s+potential\s+(?:vuln|finding)/i);
+  if (m) { setCount('analyze', parseNum(m[1])); return; }
+
+  // Verify: units being verified
+  m = line.match(/[Vv]erif(?:ying|ied)[:\s]+([\d,]+)/);
+  if (!m) m = line.match(/([\d,]+)\s+(?:findings?|units?)\s+(?:to\s+)?verif/i);
+  if (m) { setCount('verify', parseNum(m[1])); return; }
+
+  // Report: confirmed findings — matches pipeline_output.json log lines and disclosure generation
+  m = line.match(/pipeline_output\.json[:\s]+([\d,]+)\s+findings?/i);
+  if (!m) m = line.match(/[Gg]enerating\s+([\d,]+)\s+disclosures?/);
+  if (!m) m = line.match(/[Dd]isclosures?[:\s]+([\d,]+)\s+files?/);
+  if (!m) m = line.match(/([Rr]eport(?:ing|ed)?)[:\s]+([\d,]+)\s+(?:confirmed\s+)?findings?/);
+  if (!m) m = line.match(/([\d,]+)\s+(?:confirmed\s+)?findings?\s+(?:in\s+)?report/i);
+  if (m) { setCount('report', parseNum(m[m.length - 1])); return; }
+}
+
+function updateSteps(line) {
+  const l = line.toLowerCase();
+  if (/^\[parse\]/.test(l))                             { markActive('parse'); }
+  else if (/^✓ parse/.test(l))                          { markDone('parse'); }
+  else if (/^\[enhance\]/.test(l))                      { markDone('parse'); markActive('enhance'); }
+  else if (/^✓ enhance/.test(l))                        { markDone('enhance'); }
+  else if (/^\[analyze\]|^\[detect\]/.test(l))          { markDone('enhance'); markActive('analyze'); }
+  else if (/^✓ analy|^✓ detect/.test(l))                { markDone('analyze'); }
+  else if (/^\[verify\]/.test(l))                       { markDone('analyze'); markActive('verify'); }
+  else if (/^✓ verify/.test(l))                         { markDone('verify'); }
+  else if (/^\[report\]/.test(l))                       { markDone('verify'); markActive('report'); }
+  else if (/^✓ report/.test(l))                         { markDone('report'); }
+}
+
+function classifyLine(line) {
+  const l = line.toLowerCase();
+  if (line.startsWith('✓') || /complete\b/.test(l)) return 'ok';
+  if (/potential|vulner|finding|! /.test(l) && !line.startsWith('✓')) return 'finding';
+  if (/^\[parse\]|^\[enhance\]|^\[analyze\]|^\[detect\]|^\[verify\]|^\[report\]|^\[dynamic/.test(l)) return 'step-tag';
+  if (/→|analyzing batch|running|scanning|processing/.test(l)) return 'progress';
+  return '';
+}
+
+function appendLine(rawLine) {
+  const logBody = document.getElementById('log-body');
+  const div = document.createElement('div');
+  div.className = 'log-line';
+
+  // Extract optional HH:MM:SS timestamp prefix
+  const tsMatch = rawLine.match(/^(\d{2}:\d{2}:\d{2})\s+(.*)/s);
+  let body = rawLine;
+  if (tsMatch) {
+    const ts = document.createElement('span');
+    ts.className = 'ts';
+    ts.textContent = tsMatch[1] + ' ';
+    div.appendChild(ts);
+    body = tsMatch[2];
+  }
+
+  const cls = classifyLine(rawLine);
+  if (cls) div.classList.add(cls);
+
+  const bodySpan = document.createElement('span');
+  bodySpan.className = 'body';
+  bodySpan.textContent = body;
+  div.appendChild(bodySpan);
+
+  logBody.appendChild(div);
+  logBody.scrollTop = logBody.scrollHeight;
+
+  updateSteps(rawLine);
+  tryExtractCounts(rawLine);
+}
+
+function loadDisclosures() {
+  fetch('/disclosures/' + jobID)
+    .then(r => r.ok ? r.json() : [])
+    .then(list => {
+      if (!list || list.length === 0) return;
+      const container = document.getElementById('disclosures');
+      const links = document.getElementById('disclosure-links');
+      list.forEach(d => {
+        const a = document.createElement('a');
+        a.href = d.url;
+        a.target = '_blank';
+        a.className = 'btn-disclosure';
+        a.textContent = d.label;
+        links.appendChild(a);
+      });
+      container.style.display = '';
+    })
+    .catch(() => {});
+}
+
+function onDone(status) {
+  streamClosed = true;
+  const dot = document.getElementById('status-dot');
+  const text = document.getElementById('status-text');
+  dot.classList.remove('running');
+
+  if (status === 'done') {
+    dot.classList.add('done');
+    text.textContent = 'Scan complete';
+    markAllDone();
+    document.getElementById('btn-report').classList.add('ready');
+    // Only enable Summary button if the summary actually exists.
+    fetch('/summary/' + jobID, { method: 'HEAD' }).then(r => {
+      if (r.ok) document.getElementById('btn-summary').classList.add('ready');
+    });
+    loadDisclosures();
+  } else {
+    dot.classList.add('error');
+    text.textContent = 'Scan failed';
+    document.getElementById('error-banner').style.display = 'block';
+  }
+}
+
+function connect() {
+  if (streamClosed) return;
+  const es = new EventSource('/scan/' + jobID + '/logs');
+
+  es.onmessage = function(e) {
+    appendLine(e.data);
+  };
+
+  es.addEventListener('done', function(e) {
+    es.close();
+    onDone(e.data);
+  });
+
+  es.onerror = function() {
+    es.close();
+    if (!streamClosed) {
+      setTimeout(connect, 2000);
+    }
+  };
+}
+
+connect();
+</script>
+</body>
+</html>

@@ -8,6 +8,7 @@ OUTPUT FORMAT:
 # Security Disclosure: {short_title}
 
 **Product:** {product_name}
+**Repository:** {repo_url}
 **Type:** CWE-{cwe_id} ({cwe_name})
 **Affected:** {affected_versions}
 
@@ -68,6 +69,7 @@ INSTRUCTIONS:
 - Steps to Reproduce: if dynamic_testing data exists, use those steps; otherwise write "[REQUIRES DYNAMIC TESTING]" for each step
 - Impact: 3-5 bullet points, no sub-bullets
 - Suggested Fix: show minimal code change, use comments to indicate what was added
+- Repository: if repo_url is empty or null, omit the **Repository:** line entirely
 - Do not include CVSS scores or severity ratings
 - Do not include disclosure timelines
 - Do not include references section
