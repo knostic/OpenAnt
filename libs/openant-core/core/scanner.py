@@ -55,6 +55,7 @@ def scan_repository(
     dynamic_test: bool = False,
     workers: int = 8,
     backoff_seconds: int = 30,
+    repo_url: str = "",
 ) -> ScanResult:
     """Scan a repository for vulnerabilities.
 
@@ -374,6 +375,7 @@ def scan_repository(
             results_path=active_results_path,
             output_path=pipeline_output_path,
             repo_name=os.path.basename(repo_path),
+            repo_url=repo_url,
             language=result.language,
             application_type=(
                 app_context_path and _read_app_type(app_context_path)

@@ -70,6 +70,7 @@ def cmd_scan(args):
             dynamic_test=args.dynamic_test,
             workers=args.workers,
             backoff_seconds=args.backoff,
+            repo_url=getattr(args, "repo_url", "") or "",
         )
 
         _output_json(success(result.to_dict()))
@@ -940,6 +941,8 @@ def main():
                         help="Number of parallel workers for LLM steps (default: 8)")
     scan_p.add_argument("--backoff", type=int, default=30,
                         help="Seconds to wait when rate-limited (default: 30)")
+    scan_p.add_argument("--repo-url", default="",
+                        help="Repository URL (included in reports; auto-detected when scanning a URL)")
     scan_p.set_defaults(func=cmd_scan)
 
     # ---------------------------------------------------------------
