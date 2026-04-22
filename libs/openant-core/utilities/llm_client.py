@@ -23,6 +23,7 @@ from typing import Optional
 import anthropic
 from dotenv import load_dotenv
 
+from .anthropic_http import create_anthropic_client
 from .rate_limiter import get_rate_limiter
 
 
@@ -204,7 +205,7 @@ class AnthropicClient:
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in environment")
 
-        self.client = anthropic.Anthropic(api_key=api_key, max_retries=5)
+        self.client = create_anthropic_client(api_key=api_key, max_retries=5)
         self.model = model
         self.tracker = tracker or _global_tracker
         self.last_call = None  # Store last call details

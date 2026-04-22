@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import anthropic
-
+from .anthropic_http import create_anthropic_client
 from .llm_client import TokenTracker, get_global_tracker
 from .rate_limiter import get_rate_limiter
 
@@ -271,7 +271,7 @@ class FindingVerifier:
         self.verbose = verbose
         self.app_context = app_context
         self.tool_executor = ToolExecutor(index)
-        self.client = client or anthropic.Anthropic(max_retries=5)
+        self.client = client or create_anthropic_client(max_retries=5)
         self.logger = logger or _null_logger
         self._use_logger = logger is not None
 

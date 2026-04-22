@@ -29,9 +29,10 @@ import html
 import os
 from datetime import datetime
 
-import anthropic
 from dotenv import load_dotenv
 from utilities.file_io import read_json
+
+from utilities.anthropic_http import create_anthropic_client
 
 # Load environment variables from .env file
 load_dotenv()
@@ -201,7 +202,7 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not found in environment")
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = create_anthropic_client(api_key=api_key)
     response = client.messages.create(
         model=REPORT_MODEL,
         max_tokens=MAX_TOKENS,

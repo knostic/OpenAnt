@@ -40,6 +40,25 @@ except ImportError:
     HAS_APP_CONTEXT = False
 
 
+def _format_exception_chain(exc: BaseException, limit: int = 500) -> str:
+    """Readable error text; Anthropic often raises APIConnectionError with a hidden __cause__."""
+    parts: list[str] = []
+    cur: BaseException | None = exc
+    seen: set[str] = set()
+    depth = 0
+    while cur is not None and depth < 6:
+        msg = (str(cur) or type(cur).__name__).strip()
+        if msg and msg not in seen:
+            parts.append(msg)
+            seen.add(msg)
+        cur = cur.__cause__ or cur.__context__
+        depth += 1
+    text = " | ".join(parts) if parts else type(exc).__name__
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
 def scan_repository(
     repo_path: str,
     output_dir: str,
@@ -620,8 +639,9 @@ def scan_repository(
                 outputs["summary_path"] = summary_path
                 print(f"  Summary: {summary_path}", file=sys.stderr)
             except Exception as e:
-                print(f"  WARNING: Summary report failed: {e}", file=sys.stderr)
-                ctx.errors.append(f"Summary report: {e}")
+                detail = _format_exception_chain(e)
+                print(f"  WARNING: Summary report failed: {detail}", file=sys.stderr)
+                ctx.errors.append(f"Summary report: {detail}")
 
             # Only generate disclosures if there are findings
             if has_findings:
@@ -630,8 +650,9 @@ def scan_repository(
                     outputs["disclosures_dir"] = disclosures_dir
                     print(f"  Disclosures: {disclosures_dir}", file=sys.stderr)
                 except Exception as e:
-                    print(f"  WARNING: Disclosure docs failed: {e}", file=sys.stderr)
-                    ctx.errors.append(f"Disclosure docs: {e}")
+                    detail = _format_exception_chain(e)
+                    print(f"  WARNING: Disclosure docs failed: {detail}", file=sys.stderr)
+                    ctx.errors.append(f"Disclosure docs: {detail}")
 
             ctx.summary = {"formats_generated": list(outputs.keys())}
             ctx.outputs = outputs

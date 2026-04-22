@@ -70,11 +70,19 @@ openant set-api-key <your-key>
 
 **The key must have access to the Claude Opus 4.6 model.** Get a key at [console.anthropic.com](https://console.anthropic.com/settings/keys).
 
+If HTTPS traffic to Anthropic is intercepted (for example by Zscaler), export your corporate root CA in PEM form -- the same variable many tools use with Node:
+
+```bash
+export NODE_EXTRA_CA_CERTS=/path/to/your-corporate-root-ca.pem
+```
+
+OpenAnt's Python runtime loads that bundle for **Anthropic Python SDK** API calls so TLS verification succeeds behind the proxy. When this variable is set, Python 3.13+'s strict X.509 validation is relaxed to match Node's behavior, so Zscaler-class CAs (whose Basic Constraints extension is sometimes non-critical) validate -- a deliberate trade toward compatibility with typical corporate intercept roots and Node-like trust behavior.
+
 ### Python runtime
 
 OpenAnt's parsing, enhancement, analysis, and reporting code is Python 3.11+. The Go CLI picks an interpreter in this order:
 
-1. `OPENANT_PYTHON` env var (set this to pin a specific interpreter — e.g. `OPENANT_PYTHON=python3.11`).
+1. `OPENANT_PYTHON` env var (set this to pin a specific interpreter -- e.g. `OPENANT_PYTHON=python3.11`).
 2. Managed venv at `~/.openant/venv/` (auto-created on first use). The CLI uses `bin/python` on Linux/macOS and `Scripts\python.exe` on Windows.
 3. `python3` / `python` on `PATH`.
 

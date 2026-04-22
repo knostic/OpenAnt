@@ -8,9 +8,10 @@ import json
 import os
 import re
 import sys
-import anthropic
 from pathlib import Path
 from dotenv import load_dotenv
+
+from utilities.anthropic_http import create_anthropic_client
 
 from .schema import validate_pipeline_output, ValidationError
 from utilities.file_io import open_utf8, read_json
@@ -138,7 +139,7 @@ def generate_summary_report(pipeline_data: dict) -> tuple[str, dict]:
         output_tokens, total_tokens, cost_usd.
     """
     _check_api_key()
-    client = anthropic.Anthropic()
+    client = create_anthropic_client()
 
     summary_data = _compact_for_summary(pipeline_data)
     system_prompt = load_prompt("system")
@@ -201,7 +202,7 @@ def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[st
         (disclosure_text, usage_dict)
     """
     _check_api_key()
-    client = anthropic.Anthropic()
+    client = create_anthropic_client()
 
     system_prompt = load_prompt("system")
 

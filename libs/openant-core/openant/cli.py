@@ -590,9 +590,9 @@ def cmd_report_data(args):
     and step reports — everything display-ready.
     """
     import html as html_mod
-    import anthropic
     from core.schemas import success, error
     from core.step_report import step_context
+    from utilities.anthropic_http import create_anthropic_client
     from utilities.llm_client import get_global_tracker
 
     results_path = args.results
@@ -809,7 +809,7 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
 {findings_text}
 """
                 print("[Report] Generating remediation guidance (LLM)...", file=sys.stderr)
-                client = anthropic.Anthropic()
+                client = create_anthropic_client()
                 response = client.messages.create(
                     model="claude-sonnet-4-20250514",
                     max_tokens=4096,

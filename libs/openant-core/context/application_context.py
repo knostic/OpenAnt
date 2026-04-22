@@ -29,9 +29,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from utilities.file_io import open_utf8, read_json, write_json
+
+from utilities.anthropic_http import create_anthropic_client
 
 # Load environment variables
 load_dotenv()
@@ -509,7 +510,7 @@ def generate_application_context(
 
     # Call LLM
     print(f"Generating context with {model}...", file=sys.stderr)
-    client = Anthropic()
+    client = create_anthropic_client()
     response = client.messages.create(
         model=model,
         max_tokens=2000,
