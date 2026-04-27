@@ -18,6 +18,7 @@ def run_tests(
     pipeline_output_path: str,
     output_dir: str,
     max_retries: int = 3,
+    repo_path: str | None = None,
 ) -> DynamicTestStepResult:
     """Run dynamic exploit tests on confirmed vulnerabilities.
 
@@ -83,6 +84,7 @@ def run_tests(
         pipeline_output_path,
         output_dir,
         max_retries=max_retries,
+        repo_path=repo_path,
     )
 
     # Count outcomes

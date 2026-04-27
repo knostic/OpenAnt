@@ -6,6 +6,7 @@ Returns (text, usage_dict) tuples from LLM functions so callers can track costs.
 
 import json
 import os
+import re
 import sys
 import anthropic
 from pathlib import Path
@@ -151,6 +152,46 @@ def generate_summary_report(pipeline_data: dict) -> tuple[str, dict]:
     return response.content[0].text, _extract_usage(response)
 
 
+def _splice_code_section(llm_output: str, code_section: str) -> str:
+    """Insert the verbatim code block into the LLM-generated disclosure.
+
+    The LLM generates everything except the Vulnerable Code section. This
+    function inserts the server-built code block at the right position.
+
+    As a safety net, if the LLM ignored the instruction and still generated
+    its own ``## Vulnerable Code`` block, that block is stripped first.
+    """
+    if not code_section:
+        return llm_output
+
+    # Safety net: strip any LLM-generated Vulnerable Code section.
+    # Matches from "## Vulnerable Code" up to the next ## heading or end of string.
+    output = re.sub(
+        r'## Vulnerable Code.*?(?=\n## |\Z)',
+        '',
+        llm_output,
+        flags=re.DOTALL,
+    )
+
+    # Insert the real code section before "## Steps to Reproduce".
+    insertion_point = '## Steps to Reproduce'
+    if insertion_point in output:
+        output = output.replace(
+            insertion_point,
+            f"{code_section}\n\n{insertion_point}",
+            1,
+        )
+    else:
+        # Fallback: insert before "## Impact" if Steps is missing.
+        fallback = '## Impact'
+        if fallback in output:
+            output = output.replace(fallback, f"{code_section}\n\n{fallback}", 1)
+        else:
+            output += f"\n\n{code_section}"
+
+    return output
+
+
 def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[str, dict]:
     """Generate a disclosure document for a single vulnerability.
 
@@ -162,10 +203,19 @@ def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[st
 
     system_prompt = load_prompt("system")
 
-    vuln_with_product = {**vulnerability_data, "product_name": product_name}
-    user_prompt = load_prompt("disclosure").replace(
-        "{vulnerability_data}",
-        json.dumps(vuln_with_product, indent=2)
+    # The vulnerable-code markdown block is spliced into the LLM output
+    # AFTER generation — the LLM never sees or produces it. This prevents
+    # the LLM from hallucinating the snippet.
+    code_section = vulnerability_data.get("vulnerable_code_section") or ""
+    payload = {
+        k: v for k, v in vulnerability_data.items()
+        if k not in ("vulnerable_code_section", "vulnerable_code")
+    }
+    payload["product_name"] = product_name
+
+    user_prompt = (
+        load_prompt("disclosure")
+        .replace("{vulnerability_data}", json.dumps(payload, indent=2), 1)
     )
 
     response = client.messages.create(
@@ -175,7 +225,10 @@ def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[st
         messages=[{"role": "user", "content": user_prompt}]
     )
 
-    return response.content[0].text, _extract_usage(response)
+    llm_output = response.content[0].text
+    final_output = _splice_code_section(llm_output, code_section)
+
+    return final_output, _extract_usage(response)
 
 
 def generate_all(pipeline_path: str, output_dir: str) -> None:

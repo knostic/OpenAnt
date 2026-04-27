@@ -55,6 +55,9 @@ def scan_repository(
     dynamic_test: bool = False,
     workers: int = 8,
     backoff_seconds: int = 30,
+    repo_name: str | None = None,
+    repo_url: str | None = None,
+    commit_sha: str | None = None,
 ) -> ScanResult:
     """Scan a repository for vulnerabilities.
 
@@ -373,7 +376,9 @@ def scan_repository(
         build_pipeline_output(
             results_path=active_results_path,
             output_path=pipeline_output_path,
-            repo_name=os.path.basename(repo_path),
+            repo_name=repo_name or os.path.basename(repo_path),
+            repo_url=repo_url,
+            commit_sha=commit_sha,
             language=result.language,
             application_type=(
                 app_context_path and _read_app_type(app_context_path)
@@ -645,4 +650,8 @@ def _print_summary(result: ScanResult) -> None:
     print(f"  Output:         {result.output_dir}", file=sys.stderr)
     if result.skipped_steps:
         print(f"  Skipped:        {', '.join(result.skipped_steps)}", file=sys.stderr)
+    if result.usage.total_input_tokens == 0 and result.metrics.errors > 0:
+        print("", file=sys.stderr)
+        print("  *** No API calls succeeded — repository was NOT analyzed. ***", file=sys.stderr)
+        print("  *** Check your API key: openant set-api-key <key>          ***", file=sys.stderr)
     print("=" * 60, file=sys.stderr)

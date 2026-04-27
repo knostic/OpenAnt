@@ -27,6 +27,7 @@ def run_dynamic_tests(
     output_dir: str | None = None,
     max_retries: int = 3,
     checkpoint_path: str | None = None,
+    repo_path: str | None = None,
 ) -> list[DynamicTestResult]:
     """Run dynamic tests for all findings in a pipeline output file.
 
@@ -36,6 +37,9 @@ def run_dynamic_tests(
                     as pipeline_output_path.
         max_retries: Max retries per finding on error (default 3).
         checkpoint_path: Path to checkpoint directory for resume support.
+        repo_path: Path to the repository root. When given, the vulnerable
+            source file is pre-staged into the Docker build context so
+            ``COPY <filename> .`` works on the first try.
 
     Returns:
         List of DynamicTestResult objects
@@ -169,8 +173,18 @@ def run_dynamic_tests(
         print(f"  Generated (${generation_cost:.4f}). Running in Docker...",
               file=sys.stderr)
 
+        # Resolve the vulnerable source file for pre-staging.
+        source_file = None
+        if repo_path:
+            rel_path = finding.get("location", {}).get("file", "")
+            if rel_path:
+                candidate = os.path.join(repo_path, rel_path)
+                if os.path.isfile(candidate):
+                    source_file = candidate
+
         # Step 2: Execute in Docker and retry on errors
-        execution = run_single_container(generation, finding_id)
+        execution = run_single_container(generation, finding_id,
+                                         source_file=source_file)
         result = collect_result(finding, generation, execution, generation_cost)
         retry_count = 0
 
@@ -208,7 +222,8 @@ def run_dynamic_tests(
                 break
 
             generation = retry_gen
-            execution = run_single_container(generation, finding_id)
+            execution = run_single_container(generation, finding_id,
+                                             source_file=source_file)
             result = collect_result(finding, generation, execution, generation_cost)
             print(f"  Retry {retry_count} result: {result.status} "
                   f"(${generation_cost:.4f})", file=sys.stderr)

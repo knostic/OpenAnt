@@ -112,6 +112,12 @@ def _build_finding_prompt(finding: dict, repo_info: dict) -> str:
     """Build the prompt for generating a test for a single finding."""
     language = repo_info.get("language", "Python")
 
+    # Derive the staged source filename so the LLM can reference it in COPY.
+    source_basename = ""
+    loc = finding.get("location", {})
+    if isinstance(loc, dict) and loc.get("file"):
+        source_basename = os.path.basename(loc["file"])
+
     parts = [
         f"Generate a dynamic exploit test for the following vulnerability.",
         "",
@@ -123,10 +129,17 @@ def _build_finding_prompt(finding: dict, repo_info: dict) -> str:
         f"  ID: {finding.get('id', 'unknown')}",
         f"  Name: {finding.get('name', 'unknown')}",
         f"  CWE: {finding.get('cwe_id', 0)} - {finding.get('cwe_name', 'Unknown')}",
-        f"  Location: {json.dumps(finding.get('location', {}), indent=4)}",
+        f"  Location: {json.dumps(loc, indent=4)}",
         f"  Stage 1 Verdict: {finding.get('stage1_verdict', 'unknown')}",
         f"  Stage 2 Verdict: {finding.get('stage2_verdict', 'unknown')}",
     ]
+
+    if source_basename:
+        parts.extend([
+            "",
+            f"  Source file (pre-staged in Docker build context): {source_basename}",
+            f"  Your Dockerfile MUST use `COPY {source_basename} .` — the file is already there.",
+        ])
 
     if finding.get("description"):
         parts.extend(["", f"  Description: {finding['description']}"])

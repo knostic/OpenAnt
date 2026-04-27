@@ -141,6 +141,20 @@ func runScan(cmd *cobra.Command, args []string) {
 		pyArgs = append(pyArgs, "--backoff", fmt.Sprintf("%d", scanBackoff))
 	}
 
+	// Pass repository metadata from project context so reports don't show
+	// [NOT PROVIDED] placeholders.
+	if ctx != nil && ctx.Project != nil {
+		if ctx.Project.Name != "" {
+			pyArgs = append(pyArgs, "--repo-name", ctx.Project.Name)
+		}
+		if ctx.Project.RepoURL != "" {
+			pyArgs = append(pyArgs, "--repo-url", ctx.Project.RepoURL)
+		}
+		if ctx.Project.CommitSHA != "" {
+			pyArgs = append(pyArgs, "--commit-sha", ctx.Project.CommitSHA)
+		}
+	}
+
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())
 	if err != nil {
 		output.PrintError(err.Error())

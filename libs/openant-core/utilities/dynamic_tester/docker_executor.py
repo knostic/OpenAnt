@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 
 # Timeouts
 DEFAULT_CONTAINER_TIMEOUT = 120   # seconds per container
@@ -58,8 +59,20 @@ def _sanitize_compose(content: str) -> str:
     return content
 
 
-def _write_test_files(work_dir: str, generation: dict) -> None:
-    """Write generated test files into the working directory."""
+def _write_test_files(work_dir: str, generation: dict, source_file: str | None = None) -> None:
+    """Write generated test files into the working directory.
+
+    Args:
+        work_dir: Temporary directory used as Docker build context.
+        generation: LLM-generated test artifacts (dockerfile, test_script, …).
+        source_file: Optional path to the vulnerable source file. When given,
+            the file is copied into *work_dir* so the Dockerfile can COPY it
+            without the LLM having to guess the path.
+    """
+    # Pre-stage the vulnerable source file so `COPY <basename> .` just works.
+    if source_file and os.path.isfile(source_file):
+        shutil.copy2(source_file, os.path.join(work_dir, os.path.basename(source_file)))
+
     # Write Dockerfile
     with open(os.path.join(work_dir, "Dockerfile"), "w") as f:
         f.write(generation["dockerfile"])
@@ -116,6 +129,7 @@ def run_single_container(
     finding_id: str,
     container_timeout: int = DEFAULT_CONTAINER_TIMEOUT,
     build_timeout: int = DEFAULT_BUILD_TIMEOUT,
+    source_file: str | None = None,
 ) -> DockerExecutionResult:
     """Build and run a single Docker container for a test.
 
@@ -133,9 +147,12 @@ def run_single_container(
 
     # Sanitize finding_id for use as Docker image tag.
     # Docker tags must match [a-z0-9][a-z0-9._-]*, so strip anything else.
+    # UUID prefix prevents collisions between parallel dynamic-test runs
+    # (same finding IDs across scans).
+    run_id = uuid.uuid4().hex[:8]
     safe_id = re.sub(r"[^a-z0-9-]", "-", finding_id.lower()).strip("-_.")
-    image_tag = f"openant-test-{safe_id}"
-    network_name = f"openant-net-{safe_id}"
+    image_tag = f"openant-test-{run_id}-{safe_id}"
+    network_name = f"openant-net-{run_id}-{safe_id}"
 
     # Use a deterministic, sanitized work_dir name so docker compose project
     # names (derived from the dir name) are always valid Docker references.
@@ -148,7 +165,7 @@ def run_single_container(
         os.rename(raw_work_dir, work_dir)
 
     try:
-        _write_test_files(work_dir, generation)
+        _write_test_files(work_dir, generation, source_file=source_file)
 
         if generation.get("docker_compose") and generation.get("needs_attacker_server"):
             # Multi-service: use docker compose with explicit project name

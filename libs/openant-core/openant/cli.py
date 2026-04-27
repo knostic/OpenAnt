@@ -70,6 +70,9 @@ def cmd_scan(args):
             dynamic_test=args.dynamic_test,
             workers=args.workers,
             backoff_seconds=args.backoff,
+            repo_name=getattr(args, "repo_name", None),
+            repo_url=getattr(args, "repo_url", None),
+            commit_sha=getattr(args, "commit_sha", None),
         )
 
         _output_json(success(result.to_dict()))
@@ -395,6 +398,7 @@ def cmd_dynamic_test(args):
                 pipeline_output_path=args.pipeline_output,
                 output_dir=output_dir,
                 max_retries=args.max_retries,
+                repo_path=getattr(args, "repo_path", None),
             )
 
             ctx.summary = {
@@ -465,10 +469,16 @@ def cmd_report(args):
                 "Otherwise, run 'openant dynamic-test' first.\n",
                 file=sys.stderr,
             )
-            try:
-                answer = input("[Y/n] ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                answer = "n"
+            if not sys.stdin.isatty():
+                # Non-interactive (Go CLI pipes stdin) — continue silently.
+                answer = "y"
+            else:
+                sys.stderr.write("[Y/n] ")
+                sys.stderr.flush()
+                try:
+                    answer = sys.stdin.readline().strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    answer = "n"
             if answer not in ("y", "yes", ""):
                 print("Aborted. Run 'openant dynamic-test' first.", file=sys.stderr)
                 return 0
@@ -938,6 +948,9 @@ def main():
     scan_p.add_argument("--model", choices=["opus", "sonnet"], default="opus", help="Model (default: opus)")
     scan_p.add_argument("--workers", type=int, default=8,
                         help="Number of parallel workers for LLM steps (default: 8)")
+    scan_p.add_argument("--repo-name", help="Repository name (org/repo)")
+    scan_p.add_argument("--repo-url", help="Repository URL")
+    scan_p.add_argument("--commit-sha", help="Commit SHA")
     scan_p.add_argument("--backoff", type=int, default=30,
                         help="Seconds to wait when rate-limited (default: 30)")
     scan_p.set_defaults(func=cmd_scan)
@@ -1045,6 +1058,7 @@ def main():
     dt_p = subparsers.add_parser("dynamic-test", help="Run dynamic exploit testing (requires Docker)")
     dt_p.add_argument("pipeline_output", help="Path to pipeline_output.json")
     dt_p.add_argument("--output", "-o", help="Output directory (default: temp dir)")
+    dt_p.add_argument("--repo-path", help="Path to the repository root (for pre-staging source files into Docker build context)")
     dt_p.add_argument("--max-retries", type=int, default=3,
                       help="Max retries per finding on error (default: 3)")
     dt_p.set_defaults(func=cmd_dynamic_test)

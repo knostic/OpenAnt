@@ -80,6 +80,12 @@ func runDynamicTest(cmd *cobra.Command, args []string) {
 		pyArgs = append(pyArgs, "--max-retries", fmt.Sprintf("%d", dynamicTestMaxRetries))
 	}
 
+	// Pass repo path so the dynamic tester can pre-stage source files into
+	// the Docker build context.
+	if ctx != nil && ctx.Project != nil && ctx.RepoPath != "" {
+		pyArgs = append(pyArgs, "--repo-path", ctx.RepoPath)
+	}
+
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())
 	if err != nil {
 		output.PrintError(err.Error())

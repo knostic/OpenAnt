@@ -4,7 +4,46 @@ All notable changes to OpenAnt are documented in this file.
 
 ## [Unreleased]
 
-This release syncs a large body of work from internal development. Highlights:
+### Fixed
+
+- **Disclosure code is now byte-faithful to source.** The disclosure
+  renderer pulls the actual file slice from the repo instead of rerunning
+  an LLM rewrite, so every finding's `Vulnerable Code` block matches the
+  real source.
+- **No more silent 401s.** `openant set-api-key` validates the key on save
+  and fails loudly on bad input. `openant scan` prints a blocking warning
+  and exits non-zero when zero API calls succeed, so an all-401 run can no
+  longer masquerade as a clean repo.
+- **CWE tagging is now systematic.** `pipeline_output.json` carries
+  non-null `cwe`, `cwe_id`, and `vulnerability_type` for every finding.
+  Stage 1 prompt asks for them directly rather than relying on the
+  renderer LLM to infer them from prose.
+- **`[NOT PROVIDED]` placeholders eliminated.** Repo name, commit SHA, and
+  file count are threaded into every phase report envelope
+  (`parse.report.json`, `scan.report.json`) instead of being lost between
+  stages.
+- **`Verified` column reflects the highest evidence tier.** `dynamic` >
+  `verified` > `static`, so dynamically reproduced findings show as
+  `dynamic` and the disclosure footer reads "Confirmed via dynamic test"
+  where applicable.
+- **Call-graph-aware deduplication.** When two findings share a
+  sink/vector and the call graph records an edge between them, they
+  collapse into a single finding.
+- **Dynamic test scaffolding fixed.** `openant dynamic-test` pre-stages
+  the vulnerable source file into the Docker build context end-to-end
+  through the dynamic-test chain — first-try Docker builds no longer fail
+  because the source isn't in context.
+- **Concurrency-safe Docker resources.** Docker image and network names
+  get a UUID prefix so parallel dynamic-test workers can't collide.
+- **Agreement filter checks the final verdict** instead of the
+  intermediate `agree` flag, so high-confidence dynamic results aren't
+  dropped by a stale agreement signal.
+- **Dedup matches on CWE** instead of `attack_vector` text, so small
+  wording differences no longer split what's logically the same finding.
+
+## [2026-04-14] — Initial public release
+
+This release synced a large body of work from internal development. Highlights:
 
 ### Added
 

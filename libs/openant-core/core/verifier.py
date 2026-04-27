@@ -244,10 +244,13 @@ def _write_verified_results(
         "verify": True,
         "metrics": experiment.get("metrics", {}),
         "results": merged_results,
+        # Filter on the FINAL verdict (already updated by Stage 2 when it
+        # disagrees), not the `agree` flag. Stage 2 may disagree on the
+        # reason/CWE but still confirm the finding is vulnerable — those
+        # must not be dropped.
         "confirmed_findings": [
             r for r in verified_only
-            if r.get("verification", {}).get("agree", False)
-            and r.get("finding", "").lower() in ("vulnerable", "bypassable")
+            if r.get("finding", "").lower() in ("vulnerable", "bypassable")
         ],
     }
 

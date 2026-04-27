@@ -274,6 +274,12 @@ def _normalize_result(result: dict) -> dict:
     if "verdict" in result and isinstance(result["verdict"], str):
         result["verdict"] = result["verdict"].upper()
 
+    # Ensure CWE fields are always present.
+    if "cwe_id" not in result:
+        result["cwe_id"] = 0
+    if "cwe_name" not in result:
+        result["cwe_name"] = None
+
     return result
 
 

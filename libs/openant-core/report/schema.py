@@ -20,6 +20,7 @@ class Finding:
     dynamic_testing: dict | bool = False
     description: Optional[str] = None
     vulnerable_code: Optional[str] = None
+    vulnerable_code_section: Optional[str] = None
     impact: Optional[list] = None
     suggested_fix: Optional[str] = None
     steps_to_reproduce: Optional[list] = None
@@ -40,6 +41,7 @@ class Finding:
             dynamic_testing=data.get("dynamic_testing", False),
             description=data.get("description"),
             vulnerable_code=data.get("vulnerable_code"),
+            vulnerable_code_section=data.get("vulnerable_code_section"),
             impact=data.get("impact"),
             suggested_fix=data.get("suggested_fix"),
             steps_to_reproduce=data.get("steps_to_reproduce"),

@@ -15,15 +15,7 @@ OUTPUT FORMAT:
 
 {2-3 sentence description of the vulnerability. What is the bug? What can an attacker do?}
 
-## Vulnerable Code
-
-`{file_path}`:
-
-```{language}
-{minimal_code_snippet_with_vulnerability_highlighted}
-```
-
-{1 sentence explaining why this code is vulnerable}
+{1 sentence explaining why the code is vulnerable — refer to the function name and the dangerous operation}
 
 ## Steps to Reproduce
 
@@ -58,13 +50,14 @@ OUTPUT FORMAT:
 
 ---
 
-Discovered via static analysis.{" Confirmed via dynamic testing." if dynamic_testing else ""}
+Verified via {"dynamic testing" if dynamic_testing else "attacker simulation (Stage 2)" if stage2_verdict in ("confirmed", "agreed") else "static analysis"}.
 
 ---
 
 INSTRUCTIONS:
 - Keep summary under 50 words
-- Code snippets: show only the vulnerable function/section, not entire files
+- Do NOT include a "## Vulnerable Code" section — it is added automatically after your output is generated. Do NOT emit code fences with the vulnerable source code. If you need to reference the vulnerable code, refer to the function name and describe the issue in prose.
+- Other code snippets (Suggested Fix): show only the minimal change needed, not entire files
 - Steps to Reproduce: if dynamic_testing data exists, use those steps; otherwise write "[REQUIRES DYNAMIC TESTING]" for each step
 - Impact: 3-5 bullet points, no sub-bullets
 - Suggested Fix: show minimal code change, use comments to indicate what was added
