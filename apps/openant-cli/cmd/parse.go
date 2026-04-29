@@ -23,15 +23,21 @@ If no repository path is given, the active project is used (see: openant init).`
 }
 
 var (
-	parseOutput   string
-	parseLanguage string
-	parseLevel    string
+	parseOutput    string
+	parseLanguage  string
+	parseLevel     string
+	parseDiffBase  string
+	parsePR        int
+	parseDiffScope string
 )
 
 func init() {
 	parseCmd.Flags().StringVarP(&parseOutput, "output", "o", "", "Output directory (default: project scan dir)")
 	parseCmd.Flags().StringVarP(&parseLanguage, "language", "l", "", "Language: python, javascript, go, c, ruby, php, auto")
 	parseCmd.Flags().StringVar(&parseLevel, "level", "all", "Processing level: all, reachable, codeql, exploitable")
+	parseCmd.Flags().StringVar(&parseDiffBase, "diff-base", "", "Incremental mode: tag units overlapping diff vs this ref")
+	parseCmd.Flags().IntVar(&parsePR, "pr", 0, "Incremental mode against a GitHub PR number (mutex with --diff-base)")
+	parseCmd.Flags().StringVar(&parseDiffScope, "diff-scope", "changed_functions", "Diff scope: changed_files, changed_functions, callers")
 }
 
 func runParse(cmd *cobra.Command, args []string) {
@@ -64,6 +70,17 @@ func runParse(cmd *cobra.Command, args []string) {
 		os.Exit(2)
 	}
 
+	stepOpts, err := resolveStepDiffOpts(ctx, parseDiffBase, parsePR, parseDiffScope)
+	if err != nil {
+		output.PrintError(err.Error())
+		os.Exit(2)
+	}
+	manifestPath, err := prepareDiffManifest(repoPath, parseOutput, stepOpts)
+	if err != nil {
+		output.PrintError(err.Error())
+		os.Exit(2)
+	}
+
 	// Construct dataset name from project metadata: org-repo-shortSHA
 	var datasetName string
 	if ctx != nil && ctx.Project != nil {
@@ -84,6 +101,9 @@ func runParse(cmd *cobra.Command, args []string) {
 	}
 	if parseLevel != "all" {
 		pyArgs = append(pyArgs, "--level", parseLevel)
+	}
+	if manifestPath != "" {
+		pyArgs = append(pyArgs, "--diff-manifest", manifestPath)
 	}
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, resolvedAPIKey())

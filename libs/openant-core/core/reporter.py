@@ -24,6 +24,43 @@ from core.schemas import ReportResult
 _CORE_ROOT = Path(__file__).parent.parent
 
 
+def _load_diff_metadata(scan_dir: str) -> dict | None:
+    """Return a summary dict if this scan dir contains a diff_manifest.json.
+
+    Combines fields from diff_manifest.json and diff_filter.report.json so the
+    HTML/report consumers have one place to read PR/incremental metadata.
+    """
+    manifest_path = os.path.join(scan_dir, "diff_manifest.json")
+    if not os.path.exists(manifest_path):
+        return None
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    out = {
+        "mode": "incremental",
+        "base_ref": manifest.get("base_ref"),
+        "base_sha": manifest.get("base_sha"),
+        "head_sha": manifest.get("head_sha"),
+        "scope": manifest.get("scope"),
+        "pr_number": manifest.get("pr_number") or None,
+        "changed_files": len(manifest.get("changed_files") or []),
+    }
+    filter_report = os.path.join(scan_dir, "diff_filter.report.json")
+    if os.path.exists(filter_report):
+        try:
+            with open(filter_report) as f:
+                stats = json.load(f)
+            out["units_in_diff"] = stats.get("selected")
+            out["units_total_parsed"] = stats.get("total")
+            out["callers_added"] = stats.get("callers_added") or 0
+            out["fallback_file_match"] = stats.get("fallback_file_match") or 0
+        except (json.JSONDecodeError, OSError):
+            pass
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -317,6 +354,21 @@ def build_pipeline_output(
         },
         "findings": findings_data,
     }
+
+    # If this scan ran in diff mode, attach the manifest + filter stats so the
+    # HTML report can show a PR / incremental scan header.
+    scan_dir = os.path.dirname(os.path.abspath(results_path))
+    diff_meta = _load_diff_metadata(scan_dir)
+    if diff_meta is not None:
+        pipeline_output["diff"] = diff_meta
+        _banner = (
+            f"[Report] Incremental scan: base={diff_meta.get('base_ref')}, "
+            f"scope={diff_meta.get('scope')}, "
+            f"{diff_meta.get('units_in_diff', '?')}/{diff_meta.get('units_total_parsed', '?')} units"
+        )
+        if diff_meta.get("pr_number"):
+            _banner += f", PR #{diff_meta['pr_number']}"
+        print(_banner, file=sys.stderr)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w") as f:

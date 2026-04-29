@@ -1,0 +1,14 @@
+# Patterns of tracked file paths that must NOT exist on a public release branch.
+# Format: extended regex (ERE) per line, matched against `git ls-files` output.
+# Lines starting with # and blank lines are ignored.
+# Used by scripts/check-public-release.sh.
+
+# Internal docs subtree (sessions, runbooks, postmortems, triage, etc.)
+^docs/internal/
+
+# Working-state files anywhere in the tree
+\.wip\.md$
+\.todo\.md$
+
+# Internal session log at repo root
+^last-opencode-sess\.md$

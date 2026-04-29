@@ -4,16 +4,19 @@
 
 # OpenAnt
 
-[OpenAnt](https://knostic.ai/openant) from [Knostic](https://knostic.ai) is the leading open source LLM-based vulnerability discovery product, helping defenders proactively find verified security flaws while minimizing both false positives and false negatives. Stage 1 detects. Stage 2 attacks. What survives is real.
+[OpenAnt](https://knostic.ai/openant) from [Knostic](https://knostic.ai) is an open source LLM-based vulnerability discovery product that helps defenders proactively find verified security flaws while minimizing both false positives and false negatives. Stage 1 detects. Stage 2 attacks. What survives is real.
 
 We're pretty proud of this product and are in the vulnerability disclosure process for its findings, but do keep in mind that this started as a research project, and some of its features are still in beta. We welcome contributions to make it better.
 
 ## Why open source?
+
 Considering the explosion of AI-discovered vulnerabilities, we hope OpenAnt will be the tool helping open source maintainers stay ahead of attackers, where they can use it themselves or submit their repo for scanning at no cost.
 
-While we do provide OpenAnt as a service, you may have heard about Aardvark from OpenAI (now Codex Security) and Claude Code Security from Anthropic, and we have zero intention of competing with them.
+Then, since Knostic's focus is on protecting agents and coding assistants and not vulnerability research or application security, and we like open source, we decided to release OpenAnt under the Apache 2 license.
+Besides, you may have heard about Aardvark from OpenAI (now Codex Security) and Claude Code Security from Anthropic, and we have zero intention of competing with them.
 
 ## Technical details and free scanning for open source projects
+
 For technical details, limitations, and token costs, check out this blog post:
 [https://knostic.ai/blog/openant](https://knostic.ai/blog/openant)
 
@@ -21,6 +24,7 @@ To submit your repo for scanning:
 [https://knostic.ai/blog/oss-scan](https://knostic.ai/blog/oss-scan)
 
 ## Supported languages
+
 - Go
 - Python
 - JavaScript/TypeScript (beta)
@@ -29,15 +33,16 @@ To submit your repo for scanning:
 - Ruby (beta)
 
 ## Credits
+
 Research and ideation: [Nahum Korda](https://github.com/NahumKorda/).
 
-Productization: Alex Raihelgaus, Daniel Geyshis.
+Productization: [Alex Raihelgaus](https://github.com/ar7casper/), [Daniel Geyshis](https://github.com/dgeyshis).
 
 With thanks to: [Michal Kamensky](https://github.com/kamenskymic/), [Imri Goldberg](https://github.com/lorg), [Gadi Evron](https://github.com/gadievron/), Daniel Cuthbert. Josh Grossman, and Avi Douglen.
 
 ## Check out Knostic
-**If you like our work**, check out what we do at [Knostic](https://knostic.ai) to defend your agents and coding assistants, prevent them from deleting your hard drive and code, and control associated supply chain risks such as MCP servers, extensions, and skills.
 
+**If you like our work**, check out what we do at [Knostic](https://knostic.ai) to defend your agents and coding assistants, prevent them from deleting your hard drive and code, and control associated supply chain risks such as MCP servers, extensions, and skills.
 
 ## Local setup
 
@@ -133,12 +138,12 @@ openant project show              # details of active project
 openant project switch <org/repo> # switch active project
 ```
 
-
 ## LICENSE
+
 This project is licensed under Apache 2. See the LICENSE file for details.
 
-
 ## Disclaimer and legal notice
+
 This project is intended for defensive and research purposes only. OpenAnt is still in the research phase, use it carefully and at your own risk. Knostic, OpenAnt, and associated developers, researchers, and maintainers assume no responsibility whatsoever for any misuse, damage, or consequences arising from the use of this tool.
 
 Only scan code you own or have explicit permission to test. If you discover a vulnerability in someone else's project through legitimate means, please follow coordinated vulnerability disclosure practices and report it to the maintainers before making it public.

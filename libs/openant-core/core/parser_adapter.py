@@ -75,6 +75,7 @@ def parse_repository(
     processing_level: str = "reachable",
     skip_tests: bool = True,
     name: str = None,
+    diff_manifest: str | None = None,
 ) -> ParseResult:
     """Parse a repository into an OpenAnt dataset.
 
@@ -107,21 +108,85 @@ def parse_repository(
 
     # Dispatch to the right parser
     if language == "python":
-        return _parse_python(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_python(repo_path, output_dir, processing_level, skip_tests, name)
     elif language == "javascript":
-        return _parse_javascript(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_javascript(repo_path, output_dir, processing_level, skip_tests, name)
     elif language == "go":
-        return _parse_go(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_go(repo_path, output_dir, processing_level, skip_tests, name)
     elif language == "c":
-        return _parse_c(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_c(repo_path, output_dir, processing_level, skip_tests, name)
     elif language == "ruby":
-        return _parse_ruby(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_ruby(repo_path, output_dir, processing_level, skip_tests, name)
     elif language == "php":
-        return _parse_php(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_php(repo_path, output_dir, processing_level, skip_tests, name)
     elif language == "zig":
-        return _parse_zig(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_zig(repo_path, output_dir, processing_level, skip_tests, name)
     else:
         raise ValueError(f"Unsupported language: {language}")
+
+    _maybe_apply_diff_filter(result, output_dir, diff_manifest)
+    return result
+
+
+def _maybe_apply_diff_filter(
+    result: ParseResult,
+    output_dir: str,
+    diff_manifest: str | None,
+) -> None:
+    """Apply the diff filter to the dataset on disk if a manifest is provided.
+
+    Annotates every unit with `diff_selected: bool` and rewrites dataset.json.
+    Writes stats to {output_dir}/diff_filter.report.json for the step report
+    (picked up alongside parse.report.json). If `diff_manifest` is None and
+    no default manifest exists in output_dir, this is a no-op so legacy runs
+    behave exactly as before.
+    """
+    # Resolve manifest path: explicit arg wins, else look for the default.
+    if diff_manifest is None:
+        default = os.path.join(output_dir, "diff_manifest.json")
+        if os.path.exists(default):
+            diff_manifest = default
+    if not diff_manifest:
+        return
+
+    from core.diff_filter import apply_diff_filter, load_manifest
+
+    print(f"\n[Diff Filter] Loading manifest from {diff_manifest}", file=sys.stderr)
+    manifest = load_manifest(diff_manifest)
+
+    if not os.path.exists(result.dataset_path):
+        print(
+            f"  [Warning] dataset {result.dataset_path} not found; skipping diff filter",
+            file=sys.stderr,
+        )
+        return
+
+    with open(result.dataset_path, "r") as f:
+        dataset = json.load(f)
+
+    # Dataset may be a dict with "units" or a raw list.
+    if isinstance(dataset, dict):
+        units = dataset.get("units", [])
+    else:
+        units = dataset
+
+    stats = apply_diff_filter(units, manifest)
+
+    with open(result.dataset_path, "w") as f:
+        json.dump(dataset, f, indent=2)
+
+    # Expose stats on the ParseResult via a side-channel file; the parse
+    # step_context reads this when assembling parse.report.json.
+    diff_report_path = os.path.join(output_dir, "diff_filter.report.json")
+    with open(diff_report_path, "w") as f:
+        json.dump(stats.to_dict(), f, indent=2)
+
+    print(
+        f"  Diff filter ({stats.scope}): {stats.selected}/{stats.total} units selected"
+        + (f" ({stats.callers_added} added as callers)" if stats.callers_added else "")
+        + (f", {stats.fallback_file_match} fell back to file-level" if stats.fallback_file_match else ""),
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------

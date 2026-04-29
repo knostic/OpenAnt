@@ -10,6 +10,7 @@ OUTPUT FORMAT:
 **Repository:** {url}
 **Language:** {repository.language}
 **Commit:** {repository.commit_sha or "Not available"}
+**Scan Mode:** {scan_mode_line}
 **Analysis Date:** {date}
 **Application Type:** {app_type}
 **Processing Level:** {pipeline_stats.processing_level or "Not available"}
@@ -95,6 +96,12 @@ INSTRUCTIONS:
 - "Verified" column: "dynamic" if dynamic_testing exists for that finding, "verified" if stage2_verdict is "confirmed" or "agreed" (Stage 2 attacker simulation passed), else "static"
 - Language comes from repository.language
 - Commit SHA comes from repository.commit_sha; if null or missing, write "Not available"
+- Scan Mode is derived from the top-level `diff` field on the input data:
+  - If `diff` is missing or `diff.mode != "incremental"`, write: `Full`
+  - If `diff.mode == "incremental"`, write:
+    `Incremental ({diff.base_sha[:8]}..{diff.head_sha[:8]}, scope={diff.scope}, {diff.units_in_diff}/{diff.units_total_parsed} units)`
+  - When the scan was incremental, ALSO add a paragraph immediately after the metadata block:
+    `> This is an incremental scan. Only the {diff.units_in_diff}/{diff.units_total_parsed} unit(s) overlapping changes between {diff.base_sha[:8]} and {diff.head_sha[:8]} were analyzed. Findings on unchanged units inherit the most recent prior verdict and are not re-examined here.`
 - Processing Level comes from pipeline_stats.processing_level; if null or missing, write "Not available"
 - Reachable units comes from pipeline_stats.reachable_units; total units from pipeline_stats.total_units
 - Per-Step Costs: iterate pipeline_stats.costs; compute totals by summing estimated and actual

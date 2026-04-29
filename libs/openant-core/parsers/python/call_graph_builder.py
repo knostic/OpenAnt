@@ -35,6 +35,7 @@ import ast
 import json
 import re
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -176,7 +177,7 @@ class CallGraphBuilder:
         caller_class = caller_func.get('class_name')
 
         try:
-            tree = ast.parse(code)
+            tree = ast.parse(textwrap.dedent(code))
         except SyntaxError:
             # Fall back to regex-based extraction
             return self._extract_calls_regex(code, caller_id)

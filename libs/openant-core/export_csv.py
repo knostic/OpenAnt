@@ -27,7 +27,42 @@ Example:
 import argparse
 import csv
 import json
+import os
 import sys
+
+
+def _load_diff_block(experiment_path: str) -> dict | None:
+    """Look for the ``diff`` block in pipeline_output.json next to the
+    experiment file. Returns None for full scans / when not found.
+    Used to prepend an incremental-scan banner to CSV output.
+    """
+    exp_dir = os.path.dirname(os.path.abspath(experiment_path))
+    candidate = os.path.join(exp_dir, "pipeline_output.json")
+    if not os.path.exists(candidate):
+        return None
+    try:
+        with open(candidate) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    diff = data.get("diff")
+    if isinstance(diff, dict) and diff.get("mode") == "incremental":
+        return diff
+    return None
+
+
+def _format_diff_banner(diff: dict) -> str:
+    """Format the leading "# Incremental: ..." comment line for the CSV."""
+    base = (diff.get("base_sha") or "")[:8]
+    head = (diff.get("head_sha") or "")[:8]
+    units_in = diff.get("units_in_diff")
+    units_total = diff.get("units_total_parsed")
+    scope = diff.get("scope") or ""
+    units_str = ""
+    if units_in is not None and units_total is not None:
+        units_str = f", {units_in}/{units_total} units"
+    scope_str = f", scope={scope}" if scope else ""
+    return f"# Incremental: {base}..{head}{scope_str}{units_str}"
 
 
 def load_json(path: str) -> dict:
@@ -141,7 +176,14 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
         'agentic_classification'
     ]
 
+    diff = _load_diff_block(experiment_path)
+
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        if diff is not None:
+            # Comment line preceding the header — most CSV consumers
+            # (Excel, Google Sheets, pandas with comment='#') ignore it,
+            # while still being human-readable when opened raw.
+            f.write(_format_diff_banner(diff) + "\n")
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)

@@ -342,6 +342,15 @@ class ContextEnhancer:
             Enhanced dataset
         """
         units = dataset.get("units", [])
+
+        # Diff filter: honor diff_selected when set by the parse step.
+        # Keep units_by_id scoped to the original so callers lookup still works
+        # for units outside the diff scope.
+        if any("diff_selected" in u for u in units):
+            _pre = len(units)
+            units = [u for u in units if u.get("diff_selected")]
+            self._log("info", f"Diff filter: {_pre} -> {len(units)} units")
+
         total = len(units)
 
         self._log("info", f"Enhancing {total} units with LLM context (single-shot mode)", units=total)
@@ -465,6 +474,13 @@ class ContextEnhancer:
             Enhanced dataset with agent_context field
         """
         units = dataset.get("units", [])
+
+        # Diff filter: honor diff_selected when set by the parse step.
+        if any("diff_selected" in u for u in units):
+            _pre = len(units)
+            units = [u for u in units if u.get("diff_selected")]
+            self._log("info", f"Diff filter: {_pre} -> {len(units)} units")
+
         total = len(units)
 
         # Checkpoint directory setup

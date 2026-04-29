@@ -1,0 +1,13 @@
+# Case-insensitive fixed-string substrings that must NOT appear in tracked
+# file content on a public release branch. One pattern per line.
+# Lines starting with # and blank lines are ignored.
+# Used by scripts/check-public-release.sh.
+
+# Internal product name — must not leak into public source/docs
+sastinel
+
+# Jira ticket prefix — internal-only references
+KIR-
+
+# Dead-link references to internal-only docs
+docs/internal

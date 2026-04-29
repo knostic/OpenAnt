@@ -2,7 +2,7 @@
 
 All notable changes to OpenAnt are documented in this file.
 
-## [Unreleased]
+## [2026-04-29] — Python parser dedent fix
 
 ### Fixed
 

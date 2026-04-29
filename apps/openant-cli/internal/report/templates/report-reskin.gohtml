@@ -106,7 +106,15 @@
                     <h1 class="text-2xl sm:text-3xl lg:text-4xl font-bold text-knostic-navy mb-1">{{.Title}}</h1>
                     <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-knostic-muted mt-2">
                         {{if .RepoName}}<span title="Repository"><strong class="text-knostic-navy">{{.RepoName}}</strong></span>{{end}}
-                        {{if .ShortCommit}}<code class="text-xs bg-knostic-card-bg border border-knostic-border-light px-2 py-0.5 rounded text-knostic-navy">{{.ShortCommit}}</code>{{end}}
+                        {{if .IsIncremental}}
+                            <span class="inline-flex items-center gap-2">
+                                <span class="text-xs font-bold uppercase tracking-wider bg-knostic-purple text-white px-2 py-0.5 rounded">Incremental</span>
+                                <code class="text-xs bg-knostic-card-bg border border-knostic-border-light px-2 py-0.5 rounded text-knostic-navy" title="base..head">{{.DiffRange}}</code>
+                                <span class="text-xs text-knostic-muted" title="Diff scope: {{.Diff.Scope}}, {{.Diff.ChangedFiles}} file(s) changed">{{.Diff.UnitsInDiff}}/{{.Diff.UnitsTotalParsed}} units</span>
+                            </span>
+                        {{else if .ShortCommit}}
+                            <code class="text-xs bg-knostic-card-bg border border-knostic-border-light px-2 py-0.5 rounded text-knostic-navy">{{.ShortCommit}}</code>
+                        {{end}}
                         {{if .Language}}<span class="capitalize">{{.Language}}</span>{{end}}
                     </div>
                 </div>

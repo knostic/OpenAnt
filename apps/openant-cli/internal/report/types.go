@@ -26,6 +26,58 @@ type ReportData struct {
 	FindingsByVerdict []FindingGroup `json:"findings_by_verdict"`
 	StepReports       []StepReport   `json:"step_reports"`
 	Categories        []Category     `json:"categories"`
+	Diff              *DiffInfo      `json:"diff,omitempty"`
+}
+
+// DiffInfo carries the incremental-scan range info to the report templates.
+// Nil for full scans. Mirrors the "diff" block on pipeline_output.json,
+// trimmed to the fields the templates actually render.
+type DiffInfo struct {
+	Mode             string `json:"mode"` // "incremental"
+	BaseSHA          string `json:"base_sha"`
+	HeadSHA          string `json:"head_sha"`
+	Scope            string `json:"scope"`
+	UnitsInDiff      int    `json:"units_in_diff"`
+	UnitsTotalParsed int    `json:"units_total_parsed"`
+	ChangedFiles     int    `json:"changed_files"`
+	PRNumber         int    `json:"pr_number,omitempty"`
+}
+
+// IsIncremental reports whether this report is for an incremental scan.
+// Templates check this to decide between the "full" and "incremental"
+// header renderings.
+func (d ReportData) IsIncremental() bool {
+	return d.Diff != nil && d.Diff.Mode == "incremental"
+}
+
+// ShortBaseSHA returns the first 8 characters of the diff base SHA, or "".
+func (d ReportData) ShortBaseSHA() string {
+	if d.Diff == nil {
+		return ""
+	}
+	if len(d.Diff.BaseSHA) > 8 {
+		return d.Diff.BaseSHA[:8]
+	}
+	return d.Diff.BaseSHA
+}
+
+// ShortHeadSHA returns the first 8 characters of the diff head SHA, or "".
+func (d ReportData) ShortHeadSHA() string {
+	if d.Diff == nil {
+		return ""
+	}
+	if len(d.Diff.HeadSHA) > 8 {
+		return d.Diff.HeadSHA[:8]
+	}
+	return d.Diff.HeadSHA
+}
+
+// DiffRange returns the git-style "<base8>..<head8>" string, or "".
+func (d ReportData) DiffRange() string {
+	if d.Diff == nil {
+		return ""
+	}
+	return d.ShortBaseSHA() + ".." + d.ShortHeadSHA()
 }
 
 // SafeRemediation returns the remediation HTML as a template.HTML

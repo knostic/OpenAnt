@@ -65,6 +65,66 @@ def get_verdict_priority(verdict: str) -> int:
     return priorities.get(verdict, 3)
 
 
+def _short_sha(sha: str | None) -> str:
+    """Return the first 8 characters of a SHA, or empty if input is None."""
+    if not sha:
+        return ""
+    return sha[:8]
+
+
+def _load_pipeline_metadata(experiment_path: str) -> tuple[dict | None, dict | None]:
+    """Auto-detect pipeline_output.json next to the experiment file.
+
+    Returns (repository, diff) blocks or (None, None) if not found / unreadable.
+    Used to render repo identity and incremental-scan range in the HTML header.
+    """
+    exp_dir = os.path.dirname(os.path.abspath(experiment_path))
+    candidate = os.path.join(exp_dir, "pipeline_output.json")
+    if not os.path.exists(candidate):
+        return None, None
+    try:
+        with open(candidate, 'r') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None, None
+    return data.get("repository"), data.get("diff")
+
+
+def _build_header_subtitle(
+    timestamp: str,
+    repository: dict | None,
+    diff: dict | None,
+) -> str:
+    """Build the HTML header subtitle.
+
+    Full scan: "<repo> @ <sha8> · Generated <ts>"
+    Incremental: "<repo> · Incremental: <base8>..<head8> · N/M units · Generated <ts>"
+    No metadata: "Generated <ts>" (preserves prior behavior)
+    """
+    if not repository:
+        return f"Generated on {html.escape(timestamp)}"
+
+    repo_name = html.escape(repository.get("name") or "unknown")
+
+    if diff and diff.get("mode") == "incremental":
+        base = _short_sha(diff.get("base_sha"))
+        head = _short_sha(diff.get("head_sha"))
+        units_in = diff.get("units_in_diff")
+        units_total = diff.get("units_total_parsed")
+        units_str = ""
+        if units_in is not None and units_total is not None:
+            units_str = f" · {units_in}/{units_total} units"
+        return (
+            f'<span class="incremental-badge">Incremental</span> '
+            f'{repo_name} · {html.escape(base)}..{html.escape(head)}{html.escape(units_str)} · '
+            f'Generated {html.escape(timestamp)}'
+        )
+
+    sha = _short_sha(repository.get("commit_sha"))
+    sha_str = f" @ {html.escape(sha)}" if sha else ""
+    return f"{repo_name}{sha_str} · Generated {html.escape(timestamp)}"
+
+
 def get_verdict_color(verdict: str) -> str:
     """Get color for verdict."""
     colors = {
@@ -222,8 +282,16 @@ def generate_html_report(
     remediation_html: str,
     output_path: str,
     step_reports: list[dict] | None = None,
+    repository: dict | None = None,
+    diff: dict | None = None,
 ):
-    """Generate the HTML report."""
+    """Generate the HTML report.
+
+    repository / diff are usually loaded from pipeline_output.json by the
+    caller (see ``_load_pipeline_metadata``). When present, the header
+    renders the repo identity and, for incremental scans, the
+    base..head range.
+    """
     # Prepare data
     units_by_id = {u['id']: u for u in dataset.get('units', [])}
 
@@ -352,6 +420,20 @@ def generate_html_report(
         .subtitle {{
             color: var(--text-secondary);
             font-size: 1rem;
+        }}
+
+        .incremental-badge {{
+            display: inline-block;
+            background: var(--accent);
+            color: #fff;
+            padding: 0.1rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin-right: 0.5rem;
+            vertical-align: middle;
         }}
 
         .stats-grid {{
@@ -544,7 +626,7 @@ def generate_html_report(
     <div class="container">
         <header>
             <h1>Security Analysis Report</h1>
-            <p class="subtitle">Generated on {timestamp}</p>
+            <p class="subtitle">{_build_header_subtitle(timestamp, repository, diff)}</p>
         </header>
 
         <div class="stats-grid">
@@ -754,8 +836,18 @@ def main():
     print("Generating remediation guidance (calling LLM)...")
     remediation_html = generate_remediation_guidance(findings)
 
+    repository, diff = _load_pipeline_metadata(args.experiment)
+
     print("Building HTML report...")
-    generate_html_report(experiment, dataset, remediation_html, args.output, step_reports=step_reports)
+    generate_html_report(
+        experiment,
+        dataset,
+        remediation_html,
+        args.output,
+        step_reports=step_reports,
+        repository=repository,
+        diff=diff,
+    )
 
     # Print summary
     verdict_counts = {}

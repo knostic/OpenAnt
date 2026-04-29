@@ -32,6 +32,7 @@ Stage 2: Simulate an attacker to eliminate false positives
 
 Commands:
   scan          Full pipeline: parse → enhance → detect → verify → report
+  diff          Scan only code changed vs a base ref or GitHub PR
   parse         Extract code units from a repository
   enhance       Add security context to a parsed dataset
   analyze       Run Stage 1 vulnerability detection
@@ -79,6 +80,7 @@ func init() {
 
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(scanCmd)
+	rootCmd.AddCommand(diffCmd)
 	rootCmd.AddCommand(parseCmd)
 	rootCmd.AddCommand(enhanceCmd)
 	rootCmd.AddCommand(analyzeCmd)

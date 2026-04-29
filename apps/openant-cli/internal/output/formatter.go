@@ -345,6 +345,21 @@ func PrintScanSummaryV2(data map[string]any) {
 
 	PrintHeader("Scan Results")
 
+	// Mode line: surfaces incremental-scan range so the user sees
+	// "what was compared" without diving into pipeline_output.json.
+	if diff, ok := data["diff"].(map[string]any); ok && diff != nil {
+		if mode, _ := diff["mode"].(string); mode == "incremental" {
+			base := shortSHA8(diff["base_sha"])
+			head := shortSHA8(diff["head_sha"])
+			unitsIn := intFromAny(diff["units_in_diff"])
+			unitsTotal := intFromAny(diff["units_total_parsed"])
+			modeLine := fmt.Sprintf("Incremental (%s..%s, %d/%d units)", base, head, unitsIn, unitsTotal)
+			PrintKeyValue("Mode", modeLine)
+		} else {
+			PrintKeyValue("Mode", "Full")
+		}
+	}
+
 	total := intFromAny(metrics["total"])
 	vulnerable := intFromAny(metrics["vulnerable"])
 	bypassable := intFromAny(metrics["bypassable"])
@@ -448,6 +463,20 @@ func intFromAny(v any) int {
 	default:
 		return 0
 	}
+}
+
+// shortSHA8 returns the first 8 characters of a SHA from a JSON-decoded
+// string field. Returns "?" for missing/empty input so the rendered Mode
+// line never looks malformed.
+func shortSHA8(v any) string {
+	s, _ := v.(string)
+	if len(s) >= 8 {
+		return s[:8]
+	}
+	if s == "" {
+		return "?"
+	}
+	return s
 }
 
 // floatFromAny extracts a float64 from a JSON-decoded any value.

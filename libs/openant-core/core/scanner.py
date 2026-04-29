@@ -58,6 +58,7 @@ def scan_repository(
     repo_name: str | None = None,
     repo_url: str | None = None,
     commit_sha: str | None = None,
+    diff_manifest: str | None = None,
 ) -> ScanResult:
     """Scan a repository for vulnerabilities.
 
@@ -136,6 +137,7 @@ def scan_repository(
             language=language,
             processing_level=processing_level,
             skip_tests=skip_tests,
+            diff_manifest=diff_manifest,
         )
 
         ctx.summary = {
@@ -143,6 +145,14 @@ def scan_repository(
             "language": parse_result.language,
             "processing_level": parse_result.processing_level,
         }
+        # If the parse step generated a diff_stats report, attach it.
+        _diff_report = os.path.join(output_dir, "diff_filter.report.json")
+        if os.path.exists(_diff_report):
+            try:
+                with open(_diff_report) as _f:
+                    ctx.summary["diff_stats"] = json.load(_f)
+            except (json.JSONDecodeError, OSError):
+                pass
         ctx.outputs = {
             "dataset_path": parse_result.dataset_path,
             "analyzer_output_path": parse_result.analyzer_output_path,

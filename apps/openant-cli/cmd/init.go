@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/knostic/open-ant-cli/internal/config"
+	"github.com/knostic/open-ant-cli/internal/git"
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -32,15 +33,25 @@ Examples:
 }
 
 var (
-	initLanguage string
-	initCommit   string
-	initName     string
+	initLanguage    string
+	initCommit      string
+	initName        string
+	initFull        bool
+	initIncremental bool
+	initDiffBase    string
+	initPR          int
+	initDiffScope   string
 )
 
 func init() {
 	initCmd.Flags().StringVarP(&initLanguage, "language", "l", "", "Language to analyze: python, javascript, go, c, ruby, php (required)")
 	initCmd.Flags().StringVar(&initCommit, "commit", "", "Specific commit SHA (default: HEAD)")
 	initCmd.Flags().StringVar(&initName, "name", "", "Override project name (default: derived from URL/path)")
+	initCmd.Flags().BoolVar(&initFull, "full", false, "Force full scan (rejects --incremental/--diff-base/--pr)")
+	initCmd.Flags().BoolVar(&initIncremental, "incremental", false, "Incremental against the last successful scan on this project")
+	initCmd.Flags().StringVar(&initDiffBase, "diff-base", "", "Incremental against this ref (e.g. origin/main, HEAD~5)")
+	initCmd.Flags().IntVar(&initPR, "pr", 0, "Incremental against a GitHub PR number (requires gh; mutex with --diff-base)")
+	initCmd.Flags().StringVar(&initDiffScope, "diff-scope", "", "Diff scope: changed_files, changed_functions, callers (default changed_functions)")
 	_ = initCmd.MarkFlagRequired("language")
 }
 
@@ -159,6 +170,35 @@ func runInit(cmd *cobra.Command, args []string) {
 	if err := os.MkdirAll(scanDir, 0755); err != nil {
 		output.PrintError(fmt.Sprintf("Failed to create scan directory: %s", err))
 		os.Exit(1)
+	}
+
+	// Decide full vs incremental. selectMode handles flag validation,
+	// baseline lookup, TTY prompt, and non-TTY error.
+	decision, err := selectMode(modeOpts{
+		full:        initFull,
+		incremental: initIncremental,
+		diffBase:    initDiffBase,
+		pr:          initPR,
+		scope:       initDiffScope,
+		projectName: name,
+		repoPath:    repoPath,
+	})
+	if err != nil {
+		output.PrintError(err.Error())
+		os.Exit(2)
+	}
+
+	// Write scan-run meta.json reflecting the decision.
+	meta := config.NewScanMeta(
+		decision.Kind,
+		project.CommitSHA,
+		git.CurrentBranch(repoPath),
+		initLanguage,
+	)
+	meta.Base = decision.Base
+	meta.Scope = decision.Scope
+	if err := config.SaveScanMeta(name, project.CommitSHAShort, meta); err != nil {
+		output.PrintWarning(fmt.Sprintf("Failed to write scan meta: %s", err))
 	}
 
 	// Set as active project

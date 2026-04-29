@@ -335,6 +335,14 @@ def run_analysis(
 
     units = dataset.get("units", [])
 
+    # Diff filter: if upstream parse stamped diff_selected on units (PR-diff
+    # mode), drop the unselected ones. Pre-diff datasets have no field and
+    # are processed unchanged.
+    if any("diff_selected" in u for u in units):
+        _pre = len(units)
+        units = [u for u in units if u.get("diff_selected")]
+        print(f"[Analyze] Diff filter: {_pre} -> {len(units)} units", file=sys.stderr)
+
     # Optional: filter by enhancement security classification
     if exploitable_filter:
         original_count = len(units)
