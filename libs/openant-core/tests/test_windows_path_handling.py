@@ -161,15 +161,31 @@ def _load_pipeline_module(name, source_path):
     reliably remove it afterwards (via ``sys.modules.pop(name, None)``)
     to prevent stale module-level state — such as ``_UNICODE_OK`` and
     ``SYM_*`` globals — from leaking into subsequent tests.
+
+    ``sys.path`` is snapshot/restored around ``exec_module`` so that the
+    module-level ``sys.path.insert`` calls in the pipeline files do not
+    accumulate extra entries on repeated calls (e.g. across parametrized
+    test runs).
     """
     spec = importlib.util.spec_from_file_location(name, source_path)
     mod = importlib.util.module_from_spec(spec)
     # Register before exec so that relative imports inside the module
     # resolve correctly, and so callers can pop the module after use.
     sys.modules[name] = mod
-    # The pipeline modules import siblings via sys.path manipulation;
-    # let them do that as part of their normal import.
-    spec.loader.exec_module(mod)
+    # Snapshot sys.path so that module-level sys.path.insert calls inside
+    # the pipeline files do not leave behind permanent extra entries.
+    path_snapshot = sys.path[:]
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        # Roll back the registration so the failed module does not pollute
+        # sys.modules (CPython convention for importlib loaders).
+        sys.modules.pop(name, None)
+        raise
+    finally:
+        # Restore sys.path to prevent the module's own insertions from
+        # accumulating across repeated calls.
+        sys.path[:] = path_snapshot
     return mod
 
 
@@ -264,7 +280,7 @@ def test_pipeline_uses_unicode_when_stdout_supports_it(monkeypatch, mod_name, re
         # assertion failure messages are safe on cp1252 consoles — printing
         # the literal characters (U+2713, U+2717, U+2192) would itself raise
         # UnicodeEncodeError on the very platform these tests guard against.
-        assert mod.SYM_OK == "\u2713"    # CHECK MARK (U+2713)
+        assert mod.SYM_OK == "\u2713"  # CHECK MARK (U+2713)
         assert mod.SYM_FAIL == "\u2717"  # BALLOT X (U+2717)
         assert mod.SYM_ARROW == "\u2192"  # RIGHTWARDS ARROW (U+2192)
     finally:
