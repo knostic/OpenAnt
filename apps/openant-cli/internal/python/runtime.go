@@ -155,6 +155,16 @@ func checkPython(path string) (*RuntimeInfo, error) {
 // On success, it updates the RuntimeInfo to point to the venv Python.
 func CheckOpenantInstalled(pythonPath string) error {
 	if isOpenantImportable(pythonPath) {
+		// openant is already installed. Record the current pyproject.toml
+		// hash if we don't have one yet so existing users don't trigger a
+		// spurious reinstall on first run after upgrade. Best-effort only.
+		if readStoredHash() == "" {
+			if corePath, err := findOpenantCore(); err == nil {
+				if h, err := hashFile(filepath.Join(corePath, "pyproject.toml")); err == nil {
+					_ = writeStoredHash(h)
+				}
+			}
+		}
 		return nil
 	}
 
@@ -255,18 +265,43 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// readStoredHash reads the previously stored dependency hash, or "" if absent.
-func readStoredHash() string {
-	data, err := os.ReadFile(depsHashPath())
+// readHashAt reads a stored hash from the given path, or "" if absent.
+func readHashAt(path string) string {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
 }
 
+// writeHashAt saves a hash to the given path.
+func writeHashAt(path, hash string) error {
+	return os.WriteFile(path, []byte(hash+"\n"), 0644)
+}
+
+// readStoredHash reads the previously stored dependency hash, or "" if absent.
+func readStoredHash() string { return readHashAt(depsHashPath()) }
+
 // writeStoredHash saves the dependency hash to the venv marker file.
-func writeStoredHash(hash string) error {
-	return os.WriteFile(depsHashPath(), []byte(hash+"\n"), 0644)
+func writeStoredHash(hash string) error { return writeHashAt(depsHashPath(), hash) }
+
+// depsStalenessAt inspects pyproject.toml at corePath and the hash stored at
+// hashPath, and reports whether a reinstall is needed. The boolean is true
+// when deps are stale (i.e. the hash differs and a reinstall is warranted).
+// The caller is expected to skip the check on any error.
+func depsStalenessAt(corePath, hashPath string) (stale bool, currentHash string, err error) {
+	pyprojectPath := filepath.Join(corePath, "pyproject.toml")
+	currentHash, err = hashFile(pyprojectPath)
+	if err != nil {
+		return false, "", err
+	}
+	return currentHash != readHashAt(hashPath), currentHash, nil
+}
+
+// depsStaleness is the production wrapper around depsStalenessAt that uses
+// the real venv hash path.
+func depsStaleness(corePath string) (stale bool, currentHash string, err error) {
+	return depsStalenessAt(corePath, depsHashPath())
 }
 
 // CheckDepsStale checks if pyproject.toml has changed since the last install.
@@ -279,15 +314,12 @@ func CheckDepsStale(pythonPath string) error {
 		return nil
 	}
 
-	pyprojectPath := filepath.Join(corePath, "pyproject.toml")
-	currentHash, err := hashFile(pyprojectPath)
+	stale, currentHash, err := depsStaleness(corePath)
 	if err != nil {
 		// Can't read pyproject.toml — skip check
 		return nil
 	}
-
-	storedHash := readStoredHash()
-	if currentHash == storedHash {
+	if !stale {
 		return nil // deps are up-to-date
 	}
 

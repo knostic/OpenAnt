@@ -120,52 +120,167 @@ func TestHashFile_DifferentContent(t *testing.T) {
 // readStoredHash / writeStoredHash
 // ---------------------------------------------------------------------------
 
-// testDepsHashPath overrides the venv dir for testing by writing directly
-// to a known path. Since readStoredHash/writeStoredHash use depsHashPath()
-// which depends on the user's home dir, we test the underlying logic with
-// direct file operations that mirror the implementation.
+// readStoredHash / writeStoredHash delegate to readHashAt/writeHashAt with
+// a path under the user's real ~/.openant/venv/. The tests exercise the
+// underlying readHashAt/writeHashAt helpers directly to avoid touching the
+// real venv directory.
 
-func TestWriteAndReadStoredHash_RoundTrip(t *testing.T) {
+func TestWriteAndReadHashAt_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".deps-hash")
 
 	hash := "abc123def456"
-	if err := os.WriteFile(path, []byte(hash+"\n"), 0644); err != nil {
-		t.Fatal(err)
+	if err := writeHashAt(path, hash); err != nil {
+		t.Fatalf("writeHashAt: %v", err)
 	}
 
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	got := string(data)
-	if got != hash+"\n" {
-		t.Errorf("round-trip failed: got %q, want %q", got, hash+"\n")
+	got := readHashAt(path)
+	if got != hash {
+		t.Errorf("readHashAt = %q, want %q (trailing newline should be trimmed)", got, hash)
 	}
 }
 
-func TestReadStoredHash_MissingFile(t *testing.T) {
-	// readStoredHash returns "" for missing file
-	got := readStoredHash()
-	// This reads from the real depsHashPath which may or may not exist.
-	// We just verify it doesn't panic and returns a string.
-	_ = got
+func TestReadHashAt_MissingFile_ReturnsEmpty(t *testing.T) {
+	got := readHashAt(filepath.Join(t.TempDir(), "nonexistent"))
+	if got != "" {
+		t.Errorf("readHashAt missing file = %q, want \"\"", got)
+	}
 }
 
-func TestReadStoredHash_ReturnsEmpty_WhenNoVenv(t *testing.T) {
-	// If the venv dir doesn't exist, readStoredHash should return ""
-	// without error. We can't easily override venvDir() but we verify
-	// that reading a nonexistent file returns "".
+func TestReadHashAt_TrimsWhitespace(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "nonexistent", ".deps-hash")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		// Expected — file doesn't exist
-		return
+	path := filepath.Join(dir, ".deps-hash")
+	if err := os.WriteFile(path, []byte("  abc\n\n"), 0644); err != nil {
+		t.Fatal(err)
 	}
-	// If somehow it does exist, it should be empty or a hash
-	_ = data
+	if got := readHashAt(path); got != "abc" {
+		t.Errorf("readHashAt = %q, want %q", got, "abc")
+	}
+}
+
+func TestReadStoredHash_DoesNotPanic(t *testing.T) {
+	// Smoke test: reading from the real ~/.openant/venv/.deps-hash must
+	// not panic regardless of whether the file exists.
+	_ = readStoredHash()
+}
+
+// ---------------------------------------------------------------------------
+// depsStalenessAt — covers the trigger detection logic without invoking pip
+// ---------------------------------------------------------------------------
+
+// writeFakeCore creates a minimal pyproject.toml under a fake core dir and
+// returns the core dir path.
+func writeFakeCore(t *testing.T, contents string) string {
+	t.Helper()
+	core := t.TempDir()
+	if err := os.WriteFile(filepath.Join(core, "pyproject.toml"), []byte(contents), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return core
+}
+
+func TestDepsStalenessAt_FreshState_NoHashStored_IsStale(t *testing.T) {
+	core := writeFakeCore(t, "[project]\nname = \"x\"\n")
+	hashPath := filepath.Join(t.TempDir(), ".deps-hash")
+
+	stale, cur, err := depsStalenessAt(core, hashPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stale {
+		t.Error("expected stale=true when no hash has been stored")
+	}
+	if cur == "" {
+		t.Error("expected non-empty current hash")
+	}
+}
+
+func TestDepsStalenessAt_MatchingHash_NotStale(t *testing.T) {
+	core := writeFakeCore(t, "[project]\nname = \"x\"\n")
+	hashPath := filepath.Join(t.TempDir(), ".deps-hash")
+
+	// First call: capture the hash and write it out.
+	_, cur, err := depsStalenessAt(core, hashPath)
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if err := writeHashAt(hashPath, cur); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second call: hash matches, should not be stale.
+	stale, _, err := depsStalenessAt(core, hashPath)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if stale {
+		t.Error("expected stale=false when stored hash matches current")
+	}
+}
+
+func TestDepsStalenessAt_ModifiedPyproject_IsStale(t *testing.T) {
+	core := writeFakeCore(t, "[project]\nname = \"x\"\nversion = \"0.1\"\n")
+	hashPath := filepath.Join(t.TempDir(), ".deps-hash")
+
+	_, originalHash, err := depsStalenessAt(core, hashPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeHashAt(hashPath, originalHash); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutate pyproject.toml — simulating a `git pull` that bumped a dep.
+	if err := os.WriteFile(
+		filepath.Join(core, "pyproject.toml"),
+		[]byte("[project]\nname = \"x\"\nversion = \"0.2\"\ndependencies = [\"requests\"]\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, newHash, err := depsStalenessAt(core, hashPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale {
+		t.Error("expected stale=true after pyproject.toml was modified")
+	}
+	if newHash == originalHash {
+		t.Error("expected new hash to differ from original after content change")
+	}
+}
+
+func TestDepsStalenessAt_MissingPyproject_ReturnsError(t *testing.T) {
+	core := t.TempDir() // no pyproject.toml inside
+	hashPath := filepath.Join(t.TempDir(), ".deps-hash")
+
+	stale, _, err := depsStalenessAt(core, hashPath)
+	if err == nil {
+		t.Error("expected error when pyproject.toml is missing")
+	}
+	if stale {
+		t.Error("expected stale=false on error")
+	}
+}
+
+func TestDepsStalenessAt_StoredHashEqualsEmpty_StillStale(t *testing.T) {
+	// If the hash file is present but empty (e.g. truncated write), the
+	// stored hash trims to "" and we should treat the deps as stale so the
+	// next run heals the state by reinstalling.
+	core := writeFakeCore(t, "[project]\nname = \"x\"\n")
+	hashPath := filepath.Join(t.TempDir(), ".deps-hash")
+	if err := os.WriteFile(hashPath, []byte("\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, _, err := depsStalenessAt(core, hashPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale {
+		t.Error("expected stale=true when stored hash is empty")
+	}
 }
 
 // ---------------------------------------------------------------------------
