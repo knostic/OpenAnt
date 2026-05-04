@@ -134,6 +134,8 @@ class TestParse:
                 pytest.skip("Go CLI using system Python without required packages (Windows)")
             else:
                 pytest.fail("Go CLI resolved wrong Python (missing required packages)")
+        if result.returncode != 0 and "UnicodeEncodeError" in result.stderr:
+            pytest.fail("UnicodeEncodeError from JS parser (unexpected regression)")
         assert result.returncode == 0
         envelope = json.loads(result.stdout)
         assert envelope["status"] == "success"

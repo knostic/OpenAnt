@@ -30,6 +30,11 @@ JS_NODE_MODULES = JS_PARSERS_DIR / "node_modules"
 
 
 @pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="backslash path simulation only meaningful on Windows; "
+    "replacing all forward slashes produces a non-absolute path on POSIX",
+)
+@pytest.mark.skipif(
     not shutil.which("node") or not JS_NODE_MODULES.exists(),
     reason="Node.js or JS parser npm dependencies not available",
 )
@@ -40,8 +45,9 @@ def test_typescript_analyzer_accepts_backslash_paths(tmp_path):
     separated by ``\\``. ts-morph treats backslash as an escape character
     when matching paths it has already added, so without explicit
     normalisation the analyzer reports zero functions even for valid input.
-    We simulate this on any platform by writing a file list with backslash
-    separators and asserting the analyzer still finds the function.
+    This test only runs on Windows because a Linux/macOS absolute path
+    (``/tmp/...``) with all slashes replaced becomes ``\\tmp\\...`` which
+    Node does not treat as absolute, making the test unsound on POSIX.
     """
     # Create a simple repo
     repo = tmp_path / "repo"
@@ -190,6 +196,10 @@ def pipeline_module(request, monkeypatch):
         mod = _load_pipeline_module(mod_name, path)
         yield mod
     finally:
+        # Remove the freshly loaded module so its stale cp1252-patched
+        # module-level state (_UNICODE_OK, SYM_*) doesn't leak into later
+        # tests that may load the same pipeline module.
+        sys.modules.pop(mod_name, None)
         try:
             sys.path.remove(str(parsers_root.parent))
         except ValueError:
@@ -214,8 +224,19 @@ def test_pipeline_uses_ascii_fallback_on_cp1252_stdout(pipeline_module):
         s.encode("cp1252")  # must not raise
 
 
-def test_pipeline_uses_unicode_when_stdout_supports_it(monkeypatch):
-    """When stdout can encode the symbols, prefer the prettier Unicode form."""
+@pytest.mark.parametrize(
+    "mod_name,rel_path",
+    [
+        ("openant_test_js_pipeline_utf8", "javascript/test_pipeline.py"),
+        ("openant_test_go_pipeline_utf8", "go/test_pipeline.py"),
+    ],
+)
+def test_pipeline_uses_unicode_when_stdout_supports_it(monkeypatch, mod_name, rel_path):
+    """When stdout can encode the symbols, prefer the prettier Unicode form.
+
+    Covers both the JS and Go pipeline modules to ensure neither regresses
+    to ASCII when the terminal supports Unicode.
+    """
     # Reload under a UTF-8 stdout to confirm the other branch.
     fake_stdout = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", newline="")
     monkeypatch.setattr(sys, "stdout", fake_stdout)
@@ -223,16 +244,14 @@ def test_pipeline_uses_unicode_when_stdout_supports_it(monkeypatch):
     parsers_root = PARSERS_DIR
     sys.path.insert(0, str(parsers_root.parent))
     try:
-        sys.modules.pop("openant_test_js_pipeline_utf8", None)
-        mod = _load_pipeline_module(
-            "openant_test_js_pipeline_utf8",
-            parsers_root / "javascript" / "test_pipeline.py",
-        )
+        sys.modules.pop(mod_name, None)
+        mod = _load_pipeline_module(mod_name, parsers_root / rel_path)
         assert mod._UNICODE_OK is True
         assert mod.SYM_OK == "✓"
         assert mod.SYM_FAIL == "✗"
         assert mod.SYM_ARROW == "→"
     finally:
+        sys.modules.pop(mod_name, None)
         try:
             sys.path.remove(str(parsers_root.parent))
         except ValueError:
