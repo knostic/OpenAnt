@@ -50,7 +50,7 @@ var (
 )
 
 func init() {
-	initCmd.Flags().StringVarP(&initLanguage, "language", "l", "", "Language to analyze: python, javascript, go, c, ruby, php, auto (default: auto-detect)")
+	initCmd.Flags().StringVarP(&initLanguage, "language", "l", "", "Language to analyze: python, javascript, go, c, ruby, php, zig, auto (default: auto-detect)")
 	initCmd.Flags().StringVar(&initCommit, "commit", "", "Specific commit SHA (default: HEAD)")
 	initCmd.Flags().StringVar(&initName, "name", "", "Override project name (default: derived from URL/path)")
 	initCmd.Flags().BoolVar(&initFull, "full", false, "Force full scan (rejects --incremental/--diff-base/--pr)")
@@ -363,7 +363,7 @@ func detectLanguage(repoPath string) (string, error) {
 	if bestLang == "" {
 		return "", fmt.Errorf(
 			"no supported source files found in %s. "+
-				"Supported languages: Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP",
+				"Supported languages: Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Zig",
 			repoPath,
 		)
 	}

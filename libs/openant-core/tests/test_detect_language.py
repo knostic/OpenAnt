@@ -65,6 +65,33 @@ class TestDetectLanguageGo:
         assert detect_language(str(tmp_path)) == "go"
 
 
+class TestDetectLanguageMixed:
+    """Mixed-language repos must report the dominant language by file count.
+
+    Unlike the per-language classes above which lean on skip_dirs to mask
+    competing extensions, these cases place real source from two languages
+    side-by-side at the root so the dominance heuristic itself is exercised.
+    """
+
+    def test_ts_dominant_over_python_at_root(self, tmp_path: Path) -> None:
+        # 6 TS source files vs 4 Python tooling files at the same level —
+        # mirrors a typical Node project that ships a few Python build
+        # scripts. No skip_dirs trickery involved.
+        for i in range(6):
+            _write(tmp_path / "src" / f"mod_{i}.ts")
+        for i in range(4):
+            _write(tmp_path / "scripts" / f"tool_{i}.py")
+        assert detect_language(str(tmp_path)) == "javascript"
+
+    def test_python_dominant_over_javascript_at_root(self, tmp_path: Path) -> None:
+        # Inverse case: Python repo with a small JS frontend.
+        for i in range(7):
+            _write(tmp_path / f"pkg_{i}.py")
+        for i in range(3):
+            _write(tmp_path / "frontend" / f"page_{i}.js")
+        assert detect_language(str(tmp_path)) == "python"
+
+
 class TestDetectLanguageSkipDirs:
     def test_node_modules_ignored(self, tmp_path: Path) -> None:
         # Two real .py files at the root, plus a noisy node_modules tree.
