@@ -12,8 +12,8 @@ import (
 var generateContextCmd = &cobra.Command{
 	Use:   "generate-context [repository-path]",
 	Short: "Generate application security context for a repository",
-	Long: `Generate analyzes a repository and produces an application_context.json
-file that describes the application type, trust boundaries, intended
+	Long: `Analyzes a repository and produces an application_context.json file
+that describes the application type, trust boundaries, intended
 behaviors, and patterns that should not be flagged as vulnerabilities.
 
 This context is automatically used by the analyze and verify commands
