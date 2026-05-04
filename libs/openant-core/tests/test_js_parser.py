@@ -6,7 +6,6 @@ Requires Node.js and npm dependencies installed:
 import json
 import subprocess
 import shutil
-import sys
 from pathlib import Path
 
 import pytest
@@ -66,13 +65,6 @@ class TestRepositoryScanner:
 
 
 class TestTypeScriptAnalyzer:
-    # Known issue: ts-morph fails to resolve files with backslash paths on Windows
-    _windows_path_xfail = pytest.mark.xfail(
-        sys.platform == "win32",
-        reason="ts-morph path resolution issue with Windows backslash paths",
-        strict=False,
-    )
-
     def test_analyzes_files(self, sample_js_repo, tmp_path):
         # First scan to get file list
         scan_output = tmp_path / "scan.json"
@@ -94,7 +86,6 @@ class TestTypeScriptAnalyzer:
         assert result.returncode == 0
         assert analyzer_output.exists()
 
-    @_windows_path_xfail
     def test_extracts_functions(self, sample_js_repo, tmp_path):
         scan_output = tmp_path / "scan.json"
         run_node("repository_scanner.js", sample_js_repo, "--output", str(scan_output))
@@ -190,14 +181,6 @@ class TestUnitGenerator:
 class TestFullPipeline:
     """End-to-end test through parser_adapter."""
 
-    # Known issue: test_pipeline.py uses Unicode checkmarks that fail on Windows cp1252
-    _windows_unicode_xfail = pytest.mark.xfail(
-        sys.platform == "win32",
-        reason="JS test_pipeline.py Unicode chars fail on Windows cp1252 encoding",
-        strict=False,
-    )
-
-    @_windows_unicode_xfail
     def test_parse_js_repo(self, sample_js_repo, tmp_output_dir):
         from core.parser_adapter import parse_repository
 
@@ -213,7 +196,6 @@ class TestFullPipeline:
         assert result.analyzer_output_path is not None
         assert Path(result.analyzer_output_path).exists()
 
-    @_windows_unicode_xfail
     def test_auto_detects_javascript(self, sample_js_repo, tmp_output_dir):
         from core.parser_adapter import parse_repository
 

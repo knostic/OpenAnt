@@ -30,6 +30,21 @@ const { ts } = require("@ts-morph/common");
 const path = require("path");
 
 /**
+ * Convert a filesystem path to forward slashes.
+ *
+ * ts-morph stores source-file paths internally with forward slashes and
+ * also treats backslashes as escape characters when matching paths it
+ * has already added. On Windows, Node's `path.relative()` and
+ * `path.resolve()` return backslash-separated paths, which causes
+ * ts-morph to silently fail to find any files (resulting in 0 functions
+ * extracted). Always normalise to forward slashes before handing paths
+ * to ts-morph or storing them as functionId components.
+ */
+function toPosixPath(p) {
+  return p.replace(/\\/g, "/");
+}
+
+/**
  * Maximally permissive compiler options for AST extraction.
  * We use ESNext target/module to accept ALL valid JS/TS syntax
  * regardless of what the project actually targets.
@@ -136,10 +151,15 @@ class TypeScriptAnalyzer {
         ? filePath
         : path.join(this.repoPath, filePath);
 
+      // ts-morph treats backslashes as escape characters when matching
+      // paths it has already added. Normalise to forward slashes so
+      // Windows-native paths (with `\`) resolve consistently.
+      const normalised = toPosixPath(fullPath);
+
       try {
-        this.project.addSourceFileAtPath(fullPath);
+        this.project.addSourceFileAtPath(normalised);
       } catch (error) {
-        console.error(`Failed to add file ${fullPath}: ${error.message}`);
+        console.error(`Failed to add file ${normalised}: ${error.message}`);
       }
     }
 
@@ -163,7 +183,12 @@ class TypeScriptAnalyzer {
    * Extract all functions/methods from a source file
    */
   extractFunctionsFromFile(sourceFile) {
-    const relativePath = path.relative(this.repoPath, sourceFile.getFilePath());
+    // Always emit POSIX-style relative paths so functionId values are
+    // stable across platforms (Python downstream consumers and dataset
+    // diffs key off these strings).
+    const relativePath = toPosixPath(
+      path.relative(this.repoPath, sourceFile.getFilePath()),
+    );
 
     // Extract function declarations
     for (const func of sourceFile.getFunctions()) {
@@ -407,7 +432,9 @@ class TypeScriptAnalyzer {
    * For each function, find what other functions it calls
    */
   buildCallGraphForFile(sourceFile) {
-    const relativePath = path.relative(this.repoPath, sourceFile.getFilePath());
+    const relativePath = toPosixPath(
+      path.relative(this.repoPath, sourceFile.getFilePath()),
+    );
 
     // Analyze function declarations
     for (const func of sourceFile.getFunctions()) {
@@ -889,9 +916,14 @@ if (require.main === module) {
             process.exit(1);
           }
           const content = fs.readFileSync(listFile, "utf-8");
+          // Split on either CRLF or LF and trim residual whitespace so
+          // file lists written on Windows (with \r\n line endings) don't
+          // leave a trailing \r on each path, which would make
+          // addSourceFileAtPath fail.
           filePaths = content
-            .split("\n")
-            .filter((line) => line.trim().length > 0);
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0);
           console.error(`Loaded ${filePaths.length} files from ${listFile}`);
           i += 2;
         } else if (args[i] === "--output" && i + 1 < args.length) {

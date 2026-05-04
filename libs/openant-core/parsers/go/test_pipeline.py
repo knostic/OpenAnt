@@ -43,6 +43,24 @@ from enum import Enum
 from pathlib import Path
 from typing import Set
 
+
+def _stdout_supports_unicode() -> bool:
+    """Return True if sys.stdout can emit the symbols we use for status."""
+    encoding = getattr(sys.stdout, "encoding", None) or ""
+    try:
+        # Probe with the actual symbols we emit. This catches cp1252 and
+        # other limited code pages without us having to enumerate them.
+        "✓✗→".encode(encoding)
+        return True
+    except (UnicodeEncodeError, LookupError):
+        return False
+
+
+_UNICODE_OK = _stdout_supports_unicode()
+SYM_OK = "✓" if _UNICODE_OK else "OK"
+SYM_FAIL = "✗" if _UNICODE_OK else "FAIL"
+SYM_ARROW = "→" if _UNICODE_OK else "->"
+
 # Add parent directory to path for utilities import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from utilities.context_enhancer import ContextEnhancer
@@ -158,7 +176,7 @@ class GoPipelineTest:
             }
 
             if result.returncode == 0:
-                print(f"✓ Success ({elapsed:.2f}s)")
+                print(f"{SYM_OK} Success ({elapsed:.2f}s)")
                 print()
                 # Print stderr (often contains summary info)
                 if result.stderr:
@@ -172,7 +190,7 @@ class GoPipelineTest:
                         data = json.load(f)
                     stage_result['summary'] = self._summarize_output(name, data)
             else:
-                print(f"✗ Failed (exit code {result.returncode})")
+                print(f"{SYM_FAIL} Failed (exit code {result.returncode})")
                 print()
                 if result.stderr:
                     print("STDERR:")
@@ -185,7 +203,7 @@ class GoPipelineTest:
 
         except Exception as e:
             elapsed = (datetime.now() - start_time).total_seconds()
-            print(f"✗ Error: {e}")
+            print(f"{SYM_FAIL} Error: {e}")
             return {
                 'success': False,
                 'elapsed_seconds': elapsed,
@@ -378,9 +396,9 @@ class GoPipelineTest:
                 'summary': summary
             }
 
-            print(f"✓ Success ({elapsed:.2f}s)")
+            print(f"{SYM_OK} Success ({elapsed:.2f}s)")
             print(f"  Entry points detected: {len(self.entry_points)}")
-            print(f"  Units: {original_count} → {len(filtered_units)} ({summary['reduction_percentage']}% reduction)")
+            print(f"  Units: {original_count} {SYM_ARROW} {len(filtered_units)} ({summary['reduction_percentage']}% reduction)")
             print()
 
             self.results['stages']['reachability_filter'] = result
@@ -388,7 +406,7 @@ class GoPipelineTest:
 
         except Exception as e:
             elapsed = (datetime.now() - start_time).total_seconds()
-            print(f"✗ Error: {e}")
+            print(f"{SYM_FAIL} Error: {e}")
             import traceback
             traceback.print_exc()
             result = {
@@ -442,7 +460,7 @@ class GoPipelineTest:
             )
 
             if result.returncode != 0:
-                print(f"✗ CodeQL database creation failed")
+                print(f"{SYM_FAIL} CodeQL database creation failed")
                 print(f"  stderr: {result.stderr[:500] if result.stderr else 'none'}")
                 elapsed = (datetime.now() - start_time).total_seconds()
                 self.results['stages']['codeql_analysis'] = {
@@ -473,7 +491,7 @@ class GoPipelineTest:
             )
 
             if result.returncode != 0:
-                print(f"✗ CodeQL analysis failed")
+                print(f"{SYM_FAIL} CodeQL analysis failed")
                 print(f"  stderr: {result.stderr[:500] if result.stderr else 'none'}")
                 elapsed = (datetime.now() - start_time).total_seconds()
                 self.results['stages']['codeql_analysis'] = {
@@ -489,7 +507,7 @@ class GoPipelineTest:
             # Step 3: Parse SARIF output
             print("Parsing results...")
             if not os.path.exists(sarif_output):
-                print("✗ SARIF output not found")
+                print("{SYM_FAIL} SARIF output not found")
                 elapsed = (datetime.now() - start_time).total_seconds()
                 self.results['stages']['codeql_analysis'] = {
                     'success': False,
@@ -550,7 +568,7 @@ class GoPipelineTest:
                 'summary': summary
             }
 
-            print(f"✓ Success ({elapsed:.2f}s)")
+            print(f"{SYM_OK} Success ({elapsed:.2f}s)")
             print(f"  Total findings: {len(self.codeql_findings)}")
             print(f"  Unique files: {summary['unique_files']}")
             if summary['by_level']:
@@ -562,7 +580,7 @@ class GoPipelineTest:
 
         except FileNotFoundError:
             elapsed = (datetime.now() - start_time).total_seconds()
-            print("✗ CodeQL not found. Please install CodeQL CLI.")
+            print("{SYM_FAIL} CodeQL not found. Please install CodeQL CLI.")
             print("  See: https://docs.github.com/en/code-security/codeql-cli")
             self.results['stages']['codeql_analysis'] = {
                 'success': False,
@@ -573,7 +591,7 @@ class GoPipelineTest:
 
         except subprocess.TimeoutExpired:
             elapsed = (datetime.now() - start_time).total_seconds()
-            print("✗ CodeQL analysis timed out")
+            print("{SYM_FAIL} CodeQL analysis timed out")
             self.results['stages']['codeql_analysis'] = {
                 'success': False,
                 'elapsed_seconds': elapsed,
@@ -583,7 +601,7 @@ class GoPipelineTest:
 
         except Exception as e:
             elapsed = (datetime.now() - start_time).total_seconds()
-            print(f"✗ Error: {e}")
+            print(f"{SYM_FAIL} Error: {e}")
             import traceback
             traceback.print_exc()
             self.results['stages']['codeql_analysis'] = {
@@ -695,10 +713,10 @@ class GoPipelineTest:
                 'summary': summary
             }
 
-            print(f"✓ Success ({elapsed:.2f}s)")
+            print(f"{SYM_OK} Success ({elapsed:.2f}s)")
             print(f"  CodeQL findings: {len(self.codeql_findings)}")
             print(f"  Flagged function units: {len(self.codeql_flagged_units)}")
-            print(f"  Units: {original_count} → {len(filtered_units)} ({summary['reduction_percentage']}% reduction)")
+            print(f"  Units: {original_count} {SYM_ARROW} {len(filtered_units)} ({summary['reduction_percentage']}% reduction)")
             print()
 
             self.results['stages']['codeql_filter'] = result
@@ -706,7 +724,7 @@ class GoPipelineTest:
 
         except Exception as e:
             elapsed = (datetime.now() - start_time).total_seconds()
-            print(f"✗ Error: {e}")
+            print(f"{SYM_FAIL} Error: {e}")
             import traceback
             traceback.print_exc()
             result = {
@@ -784,14 +802,14 @@ class GoPipelineTest:
             }
 
             print()
-            print(f"✓ Success ({elapsed:.2f}s)")
+            print(f"{SYM_OK} Success ({elapsed:.2f}s)")
 
             self.results['stages']['context_enhancer'] = result
             return True
 
         except Exception as e:
             elapsed = (datetime.now() - start_time).total_seconds()
-            print(f"✗ Error: {e}")
+            print(f"{SYM_FAIL} Error: {e}")
             import traceback
             traceback.print_exc()
             result = {
@@ -873,12 +891,12 @@ class GoPipelineTest:
                 'summary': summary
             }
 
-            print(f"✓ Success ({elapsed:.2f}s)")
+            print(f"{SYM_OK} Success ({elapsed:.2f}s)")
             print(f"  Classification breakdown:")
             for cls, count in sorted(classification_counts.items()):
-                marker = "→" if cls == "exploitable" else " "
+                marker = "{SYM_ARROW}" if cls == "exploitable" else " "
                 print(f"    {marker} {cls}: {count}")
-            print(f"  Units: {original_count} → {len(filtered_units)} ({summary['reduction_percentage']}% reduction)")
+            print(f"  Units: {original_count} {SYM_ARROW} {len(filtered_units)} ({summary['reduction_percentage']}% reduction)")
             print()
 
             self.results['stages']['exploitable_filter'] = result
@@ -886,7 +904,7 @@ class GoPipelineTest:
 
         except Exception as e:
             elapsed = (datetime.now() - start_time).total_seconds()
-            print(f"✗ Error: {e}")
+            print(f"{SYM_FAIL} Error: {e}")
             import traceback
             traceback.print_exc()
             result = {
@@ -966,13 +984,13 @@ class GoPipelineTest:
         self.results['success'] = all_success
 
         if all_success:
-            print("✓ All stages completed successfully")
+            print("{SYM_OK} All stages completed successfully")
         else:
-            print("✗ Some stages failed")
+            print("{SYM_FAIL} Some stages failed")
 
         print()
         for stage_name, stage_result in self.results['stages'].items():
-            status = "✓" if stage_result.get('success') else "✗"
+            status = "{SYM_OK}" if stage_result.get('success') else "{SYM_FAIL}"
             elapsed = stage_result.get('elapsed_seconds', 0)
             print(f"  {status} {stage_name}: {elapsed:.2f}s")
 
