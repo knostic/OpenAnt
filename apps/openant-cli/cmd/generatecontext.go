@@ -29,8 +29,8 @@ Use --force to skip the manual override check.`,
 }
 
 var (
-	gcOutput    string
-	gcForce     bool
+	gcOutput     string
+	gcForce      bool
 	gcShowPrompt bool
 )
 
