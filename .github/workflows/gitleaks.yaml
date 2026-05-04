@@ -2,7 +2,7 @@ name: gitleaks
 on:
   push:
     branches: [master]
-  pull_request:
+  pull_request_target:
 jobs:
   scan:
     name: gitleaks
@@ -17,6 +17,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Set scan range
         id: range
         env:
@@ -26,7 +27,7 @@ jobs:
           FORCED: ${{ github.event.forced }}
         run: |
           NULL_SHA="0000000000000000000000000000000000000000"
-          if [ "$EVENT" = "pull_request" ]; then
+          if [ "$EVENT" = "pull_request_target" ]; then
             echo "log_opts=${BASE_SHA}..HEAD" >> $GITHUB_OUTPUT
           elif [ "$BEFORE_SHA" = "$NULL_SHA" ] || [ -z "$BEFORE_SHA" ] || [ "$FORCED" = "true" ]; then
             echo "log_opts=" >> $GITHUB_OUTPUT
