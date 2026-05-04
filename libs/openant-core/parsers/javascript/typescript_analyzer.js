@@ -240,6 +240,149 @@ class TypeScriptAnalyzer {
     // Extract functions from module.exports.propertyName = function() {...}
     // Pattern used by DVNA and similar CommonJS codebases
     this._extractModuleExportsPropertyFunctions(sourceFile, relativePath);
+
+    // Extract anonymous arrow / function-expression callbacks passed to
+    // Express.js style route registrations. Without this pass the parser
+    // misses the actual handler bodies whenever a codebase uses the
+    // idiomatic `router.post('/x', handler, async (req, res) => {...})`
+    // pattern, which is the bug reported in
+    // https://github.com/knostic/OpenAnt/issues/21.
+    this._extractRouteHandlerCallbacks(sourceFile, relativePath);
+  }
+
+  /**
+   * Express verbs that take a path-string and one or more handler
+   * callbacks. `use` is included because `app.use('/api', (req, res, next) => …)`
+   * is a common middleware mounting pattern. `all` is the Express
+   * "match every method" wildcard.
+   *
+   * Hapi / Koa / Fastify use a different shape (object literal with a
+   * `handler` property rather than a positional callback) and would need
+   * separate detection — out of scope for the #21 fix.
+   */
+  static _expressRouteVerbs() {
+    return new Set([
+      "get",
+      "post",
+      "put",
+      "patch",
+      "delete",
+      "options",
+      "head",
+      "all",
+      "use",
+    ]);
+  }
+
+  /**
+   * Walk every call expression in the file and, when it looks like
+   * `<receiver>.<verb>(<path>, ...callbacks)` for an Express verb, treat
+   * each arrow / function-expression argument as a route handler unit.
+   *
+   * Each extracted unit gets:
+   *   - a synthetic name in the shape `<VERB> <path>` (e.g.
+   *     `POST /orders`) when the path is a string literal — matches the
+   *     "method and path as metadata" expectation in the issue.
+   *   - `isEntryPoint: true` since these directly receive HTTP request
+   *     data, which is what the reachability_filter looks for.
+   *   - `unitType: "route_handler"` so the existing classifier logic
+   *     downstream doesn't have to re-derive it.
+   *
+   * If multiple callbacks are passed (middleware chain plus the final
+   * handler), each one becomes its own unit suffixed with its 0-based
+   * argument index, so they don't collide.
+   */
+  _extractRouteHandlerCallbacks(sourceFile, relativePath) {
+    const verbs = TypeScriptAnalyzer._expressRouteVerbs();
+
+    // SyntaxKind.CallExpression — its numeric value drifts between
+    // typescript releases (213 in older versions, 214 in 5.x), so we
+    // resolve it dynamically off the typescript dep rather than
+    // hard-coding it.
+    const ts = require("typescript");
+    const callExprKind = ts.SyntaxKind.CallExpression;
+
+    for (const callExpr of sourceFile.getDescendantsOfKind(callExprKind)) {
+      const expression = callExpr.getExpression();
+      if (!expression || expression.getKindName() !== "PropertyAccessExpression") {
+        continue;
+      }
+
+      const verb = expression.getName ? expression.getName() : null;
+      if (!verb || !verbs.has(verb.toLowerCase())) {
+        continue;
+      }
+
+      const args = callExpr.getArguments();
+      if (args.length === 0) {
+        continue;
+      }
+
+      // Path is the first arg if it's a string literal. Some patterns
+      // pass a regex or omit the path entirely (e.g. `app.use(middleware)`),
+      // in which case we fall back to a `<verb>` label.
+      let pathLiteral = null;
+      const first = args[0];
+      const firstKind = first.getKindName();
+      if (
+        firstKind === "StringLiteral" ||
+        firstKind === "NoSubstitutionTemplateLiteral"
+      ) {
+        // .getLiteralText() returns the unquoted value
+        pathLiteral = first.getLiteralText ? first.getLiteralText() : null;
+      }
+
+      // Iterate the *callback* arguments — skip the path arg if present.
+      const startIdx =
+        firstKind === "StringLiteral" ||
+        firstKind === "NoSubstitutionTemplateLiteral" ||
+        firstKind === "RegularExpressionLiteral"
+          ? 1
+          : 0;
+
+      for (let i = startIdx; i < args.length; i++) {
+        const arg = args[i];
+        const argKind = arg.getKindName();
+        if (argKind !== "ArrowFunction" && argKind !== "FunctionExpression") {
+          continue;
+        }
+
+        const argIdx = i - startIdx;
+        const verbUpper = verb.toUpperCase();
+        let baseName;
+        if (pathLiteral) {
+          baseName = `${verbUpper} ${pathLiteral}`;
+        } else {
+          baseName = verbUpper;
+        }
+
+        // Suffix duplicate base names with the argument index so the
+        // function map doesn't collide. The first callback gets no
+        // suffix to keep the common "single handler" case readable.
+        const name = argIdx === 0 ? baseName : `${baseName} [${argIdx}]`;
+        const functionId = `${relativePath}:${name}`;
+
+        // Skip if a previous pass already extracted this exact id, e.g.
+        // when the route handler was named via a separate variable
+        // declaration earlier in the file.
+        if (this.functions[functionId]) {
+          continue;
+        }
+
+        const code = arg.getFullText();
+        this.functions[functionId] = {
+          name: name,
+          code: code,
+          isExported: false,
+          unitType: "route_handler",
+          startLine: arg.getStartLineNumber(),
+          endLine: arg.getEndLineNumber(),
+          isEntryPoint: true,
+          httpMethod: verbUpper,
+          httpPath: pathLiteral || null,
+        };
+      }
+    }
   }
 
   /**
