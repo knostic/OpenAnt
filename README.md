@@ -27,7 +27,7 @@ To submit your repo for scanning:
 
 - Go
 - Python
-- JavaScript/TypeScript (beta)
+- JavaScript / TypeScript (beta)
 - C/C++ (beta)
 - PHP (beta)
 - Ruby (beta)
