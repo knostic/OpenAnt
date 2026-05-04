@@ -39,6 +39,9 @@ const path = require("path");
  * ts-morph to silently fail to find any files (resulting in 0 functions
  * extracted). Always normalise to forward slashes before handing paths
  * to ts-morph or storing them as functionId components.
+ *
+ * UNC paths (`\\server\share\...`) are correctly converted to
+ * `//server/share/...`, which TypeScript understands on Windows.
  */
 function toPosixPath(p) {
   return p.replace(/\\/g, "/");
@@ -65,7 +68,9 @@ const PERMISSIVE_COMPILER_OPTIONS = {
 
 class TypeScriptAnalyzer {
   constructor(repoPath) {
-    this.repoPath = repoPath;
+    // Normalise immediately so all later path operations (path.relative,
+    // path.join) work with a consistent forward-slash base on Windows.
+    this.repoPath = toPosixPath(path.resolve(repoPath));
     this.project = new Project({
       compilerOptions: PERMISSIVE_COMPILER_OPTIONS,
     });
@@ -525,8 +530,12 @@ function extractSingleFunction(filePath, functionRef) {
     compilerOptions: PERMISSIVE_COMPILER_OPTIONS,
   });
 
+  // Normalise to forward slashes so ts-morph can match the path it stores
+  // internally. On Windows, filePath may arrive with backslashes.
+  const normalisedFilePath = toPosixPath(path.resolve(filePath));
+
   try {
-    const sourceFile = project.addSourceFileAtPath(filePath);
+    const sourceFile = project.addSourceFileAtPath(normalisedFilePath);
 
     // Parse function reference (e.g., "sessionHandler.handleLogin" or just "handleLogin")
     let className = null;
@@ -716,16 +725,21 @@ function extractSingleFunction(filePath, functionRef) {
               );
               if (requireMatch) {
                 const requiredPath = requireMatch[1];
-                // Resolve the path relative to current file
-                const currentDir = path.dirname(filePath);
-                let resolvedPath = path.resolve(currentDir, requiredPath);
+                // Resolve the path relative to current file; use the
+                // already-normalised path to avoid mixed separators.
+                const currentDir = path.dirname(normalisedFilePath);
+                let resolvedPath = toPosixPath(
+                  path.resolve(currentDir, requiredPath),
+                );
 
                 // Try with .js extension if not present
                 if (!fs.existsSync(resolvedPath)) {
                   resolvedPath = resolvedPath + ".js";
                 }
                 if (!fs.existsSync(resolvedPath)) {
-                  resolvedPath = path.resolve(currentDir, requiredPath + ".ts");
+                  resolvedPath = toPosixPath(
+                    path.resolve(currentDir, requiredPath + ".ts"),
+                  );
                 }
 
                 if (fs.existsSync(resolvedPath)) {

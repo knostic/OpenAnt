@@ -44,8 +44,15 @@ from typing import Set, Tuple
 
 
 def _stdout_supports_unicode() -> bool:
-    """Return True if sys.stdout can emit the symbols we use for status."""
-    encoding = getattr(sys.stdout, "encoding", None) or ""
+    """Return True if sys.stdout can emit the symbols we use for status.
+
+    Returns False when stdout is piped or redirected (common in CI) and
+    the encoding cannot be determined — this degrades output to plain ASCII
+    rather than raising UnicodeEncodeError at runtime.
+    """
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return False
     try:
         # Probe with the actual symbols we emit. This catches cp1252 and
         # other limited code pages without us having to enumerate them.
@@ -715,7 +722,7 @@ class PipelineTest:
             # Step 3: Parse SARIF output
             print("Parsing results...")
             if not os.path.exists(sarif_output):
-                print("{SYM_FAIL} SARIF output not found")
+                print(f"{SYM_FAIL} SARIF output not found")
                 elapsed = (datetime.now() - start_time).total_seconds()
                 self.results['stages']['codeql_analysis'] = {
                     'success': False,
@@ -790,7 +797,7 @@ class PipelineTest:
 
         except FileNotFoundError:
             elapsed = (datetime.now() - start_time).total_seconds()
-            print("{SYM_FAIL} CodeQL not found. Please install CodeQL CLI.")
+            print(f"{SYM_FAIL} CodeQL not found. Please install CodeQL CLI.")
             print("  See: https://docs.github.com/en/code-security/codeql-cli")
             self.results['stages']['codeql_analysis'] = {
                 'success': False,
@@ -801,7 +808,7 @@ class PipelineTest:
 
         except subprocess.TimeoutExpired:
             elapsed = (datetime.now() - start_time).total_seconds()
-            print("{SYM_FAIL} CodeQL analysis timed out")
+            print(f"{SYM_FAIL} CodeQL analysis timed out")
             self.results['stages']['codeql_analysis'] = {
                 'success': False,
                 'elapsed_seconds': elapsed,
@@ -1025,7 +1032,7 @@ class PipelineTest:
             print(f"{SYM_OK} Success ({elapsed:.2f}s)")
             print(f"  Classification breakdown:")
             for cls, count in sorted(classification_counts.items()):
-                marker = "{SYM_ARROW}" if cls == "exploitable" else " "
+                marker = SYM_ARROW if cls == "exploitable" else " "
                 print(f"    {marker} {cls}: {count}")
             print(f"  Units: {original_count} {SYM_ARROW} {len(filtered_units)} ({summary['reduction_percentage']}% reduction)")
             print()
@@ -1123,13 +1130,13 @@ class PipelineTest:
         self.results['success'] = all_success
 
         if all_success:
-            print("{SYM_OK} All stages completed successfully")
+            print(f"{SYM_OK} All stages completed successfully")
         else:
-            print("{SYM_FAIL} Some stages failed")
+            print(f"{SYM_FAIL} Some stages failed")
 
         print()
         for stage_name, stage_result in self.results['stages'].items():
-            status = "{SYM_OK}" if stage_result.get('success') else "{SYM_FAIL}"
+            status = SYM_OK if stage_result.get('success') else SYM_FAIL
             elapsed = stage_result.get('elapsed_seconds', 0)
             print(f"  {status} {stage_name}: {elapsed:.2f}s")
 
