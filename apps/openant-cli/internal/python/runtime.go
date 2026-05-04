@@ -282,8 +282,14 @@ func readHashAt(path string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// writeHashAt saves a hash to the given path.
+// writeHashAt saves a hash to the given path, creating the parent directory
+// if it does not already exist.
 func writeHashAt(path, hash string) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
 	return os.WriteFile(path, []byte(hash+"\n"), 0644)
 }
 

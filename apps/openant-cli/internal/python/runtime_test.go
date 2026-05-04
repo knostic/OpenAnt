@@ -164,6 +164,18 @@ func TestReadStoredHash_DoesNotPanic(t *testing.T) {
 	_ = readStoredHash()
 }
 
+func TestWriteHashAt_CreatesMissingParentDir(t *testing.T) {
+	dir := t.TempDir()
+	// nested directory that does not yet exist
+	path := filepath.Join(dir, "a", "b", ".deps-hash")
+	if err := writeHashAt(path, "deadbeef"); err != nil {
+		t.Fatalf("writeHashAt should create missing parents: %v", err)
+	}
+	if got := readHashAt(path); got != "deadbeef" {
+		t.Errorf("readHashAt after writeHashAt = %q, want %q", got, "deadbeef")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // depsStalenessAt — covers the trigger detection logic without invoking pip
 // ---------------------------------------------------------------------------
