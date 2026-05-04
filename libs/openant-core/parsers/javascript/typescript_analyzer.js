@@ -520,19 +520,19 @@ class TypeScriptAnalyzer {
 function extractSingleFunction(filePath, functionRef) {
   const fs = require("fs");
 
-  // Check if file exists
-  if (!fs.existsSync(filePath)) {
-    console.error(`File not found: ${filePath}`);
+  // Normalise to forward slashes so ts-morph can match the path it stores
+  // internally. On Windows, filePath may arrive with backslashes.
+  const normalisedFilePath = toPosixPath(path.resolve(filePath));
+
+  // Check if file exists using the normalised path for consistent error messages.
+  if (!fs.existsSync(normalisedFilePath)) {
+    console.error(`File not found: ${normalisedFilePath}`);
     process.exit(1);
   }
 
   const project = new Project({
     compilerOptions: PERMISSIVE_COMPILER_OPTIONS,
   });
-
-  // Normalise to forward slashes so ts-morph can match the path it stores
-  // internally. On Windows, filePath may arrive with backslashes.
-  const normalisedFilePath = toPosixPath(path.resolve(filePath));
 
   try {
     const sourceFile = project.addSourceFileAtPath(normalisedFilePath);

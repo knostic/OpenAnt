@@ -30,13 +30,11 @@ JS_NODE_MODULES = JS_PARSERS_DIR / "node_modules"
 
 
 @pytest.mark.skipif(
-    sys.platform != "win32",
-    reason="backslash path simulation only meaningful on Windows; "
-    "replacing all forward slashes produces a non-absolute path on POSIX",
-)
-@pytest.mark.skipif(
-    not shutil.which("node") or not JS_NODE_MODULES.exists(),
-    reason="Node.js or JS parser npm dependencies not available",
+    sys.platform != "win32"
+    or not shutil.which("node")
+    or not JS_NODE_MODULES.exists(),
+    reason="Windows-only (backslash paths are non-absolute on POSIX) and "
+    "requires Node.js and JS parser npm dependencies",
 )
 def test_typescript_analyzer_accepts_backslash_paths(tmp_path):
     """Regression: ts-morph silently drops files when given backslash paths.
@@ -158,9 +156,17 @@ def _load_pipeline_module(name, source_path):
     The two pipelines (JS, Go) live in sibling directories and both
     expose a module named ``test_pipeline``. We import them under
     distinct names so they coexist in this test process.
+
+    The module is registered in ``sys.modules`` so that callers can
+    reliably remove it afterwards (via ``sys.modules.pop(name, None)``)
+    to prevent stale module-level state — such as ``_UNICODE_OK`` and
+    ``SYM_*`` globals — from leaking into subsequent tests.
     """
     spec = importlib.util.spec_from_file_location(name, source_path)
     mod = importlib.util.module_from_spec(spec)
+    # Register before exec so that relative imports inside the module
+    # resolve correctly, and so callers can pop the module after use.
+    sys.modules[name] = mod
     # The pipeline modules import siblings via sys.path manipulation;
     # let them do that as part of their normal import.
     spec.loader.exec_module(mod)
@@ -182,7 +188,10 @@ def pipeline_module(request, monkeypatch):
     monkeypatch.setattr(sys, "stdout", fake_stdout)
 
     parsers_root = PARSERS_DIR
-    sys.path.insert(0, str(parsers_root.parent))  # so utilities.* imports work
+    parsers_parent = str(parsers_root.parent)
+    already_on_path = parsers_parent in sys.path
+    if not already_on_path:
+        sys.path.insert(0, parsers_parent)  # so utilities.* imports work
     try:
         if request.param == "javascript":
             path = parsers_root / "javascript" / "test_pipeline.py"
@@ -200,10 +209,11 @@ def pipeline_module(request, monkeypatch):
         # module-level state (_UNICODE_OK, SYM_*) doesn't leak into later
         # tests that may load the same pipeline module.
         sys.modules.pop(mod_name, None)
-        try:
-            sys.path.remove(str(parsers_root.parent))
-        except ValueError:
-            pass
+        if not already_on_path:
+            try:
+                sys.path.remove(parsers_parent)
+            except ValueError:
+                pass
 
 
 def test_pipeline_uses_ascii_fallback_on_cp1252_stdout(pipeline_module):
@@ -242,17 +252,25 @@ def test_pipeline_uses_unicode_when_stdout_supports_it(monkeypatch, mod_name, re
     monkeypatch.setattr(sys, "stdout", fake_stdout)
 
     parsers_root = PARSERS_DIR
-    sys.path.insert(0, str(parsers_root.parent))
+    parsers_parent = str(parsers_root.parent)
+    already_on_path = parsers_parent in sys.path
+    if not already_on_path:
+        sys.path.insert(0, parsers_parent)
     try:
         sys.modules.pop(mod_name, None)
         mod = _load_pipeline_module(mod_name, parsers_root / rel_path)
         assert mod._UNICODE_OK is True
-        assert mod.SYM_OK == "✓"
-        assert mod.SYM_FAIL == "✗"
-        assert mod.SYM_ARROW == "→"
+        # Use Unicode escape sequences rather than literal glyphs so that
+        # assertion failure messages are safe on cp1252 consoles — printing
+        # the literal characters (U+2713, U+2717, U+2192) would itself raise
+        # UnicodeEncodeError on the very platform these tests guard against.
+        assert mod.SYM_OK == "\u2713"    # CHECK MARK (U+2713)
+        assert mod.SYM_FAIL == "\u2717"  # BALLOT X (U+2717)
+        assert mod.SYM_ARROW == "\u2192"  # RIGHTWARDS ARROW (U+2192)
     finally:
         sys.modules.pop(mod_name, None)
-        try:
-            sys.path.remove(str(parsers_root.parent))
-        except ValueError:
-            pass
+        if not already_on_path:
+            try:
+                sys.path.remove(parsers_parent)
+            except ValueError:
+                pass
