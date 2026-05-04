@@ -35,7 +35,7 @@ class PythonRouteParser:
 
         for f in files:
             try:
-                content = f.read_text()
+                content = f.read_text(encoding="utf-8", errors="replace")
                 if "from django" in content or "django.urls" in content:
                     return "django"
                 if "from flask" in content or "Flask(" in content:
@@ -76,7 +76,7 @@ class PythonRouteParser:
         path_str = str(file_path)
         if path_str not in self.file_cache:
             try:
-                self.file_cache[path_str] = file_path.read_text()
+                self.file_cache[path_str] = file_path.read_text(encoding="utf-8", errors="replace")
             except Exception as e:
                 print(f"Error reading {file_path}: {e}")
                 self.file_cache[path_str] = ""

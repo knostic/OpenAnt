@@ -383,6 +383,8 @@ class CPipelineTest:
                 create_db_cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=600
             )
 
@@ -414,6 +416,8 @@ class CPipelineTest:
                 analyze_cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=1800
             )
 

@@ -130,6 +130,8 @@ class PipelineTest:
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 cwd=self.parser_dir
             )
 
@@ -293,6 +295,8 @@ class PipelineTest:
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 cwd=self.parser_dir
             )
 
@@ -646,6 +650,8 @@ class PipelineTest:
                 create_db_cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=600  # 10 minute timeout
             )
 
@@ -677,6 +683,8 @@ class PipelineTest:
                 analyze_cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=1800  # 30 minute timeout
             )
 

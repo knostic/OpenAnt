@@ -119,7 +119,9 @@ class GoPipelineTest:
                 ['go', 'build', '-o', 'go_parser', '.'],
                 cwd=go_parser_dir,
                 capture_output=True,
-                text=True
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             if result.returncode != 0:
                 print(f"Error building Go parser: {result.stderr}")
@@ -144,6 +146,8 @@ class GoPipelineTest:
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 cwd=self.parser_dir
             )
 
@@ -438,6 +442,8 @@ class GoPipelineTest:
                 create_db_cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=600  # 10 minute timeout
             )
 
@@ -469,6 +475,8 @@ class GoPipelineTest:
                 analyze_cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=1800  # 30 minute timeout
             )
 

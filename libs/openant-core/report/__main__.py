@@ -19,7 +19,7 @@ from .schema import validate_pipeline_output, ValidationError
 
 def cmd_summary(args):
     """Generate summary report."""
-    pipeline_data = json.loads(Path(args.input).read_text())
+    pipeline_data = json.loads(Path(args.input).read_text(encoding="utf-8"))
 
     try:
         validate_pipeline_output(pipeline_data)
@@ -32,14 +32,14 @@ def cmd_summary(args):
 
     output_path = Path(args.output) if args.output else Path("SUMMARY_REPORT.md")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(report)
+    output_path.write_text(report, encoding="utf-8")
     print(f"  -> {output_path}")
     print(f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)")
 
 
 def cmd_disclosures(args):
     """Generate disclosure documents."""
-    pipeline_data = json.loads(Path(args.input).read_text())
+    pipeline_data = json.loads(Path(args.input).read_text(encoding="utf-8"))
 
     try:
         validate_pipeline_output(pipeline_data)
@@ -62,7 +62,7 @@ def cmd_disclosures(args):
 
         safe_name = finding["short_name"].replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
-        (output_dir / filename).write_text(disclosure)
+        (output_dir / filename).write_text(disclosure, encoding="utf-8")
         print(f"  -> {output_dir / filename}")
         count += 1
 

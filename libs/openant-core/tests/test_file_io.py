@@ -252,6 +252,25 @@ def _has_binary_mode(call_args: str) -> bool:
     return re.search(r"""(['"])([rwax+]*b[rwax+]*)\1""", call_args) is not None
 
 
+def _scan_calls(scrubbed: str, original: str, call_re: re.Pattern):
+    """Yield (line_number, args_text, original_line) for each call match."""
+    for m in call_re.finditer(scrubbed):
+        i = m.end()
+        depth = 1
+        while i < len(scrubbed) and depth:
+            ch = scrubbed[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            continue
+        args = original[m.end():i - 1]
+        line = original[:m.start()].count("\n") + 1
+        yield line, args, original.splitlines()[line - 1].strip()
+
+
 def test_no_bare_open_in_non_test_code():
     """Regression: every text-mode `open(` call in non-test code must specify
     encoding=, otherwise Windows defaults to cp1252 and crashes on non-ASCII
@@ -261,28 +280,81 @@ def test_no_bare_open_in_non_test_code():
     for path in _iter_python_sources(CORE_ROOT):
         text = path.read_text(encoding="utf-8")
         scrubbed = _strip_strings_and_comments(text)
-        for m in _OPEN_CALL_RE.finditer(scrubbed):
-            # Find matching close paren in the SCRUBBED text (parens preserved).
-            i = m.end()
-            depth = 1
-            while i < len(scrubbed) and depth:
-                ch = scrubbed[i]
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                i += 1
-            if depth != 0:
-                continue
-            args = text[m.end():i - 1]
+        for line, args, src in _scan_calls(scrubbed, text, _OPEN_CALL_RE):
             if _has_binary_mode(args) or _has_encoding(args):
                 continue
-            line = text[:m.start()].count("\n") + 1
             rel = path.relative_to(CORE_ROOT).as_posix()
-            offenders.append(f"{rel}:{line}: {text.splitlines()[line - 1].strip()}")
+            offenders.append(f"{rel}:{line}: {src}")
 
     assert not offenders, (
         "Found bare open() calls without encoding= in non-test code. "
         "Use utilities.file_io.open_utf8 / read_json / write_json or pass "
         "encoding='utf-8' explicitly:\n  " + "\n  ".join(offenders)
+    )
+
+
+# Match `.read_text(` / `.write_text(` method calls (any object, including
+# Path objects). Don't match `text=` kwargs or other identifiers ending in
+# read_text/write_text.
+_PATH_TEXT_RE = re.compile(r"\.(?:read_text|write_text)\s*\(")
+
+
+def test_no_bare_pathlib_text_io_in_non_test_code():
+    """Regression: ``Path.read_text()`` / ``write_text()`` default to the
+    system locale encoding on Python <3.10 and to ``locale.getpreferredencoding(False)``
+    in 3.10+ unless ``-X utf8`` mode is on. On Windows that is cp1252, which
+    crashes on non-ASCII content. Every call in non-test code must pass
+    ``encoding=`` explicitly.
+    """
+    offenders: list[str] = []
+    for path in _iter_python_sources(CORE_ROOT):
+        text = path.read_text(encoding="utf-8")
+        scrubbed = _strip_strings_and_comments(text)
+        for line, args, src in _scan_calls(scrubbed, text, _PATH_TEXT_RE):
+            if _has_encoding(args):
+                continue
+            rel = path.relative_to(CORE_ROOT).as_posix()
+            offenders.append(f"{rel}:{line}: {src}")
+
+    assert not offenders, (
+        "Found Path.read_text()/write_text() calls without encoding= in "
+        "non-test code. Pass encoding='utf-8' explicitly:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+# Match `subprocess.run(` (covers `subprocess.run` and `sp.run` etc. via the
+# right-hand identifier — restrict to the explicit form to avoid noise).
+_SUBPROCESS_RUN_RE = re.compile(r"(?<![A-Za-z0-9_.])subprocess\.run\s*\(")
+
+
+def _has_text_mode(call_args: str) -> bool:
+    return (
+        re.search(r"\btext\s*=\s*True", call_args) is not None
+        or re.search(r"\buniversal_newlines\s*=\s*True", call_args) is not None
+    )
+
+
+def test_no_bare_text_mode_subprocess_in_non_test_code():
+    """Regression: ``subprocess.run(..., text=True)`` decodes stdout/stderr
+    with the system locale on Windows (cp1252), which crashes on non-ASCII
+    output from parsers, codeql, etc. Every text-mode subprocess call must
+    pass ``encoding=`` explicitly (or use ``utilities.file_io.run_utf8``).
+    """
+    offenders: list[str] = []
+    for path in _iter_python_sources(CORE_ROOT):
+        text = path.read_text(encoding="utf-8")
+        scrubbed = _strip_strings_and_comments(text)
+        for line, args, src in _scan_calls(scrubbed, text, _SUBPROCESS_RUN_RE):
+            if not _has_text_mode(args):
+                continue
+            if _has_encoding(args):
+                continue
+            rel = path.relative_to(CORE_ROOT).as_posix()
+            offenders.append(f"{rel}:{line}: {src}")
+
+    assert not offenders, (
+        "Found subprocess.run(..., text=True) calls without encoding= in "
+        "non-test code. Pass encoding='utf-8', errors='replace' explicitly "
+        "(or use utilities.file_io.run_utf8):\n  " + "\n  ".join(offenders)
     )

@@ -208,7 +208,7 @@ def gather_context_sources(repo_path: Path) -> dict[str, str]:
         filepath = repo_path / filename
         if filepath.exists():
             try:
-                content = filepath.read_text(errors="ignore")
+                content = filepath.read_text(encoding="utf-8", errors="ignore")
                 # Limit size to avoid token overflow
                 if len(content) > 10000:
                     content = content[:10000] + "\n\n[... truncated ...]"
@@ -289,7 +289,7 @@ def detect_entry_points(repo_path: Path) -> str:
             continue
 
         try:
-            content = py_file.read_text(errors="ignore")
+            content = py_file.read_text(encoding="utf-8", errors="ignore")
             rel_path = py_file.relative_to(repo_path)
 
             for category, patterns in ENTRY_POINT_PATTERNS.items():
@@ -308,7 +308,7 @@ def detect_entry_points(repo_path: Path) -> str:
             continue
 
         try:
-            content = js_file.read_text(errors="ignore")
+            content = js_file.read_text(encoding="utf-8", errors="ignore")
             rel_path = js_file.relative_to(repo_path)
 
             if re.search(r"express\(\)|require\(['\"]express['\"]\)", content):
@@ -340,7 +340,7 @@ def check_manual_override(repo_path: Path) -> ApplicationContext | None:
             continue
 
         try:
-            content = filepath.read_text()
+            content = filepath.read_text(encoding="utf-8")
 
             if filename.endswith('.json'):
                 # Direct JSON format

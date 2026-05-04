@@ -63,7 +63,7 @@ def _check_api_key():
 
 def load_prompt(name: str) -> str:
     """Load a prompt template from the prompts directory."""
-    return (PROMPTS_DIR / f"{name}.txt").read_text()
+    return (PROMPTS_DIR / f"{name}.txt").read_text(encoding="utf-8")
 
 
 def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
@@ -76,7 +76,7 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
     if not dynamic_path.exists():
         return pipeline_data
 
-    dynamic_data = json.loads(dynamic_path.read_text())
+    dynamic_data = json.loads(dynamic_path.read_text(encoding="utf-8"))
     results_by_id = {}
     for result in dynamic_data.get("results", []):
         fid = result.get("finding_id")
@@ -233,7 +233,7 @@ def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[st
 
 def generate_all(pipeline_path: str, output_dir: str) -> None:
     """Generate all reports from a pipeline output file."""
-    pipeline_data = json.loads(Path(pipeline_path).read_text())
+    pipeline_data = json.loads(Path(pipeline_path).read_text(encoding="utf-8"))
 
     try:
         validate_pipeline_output(pipeline_data)
@@ -247,7 +247,7 @@ def generate_all(pipeline_path: str, output_dir: str) -> None:
     # Generate summary report
     print("Generating summary report...")
     summary, _usage = generate_summary_report(pipeline_data)
-    (output_path / "SUMMARY_REPORT.md").write_text(summary)
+    (output_path / "SUMMARY_REPORT.md").write_text(summary, encoding="utf-8")
     print(f"  -> {output_path / 'SUMMARY_REPORT.md'}")
 
     # Generate disclosure for each confirmed vulnerability
@@ -265,7 +265,7 @@ def generate_all(pipeline_path: str, output_dir: str) -> None:
 
         safe_name = finding["short_name"].replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
-        (disclosures_dir / filename).write_text(disclosure)
+        (disclosures_dir / filename).write_text(disclosure, encoding="utf-8")
         print(f"  -> {disclosures_dir / filename}")
 
 
