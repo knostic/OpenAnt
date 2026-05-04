@@ -596,7 +596,7 @@ Examples:
         extractor = FunctionExtractor(args.repo_path)
 
         if args.scan_file:
-            with open(args.scan_file) as f:
+            with open(args.scan_file, encoding="utf-8") as f:
                 scan_result = json.load(f)
             result = extractor.extract_from_scan(scan_result)
         else:
@@ -605,7 +605,7 @@ Examples:
         output = json.dumps(result, indent=2)
 
         if args.output:
-            with open(args.output, 'w') as f:
+            with open(args.output, 'w', encoding="utf-8") as f:
                 f.write(output)
             print(f"Extraction complete. Results written to: {args.output}", file=sys.stderr)
             print(f"Total functions: {result['statistics']['total_functions']}", file=sys.stderr)

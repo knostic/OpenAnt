@@ -51,7 +51,7 @@ def run_tests(
     os.makedirs(output_dir, exist_ok=True)
 
     # Check how many findings to test
-    with open(pipeline_output_path) as f:
+    with open(pipeline_output_path, encoding="utf-8") as f:
         pipeline_data = json.load(f)
 
     findings = pipeline_data.get("findings", [])
@@ -65,7 +65,7 @@ def run_tests(
 
     if not testable:
         results_path = os.path.join(output_dir, "dynamic_test_results.json")
-        with open(results_path, "w") as f:
+        with open(results_path, "w", encoding="utf-8") as f:
             json.dump({"findings_tested": 0, "results": []}, f, indent=2)
 
         return DynamicTestStepResult(

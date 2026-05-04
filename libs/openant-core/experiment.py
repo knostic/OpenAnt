@@ -211,7 +211,7 @@ def load_dataset(name: str, enhanced: bool = False) -> dict:
     if not path or not os.path.exists(path):
         raise ValueError(f"Dataset not found: {name} (enhanced={enhanced})")
 
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -221,7 +221,7 @@ def load_ground_truth(name: str) -> dict:
     if not path or not os.path.exists(path):
         return {}
 
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -1034,7 +1034,7 @@ def main():
         suffix = "" if args.no_enhanced else "_enhanced"
         output_path = f"experiment_{args.dataset}_{args.model}{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(experiment, f, indent=2)
 
     print()

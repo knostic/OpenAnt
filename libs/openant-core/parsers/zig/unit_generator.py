@@ -246,8 +246,8 @@ class UnitGenerator:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        with open(output_path / "dataset.json", "w") as f:
+        with open(output_path / "dataset.json", "w", encoding="utf-8") as f:
             json.dump(dataset, f, indent=2)
 
-        with open(output_path / "analyzer_output.json", "w") as f:
+        with open(output_path / "analyzer_output.json", "w", encoding="utf-8") as f:
             json.dump(analyzer_output, f, indent=2)

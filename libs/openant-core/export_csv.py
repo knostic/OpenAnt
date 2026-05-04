@@ -41,7 +41,7 @@ def _load_diff_block(experiment_path: str) -> dict | None:
     if not os.path.exists(candidate):
         return None
     try:
-        with open(candidate) as f:
+        with open(candidate, encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
@@ -67,7 +67,7 @@ def _format_diff_banner(diff: dict) -> str:
 
 def load_json(path: str) -> dict:
     """Load JSON file."""
-    with open(path, 'r') as f:
+    with open(path, 'r', encoding="utf-8") as f:
         return json.load(f)
 
 

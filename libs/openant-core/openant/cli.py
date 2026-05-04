@@ -39,7 +39,7 @@ def _load_step_reports(directory: str) -> list[dict]:
     reports = []
     for path in glob.glob(os.path.join(directory, "*.report.json")):
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 reports.append(json.load(f))
         except (json.JSONDecodeError, OSError):
             continue
@@ -82,7 +82,7 @@ def cmd_scan(args):
         # is the same one written into pipeline_output.json by reporter.py.
         if result.pipeline_output_path and os.path.exists(result.pipeline_output_path):
             try:
-                with open(result.pipeline_output_path) as f:
+                with open(result.pipeline_output_path, encoding="utf-8") as f:
                     po = json.load(f)
                 diff_block = po.get("diff")
                 if isinstance(diff_block, dict) and diff_block.get("mode") == "incremental":
@@ -135,7 +135,7 @@ def cmd_parse(args):
             diff_report = os.path.join(output_dir, "diff_filter.report.json")
             if os.path.exists(diff_report):
                 try:
-                    with open(diff_report) as f:
+                    with open(diff_report, encoding="utf-8") as f:
                         ctx.summary["diff_stats"] = json.load(f)
                 except (json.JSONDecodeError, OSError):
                     pass
@@ -607,9 +607,9 @@ def cmd_report_data(args):
             "dataset_path": os.path.abspath(dataset_path),
         }) as ctx:
             # Load data
-            with open(results_path) as f:
+            with open(results_path, encoding="utf-8") as f:
                 experiment = json.load(f)
-            with open(dataset_path) as f:
+            with open(dataset_path, encoding="utf-8") as f:
                 dataset = json.load(f)
 
             # --- Load dynamic test results if available ---
@@ -620,9 +620,9 @@ def cmd_report_data(args):
             dt_path = os.path.join(results_dir, "dynamic_test_results.json")
             po_path = os.path.join(results_dir, "pipeline_output.json")
             if os.path.exists(dt_path) and os.path.exists(po_path):
-                with open(dt_path) as f:
+                with open(dt_path, encoding="utf-8") as f:
                     dt_data = json.load(f)
-                with open(po_path) as f:
+                with open(po_path, encoding="utf-8") as f:
                     po_data = json.load(f)
 
                 # Map VULN-ID → route_key from pipeline_output
@@ -876,7 +876,7 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
             diff_block = None
             if os.path.exists(po_path):
                 try:
-                    with open(po_path) as f:
+                    with open(po_path, encoding="utf-8") as f:
                         po = json.load(f)
                     repo_info = po.get("repository", {})
                     repo_name = repo_info.get("name", "")

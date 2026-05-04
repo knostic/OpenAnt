@@ -74,14 +74,14 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
         shutil.copy2(source_file, os.path.join(work_dir, os.path.basename(source_file)))
 
     # Write Dockerfile
-    with open(os.path.join(work_dir, "Dockerfile"), "w") as f:
+    with open(os.path.join(work_dir, "Dockerfile"), "w", encoding="utf-8") as f:
         f.write(generation["dockerfile"])
 
     # Write test script
     test_filename = generation.get("test_filename", "test_exploit.py")
     test_path = os.path.join(work_dir, test_filename)
     os.makedirs(os.path.dirname(test_path), exist_ok=True)
-    with open(test_path, "w") as f:
+    with open(test_path, "w", encoding="utf-8") as f:
         f.write(generation["test_script"])
 
     # Write requirements/dependencies file
@@ -89,7 +89,7 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
         req_filename = generation.get("requirements_filename", "requirements.txt")
         req_path = os.path.join(work_dir, req_filename)
         os.makedirs(os.path.dirname(req_path), exist_ok=True)
-        with open(req_path, "w") as f:
+        with open(req_path, "w", encoding="utf-8") as f:
             f.write(generation["requirements"])
 
     # Copy attacker server if needed (before docker-compose so it's available)
@@ -98,14 +98,14 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
         os.makedirs(attacker_dir, exist_ok=True)
         shutil.copy2(ATTACKER_SERVER_PATH, os.path.join(attacker_dir, "server.py"))
         # Write attacker Dockerfile
-        with open(os.path.join(attacker_dir, "Dockerfile"), "w") as f:
+        with open(os.path.join(attacker_dir, "Dockerfile"), "w", encoding="utf-8") as f:
             f.write("FROM python:3.11-slim\nWORKDIR /app\nCOPY server.py .\n"
                     "EXPOSE 9999\nCMD [\"python\", \"server.py\"]\n")
 
     # Write docker-compose if multi-service, with sanitization
     if generation.get("docker_compose"):
         compose_content = _sanitize_compose(generation["docker_compose"])
-        with open(os.path.join(work_dir, "docker-compose.yml"), "w") as f:
+        with open(os.path.join(work_dir, "docker-compose.yml"), "w", encoding="utf-8") as f:
             f.write(compose_content)
 
 
@@ -116,6 +116,8 @@ def _run_command(cmd: list[str], timeout: int, cwd: str = None) -> tuple[str, st
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             cwd=cwd,
         )

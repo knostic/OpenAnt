@@ -330,7 +330,7 @@ def run_analysis(
 
     # Load dataset
     print(f"[Analyze] Loading dataset: {dataset_path}", file=sys.stderr)
-    with open(dataset_path) as f:
+    with open(dataset_path, encoding="utf-8") as f:
         dataset = json.load(f)
 
     units = dataset.get("units", [])
@@ -513,7 +513,7 @@ def run_analysis(
         "code_by_route": code_by_route,
     }
 
-    with open(results_path, "w") as f:
+    with open(results_path, "w", encoding="utf-8") as f:
         json.dump(experiment_result, f, indent=2)
 
     print(f"\n[Analyze] Results written to {results_path}", file=sys.stderr)

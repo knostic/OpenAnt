@@ -42,7 +42,7 @@ MAX_TOKENS = 4096
 
 def load_json(path: str) -> dict:
     """Load JSON file."""
-    with open(path, 'r') as f:
+    with open(path, 'r', encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -83,7 +83,7 @@ def _load_pipeline_metadata(experiment_path: str) -> tuple[dict | None, dict | N
     if not os.path.exists(candidate):
         return None, None
     try:
-        with open(candidate, 'r') as f:
+        with open(candidate, 'r', encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
         return None, None

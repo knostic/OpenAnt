@@ -45,7 +45,7 @@ def run_dynamic_tests(
         List of DynamicTestResult objects
     """
     # Load pipeline output
-    with open(pipeline_output_path, "r") as f:
+    with open(pipeline_output_path, "r", encoding="utf-8") as f:
         pipeline = json.load(f)
 
     findings = pipeline.get("findings", [])
@@ -253,13 +253,13 @@ def run_dynamic_tests(
     report_md = generate_report(results, repo_info["name"], total_cost)
 
     report_path = os.path.join(output_dir, "DYNAMIC_TEST_RESULTS.md")
-    with open(report_path, "w") as f:
+    with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_md)
     print(f"\nReport written to {report_path}", file=sys.stderr)
 
     # Save structured results JSON
     results_path = os.path.join(output_dir, "dynamic_test_results.json")
-    with open(results_path, "w") as f:
+    with open(results_path, "w", encoding="utf-8") as f:
         json.dump({
             "repository": repo_info["name"],
             "total_findings": len(findings),

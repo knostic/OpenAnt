@@ -69,7 +69,7 @@ def enhance_dataset(
 
     # Load dataset
     print(f"[Enhance] Loading dataset: {dataset_path}", file=sys.stderr)
-    with open(dataset_path) as f:
+    with open(dataset_path, encoding="utf-8") as f:
         dataset = json.load(f)
 
     units = dataset.get("units", [])
@@ -138,7 +138,7 @@ def enhance_dataset(
 
     # Write enhanced dataset
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(enhanced, f, indent=2)
 
     print(f"[Enhance] Enhanced dataset: {output_path}", file=sys.stderr)

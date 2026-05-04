@@ -283,7 +283,7 @@ def load_index_from_file(analyzer_output_path: str, repo_path: str = None) -> Re
     Returns:
         RepositoryIndex instance
     """
-    with open(analyzer_output_path, 'r') as f:
+    with open(analyzer_output_path, 'r', encoding="utf-8") as f:
         analyzer_output = json.load(f)
 
     return RepositoryIndex(analyzer_output, repo_path)

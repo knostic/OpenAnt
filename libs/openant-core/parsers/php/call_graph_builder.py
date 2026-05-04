@@ -482,7 +482,7 @@ Examples:
     args = parser.parse_args()
 
     try:
-        with open(args.input_file) as f:
+        with open(args.input_file, encoding="utf-8") as f:
             extractor_output = json.load(f)
 
         print(f"Processing {len(extractor_output.get('functions', {}))} functions...", file=sys.stderr)
@@ -503,7 +503,7 @@ Examples:
         output = json.dumps(result, indent=2)
 
         if args.output:
-            with open(args.output, 'w') as f:
+            with open(args.output, 'w', encoding="utf-8") as f:
                 f.write(output)
             print(f"Output written to: {args.output}", file=sys.stderr)
         else:

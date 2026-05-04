@@ -321,5 +321,5 @@ class CallGraphBuilder:
 
     def save_results(self, output_path: str, results: Dict[str, Any]) -> None:
         """Save call graph to a JSON file."""
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)

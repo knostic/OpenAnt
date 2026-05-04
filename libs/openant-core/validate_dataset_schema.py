@@ -61,7 +61,7 @@ def validate_unit(unit, index):
 
 
 def validate_dataset(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
 
     all_errors = []

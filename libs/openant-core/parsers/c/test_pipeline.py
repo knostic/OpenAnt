@@ -139,7 +139,7 @@ class CPipelineTest:
 
             # Save scan results
             self.scan_results_file = os.path.join(self.output_dir, 'scan_results.json')
-            with open(self.scan_results_file, 'w') as f:
+            with open(self.scan_results_file, 'w', encoding="utf-8") as f:
                 json.dump(scan_result, f, indent=2)
 
             # Stage 2: Extract functions
@@ -178,12 +178,12 @@ class CPipelineTest:
             print(f"         Avg upstream deps: {dataset['statistics']['avg_upstream']}")
 
             # Write dataset
-            with open(self.dataset_file, 'w') as f:
+            with open(self.dataset_file, 'w', encoding="utf-8") as f:
                 json.dump(dataset, f, indent=2)
 
             # Write analyzer output
             analyzer_output = generator.generate_analyzer_output()
-            with open(self.analyzer_output_file, 'w') as f:
+            with open(self.analyzer_output_file, 'w', encoding="utf-8") as f:
                 json.dump(analyzer_output, f, indent=2)
 
             elapsed = (datetime.now() - start_time).total_seconds()
@@ -242,7 +242,7 @@ class CPipelineTest:
         start_time = datetime.now()
 
         try:
-            with open(self.analyzer_output_file, 'r') as f:
+            with open(self.analyzer_output_file, 'r', encoding="utf-8") as f:
                 analyzer = json.load(f)
 
             functions = analyzer.get("functions", {})
@@ -262,7 +262,7 @@ class CPipelineTest:
                 }
 
             # Build call graph from dataset unit metadata
-            with open(self.dataset_file, 'r') as f:
+            with open(self.dataset_file, 'r', encoding="utf-8") as f:
                 dataset = json.load(f)
 
             call_graph = {}
@@ -313,7 +313,7 @@ class CPipelineTest:
                 "reduction_percentage": round((1 - len(filtered_units) / original_count) * 100, 1) if original_count > 0 else 0
             }
 
-            with open(self.dataset_file, 'w') as f:
+            with open(self.dataset_file, 'w', encoding="utf-8") as f:
                 json.dump(dataset, f, indent=2)
 
             elapsed = (datetime.now() - start_time).total_seconds()
@@ -443,7 +443,7 @@ class CPipelineTest:
                 }
                 return False
 
-            with open(sarif_output, 'r') as f:
+            with open(sarif_output, 'r', encoding="utf-8") as f:
                 sarif_data = json.load(f)
 
             self.codeql_findings = []
@@ -555,7 +555,7 @@ class CPipelineTest:
         start_time = datetime.now()
 
         try:
-            with open(self.dataset_file, 'r') as f:
+            with open(self.dataset_file, 'r', encoding="utf-8") as f:
                 dataset = json.load(f)
 
             # Build mapping of file -> [(start_line, end_line, func_id)]
@@ -605,7 +605,7 @@ class CPipelineTest:
                 "reduction_percentage": round((1 - len(filtered_units) / original_count) * 100, 1) if original_count > 0 else 0
             }
 
-            with open(self.dataset_file, 'w') as f:
+            with open(self.dataset_file, 'w', encoding="utf-8") as f:
                 json.dump(dataset, f, indent=2)
 
             elapsed = (datetime.now() - start_time).total_seconds()
@@ -662,7 +662,7 @@ class CPipelineTest:
         start_time = datetime.now()
 
         try:
-            with open(self.dataset_file, 'r') as f:
+            with open(self.dataset_file, 'r', encoding="utf-8") as f:
                 dataset = json.load(f)
 
             enhancer = ContextEnhancer()
@@ -695,7 +695,7 @@ class CPipelineTest:
                     'data_flows_extracted': enhancer.stats['data_flows_extracted']
                 }
 
-            with open(self.dataset_file, 'w') as f:
+            with open(self.dataset_file, 'w', encoding="utf-8") as f:
                 json.dump(enhanced, f, indent=2)
 
             elapsed = (datetime.now() - start_time).total_seconds()
@@ -740,7 +740,7 @@ class CPipelineTest:
         start_time = datetime.now()
 
         try:
-            with open(self.dataset_file, 'r') as f:
+            with open(self.dataset_file, 'r', encoding="utf-8") as f:
                 dataset = json.load(f)
 
             units = dataset.get("units", [])
@@ -767,7 +767,7 @@ class CPipelineTest:
                 "reduction_percentage": round((1 - len(filtered_units) / original_count) * 100, 1) if original_count > 0 else 0
             }
 
-            with open(self.dataset_file, 'w') as f:
+            with open(self.dataset_file, 'w', encoding="utf-8") as f:
                 json.dump(dataset, f, indent=2)
 
             elapsed = (datetime.now() - start_time).total_seconds()
@@ -908,7 +908,7 @@ class CPipelineTest:
 
         # Save results summary
         results_file = os.path.join(self.output_dir, 'pipeline_results.json')
-        with open(results_file, 'w') as f:
+        with open(results_file, 'w', encoding="utf-8") as f:
             clean_results = {
                 'repository': self.results['repository'],
                 'test_time': self.results['test_time'],

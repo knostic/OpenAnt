@@ -80,7 +80,7 @@ def run_verification(
 
     # Load Stage 1 results
     print(f"[Verify] Loading results: {results_path}", file=sys.stderr)
-    with open(results_path) as f:
+    with open(results_path, encoding="utf-8") as f:
         experiment = json.load(f)
 
     all_results = experiment.get("results", [])
@@ -268,7 +268,7 @@ def _write_verified_results(
 
     output["metrics"] = {"total": len(merged_results), **counts}
 
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
 
 

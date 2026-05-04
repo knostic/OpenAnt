@@ -461,7 +461,7 @@ def main():
     result = parser.parse()
 
     if output_file:
-        with open(output_file, 'w') as f:
+        with open(output_file, 'w', encoding="utf-8") as f:
             json.dump(result, f, indent=2)
         print(f"Output written to {output_file}")
     else:

@@ -138,7 +138,7 @@ def parse_repository(repo_path: str, options: dict = None) -> tuple:
 
     if output_dir:
         scan_file = Path(output_dir) / 'scan_result.json'
-        with open(scan_file, 'w') as f:
+        with open(scan_file, 'w', encoding="utf-8") as f:
             json.dump(scan_result, f, indent=2)
         print(f"  Saved: {scan_file}", file=sys.stderr)
 
@@ -154,7 +154,7 @@ def parse_repository(repo_path: str, options: dict = None) -> tuple:
 
     if output_dir:
         extract_file = Path(output_dir) / 'functions.json'
-        with open(extract_file, 'w') as f:
+        with open(extract_file, 'w', encoding="utf-8") as f:
             json.dump(extractor_result, f, indent=2)
         print(f"  Saved: {extract_file}", file=sys.stderr)
 
@@ -171,7 +171,7 @@ def parse_repository(repo_path: str, options: dict = None) -> tuple:
 
     if output_dir:
         graph_file = Path(output_dir) / 'call_graph.json'
-        with open(graph_file, 'w') as f:
+        with open(graph_file, 'w', encoding="utf-8") as f:
             json.dump(call_graph_result, f, indent=2)
         print(f"  Saved: {graph_file}", file=sys.stderr)
 
@@ -199,7 +199,7 @@ def parse_repository(repo_path: str, options: dict = None) -> tuple:
 
     if output_dir:
         analyzer_file = Path(output_dir) / 'analyzer_output.json'
-        with open(analyzer_file, 'w') as f:
+        with open(analyzer_file, 'w', encoding="utf-8") as f:
             json.dump(analyzer_output, f, indent=2)
         print(f"  Saved: {analyzer_file}", file=sys.stderr)
 
@@ -253,7 +253,7 @@ Examples:
         # Save dataset
         dataset_json = json.dumps(dataset, indent=2)
         if args.output:
-            with open(args.output, 'w') as f:
+            with open(args.output, 'w', encoding="utf-8") as f:
                 f.write(dataset_json)
             print(f"\nDataset written to: {args.output}", file=sys.stderr)
         else:
@@ -261,7 +261,7 @@ Examples:
 
         # Save analyzer output if requested
         if args.analyzer_output:
-            with open(args.analyzer_output, 'w') as f:
+            with open(args.analyzer_output, 'w', encoding="utf-8") as f:
                 json.dump(analyzer_output, f, indent=2)
             print(f"Analyzer output written to: {args.analyzer_output}", file=sys.stderr)
 

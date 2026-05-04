@@ -268,6 +268,6 @@ class StepReport:
         """Write ``{step}.report.json`` to *output_dir*. Returns the path."""
         os.makedirs(output_dir, exist_ok=True)
         path = os.path.join(output_dir, f"{self.step}.report.json")
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
         return path

@@ -96,9 +96,9 @@ def main():
                 "statistics": {"total_units": 0, "by_type": {}},
                 "metadata": {"generator": "zig_unit_generator.py"},
             }
-            with open(output_dir / "dataset.json", "w") as f:
+            with open(output_dir / "dataset.json", "w", encoding="utf-8") as f:
                 json.dump(empty_dataset, f, indent=2)
-            with open(output_dir / "analyzer_output.json", "w") as f:
+            with open(output_dir / "analyzer_output.json", "w", encoding="utf-8") as f:
                 json.dump({"repository": str(repo_path), "functions": {}}, f, indent=2)
             return 0
 

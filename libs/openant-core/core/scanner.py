@@ -149,7 +149,7 @@ def scan_repository(
         _diff_report = os.path.join(output_dir, "diff_filter.report.json")
         if os.path.exists(_diff_report):
             try:
-                with open(_diff_report) as _f:
+                with open(_diff_report, encoding="utf-8") as _f:
                     ctx.summary["diff_stats"] = json.load(_f)
             except (json.JSONDecodeError, OSError):
                 pass
@@ -542,7 +542,7 @@ def _load_step_report(output_dir: str, step: str) -> dict:
     """Load a step report JSON from disk. Returns empty dict on failure."""
     path = os.path.join(output_dir, f"{step}.report.json")
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {"step": step, "status": "unknown"}
@@ -551,7 +551,7 @@ def _load_step_report(output_dir: str, step: str) -> dict:
 def _read_app_type(app_context_path: str) -> str | None:
     """Read application_type from an app context JSON file."""
     try:
-        with open(app_context_path) as f:
+        with open(app_context_path, encoding="utf-8") as f:
             data = json.load(f)
         return data.get("application_type")
     except Exception:

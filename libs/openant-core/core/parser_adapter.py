@@ -161,7 +161,7 @@ def _maybe_apply_diff_filter(
         )
         return
 
-    with open(result.dataset_path, "r") as f:
+    with open(result.dataset_path, "r", encoding="utf-8") as f:
         dataset = json.load(f)
 
     # Dataset may be a dict with "units" or a raw list.
@@ -172,13 +172,13 @@ def _maybe_apply_diff_filter(
 
     stats = apply_diff_filter(units, manifest)
 
-    with open(result.dataset_path, "w") as f:
+    with open(result.dataset_path, "w", encoding="utf-8") as f:
         json.dump(dataset, f, indent=2)
 
     # Expose stats on the ParseResult via a side-channel file; the parse
     # step_context reads this when assembling parse.report.json.
     diff_report_path = os.path.join(output_dir, "diff_filter.report.json")
-    with open(diff_report_path, "w") as f:
+    with open(diff_report_path, "w", encoding="utf-8") as f:
         json.dump(stats.to_dict(), f, indent=2)
 
     print(
@@ -245,7 +245,7 @@ def _apply_reachability_filter(
 
     print(f"\n[Reachability Filter] Filtering to {processing_level} units...", file=sys.stderr)
 
-    with open(call_graph_path, "r") as f:
+    with open(call_graph_path, "r", encoding="utf-8") as f:
         call_graph_data = json.load(f)
 
     functions = call_graph_data.get("functions", {})
@@ -352,10 +352,10 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
         dataset = _apply_reachability_filter(dataset, output_dir, processing_level)
 
     # Write outputs
-    with open(dataset_path, "w") as f:
+    with open(dataset_path, "w", encoding="utf-8") as f:
         json.dump(dataset, f, indent=2)
 
-    with open(analyzer_output_path, "w") as f:
+    with open(analyzer_output_path, "w", encoding="utf-8") as f:
         json.dump(analyzer_output, f, indent=2)
 
     units_count = len(dataset.get("units", []))
@@ -413,7 +413,7 @@ def _parse_javascript(repo_path: str, output_dir: str, processing_level: str, sk
     # Count units
     units_count = 0
     if os.path.exists(dataset_path):
-        with open(dataset_path) as f:
+        with open(dataset_path, encoding="utf-8") as f:
             data = json.load(f)
         units_count = len(data.get("units", []))
 
@@ -470,7 +470,7 @@ def _parse_go(repo_path: str, output_dir: str, processing_level: str, skip_tests
     # Count units
     units_count = 0
     if os.path.exists(dataset_path):
-        with open(dataset_path) as f:
+        with open(dataset_path, encoding="utf-8") as f:
             data = json.load(f)
         units_count = len(data.get("units", []))
 
@@ -530,7 +530,7 @@ def _parse_c(repo_path: str, output_dir: str, processing_level: str, skip_tests:
     # Count units
     units_count = 0
     if os.path.exists(dataset_path):
-        with open(dataset_path) as f:
+        with open(dataset_path, encoding="utf-8") as f:
             data = json.load(f)
         units_count = len(data.get("units", []))
 
@@ -590,7 +590,7 @@ def _parse_ruby(repo_path: str, output_dir: str, processing_level: str, skip_tes
     # Count units
     units_count = 0
     if os.path.exists(dataset_path):
-        with open(dataset_path) as f:
+        with open(dataset_path, encoding="utf-8") as f:
             data = json.load(f)
         units_count = len(data.get("units", []))
 
@@ -650,7 +650,7 @@ def _parse_php(repo_path: str, output_dir: str, processing_level: str, skip_test
     # Count units
     units_count = 0
     if os.path.exists(dataset_path):
-        with open(dataset_path) as f:
+        with open(dataset_path, encoding="utf-8") as f:
             data = json.load(f)
         units_count = len(data.get("units", []))
 
@@ -710,7 +710,7 @@ def _parse_zig(repo_path: str, output_dir: str, processing_level: str, skip_test
     # Count units
     units_count = 0
     if os.path.exists(dataset_path):
-        with open(dataset_path) as f:
+        with open(dataset_path, encoding="utf-8") as f:
             data = json.load(f)
         units_count = len(data.get("units", []))
 

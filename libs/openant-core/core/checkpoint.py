@@ -79,7 +79,7 @@ class StepCheckpoint:
                 continue
             filepath = os.path.join(self.dir, filename)
             try:
-                with open(filepath, "r") as f:
+                with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 unit_id = data.get("id")
                 if unit_id:
@@ -130,7 +130,7 @@ class StepCheckpoint:
         filename = self._safe_filename(unit_id) + ".json"
         filepath = os.path.join(self.dir, filename)
         data["id"] = unit_id  # ensure id is always present
-        with open(filepath, "w") as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
     def write_summary(
@@ -168,7 +168,7 @@ class StepCheckpoint:
         }
         if usage is not None:
             data["usage"] = usage
-        with open(filepath, "w") as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
     @staticmethod
@@ -182,7 +182,7 @@ class StepCheckpoint:
         if not os.path.isfile(filepath):
             return None
         try:
-            with open(filepath, "r") as f:
+            with open(filepath, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             return None
@@ -241,7 +241,7 @@ class StepCheckpoint:
                 continue
             filepath = os.path.join(checkpoint_dir, filename)
             try:
-                with open(filepath, "r") as f:
+                with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except (json.JSONDecodeError, OSError):
                 errors += 1

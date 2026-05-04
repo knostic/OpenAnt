@@ -343,7 +343,7 @@ Examples:
     args = parser.parse_args()
 
     try:
-        with open(args.input_file) as f:
+        with open(args.input_file, encoding="utf-8") as f:
             call_graph_data = json.load(f)
 
         options = {
@@ -373,7 +373,7 @@ Examples:
         output = json.dumps(result, indent=2)
 
         if args.output:
-            with open(args.output, 'w') as f:
+            with open(args.output, 'w', encoding="utf-8") as f:
                 f.write(output)
             print(f"\nOutput written to: {args.output}", file=sys.stderr)
         else:
@@ -382,7 +382,7 @@ Examples:
         # Write analyzer output if requested
         if args.analyzer_output:
             analyzer = generator.generate_analyzer_output()
-            with open(args.analyzer_output, 'w') as f:
+            with open(args.analyzer_output, 'w', encoding="utf-8") as f:
                 json.dump(analyzer, f, indent=2)
             print(f"Analyzer output written to: {args.analyzer_output}", file=sys.stderr)
 
