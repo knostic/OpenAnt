@@ -161,7 +161,11 @@ func CheckOpenantInstalled(pythonPath string) error {
 		if readStoredHash() == "" {
 			if corePath, err := findOpenantCore(); err == nil {
 				if h, err := hashFile(filepath.Join(corePath, "pyproject.toml")); err == nil {
-					_ = writeStoredHash(h)
+					if err := writeStoredHash(h); err != nil {
+						fmt.Fprintf(os.Stderr,
+							"warning: could not save dependency hash at %s: %v (next run may reinstall)\n",
+							depsHashPath(), err)
+					}
 				}
 			}
 		}
@@ -213,7 +217,11 @@ func CheckOpenantInstalled(pythonPath string) error {
 	// Save dependency hash so CheckDepsStale knows this is the baseline.
 	pyprojectPath := filepath.Join(corePath, "pyproject.toml")
 	if h, err := hashFile(pyprojectPath); err == nil {
-		_ = writeStoredHash(h)
+		if err := writeStoredHash(h); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"warning: could not save dependency hash at %s: %v (next run may reinstall)\n",
+				depsHashPath(), err)
+		}
 	}
 
 	fmt.Fprintln(os.Stderr, "openant installed successfully.")
