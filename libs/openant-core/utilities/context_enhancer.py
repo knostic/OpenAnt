@@ -25,7 +25,13 @@ from typing import Callable, Optional
 
 import anthropic
 
-from .llm_client import AnthropicClient, TokenTracker, get_global_tracker, reset_global_tracker
+from .llm_client import (
+    AnthropicClient,
+    TokenTracker,
+    get_anthropic_client,
+    get_global_tracker,
+    reset_global_tracker,
+)
 from .agentic_enhancer import RepositoryIndex, enhance_unit_with_agent, load_index_from_file
 from .rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
 
@@ -585,7 +591,7 @@ class ContextEnhancer:
         # which spawns a new httpx connection pool. With 1000+ units and 8 workers,
         # this exhausted file descriptors (macOS limit ~256). The httpx.Client
         # underlying anthropic.Anthropic is thread-safe, so sharing is correct.
-        shared_client = anthropic.Anthropic(max_retries=5)
+        shared_client = get_anthropic_client(max_retries=5)
 
         # Filter to unprocessed units
         units_to_process = [(i, unit) for i, unit in enumerate(units) if unit.get("id") not in processed_ids]

@@ -50,7 +50,11 @@ def enhance_dataset(
     # Configure global rate limiter
     configure_rate_limiter(backoff_seconds=float(backoff_seconds))
 
-    model_id = "claude-sonnet-4-20250514" if model == "sonnet" else "claude-opus-4-6"
+    # resolve_model_id() handles "opus"/"sonnet" aliases, passes through
+    # slash-form IDs verbatim, and strips a leading "openrouter/" prefix
+    # so OpenCode-style IDs work (see issue #9).
+    from utilities.llm_client import resolve_model_id
+    model_id = resolve_model_id(model)
     print(f"[Enhance] Mode: {mode}", file=sys.stderr)
     print(f"[Enhance] Model: {model_id}", file=sys.stderr)
 

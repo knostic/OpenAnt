@@ -8,30 +8,28 @@ import json
 import os
 import re
 import sys
-import anthropic
+import anthropic  # noqa: F401 — re-exported so monkeypatch tests can patch generator.anthropic.Anthropic
 from pathlib import Path
 from dotenv import load_dotenv
 
 from .schema import validate_pipeline_output, ValidationError
+from utilities.llm_client import get_anthropic_client, get_pricing
 
 load_dotenv()
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 MODEL = "claude-opus-4-6"
 
-# Pricing per million tokens
-_PRICING = {
-    "claude-opus-4-6": {"input": 15.00, "output": 75.00},
-    "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
-    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-}
-_DEFAULT_PRICING = {"input": 3.00, "output": 15.00}
-
 
 def _extract_usage(response, model: str = MODEL) -> dict:
-    """Extract usage info from an Anthropic API response."""
+    """Extract usage info from an Anthropic API response.
+
+    Pricing is sourced from utilities.llm_client.get_pricing(), which
+    honours MODEL_PRICING_OVERRIDE and reports $0 (with a one-time stderr
+    warning) for unknown model IDs rather than guessing.
+    """
     usage = response.usage
-    pricing = _PRICING.get(model, _DEFAULT_PRICING)
+    pricing = get_pricing(model)
     input_cost = (usage.input_tokens / 1_000_000) * pricing["input"]
     output_cost = (usage.output_tokens / 1_000_000) * pricing["output"]
     return {
@@ -54,11 +52,17 @@ def _merge_usage(usages: list[dict]) -> dict:
 
 
 def _check_api_key():
-    """Check that ANTHROPIC_API_KEY is set."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Error: ANTHROPIC_API_KEY environment variable not set.", file=sys.stderr)
-        print("Set it with: export ANTHROPIC_API_KEY=sk-ant-...", file=sys.stderr)
-        sys.exit(1)
+    """Check that an API key is set (ANTHROPIC_API_KEY or OPENANT_LLM_API_KEY)."""
+    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENANT_LLM_API_KEY"):
+        return
+    print("Error: no API key found.", file=sys.stderr)
+    print("Set ANTHROPIC_API_KEY=sk-ant-... for Claude, or", file=sys.stderr)
+    print(
+        "OPENANT_LLM_API_KEY + OPENANT_LLM_BASE_URL for non-Claude providers "
+        "(see README).",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def load_prompt(name: str) -> str:
@@ -136,7 +140,7 @@ def generate_summary_report(pipeline_data: dict) -> tuple[str, dict]:
         output_tokens, total_tokens, cost_usd.
     """
     _check_api_key()
-    client = anthropic.Anthropic()
+    client = get_anthropic_client()
 
     summary_data = _compact_for_summary(pipeline_data)
     system_prompt = load_prompt("system")
@@ -199,7 +203,7 @@ def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[st
         (disclosure_text, usage_dict)
     """
     _check_api_key()
-    client = anthropic.Anthropic()
+    client = get_anthropic_client()
 
     system_prompt = load_prompt("system")
 

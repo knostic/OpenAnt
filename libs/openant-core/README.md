@@ -348,6 +348,48 @@ For a repository with 1,000 units:
 
 ---
 
+## Using non-Claude models via OpenRouter
+
+OpenRouter exposes an Anthropic-compatible endpoint, so OpenAnt can drive
+Qwen, Kimi, MiniMax, DeepSeek and similar models without a separate SDK.
+Three env vars + a `--model` argument are all that's needed:
+
+```bash
+export OPENANT_LLM_BASE_URL=https://openrouter.ai/api/v1
+export OPENANT_LLM_API_KEY=sk-or-v1-...
+openant scan /path/to/repo --output /tmp/results --model qwen/qwen-3-coder-480b
+```
+
+When `OPENANT_LLM_BASE_URL` is unset, every Anthropic client construction
+falls back to the SDK defaults, so existing Claude setups behave exactly
+as before.
+
+`--model` accepts:
+
+| Form | Example | Effect |
+|------|---------|--------|
+| Alias | `opus`, `sonnet` | Resolves to the canonical Claude ID. |
+| Explicit Claude ID | `claude-opus-4-6` | Used verbatim. |
+| Slash-form ID | `qwen/qwen-3-coder-480b` | Used verbatim against the configured endpoint. |
+| OpenCode-style prefix | `openrouter/moonshotai/kimi-k2` | Leading `openrouter/` is stripped (becomes `moonshotai/kimi-k2`). |
+
+### Cost tracking for non-Claude models
+
+The hardcoded pricing table only covers Claude. For unknown model IDs,
+OpenAnt defaults to `$0` per million tokens and prints a one-time warning
+to stderr, so cost rollups stay honest rather than guessing. To plug in
+real OpenRouter pricing, set `MODEL_PRICING_OVERRIDE` to a JSON object of
+`{model_id: {input, output}}` per million tokens:
+
+```bash
+export MODEL_PRICING_OVERRIDE='{"qwen/qwen-3-coder-480b": {"input": 0.4, "output": 1.6}}'
+```
+
+Override values take precedence over the built-in table, so you can also
+use this to update Claude pricing without code changes.
+
+---
+
 ## Supported Vulnerabilities
 
 | Type | Detection Pattern | Languages |

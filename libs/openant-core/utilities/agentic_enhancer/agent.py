@@ -16,7 +16,7 @@ from typing import Optional, Set, List
 
 import anthropic
 
-from ..llm_client import TokenTracker, get_global_tracker
+from ..llm_client import TokenTracker, get_anthropic_client, get_global_tracker
 from ..rate_limiter import get_rate_limiter
 from .repository_index import RepositoryIndex
 from .tools import TOOL_DEFINITIONS, ToolExecutor
@@ -126,7 +126,7 @@ class ContextAgent:
         self.tool_executor = ToolExecutor(index)
         self.entry_points = entry_points or set()
         self.reachability = reachability
-        self.client = client or anthropic.Anthropic(max_retries=5)
+        self.client = client or get_anthropic_client(max_retries=5)
 
     def analyze_unit(
         self,

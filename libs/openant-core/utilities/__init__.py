@@ -5,7 +5,11 @@ from .llm_client import (
     TokenTracker,
     get_global_tracker,
     reset_global_tracker,
-    MODEL_PRICING
+    get_anthropic_client,
+    get_pricing,
+    resolve_model_id,
+    MODEL_ALIASES,
+    MODEL_PRICING,
 )
 from .json_corrector import JSONCorrector
 from .context_corrector import ContextCorrector
@@ -20,6 +24,10 @@ __all__ = [
     'get_global_tracker',
     'reset_global_tracker',
     'MODEL_PRICING',
+    'MODEL_ALIASES',
+    'get_anthropic_client',
+    'get_pricing',
+    'resolve_model_id',
     'JSONCorrector',
     'ContextCorrector',
     'ContextReviewer',

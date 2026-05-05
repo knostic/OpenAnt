@@ -587,10 +587,9 @@ def cmd_report_data(args):
     and step reports — everything display-ready.
     """
     import html as html_mod
-    import anthropic
     from core.schemas import success, error
     from core.step_report import step_context
-    from utilities.llm_client import get_global_tracker
+    from utilities.llm_client import get_anthropic_client, get_global_tracker
 
     results_path = args.results
     dataset_path = args.dataset
@@ -810,7 +809,7 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
 {findings_text}
 """
                 print("[Report] Generating remediation guidance (LLM)...", file=sys.stderr)
-                client = anthropic.Anthropic()
+                client = get_anthropic_client()
                 response = client.messages.create(
                     model="claude-sonnet-4-20250514",
                     max_tokens=4096,
@@ -985,7 +984,18 @@ def main():
                         help="Enable Docker-isolated dynamic testing (off by default)")
     scan_p.add_argument("--no-skip-tests", action="store_true", help="Include test files in parsing (default: tests are skipped)")
     scan_p.add_argument("--limit", type=int, help="Max units to analyze")
-    scan_p.add_argument("--model", choices=["opus", "sonnet"], default="opus", help="Model (default: opus)")
+    scan_p.add_argument(
+        "--model",
+        default="opus",
+        help=(
+            "Model to use. Accepts 'opus' / 'sonnet' aliases, an explicit "
+            "Claude ID, or a slash-form ID for an OpenAI/OpenRouter-compatible "
+            "endpoint (e.g. 'qwen/qwen-3-coder-480b'). The 'openrouter/' "
+            "prefix is recognised and stripped (e.g. "
+            "'openrouter/moonshotai/kimi-k2'). Set OPENANT_LLM_BASE_URL + "
+            "OPENANT_LLM_API_KEY to route requests to a non-Anthropic provider."
+        ),
+    )
     scan_p.add_argument("--workers", type=int, default=8,
                         help="Number of parallel workers for LLM steps (default: 8)")
     scan_p.add_argument("--repo-name", help="Repository name (org/repo)")
@@ -1056,7 +1066,17 @@ def main():
                                help="Analyze units classified as exploitable or vulnerable_internal (safer, compensates for parser gaps)")
     exploit_group.add_argument("--exploitable-only", action="store_true",
                                help="Analyze only units classified as exploitable (strict, use after parser entry point fixes)")
-    analyze_p.add_argument("--model", choices=["opus", "sonnet"], default="opus", help="Model (default: opus)")
+    analyze_p.add_argument(
+        "--model",
+        default="opus",
+        help=(
+            "Model to use. Accepts 'opus' / 'sonnet' aliases, an explicit "
+            "Claude ID, or a slash-form ID for an OpenAI/OpenRouter-compatible "
+            "endpoint (e.g. 'qwen/qwen-3-coder-480b'). The 'openrouter/' "
+            "prefix is recognised and stripped. Set OPENANT_LLM_BASE_URL + "
+            "OPENANT_LLM_API_KEY to route requests to a non-Anthropic provider."
+        ),
+    )
     analyze_p.add_argument("--workers", type=int, default=8,
                            help="Number of parallel workers for LLM calls (default: 8)")
     analyze_p.add_argument("--checkpoint", help="Path to checkpoint directory for save/resume")

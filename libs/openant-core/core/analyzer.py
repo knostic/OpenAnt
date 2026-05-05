@@ -312,8 +312,11 @@ def run_analysis(
     checkpoint = StepCheckpoint("Analyze", output_dir)
     checkpoint.dir = checkpoint_path
 
-    # Select model
-    model_id = "claude-opus-4-6" if model == "opus" else "claude-sonnet-4-20250514"
+    # Select model. resolve_model_id() handles "opus"/"sonnet" aliases,
+    # passes through slash-form IDs verbatim, and strips a leading
+    # "openrouter/" prefix so OpenCode-style IDs work (see issue #9).
+    from utilities.llm_client import resolve_model_id
+    model_id = resolve_model_id(model)
     print(f"[Analyze] Model: {model_id}", file=sys.stderr)
 
     # Initialize client

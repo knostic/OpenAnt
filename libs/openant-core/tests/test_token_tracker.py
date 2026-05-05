@@ -1,5 +1,5 @@
 """Tests for TokenTracker."""
-from utilities.llm_client import TokenTracker, MODEL_PRICING
+from utilities.llm_client import TokenTracker
 
 
 class TestTokenTracker:
@@ -22,12 +22,21 @@ class TestTokenTracker:
         expected_cost = (1000 / 1_000_000) * 3.0 + (500 / 1_000_000) * 15.0
         assert result["cost_usd"] == round(expected_cost, 6)
 
-    def test_record_call_unknown_model_uses_default(self):
+    def test_record_call_unknown_model_yields_zero_cost(self, capsys, monkeypatch):
+        # Unknown model IDs now default to $0 (with a one-time stderr warning)
+        # rather than silently estimating with Sonnet rates. See issue #9 —
+        # once non-Claude models could enter the mix, the old fallback turned
+        # cost rollups into fiction. Set MODEL_PRICING_OVERRIDE for real prices.
+        from utilities import llm_client
+        monkeypatch.setattr(llm_client, "_unknown_model_warned", set())
+
         tracker = TokenTracker()
         result = tracker.record_call("some-future-model", 100, 50)
-        default_pricing = MODEL_PRICING["default"]
-        expected_cost = (100 / 1_000_000) * default_pricing["input"] + (50 / 1_000_000) * default_pricing["output"]
-        assert result["cost_usd"] == round(expected_cost, 6)
+        assert result["cost_usd"] == 0.0
+
+        captured = capsys.readouterr()
+        assert "some-future-model" in captured.err
+        assert "MODEL_PRICING_OVERRIDE" in captured.err
 
     def test_cumulative_tracking(self):
         tracker = TokenTracker()

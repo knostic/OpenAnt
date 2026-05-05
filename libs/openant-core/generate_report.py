@@ -29,8 +29,9 @@ import html
 import os
 from datetime import datetime
 
-import anthropic
 from dotenv import load_dotenv
+
+from utilities.llm_client import get_anthropic_client
 
 # Load environment variables from .env file
 load_dotenv()
@@ -198,11 +199,13 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
 {findings_text}
 """
 
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY not found in environment")
+    if not os.getenv("ANTHROPIC_API_KEY") and not os.getenv("OPENANT_LLM_API_KEY"):
+        raise ValueError(
+            "No API key found. Set ANTHROPIC_API_KEY, or for non-Claude "
+            "providers set OPENANT_LLM_API_KEY (and OPENANT_LLM_BASE_URL)."
+        )
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = get_anthropic_client()
     response = client.messages.create(
         model=REPORT_MODEL,
         max_tokens=MAX_TOKENS,

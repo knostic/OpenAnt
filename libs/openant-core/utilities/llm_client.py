@@ -15,9 +15,18 @@ Usage:
 
     tracker = get_global_tracker()
     print(f"Total cost: ${tracker.total_cost_usd:.4f}")
+
+OpenRouter / non-Claude models:
+    Set OPENANT_LLM_BASE_URL and OPENANT_LLM_API_KEY to route every
+    anthropic.Anthropic(...) construction through a different endpoint
+    (e.g. https://openrouter.ai/api/v1). Use a slash-form --model value
+    (qwen/qwen-3-coder-480b) or the OpenCode-style openrouter/ prefix
+    (openrouter/moonshotai/kimi-k2 -> moonshotai/kimi-k2).
 """
 
+import json
 import os
+import sys
 import threading
 from typing import Optional
 import anthropic
@@ -28,11 +37,122 @@ from .rate_limiter import get_rate_limiter
 
 # Pricing per million tokens (as of December 2024)
 MODEL_PRICING = {
+    "claude-opus-4-6": {"input": 15.00, "output": 75.00},
     "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
     # Fallback for unknown models (use Sonnet pricing as conservative estimate)
     "default": {"input": 3.00, "output": 15.00}
 }
+
+
+# Model aliases used by --model on the CLI. Anything not in this map and
+# without a "/" is left as-is so future Claude IDs keep working.
+MODEL_ALIASES = {
+    "opus": "claude-opus-4-6",
+    "sonnet": "claude-sonnet-4-20250514",
+}
+
+
+def resolve_model_id(value: str) -> str:
+    """Resolve a --model argument to the literal ID sent to the API.
+
+    Rules:
+        - "opus" / "sonnet" -> their canonical Claude IDs.
+        - A value containing "/" is passed through verbatim, with one
+          exception: a leading "openrouter/" prefix is stripped so that
+          OpenCode-style IDs like "openrouter/moonshotai/kimi-k2" work
+          out of the box (they become "moonshotai/kimi-k2"). See issue #9.
+        - Anything else is returned unchanged so explicit Claude IDs
+          (e.g. "claude-opus-4-6") still work.
+    """
+    if not value:
+        return value
+    if value in MODEL_ALIASES:
+        return MODEL_ALIASES[value]
+    if "/" in value:
+        if value.startswith("openrouter/"):
+            return value[len("openrouter/"):]
+        return value
+    return value
+
+
+_unknown_model_warned: set[str] = set()
+_unknown_model_lock = threading.Lock()
+
+
+def _warn_unknown_model_once(model: str) -> None:
+    """Warn at most once per process for each unpriced model ID."""
+    with _unknown_model_lock:
+        if model in _unknown_model_warned:
+            return
+        _unknown_model_warned.add(model)
+    print(
+        f"[llm_client] No pricing entry for model '{model}'; cost rollups "
+        f"for this model will report $0.00. Set MODEL_PRICING_OVERRIDE to "
+        f"add it (see README).",
+        file=sys.stderr,
+    )
+
+
+def _load_pricing_override() -> dict:
+    """Parse MODEL_PRICING_OVERRIDE, returning {} on error."""
+    raw = os.environ.get("MODEL_PRICING_OVERRIDE")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        print(
+            f"[llm_client] Could not parse MODEL_PRICING_OVERRIDE as JSON: {exc}",
+            file=sys.stderr,
+        )
+        return {}
+    if not isinstance(parsed, dict):
+        print(
+            "[llm_client] MODEL_PRICING_OVERRIDE must be a JSON object "
+            "of {model_id: {input, output}}; ignoring.",
+            file=sys.stderr,
+        )
+        return {}
+    return parsed
+
+
+def get_pricing(model: str) -> dict:
+    """Return pricing for a model, honouring MODEL_PRICING_OVERRIDE.
+
+    Override values take precedence over the built-in table. Unknown
+    models default to {input: 0, output: 0} and emit a one-time warning.
+    """
+    override = _load_pricing_override()
+    if model in override:
+        return override[model]
+    if model in MODEL_PRICING:
+        return MODEL_PRICING[model]
+    _warn_unknown_model_once(model)
+    return {"input": 0.0, "output": 0.0}
+
+
+def get_anthropic_client(**kwargs) -> "anthropic.Anthropic":
+    """Construct an anthropic.Anthropic() honouring OPENANT_LLM_* env vars.
+
+    When OPENANT_LLM_BASE_URL is set, the SDK is pointed at that endpoint
+    (typically OpenRouter or a self-hosted Anthropic-compatible proxy).
+    When OPENANT_LLM_API_KEY is set, that key is used in place of
+    ANTHROPIC_API_KEY. Both fall through to the SDK's normal env handling
+    when unset, so existing setups behave identically.
+
+    Any kwargs (e.g. max_retries=5, api_key=...) are forwarded; explicit
+    kwargs take precedence over the env var fallbacks.
+    """
+    base_url = os.environ.get("OPENANT_LLM_BASE_URL")
+    api_key = os.environ.get("OPENANT_LLM_API_KEY")
+
+    if base_url and "base_url" not in kwargs:
+        kwargs["base_url"] = base_url
+    if api_key and "api_key" not in kwargs:
+        kwargs["api_key"] = api_key
+
+    return anthropic.Anthropic(**kwargs)
 
 
 class TokenTracker:
@@ -70,8 +190,10 @@ class TokenTracker:
         Returns:
             Dict with call details including cost
         """
-        # Get pricing for model
-        pricing = MODEL_PRICING.get(model, MODEL_PRICING["default"])
+        # Get pricing for model. get_pricing() honours MODEL_PRICING_OVERRIDE
+        # and falls back to {input: 0, output: 0} for unknown models with a
+        # one-time warning, rather than silently estimating with Sonnet rates.
+        pricing = get_pricing(model)
 
         # Calculate cost (pricing is per million tokens)
         input_cost = (input_tokens / 1_000_000) * pricing["input"]
@@ -200,11 +322,14 @@ class AnthropicClient:
         """
         load_dotenv()
 
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY not found in environment")
+        # Either the OpenRouter override or ANTHROPIC_API_KEY must be set.
+        if not os.getenv("OPENANT_LLM_API_KEY") and not os.getenv("ANTHROPIC_API_KEY"):
+            raise ValueError(
+                "No API key found. Set ANTHROPIC_API_KEY, or for non-Claude "
+                "providers set OPENANT_LLM_API_KEY (and OPENANT_LLM_BASE_URL)."
+            )
 
-        self.client = anthropic.Anthropic(api_key=api_key, max_retries=5)
+        self.client = get_anthropic_client(max_retries=5)
         self.model = model
         self.tracker = tracker or _global_tracker
         self.last_call = None  # Store last call details
