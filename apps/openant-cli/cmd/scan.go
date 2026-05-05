@@ -51,6 +51,7 @@ var (
 	scanIncremental                 bool
 	scanDiffBase                    string
 	scanPR                          int
+	scanStaged                      bool
 	scanDiffScope                   string
 	scanLLMReachability             bool
 	scanLLMReachabilityMaxCodeBytes int
@@ -82,6 +83,7 @@ func registerScanFlags(cmd *cobra.Command) {
 	cmd.Flags().BoolVar(&scanIncremental, "incremental", false, "Incremental against the last successful scan on this project")
 	cmd.Flags().StringVar(&scanDiffBase, "diff-base", "", "Incremental mode: filter pipeline to units overlapping diff vs this ref (e.g. origin/main, HEAD~5)")
 	cmd.Flags().IntVar(&scanPR, "pr", 0, "Incremental mode against a GitHub PR number (requires gh; mutex with --diff-base)")
+	cmd.Flags().BoolVar(&scanStaged, "staged", false, "Incremental mode against the staged index vs HEAD (pre-commit hook usage; mutex with --diff-base/--pr)")
 	cmd.Flags().StringVar(&scanDiffScope, "diff-scope", "changed_functions", "Diff scope: changed_files, changed_functions, callers")
 	cmd.Flags().BoolVar(&scanLLMReachability, "llm-reachability", false, "Enable the LLM reachability review stage (Opus). Surfaces entry points and external-input sites the structural pass would miss by reviewing the full codebase before the reachability filter is applied. Off by default — enabling this incurs cost proportional to total repo size, not the filtered unit count (~one Opus call per 25 units across the whole codebase).")
 	cmd.Flags().IntVar(&scanLLMReachabilityMaxCodeBytes, "llm-reachability-max-code-bytes", 1500, "Max code bytes per unit sent to the LLM reachability stage (default: 1500). Higher values (e.g. 4096, 8192) catch entry-point indicators past byte 1500 in long handlers / generated code, at proportional Opus cost increase. Only meaningful with --llm-reachability.")
@@ -139,6 +141,7 @@ func runScan(cmd *cobra.Command, args []string) {
 	if decision.Kind == config.ScanKindDiff {
 		manifestOpts.base = decision.Base
 		manifestOpts.scope = decision.Scope
+		manifestOpts.staged = decision.Staged
 	}
 	manifestPath, err := prepareDiffManifest(repoPath, scanOutput, manifestOpts)
 	if err != nil {
@@ -279,7 +282,7 @@ func finalizeScanMetaIfProject(ctx *projectContext, status string) {
 // reflecting the decision so step verbs and finalizeScanMetaIfProject
 // have something to read/update.
 func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error) {
-	flagsPassed := scanFull || scanIncremental || scanDiffBase != "" || scanPR > 0
+	flagsPassed := scanFull || scanIncremental || scanDiffBase != "" || scanPR > 0 || scanStaged
 
 	// Reuse init's pending decision when no flags override it.
 	if !flagsPassed && ctx != nil && ctx.Project != nil {
@@ -299,6 +302,7 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 		incremental: scanIncremental,
 		diffBase:    scanDiffBase,
 		pr:          scanPR,
+		staged:      scanStaged,
 		scope:       scanDiffScope,
 		projectName: projectName,
 		repoPath:    repoPath,

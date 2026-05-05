@@ -249,6 +249,141 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStagedChangedFilesAndHunks(t *testing.T) {
+	dir := t.TempDir()
+	initTestRepo(t, dir)
+
+	// Commit 1: initial state.
+	writeFile(t, dir, "a.txt", "one\ntwo\nthree\n")
+	writeFile(t, dir, "b.txt", "alpha\nbeta\n")
+	runCmd(t, dir, "git", "add", ".")
+	runCmd(t, dir, "git", "commit", "-q", "-m", "init")
+
+	// Stage some changes against the index but do not commit.
+	writeFile(t, dir, "a.txt", "one\ntwo MODIFIED\nthree\nfour ADDED\n")
+	writeFile(t, dir, "c.txt", "fresh\n")
+	runCmd(t, dir, "git", "add", "a.txt", "c.txt")
+
+	// Working-tree-only edit on b.txt — must NOT appear in --cached output.
+	writeFile(t, dir, "b.txt", "alpha\nbeta\nWORKTREE-ONLY\n")
+
+	files, err := StagedChangedFiles(dir)
+	if err != nil {
+		t.Fatalf("StagedChangedFiles: %v", err)
+	}
+	want := []string{"a.txt", "c.txt"}
+	sort.Strings(files)
+	if !reflect.DeepEqual(files, want) {
+		t.Errorf("StagedChangedFiles = %v, want %v (b.txt is worktree-only, must not appear)", files, want)
+	}
+
+	hunksA, err := StagedHunksForFile(dir, "a.txt")
+	if err != nil {
+		t.Fatalf("StagedHunksForFile a.txt: %v", err)
+	}
+	if len(hunksA) == 0 {
+		t.Fatalf("expected staged hunks on a.txt, got none")
+	}
+	for _, h := range hunksA {
+		if h[0] < 1 || h[1] < h[0] {
+			t.Errorf("bad staged hunk range %v", h)
+		}
+	}
+
+	hunksC, err := StagedHunksForFile(dir, "c.txt")
+	if err != nil {
+		t.Fatalf("StagedHunksForFile c.txt: %v", err)
+	}
+	if len(hunksC) != 1 || hunksC[0][0] != 1 {
+		t.Errorf("unexpected staged hunks on c.txt: %v", hunksC)
+	}
+}
+
+func TestBuildStagedManifest(t *testing.T) {
+	dir := t.TempDir()
+	initTestRepo(t, dir)
+
+	writeFile(t, dir, "a.txt", "one\ntwo\n")
+	runCmd(t, dir, "git", "add", ".")
+	runCmd(t, dir, "git", "commit", "-q", "-m", "init")
+
+	writeFile(t, dir, "a.txt", "one\ntwo changed\nthree\n")
+	runCmd(t, dir, "git", "add", "a.txt")
+
+	m, err := BuildStagedManifest(dir, ScopeChangedFunctions)
+	if err != nil {
+		t.Fatalf("BuildStagedManifest: %v", err)
+	}
+	if m.BaseRef != StagedRef {
+		t.Errorf("BaseRef = %q, want %q", m.BaseRef, StagedRef)
+	}
+	if m.Scope != ScopeChangedFunctions {
+		t.Errorf("Scope = %q, want %q", m.Scope, ScopeChangedFunctions)
+	}
+	if len(m.ChangedFiles) != 1 || m.ChangedFiles[0] != "a.txt" {
+		t.Errorf("ChangedFiles = %v, want [a.txt]", m.ChangedFiles)
+	}
+	if m.BaseSHA == "" || m.BaseSHA == stagedHeadSHA {
+		t.Errorf("BaseSHA should be HEAD, got %q", m.BaseSHA)
+	}
+	if m.HeadSHA != stagedHeadSHA {
+		t.Errorf("HeadSHA = %q, want %q", m.HeadSHA, stagedHeadSHA)
+	}
+	if len(m.Hunks["a.txt"]) == 0 {
+		t.Errorf("expected hunks for a.txt, got %v", m.Hunks)
+	}
+}
+
+func TestBuildStagedManifestChangedFilesScopeOmitsHunks(t *testing.T) {
+	dir := t.TempDir()
+	initTestRepo(t, dir)
+
+	writeFile(t, dir, "a.txt", "x\n")
+	runCmd(t, dir, "git", "add", ".")
+	runCmd(t, dir, "git", "commit", "-q", "-m", "init")
+
+	writeFile(t, dir, "a.txt", "x\ny\n")
+	runCmd(t, dir, "git", "add", "a.txt")
+
+	m, err := BuildStagedManifest(dir, ScopeChangedFiles)
+	if err != nil {
+		t.Fatalf("BuildStagedManifest: %v", err)
+	}
+	if m.Hunks != nil {
+		t.Errorf("hunks should be nil for changed_files scope, got %v", m.Hunks)
+	}
+}
+
+func TestBuildStagedManifestEmptyIndex(t *testing.T) {
+	dir := t.TempDir()
+	initTestRepo(t, dir)
+
+	writeFile(t, dir, "a.txt", "x\n")
+	runCmd(t, dir, "git", "add", ".")
+	runCmd(t, dir, "git", "commit", "-q", "-m", "init")
+
+	// Nothing staged.
+	m, err := BuildStagedManifest(dir, ScopeChangedFunctions)
+	if err != nil {
+		t.Fatalf("BuildStagedManifest with empty index: %v", err)
+	}
+	if len(m.ChangedFiles) != 0 {
+		t.Errorf("expected no changed files, got %v", m.ChangedFiles)
+	}
+}
+
+func TestBuildStagedManifestRejectsBadScope(t *testing.T) {
+	dir := t.TempDir()
+	initTestRepo(t, dir)
+	writeFile(t, dir, "a.txt", "x\n")
+	runCmd(t, dir, "git", "add", ".")
+	runCmd(t, dir, "git", "commit", "-q", "-m", "init")
+
+	if _, err := BuildStagedManifest(dir, "everything"); err == nil {
+		t.Fatal("expected error for invalid scope, got nil")
+	}
+}
+
 func TestIsValidScope(t *testing.T) {
 	valid := []string{ScopeChangedFiles, ScopeChangedFunctions, ScopeCallers}
 	for _, s := range valid {

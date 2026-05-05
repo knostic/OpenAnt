@@ -208,6 +208,29 @@ intended for local single-user use. Scan outputs persist under
 `~/.openant/webui/` across restarts. Analysis still sends source code to your
 configured LLM provider, the same as the CLI.
 
+### Incremental and diff-based scans
+
+For repositories where a full scan is too slow or expensive, OpenAnt can
+restrict the pipeline to units whose bodies overlap a git diff hunk:
+
+```bash
+openant scan --diff-base origin/main          # diff vs a ref
+openant scan --pr 123                         # diff vs the base of a GitHub PR
+openant scan --staged                         # diff vs HEAD using the staged index
+openant scan --incremental                    # diff vs the last successful scan
+```
+
+`--staged` reads `git diff --cached` and is intended for pre-commit hooks or
+local "scan what I'm about to commit" runs. The base is HEAD; the head is the
+index, so files staged with `git add` are scanned and worktree-only edits are
+not.
+
+The shorter `openant diff` form takes the same flags, e.g.:
+
+```bash
+openant diff --staged --skip-dynamic-test
+```
+
 ### Working with multiple projects
 
 The pipeline operates on one project at a time. Running `openant init` sets the newly initialized project as the active one, so all subsequent commands target it by default.

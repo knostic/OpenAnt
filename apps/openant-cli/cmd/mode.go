@@ -22,17 +22,20 @@ type modeOpts struct {
 	incremental bool
 	diffBase    string
 	pr          int
+	staged      bool
 	scope       string
 	projectName string
 	repoPath    string
 }
 
 // modeDecision is the resolved mode for a scan-run. Fields beyond Kind
-// are only set when Kind == ScanKindDiff.
+// are only set when Kind == ScanKindDiff. Staged is true when the diff
+// runs against the index (vs a committed ref).
 type modeDecision struct {
-	Kind  string
-	Base  string // ref used for diff (may be a SHA or named ref)
-	Scope string
+	Kind   string
+	Base   string // ref used for diff (may be a SHA or named ref)
+	Scope  string
+	Staged bool
 }
 
 // errBaselineNonInteractive is returned when init/scan is invoked without
@@ -66,6 +69,10 @@ func selectMode(o modeOpts) (modeDecision, error) {
 	scope := o.scope
 	if scope == "" {
 		scope = git.ScopeChangedFunctions
+	}
+
+	if o.staged {
+		return modeDecision{Kind: config.ScanKindDiff, Scope: scope, Staged: true}, nil
 	}
 
 	if o.pr > 0 {
@@ -122,11 +129,14 @@ func validateModeFlags(o modeOpts) error {
 	if o.incremental {
 		diffFlagCount++
 	}
+	if o.staged {
+		diffFlagCount++
+	}
 	if o.full && diffFlagCount > 0 {
-		return errors.New("--full cannot be combined with --incremental, --diff-base, or --pr")
+		return errors.New("--full cannot be combined with --incremental, --diff-base, --pr, or --staged")
 	}
 	if diffFlagCount > 1 {
-		return errors.New("--incremental, --diff-base, and --pr are mutually exclusive")
+		return errors.New("--incremental, --diff-base, --pr, and --staged are mutually exclusive")
 	}
 	if o.scope != "" && !git.IsValidScope(o.scope) {
 		return fmt.Errorf(
