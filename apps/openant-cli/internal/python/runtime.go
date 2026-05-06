@@ -46,9 +46,34 @@ func venvPython() string {
 // DetectRuntime finds a suitable Python 3.11+ installation.
 //
 // Search order:
-//  1. Managed venv at ~/.openant/venv/ (if it exists and is valid)
-//  2. python3 / python on PATH
+//  1. OPENANT_PYTHON env var (if set and valid) — set this to pin a specific
+//     interpreter for debugging, CI, or container use (e.g. OPENANT_PYTHON=python3.11).
+//  2. Managed venv at ~/.openant/venv/ (if it exists and is valid)
+//  3. python3 / python on PATH
+//
+// Note: the managed-venv path (strategy 2) uses "bin/python" which is correct
+// on Linux/macOS. On Windows the venv layout uses "Scripts\python.exe"; users
+// on Windows who rely on the managed venv should set OPENANT_PYTHON explicitly
+// to point at the desired interpreter.
 func DetectRuntime() (*RuntimeInfo, error) {
+	// Strategy 0: honour explicit override via OPENANT_PYTHON env var.
+	// If the override is set but unusable, warn and fall through rather than
+	// silently using a different interpreter behind the caller's back.
+	if override := os.Getenv("OPENANT_PYTHON"); override != "" {
+		info, err := checkPython(override)
+		if err != nil {
+			fmt.Fprintf(os.Stderr,
+				"warning: OPENANT_PYTHON=%q is not a usable Python binary (%v); ignoring override\n",
+				override, err)
+		} else if info.Major > MinPythonMajor || (info.Major == MinPythonMajor && info.Minor >= MinPythonMinor) {
+			return info, nil
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"warning: OPENANT_PYTHON=%q is Python %s, below the required %d.%d; ignoring override\n",
+				override, info.Version, MinPythonMajor, MinPythonMinor)
+		}
+	}
+
 	// Strategy 1: check managed venv
 	vp := venvPython()
 	if fileExists(vp) {

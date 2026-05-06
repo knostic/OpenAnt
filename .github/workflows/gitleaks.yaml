@@ -9,13 +9,20 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
-      actions: read
-      checks: write
     steps:
+      # Fork PRs need pull_request_target so GITLEAKS_LICENSE is available
+      # (regular pull_request from a fork has no access to repo secrets).
+      # gitleaks-action@v2 rejects pull_request_target ("event is not yet
+      # supported"), so we run the gitleaks CLI directly. Pattern mirrors
+      # kirin_auto/.github/workflows/gitleaks.yaml.
+      #
+      # Safety with pull_request_target: explicitly check out the fork's HEAD
+      # SHA, drop persisted credentials, restrict permissions to contents:read.
+      # Gitleaks only reads files — no fork code is executed.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4.2.2
         with:
           fetch-depth: 0
+          filter: blob:none
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Set scan range
@@ -28,14 +35,30 @@ jobs:
         run: |
           NULL_SHA="0000000000000000000000000000000000000000"
           if [ "$EVENT" = "pull_request_target" ]; then
-            echo "log_opts=${BASE_SHA}..HEAD" >> $GITHUB_OUTPUT
+            echo "log_opts=${BASE_SHA}..HEAD" >> "$GITHUB_OUTPUT"
           elif [ "$BEFORE_SHA" = "$NULL_SHA" ] || [ -z "$BEFORE_SHA" ] || [ "$FORCED" = "true" ]; then
-            echo "log_opts=" >> $GITHUB_OUTPUT
+            echo "log_opts=" >> "$GITHUB_OUTPUT"
           else
-            echo "log_opts=${BEFORE_SHA}..HEAD" >> $GITHUB_OUTPUT
+            echo "log_opts=${BEFORE_SHA}..HEAD" >> "$GITHUB_OUTPUT"
           fi
-      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+      - name: Install gitleaks
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # renovate: datasource=github-releases depName=gitleaks/gitleaks
+          GITLEAKS_VERSION: v8.30.1
+        run: |
+          VERSION="${GITLEAKS_VERSION#v}"
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Run gitleaks
+        env:
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
-          GITLEAKS_LOG_OPTS: ${{ steps.range.outputs.log_opts }}
+          LOG_OPTS: ${{ steps.range.outputs.log_opts }}
+        run: |
+          if [ -n "$LOG_OPTS" ]; then
+            gitleaks detect --source . --log-opts "$LOG_OPTS" --exit-code 1
+          else
+            gitleaks detect --source . --exit-code 1
+          fi

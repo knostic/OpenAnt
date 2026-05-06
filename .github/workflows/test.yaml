@@ -1,0 +1,134 @@
+name: tests
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  python-tests:
+    name: Python tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.repository == 'knostic/OpenAnt' && fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            libs/openant-core/requirements.txt
+            libs/openant-core/pyproject.toml
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: libs/openant-core/parsers/javascript/package-lock.json
+
+      - name: Install Python dependencies
+        working-directory: libs/openant-core
+        run: pip install -r requirements.txt && pip install ".[dev]"
+
+      - name: Cache JS parser node_modules
+        id: cache-node-modules
+        uses: actions/cache@v4
+        with:
+          path: libs/openant-core/parsers/javascript/node_modules
+          key: ${{ runner.os }}-jsparser-nodemodules-${{ hashFiles('libs/openant-core/parsers/javascript/package-lock.json') }}
+
+      - name: Install JS parser dependencies
+        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        working-directory: libs/openant-core/parsers/javascript
+        run: npm ci
+
+      - name: Run Python and parser tests
+        working-directory: libs/openant-core
+        run: python -m pytest tests/test_token_tracker.py tests/test_parser_adapter.py tests/test_python_parser.py tests/test_js_parser.py -v
+
+  go-tests:
+    name: Go build + integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      OPENANT_PYTHON: python
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.repository == 'knostic/OpenAnt' && fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: apps/openant-cli/go.mod
+          cache-dependency-path: apps/openant-cli/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            libs/openant-core/requirements.txt
+            libs/openant-core/pyproject.toml
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: libs/openant-core/parsers/javascript/package-lock.json
+
+      - name: Vet
+        working-directory: apps/openant-cli
+        run: go vet ./...
+
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
+        working-directory: apps/openant-cli
+        run: go build -o openant .
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        working-directory: apps/openant-cli
+        run: go build -o openant.exe .
+
+      - name: Verify binary exists
+        working-directory: apps/openant-cli
+        shell: bash
+        run: |
+          if [ -f openant ] || [ -f openant.exe ]; then
+            echo "Binary built successfully"
+          else
+            echo "ERROR: Binary not found" && exit 1
+          fi
+
+      - name: Install Python dependencies
+        working-directory: libs/openant-core
+        run: pip install -r requirements.txt && pip install ".[dev]"
+
+      - name: Cache JS parser node_modules
+        id: cache-node-modules
+        uses: actions/cache@v4
+        with:
+          path: libs/openant-core/parsers/javascript/node_modules
+          key: ${{ runner.os }}-jsparser-nodemodules-${{ hashFiles('libs/openant-core/parsers/javascript/package-lock.json') }}
+
+      - name: Install JS parser dependencies
+        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        working-directory: libs/openant-core/parsers/javascript
+        run: npm ci
+
+      - name: Run Go CLI integration tests
+        working-directory: libs/openant-core
+        run: python -m pytest tests/test_go_cli.py -v --tb=short
