@@ -24,8 +24,11 @@ var (
 var rootCmd = &cobra.Command{
 	Use:   "openant",
 	Short: "LLM-powered static analysis security testing",
-	Long: `OpenAnt is a two-stage SAST tool that uses Claude to find real vulnerabilities
+	Long: `OpenAnt is a two-stage SAST tool that uses LLMs to find real vulnerabilities
 in Python, JavaScript, Go, and C/C++ codebases.
+
+Works with Anthropic's API or any compatible local AI server (llama-swap,
+llama-server, vLLM, LM Studio, etc.).
 
 Stage 1: Detect potential vulnerabilities via code analysis
 Stage 2: Simulate an attacker to eliminate false positives
@@ -40,7 +43,7 @@ Commands:
   build-output  Assemble pipeline_output.json from verified results
   dynamic-test  Docker-isolated exploit testing
   report        Generate reports from analysis results
-  config        Manage CLI configuration (API key, etc.)`,
+  config        Manage CLI configuration (API key, endpoint, models)`,
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
@@ -65,17 +68,57 @@ func requireAPIKey() string {
 	}
 	fmt.Fprintln(os.Stderr, "Error: No API key configured.")
 	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "Run:  openant set-api-key <your-anthropic-api-key>")
+	fmt.Fprintln(os.Stderr, "Run:  openant config set api-key")
 	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "You can get an API key at https://console.anthropic.com/settings/keys")
+	fmt.Fprintln(os.Stderr, "For local AI (llama-swap, llama-server, etc.), any value works:")
+	fmt.Fprintln(os.Stderr, "  openant config set api-key       (enter 'not-needed')")
+	fmt.Fprintln(os.Stderr, "  openant config set base-url      (enter your server URL)")
 	os.Exit(2)
 	return "" // unreachable
+}
+
+// llmEnv builds the environment variable map passed to the Python subprocess.
+// It injects the API key, base URL, and model names from the config file
+// so the Python core can connect to a local AI server or Anthropic's API.
+func llmEnv() map[string]string {
+	env := map[string]string{}
+
+	key := resolvedAPIKey()
+	if key != "" {
+		env["ANTHROPIC_API_KEY"] = key
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return env
+	}
+
+	if cfg.BaseURL != "" {
+		env["ANTHROPIC_BASE_URL"] = cfg.BaseURL
+	}
+	if cfg.OpusModel != "" {
+		env["OPENANT_OPUS_MODEL"] = cfg.OpusModel
+	}
+	if cfg.SonnetModel != "" {
+		env["OPENANT_SONNET_MODEL"] = cfg.SonnetModel
+	}
+	if cfg.VerifySSL != nil && !*cfg.VerifySSL {
+		env["OPENANT_VERIFY_SSL"] = "false"
+	}
+
+	return env
+}
+
+// llmEnvRequired is like llmEnv but exits if no API key is configured.
+func llmEnvRequired() map[string]string {
+	requireAPIKey() // exits if missing
+	return llmEnv()
 }
 
 func init() {
 	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output raw JSON (machine-readable)")
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "Suppress progress output")
-	rootCmd.PersistentFlags().StringVar(&apiKeyFlag, "api-key", "", "Anthropic API key (overrides config)")
+	rootCmd.PersistentFlags().StringVar(&apiKeyFlag, "api-key", "", "LLM API key (overrides config)")
 	rootCmd.PersistentFlags().StringVarP(&projectFlag, "project", "p", "", "Project to use (overrides active project, e.g. grafana/grafana)")
 
 	rootCmd.AddCommand(initCmd)

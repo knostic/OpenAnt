@@ -18,7 +18,8 @@ from utilities.llm_client import AnthropicClient, TokenTracker
 
 
 # Use a cheaper/faster model for consistency checks
-CONSISTENCY_MODEL = "claude-sonnet-4-20250514"
+from utilities.config import resolve_model, extract_text
+CONSISTENCY_MODEL = resolve_model("sonnet")
 MAX_TOKENS = 4096
 
 
@@ -281,7 +282,7 @@ def _resolve_stage1_inconsistency(
         )
 
         # Parse response
-        text = response.content[0].text if response.content else ""
+        text = extract_text(response)
 
         # Extract JSON from response
         json_match = re.search(r'\{[\s\S]*\}', text)

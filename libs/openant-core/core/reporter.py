@@ -587,11 +587,12 @@ def _record_usage_in_tracker(usage: dict):
     """Record usage in the global TokenTracker so step_context captures it."""
     try:
         from utilities.llm_client import get_global_tracker
+        from utilities.config import resolve_model
         tracker = get_global_tracker()
         # Record as a single aggregated call
         if usage.get("total_tokens", 0) > 0:
             tracker.record_call(
-                model="claude-opus-4-6",
+                model=resolve_model("opus"),
                 input_tokens=usage["input_tokens"],
                 output_tokens=usage["output_tokens"],
             )

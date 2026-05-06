@@ -78,8 +78,8 @@ Manual Override:
 
     parser.add_argument(
         "--model", "-m",
-        default="claude-sonnet-4-20250514",
-        help="Anthropic model to use (default: claude-sonnet-4-20250514)",
+        default="sonnet",
+        help="Model alias ('opus', 'sonnet') or full model name",
     )
 
     parser.add_argument(

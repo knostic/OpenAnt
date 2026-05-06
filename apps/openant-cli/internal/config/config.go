@@ -17,7 +17,11 @@ import (
 // Config holds the persistent CLI configuration.
 type Config struct {
 	APIKey        string `json:"api_key,omitempty"`
+	BaseURL       string `json:"base_url,omitempty"`
 	DefaultModel  string `json:"default_model,omitempty"`
+	OpusModel     string `json:"opus_model,omitempty"`
+	SonnetModel   string `json:"sonnet_model,omitempty"`
+	VerifySSL     *bool  `json:"verify_ssl,omitempty"`
 	ActiveProject string `json:"active_project,omitempty"`
 }
 

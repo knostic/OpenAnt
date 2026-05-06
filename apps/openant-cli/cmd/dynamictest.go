@@ -86,7 +86,7 @@ func runDynamicTest(cmd *cobra.Command, args []string) {
 		pyArgs = append(pyArgs, "--repo-path", ctx.RepoPath)
 	}
 
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, llmEnvRequired())
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)

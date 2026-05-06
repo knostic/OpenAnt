@@ -10,7 +10,7 @@ Classes:
 Usage:
     from utilities.llm_client import AnthropicClient, get_global_tracker
 
-    client = AnthropicClient(model="claude-opus-4-20250514")
+    client = AnthropicClient(model="opus")  # or "sonnet", or a full model ID
     response = client.analyze_sync("Analyze this code...")
 
     tracker = get_global_tracker()
@@ -183,29 +183,28 @@ def reset_global_tracker():
 
 class AnthropicClient:
     """
-    Client for Anthropic Claude API.
+    LLM API client with token tracking.
 
-    Uses Claude Opus 4 for vulnerability analysis.
-    Tracks token usage and costs for all calls.
+    Wraps anthropic.Anthropic and routes through config (base URL, model names)
+    so it works with both Anthropic cloud and local AI servers.
     """
 
-    def __init__(self, model: str = "claude-opus-4-20250514", tracker: TokenTracker = None):
+    def __init__(self, model: str = "opus", tracker: TokenTracker = None):
         """
-        Initialize the Anthropic client.
+        Initialize the client.
 
         Args:
-            model: Model identifier. Default is Claude Opus 4 (highest capability).
-                   Use "claude-sonnet-4-20250514" for cost-effective option.
+            model: Model alias ("opus", "sonnet") or full model ID.
+                   Resolved via OPENANT_OPUS_MODEL / OPENANT_SONNET_MODEL
+                   env vars, falling back to Claude model names.
             tracker: Optional TokenTracker instance. Uses global tracker if not provided.
         """
+        from .config import create_anthropic_client, resolve_model
+
         load_dotenv()
 
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY not found in environment")
-
-        self.client = anthropic.Anthropic(api_key=api_key, max_retries=5)
-        self.model = model
+        self.client = create_anthropic_client(max_retries=5)
+        self.model = resolve_model(model)
         self.tracker = tracker or _global_tracker
         self.last_call = None  # Store last call details
 
@@ -245,7 +244,8 @@ class AnthropicClient:
             output_tokens=message.usage.output_tokens
         )
 
-        return message.content[0].text
+        from .config import extract_text
+        return extract_text(message)
 
     def analyze_sync(self, prompt: str, max_tokens: int = 8192, model: str = None, system: str = None) -> str:
         """
@@ -291,7 +291,8 @@ class AnthropicClient:
             output_tokens=message.usage.output_tokens
         )
 
-        return message.content[0].text
+        from .config import extract_text
+        return extract_text(message)
 
     def get_last_call(self) -> Optional[dict]:
         """

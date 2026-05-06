@@ -27,8 +27,8 @@ type InvokeResult struct {
 // - stderr is streamed to the terminal in real-time (progress messages)
 // - stdout is captured and parsed as JSON
 // - Working directory is set to the openant-core lib directory if provided
-// - If apiKey is non-empty, it is injected as ANTHROPIC_API_KEY in the subprocess
-func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey string) (*InvokeResult, error) {
+// - extraEnv entries are injected into the subprocess environment
+func Invoke(pythonPath string, args []string, workDir string, quiet bool, extraEnv map[string]string) (*InvokeResult, error) {
 	cmdArgs := append([]string{"-m", "openant"}, args...)
 	cmd := exec.Command(pythonPath, cmdArgs...)
 
@@ -36,12 +36,13 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 		cmd.Dir = workDir
 	}
 
-	// Pass through environment (Python needs ANTHROPIC_API_KEY, etc.)
-	// If an API key is provided via flag or config, inject it into the
-	// subprocess environment so Python picks it up regardless of .env files.
+	// Pass through environment, then overlay caller-supplied vars
+	// (API key, base URL, model names, etc.)
 	cmd.Env = os.Environ()
-	if apiKey != "" {
-		cmd.Env = setEnv(cmd.Env, "ANTHROPIC_API_KEY", apiKey)
+	for k, v := range extraEnv {
+		if v != "" {
+			cmd.Env = setEnv(cmd.Env, k, v)
+		}
 	}
 
 	// Capture stdout (JSON output)

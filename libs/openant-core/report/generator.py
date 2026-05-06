@@ -12,12 +12,13 @@ import anthropic
 from pathlib import Path
 from dotenv import load_dotenv
 
+from utilities.config import resolve_model, create_anthropic_client, extract_text
 from .schema import validate_pipeline_output, ValidationError
 
 load_dotenv()
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
-MODEL = "claude-opus-4-6"
+MODEL = resolve_model("opus")
 
 # Pricing per million tokens
 _PRICING = {
@@ -136,7 +137,7 @@ def generate_summary_report(pipeline_data: dict) -> tuple[str, dict]:
         output_tokens, total_tokens, cost_usd.
     """
     _check_api_key()
-    client = anthropic.Anthropic()
+    client = create_anthropic_client()
 
     summary_data = _compact_for_summary(pipeline_data)
     system_prompt = load_prompt("system")
@@ -149,7 +150,7 @@ def generate_summary_report(pipeline_data: dict) -> tuple[str, dict]:
         messages=[{"role": "user", "content": user_prompt}]
     )
 
-    return response.content[0].text, _extract_usage(response)
+    return extract_text(response), _extract_usage(response)
 
 
 def _splice_code_section(llm_output: str, code_section: str) -> str:
@@ -199,7 +200,7 @@ def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[st
         (disclosure_text, usage_dict)
     """
     _check_api_key()
-    client = anthropic.Anthropic()
+    client = create_anthropic_client()
 
     system_prompt = load_prompt("system")
 
@@ -225,7 +226,7 @@ def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[st
         messages=[{"role": "user", "content": user_prompt}]
     )
 
-    llm_output = response.content[0].text
+    llm_output = extract_text(response)
     final_output = _splice_code_section(llm_output, code_section)
 
     return final_output, _extract_usage(response)

@@ -40,6 +40,8 @@ from typing import Callable, Optional
 
 import anthropic
 
+from .config import create_anthropic_client, resolve_model, extract_text
+
 from .llm_client import TokenTracker, get_global_tracker
 from .rate_limiter import get_rate_limiter
 
@@ -62,7 +64,7 @@ except ImportError:
     ApplicationContext = None
 
 
-VERIFIER_MODEL = "claude-opus-4-6"
+VERIFIER_MODEL = resolve_model("opus")
 MAX_ITERATIONS = 20
 MAX_TOKENS_PER_RESPONSE = 4096
 
@@ -271,7 +273,7 @@ class FindingVerifier:
         self.verbose = verbose
         self.app_context = app_context
         self.tool_executor = ToolExecutor(index)
-        self.client = client or anthropic.Anthropic(max_retries=5)
+        self.client = client or create_anthropic_client(max_retries=5)
         self.logger = logger or _null_logger
         self._use_logger = logger is not None
 
@@ -848,7 +850,7 @@ class FindingVerifier:
             )
 
             # Parse response
-            text = response.content[0].text if response.content else ""
+            text = extract_text(response)
             result = self._parse_json_from_text(text)
 
             if result:

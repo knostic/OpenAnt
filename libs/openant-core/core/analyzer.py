@@ -313,7 +313,7 @@ def run_analysis(
     checkpoint.dir = checkpoint_path
 
     # Select model
-    model_id = "claude-opus-4-6" if model == "opus" else "claude-sonnet-4-20250514"
+    from utilities.config import resolve_model; model_id = resolve_model(model)
     print(f"[Analyze] Model: {model_id}", file=sys.stderr)
 
     # Initialize client

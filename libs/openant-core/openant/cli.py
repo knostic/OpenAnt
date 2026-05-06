@@ -810,13 +810,15 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
 {findings_text}
 """
                 print("[Report] Generating remediation guidance (LLM)...", file=sys.stderr)
-                client = anthropic.Anthropic()
+                from utilities.config import create_anthropic_client, resolve_model, extract_text
+                _remed_model = resolve_model("sonnet")
+                client = create_anthropic_client()
                 response = client.messages.create(
-                    model="claude-sonnet-4-20250514",
+                    model=_remed_model,
                     max_tokens=4096,
                     messages=[{"role": "user", "content": prompt}],
                 )
-                remediation_html = response.content[0].text
+                remediation_html = extract_text(response)
 
                 # Post-process: linkify finding references like #4, #12-#14
                 import re
@@ -829,7 +831,7 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
                 usage = response.usage
                 tracker = get_global_tracker()
                 tracker.record_call(
-                    model="claude-sonnet-4-20250514",
+                    model=_remed_model,
                     input_tokens=usage.input_tokens,
                     output_tokens=usage.output_tokens,
                 )

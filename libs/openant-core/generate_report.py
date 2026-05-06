@@ -32,11 +32,13 @@ from datetime import datetime
 import anthropic
 from dotenv import load_dotenv
 
+from utilities.config import resolve_model, create_anthropic_client, extract_text
+
 # Load environment variables from .env file
 load_dotenv()
 
 
-REPORT_MODEL = "claude-sonnet-4-20250514"
+REPORT_MODEL = resolve_model("sonnet")
 MAX_TOKENS = 4096
 
 
@@ -198,18 +200,14 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
 {findings_text}
 """
 
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY not found in environment")
-
-    client = anthropic.Anthropic(api_key=api_key)
+    client = create_anthropic_client()
     response = client.messages.create(
         model=REPORT_MODEL,
         max_tokens=MAX_TOKENS,
         messages=[{"role": "user", "content": prompt}]
     )
 
-    return response.content[0].text
+    return extract_text(response)
 
 
 def _build_pipeline_costs_html(step_reports: list[dict]) -> str:

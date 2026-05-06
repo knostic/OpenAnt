@@ -50,7 +50,7 @@ def enhance_dataset(
     # Configure global rate limiter
     configure_rate_limiter(backoff_seconds=float(backoff_seconds))
 
-    model_id = "claude-sonnet-4-20250514" if model == "sonnet" else "claude-opus-4-6"
+    from utilities.config import resolve_model; model_id = resolve_model(model)
     print(f"[Enhance] Mode: {mode}", file=sys.stderr)
     print(f"[Enhance] Model: {model_id}", file=sys.stderr)
 

@@ -40,17 +40,19 @@ func validateAPIKey(key string) error {
 
 var setAPIKeyCmd = &cobra.Command{
 	Use:   "set-api-key <key>",
-	Short: "Save your Anthropic API key",
-	Long: `Save your Anthropic API key to the OpenAnt config file.
+	Short: "Save your LLM API key",
+	Long: `Save your LLM API key to the OpenAnt config file.
 
 The key is stored in ~/.config/openant/config.json with restricted
 permissions (0600). This is required before running enhance, analyze,
 verify, or scan.
 
-Get an API key at https://console.anthropic.com/settings/keys
+For Anthropic: get a key at https://console.anthropic.com/settings/keys
+For local AI (llama-swap, etc.): use any non-empty value (e.g. "not-needed")
 
 Examples:
-  openant set-api-key sk-ant-api03-...`,
+  openant set-api-key sk-ant-api03-...     Anthropic key
+  openant set-api-key not-needed           Local AI (no real key needed)`,
 	Args: cobra.ExactArgs(1),
 	Run:  runSetAPIKey,
 }
@@ -62,21 +64,24 @@ func runSetAPIKey(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Validate against Anthropic BEFORE saving — a bad key should never
-	// be persisted, otherwise `openant scan` silently produces zero results
-	// that look like a clean repo.
-	fmt.Fprintf(os.Stderr, "Validating API key with Anthropic... ")
-	if err := validateAPIKey(key); err != nil {
-		fmt.Fprintf(os.Stderr, "\n")
-		output.PrintError(err.Error())
-		os.Exit(1)
-	}
-	fmt.Fprintf(os.Stderr, "OK\n")
-
 	cfg, err := config.Load()
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(1)
+	}
+
+	// Only validate against Anthropic if no custom base URL is configured.
+	// With a local AI server the Anthropic validation endpoint is irrelevant.
+	if cfg.BaseURL == "" {
+		fmt.Fprintf(os.Stderr, "Validating API key with Anthropic... ")
+		if err := validateAPIKey(key); err != nil {
+			fmt.Fprintf(os.Stderr, "\n")
+			output.PrintError(err.Error())
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "OK\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "Custom base URL configured — skipping Anthropic validation\n")
 	}
 
 	cfg.APIKey = key

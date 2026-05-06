@@ -19,9 +19,12 @@ var configCmd = &cobra.Command{
 Configuration is stored in ~/.config/openant/config.json.
 
 Examples:
-  openant config set api-key        Set your Anthropic API key (interactive)
+  openant config set api-key        Set your API key (interactive)
+  openant config set base-url       Set LLM endpoint for local AI
+  openant config set opus-model     Set model for heavy analysis
+  openant config set sonnet-model   Set model for lighter tasks
   openant config show               View current configuration
-  openant config unset api-key      Remove your API key
+  openant config unset base-url     Remove a setting
   openant config path               Print the config file path`,
 }
 
@@ -31,10 +34,14 @@ var configSetCmd = &cobra.Command{
 	Long: `Set a configuration value. For sensitive values like api-key,
 the value is read from stdin (not echoed) to avoid shell history exposure.
 
-Supported keys: api-key, default-model
+Supported keys: api-key, base-url, default-model, opus-model, sonnet-model, verify-ssl
 
 Examples:
   openant config set api-key              Interactive prompt (recommended)
+  openant config set base-url             Set LLM endpoint (e.g. http://localhost:8080)
+  openant config set opus-model           Set model name for heavy analysis
+  openant config set sonnet-model         Set model name for lighter tasks
+  openant config set verify-ssl           Enable/disable SSL certificate verification
   echo "sk-ant-..." | openant config set api-key --stdin   Piped input`,
 	Args: cobra.ExactArgs(1),
 	Run:  runConfigSet,
@@ -126,8 +133,97 @@ func runConfigSet(cmd *cobra.Command, args []string) {
 
 		cfg.DefaultModel = value
 
+	case "base-url":
+		if configStdin {
+			scanner := bufio.NewScanner(os.Stdin)
+			if scanner.Scan() {
+				value = strings.TrimSpace(scanner.Text())
+			}
+		} else {
+			fmt.Fprint(os.Stderr, "Enter LLM API base URL (e.g. http://localhost:8080): ")
+			scanner := bufio.NewScanner(os.Stdin)
+			if scanner.Scan() {
+				value = strings.TrimSpace(scanner.Text())
+			}
+		}
+
+		if value == "" {
+			output.PrintError("No value provided")
+			os.Exit(1)
+		}
+
+		cfg.BaseURL = value
+
+	case "opus-model":
+		if configStdin {
+			scanner := bufio.NewScanner(os.Stdin)
+			if scanner.Scan() {
+				value = strings.TrimSpace(scanner.Text())
+			}
+		} else {
+			fmt.Fprint(os.Stderr, "Enter opus model name (heavy analysis, e.g. qwen3:32b): ")
+			scanner := bufio.NewScanner(os.Stdin)
+			if scanner.Scan() {
+				value = strings.TrimSpace(scanner.Text())
+			}
+		}
+
+		if value == "" {
+			output.PrintError("No value provided")
+			os.Exit(1)
+		}
+
+		cfg.OpusModel = value
+
+	case "sonnet-model":
+		if configStdin {
+			scanner := bufio.NewScanner(os.Stdin)
+			if scanner.Scan() {
+				value = strings.TrimSpace(scanner.Text())
+			}
+		} else {
+			fmt.Fprint(os.Stderr, "Enter sonnet model name (lighter tasks, e.g. qwen3:8b): ")
+			scanner := bufio.NewScanner(os.Stdin)
+			if scanner.Scan() {
+				value = strings.TrimSpace(scanner.Text())
+			}
+		}
+
+		if value == "" {
+			output.PrintError("No value provided")
+			os.Exit(1)
+		}
+
+		cfg.SonnetModel = value
+
+	case "verify-ssl":
+		if configStdin {
+			scanner := bufio.NewScanner(os.Stdin)
+			if scanner.Scan() {
+				value = strings.TrimSpace(scanner.Text())
+			}
+		} else {
+			fmt.Fprint(os.Stderr, "Verify SSL certificates? (true/false): ")
+			scanner := bufio.NewScanner(os.Stdin)
+			if scanner.Scan() {
+				value = strings.TrimSpace(scanner.Text())
+			}
+		}
+
+		switch strings.ToLower(value) {
+		case "true", "yes", "1":
+			v := true
+			cfg.VerifySSL = &v
+		case "false", "no", "0":
+			v := false
+			cfg.VerifySSL = &v
+		default:
+			output.PrintError("Value must be true or false")
+			os.Exit(1)
+		}
+
 	default:
-		output.PrintError(fmt.Sprintf("Unknown config key: %s\nSupported keys: api-key, default-model", key))
+		output.PrintError(fmt.Sprintf("Unknown config key: %s\nSupported keys: api-key, base-url, default-model, opus-model, sonnet-model, verify-ssl", key))
 		os.Exit(1)
 	}
 
@@ -151,8 +247,20 @@ func runConfigShow(cmd *cobra.Command, args []string) {
 
 	output.PrintHeader("Configuration")
 	output.PrintKeyValue("api_key", config.MaskKey(cfg.APIKey))
+	if cfg.BaseURL != "" {
+		output.PrintKeyValue("base_url", cfg.BaseURL)
+	}
 	if cfg.DefaultModel != "" {
 		output.PrintKeyValue("default_model", cfg.DefaultModel)
+	}
+	if cfg.OpusModel != "" {
+		output.PrintKeyValue("opus_model", cfg.OpusModel)
+	}
+	if cfg.SonnetModel != "" {
+		output.PrintKeyValue("sonnet_model", cfg.SonnetModel)
+	}
+	if cfg.VerifySSL != nil {
+		output.PrintKeyValue("verify_ssl", fmt.Sprintf("%v", *cfg.VerifySSL))
 	}
 	if cfg.ActiveProject != "" {
 		output.PrintKeyValue("active_project", cfg.ActiveProject)
@@ -173,10 +281,18 @@ func runConfigUnset(cmd *cobra.Command, args []string) {
 	switch key {
 	case "api-key":
 		cfg.APIKey = ""
+	case "base-url":
+		cfg.BaseURL = ""
 	case "default-model":
 		cfg.DefaultModel = ""
+	case "opus-model":
+		cfg.OpusModel = ""
+	case "sonnet-model":
+		cfg.SonnetModel = ""
+	case "verify-ssl":
+		cfg.VerifySSL = nil
 	default:
-		output.PrintError(fmt.Sprintf("Unknown config key: %s\nSupported keys: api-key, default-model", key))
+		output.PrintError(fmt.Sprintf("Unknown config key: %s\nSupported keys: api-key, base-url, default-model, opus-model, sonnet-model, verify-ssl", key))
 		os.Exit(1)
 	}
 

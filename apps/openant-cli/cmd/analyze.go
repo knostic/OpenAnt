@@ -13,7 +13,7 @@ import (
 var analyzeCmd = &cobra.Command{
 	Use:   "analyze [dataset-path]",
 	Short: "Run vulnerability analysis on parsed data",
-	Long: `Analyze runs Claude-powered Stage 1 vulnerability detection on a parsed dataset.
+	Long: `Analyze runs LLM-powered Stage 1 vulnerability detection on a parsed dataset.
 
 With --verify, it chains into Stage 2 attacker simulation automatically.
 For standalone Stage 2, use the verify command instead.
@@ -124,7 +124,7 @@ func runAnalyze(cmd *cobra.Command, args []string) {
 		pyArgs = append(pyArgs, "--backoff", fmt.Sprintf("%d", analyzeBackoff))
 	}
 
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, llmEnvRequired())
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)

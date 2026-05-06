@@ -16,6 +16,7 @@ from typing import Optional, Set, List
 
 import anthropic
 
+from ..config import create_anthropic_client, resolve_model
 from ..llm_client import TokenTracker, get_global_tracker
 from ..rate_limiter import get_rate_limiter
 from .repository_index import RepositoryIndex
@@ -26,7 +27,7 @@ from .reachability_analyzer import ReachabilityAnalyzer
 
 
 # Use Sonnet for exploration (cost-effective)
-AGENT_MODEL = "claude-sonnet-4-20250514"
+AGENT_MODEL = resolve_model("sonnet")
 
 # Safety limits
 MAX_ITERATIONS = 20
@@ -126,7 +127,7 @@ class ContextAgent:
         self.tool_executor = ToolExecutor(index)
         self.entry_points = entry_points or set()
         self.reachability = reachability
-        self.client = client or anthropic.Anthropic(max_retries=5)
+        self.client = client or create_anthropic_client(max_retries=5)
 
     def analyze_unit(
         self,

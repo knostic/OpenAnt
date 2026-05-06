@@ -106,7 +106,7 @@ func runParse(cmd *cobra.Command, args []string) {
 		pyArgs = append(pyArgs, "--diff-manifest", manifestPath)
 	}
 
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, resolvedAPIKey())
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, llmEnv())
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)

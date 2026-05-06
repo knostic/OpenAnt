@@ -65,7 +65,7 @@ func DetectViaPython(pythonPath, scanDir, stepName string) *Info {
 	}
 
 	// Call Python for accurate counts
-	result, err := python.Invoke(pythonPath, []string{"checkpoint-status", dir}, "", true, "")
+	result, err := python.Invoke(pythonPath, []string{"checkpoint-status", dir}, "", true, nil)
 	if err != nil || result.Envelope.Status != "success" {
 		// Python failed — fall back to simple file count
 		return DetectFallback(scanDir, stepName)

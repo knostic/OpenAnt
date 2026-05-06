@@ -217,7 +217,7 @@ func runReport(cmd *cobra.Command, args []string) {
 			// Other formats delegate to Python
 			pyArgs := buildReportArgs(resultsPath, fmt)
 
-			result, err := python.Invoke(rt.Path, pyArgs, "", quiet, resolvedAPIKey())
+			result, err := python.Invoke(rt.Path, pyArgs, "", quiet, llmEnv())
 			if err != nil {
 				output.PrintError(fmt + ": " + err.Error())
 				exitCode = 2
@@ -312,7 +312,7 @@ func runHTMLReport(rt *python.RuntimeInfo, resultsPath string, outputPath string
 		pyArgs = append(pyArgs, "--dataset", reportDataset)
 	}
 
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, resolvedAPIKey())
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, llmEnv())
 	if err != nil {
 		return fmt.Errorf("report-data failed: %w", err)
 	}

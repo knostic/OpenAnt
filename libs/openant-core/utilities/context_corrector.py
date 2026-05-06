@@ -16,6 +16,7 @@ import subprocess
 import sys
 from typing import Optional
 
+from .config import resolve_model
 from .llm_client import AnthropicClient, TokenTracker, get_global_tracker
 
 
@@ -102,7 +103,7 @@ def parse_missing_context_with_llm(
     prompt = get_missing_context_prompt(reasoning)
 
     try:
-        llm_response = client.analyze_sync(prompt, model="claude-sonnet-4-20250514")
+        llm_response = client.analyze_sync(prompt, model=resolve_model("sonnet"))
         parsed = _parse_json_response(llm_response)
 
         if parsed and "missing_context" in parsed:
@@ -254,7 +255,7 @@ def search_files_for_context(
         prompt = get_file_search_prompt(missing_context, files_content, batch_info)
 
         try:
-            response = client.analyze_sync(prompt, model="claude-sonnet-4-20250514")
+            response = client.analyze_sync(prompt, model=resolve_model("sonnet"))
             result = _parse_json_response(response)
 
             if result and result.get("found_files"):

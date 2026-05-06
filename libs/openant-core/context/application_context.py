@@ -32,6 +32,8 @@ from typing import Any
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from utilities.config import resolve_model, create_anthropic_client, extract_text
+
 # Load environment variables
 load_dotenv()
 
@@ -462,7 +464,7 @@ Respond with a JSON object (no other text):
 
 def generate_application_context(
     repo_path: Path,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "sonnet",
     force_regenerate: bool = False,
 ) -> ApplicationContext:
     """Generate application context using LLM analysis.
@@ -502,10 +504,11 @@ def generate_application_context(
         sources_text += f"\n### {name}\n```\n{content}\n```\n"
 
     # Call LLM
-    print(f"Generating context with {model}...", file=sys.stderr)
-    client = Anthropic()
+    resolved = resolve_model(model)
+    print(f"Generating context with {resolved}...", file=sys.stderr)
+    client = create_anthropic_client()
     response = client.messages.create(
-        model=model,
+        model=resolved,
         max_tokens=2000,
         messages=[{
             "role": "user",
@@ -514,7 +517,7 @@ def generate_application_context(
     )
 
     # Parse response
-    response_text = response.content[0].text
+    response_text = extract_text(response)
 
     # Extract JSON from response
     json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)

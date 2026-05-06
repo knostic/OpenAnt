@@ -83,7 +83,7 @@ def extract_json_with_llm(
         # Use Sonnet for extraction (faster/cheaper)
         llm_response = client.analyze_sync(
             prompt,
-            model="claude-sonnet-4-20250514",
+            model=resolve_model("sonnet"),
             max_tokens=2048
         )
         return _parse_json_response(llm_response)
