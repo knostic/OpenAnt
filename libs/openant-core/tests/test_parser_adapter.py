@@ -1,11 +1,11 @@
 """Tests for core/parser_adapter.py — language detection and Python parsing."""
-import json
 import os
 from pathlib import Path
 
 import pytest
 
 from core.parser_adapter import detect_language, parse_repository
+from utilities.file_io import read_json
 
 
 class TestDetectLanguage:
@@ -65,8 +65,7 @@ class TestParseRepositoryPython:
             language="python",
             processing_level="all",
         )
-        with open(result.dataset_path) as f:
-            dataset = json.load(f)
+        dataset = read_json(result.dataset_path)
         assert "units" in dataset
         assert len(dataset["units"]) > 0
 
@@ -77,8 +76,7 @@ class TestParseRepositoryPython:
             language="python",
             processing_level="all",
         )
-        with open(result.dataset_path) as f:
-            dataset = json.load(f)
+        dataset = read_json(result.dataset_path)
         for unit in dataset["units"]:
             assert "id" in unit
             assert "code" in unit
@@ -101,6 +99,5 @@ class TestParseRepositoryPython:
         )
         assert result.analyzer_output_path is not None
         assert Path(result.analyzer_output_path).exists()
-        with open(result.analyzer_output_path) as f:
-            data = json.load(f)
+        data = read_json(result.analyzer_output_path)
         assert "functions" in data
