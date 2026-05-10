@@ -30,9 +30,10 @@ Scopes:
 
 from __future__ import annotations
 
-import json
 import sys
 from dataclasses import dataclass, asdict
+
+from utilities.file_io import read_json
 
 
 # Scope constants (must match internal/git/manifest.go).
@@ -65,8 +66,7 @@ class DiffStats:
 
 def load_manifest(path: str) -> dict:
     """Read and minimally validate a diff manifest file."""
-    with open(path, "r", encoding="utf-8") as f:
-        m = json.load(f)
+    m = read_json(path)
     scope = m.get("scope")
     if scope not in _VALID_SCOPES:
         raise ValueError(

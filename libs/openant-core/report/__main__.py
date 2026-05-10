@@ -9,17 +9,17 @@ Usage:
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
 from .generator import generate_summary_report, generate_disclosure, generate_all
 from .schema import validate_pipeline_output, ValidationError
+from utilities.file_io import read_json
 
 
 def cmd_summary(args):
     """Generate summary report."""
-    pipeline_data = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    pipeline_data = read_json(args.input)
 
     try:
         validate_pipeline_output(pipeline_data)
@@ -39,7 +39,7 @@ def cmd_summary(args):
 
 def cmd_disclosures(args):
     """Generate disclosure documents."""
-    pipeline_data = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    pipeline_data = read_json(args.input)
 
     try:
         validate_pipeline_output(pipeline_data)

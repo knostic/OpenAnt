@@ -13,6 +13,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .schema import validate_pipeline_output, ValidationError
+from utilities.file_io import read_json
 
 load_dotenv()
 
@@ -76,7 +77,7 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
     if not dynamic_path.exists():
         return pipeline_data
 
-    dynamic_data = json.loads(dynamic_path.read_text(encoding="utf-8"))
+    dynamic_data = read_json(dynamic_path)
     results_by_id = {}
     for result in dynamic_data.get("results", []):
         fid = result.get("finding_id")
@@ -233,7 +234,7 @@ def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[st
 
 def generate_all(pipeline_path: str, output_dir: str) -> None:
     """Generate all reports from a pipeline output file."""
-    pipeline_data = json.loads(Path(pipeline_path).read_text(encoding="utf-8"))
+    pipeline_data = read_json(pipeline_path)
 
     try:
         validate_pipeline_output(pipeline_data)

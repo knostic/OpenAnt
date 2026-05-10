@@ -4,10 +4,11 @@ Stage 2: Function Extractor for Zig
 Extracts functions, methods, and structs from Zig source files using tree-sitter.
 """
 
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, List
+
+from utilities.file_io import write_json
 
 import tree_sitter_zig as ts_zig
 from tree_sitter import Language, Parser, Node
@@ -276,5 +277,4 @@ class FunctionExtractor:
 
     def save_results(self, output_path: str, results: Dict[str, Any]) -> None:
         """Save extraction results to a JSON file."""
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
+        write_json(output_path, results)

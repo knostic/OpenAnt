@@ -4,10 +4,11 @@ Stage 3: Call Graph Builder for Zig
 Builds bidirectional call graphs showing function dependencies.
 """
 
-import json
 import re
 from collections import defaultdict
 from typing import Dict, Any, List, Set
+
+from utilities.file_io import write_json
 
 import tree_sitter_zig as ts_zig
 from tree_sitter import Language, Parser, Node
@@ -321,5 +322,4 @@ class CallGraphBuilder:
 
     def save_results(self, output_path: str, results: Dict[str, Any]) -> None:
         """Save call graph to a JSON file."""
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
+        write_json(output_path, results)

@@ -5,10 +5,11 @@ Enumerates all Zig source files in a repository.
 """
 
 import os
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+
+from utilities.file_io import write_json
 
 
 class RepositoryScanner:
@@ -131,5 +132,4 @@ class RepositoryScanner:
 
     def save_results(self, output_path: str, results: Dict[str, Any]) -> None:
         """Save scan results to a JSON file."""
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
+        write_json(output_path, results)

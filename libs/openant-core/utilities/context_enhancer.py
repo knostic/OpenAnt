@@ -28,6 +28,7 @@ import anthropic
 from .llm_client import AnthropicClient, TokenTracker, get_global_tracker, reset_global_tracker
 from .agentic_enhancer import RepositoryIndex, enhance_unit_with_agent, load_index_from_file
 from .rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
+from .file_io import read_json, write_json
 
 # Avoid circular import — import checkpoint at usage site
 _StepCheckpoint = None
@@ -504,8 +505,7 @@ class ContextEnhancer:
                 if unit_id in processed_ids:
                     cp_file = os.path.join(checkpoint_dir, f"{self._safe_filename(unit_id)}.json")
                     if os.path.exists(cp_file):
-                        with open(cp_file, 'r', encoding="utf-8") as f:
-                            cp_data = json.load(f)
+                        cp_data = read_json(cp_file)
                         unit["agent_context"] = cp_data.get("agent_context", {})
                         if "code" in cp_data:
                             unit["code"] = cp_data["code"]
@@ -538,8 +538,7 @@ class ContextEnhancer:
                 if not os.path.exists(cp_file):
                     continue
                 try:
-                    with open(cp_file, 'r', encoding="utf-8") as f:
-                        cp_data = json.load(f)
+                    cp_data = read_json(cp_file)
                     # Sum usage from all existing checkpoints (completed + errored)
                     cp_usage = cp_data.get("usage", {})
                     _summary_input_tokens += cp_usage.get("input_tokens", 0)
@@ -792,8 +791,7 @@ class ContextEnhancer:
                 "output_tokens": meta.get("output_tokens", 0),
                 "cost_usd": meta.get("cost_usd", 0.0),
             }
-        with open(filepath, 'w', encoding="utf-8") as f:
-            json.dump(cp_data, f, indent=2)
+        write_json(filepath, cp_data)
 
     def _load_completed_units(self, checkpoint_dir: str) -> set:
         """Load the set of completed unit IDs from per-unit checkpoint files."""
@@ -805,8 +803,7 @@ class ContextEnhancer:
                 continue
             filepath = os.path.join(checkpoint_dir, filename)
             try:
-                with open(filepath, 'r', encoding="utf-8") as f:
-                    cp_data = json.load(f)
+                cp_data = read_json(filepath)
                 unit_id = cp_data.get("id")
                 agent_ctx = cp_data.get("agent_context", {})
                 if unit_id and agent_ctx and not agent_ctx.get("error"):
@@ -818,8 +815,7 @@ class ContextEnhancer:
     def _migrate_legacy_checkpoint(self, checkpoint_path: str, checkpoint_dir: str, units: list):
         """Migrate a legacy single-file checkpoint to per-unit checkpoint files."""
         try:
-            with open(checkpoint_path, 'r', encoding="utf-8") as f:
-                checkpoint_data = json.load(f)
+            checkpoint_data = read_json(checkpoint_path)
             for cp_unit in checkpoint_data.get("units", []):
                 if cp_unit.get("agent_context") and not cp_unit["agent_context"].get("error"):
                     self._save_unit_checkpoint(cp_unit, checkpoint_dir)
@@ -998,8 +994,7 @@ def main():
         logging.error(f"Error: Input file not found: {input_path}")
         return 1
 
-    with open(input_path, 'r', encoding="utf-8") as f:
-        dataset = json.load(f)
+    dataset = read_json(input_path)
 
     # Enhance
     enhancer = ContextEnhancer()
@@ -1029,8 +1024,7 @@ def main():
 
     # Write output
     output_path = Path(args.output) if args.output else input_path
-    with open(output_path, 'w', encoding="utf-8") as f:
-        json.dump(enhanced, f, indent=2)
+    write_json(output_path, enhanced)
 
     logging.info(f"Enhanced dataset written to: {output_path}")
     return 0

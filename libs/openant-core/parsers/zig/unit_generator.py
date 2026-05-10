@@ -4,10 +4,11 @@ Stage 4: Unit Generator for Zig
 Creates self-contained analysis units with dependency context.
 """
 
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set
+
+from utilities.file_io import write_json
 
 
 class UnitGenerator:
@@ -246,8 +247,6 @@ class UnitGenerator:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        with open(output_path / "dataset.json", "w", encoding="utf-8") as f:
-            json.dump(dataset, f, indent=2)
+        write_json(output_path / "dataset.json", dataset)
 
-        with open(output_path / "analyzer_output.json", "w", encoding="utf-8") as f:
-            json.dump(analyzer_output, f, indent=2)
+        write_json(output_path / "analyzer_output.json", analyzer_output)
