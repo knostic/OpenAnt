@@ -13,11 +13,15 @@ Coverage by platform:
   run there.
 - ``test_pipeline_uses_ascii_fallback_on_cp1252_stdout`` and the Unicode
   counterpart — cross-platform; cp1252 stdout encoding can be simulated anywhere.
+- ``test_no_bare_path_calls_in_typescript_analyzer`` — cross-platform static
+  scanner; greps typescript_analyzer.js for path.X() calls missing toPosixPath(),
+  mirroring the PR #45 antipattern-prevention pattern.
 """
 import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -178,6 +182,54 @@ def test_typescript_analyzer_strips_crlf_from_file_list(tmp_path):
     func_names = [f.get("name") for f in data.get("functions", {}).values()]
     assert "alpha" in func_names
     assert "beta" in func_names
+
+
+# ---------------------------------------------------------------------------
+# Static regression scanner: toPosixPath() must wrap every path.X() call
+# ---------------------------------------------------------------------------
+
+# Match path.relative/resolve/join call sites (non-method-name contexts).
+_BARE_PATH_CALL_RE = re.compile(r"\bpath\.(relative|resolve|join)\s*\(")
+# Match JS comment lines so JSDoc / inline comments don't trip the scanner.
+_JS_COMMENT_LINE_RE = re.compile(r"^\s*(?://|\*)")
+
+
+def test_no_bare_path_calls_in_typescript_analyzer():
+    """Regression: every path.relative/resolve/join() in typescript_analyzer.js
+    must be accompanied by toPosixPath() within 6 lines.
+
+    Mirrors the pattern from PR #45 (test_no_bare_open, test_no_bare_pathlib_text_io,
+    etc.) that prevents contributors from reintroducing encoding antipatterns.
+    Here the guarded antipattern is passing a raw path.X() result to ts-morph
+    or storing it as a functionId component without normalising backslashes first.
+
+    The ±6-line window covers all current wrapping patterns:
+    - same-line:        ``toPosixPath(path.resolve(...))``
+    - split-line:       ``toPosixPath(\\n  path.relative(...))`` (toPosixPath 1 line before)
+    - assign-then-wrap: ``const v = path.join(...);\\n...\\ntoPosixPath(v)`` (up to 5 lines after,
+      including interleaved comment lines)
+
+    Scoped to typescript_analyzer.js only — other JS parser files (context_assembler,
+    repository_scanner, etc.) legitimately call path.X() without toPosixPath because
+    they don't interact with ts-morph.
+    """
+    text = TS_ANALYZER.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    offenders = []
+    for i, line in enumerate(lines):
+        if _JS_COMMENT_LINE_RE.match(line):
+            continue
+        if _BARE_PATH_CALL_RE.search(line):
+            lo = max(0, i - 6)
+            hi = min(len(lines), i + 7)
+            window = "\n".join(lines[lo:hi])
+            if "toPosixPath(" not in window:
+                offenders.append(f":{i + 1}: {line.strip()}")
+    assert not offenders, (
+        f"Found path.relative/resolve/join() without toPosixPath() in "
+        f"{TS_ANALYZER.name}. Wrap the result with toPosixPath() — see "
+        f"the CONTRACT comment on that function.\n  " + "\n  ".join(offenders)
+    )
 
 
 # ---------------------------------------------------------------------------
