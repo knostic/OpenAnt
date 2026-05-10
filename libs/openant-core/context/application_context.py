@@ -347,6 +347,7 @@ def check_manual_override(repo_path: Path) -> ApplicationContext | None:
                 data['source'] = 'manual'
                 return ApplicationContext(**data)
 
+            # .md files need raw text so regex can extract the embedded JSON block.
             content = filepath.read_text(encoding="utf-8")
 
             if filename.endswith('.md'):
