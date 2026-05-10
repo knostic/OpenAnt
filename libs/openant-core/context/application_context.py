@@ -341,15 +341,15 @@ def check_manual_override(repo_path: Path) -> ApplicationContext | None:
             continue
 
         try:
-            content = filepath.read_text(encoding="utf-8")
-
             if filename.endswith('.json'):
                 # Direct JSON format
-                data = json.loads(content)
+                data = read_json(filepath)
                 data['source'] = 'manual'
                 return ApplicationContext(**data)
 
-            elif filename.endswith('.md'):
+            content = filepath.read_text(encoding="utf-8")
+
+            if filename.endswith('.md'):
                 # Markdown format - check for JSON code block
                 json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
                 if json_match:
