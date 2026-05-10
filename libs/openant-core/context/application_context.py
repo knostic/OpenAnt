@@ -546,8 +546,7 @@ def save_context(context: ApplicationContext, output_path: Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(output_path, 'w', encoding="utf-8") as f:
-        json.dump(asdict(context), f, indent=2)
+    write_json(output_path, asdict(context))
 
     print(f"Context saved to {output_path}", file=sys.stderr)
 

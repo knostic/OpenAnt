@@ -175,8 +175,7 @@ def _maybe_apply_diff_filter(
     # Expose stats on the ParseResult via a side-channel file; the parse
     # step_context reads this when assembling parse.report.json.
     diff_report_path = os.path.join(output_dir, "diff_filter.report.json")
-    with open(diff_report_path, "w", encoding="utf-8") as f:
-        json.dump(stats.to_dict(), f, indent=2)
+    write_json(diff_report_path, stats.to_dict())
 
     print(
         f"  Diff filter ({stats.scope}): {stats.selected}/{stats.total} units selected"
