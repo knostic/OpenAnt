@@ -33,6 +33,7 @@ PARSERS_DIR = Path(__file__).parent.parent / "parsers"
 JS_PARSERS_DIR = PARSERS_DIR / "javascript"
 GO_PARSERS_DIR = PARSERS_DIR / "go"
 TS_ANALYZER = JS_PARSERS_DIR / "typescript_analyzer.js"
+PATH_UTILS = JS_PARSERS_DIR / "path_utils.js"
 JS_NODE_MODULES = JS_PARSERS_DIR / "node_modules"
 
 
@@ -48,14 +49,19 @@ JS_NODE_MODULES = JS_PARSERS_DIR / "node_modules"
 def test_to_posix_path_normalises_backslashes():
     """toPosixPath() must replace every backslash with a forward slash.
 
-    This verifies the normalisation contract on all platforms — not just
-    Windows — so a refactor that accidentally breaks the replace() call is
-    caught in Linux/macOS CI before it ever reaches a Windows runner.
+    Calls the *actual* function from path_utils.js (not a reimplementation),
+    so a regression in the live regex is caught on all platforms. Also covers
+    the UNC path contract documented in path_utils.js: ``\\\\server\\share\\...``
+    must become ``//server/share/...``.
     """
-    # Inline the same logic used in typescript_analyzer.js. We use \x5c
-    # (the hex escape for backslash) in the JS literal to avoid any
-    # shell or Python string-escaping ambiguity across platforms.
-    script = r"function toPosixPath(p){return p.split('\x5c').join('/');} console.log(toPosixPath('C:\x5cUsers\x5cfoo\x5cbar.js'));"
+    # Require path_utils.js directly — it has no ts-morph dependency, so
+    # node_modules is not required. We use \x5c (hex for backslash) in the
+    # JS string literals to avoid Python/Node string-escaping ambiguity.
+    path_utils = str(PATH_UTILS).replace("\\", "/")
+    script = (
+        "const {toPosixPath} = require(" + json.dumps(path_utils) + ");"
+        + r"console.log(JSON.stringify([toPosixPath('C:\x5cUsers\x5cfoo\x5cbar.js'),toPosixPath('\x5c\x5cserver\x5cshare\x5cfoo.js')]));"
+    )
     result = subprocess.run(
         ["node", "-e", script],
         capture_output=True,
@@ -63,8 +69,12 @@ def test_to_posix_path_normalises_backslashes():
         timeout=10,
     )
     assert result.returncode == 0, f"node failed: {result.stderr}"
-    assert result.stdout.strip() == "C:/Users/foo/bar.js", (
-        f"unexpected output: {result.stdout.strip()!r}"
+    results = json.loads(result.stdout.strip())
+    assert results[0] == "C:/Users/foo/bar.js", (
+        f"regular path: {results[0]!r}"
+    )
+    assert results[1] == "//server/share/foo.js", (
+        f"UNC path: {results[1]!r}"
     )
 
 
@@ -189,6 +199,12 @@ def test_typescript_analyzer_strips_crlf_from_file_list(tmp_path):
 # ---------------------------------------------------------------------------
 
 # Match path.relative/resolve/join call sites (non-method-name contexts).
+# dirname/basename/normalize/isAbsolute are intentionally excluded: they
+# preserve (not change) the separator style of their input, so they are safe
+# as long as the *input* is already normalised — which is the precondition
+# enforced by toPosixPath() at the point where Windows paths enter the system.
+# If you add a path method that *produces* new separators (e.g. path.format),
+# add it to this regex.
 _BARE_PATH_CALL_RE = re.compile(r"\bpath\.(relative|resolve|join)\s*\(")
 # Match JS comment lines so JSDoc / inline comments don't trip the scanner.
 _JS_COMMENT_LINE_RE = re.compile(r"^\s*(?://|\*)")
