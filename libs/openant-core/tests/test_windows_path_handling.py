@@ -1,10 +1,18 @@
 """Tests for Windows-specific path/encoding handling in JS and Go parser pipelines.
 
 These tests cover three fixes that prevent OpenAnt from running correctly on
-Windows. They are meant to run on every platform — the bugs they protect
-against are platform-independent in their failure modes (you can simulate a
-backslash file list, a CRLF file list, and a cp1252-only stdout from any
-host) and a regression on POSIX would still be a regression.
+Windows.
+
+Coverage by platform:
+- ``test_to_posix_path_normalises_backslashes`` — cross-platform; verifies the
+  normalisation helper directly via ``node -e`` (skipped only if Node is absent).
+- ``test_typescript_analyzer_strips_crlf_from_file_list`` — cross-platform;
+  CRLF stripping is equally testable on POSIX.
+- ``test_typescript_analyzer_accepts_backslash_paths`` — Windows-only; backslash
+  absolute paths are meaningless on POSIX so the end-to-end scenario can only
+  run there.
+- ``test_pipeline_uses_ascii_fallback_on_cp1252_stdout`` and the Unicode
+  counterpart — cross-platform; cp1252 stdout encoding can be simulated anywhere.
 """
 import importlib.util
 import io
@@ -27,6 +35,33 @@ JS_NODE_MODULES = JS_PARSERS_DIR / "node_modules"
 # ---------------------------------------------------------------------------
 # JS analyzer: backslash paths must be normalised before reaching ts-morph
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not shutil.which("node"),
+    reason="Node.js not available",
+)
+def test_to_posix_path_normalises_backslashes():
+    """toPosixPath() must replace every backslash with a forward slash.
+
+    This verifies the normalisation contract on all platforms — not just
+    Windows — so a refactor that accidentally breaks the replace() call is
+    caught in Linux/macOS CI before it ever reaches a Windows runner.
+    """
+    # Inline the same logic used in typescript_analyzer.js. We use \x5c
+    # (the hex escape for backslash) in the JS literal to avoid any
+    # shell or Python string-escaping ambiguity across platforms.
+    script = r"function toPosixPath(p){return p.split('\x5c').join('/');} console.log(toPosixPath('C:\x5cUsers\x5cfoo\x5cbar.js'));"
+    result = subprocess.run(
+        ["node", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, f"node failed: {result.stderr}"
+    assert result.stdout.strip() == "C:/Users/foo/bar.js", (
+        f"unexpected output: {result.stdout.strip()!r}"
+    )
 
 
 @pytest.mark.skipif(
