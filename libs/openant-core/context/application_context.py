@@ -31,7 +31,7 @@ from typing import Any
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
-from utilities.file_io import read_json, write_json
+from utilities.file_io import open_utf8, read_json, write_json
 
 # Load environment variables
 load_dotenv()
@@ -209,7 +209,8 @@ def gather_context_sources(repo_path: Path) -> dict[str, str]:
         filepath = repo_path / filename
         if filepath.exists():
             try:
-                content = filepath.read_text(encoding="utf-8", errors="ignore")
+                with open_utf8(filepath, errors="ignore") as _f:
+                    content = _f.read()
                 # Limit size to avoid token overflow
                 if len(content) > 10000:
                     content = content[:10000] + "\n\n[... truncated ...]"
@@ -290,7 +291,8 @@ def detect_entry_points(repo_path: Path) -> str:
             continue
 
         try:
-            content = py_file.read_text(encoding="utf-8", errors="ignore")
+            with open_utf8(py_file, errors="ignore") as _f:
+                content = _f.read()
             rel_path = py_file.relative_to(repo_path)
 
             for category, patterns in ENTRY_POINT_PATTERNS.items():
@@ -309,7 +311,8 @@ def detect_entry_points(repo_path: Path) -> str:
             continue
 
         try:
-            content = js_file.read_text(encoding="utf-8", errors="ignore")
+            with open_utf8(js_file, errors="ignore") as _f:
+                content = _f.read()
             rel_path = js_file.relative_to(repo_path)
 
             if re.search(r"express\(\)|require\(['\"]express['\"]\)", content):
@@ -348,7 +351,8 @@ def check_manual_override(repo_path: Path) -> ApplicationContext | None:
                 return ApplicationContext(**data)
 
             # .md files need raw text so regex can extract the embedded JSON block.
-            content = filepath.read_text(encoding="utf-8")
+            with open_utf8(filepath) as _f:
+                content = _f.read()
 
             if filename.endswith('.md'):
                 # Markdown format - check for JSON code block

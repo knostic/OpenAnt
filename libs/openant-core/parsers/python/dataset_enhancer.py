@@ -30,7 +30,8 @@ class PythonDependencyResolver:
         path_str = str(file_path)
         if path_str not in self.file_cache:
             try:
-                self.file_cache[path_str] = file_path.read_text(encoding="utf-8", errors="replace")
+                with open_utf8(file_path, errors="replace") as _f:
+                    self.file_cache[path_str] = _f.read()
             except Exception as e:
                 self.file_cache[path_str] = ""
         return self.file_cache[path_str]
