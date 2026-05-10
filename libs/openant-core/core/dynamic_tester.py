@@ -12,6 +12,7 @@ import sys
 
 from core.schemas import DynamicTestStepResult, UsageInfo
 from core import tracking
+from utilities.file_io import read_json, write_json
 
 
 def run_tests(
@@ -51,9 +52,7 @@ def run_tests(
     os.makedirs(output_dir, exist_ok=True)
 
     # Check how many findings to test
-    with open(pipeline_output_path, encoding="utf-8") as f:
-        pipeline_data = json.load(f)
-
+    pipeline_data = read_json(pipeline_output_path)
     findings = pipeline_data.get("findings", [])
     testable = [
         f for f in findings
@@ -65,8 +64,7 @@ def run_tests(
 
     if not testable:
         results_path = os.path.join(output_dir, "dynamic_test_results.json")
-        with open(results_path, "w", encoding="utf-8") as f:
-            json.dump({"findings_tested": 0, "results": []}, f, indent=2)
+        write_json(results_path, {"findings_tested": 0, "results": []})
 
         return DynamicTestStepResult(
             results_json_path=results_path,

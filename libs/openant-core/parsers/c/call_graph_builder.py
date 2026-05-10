@@ -40,6 +40,7 @@ from typing import Dict, List, Optional, Set
 import tree_sitter_c as tsc
 import tree_sitter_cpp as tscpp
 from tree_sitter import Language, Parser
+from utilities.file_io import read_json, write_json, open_utf8
 
 
 C_LANGUAGE = Language(tsc.language())
@@ -423,9 +424,7 @@ Examples:
     args = parser.parse_args()
 
     try:
-        with open(args.input_file, encoding="utf-8") as f:
-            extractor_output = json.load(f)
-
+        extractor_output = read_json(args.input_file)
         print(f"Processing {len(extractor_output.get('functions', {}))} functions...", file=sys.stderr)
 
         builder = CallGraphBuilder(extractor_output, {'max_depth': args.depth})
@@ -444,7 +443,7 @@ Examples:
         output = json.dumps(result, indent=2)
 
         if args.output:
-            with open(args.output, 'w', encoding="utf-8") as f:
+            with open_utf8(args.output, 'w') as f:
                 f.write(output)
             print(f"Output written to: {args.output}", file=sys.stderr)
         else:

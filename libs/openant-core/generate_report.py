@@ -31,6 +31,7 @@ from datetime import datetime
 
 import anthropic
 from dotenv import load_dotenv
+from utilities.file_io import read_json
 
 # Load environment variables from .env file
 load_dotenv()
@@ -42,8 +43,7 @@ MAX_TOKENS = 4096
 
 def load_json(path: str) -> dict:
     """Load JSON file."""
-    with open(path, 'r', encoding="utf-8") as f:
-        return json.load(f)
+    return read_json(path)
 
 
 def extract_file(unit_id: str) -> str:
@@ -83,8 +83,7 @@ def _load_pipeline_metadata(experiment_path: str) -> tuple[dict | None, dict | N
     if not os.path.exists(candidate):
         return None, None
     try:
-        with open(candidate, 'r', encoding="utf-8") as f:
-            data = json.load(f)
+        data = read_json(candidate)
     except (json.JSONDecodeError, OSError):
         return None, None
     return data.get("repository"), data.get("diff")

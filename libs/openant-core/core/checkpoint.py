@@ -27,6 +27,7 @@ import sys
 from datetime import datetime, timezone
 
 from utilities.safe_filename import safe_filename
+from utilities.file_io import read_json, write_json
 from pathlib import Path
 
 
@@ -79,8 +80,7 @@ class StepCheckpoint:
                 continue
             filepath = os.path.join(self.dir, filename)
             try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                data = read_json(filepath)
                 unit_id = data.get("id")
                 if unit_id:
                     results[unit_id] = data
@@ -130,9 +130,7 @@ class StepCheckpoint:
         filename = self._safe_filename(unit_id) + ".json"
         filepath = os.path.join(self.dir, filename)
         data["id"] = unit_id  # ensure id is always present
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-
+        write_json(filepath, data)
     def write_summary(
         self,
         total_units: int,
@@ -168,9 +166,7 @@ class StepCheckpoint:
         }
         if usage is not None:
             data["usage"] = usage
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-
+        write_json(filepath, data)
     @staticmethod
     def read_summary(checkpoint_dir: str) -> dict | None:
         """Read _summary.json from a checkpoint directory.
@@ -182,8 +178,7 @@ class StepCheckpoint:
         if not os.path.isfile(filepath):
             return None
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
+            return read_json(filepath)
         except (json.JSONDecodeError, OSError):
             return None
 
@@ -241,8 +236,7 @@ class StepCheckpoint:
                 continue
             filepath = os.path.join(checkpoint_dir, filename)
             try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                data = read_json(filepath)
             except (json.JSONDecodeError, OSError):
                 errors += 1
                 error_breakdown["unreadable"] = error_breakdown.get("unreadable", 0) + 1

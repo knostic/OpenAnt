@@ -299,6 +299,13 @@ def test_no_bare_open_in_non_test_code():
 _PATH_TEXT_RE = re.compile(r"\.(?:read_text|write_text)\s*\(")
 
 
+# Match `path.open(`-style method calls. The bare ``open(`` case is handled
+# above, so here we look explicitly for ``.open(`` (Path or file-like object
+# method form) which has the same Windows cp1252 default behaviour as
+# ``open()`` and is not caught by the bare-open regex.
+_DOT_OPEN_RE = re.compile(r"\.open\s*\(")
+
+
 def test_no_bare_pathlib_text_io_in_non_test_code():
     """Regression: ``Path.read_text()`` / ``write_text()`` default to the
     system locale encoding on Python <3.10 and to ``locale.getpreferredencoding(False)``
@@ -320,6 +327,27 @@ def test_no_bare_pathlib_text_io_in_non_test_code():
         "Found Path.read_text()/write_text() calls without encoding= in "
         "non-test code. Pass encoding='utf-8' explicitly:\n  "
         + "\n  ".join(offenders)
+    )
+
+
+def test_no_bare_dot_open_in_non_test_code():
+    """Regression: ``path.open()`` (the Path / file-like method form) defaults
+    to system locale encoding the same way ``open()`` does, and is not caught
+    by the bare-open regex above. Every text-mode call must pass ``encoding=``.
+    """
+    offenders: list[str] = []
+    for path in _iter_python_sources(CORE_ROOT):
+        text = path.read_text(encoding="utf-8")
+        scrubbed = _strip_strings_and_comments(text)
+        for line, args, src in _scan_calls(scrubbed, text, _DOT_OPEN_RE):
+            if _has_binary_mode(args) or _has_encoding(args):
+                continue
+            rel = path.relative_to(CORE_ROOT).as_posix()
+            offenders.append(f"{rel}:{line}: {src}")
+
+    assert not offenders, (
+        "Found .open() calls without encoding= in non-test code. "
+        "Pass encoding='utf-8' explicitly:\n  " + "\n  ".join(offenders)
     )
 
 

@@ -27,6 +27,7 @@ from core.schemas import (
 )
 from core.step_report import step_context
 from core import tracking
+from utilities.file_io import read_json
 
 # Import app context generator (optional)
 try:
@@ -149,8 +150,7 @@ def scan_repository(
         _diff_report = os.path.join(output_dir, "diff_filter.report.json")
         if os.path.exists(_diff_report):
             try:
-                with open(_diff_report, encoding="utf-8") as _f:
-                    ctx.summary["diff_stats"] = json.load(_f)
+                ctx.summary["diff_stats"] = read_json(_diff_report)
             except (json.JSONDecodeError, OSError):
                 pass
         ctx.outputs = {
@@ -542,8 +542,7 @@ def _load_step_report(output_dir: str, step: str) -> dict:
     """Load a step report JSON from disk. Returns empty dict on failure."""
     path = os.path.join(output_dir, f"{step}.report.json")
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
+        return read_json(path)
     except Exception:
         return {"step": step, "status": "unknown"}
 
@@ -551,8 +550,7 @@ def _load_step_report(output_dir: str, step: str) -> dict:
 def _read_app_type(app_context_path: str) -> str | None:
     """Read application_type from an app context JSON file."""
     try:
-        with open(app_context_path, encoding="utf-8") as f:
-            data = json.load(f)
+        data = read_json(app_context_path)
         return data.get("application_type")
     except Exception:
         return None

@@ -31,6 +31,7 @@ from typing import Any
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from utilities.file_io import read_json, write_json
 
 # Load environment variables
 load_dotenv()
@@ -560,9 +561,7 @@ def load_context(input_path: Path) -> ApplicationContext:
     Returns:
         ApplicationContext loaded from file.
     """
-    with open(input_path, encoding="utf-8") as f:
-        data = json.load(f)
-
+    data = read_json(input_path)
     # Mark as manual to skip validation (already validated when saved)
     original_source = data.get('source', 'llm')
     data['source'] = 'manual'  # Temporarily bypass validation

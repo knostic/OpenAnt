@@ -53,6 +53,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
+from utilities.file_io import read_json, write_json, open_utf8
 
 
 # File boundary marker for enhanced code
@@ -400,9 +401,7 @@ Examples:
     args = parser.parse_args()
 
     try:
-        with open(args.input_file, encoding="utf-8") as f:
-            call_graph_data = json.load(f)
-
+        call_graph_data = read_json(args.input_file)
         options = {
             'max_depth': args.depth,
         }
@@ -430,7 +429,7 @@ Examples:
         output = json.dumps(result, indent=2)
 
         if args.output:
-            with open(args.output, 'w', encoding="utf-8") as f:
+            with open_utf8(args.output, 'w') as f:
                 f.write(output)
             print(f"\nOutput written to: {args.output}", file=sys.stderr)
         else:

@@ -17,6 +17,7 @@ from core.schemas import EnhanceResult, UsageInfo
 from core import tracking
 from core.progress import ProgressReporter
 from utilities.rate_limiter import configure_rate_limiter
+from utilities.file_io import read_json, write_json
 
 
 def enhance_dataset(
@@ -69,9 +70,7 @@ def enhance_dataset(
 
     # Load dataset
     print(f"[Enhance] Loading dataset: {dataset_path}", file=sys.stderr)
-    with open(dataset_path, encoding="utf-8") as f:
-        dataset = json.load(f)
-
+    dataset = read_json(dataset_path)
     units = dataset.get("units", [])
     print(f"[Enhance] Units to enhance: {len(units)}", file=sys.stderr)
 
@@ -138,9 +137,7 @@ def enhance_dataset(
 
     # Write enhanced dataset
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(enhanced, f, indent=2)
-
+    write_json(output_path, enhanced)
     print(f"[Enhance] Enhanced dataset: {output_path}", file=sys.stderr)
     print(f"[Enhance] Classifications: {classifications}", file=sys.stderr)
     if error_count:

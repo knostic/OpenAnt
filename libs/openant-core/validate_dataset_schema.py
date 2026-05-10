@@ -8,6 +8,7 @@ Run BEFORE any expensive LLM operations.
 
 import json
 import sys
+from utilities.file_io import read_json
 
 
 def validate_unit(unit, index):
@@ -61,9 +62,7 @@ def validate_unit(unit, index):
 
 
 def validate_dataset(path):
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-
+    data = read_json(path)
     all_errors = []
     units = data.get("units", [])
 

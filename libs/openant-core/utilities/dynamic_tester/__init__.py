@@ -20,6 +20,7 @@ from utilities.dynamic_tester.docker_executor import run_single_container
 from utilities.dynamic_tester.result_collector import collect_result
 from utilities.dynamic_tester.reporter import generate_report
 from utilities.llm_client import get_global_tracker
+from utilities.file_io import read_json, write_json, open_utf8
 
 
 def run_dynamic_tests(
@@ -45,9 +46,7 @@ def run_dynamic_tests(
         List of DynamicTestResult objects
     """
     # Load pipeline output
-    with open(pipeline_output_path, "r", encoding="utf-8") as f:
-        pipeline = json.load(f)
-
+    pipeline = read_json(pipeline_output_path)
     findings = pipeline.get("findings", [])
     repo_info = {
         "name": pipeline.get("repository", {}).get("name", "unknown"),
@@ -253,13 +252,13 @@ def run_dynamic_tests(
     report_md = generate_report(results, repo_info["name"], total_cost)
 
     report_path = os.path.join(output_dir, "DYNAMIC_TEST_RESULTS.md")
-    with open(report_path, "w", encoding="utf-8") as f:
+    with open_utf8(report_path, "w") as f:
         f.write(report_md)
     print(f"\nReport written to {report_path}", file=sys.stderr)
 
     # Save structured results JSON
     results_path = os.path.join(output_dir, "dynamic_test_results.json")
-    with open(results_path, "w", encoding="utf-8") as f:
+    with open_utf8(results_path, "w") as f:
         json.dump({
             "repository": repo_info["name"],
             "total_findings": len(findings),

@@ -42,6 +42,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import tree_sitter_ruby as ts_ruby
 from tree_sitter import Language, Parser
+from utilities.file_io import read_json, write_json, open_utf8
 
 
 RUBY_LANGUAGE = Language(ts_ruby.language())
@@ -444,8 +445,7 @@ Examples:
         extractor = FunctionExtractor(args.repo_path)
 
         if args.scan_file:
-            with open(args.scan_file, encoding="utf-8") as f:
-                scan_result = json.load(f)
+            scan_result = read_json(args.scan_file)
             result = extractor.extract_from_scan(scan_result)
         else:
             result = extractor.extract_all()
@@ -453,7 +453,7 @@ Examples:
         output = json.dumps(result, indent=2)
 
         if args.output:
-            with open(args.output, 'w', encoding="utf-8") as f:
+            with open_utf8(args.output, 'w') as f:
                 f.write(output)
             print(f"Extraction complete. Results written to: {args.output}", file=sys.stderr)
             print(f"Total functions: {result['statistics']['total_functions']}", file=sys.stderr)

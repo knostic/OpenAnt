@@ -29,6 +29,7 @@ import csv
 import json
 import os
 import sys
+from utilities.file_io import read_json
 
 
 def _load_diff_block(experiment_path: str) -> dict | None:
@@ -41,8 +42,7 @@ def _load_diff_block(experiment_path: str) -> dict | None:
     if not os.path.exists(candidate):
         return None
     try:
-        with open(candidate, encoding="utf-8") as f:
-            data = json.load(f)
+        data = read_json(candidate)
     except (json.JSONDecodeError, OSError):
         return None
     diff = data.get("diff")
@@ -67,8 +67,7 @@ def _format_diff_banner(diff: dict) -> str:
 
 def load_json(path: str) -> dict:
     """Load JSON file."""
-    with open(path, 'r', encoding="utf-8") as f:
-        return json.load(f)
+    return read_json(path)
 
 
 def extract_file(unit_id: str) -> str:
