@@ -42,7 +42,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Set
-from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import open_utf8, read_json, run_utf8, write_json
 
 # Add parent directory to path for utilities import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -116,13 +116,11 @@ class GoPipelineTest:
         if not os.path.exists(self.go_parser):
             print("Building Go parser...")
             go_parser_dir = os.path.join(self.parser_dir, 'go_parser')
-            result = subprocess.run(
+            result = run_utf8(
                 ['go', 'build', '-o', 'go_parser', '.'],
                 cwd=go_parser_dir,
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
             )
             if result.returncode != 0:
                 print(f"Error building Go parser: {result.stderr}")
@@ -143,12 +141,10 @@ class GoPipelineTest:
         start_time = datetime.now()
 
         try:
-            result = subprocess.run(
+            result = run_utf8(
                 command,
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 cwd=self.parser_dir
             )
 
@@ -433,12 +429,10 @@ class GoPipelineTest:
                 '--overwrite'
             ]
 
-            result = subprocess.run(
+            result = run_utf8(
                 create_db_cmd,
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=600  # 10 minute timeout
             )
 
@@ -466,12 +460,10 @@ class GoPipelineTest:
                 f'codeql/{language}-queries:codeql-suites/{language}-security-extended.qls'
             ]
 
-            result = subprocess.run(
+            result = run_utf8(
                 analyze_cmd,
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=1800  # 30 minute timeout
             )
 

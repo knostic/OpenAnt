@@ -41,7 +41,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Set, Tuple
-from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import open_utf8, read_json, run_utf8, write_json
 
 # Add parent directory to path for utilities import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -127,12 +127,10 @@ class PipelineTest:
         start_time = datetime.now()
 
         try:
-            result = subprocess.run(
+            result = run_utf8(
                 command,
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 cwd=self.parser_dir
             )
 
@@ -290,12 +288,10 @@ class PipelineTest:
         start_time = datetime.now()
 
         try:
-            result = subprocess.run(
+            result = run_utf8(
                 command,
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 cwd=self.parser_dir
             )
 
@@ -638,12 +634,10 @@ class PipelineTest:
                 '--overwrite'
             ]
 
-            result = subprocess.run(
+            result = run_utf8(
                 create_db_cmd,
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=600  # 10 minute timeout
             )
 
@@ -671,12 +665,10 @@ class PipelineTest:
                 f'codeql/{language}-queries:codeql-suites/{language}-security-extended.qls'
             ]
 
-            result = subprocess.run(
+            result = run_utf8(
                 analyze_cmd,
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=1800  # 30 minute timeout
             )
 

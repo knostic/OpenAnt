@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from utilities.file_io import open_utf8
+from utilities.file_io import open_utf8, run_utf8
 
 # Timeouts
 DEFAULT_CONTAINER_TIMEOUT = 120   # seconds per container
@@ -113,12 +113,10 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
 def _run_command(cmd: list[str], timeout: int, cwd: str = None) -> tuple[str, str, int, bool]:
     """Run a command with timeout. Returns (stdout, stderr, exit_code, timed_out)."""
     try:
-        result = subprocess.run(
+        result = run_utf8(
             cmd,
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=timeout,
             cwd=cwd,
         )

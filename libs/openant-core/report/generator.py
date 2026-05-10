@@ -64,7 +64,8 @@ def _check_api_key():
 
 def load_prompt(name: str) -> str:
     """Load a prompt template from the prompts directory."""
-    return (PROMPTS_DIR / f"{name}.txt").read_text(encoding="utf-8")
+    with open_utf8(PROMPTS_DIR / f"{name}.txt") as f:
+        return f.read()
 
 
 def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
@@ -248,7 +249,8 @@ def generate_all(pipeline_path: str, output_dir: str) -> None:
     # Generate summary report
     print("Generating summary report...")
     summary, _usage = generate_summary_report(pipeline_data)
-    (output_path / "SUMMARY_REPORT.md").write_text(summary, encoding="utf-8")
+    with open_utf8(output_path / "SUMMARY_REPORT.md", "w") as f:
+        f.write(summary)
     print(f"  -> {output_path / 'SUMMARY_REPORT.md'}")
 
     # Generate disclosure for each confirmed vulnerability
@@ -266,7 +268,8 @@ def generate_all(pipeline_path: str, output_dir: str) -> None:
 
         safe_name = finding["short_name"].replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
-        (disclosures_dir / filename).write_text(disclosure, encoding="utf-8")
+        with open_utf8(disclosures_dir / filename, "w") as f:
+            f.write(disclosure)
         print(f"  -> {disclosures_dir / filename}")
 
 

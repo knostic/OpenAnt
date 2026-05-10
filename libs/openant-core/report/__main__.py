@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .generator import generate_summary_report, generate_disclosure, generate_all
 from .schema import validate_pipeline_output, ValidationError
-from utilities.file_io import read_json
+from utilities.file_io import open_utf8, read_json
 
 
 def cmd_summary(args):
@@ -32,7 +32,8 @@ def cmd_summary(args):
 
     output_path = Path(args.output) if args.output else Path("SUMMARY_REPORT.md")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(report, encoding="utf-8")
+    with open_utf8(output_path, "w") as f:
+        f.write(report)
     print(f"  -> {output_path}")
     print(f"  Cost: ${usage['cost_usd']:.4f} ({usage['total_tokens']:,} tokens)")
 
@@ -62,7 +63,8 @@ def cmd_disclosures(args):
 
         safe_name = finding["short_name"].replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
-        (output_dir / filename).write_text(disclosure, encoding="utf-8")
+        with open_utf8(output_dir / filename, "w") as f:
+            f.write(disclosure)
         print(f"  -> {output_dir / filename}")
         count += 1
 
