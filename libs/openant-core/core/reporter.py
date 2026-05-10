@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.schemas import ReportResult
-from utilities.file_io import read_json, write_json
+from utilities.file_io import open_utf8, read_json, write_json
 
 # Root of openant-core
 _CORE_ROOT = Path(__file__).parent.parent
@@ -475,7 +475,7 @@ def generate_summary_report(
     report_text, usage = _generate_summary(pipeline_data)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
+    with open_utf8(output_path, "w") as f:
         f.write(report_text)
 
     print(f"  Summary report: {output_path}", file=sys.stderr)
@@ -542,7 +542,7 @@ def generate_disclosure_docs(
             safe_name = finding["short_name"].replace(" ", "_").upper()
             filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
             filepath = os.path.join(output_dir, filename)
-            with open(filepath, "w", encoding="utf-8") as f:
+            with open_utf8(filepath, "w") as f:
                 f.write(disclosure_text)
             return finding["short_name"], filepath, usage
 

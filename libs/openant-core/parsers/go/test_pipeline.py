@@ -42,6 +42,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Set
+from utilities.file_io import read_json, write_json, open_utf8
 
 # Add parent directory to path for utilities import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -172,8 +173,7 @@ class GoPipelineTest:
 
                 # Load and summarize output
                 if os.path.exists(output_file):
-                    with open(output_file, 'r', encoding="utf-8") as f:
-                        data = json.load(f)
+                    data = read_json(output_file)
                     stage_result['summary'] = self._summarize_output(name, data)
             else:
                 print(f"✗ Failed (exit code {result.returncode})")
@@ -248,11 +248,9 @@ class GoPipelineTest:
         # Post-process: apply dataset name if specified (Go binary doesn't support --name)
         if result.get('success', False) and self.dataset_name and os.path.exists(self.dataset_file):
             try:
-                with open(self.dataset_file, 'r', encoding="utf-8") as f:
-                    dataset = json.load(f)
+                dataset = read_json(self.dataset_file)
                 dataset['name'] = self.dataset_name
-                with open(self.dataset_file, 'w', encoding="utf-8") as f:
-                    json.dump(dataset, f, indent=2)
+                write_json(self.dataset_file, dataset)
             except Exception as e:
                 print(f"Warning: Could not apply dataset name: {e}")
 
@@ -286,8 +284,7 @@ class GoPipelineTest:
 
         try:
             # Load analyzer output for call graph
-            with open(self.analyzer_output_file, 'r', encoding="utf-8") as f:
-                analyzer = json.load(f)
+            analyzer = read_json(self.analyzer_output_file)
 
             functions = analyzer.get("functions", {})
 
@@ -308,8 +305,7 @@ class GoPipelineTest:
                 }
 
             # Load call graph from dataset (go_parser puts it in statistics)
-            with open(self.dataset_file, 'r', encoding="utf-8") as f:
-                dataset = json.load(f)
+            dataset = read_json(self.dataset_file)
 
             # Build call graph from unit metadata
             call_graph = {}
@@ -363,8 +359,7 @@ class GoPipelineTest:
             }
 
             # Write filtered dataset
-            with open(self.dataset_file, 'w', encoding="utf-8") as f:
-                json.dump(dataset, f, indent=2)
+            write_json(self.dataset_file, dataset)
 
             elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -506,8 +501,7 @@ class GoPipelineTest:
                 }
                 return False
 
-            with open(sarif_output, 'r', encoding="utf-8") as f:
-                sarif_data = json.load(f)
+            sarif_data = read_json(sarif_output)
 
             # Extract findings and map to file:line
             self.codeql_findings = []
@@ -628,8 +622,7 @@ class GoPipelineTest:
 
         try:
             # Load dataset to get function line ranges
-            with open(self.dataset_file, 'r', encoding="utf-8") as f:
-                dataset = json.load(f)
+            dataset = read_json(self.dataset_file)
 
             # Build mapping of file -> [(start_line, end_line, func_id)]
             file_functions = {}
@@ -683,8 +676,7 @@ class GoPipelineTest:
             }
 
             # Write filtered dataset
-            with open(self.dataset_file, 'w', encoding="utf-8") as f:
-                json.dump(dataset, f, indent=2)
+            write_json(self.dataset_file, dataset)
 
             elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -741,8 +733,7 @@ class GoPipelineTest:
 
         try:
             # Load dataset
-            with open(self.dataset_file, 'r', encoding="utf-8") as f:
-                dataset = json.load(f)
+            dataset = read_json(self.dataset_file)
 
             # Enhance with LLM
             enhancer = ContextEnhancer()
@@ -779,8 +770,7 @@ class GoPipelineTest:
                 }
 
             # Write back
-            with open(self.dataset_file, 'w', encoding="utf-8") as f:
-                json.dump(enhanced, f, indent=2)
+            write_json(self.dataset_file, enhanced)
 
             elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -832,8 +822,7 @@ class GoPipelineTest:
         start_time = datetime.now()
 
         try:
-            with open(self.dataset_file, 'r', encoding="utf-8") as f:
-                dataset = json.load(f)
+            dataset = read_json(self.dataset_file)
 
             units = dataset.get("units", [])
             original_count = len(units)
@@ -862,8 +851,7 @@ class GoPipelineTest:
             }
 
             # Write filtered dataset
-            with open(self.dataset_file, 'w', encoding="utf-8") as f:
-                json.dump(dataset, f, indent=2)
+            write_json(self.dataset_file, dataset)
 
             elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -1010,7 +998,7 @@ class GoPipelineTest:
 
         # Save results summary
         results_file = os.path.join(self.output_dir, 'pipeline_results.json')
-        with open(results_file, 'w', encoding="utf-8") as f:
+        with open_utf8(results_file, 'w') as f:
             # Remove stdout/stderr from saved results (too verbose)
             clean_results = {
                 'repository': self.results['repository'],

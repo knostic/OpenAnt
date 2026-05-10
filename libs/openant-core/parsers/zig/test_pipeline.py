@@ -20,6 +20,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from utilities.file_io import write_json
 
 # Add parent directories to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -96,10 +97,8 @@ def main():
                 "statistics": {"total_units": 0, "by_type": {}},
                 "metadata": {"generator": "zig_unit_generator.py"},
             }
-            with open(output_dir / "dataset.json", "w", encoding="utf-8") as f:
-                json.dump(empty_dataset, f, indent=2)
-            with open(output_dir / "analyzer_output.json", "w", encoding="utf-8") as f:
-                json.dump({"repository": str(repo_path), "functions": {}}, f, indent=2)
+            write_json(output_dir / "dataset.json", empty_dataset)
+            write_json(output_dir / "analyzer_output.json", {"repository": str(repo_path), "functions": {}})
             return 0
 
         # Stage 2: Function Extractor

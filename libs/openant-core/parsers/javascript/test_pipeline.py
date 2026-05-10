@@ -41,6 +41,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Set, Tuple
+from utilities.file_io import read_json, write_json, open_utf8
 
 # Add parent directory to path for utilities import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -156,8 +157,7 @@ class PipelineTest:
 
                 # Load and summarize output
                 if os.path.exists(output_file):
-                    with open(output_file, 'r', encoding="utf-8") as f:
-                        data = json.load(f)
+                    data = read_json(output_file)
                     stage_result['summary'] = self._summarize_output(name, data)
             else:
                 print(f"✗ Failed (exit code {result.returncode})")
@@ -244,8 +244,7 @@ class PipelineTest:
 
         # If no specific files, use ALL files from scan results
         if not files and self.scan_results_file and os.path.exists(self.scan_results_file):
-            with open(self.scan_results_file, 'r', encoding="utf-8") as f:
-                scan_data = json.load(f)
+            scan_data = read_json(self.scan_results_file)
             files = [f['path'] for f in scan_data.get('files', [])]
 
         if not files:
@@ -254,7 +253,7 @@ class PipelineTest:
 
         # Write file list to a temporary file to avoid command-line length limits
         file_list_path = os.path.join(self.output_dir, 'file_list.txt')
-        with open(file_list_path, 'w', encoding="utf-8") as f:
+        with open_utf8(file_list_path, 'w') as f:
             for file_path in files:
                 # Convert relative path to absolute
                 if not os.path.isabs(file_path):
@@ -304,7 +303,7 @@ class PipelineTest:
 
             if result.returncode == 0:
                 # Write stdout to output file
-                with open(output_file, 'w', encoding="utf-8") as f:
+                with open_utf8(output_file, 'w') as f:
                     f.write(result.stdout)
 
                 print(f"✓ Success ({elapsed:.2f}s)")
@@ -317,8 +316,7 @@ class PipelineTest:
 
                 # Load and summarize output
                 if os.path.exists(output_file):
-                    with open(output_file, 'r', encoding="utf-8") as f:
-                        data = json.load(f)
+                    data = read_json(output_file)
                     summary = self._summarize_output(name, data)
                 else:
                     summary = {}
@@ -395,8 +393,7 @@ class PipelineTest:
 
         try:
             # Load dataset
-            with open(self.dataset_file, 'r', encoding="utf-8") as f:
-                dataset = json.load(f)
+            dataset = read_json(self.dataset_file)
 
             # Enhance with LLM
             enhancer = ContextEnhancer()
@@ -436,8 +433,7 @@ class PipelineTest:
                 }
 
             # Write back
-            with open(self.dataset_file, 'w', encoding="utf-8") as f:
-                json.dump(enhanced, f, indent=2)
+            write_json(self.dataset_file, enhanced)
 
             elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -494,8 +490,7 @@ class PipelineTest:
 
         try:
             # Load analyzer output for call graph
-            with open(self.analyzer_output_file, 'r', encoding="utf-8") as f:
-                analyzer = json.load(f)
+            analyzer = read_json(self.analyzer_output_file)
 
             functions = analyzer.get("functions", {})
             call_graph = analyzer.get("call_graph", analyzer.get("callGraph", {}))
@@ -514,8 +509,7 @@ class PipelineTest:
             self.reachable_units = reachability.get_all_reachable()
 
             # Load and filter dataset
-            with open(self.dataset_file, 'r', encoding="utf-8") as f:
-                dataset = json.load(f)
+            dataset = read_json(self.dataset_file)
 
             units = dataset.get("units", [])
             original_count = len(units)
@@ -543,8 +537,7 @@ class PipelineTest:
             }
 
             # Write filtered dataset
-            with open(self.dataset_file, 'w', encoding="utf-8") as f:
-                json.dump(dataset, f, indent=2)
+            write_json(self.dataset_file, dataset)
 
             elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -594,8 +587,7 @@ class PipelineTest:
             return "javascript"  # Default
 
         try:
-            with open(self.scan_results_file, 'r', encoding="utf-8") as f:
-                scan_data = json.load(f)
+            scan_data = read_json(self.scan_results_file)
 
             stats = scan_data.get('statistics', {})
             by_extension = stats.get('byExtension', {})
@@ -714,8 +706,7 @@ class PipelineTest:
                 }
                 return False
 
-            with open(sarif_output, 'r', encoding="utf-8") as f:
-                sarif_data = json.load(f)
+            sarif_data = read_json(sarif_output)
 
             # Extract findings and map to file:line
             self.codeql_findings = []
@@ -838,8 +829,7 @@ class PipelineTest:
 
         try:
             # Load analyzer output to get function line ranges
-            with open(self.analyzer_output_file, 'r', encoding="utf-8") as f:
-                analyzer = json.load(f)
+            analyzer = read_json(self.analyzer_output_file)
 
             functions = analyzer.get("functions", {})
 
@@ -877,8 +867,7 @@ class PipelineTest:
                             self.codeql_flagged_units.add(func_id)
 
             # Load and filter dataset
-            with open(self.dataset_file, 'r', encoding="utf-8") as f:
-                dataset = json.load(f)
+            dataset = read_json(self.dataset_file)
 
             units = dataset.get("units", [])
             original_count = len(units)
@@ -899,8 +888,7 @@ class PipelineTest:
             }
 
             # Write filtered dataset
-            with open(self.dataset_file, 'w', encoding="utf-8") as f:
-                json.dump(dataset, f, indent=2)
+            write_json(self.dataset_file, dataset)
 
             elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -963,8 +951,7 @@ class PipelineTest:
         start_time = datetime.now()
 
         try:
-            with open(self.dataset_file, 'r', encoding="utf-8") as f:
-                dataset = json.load(f)
+            dataset = read_json(self.dataset_file)
 
             units = dataset.get("units", [])
             original_count = len(units)
@@ -993,8 +980,7 @@ class PipelineTest:
             }
 
             # Write filtered dataset
-            with open(self.dataset_file, 'w', encoding="utf-8") as f:
-                json.dump(dataset, f, indent=2)
+            write_json(self.dataset_file, dataset)
 
             elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -1151,7 +1137,7 @@ class PipelineTest:
 
         # Save results summary
         results_file = os.path.join(self.output_dir, 'pipeline_results.json')
-        with open(results_file, 'w', encoding="utf-8") as f:
+        with open_utf8(results_file, 'w') as f:
             # Remove stdout/stderr from saved results (too verbose)
             clean_results = {
                 'repository': self.results['repository'],
