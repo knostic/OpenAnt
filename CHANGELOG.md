@@ -44,6 +44,37 @@ All notable changes to OpenAnt are documented in this file.
   resuming a scan with non-zero prior token usage — a dormant bug
   uncovered by the new lint step. Now uses `get_global_tracker()` to
   match the existing pattern in the same function.
+- **Managed venv path is wrong on Windows.** `venvPython()` in
+  `apps/openant-cli/internal/python/runtime.go` hard-coded
+  `bin/python`, which doesn't exist in a Windows venv (the layout there
+  is `Scripts\python.exe`). The CLI now branches on `runtime.GOOS` and
+  returns the OS-correct path, so `~/.openant/venv/` is usable on
+  Windows without setting `OPENANT_PYTHON`. New `runtime_test.go`
+  covers both layouts.
+- **Python parser test pipelines fail when invoked as subprocesses.**
+  `parsers/{javascript,go}/test_pipeline.py` import from `utilities.*`
+  but, when the Go CLI runs them as subprocesses with a different
+  working directory, `openant-core/` was not on `sys.path`. Both files
+  now prepend the openant-core root to `sys.path` before the
+  `utilities` import.
+- **Anthropic SDK auth-error test broken by SDK update.**
+  `tests/test_silent_401.py` constructed `AuthenticationError("...")`
+  with a positional message; the current SDK requires
+  `AuthenticationError(message=, response=, body=)`. The test now
+  builds a mock `httpx.Response` and uses the keyword form, and
+  temporarily restores the real `anthropic` module so the real
+  exception class is used.
+- **`run_utf8` explicit-encoding test crashed on Windows.**
+  `test_run_utf8_does_not_override_explicit_encoding` used
+  `print('café')` from a `-c` snippet, which itself fails to encode
+  on a cp1252 console before `run_utf8` even runs. The test now writes
+  raw `latin-1` bytes via `sys.stdout.buffer.write(...)` so the
+  encoding-override path is the thing under test on every platform.
+- **`withTempHome` test helper didn't work on Windows.** Both copies
+  (`apps/openant-cli/cmd/mode_test.go` and
+  `apps/openant-cli/internal/config/scan_meta_test.go`) only set
+  `HOME`, but `os.UserHomeDir()` on Windows reads `USERPROFILE`. The
+  helpers now branch on `runtime.GOOS` and set the correct env var.
 
 ### Added
 
@@ -54,6 +85,13 @@ All notable changes to OpenAnt are documented in this file.
   contributors get fast static feedback on the kind of mistake Python
   won't surface until the affected code path executes. Scoped narrowly
   on purpose — widening to additional pyflakes rules can come later.
+- **CI now runs Go unit tests on every platform.** A new
+  `go test ./... -v` step runs in the `go-tests` job before the build,
+  on Ubuntu, macOS, and Windows. Catches regressions like the venv
+  path bug above before the binary is built. The Python step also
+  switched from a hand-curated test list to `pytest tests/`, picking
+  up ten previously-CI-invisible test files (UTF-8 file I/O, Windows
+  path handling, dedup, cwe-tagging, evidence-tier, and others).
 
 ## [2026-05-07] — Incremental scans + scan pipeline rewire
 

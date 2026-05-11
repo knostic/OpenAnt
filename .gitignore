@@ -6,4 +6,4 @@ __pycache__/
 node_modules/
 apps/openant-cli/bin/
 libs/openant-core/parsers/go/go_parser/go_parser
-# docs/
+_docs/
