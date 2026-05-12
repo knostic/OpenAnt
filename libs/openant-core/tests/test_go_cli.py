@@ -207,10 +207,11 @@ class TestInit:
     def test_auto_detect_python_from_fixture(
         self, sample_python_repo, isolated_home
     ):
-        """Init without -l on a Python fixture detects ``python``."""
+        """Init with -l auto on a Python fixture detects ``python``."""
         result = run_cli(
             "init", sample_python_repo,
             "--name", "test/python-repo",
+            "-l", "auto",
             env_override=isolated_home,
         )
         assert result.returncode == 0, f"init failed:\n{result.stderr}"
@@ -224,10 +225,11 @@ class TestInit:
     def test_auto_detect_javascript_from_fixture(
         self, sample_js_repo, isolated_home
     ):
-        """Init without -l on a JS fixture detects ``javascript``."""
+        """Init with -l auto on a JS fixture detects ``javascript``."""
         result = run_cli(
             "init", sample_js_repo,
             "--name", "test/js-repo",
+            "-l", "auto",
             env_override=isolated_home,
         )
         assert result.returncode == 0, f"init failed:\n{result.stderr}"
@@ -251,6 +253,7 @@ class TestInit:
         result = run_cli(
             "init", str(repo),
             "--name", "test/ts-synth",
+            "-l", "auto",
             env_override=isolated_home,
         )
         assert result.returncode == 0, f"init failed:\n{result.stderr}"
@@ -274,6 +277,7 @@ class TestInit:
         result = run_cli(
             "init", str(repo),
             "--name", "test/go-synth",
+            "-l", "auto",
             env_override=isolated_home,
         )
         assert result.returncode == 0, f"init failed:\n{result.stderr}"
@@ -315,6 +319,7 @@ class TestInit:
         result = run_cli(
             "init", str(repo),
             "--name", "test/no-git",
+            "-l", "auto",
             env_override=isolated_home,
         )
         assert result.returncode == 0, f"init failed:\n{result.stderr}"
@@ -338,6 +343,7 @@ class TestInit:
             "init", str(repo),
             "--name", "test/no-git-commit",
             "--commit", "abc123",
+            "-l", "auto",
             env_override=isolated_home,
         )
         assert result.returncode == 0, f"init failed:\n{result.stderr}"
@@ -356,6 +362,7 @@ class TestInit:
         result = run_cli(
             "init", str(empty),
             "--name", "test/empty",
+            "-l", "auto",
             env_override=isolated_home,
         )
         assert result.returncode != 0
