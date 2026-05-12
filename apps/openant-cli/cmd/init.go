@@ -23,16 +23,13 @@ var initCmd = &cobra.Command{
 For remote URLs, the repo is cloned into ~/.openant/projects/{org}/{repo}/repo/.
 For local paths, the existing directory is referenced in place (no cloning).
 
-If --language is not specified, the dominant language is auto-detected by
-counting source files in the repository.
-
 After init, all commands (parse, scan, etc.) work without path arguments.
 
 Examples:
-  openant init https://github.com/grafana/grafana
   openant init https://github.com/grafana/grafana -l go
   openant init https://github.com/grafana/grafana -l go --commit 591ceb2eec0
-  openant init ./repos/grafana
+  openant init https://github.com/grafana/grafana -l auto
+  openant init ./repos/grafana -l go
   openant init ./repos/grafana -l go --name myorg/grafana`,
 	Args: cobra.ExactArgs(1),
 	Run:  runInit,
@@ -50,7 +47,7 @@ var (
 )
 
 func init() {
-	initCmd.Flags().StringVarP(&initLanguage, "language", "l", "", "Language to analyze: python, javascript, go, c, ruby, php, zig, auto (default: auto-detect)")
+	initCmd.Flags().StringVarP(&initLanguage, "language", "l", "", "Language to analyze: python, javascript, go, c, ruby, php, zig, auto (auto = experimental dominance heuristic; see #61)")
 	initCmd.Flags().StringVar(&initCommit, "commit", "", "Specific commit SHA (default: HEAD)")
 	initCmd.Flags().StringVar(&initName, "name", "", "Override project name (default: derived from URL/path)")
 	initCmd.Flags().BoolVar(&initFull, "full", false, "Force full scan (rejects --incremental/--diff-base/--pr)")
@@ -58,6 +55,7 @@ func init() {
 	initCmd.Flags().StringVar(&initDiffBase, "diff-base", "", "Incremental against this ref (e.g. origin/main, HEAD~5)")
 	initCmd.Flags().IntVar(&initPR, "pr", 0, "Incremental against a GitHub PR number (requires gh; mutex with --diff-base)")
 	initCmd.Flags().StringVar(&initDiffScope, "diff-scope", "", "Diff scope: changed_files, changed_functions, callers (default changed_functions)")
+	_ = initCmd.MarkFlagRequired("language")
 }
 
 func runInit(cmd *cobra.Command, args []string) {
