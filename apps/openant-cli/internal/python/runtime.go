@@ -155,20 +155,6 @@ func checkPython(path string) (*RuntimeInfo, error) {
 // On success, it updates the RuntimeInfo to point to the venv Python.
 func CheckOpenantInstalled(pythonPath string) error {
 	if isOpenantImportable(pythonPath) {
-		// openant is already installed. Record the current pyproject.toml
-		// hash if we don't have one yet so existing users don't trigger a
-		// spurious reinstall on first run after upgrade. Best-effort only.
-		if readStoredHash() == "" {
-			if corePath, err := findOpenantCore(); err == nil {
-				if h, err := hashFile(filepath.Join(corePath, "pyproject.toml")); err == nil {
-					if err := writeStoredHash(h); err != nil {
-						fmt.Fprintf(os.Stderr,
-							"warning: could not save dependency hash at %s: %v (next run may reinstall)\n",
-							depsHashPath(), err)
-					}
-				}
-			}
-		}
 		return nil
 	}
 
