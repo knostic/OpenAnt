@@ -3,6 +3,7 @@ package python
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -300,19 +301,9 @@ func TestDepsStalenessAt_StoredHashEqualsEmpty_StillStale(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCheckDepsStale_SkipsWhenCoreNotFound(t *testing.T) {
-	// CheckDepsStale should silently return nil when it can't find
-	// openant-core. We chdir to a temp dir so findOpenantCore fails.
-	origDir, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpDir := t.TempDir()
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.Chdir(origDir) })
-
-	err = CheckDepsStale("/nonexistent/python")
+	err := checkDepsStaleWith("/nonexistent/python", func() (string, error) {
+		return "", errors.New("simulated: core not found")
+	})
 	if err != nil {
 		t.Errorf("expected nil when core not found, got: %v", err)
 	}

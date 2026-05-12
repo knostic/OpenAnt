@@ -322,7 +322,13 @@ func depsStaleness(corePath string) (stale bool, currentHash string, err error) 
 // If stale, it re-runs pip install -e and updates the stored hash.
 // Returns nil if deps are up-to-date or were successfully refreshed.
 func CheckDepsStale(pythonPath string) error {
-	corePath, err := findOpenantCore()
+	return checkDepsStaleWith(pythonPath, findOpenantCore)
+}
+
+// checkDepsStaleWith is the testable core of CheckDepsStale; coreFinder is
+// injected so tests can avoid os.Chdir to simulate a missing source tree.
+func checkDepsStaleWith(pythonPath string, coreFinder func() (string, error)) error {
+	corePath, err := coreFinder()
 	if err != nil {
 		// Can't find source — skip staleness check
 		return nil
@@ -338,6 +344,9 @@ func CheckDepsStale(pythonPath string) error {
 	}
 
 	fmt.Fprintln(os.Stderr, "Dependencies changed, updating openant installation...")
+	// Known limitation: concurrent invocations that both detect stale deps
+	// will race to pip-install into the same venv. pip does not support
+	// concurrent writes; an OS-level lock would be needed to close this gap.
 	if err := installOpenant(pythonPath, corePath); err != nil {
 		return fmt.Errorf(
 			"failed to update openant dependencies: %w\n"+
