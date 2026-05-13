@@ -27,7 +27,7 @@ from core.schemas import (
 )
 from core.step_report import step_context
 from core import tracking
-from utilities.file_io import read_json
+from utilities.file_io import read_json, write_json
 
 # Import app context generator (optional)
 try:
@@ -246,8 +246,7 @@ def scan_repository(
             "model": _LLM_REACH_MODEL,
         }) as ctx:
             try:
-                with open(active_dataset_path, encoding="utf-8") as f:
-                    dataset = json.load(f)
+                dataset = read_json(active_dataset_path)
             except (OSError, json.JSONDecodeError) as exc:
                 print(f"  WARNING: failed to load dataset: {exc}", file=sys.stderr)
                 ctx.summary = {"skipped": True, "reason": str(exc)}
@@ -257,8 +256,7 @@ def scan_repository(
                 app_ctx_payload = None
                 if app_context_path and os.path.exists(app_context_path):
                     try:
-                        with open(app_context_path, encoding="utf-8") as f:
-                            app_ctx_payload = json.load(f)
+                        app_ctx_payload = read_json(app_context_path)
                     except (OSError, json.JSONDecodeError):
                         app_ctx_payload = None
 
@@ -272,12 +270,7 @@ def scan_repository(
                 summary = apply_signals(dataset, signals)
 
                 signals_path = os.path.join(output_dir, "llm_reachability.json")
-                with open(signals_path, "w", encoding="utf-8") as f:
-                    json.dump(
-                        {"signals": signals_to_json(signals)},
-                        f,
-                        indent=2,
-                    )
+                write_json(signals_path, {"signals": signals_to_json(signals)}, indent=2)
 
                 pre_filter_count = len(dataset.get("units", []))
                 post_filter_count = pre_filter_count
@@ -322,8 +315,7 @@ def scan_repository(
 
                 # Persist final dataset so downstream stages see promoted
                 # entry points, per-unit signals, and the applied filter.
-                with open(active_dataset_path, "w", encoding="utf-8") as f:
-                    json.dump(dataset, f, indent=2)
+                write_json(active_dataset_path, dataset, indent=2)
 
                 ctx.summary = {
                     "units_reviewed": pre_filter_count,
