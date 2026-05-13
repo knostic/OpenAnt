@@ -336,6 +336,242 @@ class TypeScriptAnalyzer {
     // Extract functions from module.exports.propertyName = function() {...}
     // Pattern used by DVNA and similar CommonJS codebases
     this._extractModuleExportsPropertyFunctions(sourceFile, relativePath);
+
+    // Extract anonymous callbacks used as Express route handlers / middleware
+    // Pattern: app.get('/x', auth, async (req, res) => {...})
+    this._extractExpressRouteCallbacks(sourceFile, relativePath);
+  }
+
+  /**
+   * Express HTTP verbs we recognise on a router/app object.
+   * `use` is included to pick up middleware-mount callbacks.
+   */
+  static EXPRESS_VERBS = new Set([
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "options",
+    "head",
+    "all",
+    "use",
+  ]);
+
+  /**
+   * Walk a source file looking for Express-style route registrations and
+   * emit a synthetic function entry for each anonymous arrow / function
+   * expression used as a callback.
+   *
+   * Recognises patterns of the form:
+   *   <obj>.<verb>(<path>, ...callbacks)
+   *   <obj>.<verb>(...callbacks)         // only for `use`
+   * where `<verb>` is one of the Express HTTP verbs (or `use`) and the
+   * first argument (when present) is a string-literal path.
+   *
+   * For each anonymous callback at index >= 1 we synthesise a function
+   * entry. The last anonymous-or-named callback is treated as the route
+   * handler; earlier callbacks are middleware. Named identifiers in
+   * callback positions are recorded as explicit call edges from the
+   * synthesised callbacks (e.g. `authenticateToken` becomes an upstream
+   * dependency of the handler so call-graph based analyses see the
+   * relationship).
+   */
+  /**
+   * Heuristic: does `receiver` look like an Express app / router?
+   *
+   * We accept identifiers whose name ends with or contains one of the common
+   * Express app/router stems (case-insensitive), and chained calls like
+   * `app.route(...)` or `router.route(...)`. We deliberately reject other
+   * receivers so generic `.get(...)` calls on caches / clients / query-builders
+   * aren't misread as routes.
+   *
+   * Accepted stems: app, router, routes, server, web, api, endpoints, controller.
+   * Codebases using single-word identifiers outside this list (e.g. `http`) will
+   * not be extracted; add the stem here if needed.
+   */
+  // Stems that strongly suggest an Express app/router object.
+  static EXPRESS_RECEIVER_STEMS =
+    "app|router|routes|server|web|api|endpoints|controller";
+
+  _isPlausibleExpressReceiver(receiver) {
+    if (!receiver) return false;
+    const kind = receiver.getKindName();
+    const stems = TypeScriptAnalyzer.EXPRESS_RECEIVER_STEMS;
+
+    if (kind === "Identifier") {
+      const name = receiver.getText().toLowerCase();
+      // Accept exact stems, suffix matches (myApp), and underscore-prefixed
+      // variants (app_server) while rejecting generic short names.
+      return new RegExp(`(^|_)(${stems})(\\d|$|_)`).test(name)
+        || new RegExp(`(${stems})$`).test(name);
+    }
+    if (kind === "CallExpression") {
+      // e.g. app.route('/x').get(...) — receiver is the .route() call
+      const inner = receiver.getExpression && receiver.getExpression();
+      if (inner && inner.getKindName && inner.getKindName() === "PropertyAccessExpression") {
+        const innerName = inner.getName && inner.getName();
+        if (innerName === "route" || innerName === "Router") return true;
+      }
+      return false;
+    }
+    if (kind === "PropertyAccessExpression") {
+      // e.g. this.app.get(...) or express.Router().get(...) — accept when
+      // the trailing identifier matches our identifier pattern.
+      const trailing = receiver.getName && receiver.getName();
+      if (!trailing) return false;
+      const lower = trailing.toLowerCase();
+      return new RegExp(`(${stems})$`).test(lower);
+    }
+    return false;
+  }
+
+  _extractExpressRouteCallbacks(sourceFile, relativePath) {
+    const callExpressions = sourceFile
+      .getDescendantsOfKind(ts.SyntaxKind.CallExpression);
+
+    for (const callExpr of callExpressions) {
+      const expression = callExpr.getExpression();
+      if (!expression || expression.getKindName() !== "PropertyAccessExpression") {
+        continue;
+      }
+
+      const methodName = expression.getName ? expression.getName() : null;
+      if (!methodName || !TypeScriptAnalyzer.EXPRESS_VERBS.has(methodName)) {
+        continue;
+      }
+
+      // Filter to plausibly-Express receivers. Without this we'd match any
+      // `foo.get('x', () => {})` style call (e.g. cache lookups, query
+      // builders) and synthesise bogus route units.
+      const receiver = expression.getExpression
+        ? expression.getExpression()
+        : null;
+      if (!this._isPlausibleExpressReceiver(receiver)) {
+        continue;
+      }
+
+      const args = callExpr.getArguments();
+      if (args.length === 0) continue;
+
+      // Determine whether the first argument is a path string literal.
+      const firstArg = args[0];
+      const firstKind = firstArg.getKindName();
+      let httpPath = null;
+      let callbackStartIndex = 0;
+      if (firstKind === "StringLiteral" || firstKind === "NoSubstitutionTemplateLiteral") {
+        httpPath = firstArg.getLiteralValue
+          ? firstArg.getLiteralValue()
+          : firstArg.getText().slice(1, -1);
+        callbackStartIndex = 1;
+      } else if (methodName === "use") {
+        // `app.use(middleware)` — no path, all args are callbacks.
+        httpPath = null;
+        callbackStartIndex = 0;
+      } else {
+        // Not an Express-shaped call (no string path and not `use`).
+        continue;
+      }
+
+      // Gather the callback arguments (functions + named identifiers).
+      const callbacks = args.slice(callbackStartIndex);
+      if (callbacks.length === 0) continue;
+
+      // We only emit units when at least one callback is an inline
+      // anonymous function. Otherwise the existing extraction logic
+      // already handles named handlers.
+      const hasInline = callbacks.some((a) => {
+        const k = a.getKindName();
+        return k === "ArrowFunction" || k === "FunctionExpression";
+      });
+      if (!hasInline) continue;
+
+      const httpMethod = methodName.toUpperCase();
+      const lastCallbackIndex = callbacks.length - 1;
+
+      // Collect named middleware identifiers (Identifier / PropertyAccess)
+      // that appear as siblings in the args list. They become explicit
+      // call-graph edges from each synthesised callback.
+      const namedMiddleware = [];
+      for (let i = 0; i < callbacks.length; i++) {
+        const arg = callbacks[i];
+        const k = arg.getKindName();
+        if (k === "Identifier") {
+          namedMiddleware.push(arg.getText());
+        } else if (k === "PropertyAccessExpression") {
+          // Stores only the trailing name (e.g. "auth" from "middleware.auth").
+          // dependency_resolver._resolveCall looks up by simple name, so if
+          // another unrelated function shares the same name the edge may
+          // resolve to the wrong target (silent false-positive). This is a
+          // known limitation of the current simple-name resolution model.
+          const name = arg.getName ? arg.getName() : arg.getText();
+          namedMiddleware.push(name);
+        }
+      }
+
+      for (let i = 0; i < callbacks.length; i++) {
+        const arg = callbacks[i];
+        const k = arg.getKindName();
+        if (k !== "ArrowFunction" && k !== "FunctionExpression") continue;
+
+        // Only emit for *anonymous* function expressions. A function
+        // expression with a name like `function named(req,res){}` is
+        // already extracted elsewhere.
+        if (k === "FunctionExpression" && arg.getName && arg.getName()) {
+          continue;
+        }
+
+        const isHandler = i === lastCallbackIndex;
+        const role = isHandler ? "handler" : `middleware:${i}`;
+        const pathLabel = httpPath !== null ? httpPath : "";
+        const baseName = pathLabel
+          ? `${httpMethod} ${pathLabel} [${role}]`
+          : `${httpMethod} [${role}]`;
+        const synthName = baseName;
+
+        const code = arg.getFullText();
+        const startLine = arg.getStartLineNumber();
+        const endLine = arg.getEndLineNumber();
+        // Synthesise an ID that's stable per file/line so two routes on
+        // the same line+path don't collide.
+        const idSuffix = `${httpMethod}:${pathLabel}:${startLine}:${i}`;
+        const functionId = `${relativePath}:express(${idSuffix})`;
+
+        if (this.functions[functionId]) continue;
+
+        const unitType = isHandler ? "route_handler" : "route_middleware";
+        const explicitCalls = namedMiddleware.filter((n) => n && n !== synthName);
+
+        this.functions[functionId] = {
+          name: synthName,
+          code: code,
+          isExported: false,
+          unitType: unitType,
+          startLine: startLine,
+          endLine: endLine,
+          isEntryPoint: isHandler,
+          routeMetadata: {
+            http_method: httpMethod,
+            http_path: httpPath,
+            callback_index: i,
+            total_callbacks: callbacks.length,
+            named_middleware: explicitCalls,
+          },
+          explicitCalls: explicitCalls,
+        };
+
+        // Emit a callGraph entry for the synthesised callback so the
+        // invariant `callGraph keys ≡ functions keys` holds. The named
+        // middleware identifiers are recorded as upstream dependencies via
+        // explicitCalls (merged downstream by dependency_resolver.js); here
+        // we capture any inline call expressions from the callback body so
+        // call-graph based analyses can see them too.
+        this.callGraph[functionId] = this.extractCallsFromFunction(
+          arg,
+          relativePath,
+        );
+      }
+    }
   }
 
   /**

@@ -69,6 +69,21 @@ class DependencyResolver {
   buildCallGraph() {
     for (const [funcId, funcData] of Object.entries(this.functions)) {
       const calls = this._extractCalls(funcData.code, funcId);
+
+      // Merge in any explicit call edges declared by the analyzer.
+      // This is used for cases the body-text regex can't see — e.g.
+      // Express middleware identifiers passed as sibling args:
+      //   app.post('/x', authenticateToken, async (req,res) => {...})
+      const explicitCalls = funcData.explicitCalls || [];
+      const callerFile = funcId.split(':')[0];
+      for (const name of explicitCalls) {
+        if (!name) continue;
+        const resolved = this._resolveCall(name, callerFile, funcId);
+        if (resolved && !calls.includes(resolved)) {
+          calls.push(resolved);
+        }
+      }
+
       this.callGraph[funcId] = calls;
 
       // Build reverse graph

@@ -239,6 +239,19 @@ class UnitGenerator {
             unitType = 'route_handler';
         }
 
+        // If the analyzer attached Express route metadata directly to the
+        // function (anonymous arrow handler / middleware), surface it on the
+        // unit's `route` field even when no external routes.json was given.
+        if (!routeData && funcData.routeMetadata) {
+            const meta = funcData.routeMetadata;
+            routeData = {
+                method: meta.http_method,
+                path: meta.http_path,
+                handler: funcData.name,
+                middleware: meta.named_middleware || [],
+            };
+        }
+
         // Get upstream dependencies (functions this calls)
         const upstreamIds = this.resolver.getDependencies(functionId);
         const upstreamDependencies = [];
@@ -314,6 +327,10 @@ class UnitGenerator {
                 handler: routeData.handler,
                 middleware: routeData.middleware || []
             } : null,
+            is_entry_point: funcData.isEntryPoint === true ? true : undefined,
+            http_method: funcData.routeMetadata ? funcData.routeMetadata.http_method : undefined,
+            http_path: funcData.routeMetadata ? funcData.routeMetadata.http_path : undefined,
+            callback_index: funcData.routeMetadata ? funcData.routeMetadata.callback_index : undefined,
             ground_truth: {
                 status: 'UNKNOWN',
                 vulnerability_types: [],
