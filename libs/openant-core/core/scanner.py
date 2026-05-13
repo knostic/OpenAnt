@@ -61,6 +61,7 @@ def scan_repository(
     commit_sha: str | None = None,
     diff_manifest: str | None = None,
     llm_reachability: bool = False,
+    llm_reachability_max_code_bytes: int = 1500,
 ) -> ScanResult:
     """Scan a repository for vulnerabilities.
 
@@ -266,6 +267,7 @@ def scan_repository(
                 signals = analyze_reachability(
                     dataset=dataset,
                     app_context=app_ctx_payload,
+                    max_code_bytes=llm_reachability_max_code_bytes,
                 )
                 summary = apply_signals(dataset, signals)
 

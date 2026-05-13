@@ -171,6 +171,20 @@ class TestBuildPrompt:
         prompt = build_prompt([_make_unit("a:f", code=big)])
         assert "[truncated]" in prompt
 
+    def test_max_code_bytes_override_keeps_more_context(self):
+        """Larger max_code_bytes should preserve content past the default cutoff."""
+        # 3000 bytes of unique markers — past default 1500, within 4096
+        big = ("# unique-marker\n" * 3) + ("x = 1\n" * 600) + "FINAL_MARKER = True\n"
+        # default 1500: FINAL_MARKER is past the cutoff and should be missing
+        default_prompt = build_prompt([_make_unit("a:f", code=big)])
+        assert "FINAL_MARKER" not in default_prompt
+        assert "[truncated]" in default_prompt
+        # 4096: FINAL_MARKER fits and should appear
+        wide_prompt = build_prompt(
+            [_make_unit("a:f", code=big)], max_code_bytes=4096
+        )
+        assert "FINAL_MARKER" in wide_prompt
+
 
 # ---------------------------------------------------------------------------
 # analyze_reachability — full call with a mocked client

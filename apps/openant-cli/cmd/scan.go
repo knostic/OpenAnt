@@ -51,7 +51,8 @@ var (
 	scanDiffBase    string
 	scanPR          int
 	scanDiffScope   string
-	scanLLMReachability bool
+	scanLLMReachability             bool
+	scanLLMReachabilityMaxCodeBytes int
 )
 
 func init() {
@@ -81,6 +82,7 @@ func registerScanFlags(cmd *cobra.Command) {
 	cmd.Flags().IntVar(&scanPR, "pr", 0, "Incremental mode against a GitHub PR number (requires gh; mutex with --diff-base)")
 	cmd.Flags().StringVar(&scanDiffScope, "diff-scope", "changed_functions", "Diff scope: changed_files, changed_functions, callers")
 	cmd.Flags().BoolVar(&scanLLMReachability, "llm-reachability", false, "Enable the LLM reachability review stage (Opus). Surfaces entry points and external-input sites the structural pass would miss by reviewing the full codebase before the reachability filter is applied. Off by default — enabling this incurs cost proportional to total repo size, not the filtered unit count (~one Opus call per 25 units across the whole codebase).")
+	cmd.Flags().IntVar(&scanLLMReachabilityMaxCodeBytes, "llm-reachability-max-code-bytes", 1500, "Max code bytes per unit sent to the LLM reachability stage (default: 1500). Higher values (e.g. 4096, 8192) catch entry-point indicators past byte 1500 in long handlers / generated code, at proportional Opus cost increase. Only meaningful with --llm-reachability.")
 }
 
 func runScan(cmd *cobra.Command, args []string) {
@@ -201,6 +203,9 @@ func runScan(cmd *cobra.Command, args []string) {
 	}
 	if scanLLMReachability {
 		pyArgs = append(pyArgs, "--llm-reachability")
+	}
+	if scanLLMReachabilityMaxCodeBytes != 1500 {
+		pyArgs = append(pyArgs, "--llm-reachability-max-code-bytes", fmt.Sprintf("%d", scanLLMReachabilityMaxCodeBytes))
 	}
 
 	// Pass repository metadata from project context so reports don't show

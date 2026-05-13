@@ -57,8 +57,14 @@ MODEL_SECONDARY = "claude-sonnet-4-20250514"
 # round trips but risk token-limit errors and degraded recall.
 DEFAULT_BATCH_SIZE = 25
 
-# Maximum bytes of code we send per unit. Trimmed to keep prompts tractable.
-MAX_CODE_BYTES = 1500
+# Default maximum bytes of code we send per unit. Trimmed to keep prompts
+# tractable. Callers can override via the ``max_code_bytes`` parameter on
+# :func:`analyze_reachability` (exposed as ``--llm-reachability-max-code-bytes``
+# on ``openant scan``); higher values catch entry-point indicators past the
+# default cutoff in long handlers / generated code, at proportional cost.
+DEFAULT_MAX_CODE_BYTES = 1500
+# Backward-compatible alias for any external caller importing the old name.
+MAX_CODE_BYTES = DEFAULT_MAX_CODE_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -149,16 +155,19 @@ def _build_app_context_block(app_context: Optional[Dict[str, Any]]) -> str:
     return f"APPLICATION CONTEXT:\n{ctx_json}"
 
 
-def _trim_code(code: str) -> str:
+def _trim_code(code: str, max_bytes: int = DEFAULT_MAX_CODE_BYTES) -> str:
     """Truncate a code blob so the batch fits in a reasonable prompt window."""
     if not code:
         return ""
-    if len(code) <= MAX_CODE_BYTES:
+    if len(code) <= max_bytes:
         return code
-    return code[:MAX_CODE_BYTES] + "\n# ...[truncated]"
+    return code[:max_bytes] + "\n# ...[truncated]"
 
 
-def _unit_for_prompt(unit: Dict[str, Any]) -> Dict[str, Any]:
+def _unit_for_prompt(
+    unit: Dict[str, Any],
+    max_code_bytes: int = DEFAULT_MAX_CODE_BYTES,
+) -> Dict[str, Any]:
     """Project a unit into the minimal shape we send to the LLM."""
     code_blob = ""
     code = unit.get("code") or {}
@@ -172,17 +181,18 @@ def _unit_for_prompt(unit: Dict[str, Any]) -> Dict[str, Any]:
         "unit_type": unit.get("unit_type", "function"),
         "is_entry_point": bool(unit.get("is_entry_point", False)),
         "reachable": unit.get("reachable"),
-        "code": _trim_code(code_blob),
+        "code": _trim_code(code_blob, max_bytes=max_code_bytes),
     }
 
 
 def build_prompt(
     units: List[Dict[str, Any]],
     app_context: Optional[Dict[str, Any]] = None,
+    max_code_bytes: int = DEFAULT_MAX_CODE_BYTES,
 ) -> str:
     """Assemble the LLM prompt for a batch of units."""
     app_block = _build_app_context_block(app_context)
-    payload = [_unit_for_prompt(u) for u in units]
+    payload = [_unit_for_prompt(u, max_code_bytes=max_code_bytes) for u in units]
     units_block = json.dumps(payload, indent=2)
     return PROMPT_TEMPLATE.format(
         app_context_block=app_block,
@@ -314,6 +324,7 @@ def analyze_reachability(
     client: Any = None,
     model: str = MODEL_PRIMARY,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    max_code_bytes: int = DEFAULT_MAX_CODE_BYTES,
     max_units: Optional[int] = None,
     on_error: Optional[Callable[[str], None]] = None,
 ) -> List[ReachabilitySignal]:
@@ -331,6 +342,9 @@ def analyze_reachability(
             instantiated lazily.
         model: Model id to use (defaults to Opus).
         batch_size: Units per LLM call.
+        max_code_bytes: Per-unit code-blob truncation limit. Higher values
+            give the LLM more context (better recall on long handlers /
+            generated code) at proportional Opus cost. Default 1500.
         max_units: Optional cap on how many units to review.
         on_error: Optional callback for parse/validation issues.
 
@@ -355,7 +369,9 @@ def analyze_reachability(
     signals: List[ReachabilitySignal] = []
     batches = _chunk(units, batch_size)
     for i, batch in enumerate(batches):
-        prompt = build_prompt(batch, app_context=app_context)
+        prompt = build_prompt(
+            batch, app_context=app_context, max_code_bytes=max_code_bytes
+        )
         try:
             text = client.analyze_sync(prompt, max_tokens=4096, model=model)
         except Exception as exc:  # noqa: BLE001 — advisory stage; never crash pipeline
