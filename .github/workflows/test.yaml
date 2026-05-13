@@ -52,6 +52,12 @@ jobs:
           cache: "npm"
           cache-dependency-path: libs/openant-core/parsers/javascript/package-lock.json
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: libs/openant-core/parsers/go/go_parser/go.mod
+          cache-dependency-path: libs/openant-core/parsers/go/go_parser/go.mod
+
       - name: Install Python dependencies
         working-directory: libs/openant-core
         run: pip install -r requirements.txt && pip install ".[dev]"
@@ -67,6 +73,16 @@ jobs:
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
         working-directory: libs/openant-core/parsers/javascript
         run: npm ci
+
+      - name: Build go_parser binary (Linux/macOS)
+        if: runner.os != 'Windows'
+        working-directory: libs/openant-core/parsers/go/go_parser
+        run: go build -o go_parser .
+
+      - name: Build go_parser binary (Windows)
+        if: runner.os == 'Windows'
+        working-directory: libs/openant-core/parsers/go/go_parser
+        run: go build -o go_parser.exe .
 
       - name: Run Python and parser tests
         working-directory: libs/openant-core

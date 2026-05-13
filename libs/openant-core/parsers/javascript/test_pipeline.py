@@ -307,6 +307,23 @@ class PipelineTest:
         )
 
         self.results['stages']['typescript_analyzer'] = result
+
+        # Write call_graph.json immediately after the analyzer output is
+        # available so the post-LLM reachability re-filter can use it
+        # regardless of processing_level (which may be "all").
+        if result.get('success', False) and os.path.exists(self.analyzer_output_file):
+            try:
+                analyzer = read_json(self.analyzer_output_file)
+                call_graph_data = {
+                    "functions": analyzer.get("functions", {}),
+                    "call_graph": analyzer.get("call_graph", analyzer.get("callGraph", {})),
+                    "reverse_call_graph": analyzer.get("reverse_call_graph", analyzer.get("reverseCallGraph", {})),
+                }
+                call_graph_file = os.path.join(self.output_dir, 'call_graph.json')
+                write_json(call_graph_file, call_graph_data)
+            except (OSError, json.JSONDecodeError, KeyError) as e:
+                print(f"Warning: could not write call_graph.json: {e}")
+
         return result.get('success', False)
 
     def run_stage_with_stdout_capture(self, name: str, command: list, output_file: str) -> dict:

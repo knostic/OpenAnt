@@ -60,6 +60,7 @@ def scan_repository(
     repo_url: str | None = None,
     commit_sha: str | None = None,
     diff_manifest: str | None = None,
+    llm_reachability: bool = False,
 ) -> ScanResult:
     """Scan a repository for vulnerabilities.
 
@@ -107,6 +108,7 @@ def scan_repository(
     # Count total steps for progress display
     total_steps = _count_steps(
         generate_context, enhance, verify, generate_report, dynamic_test,
+        llm_reachability=llm_reachability,
     )
     step_num = 0
 
@@ -124,19 +126,31 @@ def scan_repository(
     # ---------------------------------------------------------------
     from core.parser_adapter import parse_repository
 
+    # When LLM reachability is enabled the stage must see ALL units so it can
+    # identify entry points the structural pass would miss.  Parse with "all"
+    # here; the structural filter is re-applied after LLM signals are merged.
+    effective_parse_level = (
+        "all" if (llm_reachability and processing_level != "all") else processing_level
+    )
+
     print(_step_label("Parsing repository..."), file=sys.stderr)
+    if effective_parse_level != processing_level:
+        print(
+            "  [LLM reachability] parsing all units; structural filter runs after LLM signals",
+            file=sys.stderr,
+        )
 
     with step_context("parse", output_dir, inputs={
         "repo_path": repo_path,
         "language": language,
-        "processing_level": processing_level,
+        "processing_level": effective_parse_level,
         "skip_tests": skip_tests,
     }) as ctx:
         parse_result = parse_repository(
             repo_path=repo_path,
             output_dir=output_dir,
             language=language,
-            processing_level=processing_level,
+            processing_level=effective_parse_level,
             skip_tests=skip_tests,
             diff_manifest=diff_manifest,
         )
@@ -174,7 +188,7 @@ def scan_repository(
     # ---------------------------------------------------------------
     # Step 2: Application Context (optional)
     # ---------------------------------------------------------------
-    app_context_path = None
+    app_context_path: str | None = None
     if generate_context and HAS_APP_CONTEXT:
         print(_step_label("Generating application context..."), file=sys.stderr)
 
@@ -203,6 +217,140 @@ def scan_repository(
         print(_step_label("Skipping application context (--no-context)."),
               file=sys.stderr)
         result.skipped_steps.append("app-context")
+    print(file=sys.stderr)
+
+    # ---------------------------------------------------------------
+    # Step 2.5: LLM Reachability review (optional, opt-in)
+    # ---------------------------------------------------------------
+    # Runs after parse + app-context and before enhance/analyze. Because parse
+    # was done with processing_level="all" (when filtering is requested), the
+    # LLM sees every unit in the codebase and can identify entry points the
+    # structural heuristics would miss.  After signals are applied the
+    # structural reachability filter is re-run with LLM-promoted entry points
+    # added as extra BFS seeds, so the final dataset honours the user's
+    # requested processing_level.  Threading app_context into the prompt helps
+    # the model reason about expected entry points (e.g. "this is a web_app,
+    # look for HTTP handlers").
+    if llm_reachability:
+        from core.llm_reachability import (
+            MODEL_PRIMARY as _LLM_REACH_MODEL,
+            analyze_reachability,
+            apply_signals,
+            signals_to_json,
+        )
+
+        print(_step_label("Running LLM reachability review..."), file=sys.stderr)
+
+        with step_context("llm-reachability", output_dir, inputs={
+            "dataset_path": active_dataset_path,
+            "model": _LLM_REACH_MODEL,
+        }) as ctx:
+            try:
+                with open(active_dataset_path, encoding="utf-8") as f:
+                    dataset = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"  WARNING: failed to load dataset: {exc}", file=sys.stderr)
+                ctx.summary = {"skipped": True, "reason": str(exc)}
+                dataset = None
+
+            if dataset is not None:
+                app_ctx_payload = None
+                if app_context_path and os.path.exists(app_context_path):
+                    try:
+                        with open(app_context_path, encoding="utf-8") as f:
+                            app_ctx_payload = json.load(f)
+                    except (OSError, json.JSONDecodeError):
+                        app_ctx_payload = None
+
+                # --limit governs the analyze stage, not how many units the
+                # LLM reachability pass reviews — it must see the full
+                # codebase to find missed entry points.
+                signals = analyze_reachability(
+                    dataset=dataset,
+                    app_context=app_ctx_payload,
+                )
+                summary = apply_signals(dataset, signals)
+
+                signals_path = os.path.join(output_dir, "llm_reachability.json")
+                with open(signals_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {"signals": signals_to_json(signals)},
+                        f,
+                        indent=2,
+                    )
+
+                pre_filter_count = len(dataset.get("units", []))
+                post_filter_count = pre_filter_count
+                refilter_supported = False
+
+                # Re-apply the structural reachability filter using
+                # LLM-promoted entry points as additional BFS seeds.
+                # Only possible when call_graph.json was written by the parser
+                # (Python and Zig paths do this; JS/Go/C/Ruby/PHP handle
+                # reachability filtering internally and don't persist it).
+                if processing_level != "all":
+                    call_graph_path = os.path.join(output_dir, "call_graph.json")
+                    if os.path.exists(call_graph_path):
+                        from core.parser_adapter import apply_reachability_filter
+                        llm_promoted_ids = {
+                            u["id"] for u in dataset.get("units", [])
+                            if u.get("is_entry_point") and u.get("id")
+                        }
+                        dataset = apply_reachability_filter(
+                            dataset,
+                            output_dir,
+                            processing_level,
+                            extra_entry_points=llm_promoted_ids,
+                        )
+                        post_filter_count = len(dataset.get("units", []))
+                        result.units_count = post_filter_count
+                        refilter_supported = True
+                    else:
+                        # Parser doesn't persist call_graph.json — the full
+                        # unfiltered dataset will flow to downstream stages.
+                        # Warn loudly so the cost impact is visible.
+                        print(
+                            f"\n  WARNING: --llm-reachability with "
+                            f"--level {processing_level}: "
+                            f"{parse_result.language} does not yet support "
+                            f"post-LLM re-filtering (call_graph.json not found). "
+                            f"Downstream stages will process all "
+                            f"{pre_filter_count} units instead of the filtered "
+                            f"subset — this may significantly increase cost.",
+                            file=sys.stderr,
+                        )
+
+                # Persist final dataset so downstream stages see promoted
+                # entry points, per-unit signals, and the applied filter.
+                with open(active_dataset_path, "w", encoding="utf-8") as f:
+                    json.dump(dataset, f, indent=2)
+
+                ctx.summary = {
+                    "units_reviewed": pre_filter_count,
+                    "signals_added": summary["signals_applied"],
+                    "entry_points_promoted": summary["entry_points_promoted"],
+                    "units_touched": summary["units_touched"],
+                    "post_filter_units": post_filter_count,
+                    "refilter_supported": refilter_supported,
+                }
+                ctx.outputs = {"signals_path": signals_path}
+
+                print(
+                    f"  LLM reachability: {summary['signals_applied']} signals, "
+                    f"{summary['entry_points_promoted']} new entry points",
+                    file=sys.stderr,
+                )
+                if processing_level != "all" and refilter_supported:
+                    print(
+                        f"  After reachability filter: {post_filter_count} units",
+                        file=sys.stderr,
+                    )
+
+        collected_step_reports.append(
+            _load_step_report(output_dir, "llm-reachability")
+        )
+    else:
+        result.skipped_steps.append("llm-reachability")
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
@@ -522,6 +670,7 @@ def _count_steps(
     verify: bool,
     generate_report: bool,
     dynamic_test: bool,
+    llm_reachability: bool = False,
 ) -> int:
     """Count total steps for progress display (always includes parse, detect, build-output)."""
     count = 3  # parse + detect + build-output (always run)
@@ -534,6 +683,8 @@ def _count_steps(
     if generate_report:
         count += 1
     if dynamic_test:
+        count += 1
+    if llm_reachability:
         count += 1
     return count
 

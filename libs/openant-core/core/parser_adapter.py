@@ -191,16 +191,23 @@ def _maybe_apply_diff_filter(
 # Reachability filter (shared by Python path; JS/Go handle it internally)
 # ---------------------------------------------------------------------------
 
-def _apply_reachability_filter(
+def apply_reachability_filter(
     dataset: dict,
     output_dir: str,
     processing_level: str,
+    extra_entry_points: "set[str] | None" = None,
 ) -> dict:
     """Filter dataset units to only those reachable from entry points.
 
     Reads the call_graph.json intermediate file produced by the parser,
     detects entry points, computes reachability via BFS, and removes
     unreachable units from the dataset.
+
+    ``extra_entry_points`` supplements the structurally-detected seed set.
+    Pass LLM-promoted unit IDs here so the BFS propagates from them even if
+    the structural heuristics missed them.  Any unit that already has
+    ``is_entry_point=True`` in the dataset (e.g. set by the LLM reachability
+    stage) keeps that flag — this function never demotes it.
 
     For ``codeql`` and ``exploitable`` levels the reachability filter is
     still applied (it is a prerequisite), but the additional CodeQL /
@@ -211,6 +218,7 @@ def _apply_reachability_filter(
         dataset: The full, unfiltered dataset dict (mutated in place).
         output_dir: Directory containing call_graph.json from the parser.
         processing_level: One of "reachable", "codeql", "exploitable".
+        extra_entry_points: Additional unit IDs to seed the BFS (e.g. from LLM).
 
     Returns:
         The (possibly filtered) dataset dict.
@@ -248,9 +256,11 @@ def _apply_reachability_filter(
     call_graph = call_graph_data.get("call_graph", {})
     reverse_call_graph = call_graph_data.get("reverse_call_graph", {})
 
-    # Detect entry points
+    # Detect entry points structurally, then seed with any extras (e.g. LLM-promoted).
     detector = EntryPointDetector(functions, call_graph)
     entry_points = detector.detect_entry_points()
+    if extra_entry_points:
+        entry_points = entry_points | extra_entry_points
 
     # Compute reachable set (BFS forward from entry points)
     reachability = ReachabilityAnalyzer(
@@ -268,8 +278,9 @@ def _apply_reachability_filter(
         unit_id = u.get("id", "")
         if unit_id in reachable_ids:
             u["reachable"] = True
-            u["is_entry_point"] = unit_id in entry_points
-            if unit_id in entry_points:
+            # Preserve any is_entry_point=True already set (e.g. by LLM stage).
+            u["is_entry_point"] = (unit_id in entry_points) or u.get("is_entry_point", False)
+            if unit_id in entry_points and not u.get("entry_point_reason"):
                 u["entry_point_reason"] = detector.get_entry_point_reason(unit_id)
             filtered_units.append(u)
 
@@ -311,6 +322,10 @@ def _apply_reachability_filter(
         )
 
     return dataset
+
+
+# Private alias kept for the Python parser path which calls it directly.
+_apply_reachability_filter = apply_reachability_filter
 
 
 # ---------------------------------------------------------------------------

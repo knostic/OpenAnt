@@ -283,6 +283,58 @@ class GoPipelineTest:
                 print(f"Warning: Could not apply dataset name: {e}")
 
         self.results['stages']['go_parser'] = result
+
+        # Write call_graph.json immediately after parsing so the post-LLM
+        # reachability re-filter can use it regardless of processing_level.
+        # Go's analyzer_output.json has functions; the call graph edges live
+        # in each unit's metadata.direct_calls / direct_callers.
+        if (
+            result.get('success', False)
+            and self.analyzer_output_file and os.path.exists(self.analyzer_output_file)
+            and self.dataset_file and os.path.exists(self.dataset_file)
+        ):
+            try:
+                analyzer = read_json(self.analyzer_output_file)
+                dataset_for_cg = read_json(self.dataset_file)
+
+                raw_functions = analyzer.get("functions", {})
+                # Normalise to the camelCase shape EntryPointDetector expects.
+                normalized_functions = {
+                    func_id: {
+                        'name': fd.get('name', ''),
+                        'unitType': fd.get('unit_type', fd.get('unitType', 'function')),
+                        'code': fd.get('code', ''),
+                        'filePath': fd.get('file_path', fd.get('filePath', '')),
+                        'startLine': fd.get('start_line', fd.get('startLine', 0)),
+                        'endLine': fd.get('end_line', fd.get('endLine', 0)),
+                        'package': fd.get('package', ''),
+                        'receiver': fd.get('receiver', ''),
+                        'isExported': fd.get('is_exported', fd.get('isExported', False)),
+                    }
+                    for func_id, fd in raw_functions.items()
+                }
+
+                call_graph: dict = {}
+                reverse_call_graph: dict = {}
+                for unit in dataset_for_cg.get('units', []):
+                    unit_id = unit.get('id')
+                    metadata = unit.get('metadata', {})
+                    direct_calls = metadata.get('direct_calls', metadata.get('directCalls', []))
+                    direct_callers = metadata.get('direct_callers', metadata.get('directCallers', []))
+                    if direct_calls:
+                        call_graph[unit_id] = direct_calls
+                    if direct_callers:
+                        reverse_call_graph[unit_id] = direct_callers
+
+                call_graph_file = os.path.join(self.output_dir, 'call_graph.json')
+                write_json(call_graph_file, {
+                    "functions": normalized_functions,
+                    "call_graph": call_graph,
+                    "reverse_call_graph": reverse_call_graph,
+                })
+            except (OSError, json.JSONDecodeError, KeyError) as e:
+                print(f"Warning: could not write call_graph.json: {e}")
+
         return result.get('success', False)
 
     def apply_reachability_filter(self) -> bool:

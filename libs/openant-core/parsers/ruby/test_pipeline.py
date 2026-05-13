@@ -184,6 +184,10 @@ class RubyPipelineTest:
             analyzer_output = generator.generate_analyzer_output()
             write_json(self.analyzer_output_file, analyzer_output)
 
+            # Write call graph for post-LLM reachability re-filtering
+            call_graph_file = os.path.join(self.output_dir, 'call_graph.json')
+            write_json(call_graph_file, graph_result)
+
             elapsed = (datetime.now() - start_time).total_seconds()
 
             summary = {

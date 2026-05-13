@@ -51,6 +51,7 @@ var (
 	scanDiffBase    string
 	scanPR          int
 	scanDiffScope   string
+	scanLLMReachability bool
 )
 
 func init() {
@@ -79,6 +80,7 @@ func registerScanFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&scanDiffBase, "diff-base", "", "Incremental mode: filter pipeline to units overlapping diff vs this ref (e.g. origin/main, HEAD~5)")
 	cmd.Flags().IntVar(&scanPR, "pr", 0, "Incremental mode against a GitHub PR number (requires gh; mutex with --diff-base)")
 	cmd.Flags().StringVar(&scanDiffScope, "diff-scope", "changed_functions", "Diff scope: changed_files, changed_functions, callers")
+	cmd.Flags().BoolVar(&scanLLMReachability, "llm-reachability", false, "Enable the LLM reachability review stage (Opus). Surfaces entry points and external-input sites the structural pass would miss by reviewing the full codebase before the reachability filter is applied. Off by default — enabling this incurs cost proportional to total repo size, not the filtered unit count (~one Opus call per 25 units across the whole codebase).")
 }
 
 func runScan(cmd *cobra.Command, args []string) {
@@ -196,6 +198,9 @@ func runScan(cmd *cobra.Command, args []string) {
 	}
 	if manifestPath != "" {
 		pyArgs = append(pyArgs, "--diff-manifest", manifestPath)
+	}
+	if scanLLMReachability {
+		pyArgs = append(pyArgs, "--llm-reachability")
 	}
 
 	// Pass repository metadata from project context so reports don't show

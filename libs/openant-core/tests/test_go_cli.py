@@ -79,6 +79,14 @@ class TestHelp:
         output = result.stdout + result.stderr
         assert "pipeline" in output.lower()
 
+    def test_scan_help_advertises_llm_reachability(self):
+        """The opt-in --llm-reachability flag (issue #17) should be discoverable
+        from `openant scan --help`."""
+        result = run_cli("scan", "--help")
+        assert result.returncode == 0
+        output = result.stdout + result.stderr
+        assert "llm-reachability" in output.lower()
+
 
 class TestParse:
     def test_parse_python_repo(self, sample_python_repo, tmp_path):
