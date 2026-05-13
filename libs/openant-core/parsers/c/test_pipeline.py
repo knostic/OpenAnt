@@ -42,10 +42,11 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Set
-from utilities.file_io import open_utf8, read_json, run_utf8, write_json
 
-# Add parent directory to path for utilities import
+# Add parent directory to path so utilities/ imports resolve when this script
+# is invoked as a subprocess by core/parser_adapter.py (cwd may not include it).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from utilities.file_io import open_utf8, read_json, run_utf8, write_json
 from utilities.context_enhancer import ContextEnhancer
 from utilities.agentic_enhancer import EntryPointDetector, ReachabilityAnalyzer
 
