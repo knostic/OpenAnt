@@ -20,6 +20,7 @@ const path = require('path');
 class DependencyResolver {
   constructor(analyzerOutput, options = {}) {
     this.functions = analyzerOutput.functions || {};
+    this.classes = analyzerOutput.classes || {};  // "filePath:className" -> { constructorDeps, fieldDeps, baseTypes }
     this.callGraph = {};  // functionId -> [calledFunctionIds]
     this.reverseCallGraph = {};  // functionId -> [callerFunctionIds]
     this.maxDepth = options.maxDepth || 3;
@@ -29,6 +30,7 @@ class DependencyResolver {
     this.functionsByName = Object.create(null);  // simpleName -> [functionIds]
     this.functionsByFile = Object.create(null);  // filePath -> [functionIds]
     this.imports = Object.create(null);  // filePath -> { importedName -> { source, originalName } }
+    this.classesByBaseType = Object.create(null);  // baseTypeName -> ["filePath:className", ...]
 
     this._buildIndexes();
   }
@@ -51,6 +53,13 @@ class DependencyResolver {
         this.functionsByFile[filePath] = [];
       }
       this.functionsByFile[filePath].push(funcId);
+    }
+
+    for (const [classKey, classData] of Object.entries(this.classes)) {
+      for (const baseType of (classData.baseTypes || [])) {
+        if (!this.classesByBaseType[baseType]) this.classesByBaseType[baseType] = [];
+        this.classesByBaseType[baseType].push(classKey);
+      }
     }
   }
 
@@ -134,7 +143,7 @@ class DependencyResolver {
       // Skip 'this' (handled above) and common built-ins
       if (objectName === 'this' || this._isBuiltIn(objectName)) continue;
 
-      const resolved = this._resolveMethodCall(objectName, methodName, callerFile);
+      const resolved = this._resolveMethodCall(objectName, methodName, callerFile, callerFuncId);
       if (resolved && !seenCalls.has(resolved)) {
         seenCalls.add(resolved);
         calls.push(resolved);
@@ -240,20 +249,65 @@ class DependencyResolver {
 
   /**
    * Resolve an object.method call
+   *
+   * Supports two resolution strategies:
+   * 1. Direct class name match: objectName === className
+   * 2. DI-aware resolution: objectName is a constructor-injected parameter,
+   *    use its type annotation to find the target class
    */
-  _resolveMethodCall(objectName, methodName, callerFile) {
-    // Check if objectName matches a class name
-    const qualifiedName = `${objectName}.${methodName}`;
+  _resolveMethodCall(objectName, methodName, callerFile, callerFuncId = null) {
     const candidates = this.functionsByName[methodName];
 
     if (!candidates || !Array.isArray(candidates)) {
       return null;
     }
 
+    // 1. Exact class name match (existing behavior)
     for (const funcId of candidates) {
       const funcData = this.functions[funcId];
       if (funcData && funcData.className === objectName) {
         return funcId;
+      }
+    }
+
+    // 2. DI-aware resolution: look up objectName in caller's constructorDeps
+    //    e.g., this.callService.getById() -> constructorDeps says callService: CallService
+    //    -> resolve to CallService.getById
+    if (callerFuncId) {
+      const callerFunc = this.functions[callerFuncId];
+      const classEntry = callerFunc && callerFunc.className &&
+          this.classes[callerFile + ':' + callerFunc.className];
+      if (classEntry && (classEntry.constructorDeps || classEntry.fieldDeps)) {
+        const typeName = (classEntry.constructorDeps || {})[objectName]
+            ?? (classEntry.fieldDeps || {})[objectName];
+        if (typeName) {
+          // 2a. Exact type match
+          for (const funcId of candidates) {
+            const funcData = this.functions[funcId];
+            if (funcData && funcData.className === typeName) {
+              return funcId;
+            }
+          }
+
+          // 2b. Nominal type match: prefer candidates whose class implements or extends typeName.
+          //     If exactly one such candidate exists, the resolution is unambiguous.
+          const nominalClassKeys = this.classesByBaseType[typeName] || [];
+          const nominalMatches = candidates.filter(funcId => {
+            const funcData = this.functions[funcId];
+            if (!funcData || !funcData.className) return false;
+            const funcClassKey = funcId.split(':')[0] + ':' + funcData.className;
+            return nominalClassKeys.includes(funcClassKey);
+          });
+          if (nominalMatches.length === 1) return nominalMatches[0];
+
+          // 2c. Prefix match: last resort for versioned names (e.g., CallService -> CallServiceV1).
+          //     Skip if multiple candidates match to preserve no-false-positive property.
+          const prefixMatches = candidates.filter(funcId => {
+            const funcData = this.functions[funcId];
+            return funcData && funcData.className && funcData.className.startsWith(typeName);
+          });
+          if (prefixMatches.length === 1) return prefixMatches[0];
+        }
       }
     }
 

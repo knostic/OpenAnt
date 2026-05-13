@@ -58,6 +58,7 @@ class TypeScriptAnalyzer {
       compilerOptions: PERMISSIVE_COMPILER_OPTIONS,
     });
     this.functions = {}; // functionId -> function metadata
+    this.classes = {};   // "filePath:className" -> { constructorDeps, fieldDeps, baseTypes }
     this.callGraph = {}; // callerId -> array of call info
   }
 
@@ -163,6 +164,7 @@ class TypeScriptAnalyzer {
 
     return {
       functions: this.functions,
+      classes: this.classes,
       callGraph: this.callGraph,
     };
   }
@@ -239,6 +241,87 @@ class TypeScriptAnalyzer {
           endLine: method.getEndLineNumber(),
           className: className,
         };
+      }
+
+      // Build class-level metadata: constructorDeps and baseTypes
+      const classEntry = {};
+
+      // Extract base types (implements + extends) for nominal DI resolution.
+      // Strips generics: implements Repository<User> -> Repository
+      const baseTypes = [];
+      const extendsExpr = classDecl.getExtends();
+      if (extendsExpr) {
+        const name = extendsExpr.getExpression().getText().replace(/<.*$/, '');
+        if (/^[A-Z][a-zA-Z0-9_$]*$/.test(name)) baseTypes.push(name);
+      }
+      for (const impl of classDecl.getImplements()) {
+        const name = impl.getExpression().getText().replace(/<.*$/, '');
+        if (/^[A-Z][a-zA-Z0-9_$]*$/.test(name)) baseTypes.push(name);
+      }
+      if (baseTypes.length > 0) classEntry.baseTypes = baseTypes;
+
+      // Extract constructor DI metadata.
+      // DI classes have a single primary constructor; overloads are unusual in NestJS/Angular.
+      const constructors = classDecl.getConstructors();
+      if (constructors.length > 0) {
+        const ctor = constructors[0];
+        const injections = {};  // paramName -> typeName
+
+        for (const param of ctor.getParameters()) {
+          const paramName = param.getName();
+          const typeNode = param.getTypeNode();
+          if (typeNode) {
+            // Strip generic parameters so Repository<User> resolves as Repository
+            const typeName = typeNode.getText().replace(/<.*$/, '');
+            // Only store simple PascalCase type names (skip union types, primitives)
+            if (/^[A-Z][a-zA-Z0-9_$]*$/.test(typeName)) {
+              injections[paramName] = typeName;
+            }
+          }
+        }
+
+        if (Object.keys(injections).length > 0) classEntry.constructorDeps = injections;
+      }
+
+      // Extract field/property injection metadata.
+      // Covers decorator-based (@Inject, @InjectRepository, etc.) and Angular's inject() function.
+      const fieldDeps = {};
+      for (const prop of classDecl.getProperties()) {
+        const propName = prop.getName();
+        let typeName = null;
+
+        // Decorator-based: any @Inject* decorator signals an injection point;
+        // the injected type comes from the TypeScript type annotation.
+        const hasInjectDecorator = prop.getDecorators().some(d => /^Inject/.test(d.getName()));
+        if (hasInjectDecorator) {
+          const typeNode = prop.getTypeNode();
+          if (typeNode) {
+            const t = typeNode.getText().replace(/<.*$/, '');
+            if (/^[A-Z][a-zA-Z0-9_$]*$/.test(t)) typeName = t;
+          }
+        }
+
+        // Functional: private svc = inject(SvcType)  (Angular inject() API)
+        if (!typeName) {
+          const init = prop.getInitializer();
+          if (init && init.getKindName() === 'CallExpression') {
+            const expr = init.getExpression();
+            if (expr && expr.getText() === 'inject') {
+              const args = init.getArguments();
+              if (args.length > 0) {
+                const t = args[0].getText().replace(/<.*$/, '');
+                if (/^[A-Z][a-zA-Z0-9_$]*$/.test(t)) typeName = t;
+              }
+            }
+          }
+        }
+
+        if (typeName) fieldDeps[propName] = typeName;
+      }
+      if (Object.keys(fieldDeps).length > 0) classEntry.fieldDeps = fieldDeps;
+
+      if (Object.keys(classEntry).length > 0) {
+        this.classes[`${relativePath}:${className}`] = classEntry;
       }
     }
 
