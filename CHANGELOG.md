@@ -2,6 +2,101 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-05-12] — Parser depth, dependency UX, and LLM reachability (opt-in)
+
+### Fixed
+
+- **`openant parse` now defaults `--level` to `reachable`.** The Go CLI's
+  `parse` command previously defaulted to `--level all`, contradicting
+  `scan` and the Python CLI which both default to `reachable`. The
+  documentation has always said the default is `reachable`. Anyone running
+  `openant parse <repo>` without `-l` now gets the same dataset as
+  `openant scan <repo> --steps parse` — the documented behavior. Set
+  `--level all` explicitly to restore the previous output. (#35)
+
+- **JS parser dependencies are now auto-installed on first use.**
+  `openant parse` on a JavaScript/TypeScript repository previously failed
+  out of the box with `Cannot find module 'ts-morph'` because nothing in
+  the install flow ran `npm install` for `parsers/javascript/`. The Python
+  parser adapter now runs `npm install` once on first JS parse using
+  `node_modules/.package-lock.json` as the completion sentinel (catches
+  Ctrl+C-interrupted installs). Python/Go-only users still never need
+  `npm`. Includes a cross-platform file lock to prevent concurrent install
+  corruption. Closes #6. (#37)
+
+- **TypeScript parser now resolves dependency-injected service calls.**
+  NestJS-style `this.userService.findById()` calls were previously
+  unresolved in the call graph because the parser didn't extract
+  constructor parameter types. Adds DI-aware resolution covering
+  constructor injection (`constructor(private svc: SvcType)`),
+  field-decorator injection (`@Inject` / `@InjectRepository` / etc.), and
+  Angular's functional `inject()` API. Resolution priority: exact type →
+  nominal (`implements`/`extends`) → unambiguous prefix (e.g.
+  `CallService` → `CallServiceV1`). All steps return `null` on ambiguity
+  to preserve the resolver's no-false-positive guarantee. Class-level
+  metadata is keyed by `relativePath:className` so multi-module monorepos
+  with same-named classes work. (#39)
+
+- **Express anonymous route handler callbacks are now extracted as units.**
+  `router.post('/orders', authenticateToken, async (req, res) => {...})` —
+  the anonymous handler callback was previously invisible to the analyzer
+  because the call-expression argument list wasn't walked. Synth units
+  now carry `route_handler` (last callback) or `route_middleware` (earlier
+  callbacks) with HTTP method/path metadata. Both unit types are now in
+  `ENTRY_POINT_TYPES` so the reachability filter doesn't drop them. The
+  receiver filter (`app` / `router` / `routes` / `server` / `web` / `api`
+  / `endpoints` / `controller`) prevents false positives on
+  `myCache.get(...)` style calls. Named middleware identifiers become
+  call-graph edges so `authenticateToken` shows up as an upstream
+  dependency of the handler. Closes #21. (#49)
+
+### Added
+
+- **Auto-reinstall when `pyproject.toml` changes.** The Go CLI now hashes
+  `libs/openant-core/pyproject.toml` (SHA-256) and stores the hash at
+  `~/.openant/venv/.deps-hash`. Every `EnsureRuntime` call compares the
+  stored hash against the current file and re-runs `pip install -e <core>`
+  automatically when they differ. Eliminates the "user did `git pull`,
+  dependencies changed, but venv is stale" silent failure mode that
+  previously required manual reinstall. Best-effort: hash read/write
+  failures degrade gracefully with stderr warnings rather than crashing
+  the CLI. (#36)
+
+- **`openant init` no longer requires a git repository for local paths.**
+  Init on a non-git directory (tarball download, generated code, locally
+  modified tree) now succeeds with `commit_sha` set to the `"nogit"`
+  placeholder. `--commit` on a non-git directory warns and is ignored
+  rather than hard-failing. Adds a shared `config/languages.json`
+  consumed by both the Go CLI and the Python parser adapter — single
+  source of truth for file-extension mappings and skip directories,
+  eliminating Go↔Python drift. Language auto-detection is exposed as
+  opt-in via `-l auto` (experimental dominance heuristic — see #61 for
+  the validation work needed before it becomes the default). (#40)
+
+- **`--llm-reachability` opt-in stage on `openant scan`.** A new optional
+  review pass that uses Opus (default) to surface reachability signals
+  the structural analysis misses — likely entry points (framework
+  handlers, plugin/CLI registrations, message queues), external content
+  ingestion sites (HTTP request bodies, file/network reads, env/argv,
+  IPC), and async/cross-process data flows. Promote-only semantics:
+  signals can mark units as entry points but never demote a unit the
+  structural pass kept. When enabled, parse runs with `processing_level
+  = "all"` so the LLM sees the full unfiltered codebase, then the
+  structural reachability filter re-runs with LLM-promoted entry points
+  added as additional BFS seeds. Output: `llm_reachability.json` plus
+  per-unit `llm_reachability_signals` field on `dataset.json`.
+  Cost-conscious: opt-in only, batched (default 25 units per Opus call),
+  scales with total repo size rather than the filtered unit count. Off
+  by default. (#50)
+
+- **All parsers now write `call_graph.json`.** Previously only the Python
+  and Zig parsers persisted this file; JS, Go, C, Ruby, and PHP did
+  reachability filtering internally and didn't expose the graph. Required
+  for the new `--llm-reachability` re-filter to work across all
+  languages. Defensive WARNING in `scanner.py` fires with a cost-impact
+  message if the file is ever missing for a language that should support
+  it. (#50)
+
 ## [2026-05-10] — Windows compatibility & CI hardening
 
 ### Fixed
