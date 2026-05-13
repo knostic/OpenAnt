@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +28,7 @@ After init, all commands (parse, scan, etc.) work without path arguments.
 Examples:
   openant init https://github.com/grafana/grafana -l go
   openant init https://github.com/grafana/grafana -l go --commit 591ceb2eec0
+  openant init https://github.com/grafana/grafana -l auto
   openant init ./repos/grafana -l go
   openant init ./repos/grafana -l go --name myorg/grafana`,
 	Args: cobra.ExactArgs(1),
@@ -44,7 +47,7 @@ var (
 )
 
 func init() {
-	initCmd.Flags().StringVarP(&initLanguage, "language", "l", "", "Language to analyze: python, javascript, go, c, ruby, php (required)")
+	initCmd.Flags().StringVarP(&initLanguage, "language", "l", "", "Language to analyze: python, javascript, go, c, ruby, php, zig, auto (auto = experimental dominance heuristic; see #61)")
 	initCmd.Flags().StringVar(&initCommit, "commit", "", "Specific commit SHA (default: HEAD)")
 	initCmd.Flags().StringVar(&initName, "name", "", "Override project name (default: derived from URL/path)")
 	initCmd.Flags().BoolVar(&initFull, "full", false, "Force full scan (rejects --incremental/--diff-base/--pr)")
@@ -118,7 +121,7 @@ func runInit(cmd *cobra.Command, args []string) {
 			}
 		}
 	} else {
-		// Local: verify it's a git repo and resolve absolute path
+		// Local: resolve absolute path
 		source = "local"
 
 		absPath, err := filepath.Abs(input)
@@ -127,29 +130,48 @@ func runInit(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 
-		if _, err := os.Stat(filepath.Join(absPath, ".git")); err != nil {
-			output.PrintError(fmt.Sprintf("%s is not a git repository (no .git directory)", absPath))
-			os.Exit(1)
-		}
-
 		repoPath = absPath
 	}
 
-	// Get commit SHA
-	commitSHA := initCommit
-	if commitSHA == "" {
-		out, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
+	// Auto-detect language if not specified
+	if initLanguage == "" || initLanguage == "auto" {
+		fmt.Fprintf(os.Stderr, "Auto-detecting language...\n")
+		detected, err := detectLanguage(repoPath)
 		if err != nil {
-			output.PrintError(fmt.Sprintf("Failed to get HEAD commit: %s", err))
+			output.PrintError(fmt.Sprintf("Language auto-detection failed: %s\nSpecify manually with -l/--language", err))
 			os.Exit(1)
 		}
-		commitSHA = strings.TrimSpace(string(out))
-	} else {
-		// Resolve short SHA to full SHA
-		out, err := exec.Command("git", "-C", repoPath, "rev-parse", commitSHA).Output()
-		if err == nil {
+		initLanguage = detected
+		fmt.Fprintf(os.Stderr, "Detected language: %s\n", initLanguage)
+	}
+
+	// Get commit SHA (best-effort — not all local paths are git repos)
+	isGit := false
+	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
+		isGit = true
+	}
+
+	commitSHA := initCommit
+	if isGit {
+		if commitSHA == "" {
+			out, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
+			if err != nil {
+				output.PrintError(fmt.Sprintf("Failed to get HEAD commit: %s", err))
+				os.Exit(1)
+			}
 			commitSHA = strings.TrimSpace(string(out))
+		} else {
+			// Resolve short SHA to full SHA
+			out, err := exec.Command("git", "-C", repoPath, "rev-parse", commitSHA).Output()
+			if err == nil {
+				commitSHA = strings.TrimSpace(string(out))
+			}
 		}
+	} else {
+		if commitSHA != "" {
+			output.PrintWarning("--commit ignored: not a git repository")
+		}
+		commitSHA = "nogit"
 	}
 
 	// Create project
@@ -223,4 +245,126 @@ func runInit(cmd *cobra.Command, args []string) {
 	fmt.Println()
 	output.PrintSuccess("Set as active project")
 	fmt.Println()
+}
+
+// languagesConfig is the structure of config/languages.json.
+type languagesConfig struct {
+	SkipDirs   []string          `json:"skip_dirs"`
+	Extensions map[string]string `json:"extensions"`
+}
+
+// findLanguagesConfig locates config/languages.json by walking up from the
+// executable path and then the current working directory.
+func findLanguagesConfig() (string, error) {
+	rel := filepath.Join("config", "languages.json")
+
+	// Strategy 1: walk up from the executable.
+	if exePath, err := os.Executable(); err == nil {
+		exePath, _ = filepath.EvalSymlinks(exePath)
+		dir := filepath.Dir(exePath)
+		for range 6 {
+			candidate := filepath.Join(dir, rel)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				return candidate, nil
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+
+	// Strategy 2: walk up from CWD.
+	if cwd, err := os.Getwd(); err == nil {
+		dir := cwd
+		for range 6 {
+			candidate := filepath.Join(dir, rel)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				return candidate, nil
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+
+	return "", fmt.Errorf("could not find config/languages.json from executable or working directory")
+}
+
+// loadLanguagesConfig loads the shared language detection config.
+func loadLanguagesConfig() (*languagesConfig, error) {
+	path, err := findLanguagesConfig()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s: %w", path, err)
+	}
+	var cfg languagesConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse %s: %w", path, err)
+	}
+	return &cfg, nil
+}
+
+// detectLanguage walks a repository and returns the dominant language by file count.
+// Extension mappings and skip directories are loaded from config/languages.json
+// (shared with libs/openant-core/core/parser_adapter.py::detect_language()).
+func detectLanguage(repoPath string) (string, error) {
+	cfg, err := loadLanguagesConfig()
+	if err != nil {
+		return "", fmt.Errorf("failed to load language config: %w", err)
+	}
+
+	skipDirs := make(map[string]bool, len(cfg.SkipDirs))
+	for _, d := range cfg.SkipDirs {
+		skipDirs[d] = true
+	}
+
+	counts := make(map[string]int)
+
+	err = filepath.WalkDir(repoPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip inaccessible paths
+		}
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		ext := strings.ToLower(filepath.Ext(d.Name()))
+		if lang, ok := cfg.Extensions[ext]; ok {
+			counts[lang]++
+		}
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to walk repository: %w", err)
+	}
+
+	// Find the dominant language
+	bestLang := ""
+	bestCount := 0
+	for lang, count := range counts {
+		if count > bestCount {
+			bestCount = count
+			bestLang = lang
+		}
+	}
+
+	if bestLang == "" {
+		return "", fmt.Errorf(
+			"no supported source files found in %s. "+
+				"Supported languages: Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Zig",
+			repoPath,
+		)
+	}
+
+	return bestLang, nil
 }

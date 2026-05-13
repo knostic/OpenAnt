@@ -8,4 +8,5 @@ apps/openant-cli/bin/
 libs/openant-core/parsers/go/go_parser/go_parser
 libs/openant-core/parsers/javascript/.openant-npm-install.lock
 _docs/
-
+docs/
+.worktrees/

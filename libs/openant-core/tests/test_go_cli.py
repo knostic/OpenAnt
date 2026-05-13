@@ -166,3 +166,205 @@ class TestApiKeyHandling:
         output = result.stderr + result.stdout
         assert result.returncode != 0
         assert "api key" in output.lower()
+
+
+class TestInit:
+    """Integration tests for ``openant init`` covering item 13 of #16:
+    auto-detect language and tolerate non-git directories.
+    """
+
+    @pytest.fixture
+    def isolated_home(self, tmp_path):
+        """Override home so init writes into a tmp ~/.openant/."""
+        home = str(tmp_path / "fakehome")
+        os.makedirs(home)
+        # USERPROFILE for Windows, HOME for Unix.
+        return {"USERPROFILE": home, "HOME": home}
+
+    def _read_project_json(self, home_dir, project_name):
+        project_json = (
+            Path(home_dir)
+            / ".openant"
+            / "projects"
+            / project_name
+            / "project.json"
+        )
+        assert project_json.exists(), (
+            f"project.json not found at {project_json}"
+        )
+        return json.loads(project_json.read_text())
+
+    @staticmethod
+    def _make_repo(tmp_path, name, files):
+        repo = tmp_path / name
+        repo.mkdir()
+        for rel, content in files.items():
+            target = repo / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        return repo
+
+    def test_auto_detect_python_from_fixture(
+        self, sample_python_repo, isolated_home
+    ):
+        """Init with -l auto on a Python fixture detects ``python``."""
+        result = run_cli(
+            "init", sample_python_repo,
+            "--name", "test/python-repo",
+            "-l", "auto",
+            env_override=isolated_home,
+        )
+        assert result.returncode == 0, f"init failed:\n{result.stderr}"
+        assert "Detected language: python" in result.stderr
+
+        project = self._read_project_json(
+            isolated_home["HOME"], "test/python-repo",
+        )
+        assert project["language"] == "python"
+
+    def test_auto_detect_javascript_from_fixture(
+        self, sample_js_repo, isolated_home
+    ):
+        """Init with -l auto on a JS fixture detects ``javascript``."""
+        result = run_cli(
+            "init", sample_js_repo,
+            "--name", "test/js-repo",
+            "-l", "auto",
+            env_override=isolated_home,
+        )
+        assert result.returncode == 0, f"init failed:\n{result.stderr}"
+        assert "Detected language: javascript" in result.stderr
+
+        project = self._read_project_json(
+            isolated_home["HOME"], "test/js-repo",
+        )
+        assert project["language"] == "javascript"
+
+    def test_auto_detect_typescript_synthetic(self, tmp_path, isolated_home):
+        """A TS-only tree (no .git) is detected as ``javascript``."""
+        repo = self._make_repo(
+            tmp_path, "ts_repo",
+            {
+                "src/app.ts": "export const x = 1;\n",
+                "src/comp.tsx": "export default () => null;\n",
+                "src/util.ts": "export const y = 2;\n",
+            },
+        )
+        result = run_cli(
+            "init", str(repo),
+            "--name", "test/ts-synth",
+            "-l", "auto",
+            env_override=isolated_home,
+        )
+        assert result.returncode == 0, f"init failed:\n{result.stderr}"
+        assert "Detected language: javascript" in result.stderr
+
+        project = self._read_project_json(
+            isolated_home["HOME"], "test/ts-synth",
+        )
+        assert project["language"] == "javascript"
+
+    def test_auto_detect_go_synthetic(self, tmp_path, isolated_home):
+        """A Go-only tree (no .git) is detected as ``go``."""
+        repo = self._make_repo(
+            tmp_path, "go_repo",
+            {
+                "main.go": "package main\nfunc main() {}\n",
+                "internal/svc.go": "package internal\n",
+                "cmd/cli.go": "package cmd\n",
+            },
+        )
+        result = run_cli(
+            "init", str(repo),
+            "--name", "test/go-synth",
+            "-l", "auto",
+            env_override=isolated_home,
+        )
+        assert result.returncode == 0, f"init failed:\n{result.stderr}"
+        assert "Detected language: go" in result.stderr
+
+        project = self._read_project_json(
+            isolated_home["HOME"], "test/go-synth",
+        )
+        assert project["language"] == "go"
+
+    def test_explicit_language_overrides_auto_detect(
+        self, sample_python_repo, isolated_home
+    ):
+        """An explicit ``-l`` flag wins over auto-detection."""
+        result = run_cli(
+            "init", sample_python_repo,
+            "--name", "test/explicit-lang",
+            "-l", "go",
+            env_override=isolated_home,
+        )
+        assert result.returncode == 0, f"init failed:\n{result.stderr}"
+        # Auto-detect path must not run when -l is supplied.
+        assert "Auto-detecting" not in result.stderr
+
+        project = self._read_project_json(
+            isolated_home["HOME"], "test/explicit-lang",
+        )
+        assert project["language"] == "go"
+
+    def test_non_git_directory_uses_nogit_sha(self, tmp_path, isolated_home):
+        """Init on a plain (non-.git) dir succeeds with ``nogit`` placeholder."""
+        repo = self._make_repo(
+            tmp_path, "plain_repo",
+            {"main.py": "print('hello')\n"},
+        )
+        # Sanity: not a git repo.
+        assert not (repo / ".git").exists()
+
+        result = run_cli(
+            "init", str(repo),
+            "--name", "test/no-git",
+            "-l", "auto",
+            env_override=isolated_home,
+        )
+        assert result.returncode == 0, f"init failed:\n{result.stderr}"
+
+        project = self._read_project_json(
+            isolated_home["HOME"], "test/no-git",
+        )
+        assert project["language"] == "python"
+        assert project["commit_sha"] == "nogit"
+        assert project["commit_sha_short"] == "nogit"
+
+    def test_non_git_directory_warns_on_commit_flag(
+        self, tmp_path, isolated_home
+    ):
+        """``--commit`` on a non-git directory warns and falls back to ``nogit``."""
+        repo = self._make_repo(
+            tmp_path, "plain_repo",
+            {"main.py": "print('hello')\n"},
+        )
+        result = run_cli(
+            "init", str(repo),
+            "--name", "test/no-git-commit",
+            "--commit", "abc123",
+            "-l", "auto",
+            env_override=isolated_home,
+        )
+        assert result.returncode == 0, f"init failed:\n{result.stderr}"
+        assert "ignored" in result.stderr.lower()
+
+        project = self._read_project_json(
+            isolated_home["HOME"], "test/no-git-commit",
+        )
+        assert project["commit_sha"] == "nogit"
+
+    def test_empty_dir_fails_with_clear_error(self, tmp_path, isolated_home):
+        """Init on a directory with no source files fails cleanly."""
+        empty = tmp_path / "empty_repo"
+        empty.mkdir()
+
+        result = run_cli(
+            "init", str(empty),
+            "--name", "test/empty",
+            "-l", "auto",
+            env_override=isolated_home,
+        )
+        assert result.returncode != 0
+        combined = (result.stderr + result.stdout).lower()
+        assert "no supported source files" in combined
