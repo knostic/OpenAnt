@@ -92,27 +92,27 @@ If none yield Python 3.11+, the command exits with an error pointing at [python.
 
 OpenAnt creates two directories:
 
-- **`~/.config/openant/`** — CLI configuration (`config.json`). Stores your API key, active project, and preferences. File permissions are restricted to `0600`.
-- **`~/.openant/`** — Project data. Each initialized project gets a workspace under `~/.openant/projects/<org>/<repo>/` containing `project.json` and a `scans/` directory with per-commit outputs.
+- **`~/.config/openant/`** - CLI configuration (`config.json`). Stores your API key, active project, and preferences. File permissions are restricted to `0600`.
+- **`~/.openant/`** - Project data. Each initialized project gets a workspace under `~/.openant/projects/<org>/<repo>/` containing `project.json` and a `scans/` directory with per-commit outputs.
 
 ## Analyzing a project
 
 ### 1. Initialize
 
-Point OpenAnt at a repository. The `-l` flag (language) is required — use `go` or `python`.
+Point OpenAnt at a repository. The `-l` flag (language) is required -- use `go` or `python`.
 
 ```bash
-# Remote — clones the repo
+# Remote -- clones the repo
 openant init <repo-url> -l go
 
-# Remote — pin to a specific commit
+# Remote -- pin to a specific commit
 openant init <repo-url> -l go --commit <sha>
 
-# Local — references the directory in-place
+# Local -- references the directory in-place
 openant init <path-to-repo> -l go --name <org/repo>
 ```
 
-This creates a project workspace and sets it as the active project. All subsequent commands operate on the active project automatically — no path arguments needed.
+This creates a project workspace and sets it as the active project. All subsequent commands operate on the active project automatically -- no path arguments needed.
 
 ### 2. Run the pipeline
 

@@ -317,9 +317,8 @@ def run_analysis(
     model_id = "claude-opus-4-6" if model == "opus" else "claude-sonnet-4-20250514"
     print(f"[Analyze] Model: {model_id}", file=sys.stderr)
 
-    # Initialize client (uses global token tracker by default)
+    # Initialize client
     client = AnthropicClient(model=model_id)
-    tracker = get_global_tracker()
 
     # Initialize JSON corrector
     json_corrector = JSONCorrector(client)
