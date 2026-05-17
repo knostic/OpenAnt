@@ -29,6 +29,7 @@ var (
 	parseDiffBase  string
 	parsePR        int
 	parseDiffScope string
+	parseFresh     bool
 )
 
 func init() {
@@ -38,14 +39,14 @@ func init() {
 	parseCmd.Flags().StringVar(&parseDiffBase, "diff-base", "", "Incremental mode: tag units overlapping diff vs this ref")
 	parseCmd.Flags().IntVar(&parsePR, "pr", 0, "Incremental mode against a GitHub PR number (mutex with --diff-base)")
 	parseCmd.Flags().StringVar(&parseDiffScope, "diff-scope", "changed_functions", "Diff scope: changed_files, changed_functions, callers")
+	parseCmd.Flags().BoolVar(&parseFresh, "fresh", false, "Delete existing dataset.json and reparse from scratch (other artifacts preserved)")
 }
 
-// buildParsePyArgs assembles the argv passed to the Python `openant parse`
-// subprocess. Defaults that match the Python CLI (language=auto,
-// level=reachable) are omitted so the Python side stays in charge of the
-// canonical default value.
-func buildParsePyArgs(repoPath, output, datasetName, language, level, manifestPath string) []string {
-	pyArgs := []string{"parse", repoPath, "--output", output}
+// buildParsePyArgs constructs the argv passed to the Python parse subcommand.
+// Extracted so tests can verify pass-through behavior without invoking the
+// full Python runtime.
+func buildParsePyArgs(repoPath, outputDir, datasetName, language, level, manifestPath string, fresh bool) []string {
+	pyArgs := []string{"parse", repoPath, "--output", outputDir}
 	if datasetName != "" {
 		pyArgs = append(pyArgs, "--name", datasetName)
 	}
@@ -57,6 +58,9 @@ func buildParsePyArgs(repoPath, output, datasetName, language, level, manifestPa
 	}
 	if manifestPath != "" {
 		pyArgs = append(pyArgs, "--diff-manifest", manifestPath)
+	}
+	if fresh {
+		pyArgs = append(pyArgs, "--fresh")
 	}
 	return pyArgs
 }
@@ -113,7 +117,7 @@ func runParse(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	pyArgs := buildParsePyArgs(repoPath, parseOutput, datasetName, parseLanguage, parseLevel, manifestPath)
+	pyArgs := buildParsePyArgs(repoPath, parseOutput, datasetName, parseLanguage, parseLevel, manifestPath, parseFresh)
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, resolvedAPIKey())
 	if err != nil {

@@ -79,6 +79,7 @@ def parse_repository(
     skip_tests: bool = True,
     name: str = None,
     diff_manifest: str | None = None,
+    fresh: bool = False,
 ) -> ParseResult:
     """Parse a repository into an OpenAnt dataset.
 
@@ -92,6 +93,9 @@ def parse_repository(
         processing_level: "all", "reachable", "codeql", or "exploitable".
         skip_tests: If True, exclude test files from parsing (default: True).
         name: Dataset name override (default: derived from repo path basename).
+        fresh: If True, delete existing dataset.json before parsing so all
+            units are regenerated from scratch. Only dataset.json is deleted;
+            other artifacts in output_dir (e.g. analyzer outputs) are preserved.
 
     Returns:
         ParseResult with paths to generated files and stats.
@@ -103,6 +107,18 @@ def parse_repository(
     repo_path = os.path.abspath(repo_path)
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+
+    if fresh:
+        dataset_path = os.path.join(output_dir, "dataset.json")
+        # Use try/except instead of exists()+remove() to avoid a TOCTOU race
+        # if a concurrent --fresh run removes the file between the two calls.
+        # Only dataset.json is deleted; other artifacts (analyzer outputs, etc.)
+        # in output_dir are preserved.
+        try:
+            os.remove(dataset_path)
+            print("[Parser] --fresh: deleted existing dataset.json", file=sys.stderr)
+        except FileNotFoundError:
+            pass
 
     # Detect language if auto
     if language == "auto":

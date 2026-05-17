@@ -128,6 +128,7 @@ def cmd_parse(args):
                 skip_tests=not args.no_skip_tests,
                 name=getattr(args, "name", None),
                 diff_manifest=getattr(args, "diff_manifest", None),
+                fresh=getattr(args, "fresh", False),
             )
 
             ctx.summary = {
@@ -1038,6 +1039,8 @@ def main():
     parse_p.add_argument("--no-skip-tests", action="store_true", help="Include test files in parsing (default: tests are skipped)")
     parse_p.add_argument("--name", help="Dataset name (default: derived from repo path)")
     parse_p.add_argument("--diff-manifest", help="Path to diff_manifest.json; tags units with diff_selected")
+    parse_p.add_argument("--fresh", action="store_true",
+                         help="Delete existing dataset.json and reparse from scratch (default: reuse existing units; other artifacts preserved)")
     parse_p.set_defaults(func=cmd_parse)
 
     # ---------------------------------------------------------------
