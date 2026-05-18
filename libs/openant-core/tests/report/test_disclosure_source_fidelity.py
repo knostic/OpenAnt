@@ -309,7 +309,11 @@ class _FakeResponse:
 @pytest.fixture
 def patched_anthropic(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
-    monkeypatch.setattr(generator.anthropic, "Anthropic", _FakeAnthropic)
+    monkeypatch.setattr(
+        generator,
+        "create_anthropic_client",
+        lambda **_kwargs: _FakeAnthropic(),
+    )
 
 
 def test_generate_disclosure_output_has_real_code(patched_anthropic, pipeline_output):
