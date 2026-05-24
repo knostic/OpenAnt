@@ -62,13 +62,75 @@ ln -sf "$(pwd)/apps/openant-cli/bin/openant" /usr/local/bin/openant
 
 _Note: run this from the repo root so `$(pwd)` resolves to the correct absolute path._
 
-Set your Anthropic API key (required for analyze, verify, and scan):
+### Setting up an LLM
+
+OpenAnt routes each pipeline phase through a configurable (provider, model) pair. The fastest path is the interactive wizard:
 
 ```bash
-openant set-api-key <your-key>
+openant setup llm
 ```
 
-**The key must have access to the Claude Opus 4.6 model.** Get a key at [console.anthropic.com](https://console.anthropic.com/settings/keys).
+You name the config (e.g. `my-llm`), pick a provider per pipeline phase (`anthropic`, `openai`, or `google`), enter an API key once per provider, and the wizard probes each unique provider+model pair with a 1-token request before writing `~/.config/openant/config.json`. Run a scan against it with `--llm-config`:
+
+```bash
+openant scan /path/to/repo --llm-config my-llm
+```
+
+Wizard defaults reflect the project's per-phase recommendations (stronger reasoning models for detection / verification / reachability review; lighter models for context, report, and test generation) — override any answer to taste.
+
+#### Shipped adapters
+
+| Provider type | API key from | Notes |
+|---|---|---|
+| `anthropic` | [console.anthropic.com](https://console.anthropic.com/settings/keys) | Reference adapter. NOT included in Claude Pro / Max subscriptions — separate billing. |
+| `openai` | [platform.openai.com](https://platform.openai.com/api-keys) | NOT included in ChatGPT / Codex subscriptions — separate billing. |
+| `google` | [aistudio.google.com](https://aistudio.google.com/apikey) | NOT included in Gemini Advanced — separate billing. |
+
+All three support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop.
+
+#### Quick path for Anthropic-only setups
+
+If you want today's per-phase Claude defaults and nothing else, skip the wizard:
+
+```bash
+openant set-api-key sk-ant-...
+openant scan /path/to/repo
+```
+
+This uses the built-in `openant-default` config (compiled into the binary, no `config.json` needed) — Claude Opus 4.6 for detection phases, Sonnet 4 for the rest.
+
+#### Hand-authored config
+
+The wizard writes `~/.config/openant/config.json` for you, but you can edit it directly too. Every llm-config must list all seven pipeline phases:
+
+```json
+{
+  "$schema_version": 2,
+  "default_llm": "my-llm",
+  "llm_providers": {
+    "anthropic": {"type": "anthropic", "api_key": "sk-ant-..."},
+    "openai":    {"type": "openai",    "api_key": "sk-proj-..."},
+    "google":    {"type": "google",    "api_key": "AIza..."}
+  },
+  "llm_configs": {
+    "my-llm": {
+      "app_context":  {"provider": "openai",    "model": "gpt-4o-mini"},
+      "llm_reach":    {"provider": "anthropic", "model": "claude-opus-4-6"},
+      "enhance":      {"provider": "openai",    "model": "gpt-4o-mini"},
+      "analyze":      {"provider": "anthropic", "model": "claude-opus-4-6"},
+      "verify":       {"provider": "anthropic", "model": "claude-opus-4-6"},
+      "dynamic_test": {"provider": "google",    "model": "gemini-2.0-flash"},
+      "report":       {"provider": "google",    "model": "gemini-2.0-flash"}
+    }
+  }
+}
+```
+
+Providers accept a custom `base_url` for OpenAI-compatible / Anthropic-compatible proxies (OpenRouter, vLLM, Bedrock, internal gateways). The `openant-default` config (Claude across all phases) is built in and always available regardless of file contents.
+
+#### Adding a new provider adapter
+
+OpenAnt's adapter layer is a four-file recipe — one Python file implementing the `LLMAdapter` Protocol, one factory for the contract-test harness, plus a registry entry and the wizard's provider list. The 11-test contract harness runs automatically against your adapter once it's wired in. See [`docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md`](docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md) for the full recipe.
 
 ### Python runtime
 
@@ -147,6 +209,18 @@ openant project list              # shows all projects, marks active
 openant project show              # details of active project
 openant project switch <org/repo> # switch active project
 ```
+
+## Roadmap
+
+Things on the list, in no particular order:
+
+- **More provider adapters.** Ollama (local models), vLLM, Cohere, Mistral, Groq, Amazon Bedrock, Azure OpenAI — each is a four-file PR per the contributor recipe. Lower the barrier to local / on-prem inference.
+- **Subscription-based auth.** ChatGPT / Codex, Claude Pro / Max, and Gemini Advanced subscriptions don't currently grant API quota — users have to maintain a separate API-tier key per provider. OAuth-based adapters that ride the consumer subscription would close that gap.
+- **Cross-provider tool-call quirks.** All three shipped adapters support tool calling, but the long tail (parallel tool calls, strict-mode schema enforcement, retry semantics on partial JSON) behaves differently per provider. Real-world scans surface these — PRs welcome.
+- **More languages.** The supported-languages list above is current coverage. Rust, Java, C#, and Swift come up frequently.
+- **Hosted scan service.** Knostic offers free scans for OSS projects today via the form linked above; a self-serve API for trusted partners is a future possibility.
+
+PRs welcome on any of these — open an issue first if the scope is non-trivial so we can align before you build.
 
 ## LICENSE
 

@@ -1,6 +1,120 @@
+
 # Changelog
 
 All notable changes to OpenAnt are documented in this file.
+
+## [2026-05-24] — Pluggable LLM providers (per-phase llm-configs)
+
+### Added
+
+- **LLM adapter plugin layer.** OpenAnt's pipeline used to hardcode
+  `anthropic.Anthropic` calls in 15+ files. All LLM IO now flows
+  through `libs/openant-core/utilities/llm/`, a Protocol-based
+  adapter layer with one provider plugin per file in
+  `utilities/llm/providers/`. Three adapters ship today —
+  **Anthropic** (reference), **OpenAI** (Chat Completions), and
+  **Google Gemini** (`google-genai` SDK) — all supporting tool
+  calling. Adding more (Ollama, vLLM, OpenRouter-native, etc.) is
+  a four-file recipe; see
+  `docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md`. The
+  surface is deliberately minimal — one `complete()` method, one
+  `validate()` method, a closed set of three content-block kinds,
+  a five-class error taxonomy. Closes #65.
+
+- **Per-phase llm-configs.** `~/.config/openant/config.json` now
+  accepts an `llm_configs` section that maps each of the seven
+  pipeline phases (`analyze`, `enhance`, `verify`, `report`,
+  `dynamic_test`, `llm_reach`, `app_context`) to a
+  `{provider, model}` pair. Users pick an llm-config via
+  `openant scan --llm-config <name>`. The built-in `openant-default`
+  config (source-defined, frozen) pins today's per-phase Claude
+  defaults, so existing users see no behavior change: a fresh
+  install with no `llm_configs` resolves to `openant-default` and
+  runs against Anthropic with the same model IDs as before.
+
+- **`openant setup llm` interactive wizard.** Walks the user
+  through creating a named llm-config without hand-editing JSON.
+  Per-phase per-provider model defaults (e.g. `gpt-4o` for
+  analyze, `gpt-4o-mini` for app_context, `gemini-1.5-pro` for
+  verify), known-models hint shown once per provider per session,
+  overwrite confirmation, and a 1-token probe per unique
+  (provider, model) pair before save so a typo'd key surfaces
+  immediately. Includes a heads-up that ChatGPT / Codex
+  subscriptions don't grant OpenAI API quota.
+
+- **Eager provider validation.** When a scan starts, the registry
+  instantiates one adapter per unique provider in the resolved
+  llm-config and exposes a `validate()` method that probes each
+  unique `(provider, model)` pair with a 1-token call. Catches
+  typo'd model IDs, revoked keys, and broken endpoints before the
+  user starts a paid scan. Standalone step verbs (`openant analyze`,
+  `verify`, etc.) probe their own registry at startup too.
+
+- **Tool-support gating at config-validation time.** Phases that
+  use tool calling (`enhance`, `verify`) refuse to bind to a
+  provider whose adapter sets `supports_tools = False`. Error
+  message names the phase, the offending provider, and what to do
+  about it — fails at registry-build time, never at first call.
+
+- **Contract test harness.** An 11-test parametrised suite runs
+  against every shipped adapter (33 tests across Anthropic, OpenAI,
+  Google) pinning each one's behaviour for text completion,
+  tool-use round trips, and error mapping. Adding an adapter means
+  adding one scenario factory file and one row in
+  `tests/test_llm_adapter_contract.py::ADAPTERS`.
+
+### Changed
+
+- **`--model opus|sonnet` removed.** Both Go and Python CLIs replace
+  it with `--llm-config <name>` across `scan`, `analyze`, `enhance`,
+  `verify`, `dynamic-test`, and `report`. Backwards compatibility:
+  `~/.config/openant/config.json` files that only have the legacy
+  top-level `api_key` field auto-migrate in memory to a synthetic
+  `llm_providers["anthropic"]` entry, so `openant scan` keeps
+  working unchanged for upgrade users.
+
+- **JSON-correction calls now inherit the parent phase's binding.**
+  The legacy code hardcoded Sonnet for JSON correction regardless
+  of the analyze phase's model. With per-phase configs this stops
+  generalising — correction calls now use the same provider+model
+  as the call whose response failed to parse. For all-Anthropic
+  users this is a small cost bump on Opus-phase corrections; for
+  non-Anthropic users it's the only correct behavior.
+
+- **Unknown-model cost reporting is honest.** The pricing table
+  used to fall back to Sonnet rates for any unknown model ID,
+  which produced plausible-but-wrong totals on OpenRouter runs.
+  Unknown IDs now report `$0` with a one-time stderr warning.
+  Each adapter ships its own per-model pricing table; add entries
+  locally if you scan against a newer model the adapter doesn't
+  list yet.
+
+### Fixed
+
+- **Reporter no longer crashes on non-string response fields.**
+  Some non-Anthropic models return structured dicts where the
+  analyze prompt asked for plain strings (e.g. `attack_vector` as
+  a JSON object instead of a quoted attack description). The
+  reporter's `"\n\n".join(parts)` then raised
+  `TypeError: sequence item 0: expected str instance, dict found`
+  mid-scan. `core/reporter.py:_coerce_to_str` now defensively
+  serialises non-string values at every consumption site; the
+  analyze prompt has been tightened to require string types
+  explicitly.
+
+### Removed
+
+- **`AnthropicClient` class deleted** from
+  `libs/openant-core/utilities/llm_client.py`. The file remains
+  for `TokenTracker` (still shared across all adapter call sites)
+  but the LLM-wrapper class is gone — every caller now uses
+  `simple_text(binding, prompt, ...)` (for text-only phases) or
+  `binding.adapter.complete(...)` (for tool-using phases) from
+  `utilities.llm`.
+
+- **`OPENANT_LLM_BASE_URL` / `OPENANT_LLM_API_KEY` /
+  `OPENANT_LLM_MODEL` env vars are gone** (they were never in a
+  release). Provider configuration lives in `config.json` only.
 
 ## [2026-05-12] — Parser depth, dependency UX, and LLM reachability (opt-in)
 
