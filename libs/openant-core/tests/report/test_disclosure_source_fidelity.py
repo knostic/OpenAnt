@@ -280,39 +280,45 @@ def test_splice_preserves_other_sections():
 # the real code, even when the LLM returns fabricated code.
 # ---------------------------------------------------------------------------
 
-class _FakeAnthropic:
-    """Replacement for anthropic.Anthropic — returns fabricated code to prove
+class _FakeAdapter:
+    """Replacement for the report adapter — returns fabricated code to prove
     the post-processor catches it."""
 
-    def __init__(self, *args, **kwargs):
-        self.messages = self
+    name = "anthropic"
+    supports_tools = True
+    last_prompt: str = ""
 
-    def create(self, **kwargs):
-        _FakeAnthropic.last_prompt = kwargs["messages"][0]["content"]
-        # Return a disclosure WITH fabricated code — the post-processor must fix it.
-        return _FakeResponse()
+    def complete(self, *, model, system, messages, max_tokens, tools=None):
+        from utilities.llm import CompletionResult, TextBlock
 
+        _FakeAdapter.last_prompt = messages[0].content[0].text
+        return CompletionResult(
+            content=[TextBlock(LLM_OUTPUT_WITH_FABRICATED_CODE)],
+            input_tokens=10,
+            output_tokens=50,
+            stop_reason="end_turn",
+        )
 
-class _FakeResponse:
-    class _Content:
-        text = LLM_OUTPUT_WITH_FABRICATED_CODE
-
-    content = [_Content()]
-
-    class _Usage:
-        input_tokens = 10
-        output_tokens = 50
-
-    usage = _Usage()
+    def validate(self, model):
+        pass
 
 
 @pytest.fixture
-def patched_anthropic(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
-    monkeypatch.setattr(generator.anthropic, "Anthropic", _FakeAnthropic)
+def fake_report_binding():
+    # Issue #65: generator takes an explicit PhaseBinding now; tests
+    # build one over a scripted fake adapter rather than monkeypatching
+    # provider internals.
+    from utilities.llm import PhaseBinding
+
+    return PhaseBinding(
+        phase="report",
+        adapter=_FakeAdapter(),
+        model="claude-test",
+        provider_name="anthropic",
+    )
 
 
-def test_generate_disclosure_output_has_real_code(patched_anthropic, pipeline_output):
+def test_generate_disclosure_output_has_real_code(fake_report_binding, pipeline_output):
     """Even when the LLM returns fabricated code, the final output from
     generate_disclosure() must contain the real source."""
     ping = next(
@@ -320,7 +326,9 @@ def test_generate_disclosure_output_has_real_code(patched_anthropic, pipeline_ou
         if f["location"]["function"].endswith(":ping")
     )
 
-    text, _usage = generator.generate_disclosure(ping, product_name="fixture")
+    text, _usage = generator.generate_disclosure(
+        ping, product_name="fixture", binding=fake_report_binding,
+    )
 
     # Real code in the output
     assert "subprocess.check_output" in text, "real code must be in final output"
@@ -332,16 +340,19 @@ def test_generate_disclosure_output_has_real_code(patched_anthropic, pipeline_ou
     assert "def ping(ip)" not in text
 
 
-def test_generate_disclosure_prompt_has_no_source_code(patched_anthropic, pipeline_output):
-    """The prompt sent to Claude must NOT contain the vulnerable source code —
-    the LLM should never see it, so it can't fabricate a rewritten version."""
+def test_generate_disclosure_prompt_has_no_source_code(fake_report_binding, pipeline_output):
+    """The prompt sent to the report model must NOT contain the vulnerable
+    source code — the LLM should never see it, so it can't fabricate a
+    rewritten version."""
     ping = next(
         f for f in pipeline_output["findings"]
         if f["location"]["function"].endswith(":ping")
     )
 
-    generator.generate_disclosure(ping, product_name="fixture")
-    prompt = _FakeAnthropic.last_prompt
+    generator.generate_disclosure(
+        ping, product_name="fixture", binding=fake_report_binding,
+    )
+    prompt = _FakeAdapter.last_prompt
 
     # The actual source code must not appear in the prompt.
     assert "subprocess.check_output" not in prompt, (

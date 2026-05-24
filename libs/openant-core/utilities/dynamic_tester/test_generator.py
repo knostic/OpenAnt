@@ -14,9 +14,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from utilities.llm_client import AnthropicClient, TokenTracker
-
-SONNET_MODEL = "claude-sonnet-4-20250514"
+from utilities.llm_client import TokenTracker
+from utilities.llm import PhaseBinding, simple_text
 
 # Map language strings to Dockerfile template names
 LANGUAGE_MAP = {
@@ -210,6 +209,7 @@ def _parse_generation_response(raw: str) -> dict:
 def generate_test(
     finding: dict,
     repo_info: dict,
+    binding: PhaseBinding,
     tracker: TokenTracker = None,
 ) -> dict | None:
     """Generate a dynamic test for a single finding.
@@ -217,6 +217,7 @@ def generate_test(
     Args:
         finding: Finding dict from pipeline_output.json
         repo_info: Repository info (name, language, application_type)
+        binding: Phase binding for the dynamic_test phase.
         tracker: Optional TokenTracker for cost tracking
 
     Returns:
@@ -225,10 +226,11 @@ def generate_test(
         None if generation fails.
     """
     tracker = tracker or TokenTracker()
-    client = AnthropicClient(model=SONNET_MODEL, tracker=tracker)
 
     prompt = _build_finding_prompt(finding, repo_info)
-    raw = client.analyze_sync(prompt, max_tokens=8192, system=SYSTEM_PROMPT)
+    raw = simple_text(
+        binding, prompt, max_tokens=8192, system=SYSTEM_PROMPT, tracker=tracker,
+    )
 
     parsed = _parse_generation_response(raw)
     if not parsed:
@@ -247,6 +249,7 @@ def regenerate_test(
     repo_info: dict,
     previous_generation: dict,
     error_message: str,
+    binding: PhaseBinding,
     tracker: TokenTracker = None,
 ) -> dict | None:
     """Regenerate a test after a build/run failure, feeding the error back to the LLM.
@@ -256,13 +259,13 @@ def regenerate_test(
         repo_info: Repository info
         previous_generation: The generation that failed
         error_message: The Docker build/run error message
+        binding: Phase binding for the dynamic_test phase.
         tracker: Optional TokenTracker
 
     Returns:
         New generation dict, or None if regeneration fails.
     """
     tracker = tracker or TokenTracker()
-    client = AnthropicClient(model=SONNET_MODEL, tracker=tracker)
 
     original_prompt = _build_finding_prompt(finding, repo_info)
 
@@ -285,7 +288,9 @@ def regenerate_test(
         f"- Application-level errors: check the error details and fix the test logic"
     )
 
-    raw = client.analyze_sync(retry_prompt, max_tokens=8192, system=SYSTEM_PROMPT)
+    raw = simple_text(
+        binding, retry_prompt, max_tokens=8192, system=SYSTEM_PROMPT, tracker=tracker,
+    )
 
     parsed = _parse_generation_response(raw)
     if not parsed:

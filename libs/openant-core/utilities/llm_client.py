@@ -1,38 +1,52 @@
 """
-Anthropic LLM Client
+Token tracker.
 
-Wrapper for Claude API calls with built-in token tracking and cost calculation.
+This module used to host the ``AnthropicClient`` wrapper plus its pricing
+table. Issue #65 moved actual LLM IO to the pluggable
+:mod:`utilities.llm` package (one adapter per provider, behind a
+unified Protocol). What's left here is the cross-thread
+:class:`TokenTracker` that adapters call ``record_call`` on — kept in
+its own module because the pipeline records prior usage on resume and
+several layers depend on the singleton accessor.
 
 Classes:
-    TokenTracker: Tracks token usage and costs across multiple LLM calls
-    AnthropicClient: Synchronous Claude API client with automatic token tracking
+    TokenTracker: Tracks token usage and costs across LLM calls
 
 Usage:
-    from utilities.llm_client import AnthropicClient, get_global_tracker
-
-    client = AnthropicClient(model="claude-opus-4-20250514")
-    response = client.analyze_sync("Analyze this code...")
+    from utilities.llm_client import TokenTracker, get_global_tracker
 
     tracker = get_global_tracker()
     print(f"Total cost: ${tracker.total_cost_usd:.4f}")
 """
 
-import os
+import sys
 import threading
-from typing import Optional
-import anthropic
-from dotenv import load_dotenv
-
-from .rate_limiter import get_rate_limiter
 
 
-# Pricing per million tokens (as of December 2024)
+# Pricing per million tokens. Unknown models report $0 with a
+# one-time warning rather than silently estimating against Sonnet
+# rates — see issue #65.
 MODEL_PRICING = {
     "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
+    "claude-opus-4-6": {"input": 15.00, "output": 75.00},
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-    # Fallback for unknown models (use Sonnet pricing as conservative estimate)
-    "default": {"input": 3.00, "output": 15.00}
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
 }
+
+_unknown_pricing_warned: set[str] = set()
+_unknown_pricing_lock = threading.Lock()
+
+
+def _warn_unknown_pricing(model: str) -> None:
+    """Emit a one-time stderr warning the first time we cost an unknown model."""
+    with _unknown_pricing_lock:
+        if model in _unknown_pricing_warned:
+            return
+        _unknown_pricing_warned.add(model)
+    sys.stderr.write(
+        f"warning: no pricing for model {model!r}; cost will be reported as $0. "
+        f"Add it to MODEL_PRICING in utilities/llm_client.py for accurate totals.\n"
+    )
 
 
 class TokenTracker:
@@ -58,25 +72,43 @@ class TokenTracker:
         """Total tokens (input + output)."""
         return self.total_input_tokens + self.total_output_tokens
 
-    def record_call(self, model: str, input_tokens: int, output_tokens: int) -> dict:
+    def record_call(
+        self,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        pricing: dict[str, float] | None = None,
+    ) -> dict:
         """
         Record a single LLM call.
 
         Args:
-            model: Model identifier
-            input_tokens: Number of input tokens
-            output_tokens: Number of output tokens
+            model: Model identifier.
+            input_tokens: Number of input tokens.
+            output_tokens: Number of output tokens.
+            pricing: Optional ``{"input": $/Mtok, "output": $/Mtok}``
+                from the adapter that made the call. When provided,
+                this is authoritative — adapters own their rates per
+                issue #65. When omitted, we fall back to the legacy
+                global ``MODEL_PRICING`` so call sites that haven't
+                been threaded through yet still produce a number
+                (with a one-time stderr warning on miss). New code
+                should always pass ``pricing`` via
+                ``binding.adapter.pricing.get(binding.model)``.
 
         Returns:
-            Dict with call details including cost
+            Dict with call details including cost.
         """
-        # Get pricing for model
-        pricing = MODEL_PRICING.get(model, MODEL_PRICING["default"])
-
-        # Calculate cost (pricing is per million tokens)
-        input_cost = (input_tokens / 1_000_000) * pricing["input"]
-        output_cost = (output_tokens / 1_000_000) * pricing["output"]
-        total_cost = input_cost + output_cost
+        if pricing is None:
+            pricing = MODEL_PRICING.get(model)
+        if pricing is None:
+            _warn_unknown_pricing(model)
+            total_cost = 0.0
+        else:
+            input_cost = (input_tokens / 1_000_000) * pricing["input"]
+            output_cost = (output_tokens / 1_000_000) * pricing["output"]
+            total_cost = input_cost + output_cost
 
         call_record = {
             "model": model,
@@ -181,156 +213,7 @@ def reset_global_tracker():
     _global_tracker.reset()
 
 
-class AnthropicClient:
-    """
-    Client for Anthropic Claude API.
-
-    Uses Claude Opus 4 for vulnerability analysis.
-    Tracks token usage and costs for all calls.
-    """
-
-    def __init__(self, model: str = "claude-opus-4-20250514", tracker: TokenTracker = None):
-        """
-        Initialize the Anthropic client.
-
-        Args:
-            model: Model identifier. Default is Claude Opus 4 (highest capability).
-                   Use "claude-sonnet-4-20250514" for cost-effective option.
-            tracker: Optional TokenTracker instance. Uses global tracker if not provided.
-        """
-        load_dotenv()
-
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY not found in environment")
-
-        self.client = anthropic.Anthropic(api_key=api_key, max_retries=5)
-        self.model = model
-        self.tracker = tracker or _global_tracker
-        self.last_call = None  # Store last call details
-
-    async def analyze(self, prompt: str, max_tokens: int = 8192) -> str:
-        """
-        Send a prompt to Claude and get a response.
-
-        Args:
-            prompt: The prompt to send
-            max_tokens: Maximum tokens in response
-
-        Returns:
-            Response text from Claude
-        """
-        # Wait if we're in a global backoff period
-        rate_limiter = get_rate_limiter()
-        rate_limiter.wait_if_needed()
-
-        try:
-            message = self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-        except anthropic.RateLimitError as exc:
-            # Report to global rate limiter so all workers back off
-            retry_after = float(exc.response.headers.get("retry-after", 0))
-            get_rate_limiter().report_rate_limit(retry_after)
-            raise
-
-        # Track token usage
-        self.last_call = self.tracker.record_call(
-            model=self.model,
-            input_tokens=message.usage.input_tokens,
-            output_tokens=message.usage.output_tokens
-        )
-
-        return message.content[0].text
-
-    def analyze_sync(self, prompt: str, max_tokens: int = 8192, model: str = None, system: str = None) -> str:
-        """
-        Synchronous version of analyze.
-
-        Args:
-            prompt: The prompt to send
-            max_tokens: Maximum tokens in response
-            model: Optional model override (uses instance model if not specified)
-            system: Optional system prompt for context/instructions
-
-        Returns:
-            Response text from Claude
-        """
-        used_model = model or self.model
-
-        kwargs = {
-            "model": used_model,
-            "max_tokens": max_tokens,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        }
-        if system:
-            kwargs["system"] = system
-
-        # Wait if we're in a global backoff period
-        rate_limiter = get_rate_limiter()
-        rate_limiter.wait_if_needed()
-
-        try:
-            message = self.client.messages.create(**kwargs)
-        except anthropic.RateLimitError as exc:
-            # Report to global rate limiter so all workers back off
-            retry_after = float(exc.response.headers.get("retry-after", 0))
-            get_rate_limiter().report_rate_limit(retry_after)
-            raise
-
-        # Track token usage
-        self.last_call = self.tracker.record_call(
-            model=used_model,
-            input_tokens=message.usage.input_tokens,
-            output_tokens=message.usage.output_tokens
-        )
-
-        return message.content[0].text
-
-    def get_last_call(self) -> Optional[dict]:
-        """
-        Get details of the last API call.
-
-        Returns:
-            Dict with model, input_tokens, output_tokens, cost_usd
-        """
-        return self.last_call
-
-    def get_session_totals(self) -> dict:
-        """
-        Get cumulative totals for this session.
-
-        Returns:
-            Dict with total_calls, total_input_tokens, total_output_tokens, total_cost_usd
-        """
-        return self.tracker.get_totals()
-
-    def get_session_summary(self) -> dict:
-        """
-        Get full summary including per-call breakdown.
-
-        Returns:
-            Dict with totals and calls list
-        """
-        return self.tracker.get_summary()
-
-    def get_usage(self, message) -> dict:
-        """
-        Extract token usage from a message response.
-
-        Args:
-            message: Response from messages.create()
-
-        Returns:
-            Dict with input_tokens, output_tokens
-        """
-        return {
-            "input_tokens": message.usage.input_tokens,
-            "output_tokens": message.usage.output_tokens
-        }
+# NOTE: the ``AnthropicClient`` class that used to live here was deleted
+# as part of issue #65. Every call site now goes through
+# :mod:`utilities.llm` (Protocol-based adapter layer). See
+# ``docs/features/llm-providers/plan.wip.md`` for the migration map.

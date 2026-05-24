@@ -1,0 +1,363 @@
+"""OpenAI adapter — implements :class:`LLMAdapter` against the OpenAI SDK.
+
+Ships alongside the Anthropic reference adapter so the pipeline supports
+``provider type = "openai"`` out of the box. Supports tool calling for
+the agentic ``enhance`` and ``verify`` phases.
+
+Translation details (read ``HOW_TO_ADD_AN_ADAPTER.md`` §3 first):
+
+* **Tool-result aggregation.** The pipeline emits ONE user ``Message``
+  carrying N ``ToolResultBlock``s in response to an assistant turn
+  with N ``ToolUseBlock``s. OpenAI's Chat Completions API requires
+  one ``{role: "tool", tool_call_id: ...}`` message per result.
+  ``_messages_to_openai`` splits the single user message into N
+  native ``tool`` messages — preserving the order so the API can
+  match each result to its originating ``tool_call_id``.
+
+* **Assistant tool calls.** ``ToolUseBlock``s become entries in the
+  assistant message's ``tool_calls`` array. ``arguments`` is a JSON
+  string (per the OpenAI shape), not a dict — we ``json.dumps`` the
+  pipeline's ``input`` dict at the boundary.
+
+* **Finish reason.** OpenAI's ``stop`` / ``tool_calls`` / ``length``
+  map 1:1 to our ``end_turn`` / ``tool_use`` / ``max_tokens`` union.
+  ``content_filter`` and other future values normalise to
+  ``end_turn`` with a one-time stderr warning so a refusal doesn't
+  silently look like a clean completion (relevant for a security
+  tool where refusals can mask false negatives).
+
+* **Errors.** ``openai`` SDK exceptions map to our 5-class taxonomy:
+  ``AuthenticationError`` / ``PermissionDeniedError`` →
+  :class:`LLMAuthError`, ``RateLimitError`` →
+  :class:`LLMRateLimitError`, ``APIConnectionError`` (including
+  timeout subclass) → :class:`LLMConnectionError`,
+  ``NotFoundError`` → :class:`LLMNotFoundError`, everything else
+  (``BadRequestError``, ``APIStatusError``) →
+  :class:`LLMResponseError`.
+
+OpenAI's protocol does not include a 529-equivalent "overloaded"
+status; their backpressure is communicated via 429 + retry-after.
+The adapter does NOT integrate with the global ``RateLimiter`` like
+the Anthropic adapter does because OpenAI's SDK already implements
+client-side retry with backoff (``max_retries``). Multi-worker
+coordination is therefore best-effort via the SDK's retry — the
+pipeline-level rate limiter remains specific to the Anthropic adapter
+where it was previously load-bearing.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import threading
+from typing import Any, Optional
+
+import openai
+
+from ..adapter import (
+    CompletionResult,
+    ContentBlock,
+    LLMAuthError,
+    LLMConnectionError,
+    LLMNotFoundError,
+    LLMRateLimitError,
+    LLMResponseError,
+    Message,
+    StopReason,
+    TextBlock,
+    ToolDef,
+    ToolResultBlock,
+    ToolUseBlock,
+)
+
+
+_OPENAI_FINISH_REASONS: dict[str, StopReason] = {
+    "stop": "end_turn",
+    "tool_calls": "tool_use",
+    "length": "max_tokens",
+}
+
+# Track finish_reasons we've already warned about. Per-process, lock-guarded.
+_warned_finish_reasons: set[str] = set()
+_warned_finish_reasons_lock = threading.Lock()
+
+
+class OpenAIAdapter:
+    """:class:`LLMAdapter` implementation backed by ``openai.OpenAI``."""
+
+    name = "openai"
+    supports_tools = True
+
+    # Per-million-token rates. Models absent here report $0 with a
+    # one-time stderr warning per issue #65 §9. Add to this dict in
+    # your local fork if you scan against a model OpenAI added after
+    # this file's last update.
+    pricing: dict[str, dict[str, float]] = {
+        "gpt-4o": {"input": 2.50, "output": 10.00},
+        "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+        "o1": {"input": 15.00, "output": 60.00},
+        "o1-mini": {"input": 3.00, "output": 12.00},
+        "o1-preview": {"input": 15.00, "output": 60.00},
+        "o3-mini": {"input": 1.10, "output": 4.40},
+    }
+
+    def __init__(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        max_retries: int = 5,
+        _client: Optional[openai.OpenAI] = None,
+    ):
+        """Construct the adapter.
+
+        Args:
+            api_key: OpenAI API key. When ``None``, the SDK reads
+                ``OPENAI_API_KEY`` from the environment.
+            base_url: Override the API host. ``None`` means the SDK's
+                default (api.openai.com). Set this for
+                OpenAI-compatible proxies (LiteLLM, vLLM, etc.).
+            max_retries: Forwarded to the SDK. The SDK retries
+                transient 429s and 5xx automatically; the pipeline
+                does not add its own retry loop on top.
+            _client: Injected SDK instance for testing.
+        """
+        if _client is not None:
+            self._client = _client
+            return
+
+        kwargs: dict[str, Any] = {"max_retries": max_retries}
+        if api_key is not None:
+            kwargs["api_key"] = api_key
+        if base_url is not None:
+            kwargs["base_url"] = base_url
+        self._client = openai.OpenAI(**kwargs)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def complete(
+        self,
+        *,
+        model: str,
+        system: Optional[str],
+        messages: list[Message],
+        max_tokens: int,
+        tools: Optional[list[ToolDef]] = None,
+    ) -> CompletionResult:
+        request: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": _messages_to_openai(messages, system),
+        }
+        if tools:
+            request["tools"] = [_tool_to_openai(t) for t in tools]
+
+        try:
+            response = self._client.chat.completions.create(**request)
+        except openai.AuthenticationError as exc:
+            raise LLMAuthError(str(exc)) from exc
+        except openai.PermissionDeniedError as exc:
+            raise LLMAuthError(str(exc)) from exc
+        except openai.RateLimitError as exc:
+            retry_after = _retry_after_from(exc)
+            raise LLMRateLimitError(str(exc), retry_after=retry_after) from exc
+        except openai.NotFoundError as exc:
+            raise LLMNotFoundError(str(exc)) from exc
+        except openai.APIConnectionError as exc:
+            # Covers DNS, TCP, TLS, and SDK-mapped timeouts (the SDK's
+            # APITimeoutError inherits from APIConnectionError).
+            raise LLMConnectionError(str(exc)) from exc
+        except openai.BadRequestError as exc:
+            raise LLMResponseError(str(exc)) from exc
+        except openai.APIStatusError as exc:
+            # Everything else (5xx, unexpected statuses).
+            raise LLMResponseError(str(exc)) from exc
+
+        return _response_to_unified(response)
+
+    def validate(self, model: str) -> None:
+        try:
+            self._client.chat.completions.create(
+                model=model,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        except openai.AuthenticationError as exc:
+            raise LLMAuthError(str(exc)) from exc
+        except openai.PermissionDeniedError as exc:
+            raise LLMAuthError(str(exc)) from exc
+        except openai.RateLimitError as exc:
+            retry_after = _retry_after_from(exc)
+            raise LLMRateLimitError(str(exc), retry_after=retry_after) from exc
+        except openai.NotFoundError as exc:
+            raise LLMNotFoundError(str(exc)) from exc
+        except openai.APIConnectionError as exc:
+            raise LLMConnectionError(str(exc)) from exc
+        except openai.BadRequestError as exc:
+            raise LLMResponseError(str(exc)) from exc
+        except openai.APIStatusError as exc:
+            raise LLMResponseError(str(exc)) from exc
+
+
+# ----------------------------------------------------------------------
+# Translation helpers
+# ----------------------------------------------------------------------
+
+
+def _messages_to_openai(
+    messages: list[Message], system: Optional[str]
+) -> list[dict[str, Any]]:
+    """Translate unified messages to OpenAI Chat Completions shape.
+
+    System prompts are sent as a leading ``{role: "system"}`` message
+    rather than a separate parameter. Tool results in a user turn
+    become N standalone ``{role: "tool"}`` messages, each with its
+    own ``tool_call_id``. Plain text in a user turn becomes a
+    trailing ``{role: "user"}`` message — so a mixed user turn
+    (rare but allowed by the contract) emits tools-then-text in that
+    order, matching how OpenAI expects tool responses to immediately
+    follow the assistant call that triggered them.
+    """
+    out: list[dict[str, Any]] = []
+    if system:
+        out.append({"role": "system", "content": system})
+
+    for message in messages:
+        text_blocks = [b for b in message.content if isinstance(b, TextBlock)]
+        tool_use_blocks = [b for b in message.content if isinstance(b, ToolUseBlock)]
+        tool_result_blocks = [b for b in message.content if isinstance(b, ToolResultBlock)]
+
+        if message.role == "user":
+            # Tool results MUST come first — they reference a prior
+            # assistant message's tool_calls.
+            for tr in tool_result_blocks:
+                out.append({
+                    "role": "tool",
+                    "tool_call_id": tr.tool_use_id,
+                    "content": tr.content,
+                })
+            # Plain user text (typically a follow-up question, or the
+            # initial prompt when no tool_results are present).
+            if text_blocks:
+                out.append({
+                    "role": "user",
+                    "content": "\n".join(b.text for b in text_blocks),
+                })
+        elif message.role == "assistant":
+            msg: dict[str, Any] = {"role": "assistant"}
+            # When an assistant message has tool_calls, OpenAI accepts
+            # content=null. When there's text alongside, send both.
+            if text_blocks:
+                msg["content"] = "\n".join(b.text for b in text_blocks)
+            else:
+                msg["content"] = None
+            if tool_use_blocks:
+                msg["tool_calls"] = [
+                    {
+                        "id": tu.id,
+                        "type": "function",
+                        "function": {
+                            "name": tu.name,
+                            "arguments": json.dumps(tu.input or {}),
+                        },
+                    }
+                    for tu in tool_use_blocks
+                ]
+            out.append(msg)
+        else:  # pragma: no cover — Role is a closed Literal
+            raise LLMResponseError(
+                f"OpenAIAdapter: unknown message role {message.role!r}"
+            )
+    return out
+
+
+def _tool_to_openai(tool: ToolDef) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.input_schema,
+        },
+    }
+
+
+def _response_to_unified(response: Any) -> CompletionResult:
+    """Translate an OpenAI ChatCompletion response into our types."""
+    choice = response.choices[0]
+    message = choice.message
+
+    content_blocks: list[ContentBlock] = []
+
+    # Text content. May be None or empty when the message is purely
+    # tool_calls; only emit a TextBlock when there's actual text.
+    text = getattr(message, "content", None)
+    if text:
+        content_blocks.append(TextBlock(text=text))
+
+    # Tool calls. The SDK exposes them as a list (or None) of objects
+    # with .id, .type, .function.name, .function.arguments (string).
+    tool_calls = getattr(message, "tool_calls", None) or []
+    for tc in tool_calls:
+        arguments = getattr(tc.function, "arguments", "") or ""
+        try:
+            input_dict = json.loads(arguments) if arguments else {}
+        except json.JSONDecodeError:
+            # Malformed JSON from the model is rare but possible.
+            # Surface as an empty dict so pipeline code doesn't see a
+            # ToolUseBlock with a stringy input attribute — the
+            # subsequent tool execution will fail with a clearer
+            # "missing required field" error than a JSON parse error.
+            input_dict = {}
+        content_blocks.append(ToolUseBlock(
+            id=tc.id,
+            name=tc.function.name,
+            input=input_dict,
+        ))
+
+    raw_finish = getattr(choice, "finish_reason", None) or "stop"
+    if raw_finish not in _OPENAI_FINISH_REASONS:
+        should_warn = False
+        with _warned_finish_reasons_lock:
+            if raw_finish not in _warned_finish_reasons:
+                _warned_finish_reasons.add(raw_finish)
+                should_warn = True
+        if should_warn:
+            sys.stderr.write(
+                f"warning: OpenAIAdapter received unknown finish_reason "
+                f"{raw_finish!r}; normalising to 'end_turn'. Add this value "
+                f"to StopReason in utilities/llm/adapter.py and "
+                f"_OPENAI_FINISH_REASONS if OpenAI added a new termination "
+                f"reason.\n"
+            )
+
+    usage = getattr(response, "usage", None)
+    return CompletionResult(
+        content=content_blocks,
+        input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
+        output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+        stop_reason=_OPENAI_FINISH_REASONS.get(raw_finish, "end_turn"),
+        raw=response,
+    )
+
+
+def _retry_after_from(exc: Any) -> Optional[float]:
+    """Extract a retry-after header value from an SDK exception."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after")
+    except AttributeError:
+        return None
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None

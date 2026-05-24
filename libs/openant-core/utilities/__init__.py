@@ -1,11 +1,10 @@
 """Utility modules for OpenAnt vulnerability analysis."""
 
 from .llm_client import (
-    AnthropicClient,
     TokenTracker,
     get_global_tracker,
     reset_global_tracker,
-    MODEL_PRICING
+    MODEL_PRICING,
 )
 from .json_corrector import JSONCorrector
 from .context_corrector import ContextCorrector
@@ -15,7 +14,6 @@ from .ground_truth_challenger import GroundTruthChallenger
 from .finding_verifier import FindingVerifier, VerificationResult
 
 __all__ = [
-    'AnthropicClient',
     'TokenTracker',
     'get_global_tracker',
     'reset_global_tracker',

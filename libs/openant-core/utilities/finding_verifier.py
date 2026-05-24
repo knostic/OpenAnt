@@ -38,9 +38,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-import anthropic
-
 from .llm_client import TokenTracker, get_global_tracker
+from .llm import (
+    LLMError,
+    LLMRateLimitError,
+    Message,
+    PhaseBinding,
+    TextBlock,
+    ToolDef,
+    ToolResultBlock,
+    ToolUseBlock,
+    lookup_pricing,
+)
 from .rate_limiter import get_rate_limiter
 
 # Null logger that discards all messages (used when no logger provided)
@@ -62,7 +71,6 @@ except ImportError:
     ApplicationContext = None
 
 
-VERIFIER_MODEL = "claude-opus-4-6"
 MAX_ITERATIONS = 20
 MAX_TOKENS_PER_RESPONSE = 4096
 
@@ -260,20 +268,36 @@ class FindingVerifier:
     def __init__(
         self,
         index: RepositoryIndex,
+        binding: PhaseBinding,
         tracker: TokenTracker = None,
         verbose: bool = False,
         app_context: "ApplicationContext" = None,
         logger: logging.Logger = None,
-        client: "anthropic.Anthropic | None" = None,
     ):
+        if not binding.adapter.supports_tools:
+            raise ValueError(
+                f"Stage 2 verification requires a tool-supporting adapter, "
+                f"but the binding for phase {binding.phase!r} uses adapter "
+                f"type {binding.adapter.name!r} which does not support tools."
+            )
         self.index = index
+        self.binding = binding
         self.tracker = tracker or get_global_tracker()
         self.verbose = verbose
         self.app_context = app_context
         self.tool_executor = ToolExecutor(index)
-        self.client = client or anthropic.Anthropic(max_retries=5)
         self.logger = logger or _null_logger
         self._use_logger = logger is not None
+
+        # Build typed tool defs once per verifier instance.
+        self._tool_defs: list[ToolDef] = [
+            ToolDef(
+                name=td["name"],
+                description=td["description"],
+                input_schema=td["input_schema"],
+            )
+            for td in VERIFICATION_TOOLS
+        ]
 
     def _log(self, level: str, msg: str, **extras):
         """Log a message, using logger if available, otherwise print if verbose."""
@@ -318,7 +342,9 @@ class FindingVerifier:
         # Get system prompt with app context if available
         system_prompt = get_verification_system_prompt(self.app_context)
 
-        messages = [{"role": "user", "content": user_prompt}]
+        messages: list[Message] = [
+            Message(role="user", content=[TextBlock(user_prompt)])
+        ]
         iterations = 0
         total_input_tokens = 0
         total_output_tokens = 0
@@ -328,26 +354,17 @@ class FindingVerifier:
 
             self._log("debug", f"Iteration {iterations}", iterations=iterations)
 
-            # Wait if we're in a global backoff period
-            rate_limiter = get_rate_limiter()
-            rate_limiter.wait_if_needed()
+            # Adapter handles the rate-limiter wait/report dance internally.
+            response = self.binding.adapter.complete(
+                model=self.binding.model,
+                max_tokens=MAX_TOKENS_PER_RESPONSE,
+                system=system_prompt,
+                tools=self._tool_defs,
+                messages=messages,
+            )
 
-            try:
-                response = self.client.messages.create(
-                    model=VERIFIER_MODEL,
-                    max_tokens=MAX_TOKENS_PER_RESPONSE,
-                    system=system_prompt,
-                    tools=VERIFICATION_TOOLS,
-                    messages=messages
-                )
-            except anthropic.RateLimitError as exc:
-                # Report to global rate limiter so all workers back off
-                retry_after = float(exc.response.headers.get("retry-after", 0))
-                get_rate_limiter().report_rate_limit(retry_after)
-                raise
-
-            total_input_tokens += response.usage.input_tokens
-            total_output_tokens += response.usage.output_tokens
+            total_input_tokens += response.input_tokens
+            total_output_tokens += response.output_tokens
 
             assistant_content = response.content
             stop_reason = response.stop_reason
@@ -371,11 +388,11 @@ class FindingVerifier:
                 )
 
             # Process tool calls
-            tool_results = []
+            tool_results: list[ToolResultBlock] = []
             finish_result = None
 
             for block in assistant_content:
-                if block.type == "tool_use":
+                if isinstance(block, ToolUseBlock):
                     tool_name = block.name
                     tool_input = block.input
                     tool_use_id = block.id
@@ -384,39 +401,43 @@ class FindingVerifier:
 
                     if tool_name == "finish":
                         finish_result = tool_input
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": json.dumps({"status": "complete"})
-                        })
+                        tool_results.append(
+                            ToolResultBlock(
+                                tool_use_id=tool_use_id,
+                                content=json.dumps({"status": "complete"}),
+                            )
+                        )
                         break
                     else:
-                        result = self.tool_executor.execute(tool_name, tool_input)
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": json.dumps(result)
-                        })
+                        outcome = self.tool_executor.execute(tool_name, tool_input)
+                        tool_results.append(
+                            ToolResultBlock(
+                                tool_use_id=tool_use_id,
+                                content=json.dumps(outcome),
+                            )
+                        )
 
             if finish_result:
                 self.tracker.record_call(
-                    model=VERIFIER_MODEL,
+                    model=self.binding.model,
                     input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
                 )
                 return self._parse_finish_result(
                     finish_result, finding, iterations,
                     total_input_tokens + total_output_tokens
                 )
 
-            messages.append({"role": "assistant", "content": assistant_content})
-            messages.append({"role": "user", "content": tool_results})
+            messages.append(Message(role="assistant", content=assistant_content))
+            messages.append(Message(role="user", content=list(tool_results)))
 
         # Max iterations reached
         self.tracker.record_call(
-            model=VERIFIER_MODEL,
+            model=self.binding.model,
             input_tokens=total_input_tokens,
-            output_tokens=total_output_tokens
+            output_tokens=total_output_tokens,
+            pricing=lookup_pricing(self.binding),
         )
         return VerificationResult(
             agree=True,
@@ -830,25 +851,16 @@ class FindingVerifier:
         prompt = get_consistency_check_prompt(group, code_by_route)
 
         try:
-            # Wait if we're in a global backoff period
-            rate_limiter = get_rate_limiter()
-            rate_limiter.wait_if_needed()
+            # Adapter handles rate-limit coordination internally.
+            from .llm import simple_text
 
-            response = self.client.messages.create(
-                model=VERIFIER_MODEL,
-                max_tokens=MAX_TOKENS_PER_RESPONSE,
+            text = simple_text(
+                self.binding,
+                prompt,
                 system="You are checking verdict consistency across similar code patterns.",
-                messages=[{"role": "user", "content": prompt}]
+                max_tokens=MAX_TOKENS_PER_RESPONSE,
+                tracker=self.tracker,
             )
-
-            self.tracker.record_call(
-                model=VERIFIER_MODEL,
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens
-            )
-
-            # Parse response
-            text = response.content[0].text if response.content else ""
             result = self._parse_json_from_text(text)
 
             if result:
@@ -859,10 +871,8 @@ class FindingVerifier:
                     explanation=result.get("explanation", "")
                 )
 
-        except anthropic.RateLimitError as e:
-            # Report to global rate limiter so all workers back off
-            retry_after = float(e.response.headers.get("retry-after", 0))
-            get_rate_limiter().report_rate_limit(retry_after)
+        except LLMRateLimitError as e:
+            # Adapter already reported the 429; just log it locally.
             self._log("error", f"Consistency resolution rate limited", error=str(e))
         except Exception as e:
             self._log("error", f"Consistency resolution failed", error=str(e))
@@ -909,13 +919,14 @@ class FindingVerifier:
     ) -> Optional[VerificationResult]:
         """Try to parse a text response as JSON."""
         for block in assistant_content:
-            if hasattr(block, 'text'):
+            if isinstance(block, TextBlock):
                 result = self._parse_json_from_text(block.text)
                 if result:
                     self.tracker.record_call(
-                        model=VERIFIER_MODEL,
+                        model=self.binding.model,
                         input_tokens=total_input_tokens,
-                        output_tokens=total_output_tokens
+                        output_tokens=total_output_tokens,
+                        pricing=lookup_pricing(self.binding),
                     )
                     return self._parse_finish_result(
                         result, original_finding, iterations,
@@ -937,7 +948,7 @@ class FindingVerifier:
         if text.strip():
             try:
                 from utilities.json_corrector import JSONCorrector
-                corrector = JSONCorrector(self.client)
+                corrector = JSONCorrector(self.binding)
                 corrected = corrector.attempt_correction(text)
                 if corrected.get("verdict") != "ERROR":
                     corrected["json_corrected"] = True

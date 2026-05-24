@@ -22,12 +22,15 @@ class TestTokenTracker:
         expected_cost = (1000 / 1_000_000) * 3.0 + (500 / 1_000_000) * 15.0
         assert result["cost_usd"] == round(expected_cost, 6)
 
-    def test_record_call_unknown_model_uses_default(self):
+    def test_record_call_unknown_model_reports_zero_cost(self):
+        # Issue #65: unknown models report $0 with a one-time warning
+        # rather than silently estimating at Sonnet rates. Token counts
+        # are still recorded; only the cost is zeroed.
         tracker = TokenTracker()
         result = tracker.record_call("some-future-model", 100, 50)
-        default_pricing = MODEL_PRICING["default"]
-        expected_cost = (100 / 1_000_000) * default_pricing["input"] + (50 / 1_000_000) * default_pricing["output"]
-        assert result["cost_usd"] == round(expected_cost, 6)
+        assert result["cost_usd"] == 0.0
+        assert result["input_tokens"] == 100
+        assert result["output_tokens"] == 50
 
     def test_cumulative_tracking(self):
         tracker = TokenTracker()

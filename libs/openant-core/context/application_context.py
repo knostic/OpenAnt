@@ -29,9 +29,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from utilities.file_io import open_utf8, read_json, write_json
+from utilities.llm import PhaseBinding, simple_text
 
 # Load environment variables
 load_dotenv()
@@ -468,7 +468,7 @@ Respond with a JSON object (no other text):
 
 def generate_application_context(
     repo_path: Path,
-    model: str = "claude-sonnet-4-20250514",
+    binding: PhaseBinding,
     force_regenerate: bool = False,
 ) -> ApplicationContext:
     """Generate application context using LLM analysis.
@@ -477,7 +477,10 @@ def generate_application_context(
 
     Args:
         repo_path: Path to the repository root.
-        model: Anthropic model to use for generation.
+        binding: Phase binding for the ``app_context`` phase, obtained
+            from ``PhaseRegistry.get("app_context")``. The model and
+            adapter embedded in it are what the call actually uses —
+            no caller-side model selection.
         force_regenerate: If True, skip manual override check.
 
     Returns:
@@ -507,20 +510,17 @@ def generate_application_context(
     for name, content in sources.items():
         sources_text += f"\n### {name}\n```\n{content}\n```\n"
 
-    # Call LLM
-    print(f"Generating context with {model}...", file=sys.stderr)
-    client = Anthropic()
-    response = client.messages.create(
-        model=model,
-        max_tokens=2000,
-        messages=[{
-            "role": "user",
-            "content": CONTEXT_GENERATION_PROMPT.format(sources=sources_text)
-        }]
+    # Call LLM via the adapter — provider+model are dictated by the
+    # llm-config's ``app_context`` phase, not hardcoded here.
+    print(
+        f"Generating context with {binding.provider_name}/{binding.model}...",
+        file=sys.stderr,
     )
-
-    # Parse response
-    response_text = response.content[0].text
+    response_text = simple_text(
+        binding,
+        CONTEXT_GENERATION_PROMPT.format(sources=sources_text),
+        max_tokens=2000,
+    )
 
     # Extract JSON from response
     json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)

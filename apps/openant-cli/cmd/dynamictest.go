@@ -28,11 +28,13 @@ If no path is given, the active project's pipeline_output.json is used.`,
 var (
 	dynamicTestOutput     string
 	dynamicTestMaxRetries int
+	dynamicTestLLMConfig  string
 )
 
 func init() {
 	dynamicTestCmd.Flags().StringVarP(&dynamicTestOutput, "output", "o", "", "Output directory")
 	dynamicTestCmd.Flags().IntVar(&dynamicTestMaxRetries, "max-retries", 3, "Max retries per finding on error")
+	dynamicTestCmd.Flags().StringVar(&dynamicTestLLMConfig, "llm-config", "", "Name of the llm-config in ~/.config/openant/config.json (defaults to the file's default_llm, or the built-in 'openant-default' if no config file exists).")
 }
 
 func runDynamicTest(cmd *cobra.Command, args []string) {
@@ -84,6 +86,9 @@ func runDynamicTest(cmd *cobra.Command, args []string) {
 	// the Docker build context.
 	if ctx != nil && ctx.Project != nil && ctx.RepoPath != "" {
 		pyArgs = append(pyArgs, "--repo-path", ctx.RepoPath)
+	}
+	if dynamicTestLLMConfig != "" {
+		pyArgs = append(pyArgs, "--llm-config", dynamicTestLLMConfig)
 	}
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())

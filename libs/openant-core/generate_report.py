@@ -29,15 +29,20 @@ import html
 import os
 from datetime import datetime
 
-import anthropic
 from dotenv import load_dotenv
 from utilities.file_io import read_json
+from utilities.llm import (
+    build_phase_registry,
+    load_config_file,
+    probe_registry_or_raise,
+    resolve_llm_config,
+    simple_text,
+)
 
 # Load environment variables from .env file
 load_dotenv()
 
 
-REPORT_MODEL = "claude-sonnet-4-20250514"
 MAX_TOKENS = 4096
 
 
@@ -197,18 +202,16 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
 {findings_text}
 """
 
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY not found in environment")
+    # Resolve the report-phase binding from the active config.
+    # Probe upfront so bad keys / typo'd model IDs fail with the
+    # standardised "llm-config 'X' failed validation: ..." preamble
+    # instead of a raw SDK error on the first real call.
+    cf = load_config_file()
+    registry = build_phase_registry(cf, resolve_llm_config(cf, None))
+    probe_registry_or_raise(registry)
+    binding = registry.get("report")
 
-    client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model=REPORT_MODEL,
-        max_tokens=MAX_TOKENS,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return response.content[0].text
+    return simple_text(binding, prompt, max_tokens=MAX_TOKENS)
 
 
 def _build_pipeline_costs_html(step_reports: list[dict]) -> str:

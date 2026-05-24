@@ -14,10 +14,17 @@ Supports reachability-aware classification to distinguish:
 import json
 from typing import Optional, Set, List
 
-import anthropic
-
 from ..llm_client import TokenTracker, get_global_tracker
-from ..rate_limiter import get_rate_limiter
+from ..llm import (
+    LLMRateLimitError,
+    Message,
+    PhaseBinding,
+    TextBlock,
+    ToolDef,
+    ToolResultBlock,
+    ToolUseBlock,
+    lookup_pricing,
+)
 from .repository_index import RepositoryIndex
 from .tools import TOOL_DEFINITIONS, ToolExecutor
 from .prompts import SYSTEM_PROMPT, get_user_prompt
@@ -25,12 +32,22 @@ from .entry_point_detector import EntryPointDetector
 from .reachability_analyzer import ReachabilityAnalyzer
 
 
-# Use Sonnet for exploration (cost-effective)
-AGENT_MODEL = "claude-sonnet-4-20250514"
-
 # Safety limits
 MAX_ITERATIONS = 20
 MAX_TOKENS_PER_RESPONSE = 4096
+
+
+# Convert the dict-form TOOL_DEFINITIONS list to typed ToolDef instances
+# once at import time so we're not rebuilding them on every iteration of
+# every agent run.
+_TOOL_DEFS: list[ToolDef] = [
+    ToolDef(
+        name=td["name"],
+        description=td["description"],
+        input_schema=td["input_schema"],
+    )
+    for td in TOOL_DEFINITIONS
+]
 
 
 class AgentResult:
@@ -102,31 +119,39 @@ class ContextAgent:
     def __init__(
         self,
         index: RepositoryIndex,
+        binding: PhaseBinding,
         tracker: TokenTracker = None,
         verbose: bool = False,
         entry_points: Optional[Set[str]] = None,
         reachability: Optional[ReachabilityAnalyzer] = None,
-        client: Optional[anthropic.Anthropic] = None,
     ):
         """
         Initialize the agent.
 
         Args:
             index: RepositoryIndex for searching code
+            binding: Phase binding for the enhance phase. Carries the
+                adapter and model used for every iteration of the
+                tool-use loop. Shared across workers (adapters are
+                stateless dispatchers).
             tracker: TokenTracker for cost tracking
             verbose: If True, print debug information
             entry_points: Set of func_ids that are entry points (optional)
             reachability: ReachabilityAnalyzer for checking user input paths (optional)
-            client: Shared Anthropic client (reuse across workers to avoid FD exhaustion).
-                    If not provided, creates a new one (only for standalone/test use).
         """
+        if not binding.adapter.supports_tools:
+            raise ValueError(
+                f"Agentic enhancement requires a tool-supporting adapter, but "
+                f"the binding for phase {binding.phase!r} uses adapter type "
+                f"{binding.adapter.name!r} which does not support tools."
+            )
         self.index = index
+        self.binding = binding
         self.tracker = tracker or get_global_tracker()
         self.verbose = verbose
         self.tool_executor = ToolExecutor(index)
         self.entry_points = entry_points or set()
         self.reachability = reachability
-        self.client = client or anthropic.Anthropic(max_retries=5)
 
     def analyze_unit(
         self,
@@ -175,7 +200,9 @@ class ContextAgent:
         )
 
         # Initialize conversation
-        messages = [{"role": "user", "content": user_prompt}]
+        messages: list[Message] = [
+            Message(role="user", content=[TextBlock(user_prompt)])
+        ]
 
         iterations = 0
         total_input_tokens = 0
@@ -187,34 +214,21 @@ class ContextAgent:
             if self.verbose:
                 print(f"  Iteration {iterations}...")
 
-            # Call Claude with rate limiting
+            # Call the model. The adapter handles the rate-limiter
+            # wait/report dance internally — see AnthropicAdapter for
+            # the cross-worker coordination logic.
             try:
-                # Wait if we're in a global backoff period
-                rate_limiter = get_rate_limiter()
-                rate_limiter.wait_if_needed()
-
-                response = self.client.messages.create(
-                    model=AGENT_MODEL,
+                result = self.binding.adapter.complete(
+                    model=self.binding.model,
                     max_tokens=MAX_TOKENS_PER_RESPONSE,
                     system=SYSTEM_PROMPT,
-                    tools=TOOL_DEFINITIONS,
-                    messages=messages
+                    tools=_TOOL_DEFS,
+                    messages=messages,
                 )
-            except anthropic.RateLimitError as exc:
-                # Report to global rate limiter so all workers back off
-                retry_after = float(exc.response.headers.get("retry-after", 0))
-                get_rate_limiter().report_rate_limit(retry_after)
-                # Attach agent state so the caller knows how far we got
-                exc.agent_state = {
-                    "iteration": iterations,
-                    "max_iterations": MAX_ITERATIONS,
-                    "tokens_used": total_input_tokens + total_output_tokens,
-                    "input_tokens": total_input_tokens,
-                    "output_tokens": total_output_tokens,
-                }
-                raise
             except Exception as exc:
-                # Attach agent state so the caller knows how far we got
+                # Attach agent state so the caller knows how far we got.
+                # Covers LLMRateLimitError (adapter has already reported
+                # to the global rate limiter) and anything else.
                 exc.agent_state = {
                     "iteration": iterations,
                     "max_iterations": MAX_ITERATIONS,
@@ -225,17 +239,17 @@ class ContextAgent:
                 raise
 
             # Track tokens
-            total_input_tokens += response.usage.input_tokens
-            total_output_tokens += response.usage.output_tokens
+            total_input_tokens += result.input_tokens
+            total_output_tokens += result.output_tokens
 
             # Process response
-            assistant_content = response.content
-            stop_reason = response.stop_reason
+            assistant_content = result.content
+            stop_reason = result.stop_reason
 
             if self.verbose:
                 # Print text blocks
                 for block in assistant_content:
-                    if hasattr(block, 'text'):
+                    if isinstance(block, TextBlock):
                         print(f"    Agent: {block.text[:200]}...")
 
             # Check if we're done (finish tool called or no more tool use)
@@ -259,11 +273,11 @@ class ContextAgent:
                 )
 
             # Process tool calls
-            tool_results = []
+            tool_results: list[ToolResultBlock] = []
             finish_result = None
 
             for block in assistant_content:
-                if block.type == "tool_use":
+                if isinstance(block, ToolUseBlock):
                     tool_name = block.name
                     tool_input = block.input
                     tool_use_id = block.id
@@ -272,36 +286,41 @@ class ContextAgent:
                         print(f"    Tool: {tool_name}({json.dumps(tool_input)[:100]}...)")
 
                     # Execute tool
-                    result = self.tool_executor.execute(tool_name, tool_input)
+                    tool_outcome = self.tool_executor.execute(tool_name, tool_input)
 
                     if self.verbose:
-                        result_preview = str(result)[:200]
+                        result_preview = str(tool_outcome)[:200]
                         print(f"    Result: {result_preview}...")
 
                     # Check for finish
-                    if tool_name == "finish" and result.get("status") == "complete":
-                        finish_result = result.get("result", {})
-                        # Still add to tool_results for the message
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": json.dumps(result)
-                        })
+                    if tool_name == "finish" and tool_outcome.get("status") == "complete":
+                        finish_result = tool_outcome.get("result", {})
+                        # Still add to tool_results so the conversation
+                        # has a balanced tool_use / tool_result pair —
+                        # some adapters validate this strictly.
+                        tool_results.append(
+                            ToolResultBlock(
+                                tool_use_id=tool_use_id,
+                                content=json.dumps(tool_outcome),
+                            )
+                        )
                         break
                     else:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": json.dumps(result)
-                        })
+                        tool_results.append(
+                            ToolResultBlock(
+                                tool_use_id=tool_use_id,
+                                content=json.dumps(tool_outcome),
+                            )
+                        )
 
             # If finish was called, return result
             if finish_result:
                 # Record token usage
                 call_record = self.tracker.record_call(
-                    model=AGENT_MODEL,
+                    model=self.binding.model,
                     input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
                 )
 
                 return AgentResult(
@@ -321,12 +340,12 @@ class ContextAgent:
                 )
 
             # Add assistant message and tool results to conversation
-            messages.append({"role": "assistant", "content": assistant_content})
-            
+            messages.append(Message(role="assistant", content=assistant_content))
+
             # Only add user message with tool results if there are results
             # (empty content triggers API error: "user messages must have non-empty content")
             if tool_results:
-                messages.append({"role": "user", "content": tool_results})
+                messages.append(Message(role="user", content=list(tool_results)))
             else:
                 # No tool calls but model didn't end — treat as incomplete
                 if self.verbose:
@@ -350,9 +369,10 @@ class ContextAgent:
 
         # Record token usage
         call_record = self.tracker.record_call(
-            model=AGENT_MODEL,
+            model=self.binding.model,
             input_tokens=total_input_tokens,
-            output_tokens=total_output_tokens
+            output_tokens=total_output_tokens,
+            pricing=lookup_pricing(self.binding),
         )
 
         return AgentResult(
@@ -375,11 +395,11 @@ class ContextAgent:
 def enhance_unit_with_agent(
     unit: dict,
     index: RepositoryIndex,
+    binding: PhaseBinding,
     tracker: TokenTracker = None,
     verbose: bool = False,
     entry_points: Optional[Set[str]] = None,
     reachability: Optional[ReachabilityAnalyzer] = None,
-    client: Optional[anthropic.Anthropic] = None,
 ) -> dict:
     """
     Enhance a single unit using the agentic approach.
@@ -387,22 +407,22 @@ def enhance_unit_with_agent(
     Args:
         unit: Unit from dataset
         index: Repository index for searching
+        binding: Phase binding for the enhance phase (provider+model).
         tracker: Token tracker
         verbose: Print debug info
         entry_points: Set of func_ids that are entry points (optional)
         reachability: ReachabilityAnalyzer for checking user input paths (optional)
-        client: Shared Anthropic client (reuse across workers to avoid FD exhaustion).
 
     Returns:
         Enhanced unit with agent_context field including reachability info
     """
     agent = ContextAgent(
         index=index,
+        binding=binding,
         tracker=tracker,
         verbose=verbose,
         entry_points=entry_points,
         reachability=reachability,
-        client=client,
     )
 
     # Extract unit info

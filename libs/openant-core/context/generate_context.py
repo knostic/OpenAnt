@@ -77,9 +77,12 @@ Manual Override:
     )
 
     parser.add_argument(
-        "--model", "-m",
-        default="claude-sonnet-4-20250514",
-        help="Anthropic model to use (default: claude-sonnet-4-20250514)",
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config to use for the app_context phase "
+            "(default: file's default_llm or openant-default)."
+        ),
     )
 
     parser.add_argument(
@@ -135,9 +138,24 @@ Manual Override:
             print(f"Analyzing repository: {args.repo_path}")
             print()
 
+        # Build a phase registry locally so the standalone CLI uses
+        # the same llm-config plumbing as ``openant scan``. The probe
+        # runs upfront so bad keys / typo'd model IDs surface before
+        # we read any repo files.
+        from utilities.llm import (
+            build_phase_registry,
+            load_config_file,
+            probe_registry_or_raise,
+            resolve_llm_config,
+        )
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, args.llm_config))
+        probe_registry_or_raise(registry)
+        binding = registry.get("app_context")
+
         context = generate_application_context(
             args.repo_path,
-            model=args.model,
+            binding,
             force_regenerate=args.force,
         )
 

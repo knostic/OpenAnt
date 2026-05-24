@@ -34,6 +34,7 @@ var (
 	verifyWorkers        int
 	verifyCheckpoint     string
 	verifyBackoff        int
+	verifyLLMConfig      string
 )
 
 func init() {
@@ -44,6 +45,7 @@ func init() {
 	verifyCmd.Flags().IntVar(&verifyWorkers, "workers", 8, "Number of parallel workers for LLM steps (default: 8)")
 	verifyCmd.Flags().StringVar(&verifyCheckpoint, "checkpoint", "", "Path to checkpoint directory for save/resume")
 	verifyCmd.Flags().IntVar(&verifyBackoff, "backoff", 30, "Seconds to wait when rate-limited (default: 30)")
+	verifyCmd.Flags().StringVar(&verifyLLMConfig, "llm-config", "", "Name of the llm-config in ~/.config/openant/config.json (defaults to the file's default_llm, or the built-in 'openant-default' if no config file exists).")
 }
 
 func runVerify(cmd *cobra.Command, args []string) {
@@ -105,6 +107,9 @@ func runVerify(cmd *cobra.Command, args []string) {
 	}
 	if verifyBackoff != 30 {
 		pyArgs = append(pyArgs, "--backoff", fmt.Sprintf("%d", verifyBackoff))
+	}
+	if verifyLLMConfig != "" {
+		pyArgs = append(pyArgs, "--llm-config", verifyLLMConfig)
 	}
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())

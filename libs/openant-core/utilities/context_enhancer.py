@@ -23,9 +23,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
-import anthropic
-
-from .llm_client import AnthropicClient, TokenTracker, get_global_tracker, reset_global_tracker
+from .llm_client import TokenTracker, get_global_tracker, reset_global_tracker
+from .llm import (
+    LLMAuthError,
+    LLMConnectionError,
+    LLMError,
+    LLMNotFoundError,
+    LLMRateLimitError,
+    LLMResponseError,
+    PhaseBinding,
+    simple_text,
+)
 from .agentic_enhancer import RepositoryIndex, enhance_unit_with_agent, load_index_from_file
 from .rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
 from .file_io import read_json, write_json
@@ -45,15 +53,18 @@ _null_logger = logging.getLogger("null")
 _null_logger.addHandler(logging.NullHandler())
 
 
-# Use Sonnet for context enhancement (cost-effective auxiliary task)
-CONTEXT_ENHANCEMENT_MODEL = "claude-sonnet-4-20250514"
+# The enhance phase's model is supplied by the binding now; this
+# constant is retained only for legacy log lines that reference it.
+CONTEXT_ENHANCEMENT_MODEL_LEGACY = "claude-sonnet-4-20250514"
 
 
 def _build_error_info(exc: Exception) -> dict:
     """Build a structured error dict from an exception.
 
-    Captures exception type, message, HTTP status, request ID, and
-    any agent iteration state attached by agent.py.
+    Captures exception type, message, and any agent iteration state
+    attached by agent.py. Errors are classified by the adapter-layer
+    :class:`LLMError` taxonomy rather than provider-native types,
+    so this works for every provider plugin.
     """
     info = {
         "type": "unknown",
@@ -61,24 +72,19 @@ def _build_error_info(exc: Exception) -> dict:
         "message": str(exc),
     }
 
-    # Anthropic SDK specific exceptions
-    if isinstance(exc, anthropic.APIConnectionError):
+    # Adapter-layer error taxonomy (provider-neutral).
+    if isinstance(exc, LLMConnectionError):
         info["type"] = "connection"
-    elif isinstance(exc, anthropic.APITimeoutError):
-        info["type"] = "timeout"
-    elif isinstance(exc, anthropic.RateLimitError):
+    elif isinstance(exc, LLMRateLimitError):
         info["type"] = "rate_limit"
-        info["status_code"] = exc.status_code
-        if hasattr(exc, "response") and exc.response is not None:
-            info["request_id"] = exc.response.headers.get("request-id")
-            retry_after = exc.response.headers.get("retry-after")
-            if retry_after:
-                info["retry_after"] = retry_after
-    elif isinstance(exc, anthropic.APIStatusError):
+        if exc.retry_after is not None:
+            info["retry_after"] = exc.retry_after
+    elif isinstance(exc, LLMAuthError):
+        info["type"] = "auth"
+    elif isinstance(exc, LLMNotFoundError):
+        info["type"] = "not_found"
+    elif isinstance(exc, LLMResponseError):
         info["type"] = "api_status"
-        info["status_code"] = exc.status_code
-        if hasattr(exc, "response") and exc.response is not None:
-            info["request_id"] = exc.response.headers.get("request-id")
 
     # Agent iteration state (attached by agent.py)
     agent_state = getattr(exc, "agent_state", None)
@@ -193,20 +199,20 @@ class ContextEnhancer:
 
     def __init__(
         self,
-        client: AnthropicClient = None,
+        binding: PhaseBinding,
         tracker: TokenTracker = None,
-        logger: logging.Logger = None
+        logger: logging.Logger = None,
     ):
         """
         Initialize the enhancer.
 
         Args:
-            client: Anthropic client instance. Creates one if not provided.
+            binding: Phase binding for the enhance phase.
             tracker: Token tracker instance. Uses global tracker if not provided.
             logger: Optional logger for structured logging. If not provided, uses print().
         """
         self.tracker = tracker or get_global_tracker()
-        self.client = client or AnthropicClient(model=CONTEXT_ENHANCEMENT_MODEL, tracker=self.tracker)
+        self.binding = binding
         self.logger = logger or _null_logger
         self._use_logger = logger is not None
         self.stats = {
@@ -282,11 +288,7 @@ class ContextEnhancer:
         )
 
         try:
-            response = self.client.analyze_sync(
-                prompt,
-                max_tokens=4096,
-                model=CONTEXT_ENHANCEMENT_MODEL
-            )
+            response = simple_text(self.binding, prompt, max_tokens=4096, tracker=self.tracker)
             analysis = self._parse_json_response(response)
 
             if analysis:
@@ -355,7 +357,7 @@ class ContextEnhancer:
         total = len(units)
 
         self._log("info", f"Enhancing {total} units with LLM context (single-shot mode)", units=total)
-        self._log("info", f"Model: {CONTEXT_ENHANCEMENT_MODEL}")
+        self._log("info", f"Provider: {self.binding.provider_name}, Model: {self.binding.model}")
         mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
         self._log("info", f"Mode: {mode}")
 
@@ -412,7 +414,7 @@ class ContextEnhancer:
         # Update dataset metadata
         dataset["metadata"] = dataset.get("metadata", {})
         dataset["metadata"]["llm_enhanced"] = True
-        dataset["metadata"]["llm_model"] = CONTEXT_ENHANCEMENT_MODEL
+        dataset["metadata"]["llm_model"] = self.binding.model
         dataset["metadata"]["enhancement_stats"] = self.stats
         dataset["metadata"]["token_usage"] = token_stats
 
@@ -567,7 +569,7 @@ class ContextEnhancer:
         remaining = total - len(processed_ids)
         self._log("info", f"Enhancing {remaining} units with agentic analysis ({len(processed_ids)} already done)", units=remaining)
         self._log("info", "Mode: Iterative tool use (traces call paths)")
-        self._log("info", "Model: claude-sonnet-4-20250514")
+        self._log("info", f"Provider: {self.binding.provider_name}, Model: {self.binding.model}")
         mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
         self._log("info", f"Workers: {mode}")
         if checkpoint_dir:
@@ -579,12 +581,12 @@ class ContextEnhancer:
         stats = index.get_statistics()
         self._log("info", f"Indexed {stats['total_functions']} functions from {stats['total_files']} files")
 
-        # Create a single shared Anthropic client for all workers.
-        # Each ContextAgent previously created its own anthropic.Anthropic() instance,
-        # which spawns a new httpx connection pool. With 1000+ units and 8 workers,
-        # this exhausted file descriptors (macOS limit ~256). The httpx.Client
-        # underlying anthropic.Anthropic is thread-safe, so sharing is correct.
-        shared_client = anthropic.Anthropic(max_retries=5)
+        # The enhance phase's adapter is held on self.binding and is
+        # shared across workers; adapters are stateless dispatchers and
+        # the underlying SDK clients are thread-safe, so sharing is
+        # correct. (Previously this code spun up a fresh anthropic SDK
+        # per worker and exhausted FDs on large repos — the adapter
+        # layer makes that footgun structural rather than informal.)
 
         # Filter to unprocessed units
         units_to_process = [(i, unit) for i, unit in enumerate(units) if unit.get("id") not in processed_ids]
@@ -595,7 +597,7 @@ class ContextEnhancer:
             unit_start = time.monotonic()
             classification = "neutral"
             try:
-                enhance_unit_with_agent(unit, index, self.tracker, verbose, client=shared_client)
+                enhance_unit_with_agent(unit, index, self.binding, self.tracker, verbose)
 
                 agent_ctx = unit.get("agent_context", {})
                 classification = agent_ctx.get("security_classification", "neutral")
@@ -882,10 +884,14 @@ class ContextEnhancer:
         """
         Get stats from the last LLM call.
 
-        Returns:
-            Dict with model, input_tokens, output_tokens, cost_usd
+        Returns the most recent call recorded against the tracker, or
+        an empty dict if no calls have been recorded yet. (The legacy
+        ``client.get_last_call()`` API is gone — call sites that want
+        per-call diagnostics should walk the tracker's call list.)
         """
-        return self.client.get_last_call()
+        summary = self.tracker.get_summary()
+        calls = summary.get("calls") or []
+        return calls[-1] if calls else {}
 
     def _get_default_context(self) -> dict:
         """Return default context when LLM call fails."""
@@ -931,10 +937,10 @@ class ContextEnhancer:
                     pass
 
         # Fallback: use LLM to correct malformed JSON
-        if response.strip() and hasattr(self, 'client') and self.client:
+        if response.strip() and hasattr(self, 'binding') and self.binding:
             try:
                 from utilities.json_corrector import JSONCorrector
-                corrector = JSONCorrector(self.client)
+                corrector = JSONCorrector(self.binding)
                 corrected = corrector.attempt_correction(response)
                 if corrected.get("verdict") != "ERROR":
                     corrected["json_corrected"] = True

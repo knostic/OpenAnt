@@ -45,6 +45,7 @@ var (
 	reportPipelineOutput string
 	reportRepoName       string
 	reportExtraDest      string
+	reportLLMConfig      string
 )
 
 func init() {
@@ -54,6 +55,7 @@ func init() {
 	reportCmd.Flags().StringVar(&reportPipelineOutput, "pipeline-output", "", "Path to pipeline_output.json (for summary/disclosure)")
 	reportCmd.Flags().StringVar(&reportRepoName, "repo-name", "", "Repository name (used when auto-building pipeline_output)")
 	reportCmd.Flags().StringVar(&reportExtraDest, "copy-to", "", "Copy reports to an additional location")
+	reportCmd.Flags().StringVar(&reportLLMConfig, "llm-config", "", "Name of the llm-config in ~/.config/openant/config.json (defaults to the file's default_llm, or the built-in 'openant-default' if no config file exists).")
 }
 
 // isInteractive returns true if stdin is a terminal and we're not in quiet mode.
@@ -365,6 +367,9 @@ func buildReportArgs(resultsPath string, format string) []string {
 	}
 	if reportRepoName != "" {
 		pyArgs = append(pyArgs, "--repo-name", reportRepoName)
+	}
+	if reportLLMConfig != "" {
+		pyArgs = append(pyArgs, "--llm-config", reportLLMConfig)
 	}
 
 	return pyArgs

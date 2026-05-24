@@ -12,7 +12,7 @@ import json
 import sys
 from typing import Optional
 
-from .llm_client import AnthropicClient
+from .llm import PhaseBinding, simple_text
 from .context_corrector import gather_source_files, search_files_for_context
 
 
@@ -135,15 +135,15 @@ class ContextReviewer:
     Reviews assembled context and proactively identifies missing files.
     """
 
-    def __init__(self, client: AnthropicClient, repo_path: str):
+    def __init__(self, binding: PhaseBinding, repo_path: str):
         """
         Initialize the reviewer.
 
         Args:
-            client: Anthropic client for LLM calls
+            binding: Phase binding for the LLM call (typically the analyze phase's).
             repo_path: Path to the source code repository
         """
-        self.client = client
+        self.binding = binding
         self.repo_path = repo_path
         self._source_files = None
 
@@ -176,7 +176,7 @@ class ContextReviewer:
         prompt = get_context_review_prompt(code, route, handler, files_included)
 
         try:
-            response = self.client.analyze_sync(prompt, model="claude-sonnet-4-20250514")
+            response = simple_text(self.binding, prompt)
             review = self._parse_json_response(response)
 
             if not review:
@@ -215,7 +215,7 @@ class ContextReviewer:
 
                 # Use the existing search mechanism
                 found = search_files_for_context(
-                    self.client,
+                    self.binding,
                     f"{item.get('description', '')}. {item.get('hints', '')}",
                     source_files,
                     files_included + [f['relative_path'] for f in additional_files]
@@ -318,10 +318,10 @@ class ContextReviewer:
                     pass
 
         # Fallback: use LLM to correct malformed JSON
-        if response.strip() and hasattr(self, 'client') and self.client:
+        if response.strip() and hasattr(self, 'binding') and self.binding:
             try:
                 from utilities.json_corrector import JSONCorrector
-                corrector = JSONCorrector(self.client)
+                corrector = JSONCorrector(self.binding)
                 corrected = corrector.attempt_correction(response)
                 if corrected.get("verdict") != "ERROR":
                     corrected["json_corrected"] = True
@@ -338,14 +338,18 @@ def test_reviewer():
     print("Testing Context Reviewer", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
 
-    client = AnthropicClient()
+    from .llm import build_phase_registry, load_config_file, resolve_llm_config
+
+    cf = load_config_file()
+    registry = build_phase_registry(cf, resolve_llm_config(cf, None))
+    binding = registry.get("analyze")
     repo_path = "/Users/nahumkorda/code/dvna"
 
     if not os.path.exists(repo_path):
         print(f"Repository not found: {repo_path}", file=sys.stderr)
         return
 
-    reviewer = ContextReviewer(client, repo_path)
+    reviewer = ContextReviewer(binding, repo_path)
 
     # Test with a simple code snippet
     test_code = """

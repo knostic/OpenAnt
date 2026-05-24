@@ -65,7 +65,7 @@ def cmd_scan(args):
             generate_report=not args.no_report,
             skip_tests=not args.no_skip_tests,
             limit=args.limit,
-            model=args.model,
+            llm_config_name=args.llm_config,
             enhance=not args.no_enhance,
             enhance_mode=args.enhance_mode,
             dynamic_test=args.dynamic_test,
@@ -187,6 +187,7 @@ def cmd_enhance(args):
                 repo_path=args.repo_path,
                 mode=args.mode,
                 checkpoint_path=args.checkpoint,
+                llm_config_name=args.llm_config,
                 workers=args.workers,
                 backoff_seconds=args.backoff,
             )
@@ -231,7 +232,7 @@ def cmd_analyze(args):
     try:
         with step_context("analyze", output_dir, inputs={
             "dataset_path": os.path.abspath(args.dataset),
-            "model": args.model,
+            "llm_config": args.llm_config,
             "exploitable_filter": exploitable_filter,
             "limit": args.limit,
         }) as ctx:
@@ -242,7 +243,7 @@ def cmd_analyze(args):
                 app_context_path=args.app_context,
                 repo_path=args.repo_path,
                 limit=args.limit,
-                model=args.model,
+                llm_config_name=args.llm_config,
                 exploitable_filter=exploitable_filter,
                 workers=args.workers,
                 checkpoint_path=getattr(args, "checkpoint", None),
@@ -341,6 +342,7 @@ def cmd_verify(args):
                 workers=args.workers,
                 checkpoint_path=getattr(args, "checkpoint", None),
                 backoff_seconds=args.backoff,
+                llm_config_name=args.llm_config,
             )
 
             ctx.summary = {
@@ -425,6 +427,7 @@ def cmd_dynamic_test(args):
                 output_dir=output_dir,
                 max_retries=args.max_retries,
                 repo_path=getattr(args, "repo_path", None),
+                llm_config_name=args.llm_config,
             )
 
             ctx.summary = {
@@ -539,9 +542,15 @@ def cmd_report(args):
                     return 2
                 result = generate_csv_report(args.results, args.dataset, output_path)
             elif fmt == "summary":
-                result = generate_summary_report(pipeline_output_path, output_path)
+                result = generate_summary_report(
+                    pipeline_output_path, output_path,
+                    llm_config_name=args.llm_config,
+                )
             elif fmt == "disclosure":
-                result = generate_disclosure_docs(pipeline_output_path, output_path)
+                result = generate_disclosure_docs(
+                    pipeline_output_path, output_path,
+                    llm_config_name=args.llm_config,
+                )
             else:
                 _output_json(error(f"Unknown format: {fmt}"))
                 return 2
@@ -590,10 +599,15 @@ def cmd_report_data(args):
     and step reports — everything display-ready.
     """
     import html as html_mod
-    import anthropic
     from core.schemas import success, error
     from core.step_report import step_context
     from utilities.llm_client import get_global_tracker
+    from utilities.llm import (
+        build_phase_registry,
+        load_config_file,
+        resolve_llm_config,
+        simple_text,
+    )
 
     results_path = args.results
     dataset_path = args.dataset
@@ -809,13 +823,20 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
 {findings_text}
 """
                 print("[Report] Generating remediation guidance (LLM)...", file=sys.stderr)
-                client = anthropic.Anthropic()
-                response = client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=4096,
-                    messages=[{"role": "user", "content": prompt}],
+                # The remediation-guidance call rides the report phase
+                # so a single ``--llm-config`` flips it together with
+                # the summary/disclosure generation in report/generator.py.
+                cf = load_config_file()
+                registry = build_phase_registry(
+                    cf, resolve_llm_config(cf, getattr(args, "llm_config", None))
                 )
-                remediation_html = response.content[0].text
+                tracker = get_global_tracker()
+                remediation_html = simple_text(
+                    registry.get("report"),
+                    prompt,
+                    max_tokens=4096,
+                    tracker=tracker,
+                )
 
                 # Post-process: linkify finding references like #4, #12-#14
                 import re
@@ -823,16 +844,6 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
                     num = m.group(1)
                     return f'<a href="#finding-{num}" class="finding-ref">#{num}</a>'
                 remediation_html = re.sub(r'#(\d+)', _linkify_finding, remediation_html)
-
-                # Track usage
-                usage = response.usage
-                tracker = get_global_tracker()
-                tracker.record_call(
-                    model="claude-sonnet-4-20250514",
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                )
-                print(f"  Remediation cost: ${(usage.input_tokens / 1e6) * 3.0 + (usage.output_tokens / 1e6) * 15.0:.4f}", file=sys.stderr)
 
             # --- Step reports ---
             step_reports_data = []
@@ -983,7 +994,16 @@ def main():
                         help="Enable Docker-isolated dynamic testing (off by default)")
     scan_p.add_argument("--no-skip-tests", action="store_true", help="Include test files in parsing (default: tests are skipped)")
     scan_p.add_argument("--limit", type=int, help="Max units to analyze")
-    scan_p.add_argument("--model", choices=["opus", "sonnet"], default="opus", help="Model (default: opus)")
+    scan_p.add_argument(
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config in ~/.config/openant/config.json. "
+            "Defaults to the file's default_llm (or the built-in "
+            "`openant-default` when no config file exists). See "
+            "docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md."
+        ),
+    )
     scan_p.add_argument("--workers", type=int, default=8,
                         help="Number of parallel workers for LLM steps (default: 8)")
     scan_p.add_argument("--repo-name", help="Repository name (org/repo)")
@@ -1059,6 +1079,15 @@ def main():
                            help="Number of parallel workers for LLM calls (default: 8)")
     enhance_p.add_argument("--backoff", type=int, default=30,
                            help="Seconds to wait when rate-limited (default: 30)")
+    enhance_p.add_argument(
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config in ~/.config/openant/config.json. "
+            "Defaults to the file's default_llm (or the built-in "
+            "`openant-default` when no config file exists)."
+        ),
+    )
     enhance_p.set_defaults(func=cmd_enhance)
 
     # ---------------------------------------------------------------
@@ -1077,7 +1106,15 @@ def main():
                                help="Analyze units classified as exploitable or vulnerable_internal (safer, compensates for parser gaps)")
     exploit_group.add_argument("--exploitable-only", action="store_true",
                                help="Analyze only units classified as exploitable (strict, use after parser entry point fixes)")
-    analyze_p.add_argument("--model", choices=["opus", "sonnet"], default="opus", help="Model (default: opus)")
+    analyze_p.add_argument(
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config in ~/.config/openant/config.json. "
+            "Defaults to the file's default_llm (or the built-in "
+            "`openant-default` when no config file exists)."
+        ),
+    )
     analyze_p.add_argument("--workers", type=int, default=8,
                            help="Number of parallel workers for LLM calls (default: 8)")
     analyze_p.add_argument("--checkpoint", help="Path to checkpoint directory for save/resume")
@@ -1099,6 +1136,15 @@ def main():
     verify_p.add_argument("--checkpoint", help="Path to checkpoint directory for save/resume")
     verify_p.add_argument("--backoff", type=int, default=30,
                           help="Seconds to wait when rate-limited (default: 30)")
+    verify_p.add_argument(
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config in ~/.config/openant/config.json. "
+            "Defaults to the file's default_llm (or the built-in "
+            "`openant-default` when no config file exists)."
+        ),
+    )
     verify_p.set_defaults(func=cmd_verify)
 
     # ---------------------------------------------------------------
@@ -1124,6 +1170,15 @@ def main():
     dt_p.add_argument("--repo-path", help="Path to the repository root (for pre-staging source files into Docker build context)")
     dt_p.add_argument("--max-retries", type=int, default=3,
                       help="Max retries per finding on error (default: 3)")
+    dt_p.add_argument(
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config in ~/.config/openant/config.json. "
+            "Defaults to the file's default_llm (or the built-in "
+            "`openant-default` when no config file exists)."
+        ),
+    )
     dt_p.set_defaults(func=cmd_dynamic_test)
 
     # ---------------------------------------------------------------
@@ -1141,6 +1196,16 @@ def main():
     report_p.add_argument("--pipeline-output", help="Path to pipeline_output.json (for summary/disclosure; auto-built if absent)")
     report_p.add_argument("--repo-name", help="Repository name (used when auto-building pipeline_output)")
     report_p.add_argument("--output", "-o", help="Output path (default: derived from results path and format)")
+    report_p.add_argument(
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config in ~/.config/openant/config.json. "
+            "Defaults to the file's default_llm (or the built-in "
+            "`openant-default` when no config file exists). Used by "
+            "the summary and disclosure formats; ignored for csv/html."
+        ),
+    )
     report_p.set_defaults(func=cmd_report)
 
     # ---------------------------------------------------------------

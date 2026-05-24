@@ -14,11 +14,10 @@ import json
 from typing import Optional
 from dataclasses import dataclass
 
-from utilities.llm_client import AnthropicClient, TokenTracker
+from utilities.llm_client import TokenTracker
+from utilities.llm import PhaseBinding, simple_text
 
 
-# Use a cheaper/faster model for consistency checks
-CONSISTENCY_MODEL = "claude-sonnet-4-20250514"
 MAX_TOKENS = 4096
 
 
@@ -158,6 +157,7 @@ def _group_by_signature_pattern(results: list) -> dict:
 def run_stage1_consistency_check(
     results: list,
     code_by_route: dict,
+    binding: PhaseBinding,
     tracker: TokenTracker,
     logger=None
 ) -> list:
@@ -212,9 +212,6 @@ def run_stage1_consistency_check(
     log("info", f"Stage 1 consistency check: Found {len(inconsistent_groups)} inconsistent pattern(s)",
         step="detect")
 
-    # Resolve inconsistencies
-    client = AnthropicClient(model=CONSISTENCY_MODEL, tracker=tracker)
-
     for pattern, group in inconsistent_groups:
         verdicts = [r.get("verdict", "UNKNOWN") for r in group]
         route_keys = [r.get("route_key", "") for r in group]
@@ -225,7 +222,7 @@ def run_stage1_consistency_check(
         # Call LLM to resolve
         try:
             consistency_result = _resolve_stage1_inconsistency(
-                client, group, code_by_route, tracker
+                binding, group, code_by_route, tracker
             )
 
             if consistency_result and consistency_result.findings_updated:
@@ -258,30 +255,22 @@ def run_stage1_consistency_check(
 
 
 def _resolve_stage1_inconsistency(
-    client: AnthropicClient,
+    binding: PhaseBinding,
     group: list,
     code_by_route: dict,
-    tracker: TokenTracker
+    tracker: TokenTracker,
 ) -> Optional[Stage1ConsistencyResult]:
     """Use LLM to resolve inconsistent Stage 1 verdicts."""
     prompt = get_stage1_consistency_prompt(group, code_by_route)
 
     try:
-        response = client.messages.create(
-            model=CONSISTENCY_MODEL,
-            max_tokens=MAX_TOKENS,
+        text = simple_text(
+            binding,
+            prompt,
             system="You are checking verdict consistency across similar code patterns in a security analysis.",
-            messages=[{"role": "user", "content": prompt}]
+            max_tokens=MAX_TOKENS,
+            tracker=tracker,
         )
-
-        tracker.record_call(
-            model=CONSISTENCY_MODEL,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens
-        )
-
-        # Parse response
-        text = response.content[0].text if response.content else ""
 
         # Extract JSON from response
         json_match = re.search(r'\{[\s\S]*\}', text)

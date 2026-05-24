@@ -18,6 +18,12 @@ from core import tracking
 from core.progress import ProgressReporter
 from utilities.rate_limiter import configure_rate_limiter
 from utilities.file_io import read_json, write_json
+from utilities.llm import (
+    PhaseRegistry,
+    build_phase_registry,
+    load_config_file,
+    resolve_llm_config,
+)
 
 
 def enhance_dataset(
@@ -27,7 +33,8 @@ def enhance_dataset(
     repo_path: str | None = None,
     mode: str = "agentic",
     checkpoint_path: str | None = None,
-    model: str = "sonnet",
+    registry: PhaseRegistry | None = None,
+    llm_config_name: str | None = None,
     workers: int = 8,
     backoff_seconds: int = 30,
 ) -> EnhanceResult:
@@ -41,7 +48,11 @@ def enhance_dataset(
         mode: "agentic" (thorough, tool-use) or "single-shot" (fast, cheaper).
         checkpoint_path: Path to save/resume checkpoint (agentic mode only).
             If None, auto-derived from output_path.
-        model: "sonnet" (default, cost-effective).
+        registry: Pre-built PhaseRegistry. Scanners pass theirs;
+            standalone callers leave this None and a registry is
+            constructed from ``llm_config_name``.
+        llm_config_name: Name of the llm-config when ``registry`` is
+            None. ``None`` falls through to the active config.
         workers: Number of parallel workers (default: 8).
         backoff_seconds: Seconds to wait on rate limit before retry (default: 30).
 
@@ -51,9 +62,18 @@ def enhance_dataset(
     # Configure global rate limiter
     configure_rate_limiter(backoff_seconds=float(backoff_seconds))
 
-    model_id = "claude-sonnet-4-20250514" if model == "sonnet" else "claude-opus-4-6"
+    # Resolve the enhance-phase binding from the registry.
+    # Standalone-invocation path validates upfront (same pattern as
+    # run_analysis); scanner-driven calls trust the scanner's probe.
+    if registry is None:
+        from utilities.llm import probe_registry_or_raise
+
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+        probe_registry_or_raise(registry)
+    binding = registry.get("enhance")
     print(f"[Enhance] Mode: {mode}", file=sys.stderr)
-    print(f"[Enhance] Model: {model_id}", file=sys.stderr)
+    print(f"[Enhance] Provider: {binding.provider_name}, Model: {binding.model}", file=sys.stderr)
 
     # Auto-derive checkpoint path for agentic mode
     if mode == "agentic" and checkpoint_path is None:
@@ -61,12 +81,11 @@ def enhance_dataset(
         checkpoint_path = os.path.join(output_dir, "enhance_checkpoints")
 
     # Import here to avoid heavy imports at module load
-    from utilities.llm_client import AnthropicClient, get_global_tracker
+    from utilities.llm_client import get_global_tracker
     from utilities.context_enhancer import ContextEnhancer
 
     tracker = get_global_tracker()
-    client = AnthropicClient(model=model_id, tracker=tracker)
-    enhancer = ContextEnhancer(client=client, tracker=tracker)
+    enhancer = ContextEnhancer(binding=binding, tracker=tracker)
 
     # Load dataset
     print(f"[Enhance] Loading dataset: {dataset_path}", file=sys.stderr)

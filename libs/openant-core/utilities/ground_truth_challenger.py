@@ -18,7 +18,7 @@ import sys
 from typing import Optional
 from dataclasses import dataclass
 
-from .llm_client import AnthropicClient
+from .llm import PhaseBinding, simple_text
 
 
 @dataclass
@@ -159,7 +159,7 @@ CRITICAL: Respond with ONLY valid JSON.
 RESPOND WITH JSON ONLY."""
 
 
-def _parse_json_response(response: str, client=None) -> Optional[dict]:
+def _parse_json_response(response: str, binding: Optional[PhaseBinding] = None) -> Optional[dict]:
     """Parse JSON response from LLM, with LLM correction fallback."""
     response = response.strip()
 
@@ -187,10 +187,10 @@ def _parse_json_response(response: str, client=None) -> Optional[dict]:
                 pass
 
     # Fallback: use LLM to correct malformed JSON
-    if response.strip() and client:
+    if response.strip() and binding is not None:
         try:
             from utilities.json_corrector import JSONCorrector
-            corrector = JSONCorrector(client)
+            corrector = JSONCorrector(binding)
             corrected = corrector.attempt_correction(response)
             if corrected.get("verdict") != "ERROR":
                 corrected["json_corrected"] = True
@@ -209,16 +209,14 @@ class GroundTruthChallenger:
     2. Validate false negatives - did the model miss something, or is the ground truth wrong?
     """
 
-    def __init__(self, client: AnthropicClient, model: str = "claude-sonnet-4-20250514"):
+    def __init__(self, binding: PhaseBinding):
         """
         Initialize the challenger.
 
         Args:
-            client: Anthropic client for LLM calls
-            model: Model to use for arbitration (Sonnet for cost efficiency)
+            binding: Phase binding for the LLM call (typically the analyze phase's).
         """
-        self.client = client
-        self.model = model
+        self.binding = binding
 
     def challenge_false_positive(
         self,
@@ -249,8 +247,8 @@ class GroundTruthChallenger:
         )
 
         try:
-            response = self.client.analyze_sync(prompt, model=self.model)
-            parsed = _parse_json_response(response, client=self.client)
+            response = simple_text(self.binding, prompt)
+            parsed = _parse_json_response(response, binding=self.binding)
 
             if parsed:
                 return ChallengeResult(
@@ -322,8 +320,8 @@ class GroundTruthChallenger:
         )
 
         try:
-            response = self.client.analyze_sync(prompt, model=self.model)
-            parsed = _parse_json_response(response, client=self.client)
+            response = simple_text(self.binding, prompt)
+            parsed = _parse_json_response(response, binding=self.binding)
 
             if not parsed:
                 print(f"      Failed to parse response: {response[:500]}...", file=sys.stderr)
@@ -503,13 +501,14 @@ def print_challenge_report(challenges: dict) -> None:
 
 def test_challenger():
     """Test the ground truth challenger with sample data."""
-    from .llm_client import AnthropicClient
+    from .llm import build_phase_registry, load_config_file, resolve_llm_config
 
     print("Testing Ground Truth Challenger", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
 
-    client = AnthropicClient()
-    challenger = GroundTruthChallenger(client)
+    cf = load_config_file()
+    registry = build_phase_registry(cf, resolve_llm_config(cf, None))
+    challenger = GroundTruthChallenger(registry.get("analyze"))
 
     # Sample FP test case
     fp_code = """

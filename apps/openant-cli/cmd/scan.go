@@ -43,7 +43,7 @@ var (
 	scanNoReport        bool
 	scanSkipDynamicTest bool
 	scanLimit           int
-	scanModel       string
+	scanLLMConfig   string
 	scanWorkers     int
 	scanBackoff     int
 	scanFull        bool
@@ -73,7 +73,7 @@ func registerScanFlags(cmd *cobra.Command) {
 	cmd.Flags().BoolVar(&scanNoReport, "no-report", false, "Skip report generation")
 	cmd.Flags().BoolVar(&scanSkipDynamicTest, "skip-dynamic-test", false, "Skip Docker-isolated dynamic testing (default: run dynamic tests)")
 	cmd.Flags().IntVar(&scanLimit, "limit", 0, "Max units to analyze (0 = no limit)")
-	cmd.Flags().StringVar(&scanModel, "model", "opus", "Model: opus or sonnet")
+	cmd.Flags().StringVar(&scanLLMConfig, "llm-config", "", "Name of the llm-config in ~/.config/openant/config.json (defaults to the file's default_llm, or the built-in 'openant-default' if no config file exists). See `openant llm-config list`.")
 	cmd.Flags().IntVar(&scanWorkers, "workers", 8, "Number of parallel workers for LLM steps (default: 8)")
 	cmd.Flags().IntVar(&scanBackoff, "backoff", 30, "Seconds to wait when rate-limited (default: 30)")
 	cmd.Flags().BoolVar(&scanFull, "full", false, "Force full scan (rejects --incremental/--diff-base/--pr)")
@@ -189,8 +189,8 @@ func runScan(cmd *cobra.Command, args []string) {
 	if scanLimit > 0 {
 		pyArgs = append(pyArgs, "--limit", fmt.Sprintf("%d", scanLimit))
 	}
-	if scanModel != "opus" {
-		pyArgs = append(pyArgs, "--model", scanModel)
+	if scanLLMConfig != "" {
+		pyArgs = append(pyArgs, "--llm-config", scanLLMConfig)
 	}
 	if scanWorkers != 8 {
 		pyArgs = append(pyArgs, "--workers", fmt.Sprintf("%d", scanWorkers))

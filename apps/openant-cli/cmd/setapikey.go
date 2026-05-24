@@ -2,40 +2,20 @@ package cmd
 
 import (
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/knostic/open-ant-cli/internal/config"
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/spf13/cobra"
 )
 
-var anthropicAPIURL = "https://api.anthropic.com/v1/messages"
-
+// validateAPIKey is the back-compat wrapper for ``openant set-api-key``.
+// Delegates to the shared ``probeAnthropic`` helper which is also used by
+// ``openant setup llm`` so both code paths agree on what "the key works"
+// means.
 func validateAPIKey(key string) error {
-	body := strings.NewReader(`{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
-	req, err := http.NewRequest("POST", anthropicAPIURL, body)
-	if err != nil {
-		return fmt.Errorf("failed to build validation request: %w", err)
-	}
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("content-type", "application/json")
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("could not reach Anthropic API: %w", err)
-	}
-	defer func() { _, _ = io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("Anthropic rejected the key (HTTP 401). Double-check it at https://console.anthropic.com/settings/keys")
-	}
-	return nil
+	return probeAnthropic(key, "", "claude-haiku-4-5-20251001")
 }
 
 var setAPIKeyCmd = &cobra.Command{
@@ -79,7 +59,12 @@ func runSetAPIKey(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	cfg.APIKey = key
+	// SetAPIKey updates the v1 ``api_key`` AND the v2
+	// ``llm_providers["anthropic"].api_key`` entry (if present) so
+	// users who have authored an explicit anthropic provider see
+	// the rotation applied to their actual provider, not just the
+	// legacy field. See config.Config.SetAPIKey.
+	cfg.SetAPIKey(key)
 
 	if err := config.Save(cfg); err != nil {
 		output.PrintError(err.Error())

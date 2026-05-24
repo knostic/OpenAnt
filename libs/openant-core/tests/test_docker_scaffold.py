@@ -24,6 +24,42 @@ if "anthropic" not in sys.modules:
     sys.modules["anthropic"] = _stub
 
 
+def _fake_registry():
+    """Build a PhaseRegistry whose adapter never probes the network.
+
+    The orchestrator tests below mock ``generate_test`` and
+    ``run_single_container`` so the adapter is never actually called.
+    But ``run_dynamic_tests`` still builds a registry when none is
+    passed in, which probes Anthropic at startup. Pre-issue-#65 the
+    test relied on an ``ANTHROPIC_API_KEY`` happening to be in env;
+    that's no longer reliable. Injecting a fake registry removes the
+    env dependency entirely.
+    """
+    from utilities.llm import PhaseBinding, PhaseRegistry
+
+    class _NoopAdapter:
+        name = "anthropic"
+        supports_tools = True
+
+        def complete(self, **kwargs):  # pragma: no cover - mocked away
+            raise AssertionError("orchestrator tests should not reach the adapter")
+
+        def validate(self, model):
+            pass
+
+    adapter = _NoopAdapter()
+    bindings = {
+        phase: PhaseBinding(
+            phase=phase,
+            adapter=adapter,
+            model="test-model",
+            provider_name="anthropic",
+        )
+        for phase in ("analyze", "enhance", "verify", "report", "dynamic_test", "llm_reach", "app_context")
+    }
+    return PhaseRegistry(bindings=bindings, config_name="docker-test-config")
+
+
 def test_write_test_files_stages_source(tmp_path):
     """_write_test_files must copy the vulnerable source into the work dir."""
     from utilities.dynamic_tester.docker_executor import _write_test_files
@@ -107,7 +143,7 @@ def test_orchestrator_passes_source_file(tmp_path, monkeypatch):
     # Track what run_single_container receives
     captured_kwargs = {}
 
-    def mock_generate_test(finding, repo_info, tracker):
+    def mock_generate_test(finding, repo_info, binding, tracker):
         return {
             "dockerfile": "FROM python:3.11\nCMD echo hi",
             "test_script": "print('ok')",
@@ -131,6 +167,7 @@ def test_orchestrator_passes_source_file(tmp_path, monkeypatch):
         output_dir=str(tmp_path / "out"),
         max_retries=0,
         repo_path=str(repo),
+        registry=_fake_registry(),
     )
 
     assert captured_kwargs.get("source_file") is not None, (
@@ -163,7 +200,7 @@ def test_orchestrator_works_without_repo_path(tmp_path, monkeypatch):
 
     captured_kwargs = {}
 
-    def mock_generate_test(finding, repo_info, tracker):
+    def mock_generate_test(finding, repo_info, binding, tracker):
         return {
             "dockerfile": "FROM python:3.11\nCMD echo hi",
             "test_script": "print('ok')",
@@ -186,6 +223,7 @@ def test_orchestrator_works_without_repo_path(tmp_path, monkeypatch):
         pipeline_output_path=str(po_path),
         output_dir=str(tmp_path / "out"),
         max_retries=0,
+        registry=_fake_registry(),
     )
 
     assert captured_kwargs.get("source_file") is None, (

@@ -34,7 +34,15 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from utilities.llm_client import AnthropicClient, get_global_tracker
+from utilities.llm_client import get_global_tracker
+from utilities.llm import (
+    PhaseBinding,
+    build_phase_registry,
+    load_config_file,
+    probe_registry_or_raise,
+    resolve_llm_config,
+    simple_text,
+)
 from utilities.file_io import read_json, write_json
 from prompts.prompt_selector import get_analysis_prompt
 from prompts.vulnerability_analysis import get_system_prompt as get_stage1_system_prompt
@@ -322,7 +330,7 @@ def parse_response(response: str) -> dict:
 
 
 def analyze_unit(
-    client: AnthropicClient,
+    binding: PhaseBinding,
     unit: dict,
     use_multifile: bool = False,
     json_corrector: JSONCorrector = None,
@@ -333,7 +341,7 @@ def analyze_unit(
     Analyze a single code unit.
 
     Args:
-        client: Anthropic client
+        binding: Phase binding (provider+model) for the analyze phase.
         unit: The code unit to analyze
         use_multifile: If True, use multi-file prompt for enhanced datasets
         json_corrector: Optional JSON corrector. If not provided, one is created
@@ -404,10 +412,10 @@ def analyze_unit(
         app_context=app_context
     )
 
-    # Call Claude with system prompt for threat model awareness
+    # Call the configured analyze-phase model with the threat-model system prompt.
     start_time = datetime.now()
     system_prompt = get_stage1_system_prompt(app_context=app_context)
-    response = client.analyze_sync(prompt, system=system_prompt)
+    response = simple_text(binding, prompt, system=system_prompt)
     elapsed = (datetime.now() - start_time).total_seconds()
 
     # Parse response
@@ -415,9 +423,11 @@ def analyze_unit(
 
     # If parsing failed or verdict is missing, try JSON correction
     if result.get("verdict") in ("ERROR", None):
-        # Create JSONCorrector internally if not provided (same pattern as other components)
+        # Create JSONCorrector internally if not provided (same pattern as other components).
+        # JSONCorrector inherits the analyze binding — correction calls
+        # go to the same provider+model as the failing call.
         if json_corrector is None:
-            json_corrector = JSONCorrector(client)
+            json_corrector = JSONCorrector(binding)
         corrected = json_corrector.attempt_correction(response)
         corrected = _normalize_result(corrected)
         if corrected.get("verdict") not in ("ERROR", None):
@@ -445,7 +455,7 @@ def analyze_unit(
 def run_experiment(
     dataset_name: str,
     limit: int = None,
-    model: str = "opus",
+    llm_config_name: str = None,
     enhanced: bool = True,
     correct_context: bool = True,
     correct_json: bool = True,
@@ -460,7 +470,9 @@ def run_experiment(
     Args:
         dataset_name: Name of dataset to analyze
         limit: Max number of units to analyze (None = all)
-        model: "opus" or "sonnet"
+        llm_config_name: Name of the llm-config to use. ``None`` falls
+            through to the active config (``default_llm`` in config.json,
+            or the built-in ``openant-default``).
         enhanced: If True, use enhanced datasets with multi-file context (default: True)
         correct_context: If True, attempt to correct INSUFFICIENT_CONTEXT by finding missing code (default: True)
         correct_json: If True, attempt to correct malformed JSON responses using LLM (default: True)
@@ -472,9 +484,19 @@ def run_experiment(
     Returns:
         Experiment results with metrics
     """
-    # Select model
-    model_id = "claude-opus-4-20250514" if model == "opus" else "claude-sonnet-4-20250514"
-    print(f"Using model: {model_id}")
+    # Build the registry once and resolve per-phase bindings from it.
+    # Sub-components reuse the same registry so a single ``--llm-config``
+    # propagates to analyze, verify, enhance, etc.
+    cf = load_config_file()
+    llm_config = resolve_llm_config(cf, llm_config_name)
+    registry = build_phase_registry(cf, llm_config)
+    # Standalone-script entry point — probe upfront so a bad key /
+    # typo'd model surfaces with the canonical preamble (matches
+    # the gating in core/scanner.py and the per-step CLI verbs).
+    probe_registry_or_raise(registry)
+    analyze_binding = registry.get("analyze")
+    print(f"Using llm-config: {llm_config.name}")
+    print(f"Analyze: {analyze_binding.provider_name}/{analyze_binding.model}")
     print(f"Enhanced context: {enhanced}")
     print(f"Context correction: {correct_context}")
     print(f"JSON correction: {correct_json}")
@@ -482,21 +504,18 @@ def run_experiment(
     print(f"Review context (LLM): {review_context}")
     print(f"Stage 2 verification: {verify}")
 
-    # Initialize client
-    client = AnthropicClient(model=model_id)
-
     # Initialize context corrector if enabled
     corrector = None
     if correct_context:
         repo_path = REPO_PATHS.get(dataset_name)
         if repo_path and os.path.exists(repo_path):
-            corrector = ContextCorrector(client, repo_path, max_retries=2)
+            corrector = ContextCorrector(analyze_binding, repo_path, max_retries=2)
             print(f"Context corrector enabled (repo: {repo_path})")
 
     # Initialize JSON corrector if enabled
     json_corrector = None
     if correct_json:
-        json_corrector = JSONCorrector(client)
+        json_corrector = JSONCorrector(analyze_binding)
         print("JSON corrector enabled")
 
     # Initialize context reviewer if enabled
@@ -504,7 +523,7 @@ def run_experiment(
     if review_context:
         repo_path = REPO_PATHS.get(dataset_name)
         if repo_path and os.path.exists(repo_path):
-            context_reviewer = ContextReviewer(client, repo_path)
+            context_reviewer = ContextReviewer(analyze_binding, repo_path)
             print(f"Context reviewer enabled (repo: {repo_path})")
 
     # Load application context if available (reduces false positives)
@@ -554,7 +573,7 @@ def run_experiment(
         print(f"[{i+1}/{len(units)}] Analyzing {unit_id}{classification_tag}...")
 
         try:
-            result = analyze_unit(client, unit, use_multifile=enhanced, json_corrector=json_corrector, context_reviewer=context_reviewer, app_context=app_context)
+            result = analyze_unit(analyze_binding, unit, use_multifile=enhanced, json_corrector=json_corrector, context_reviewer=context_reviewer, app_context=app_context)
 
             # Track code for this route (for challenger)
             code_field = unit.get("code", {})
@@ -699,9 +718,10 @@ def run_experiment(
 
             verifier = FindingVerifier(
                 index=repo_index,
+                binding=registry.get("verify"),
                 tracker=get_global_tracker(),
                 verbose=verify_verbose,
-                app_context=app_context
+                app_context=app_context,
             )
 
             # Track verification metrics
@@ -847,7 +867,7 @@ def run_experiment(
                 }
 
         # Run the challenger
-        challenger = GroundTruthChallenger(client)
+        challenger = GroundTruthChallenger(analyze_binding)
         challenges = challenger.challenge_results(results, gt_for_challenger, code_by_route)
 
         # Print challenge report
@@ -885,7 +905,8 @@ def run_experiment(
 
     experiment_result = {
         "dataset": dataset_name,
-        "model": model_id,
+        "llm_config": llm_config.name,
+        "analyze_model": analyze_binding.model,
         "enhanced": enhanced,
         "timestamp": datetime.now().isoformat(),
         "metrics": metrics,
@@ -960,10 +981,13 @@ def main():
         help="Limit number of units to analyze"
     )
     parser.add_argument(
-        "--model", "-m",
-        choices=["opus", "sonnet"],
-        default="opus",
-        help="Model to use (default: opus for best capability)"
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config in ~/.config/openant/config.json to use. "
+            "Defaults to the file's `default_llm` (or the built-in "
+            "`openant-default` when no config file exists)."
+        ),
     )
     parser.add_argument(
         "--no-enhanced",
@@ -1013,7 +1037,7 @@ def main():
     experiment = run_experiment(
         dataset_name=args.dataset,
         limit=args.limit,
-        model=args.model,
+        llm_config_name=args.llm_config,
         enhanced=not args.no_enhanced,
         correct_context=not args.no_correct,
         correct_json=not args.no_json_correct,
@@ -1031,7 +1055,8 @@ def main():
         output_path = args.output
     else:
         suffix = "" if args.no_enhanced else "_enhanced"
-        output_path = f"experiment_{args.dataset}_{args.model}{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        config_tag = args.llm_config or "default"
+        output_path = f"experiment_{args.dataset}_{config_tag}{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
     write_json(output_path, experiment)
     print()

@@ -94,41 +94,10 @@ def test_print_summary_no_warning_on_normal_scan(normal_result):
 
 
 # ---------------------------------------------------------------------------
-# Prong B — analyze_sync must surface AuthenticationError clearly
+# Note: the previous "analyze_sync surfaces AuthenticationError" test was
+# removed when the AnthropicClient wrapper was deleted (issue #65). The
+# equivalent contract — "an auth failure surfaces as LLMAuthError, not
+# swallowed" — is now enforced by ``test_llm_adapter_contract.py`` for
+# every registered adapter, and by ``test_llm_anthropic_adapter.py`` at
+# the Anthropic SDK boundary specifically.
 # ---------------------------------------------------------------------------
-
-def test_analyze_sync_raises_on_auth_error():
-    """When the Anthropic API returns 401, analyze_sync must not swallow it."""
-    import os
-    os.environ["ANTHROPIC_API_KEY"] = "sk-test-bad-key"
-
-    from utilities.llm_client import AnthropicClient
-
-    # Remove the mock from sys.modules to get the real anthropic SDK
-    mock_anthropic = sys.modules.pop("anthropic", None)
-    try:
-        import importlib
-        importlib.invalidate_caches()
-        from anthropic import AuthenticationError
-        import httpx
-
-        # Create a mock response object for the APIStatusError
-        mock_response = MagicMock(spec=httpx.Response)
-        mock_response.status_code = 401
-        mock_response.headers = {"request-id": "test-123"}
-
-        client = AnthropicClient.__new__(AnthropicClient)
-        client.client = MagicMock()
-        # Create the error with the correct signature
-        error = AuthenticationError(message="invalid x-api-key", response=mock_response, body={"error": "invalid_api_key"})
-        client.client.messages.create.side_effect = error
-        client.model = "claude-haiku-4-5-20251001"
-        client.tracker = MagicMock()
-        client.last_call = None
-
-        with pytest.raises(AuthenticationError):
-            client.analyze_sync("test prompt")
-    finally:
-        # Restore the mock for other tests
-        if mock_anthropic is not None:
-            sys.modules["anthropic"] = mock_anthropic

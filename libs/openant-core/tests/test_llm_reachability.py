@@ -9,7 +9,7 @@ run without network access or an API key.
 from __future__ import annotations
 
 import json
-from typing import List
+from typing import List, TYPE_CHECKING
 
 import pytest
 
@@ -22,29 +22,64 @@ from core.llm_reachability import (
     signals_to_json,
 )
 
+if TYPE_CHECKING:
+    from utilities.llm import PhaseBinding
+
 
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
 
 
-class FakeClient:
-    """Minimal stand-in for AnthropicClient.
+class FakeAdapter:
+    """Minimal stand-in for :class:`LLMAdapter`.
 
-    Records calls and replays a fixed sequence of canned responses.
+    Records calls and replays a fixed sequence of canned text replies.
+    Used to build a :class:`PhaseBinding` test callers can hand to
+    ``analyze_reachability``.
     """
+
+    name = "anthropic"
+    supports_tools = True
 
     def __init__(self, responses: List[str]):
         self._responses = list(responses)
         self.calls: List[dict] = []
 
-    def analyze_sync(self, prompt: str, max_tokens: int = 4096, model: str = ""):
+    def complete(self, *, model, system, messages, max_tokens, tools=None):
+        from utilities.llm import CompletionResult, TextBlock
+
+        # ``simple_text`` builds a single TextBlock user message, so
+        # the prompt the test cares about is the .text of the only
+        # block of the only message.
+        prompt = messages[0].content[0].text
         self.calls.append(
             {"prompt": prompt, "max_tokens": max_tokens, "model": model}
         )
         if not self._responses:
-            return '{"signals": []}'
-        return self._responses.pop(0)
+            text = '{"signals": []}'
+        else:
+            text = self._responses.pop(0)
+        return CompletionResult(
+            content=[TextBlock(text)],
+            input_tokens=10,
+            output_tokens=10,
+            stop_reason="end_turn",
+        )
+
+    def validate(self, model):
+        pass
+
+
+def _binding(adapter: "FakeAdapter") -> "PhaseBinding":
+    from utilities.llm import PhaseBinding
+
+    return PhaseBinding(
+        phase="llm_reach",
+        adapter=adapter,
+        model="claude-test",
+        provider_name="anthropic",
+    )
 
 
 def _make_unit(unit_id: str, code: str = "pass", **kw) -> dict:
@@ -217,61 +252,67 @@ class TestAnalyzeReachability:
                 ]
             }
         )
-        client = FakeClient([canned])
-        signals = analyze_reachability(dataset, client=client)
+        adapter = FakeAdapter([canned])
+        signals = analyze_reachability(dataset, binding=_binding(adapter))
         assert len(signals) == 2
         assert {s.kind for s in signals} == {"entry_point", "external_input"}
-        assert len(client.calls) == 1
+        assert len(adapter.calls) == 1
 
     def test_app_context_threaded_into_prompt(self):
         dataset = {"units": [_make_unit("a:f")]}
-        client = FakeClient(['{"signals": []}'])
+        adapter = FakeAdapter(['{"signals": []}'])
         ctx = {"application_type": "web_app", "framework": "Flask"}
-        analyze_reachability(dataset, app_context=ctx, client=client)
-        assert "Flask" in client.calls[0]["prompt"]
-        assert "web_app" in client.calls[0]["prompt"]
+        analyze_reachability(dataset, app_context=ctx, binding=_binding(adapter))
+        assert "Flask" in adapter.calls[0]["prompt"]
+        assert "web_app" in adapter.calls[0]["prompt"]
 
     def test_malformed_response_handled_gracefully(self):
         dataset = {"units": [_make_unit("a:f")]}
         errors: List[str] = []
-        client = FakeClient(["this is not JSON"])
+        adapter = FakeAdapter(["this is not JSON"])
         sigs = analyze_reachability(
-            dataset, client=client, on_error=errors.append
+            dataset, binding=_binding(adapter), on_error=errors.append
         )
         assert sigs == []
         assert errors  # at least one error logged
 
     def test_empty_dataset_returns_empty(self):
-        client = FakeClient([])
-        sigs = analyze_reachability({"units": []}, client=client)
+        adapter = FakeAdapter([])
+        sigs = analyze_reachability({"units": []}, binding=_binding(adapter))
         assert sigs == []
-        assert client.calls == []  # no LLM calls when nothing to review
+        assert adapter.calls == []  # no LLM calls when nothing to review
 
     def test_batch_size_chunks_units(self):
         dataset = {"units": [_make_unit(f"a:{i}") for i in range(7)]}
-        client = FakeClient(['{"signals": []}'] * 5)
-        analyze_reachability(dataset, client=client, batch_size=3)
+        adapter = FakeAdapter(['{"signals": []}'] * 5)
+        analyze_reachability(dataset, binding=_binding(adapter), batch_size=3)
         # 7 units / 3 per batch = 3 calls
-        assert len(client.calls) == 3
+        assert len(adapter.calls) == 3
 
     def test_non_positive_batch_size_uses_single_batch(self):
         """``batch_size <= 0`` historically tripped a NameError. Guard the
         contract: non-positive size collapses to a single batch covering all
         units (and never raises)."""
         dataset = {"units": [_make_unit(f"a:{i}") for i in range(4)]}
-        client = FakeClient(['{"signals": []}'])
-        analyze_reachability(dataset, client=client, batch_size=0)
-        assert len(client.calls) == 1
+        adapter = FakeAdapter(['{"signals": []}'])
+        analyze_reachability(dataset, binding=_binding(adapter), batch_size=0)
+        assert len(adapter.calls) == 1
 
-    def test_client_exception_does_not_crash(self):
+    def test_adapter_exception_does_not_crash(self):
         class Boom:
-            def analyze_sync(self, *a, **kw):
+            name = "anthropic"
+            supports_tools = True
+
+            def complete(self, **kw):
                 raise RuntimeError("api boom")
+
+            def validate(self, model):
+                pass
 
         errors: List[str] = []
         sigs = analyze_reachability(
             {"units": [_make_unit("a:f")]},
-            client=Boom(),
+            binding=_binding(Boom()),
             on_error=errors.append,
         )
         assert sigs == []
@@ -436,7 +477,7 @@ class TestCliPlumbing:
             dynamic_test=False,
             no_skip_tests=False,
             limit=None,
-            model="opus",
+            llm_config=None,
             workers=1,
             repo_name=None,
             repo_url=None,
@@ -477,7 +518,7 @@ class TestCliPlumbing:
             dynamic_test=False,
             no_skip_tests=False,
             limit=None,
-            model="opus",
+            llm_config=None,
             workers=1,
             repo_name=None,
             repo_url=None,

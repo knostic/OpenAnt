@@ -20,6 +20,8 @@ def run_tests(
     output_dir: str,
     max_retries: int = 3,
     repo_path: str | None = None,
+    registry=None,
+    llm_config_name: str | None = None,
 ) -> DynamicTestStepResult:
     """Run dynamic exploit tests on confirmed vulnerabilities.
 
@@ -29,6 +31,9 @@ def run_tests(
         pipeline_output_path: Path to ``pipeline_output.json``.
         output_dir: Directory for test results.
         max_retries: Max retries per finding on error (default 3).
+        registry: Pre-built PhaseRegistry passed down by the scanner.
+            Standalone callers omit this and pay one config-load.
+        llm_config_name: Name of the llm-config when registry is None.
 
     Returns:
         DynamicTestStepResult with counts and paths.
@@ -83,6 +88,8 @@ def run_tests(
         output_dir,
         max_retries=max_retries,
         repo_path=repo_path,
+        registry=registry,
+        llm_config_name=llm_config_name,
     )
 
     # Count outcomes

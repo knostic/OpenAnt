@@ -9,13 +9,19 @@ This handles cases where:
 2. The JSON is incomplete or truncated
 3. The JSON has syntax errors
 4. The response contains multiple JSON objects
+
+Note (issue #65): JSON correction inherits the parent phase's
+:class:`PhaseBinding` rather than hardcoding Sonnet. For all-Anthropic
+users this means Opus-phase corrections now also use Opus — a small
+cost bump — but it's the only correct behavior for non-Anthropic
+configurations where a "Sonnet" model may not even exist.
 """
 
 import json
 import sys
 from typing import Optional
 
-from .llm_client import AnthropicClient
+from .llm import PhaseBinding, simple_text
 
 
 def get_json_extraction_prompt(raw_response: str) -> str:
@@ -61,14 +67,16 @@ Respond with the JSON only, no markdown, no explanation:"""
 
 
 def extract_json_with_llm(
-    client: AnthropicClient,
-    raw_response: str
+    binding: PhaseBinding,
+    raw_response: str,
 ) -> Optional[dict]:
     """
     Use LLM to extract JSON from a malformed response.
 
     Args:
-        client: Anthropic client for LLM calls
+        binding: Phase binding to issue the LLM call against. Typically
+            the binding of whatever phase received the malformed
+            response in the first place (analyze, verify, etc.).
         raw_response: The raw response that failed to parse
 
     Returns:
@@ -80,12 +88,7 @@ def extract_json_with_llm(
     prompt = get_json_extraction_prompt(raw_response)
 
     try:
-        # Use Sonnet for extraction (faster/cheaper)
-        llm_response = client.analyze_sync(
-            prompt,
-            model="claude-sonnet-4-20250514",
-            max_tokens=2048
-        )
+        llm_response = simple_text(binding, prompt, max_tokens=2048)
         return _parse_json_response(llm_response)
     except Exception as e:
         print(f"      JSON extraction failed: {e}", file=sys.stderr)
@@ -126,14 +129,16 @@ class JSONCorrector:
     Handles JSON correction for malformed LLM responses.
     """
 
-    def __init__(self, client: AnthropicClient):
+    def __init__(self, binding: PhaseBinding):
         """
         Initialize the corrector.
 
         Args:
-            client: Anthropic client for LLM calls
+            binding: Phase binding for the LLM call. Reuse the binding
+                of the phase whose response we're correcting so the
+                correction call goes through the same provider+model.
         """
-        self.client = client
+        self.binding = binding
 
     def attempt_correction(self, raw_response: str) -> dict:
         """
@@ -147,7 +152,7 @@ class JSONCorrector:
         """
         print(f"      Attempting JSON correction with LLM...", file=sys.stderr)
 
-        extracted = extract_json_with_llm(self.client, raw_response)
+        extracted = extract_json_with_llm(self.binding, raw_response)
 
         if extracted:
             # Normalize finding -> verdict
@@ -260,9 +265,12 @@ Confidence: 0.95"""
     print("Testing JSON Corrector")
     print("=" * 60)
 
-    # Initialize client
-    client = AnthropicClient()
-    corrector = JSONCorrector(client)
+    # Resolve a binding for the analyze phase from the active config.
+    from .llm import build_phase_registry, load_config_file, resolve_llm_config
+
+    cf = load_config_file()
+    registry = build_phase_registry(cf, resolve_llm_config(cf, None))
+    corrector = JSONCorrector(registry.get("analyze"))
 
     for test_case in test_cases:
         print(f"\nTest: {test_case['name']}")

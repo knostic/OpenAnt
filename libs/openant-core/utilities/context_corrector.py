@@ -16,7 +16,8 @@ import subprocess
 import sys
 from typing import Optional
 
-from .llm_client import AnthropicClient, TokenTracker, get_global_tracker
+from .llm_client import TokenTracker, get_global_tracker
+from .llm import PhaseBinding, simple_text
 
 
 # Maximum characters per batch (leaving room for prompt overhead)
@@ -82,14 +83,14 @@ Only include files with HIGH or MEDIUM relevance. If none of the files contain t
 
 
 def parse_missing_context_with_llm(
-    client: AnthropicClient,
+    binding: PhaseBinding,
     response: dict
 ) -> Optional[str]:
     """
     Use LLM to parse an INSUFFICIENT_CONTEXT response and identify what's missing.
 
     Args:
-        client: Anthropic client for LLM calls
+        binding: Phase binding for the LLM call (typically the analyze phase's).
         response: The original analysis result with INSUFFICIENT_CONTEXT verdict
 
     Returns:
@@ -102,7 +103,7 @@ def parse_missing_context_with_llm(
     prompt = get_missing_context_prompt(reasoning)
 
     try:
-        llm_response = client.analyze_sync(prompt, model="claude-sonnet-4-20250514")
+        llm_response = simple_text(binding, prompt)
         parsed = _parse_json_response(llm_response)
 
         if parsed and "missing_context" in parsed:
@@ -215,7 +216,7 @@ def format_batch_for_prompt(batch: list[dict]) -> str:
 
 
 def search_files_for_context(
-    client: AnthropicClient,
+    binding: PhaseBinding,
     missing_context: str,
     files: list[dict],
     already_included: list[str] = None
@@ -224,7 +225,7 @@ def search_files_for_context(
     Search through files using LLM to find the missing context.
 
     Args:
-        client: Anthropic client
+        binding: Phase binding for the LLM call.
         missing_context: Description of what we're looking for
         files: List of source files to search
         already_included: Files already in the analysis context
@@ -254,7 +255,7 @@ def search_files_for_context(
         prompt = get_file_search_prompt(missing_context, files_content, batch_info)
 
         try:
-            response = client.analyze_sync(prompt, model="claude-sonnet-4-20250514")
+            response = simple_text(binding, prompt)
             result = _parse_json_response(response)
 
             if result and result.get("found_files"):
@@ -315,18 +316,18 @@ class ContextCorrector:
     Tracks token usage and costs for all LLM calls.
     """
 
-    def __init__(self, client: AnthropicClient, repo_path: str, max_retries: int = 2, tracker: TokenTracker = None):
+    def __init__(self, binding: PhaseBinding, repo_path: str, max_retries: int = 2, tracker: TokenTracker = None):
         """
         Initialize the corrector.
 
         Args:
-            client: Anthropic client for LLM calls
+            binding: Phase binding for the LLM call (typically the analyze phase's).
             repo_path: Path to the source code repository
             max_retries: Maximum number of correction attempts
             tracker: Token tracker instance. Uses global tracker if not provided.
         """
         self.tracker = tracker or get_global_tracker()
-        self.client = client
+        self.binding = binding
         self.repo_path = repo_path
         self.max_retries = max_retries
         self._source_files = None  # Cache for source files
@@ -394,7 +395,7 @@ class ContextCorrector:
         for attempt in range(self.max_retries):
             # Step 1: Parse what's missing
             print(f"      Parsing missing context (attempt {attempt + 1})...", file=sys.stderr)
-            missing_context = parse_missing_context_with_llm(self.client, current_result)
+            missing_context = parse_missing_context_with_llm(self.binding, current_result)
 
             if not missing_context:
                 current_result["correction_attempted"] = True
@@ -406,7 +407,7 @@ class ContextCorrector:
             # Step 2: Search source files for the missing context
             source_files = self._get_source_files()
             found_files = search_files_for_context(
-                self.client,
+                self.binding,
                 missing_context,
                 source_files,
                 files_included
@@ -447,7 +448,7 @@ class ContextCorrector:
             try:
                 from datetime import datetime
                 start_time = datetime.now()
-                response = self.client.analyze_sync(prompt)
+                response = simple_text(self.binding, prompt)
                 elapsed = (datetime.now() - start_time).total_seconds()
 
                 # Parse the new response
@@ -511,10 +512,10 @@ class ContextCorrector:
                     pass
 
             # If all parsing failed, try LLM correction
-            if hasattr(self, 'client') and self.client:
+            if hasattr(self, 'binding') and self.binding:
                 try:
                     from utilities.json_corrector import JSONCorrector
-                    corrector = JSONCorrector(self.client)
+                    corrector = JSONCorrector(self.binding)
                     corrected = corrector.attempt_correction(response)
                     corrected = self._normalize_result(corrected)
                     if corrected.get("verdict") not in ("ERROR", None):
@@ -563,8 +564,12 @@ def test_corrector():
     print("Testing LLM-based Context Corrector", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
 
-    # Initialize client
-    client = AnthropicClient()
+    # Resolve the analyze-phase binding from the active config.
+    from .llm import build_phase_registry, load_config_file, resolve_llm_config
+
+    cf = load_config_file()
+    registry = build_phase_registry(cf, resolve_llm_config(cf, None))
+    binding = registry.get("analyze")
 
     for i, test_case in enumerate(test_cases):
         print(f"\nTest Case {i + 1}:", file=sys.stderr)
@@ -572,7 +577,7 @@ def test_corrector():
         print(file=sys.stderr)
 
         # Parse missing context
-        missing = parse_missing_context_with_llm(client, test_case)
+        missing = parse_missing_context_with_llm(binding, test_case)
         print(f"Missing context: {missing}", file=sys.stderr)
         print(file=sys.stderr)
 
@@ -587,7 +592,7 @@ def test_corrector():
 
             # Search for the missing context
             if missing:
-                found = search_files_for_context(client, missing, files, [])
+                found = search_files_for_context(binding, missing, files, [])
                 print(f"\nFound {len(found)} relevant files:", file=sys.stderr)
                 for f in found:
                     print(f"  - {f['relative_path']} ({f.get('relevance')}): {f.get('reason', '')[:50]}", file=sys.stderr)

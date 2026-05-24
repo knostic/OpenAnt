@@ -45,12 +45,10 @@ import json
 import re
 import sys
 from dataclasses import dataclass, asdict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-
-# Models — aligns with core/analyzer.py which uses "claude-opus-4-6" for Opus.
-MODEL_PRIMARY = "claude-opus-4-6"
-MODEL_SECONDARY = "claude-sonnet-4-20250514"
+if TYPE_CHECKING:
+    from utilities.llm import PhaseBinding
 
 
 # Maximum number of units to send in a single LLM call. Larger batches save
@@ -321,8 +319,7 @@ def _chunk(items: List[Any], size: int) -> List[List[Any]]:
 def analyze_reachability(
     dataset: Dict[str, Any],
     app_context: Optional[Dict[str, Any]] = None,
-    client: Any = None,
-    model: str = MODEL_PRIMARY,
+    binding: Optional["PhaseBinding"] = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_code_bytes: int = DEFAULT_MAX_CODE_BYTES,
     max_units: Optional[int] = None,
@@ -337,10 +334,12 @@ def analyze_reachability(
         app_context: Optional application context dict; included in the
             prompt to help the model reason about expected entry points
             (e.g. ``{"application_type": "web_app"}``).
-        client: An object exposing ``analyze_sync(prompt, max_tokens=...,
-            model=...)``. If omitted, an :class:`AnthropicClient` is
-            instantiated lazily.
-        model: Model id to use (defaults to Opus).
+        binding: :class:`PhaseBinding` carrying the adapter+model the
+            ``llm_reach`` phase should use. When omitted, a binding is
+            resolved from the active config file — useful for ad-hoc
+            scripts and tests; pipeline callers should always pass the
+            binding their scanner built so any ``--llm-config`` override
+            is honored.
         batch_size: Units per LLM call.
         max_code_bytes: Per-unit code-blob truncation limit. Higher values
             give the LLM more context (better recall on long handlers /
@@ -358,13 +357,30 @@ def analyze_reachability(
     if not units:
         return []
 
-    if client is None:
-        # Lazy import so unit tests can stub this out without an API key.
-        from utilities.llm_client import AnthropicClient
+    if binding is None:
+        # Self-contained fallback for callers that don't have a
+        # registry yet (standalone scripts, tests that didn't bother
+        # to pass one). Uses the same resolution path the scanner
+        # uses, so behavior matches a real scan — including the
+        # init-time probe so a misconfigured llm-config fails loud.
+        from utilities.llm import (
+            build_phase_registry,
+            load_config_file,
+            probe_registry_or_raise,
+            resolve_llm_config,
+        )
 
-        client = AnthropicClient(model=model)
+        cf = load_config_file()
+        llm_config = resolve_llm_config(cf, None)
+        registry = build_phase_registry(cf, llm_config)
+        probe_registry_or_raise(registry)
+        binding = registry.get("llm_reach")
 
     valid_ids = {u.get("id") for u in units if u.get("id")}
+
+    # Lazy import so this module stays usable when callers explicitly
+    # provide a binding and never want the registry fallback above.
+    from utilities.llm import simple_text
 
     signals: List[ReachabilitySignal] = []
     batches = _chunk(units, batch_size)
@@ -373,7 +389,7 @@ def analyze_reachability(
             batch, app_context=app_context, max_code_bytes=max_code_bytes
         )
         try:
-            text = client.analyze_sync(prompt, max_tokens=4096, model=model)
+            text = simple_text(binding, prompt, max_tokens=4096)
         except Exception as exc:  # noqa: BLE001 — advisory stage; never crash pipeline
             msg = f"batch {i + 1}/{len(batches)} failed: {exc}"
             if on_error:

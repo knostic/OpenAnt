@@ -8,38 +8,54 @@ import json
 import os
 import re
 import sys
-import anthropic
 from pathlib import Path
 from dotenv import load_dotenv
 
 from .schema import validate_pipeline_output, ValidationError
 from utilities.file_io import open_utf8, read_json
+from utilities.llm import (
+    PhaseBinding,
+    PhaseRegistry,
+    build_phase_registry,
+    load_config_file,
+    lookup_pricing,
+    resolve_llm_config,
+)
 
 load_dotenv()
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
-MODEL = "claude-opus-4-6"
-
-# Pricing per million tokens
-_PRICING = {
-    "claude-opus-4-6": {"input": 15.00, "output": 75.00},
-    "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
-    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-}
-_DEFAULT_PRICING = {"input": 3.00, "output": 15.00}
 
 
-def _extract_usage(response, model: str = MODEL) -> dict:
-    """Extract usage info from an Anthropic API response."""
-    usage = response.usage
-    pricing = _PRICING.get(model, _DEFAULT_PRICING)
-    input_cost = (usage.input_tokens / 1_000_000) * pricing["input"]
-    output_cost = (usage.output_tokens / 1_000_000) * pricing["output"]
+def _extract_usage(
+    input_tokens: int,
+    output_tokens: int,
+    model: str,
+    pricing: dict[str, float] | None = None,
+) -> dict:
+    """Build the usage dict from token counts.
+
+    ``pricing`` is the adapter's rates for ``model`` (issue #65 §9 —
+    pricing lives on the adapter, not on a shared global). When
+    omitted, we fall back to the legacy ``MODEL_PRICING`` global so
+    older call sites still produce a number; new code should always
+    pass ``binding.adapter.pricing.get(binding.model)``.
+    """
+    if pricing is None:
+        from utilities.llm_client import MODEL_PRICING
+
+        pricing = MODEL_PRICING.get(model)
+    if pricing is None:
+        total_cost = 0.0
+    else:
+        input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output"]
+        total_cost = input_cost + output_cost
     return {
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "total_tokens": usage.input_tokens + usage.output_tokens,
-        "cost_usd": round(input_cost + output_cost, 6),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "cost_usd": round(total_cost, 6),
     }
 
 
@@ -52,14 +68,6 @@ def _merge_usage(usages: list[dict]) -> dict:
         merged["total_tokens"] += u["total_tokens"]
         merged["cost_usd"] = round(merged["cost_usd"] + u["cost_usd"], 6)
     return merged
-
-
-def _check_api_key():
-    """Check that ANTHROPIC_API_KEY is set."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Error: ANTHROPIC_API_KEY environment variable not set.", file=sys.stderr)
-        print("Set it with: export ANTHROPIC_API_KEY=sk-ant-...", file=sys.stderr)
-        sys.exit(1)
 
 
 def load_prompt(name: str) -> str:
@@ -130,28 +138,42 @@ def _compact_for_summary(pipeline_data: dict) -> dict:
     return compact
 
 
-def generate_summary_report(pipeline_data: dict) -> tuple[str, dict]:
+def generate_summary_report(
+    pipeline_data: dict,
+    binding: PhaseBinding,
+) -> tuple[str, dict]:
     """Generate a summary report from pipeline data.
+
+    Args:
+        pipeline_data: Decoded pipeline_output.json content.
+        binding: Phase binding for the report phase.
 
     Returns:
         (report_text, usage_dict) where usage_dict has input_tokens,
         output_tokens, total_tokens, cost_usd.
     """
-    _check_api_key()
-    client = anthropic.Anthropic()
+    from utilities.llm import Message, TextBlock
 
     summary_data = _compact_for_summary(pipeline_data)
     system_prompt = load_prompt("system")
-    user_prompt = load_prompt("summary").replace("{pipeline_data}", json.dumps(summary_data, indent=2))
-
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=4096,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}]
+    user_prompt = load_prompt("summary").replace(
+        "{pipeline_data}", json.dumps(summary_data, indent=2)
     )
 
-    return response.content[0].text, _extract_usage(response)
+    result = binding.adapter.complete(
+        model=binding.model,
+        max_tokens=4096,
+        system=system_prompt,
+        messages=[Message(role="user", content=[TextBlock(user_prompt)])],
+    )
+
+    text = "\n".join(b.text for b in result.content if isinstance(b, TextBlock))
+    return text, _extract_usage(
+        result.input_tokens,
+        result.output_tokens,
+        binding.model,
+        pricing=lookup_pricing(binding),
+    )
 
 
 def _splice_code_section(llm_output: str, code_section: str) -> str:
@@ -194,14 +216,22 @@ def _splice_code_section(llm_output: str, code_section: str) -> str:
     return output
 
 
-def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[str, dict]:
+def generate_disclosure(
+    vulnerability_data: dict,
+    product_name: str,
+    binding: PhaseBinding,
+) -> tuple[str, dict]:
     """Generate a disclosure document for a single vulnerability.
+
+    Args:
+        vulnerability_data: Finding to disclose.
+        product_name: Repository / product name.
+        binding: Phase binding for the report phase.
 
     Returns:
         (disclosure_text, usage_dict)
     """
-    _check_api_key()
-    client = anthropic.Anthropic()
+    from utilities.llm import Message, TextBlock
 
     system_prompt = load_prompt("system")
 
@@ -220,20 +250,32 @@ def generate_disclosure(vulnerability_data: dict, product_name: str) -> tuple[st
         .replace("{vulnerability_data}", json.dumps(payload, indent=2), 1)
     )
 
-    response = client.messages.create(
-        model=MODEL,
+    result = binding.adapter.complete(
+        model=binding.model,
         max_tokens=4096,
         system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}]
+        messages=[Message(role="user", content=[TextBlock(user_prompt)])],
     )
 
-    llm_output = response.content[0].text
+    llm_output = "\n".join(
+        b.text for b in result.content if isinstance(b, TextBlock)
+    )
     final_output = _splice_code_section(llm_output, code_section)
 
-    return final_output, _extract_usage(response)
+    return final_output, _extract_usage(
+        result.input_tokens,
+        result.output_tokens,
+        binding.model,
+        pricing=lookup_pricing(binding),
+    )
 
 
-def generate_all(pipeline_path: str, output_dir: str) -> None:
+def generate_all(
+    pipeline_path: str,
+    output_dir: str,
+    registry: PhaseRegistry | None = None,
+    llm_config_name: str | None = None,
+) -> None:
     """Generate all reports from a pipeline output file."""
     pipeline_data = read_json(pipeline_path)
 
@@ -246,9 +288,15 @@ def generate_all(pipeline_path: str, output_dir: str) -> None:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # Resolve the report-phase binding once and reuse for every call.
+    if registry is None:
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+    report_binding = registry.get("report")
+
     # Generate summary report
     print("Generating summary report...")
-    summary, _usage = generate_summary_report(pipeline_data)
+    summary, _usage = generate_summary_report(pipeline_data, report_binding)
     with open_utf8(output_path / "SUMMARY_REPORT.md", "w") as f:
         f.write(summary)
     print(f"  -> {output_path / 'SUMMARY_REPORT.md'}")
@@ -264,7 +312,7 @@ def generate_all(pipeline_path: str, output_dir: str) -> None:
             continue
 
         print(f"Generating disclosure for {finding['short_name']}...")
-        disclosure, _usage = generate_disclosure(finding, product_name)
+        disclosure, _usage = generate_disclosure(finding, product_name, report_binding)
 
         safe_name = finding["short_name"].replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"

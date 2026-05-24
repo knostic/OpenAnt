@@ -26,7 +26,14 @@ from core.checkpoint import StepCheckpoint
 from core.progress import ProgressReporter
 
 # Import existing analysis machinery
-from utilities.llm_client import AnthropicClient, get_global_tracker
+from utilities.llm_client import get_global_tracker
+from utilities.llm import (
+    PhaseBinding,
+    PhaseRegistry,
+    build_phase_registry,
+    load_config_file,
+    resolve_llm_config,
+)
 from utilities.file_io import read_json, write_json
 from utilities.json_corrector import JSONCorrector
 from utilities.rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
@@ -47,7 +54,7 @@ except ImportError:
     load_context = None
 
 
-def _process_unit(client, unit, index, json_corrector, app_context):
+def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_context):
     """Process a single unit for Stage 1 detection.
 
     Returns a dict with all result data. Does not mutate shared state.
@@ -59,7 +66,7 @@ def _process_unit(client, unit, index, json_corrector, app_context):
 
     try:
         result = analyze_unit(
-            client, unit,
+            binding, unit,
             use_multifile=True,
             json_corrector=json_corrector,
             app_context=app_context,
@@ -117,7 +124,7 @@ def _process_unit(client, unit, index, json_corrector, app_context):
         }
 
 
-def _run_detection(units, client, json_corrector, app_context, workers,
+def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, workers,
                    checkpoint=None, summary_callback=None):
     """Run Stage 1 detection across all units.
 
@@ -169,7 +176,7 @@ def _run_detection(units, client, json_corrector, app_context, workers,
             units_to_process.append((i, unit))
 
     def _process_and_save(i, unit):
-        out = _process_unit(client, unit, i, json_corrector, app_context)
+        out = _process_unit(binding, unit, i, json_corrector, app_context)
         # Save checkpoint
         if checkpoint is not None:
             uid = out["result"].get("unit_id", f"unit_{i}")
@@ -264,7 +271,8 @@ def run_analysis(
     app_context_path: str | None = None,
     repo_path: str | None = None,
     limit: int | None = None,
-    model: str = "opus",
+    registry: PhaseRegistry | None = None,
+    llm_config_name: str | None = None,
     exploitable_filter: str | None = None,
     workers: int = 8,
     checkpoint_path: str | None = None,
@@ -313,15 +321,24 @@ def run_analysis(
     checkpoint = StepCheckpoint("Analyze", output_dir)
     checkpoint.dir = checkpoint_path
 
-    # Select model
-    model_id = "claude-opus-4-6" if model == "opus" else "claude-sonnet-4-20250514"
-    print(f"[Analyze] Model: {model_id}", file=sys.stderr)
+    # Resolve the binding for the analyze phase from the registry.
+    # When this function builds its own registry (standalone
+    # `openant analyze` invocation), probe it upfront so a bad key /
+    # typo'd model fails loudly here rather than mid-scan. Callers
+    # that pass an explicit ``registry`` are expected to have done
+    # their own validation (e.g. the scanner).
+    if registry is None:
+        from utilities.llm import probe_registry_or_raise
 
-    # Initialize client
-    client = AnthropicClient(model=model_id)
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+        probe_registry_or_raise(registry)
+    binding = registry.get("analyze")
+    print(f"[Analyze] Provider: {binding.provider_name}, Model: {binding.model}", file=sys.stderr)
 
-    # Initialize JSON corrector
-    json_corrector = JSONCorrector(client)
+    # JSON corrector inherits the analyze binding so correction calls
+    # route through the same provider+model.
+    json_corrector = JSONCorrector(binding)
 
     # Load application context if provided
     app_context = None
@@ -416,7 +433,7 @@ def run_analysis(
 
     # --- Stage 1: Detection ---
     results, code_by_route = _run_detection(
-        units, client, json_corrector, app_context, workers, checkpoint=checkpoint,
+        units, binding, json_corrector, app_context, workers, checkpoint=checkpoint,
         summary_callback=_summary_callback,
     )
 
@@ -439,7 +456,7 @@ def run_analysis(
         # Retry sequentially to avoid re-triggering rate limit
         for i in retryable_indices:
             unit = units[i]
-            out = _process_unit(client, unit, i, json_corrector, app_context)
+            out = _process_unit(binding, unit, i, json_corrector, app_context)
             results[i] = out["result"]
             code_by_route[out["route_key"]] = out["code_for_route"]
 
@@ -485,7 +502,7 @@ def run_analysis(
     try:
         from utilities.stage1_consistency import run_stage1_consistency_check
         print("\n[Analyze] Running consistency check...", file=sys.stderr)
-        results = run_stage1_consistency_check(results, code_by_route, get_global_tracker())
+        results = run_stage1_consistency_check(results, code_by_route, binding, get_global_tracker())
         # Count corrections
         for r in results:
             if r.get("stage1_consistency_update"):
@@ -502,7 +519,8 @@ def run_analysis(
     results_path = os.path.join(output_dir, "results.json")
     experiment_result = {
         "dataset": os.path.basename(dataset_path),
-        "model": model_id,
+        "model": binding.model,
+        "provider": binding.provider_name,
         "timestamp": datetime.now().isoformat(),
         "metrics": {
             "total": len(units),

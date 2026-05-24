@@ -20,6 +20,12 @@ from utilities.dynamic_tester.docker_executor import run_single_container
 from utilities.dynamic_tester.result_collector import collect_result
 from utilities.dynamic_tester.reporter import generate_report
 from utilities.llm_client import get_global_tracker
+from utilities.llm import (
+    PhaseRegistry,
+    build_phase_registry,
+    load_config_file,
+    resolve_llm_config,
+)
 from utilities.file_io import read_json, write_json, open_utf8
 
 
@@ -29,6 +35,8 @@ def run_dynamic_tests(
     max_retries: int = 3,
     checkpoint_path: str | None = None,
     repo_path: str | None = None,
+    registry: PhaseRegistry | None = None,
+    llm_config_name: str | None = None,
 ) -> list[DynamicTestResult]:
     """Run dynamic tests for all findings in a pipeline output file.
 
@@ -45,6 +53,17 @@ def run_dynamic_tests(
     Returns:
         List of DynamicTestResult objects
     """
+    # Resolve the dynamic_test phase binding from the registry once and
+    # reuse it across every finding. Standalone-invocation path
+    # validates upfront; scanner-driven calls trust the scanner's probe.
+    if registry is None:
+        from utilities.llm import probe_registry_or_raise
+
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+        probe_registry_or_raise(registry)
+    dynamic_test_binding = registry.get("dynamic_test")
+
     # Load pipeline output
     pipeline = read_json(pipeline_output_path)
     findings = pipeline.get("findings", [])
@@ -155,7 +174,7 @@ def run_dynamic_tests(
 
         # Step 1: Generate test
         print("  Generating test...", file=sys.stderr)
-        generation = generate_test(finding, repo_info, tracker)
+        generation = generate_test(finding, repo_info, dynamic_test_binding, tracker)
         unit_usage = tracker.get_unit_usage()
         generation_cost = unit_usage["cost_usd"]
 
@@ -209,7 +228,7 @@ def run_dynamic_tests(
 
             retry_gen = regenerate_test(
                 finding, repo_info, generation,
-                error_msg, tracker,
+                error_msg, dynamic_test_binding, tracker,
             )
             # Refresh unit usage after retry (tracker accumulates across calls
             # on the same thread).

@@ -20,6 +20,12 @@ from core.checkpoint import StepCheckpoint
 from core.progress import ProgressReporter
 
 from utilities.llm_client import TokenTracker, get_global_tracker
+from utilities.llm import (
+    PhaseRegistry,
+    build_phase_registry,
+    load_config_file,
+    resolve_llm_config,
+)
 from utilities.file_io import read_json, write_json
 from utilities.finding_verifier import FindingVerifier
 from utilities.agentic_enhancer.repository_index import load_index_from_file
@@ -42,6 +48,8 @@ def run_verification(
     workers: int = 8,
     checkpoint_path: str | None = None,
     backoff_seconds: int = 30,
+    registry: PhaseRegistry | None = None,
+    llm_config_name: str | None = None,
 ) -> VerifyResult:
     """Run Stage 2 attacker-simulation verification on Stage 1 results.
 
@@ -130,10 +138,23 @@ def run_verification(
     if not code_by_route:
         code_by_route = _build_code_by_route(all_results)
 
+    # Resolve the verify-phase binding from the registry.
+    # Standalone-invocation path validates upfront; scanner-driven
+    # calls trust the scanner's probe.
+    if registry is None:
+        from utilities.llm import probe_registry_or_raise
+
+        cf = load_config_file()
+        registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+        probe_registry_or_raise(registry)
+    verify_binding = registry.get("verify")
+    print(f"[Verify] Provider: {verify_binding.provider_name}, Model: {verify_binding.model}", file=sys.stderr)
+
     # Run Stage 2 verification via verify_batch
     tracker = get_global_tracker()
     verifier = FindingVerifier(
         index=index,
+        binding=verify_binding,
         tracker=tracker,
         verbose=False,
         app_context=app_context,
