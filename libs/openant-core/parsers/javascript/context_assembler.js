@@ -84,7 +84,7 @@ class ContextAssembler {
 
             if (entry.isDirectory()) {
                 this.findSourceFiles(fullPath, files);
-            } else if (/\.(js|ts|jsx|tsx)$/.test(entry.name) && !entry.name.endsWith('.d.ts')) {
+            } else if (/\.(js|ts|jsx|tsx|mjs|cjs)$/.test(entry.name) && !entry.name.endsWith('.d.ts')) {
                 files.push(fullPath);
             }
         }
@@ -319,7 +319,7 @@ class ContextAssembler {
         let resolvedPath = path.resolve(fromDir, importPath);
 
         // Try to find the actual file
-        const extensions = ['', '.js', '.ts', '.jsx', '.tsx', '/index.js', '/index.ts'];
+        const extensions = ['', '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs', '/index.js', '/index.ts', '/index.mjs', '/index.cjs'];
         let found = false;
 
         for (const ext of extensions) {
@@ -462,7 +462,7 @@ class ContextAssembler {
         const fromDir = path.dirname(fromSourceFile.fileName);
         let resolvedPath = path.resolve(fromDir, importPath);
 
-        const extensions = ['', '.js', '.ts'];
+        const extensions = ['', '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs'];
 
         for (const ext of extensions) {
             const tryPath = resolvedPath + ext;
