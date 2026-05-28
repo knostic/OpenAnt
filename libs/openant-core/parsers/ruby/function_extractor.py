@@ -127,8 +127,15 @@ class FunctionExtractor:
 
     def _classify_function(self, func_name: str, class_name: Optional[str],
                            module_name: Optional[str], is_singleton: bool,
-                           file_path: str) -> str:
-        """Classify a function by its type/purpose."""
+                           file_path: str, visibility: str = 'public') -> str:
+        """Classify a function by its type/purpose.
+
+        ``visibility`` ('public' | 'private' | 'protected') is the declared
+        Ruby method visibility threaded from the class body. Only PUBLIC
+        controller methods are real route handlers; private/protected methods
+        in a controller are filter callbacks / params helpers and must not be
+        seeded as entry points.
+        """
         path_lower = file_path.lower()
 
         if func_name == 'initialize':
@@ -137,11 +144,19 @@ class FunctionExtractor:
         if is_singleton:
             return 'singleton_method'
 
+        # Non-public methods inside a class are helpers/callbacks, never
+        # route handlers or callbacks-by-name, regardless of the enclosing
+        # class. This must precede the controller branch so private params
+        # helpers (user_params) and before_action target methods (set_user)
+        # in *Controller classes are not mislabeled as route_handler.
+        if class_name and visibility in ('private', 'protected'):
+            return 'private_method' if visibility == 'private' else 'protected_method'
+
         # Callbacks
         if func_name.startswith(('before_', 'after_', 'around_')):
             return 'callback'
 
-        # Controller actions (route handlers)
+        # Controller actions (route handlers) — public methods only.
         if class_name and 'controller' in (class_name.lower() if class_name else ''):
             return 'route_handler'
         if 'controllers' in path_lower:
@@ -164,6 +179,63 @@ class FunctionExtractor:
 
         # Top-level
         return 'function'
+
+    # Sinatra / Padrino top-level route DSL verbs.
+    _SINATRA_VERBS = frozenset({
+        'get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'link', 'unlink',
+    })
+
+    @staticmethod
+    def _literal_arg_text(arg_node, source: bytes) -> Optional[str]:
+        """Return the literal value of a symbol or string argument node.
+
+        Handles ``:foo`` (simple_symbol), ``:"foo"`` (delimited symbol),
+        and ``"foo"``/``'foo'`` (string). Returns None for non-literals.
+        """
+        t = arg_node.type
+        if t == 'simple_symbol':
+            text = source[arg_node.start_byte:arg_node.end_byte].decode('utf-8', errors='replace')
+            return text[1:] if text.startswith(':') else text
+        if t in ('symbol', 'delimited_symbol'):
+            for sc in arg_node.children:
+                if sc.type in ('string_content', 'identifier', 'constant'):
+                    return source[sc.start_byte:sc.end_byte].decode('utf-8', errors='replace')
+            text = source[arg_node.start_byte:arg_node.end_byte].decode('utf-8', errors='replace')
+            return text.lstrip(':').strip('"\'')
+        if t == 'string':
+            for sc in arg_node.children:
+                if sc.type == 'string_content':
+                    return source[sc.start_byte:sc.end_byte].decode('utf-8', errors='replace')
+            return ''
+        return None
+
+    def _call_receiver_and_method(self, node, source: bytes):
+        """For a 'call' node, return (method_name, [literal positional args]).
+
+        method_name is the identifier of the call (e.g. 'define_method',
+        'alias_method', 'get'); args are the literal symbol/string values in
+        the argument_list, in order. Returns (None, []) if not a simple call.
+        """
+        method_name = None
+        for child in node.children:
+            if child.type == 'identifier':
+                method_name = self._node_text(child, source)
+                break
+        if method_name is None:
+            return None, []
+        args = []
+        for child in node.children:
+            if child.type == 'argument_list':
+                for arg in child.children:
+                    if arg.type in ('simple_symbol', 'symbol', 'delimited_symbol', 'string'):
+                        val = self._literal_arg_text(arg, source)
+                        if val is not None:
+                            args.append(val)
+        return method_name, args
+
+    def _has_block(self, node) -> bool:
+        """True if the call node carries a do..end or { } block."""
+        return any(c.type in ('do_block', 'block') for c in node.children)
 
     def _extract_imports(self, tree, source: bytes) -> Dict[str, str]:
         """Extract require/require_relative/include/extend/prepend from a file."""
@@ -211,24 +283,83 @@ class FunctionExtractor:
 
     def _extract_functions_from_tree(self, tree, source: bytes, file_path: Path,
                                      relative_path: str) -> None:
-        """Extract all method definitions from a parsed tree."""
-        # Stack-based traversal: (node, class_name, module_name)
-        stack = [(tree.root_node, None, None)]
+        """Extract all method definitions from a parsed tree.
+
+        Stack frame: ``(node, class_name, module_name, vis_state)`` where
+        ``vis_state`` is a 1-element mutable list holding the current method
+        visibility ('public'/'private'/'protected'). All direct children of a
+        single class/module body SHARE one vis_state list, so a bare
+        ``private``/``protected``/``public`` marker mutates the visibility seen
+        by subsequent siblings popped from the same body (children are pushed in
+        reverse so they pop in source order).
+        """
+        stack = [(tree.root_node, None, None, ['public'])]
 
         while stack:
-            node, class_name, module_name = stack.pop()
+            node, class_name, module_name, vis_state = stack.pop()
 
             if node.type == 'method':
                 self._process_method_node(
                     node, source, relative_path, class_name, module_name,
-                    is_singleton=False
+                    is_singleton=False, visibility=vis_state[0],
                 )
 
             elif node.type == 'singleton_method':
                 self._process_method_node(
                     node, source, relative_path, class_name, module_name,
-                    is_singleton=True
+                    is_singleton=True, visibility=vis_state[0],
                 )
+
+            elif node.type == 'alias':
+                # `alias new old` keyword form.
+                self._process_alias_node(
+                    node, source, relative_path, class_name, module_name, vis_state[0],
+                )
+
+            elif node.type == 'call':
+                # Metaprogramming / DSL calls: define_method, alias_method
+                # inside a class, and top-level Sinatra route DSL. Non-matching
+                # calls fall through to a normal child descent so nested defs are
+                # still found.
+                method_name, args = self._call_receiver_and_method(node, source)
+                handled = False
+                if method_name == 'define_method' and class_name and args:
+                    self._emit_synthetic_method(
+                        node, source, relative_path, class_name, module_name,
+                        name=args[0], unit_type=None, visibility=vis_state[0],
+                    )
+                    handled = True
+                elif method_name == 'alias_method' and class_name and args:
+                    self._emit_synthetic_method(
+                        node, source, relative_path, class_name, module_name,
+                        name=args[0], unit_type=None, visibility=vis_state[0],
+                    )
+                    handled = True
+                elif (class_name is None and module_name is None
+                      and method_name in self._SINATRA_VERBS
+                      and self._has_block(node) and args):
+                    # Top-level `get '/path' do..end` Sinatra route.
+                    self._emit_synthetic_method(
+                        node, source, relative_path, class_name=None,
+                        module_name=None, name=args[0], unit_type='route_handler',
+                        visibility='public',
+                    )
+                    handled = True
+                elif method_name in ('private', 'protected', 'public'):
+                    # Arg-form visibility, e.g. `private :foo` — privatizes only
+                    # the named symbol(s), NOT subsequent defs. Consume it here
+                    # (without descending) so its inner `private` identifier does
+                    # not leak into the bare-marker toggle below.
+                    handled = True
+                if not handled:
+                    for child in reversed(node.children):
+                        stack.append((child, class_name, module_name, vis_state))
+
+            elif node.type == 'identifier' and class_name is not None and \
+                    self._node_text(node, source) in ('private', 'protected', 'public'):
+                # Bare visibility marker toggles subsequent-sibling visibility
+                # within the current class body.
+                vis_state[0] = self._node_text(node, source)
 
             elif node.type == 'class':
                 # Extract class name
@@ -248,17 +379,7 @@ class FunctionExtractor:
                 if new_class_name:
                     class_id = f"{relative_path}:{new_class_name}"
                     body_node = node.child_by_field_name('body')
-                    methods = []
-                    if body_node:
-                        for child in body_node.children:
-                            if child.type == 'method':
-                                mname = self._get_method_name(child, source)
-                                if mname:
-                                    methods.append(mname)
-                            elif child.type == 'singleton_method':
-                                mname = self._get_method_name(child, source)
-                                if mname:
-                                    methods.append(f"self.{mname}")
+                    methods = self._collect_class_method_names(body_node, source)
 
                     self.classes[class_id] = {
                         'name': new_class_name,
@@ -271,21 +392,33 @@ class FunctionExtractor:
                     }
                     self.stats['total_classes'] += 1
 
-                # Recurse into class body with updated class_name
+                # Recurse into class body with updated class_name and a FRESH
+                # per-body visibility state (defaults to public).
                 body_node = node.child_by_field_name('body')
                 if body_node:
+                    class_vis = ['public']
                     for child in reversed(body_node.children):
-                        stack.append((child, new_class_name, module_name))
+                        stack.append((child, new_class_name, module_name, class_vis))
                 continue  # Don't walk children again
 
             elif node.type == 'module':
-                # Extract module name
-                name_node = None
-                for child in node.children:
-                    if child.type == 'constant':
-                        name_node = child
-                        break
-                new_module_name = self._node_text(name_node, source) if name_node else module_name
+                # Module name: the `name` field is a `constant` (plain module)
+                # or a `scope_resolution` (compact `module A::B`). Concatenate
+                # with any enclosing module so nested + compact forms both keep
+                # the full namespace.
+                name_node = node.child_by_field_name('name')
+                if name_node is None:
+                    for child in node.children:
+                        if child.type in ('constant', 'scope_resolution'):
+                            name_node = child
+                            break
+                this_name = self._node_text(name_node, source) if name_node else None
+                if this_name and module_name:
+                    new_module_name = f"{module_name}::{this_name}"
+                elif this_name:
+                    new_module_name = this_name
+                else:
+                    new_module_name = module_name
 
                 # Recurse into module body
                 body_node = node.child_by_field_name('body')
@@ -297,17 +430,112 @@ class FunctionExtractor:
                             break
 
                 if body_node:
+                    mod_vis = ['public']
                     for child in reversed(body_node.children):
-                        stack.append((child, class_name, new_module_name))
+                        stack.append((child, class_name, new_module_name, mod_vis))
                 continue  # Don't walk children again
 
             else:
                 for child in reversed(node.children):
-                    stack.append((child, class_name, module_name))
+                    stack.append((child, class_name, module_name, vis_state))
+
+    def _collect_class_method_names(self, body_node, source: bytes) -> List[str]:
+        """Names of methods declared in a class body, including alias/metaprog forms."""
+        methods: List[str] = []
+        if body_node is None:
+            return methods
+        for child in body_node.children:
+            if child.type == 'method':
+                mname = self._get_method_name(child, source)
+                if mname:
+                    methods.append(mname)
+            elif child.type == 'singleton_method':
+                mname = self._get_method_name(child, source)
+                if mname:
+                    methods.append(f"self.{mname}")
+            elif child.type == 'alias':
+                mname = self._alias_new_name(child, source)
+                if mname:
+                    methods.append(mname)
+            elif child.type == 'call':
+                method_name, args = self._call_receiver_and_method(child, source)
+                if method_name in ('define_method', 'alias_method') and args:
+                    methods.append(args[0])
+        return methods
+
+    @staticmethod
+    def _alias_new_name(node, source: bytes) -> Optional[str]:
+        """Return the NEW (created) name from an `alias new old` node."""
+        idents = [c for c in node.children if c.type in ('identifier', 'constant', 'simple_symbol')]
+        if idents:
+            text = source[idents[0].start_byte:idents[0].end_byte].decode('utf-8', errors='replace')
+            return text[1:] if text.startswith(':') else text
+        return None
+
+    def _process_alias_node(self, node, source: bytes, relative_path: str,
+                            class_name: Optional[str], module_name: Optional[str],
+                            visibility: str) -> None:
+        """Emit a method unit for an `alias new old` keyword statement."""
+        name = self._alias_new_name(node, source)
+        if name:
+            self._emit_synthetic_method(
+                node, source, relative_path, class_name, module_name,
+                name=name, unit_type=None, visibility=visibility,
+            )
+
+    def _emit_synthetic_method(self, node, source: bytes, relative_path: str,
+                               class_name: Optional[str], module_name: Optional[str],
+                               name: str, unit_type: Optional[str],
+                               visibility: str) -> None:
+        """Register a function unit for a metaprogramming / DSL / alias definition.
+
+        Used for define_method, alias_method, alias, and Sinatra route DSL,
+        where the defining node is not a tree-sitter `method` node. When
+        ``unit_type`` is None the normal classifier is applied.
+        """
+        if not name:
+            return
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        code = self._node_text(node, source)
+
+        if unit_type is None:
+            unit_type = self._classify_function(
+                name, class_name, module_name, False, relative_path, visibility,
+            )
+
+        if class_name:
+            qualified_name = f"{class_name}.{name}"
+        elif module_name:
+            qualified_name = f"{module_name}.{name}"
+        else:
+            qualified_name = name
+
+        func_id = f"{relative_path}:{qualified_name}"
+        self.functions[func_id] = {
+            'name': name,
+            'qualified_name': qualified_name,
+            'file_path': relative_path,
+            'start_line': start_line,
+            'end_line': end_line,
+            'code': code,
+            'class_name': class_name,
+            'module_name': module_name,
+            'parameters': [],
+            'is_singleton': False,
+            'visibility': visibility,
+            'unit_type': unit_type,
+        }
+        self.stats['total_functions'] += 1
+        if class_name:
+            self.stats['total_methods'] += 1
+        else:
+            self.stats['standalone_functions'] += 1
+        self.stats['by_type'][unit_type] = self.stats['by_type'].get(unit_type, 0) + 1
 
     def _process_method_node(self, node, source: bytes, relative_path: str,
                               class_name: Optional[str], module_name: Optional[str],
-                              is_singleton: bool) -> None:
+                              is_singleton: bool, visibility: str = 'public') -> None:
         """Process a single method or singleton_method node."""
         name = self._get_method_name(node, source)
         if not name:
@@ -319,7 +547,7 @@ class FunctionExtractor:
         parameters = self._get_parameters(node, source)
 
         unit_type = self._classify_function(
-            name, class_name, module_name, is_singleton, relative_path
+            name, class_name, module_name, is_singleton, relative_path, visibility
         )
 
         # Build qualified name and function ID
@@ -343,6 +571,7 @@ class FunctionExtractor:
             'module_name': module_name,
             'parameters': parameters,
             'is_singleton': is_singleton,
+            'visibility': visibility,
             'unit_type': unit_type,
         }
 
