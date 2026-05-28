@@ -530,8 +530,11 @@ class FunctionExtractor:
             all_extensions = C_EXTENSIONS | CPP_EXTENSIONS
             for ext in all_extensions:
                 for file_path in self.repo_path.rglob(f'*{ext}'):
-                    path_str = str(file_path)
-                    if any(excl in path_str for excl in ['.git', 'build', 'test', 'node_modules']):
+                    # Exclude on path COMPONENTS relative to repo_path, not a substring of the absolute
+                    # path. A substring test wrongly skips files whose path merely contains a token
+                    # ('src/latest/main.c', 'contest/sol.c' contain 'test') and is poisoned when an
+                    # ancestor of repo_path contains one (a checkout under '/home/tester/' excludes all).
+                    if {'.git', 'build', 'test', 'node_modules'} & set(file_path.relative_to(self.repo_path).parts):
                         continue
                     self.process_file(file_path)
 
