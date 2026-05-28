@@ -185,10 +185,14 @@ class ReachabilityAnalyzer:
                     reachable.add(callee)
                     queue.append(callee)
 
-        # Update cache
+        # Update cache. get_all_reachable() is the AUTHORITATIVE result -- an UNBOUNDED forward BFS over
+        # the full graph. is_reachable_from_entry_point() is a depth-BOUNDED reverse BFS that caches
+        # False for functions farther than max_depth from an entry point (a false negative). Overwrite
+        # unconditionally (the old "only if absent" froze whichever pass ran first) so this complete
+        # pass corrects any stale bounded result. The forward graph is built from the same reverse
+        # edges, so this can only flip stale False->True, never introduce a false positive.
         for func_id in self.functions:
-            if func_id not in self._reachability_cache:
-                self._reachability_cache[func_id] = func_id in reachable
+            self._reachability_cache[func_id] = func_id in reachable
 
         return reachable
 
