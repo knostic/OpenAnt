@@ -31,13 +31,18 @@ class RepositoryScanner:
         "target",
     }
 
-    # Test directory patterns to skip when skip_tests is True
-    TEST_PATTERNS = {"test", "tests", "spec", "specs", "_test", "test_"}
+    # Native Zig test conventions. Directory names are matched as whole path
+    # segments; filenames are matched by anchored stem prefix/suffix. Matching
+    # bare "test"/"spec" as a substring (the prior behaviour) misclassified
+    # ordinary names like ``latest``/``contest``/``fastest.zig`` as tests.
+    TEST_DIR_NAMES = {"test", "tests", "spec", "specs"}
+    TEST_FILE_PREFIXES = ("test_", "spec_")
+    TEST_FILE_SUFFIXES = ("_test.zig", "_spec.zig")
 
     def __init__(
         self,
         repo_path: str,
-        skip_tests: bool = True,
+        skip_tests: bool = False,
         exclude_patterns: Optional[List[str]] = None,
     ):
         self.repo_path = Path(repo_path).resolve()
@@ -113,20 +118,28 @@ class RepositoryScanner:
         return False
 
     def _is_test_directory(self, dirname: str) -> bool:
-        """Check if a directory name indicates test code."""
-        dirname_lower = dirname.lower()
-        return any(pattern in dirname_lower for pattern in self.TEST_PATTERNS)
+        """Check if a directory name indicates test code.
+
+        Exact (whole-name) match so that ``latest``/``contest``/``attestation``
+        are not misclassified as test directories.
+        """
+        return dirname.lower() in self.TEST_DIR_NAMES
 
     def _is_test_file(self, filepath: str) -> bool:
-        """Check if a file path indicates test code."""
-        filepath_lower = filepath.lower()
-        # Check for test in path components
-        parts = Path(filepath_lower).parts
-        for part in parts:
-            if any(pattern in part for pattern in self.TEST_PATTERNS):
-                return True
-        # Check for _test.zig suffix
-        if filepath_lower.endswith("_test.zig"):
+        """Check if a file path indicates test code.
+
+        A file is a test iff one of its directory components is a test
+        directory, or its filename is anchored (stem prefix ``test_``/``spec_``
+        or suffix ``_test.zig``/``_spec.zig``). Anchoring stops ordinary names
+        like ``src/fastest.zig``/``src/latest/main.zig`` from matching.
+        """
+        p = Path(filepath.lower())
+        if any(part in self.TEST_DIR_NAMES for part in p.parts[:-1]):
+            return True
+        name = p.name
+        if name.startswith(self.TEST_FILE_PREFIXES):
+            return True
+        if name.endswith(self.TEST_FILE_SUFFIXES):
             return True
         return False
 
