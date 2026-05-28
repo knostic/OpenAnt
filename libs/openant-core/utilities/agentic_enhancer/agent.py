@@ -32,6 +32,30 @@ AGENT_MODEL = "claude-sonnet-4-20250514"
 MAX_ITERATIONS = 20
 MAX_TOKENS_PER_RESPONSE = 4096
 
+# Input budget.
+# The conversation input had no budget: primary_code was inlined verbatim and
+# raw tool results were appended every iteration, so input grew unbounded until
+# it overflowed the model context (400). We cap each oversized input at its
+# consumption point. ~4 chars/token, so these stay well under the model window.
+MAX_PROMPT_CHARS = 60_000          # cap on inlined primary_code in the prompt
+MAX_TOOL_RESULT_CHARS = 24_000     # cap on each serialized tool result
+
+
+def cap_tool_result_content(result: dict, limit: int = MAX_TOOL_RESULT_CHARS) -> str:
+    """Serialize a tool result to JSON, truncating to ``limit`` chars.
+
+    Tool results (e.g. ``read_function`` returning a whole function body) are
+    otherwise appended raw to the conversation, growing the input without
+    bound across iterations. Small results round-trip as valid JSON; oversized
+    results are truncated with an explicit marker so the model knows content
+    was elided.
+    """
+    content = json.dumps(result)
+    if len(content) <= limit:
+        return content
+    marker = "\n... (truncated)"
+    return content[: limit - len(marker)] + marker
+
 
 class AgentResult:
     """Result from agent analysis."""
@@ -213,6 +237,28 @@ class ContextAgent:
                     "output_tokens": total_output_tokens,
                 }
                 raise
+            except anthropic.BadRequestError:
+                # 400 (e.g. constructed input still overflows the context
+                # window). Degrade gracefully instead of losing the whole
+                # enhancement — return a neutral, incomplete result. The input
+                # budget above makes this path rare, but it guards the residual.
+                if self.verbose:
+                    print(f"  BadRequest at iteration {iterations}; "
+                          "returning incomplete result")
+                return AgentResult(
+                    include_functions=[],
+                    usage_context="Analysis terminated - request rejected (400)",
+                    security_classification="neutral",
+                    classification_reasoning="Analysis incomplete - request rejected",
+                    confidence=0.2,
+                    iterations=iterations,
+                    total_tokens=total_input_tokens + total_output_tokens,
+                    is_entry_point=is_entry_point,
+                    reachable_from_entry=reachable_from_entry,
+                    entry_point_path=entry_point_path,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                )
             except Exception as exc:
                 # Attach agent state so the caller knows how far we got
                 exc.agent_state = {
@@ -285,14 +331,14 @@ class ContextAgent:
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
-                            "content": json.dumps(result)
+                            "content": cap_tool_result_content(result)
                         })
                         break
                     else:
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
-                            "content": json.dumps(result)
+                            "content": cap_tool_result_content(result)
                         })
 
             # If finish was called, return result
