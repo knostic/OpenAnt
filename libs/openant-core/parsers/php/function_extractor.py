@@ -195,15 +195,23 @@ class FunctionExtractor:
         while stack:
             node = stack.pop()
 
-            if node.type == 'use_declaration':
-                # Extract the full use statement value
+            if node.type in ('namespace_use_declaration', 'use_declaration'):
+                # tree-sitter-php emits `namespace_use_declaration` (not `use_declaration`) for
+                # `use App\Service\Foo;`, so the old node-type check matched nothing and use-imports
+                # were never recorded.
                 import_text = self._node_text(node, source)
-                # Clean up: remove 'use ' prefix and trailing ';'
                 cleaned = import_text.strip()
                 if cleaned.startswith('use '):
                     cleaned = cleaned[4:]
                 cleaned = cleaned.rstrip(';').strip()
-                imports[cleaned] = 'use'
+                # Handle grouped `use A\B, C\D;` and drop trailing `as Alias` so the stored import is
+                # the namespace path (matched by file name downstream).
+                for part in cleaned.split(','):
+                    entry = part.strip()
+                    if not entry:
+                        continue
+                    path = entry.split(' as ')[0].strip() if ' as ' in entry else entry
+                    imports[path] = 'use'
 
             elif node.type == 'namespace_definition':
                 # Extract namespace name
