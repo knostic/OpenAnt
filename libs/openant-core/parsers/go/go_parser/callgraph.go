@@ -47,7 +47,8 @@ func NewCallGraphBuilder(repoPath string) *CallGraphBuilder {
 		"sort":    true,
 		"math":    true,
 		"io":      true,
-		"os":      true,
+		// "os" is intentionally NOT skipped: it carries security-relevant sinks (os.StartProcess,
+		// etc.) that downstream analysis must be able to see; blanket-skipping dropped them.
 		"path":    true,
 		"regexp":  true,
 		"json":    true,
@@ -175,11 +176,11 @@ func (c *CallGraphBuilder) parseImports(fullPath, relPath string) {
 
 // CallInfo represents a function call found in code
 type CallInfo struct {
-	Name      string // Simple function name
-	Receiver  string // Receiver for method calls (e.g., "obj" in obj.Method())
-	Package   string // Package alias for package.Func() calls
-	IsMethod  bool   // True if this is a method call
-	IsSelf    bool   // True if receiver is "self" or matches current receiver
+	Name     string // Simple function name
+	Receiver string // Receiver for method calls (e.g., "obj" in obj.Method())
+	Package  string // Package alias for package.Func() calls
+	IsMethod bool   // True if this is a method call
+	IsSelf   bool   // True if receiver is "self" or matches current receiver
 }
 
 func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
@@ -194,6 +195,11 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 		return calls
 	}
 
+	// A selector receiver (pkg.Func vs obj.Method) is a package iff its name is one of THIS file's
+	// import aliases. Pass the file's import set down so analyzeCallExpr classifies using the real
+	// import table instead of a name-shape heuristic.
+	imports := c.importsByFile[funcInfo.FilePath]
+
 	// Walk the AST looking for call expressions
 	ast.Inspect(file, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -201,7 +207,7 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 			return true
 		}
 
-		callInfo := c.analyzeCallExpr(call)
+		callInfo := c.analyzeCallExpr(call, imports)
 		if callInfo.Name != "" && !c.builtins[callInfo.Name] && !c.builtins[callInfo.Package] {
 			calls = append(calls, callInfo)
 		}
@@ -211,7 +217,7 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 	return calls
 }
 
-func (c *CallGraphBuilder) analyzeCallExpr(call *ast.CallExpr) CallInfo {
+func (c *CallGraphBuilder) analyzeCallExpr(call *ast.CallExpr, imports map[string]string) CallInfo {
 	info := CallInfo{}
 
 	switch fun := call.Fun.(type) {
@@ -227,8 +233,9 @@ func (c *CallGraphBuilder) analyzeCallExpr(call *ast.CallExpr) CallInfo {
 		switch x := fun.X.(type) {
 		case *ast.Ident:
 			info.Receiver = x.Name
-			// Check if it looks like a package (lowercase) or object
-			if isLikelyPackage(x.Name) {
+			// It is a package call iff the receiver name is an import alias of this file.
+			// A short lowercase local (db, tx, ctx, w, r) is NOT a package.
+			if _, isImport := imports[x.Name]; isImport {
 				info.Package = x.Name
 				info.IsMethod = false
 			}
@@ -252,29 +259,6 @@ func (c *CallGraphBuilder) analyzeCallExpr(call *ast.CallExpr) CallInfo {
 	return info
 }
 
-func isLikelyPackage(name string) bool {
-	// Packages are typically lowercase
-	if len(name) == 0 {
-		return false
-	}
-
-	// Common patterns that are definitely packages
-	packagePatterns := []string{
-		"fmt", "log", "os", "io", "net", "http", "json", "xml",
-		"strings", "strconv", "bytes", "time", "context", "sync",
-		"errors", "filepath", "regexp", "math", "sort", "reflect",
-	}
-	for _, p := range packagePatterns {
-		if name == p {
-			return true
-		}
-	}
-
-	// If all lowercase and short, likely a package
-	first := rune(name[0])
-	return first >= 'a' && first <= 'z' && len(name) <= 10
-}
-
 func (c *CallGraphBuilder) resolveCalls(callerID string, callerInfo FunctionInfo, calls []CallInfo, analyzer *AnalyzerOutput) []string {
 	var resolved []string
 	seen := make(map[string]bool)
@@ -283,8 +267,10 @@ func (c *CallGraphBuilder) resolveCalls(callerID string, callerInfo FunctionInfo
 		var targetID string
 
 		// Try different resolution strategies
-		if call.IsSelf || call.Receiver == callerInfo.ClassName {
-			// Self/receiver call - look in same type's methods
+		if callerInfo.ClassName != "" && (call.IsSelf || call.Receiver == callerInfo.ClassName) {
+			// Self/receiver call - look in same type's methods. Guarded on ClassName != "" so a
+			// plain function (ClassName=="") making a simple call (Receiver=="") is NOT misrouted
+			// here via ""=="" and lost; it falls through to resolveSimpleCall below.
 			targetID = c.resolveMethodCall(call.Name, callerInfo.ClassName, callerInfo.FilePath)
 		} else if call.IsMethod && call.Receiver != "" {
 			// Method call on some object
@@ -341,12 +327,18 @@ func (c *CallGraphBuilder) resolvePackageCall(funcName, pkgAlias, currentFile st
 		return ""
 	}
 
-	// Try to find the function in files from that package
-	// This is a simplified approach - we look for functions by name
-	// that are in files whose directory matches the package
+	// Match by the package's directory (the last component of the resolved import path), NOT the
+	// user-chosen alias. funcID is "<relPath>:<Name>", so a function's package is the directory its
+	// file lives in. The old code tested strings.Contains(funcID, pkgAlias): it used the alias (so
+	// aliased imports failed to resolve) and matched any funcID merely CONTAINING the alias as a
+	// substring (so it emitted edges to unrelated packages).
+	pkgDir := filepath.Base(pkgPath)
 	for _, funcID := range c.functionsByName[funcName] {
-		// Check if the function is likely from the right package
-		if strings.Contains(funcID, pkgAlias) {
+		filePart := funcID
+		if ci := strings.LastIndex(funcID, ":"); ci >= 0 {
+			filePart = funcID[:ci]
+		}
+		if filepath.Base(filepath.Dir(filePart)) == pkgDir {
 			return funcID
 		}
 	}
