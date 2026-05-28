@@ -47,6 +47,51 @@ except ImportError:
     load_context = None
 
 
+# Truncation priority: higher score = kept first when --limit drops units.
+# Units the enhancer flagged as exploitable/vulnerable_internal must outrank
+# unclassified/neutral code so a limited run does not silently drop the most
+# security-relevant units.
+_LIMIT_PRIORITY = {"exploitable": 2, "vulnerable_internal": 1}
+
+
+def _limit_classification(unit):
+    """Return a unit's security_classification regardless of enhance mode.
+
+    Agentic enhance writes ``unit['agent_context']['security_classification']``;
+    single-shot enhance writes ``unit['llm_context']``. Reading only one mode
+    would treat the other's classified units as un-prioritized.
+    """
+    for ctx_key in ("agent_context", "llm_context"):
+        ctx = unit.get(ctx_key)
+        if isinstance(ctx, dict) and ctx.get("security_classification") is not None:
+            return ctx.get("security_classification")
+    return None
+
+
+def _apply_limit(units, limit):
+    """Truncate ``units`` to ``limit``, keeping the highest-priority units.
+
+    Units arrive from the parser in alphabetical-by-path order
+    (repository_scanner.py sorts ``self.files`` by path). A raw head-slice
+    therefore kept the first N alphabetical units (``Doc/`` before ``Lib/``)
+    with no relevance weighting, silently dropping high-value code on a
+    ``--limit`` run.
+
+    Sort by enhancement security_classification (exploitable >
+    vulnerable_internal > other) before slicing. The sort is stable, so units
+    in the same classification tier keep their original (alphabetical) order;
+    a no-limit call returns the list unchanged.
+    """
+    if not limit:
+        return units
+    prioritized = sorted(
+        units,
+        key=lambda u: _LIMIT_PRIORITY.get(_limit_classification(u), 0),
+        reverse=True,
+    )
+    return prioritized[:limit]
+
+
 def _process_unit(client, unit, index, json_corrector, app_context):
     """Process a single unit for Stage 1 detection.
 
@@ -356,7 +401,9 @@ def run_analysis(
         print(f"[Analyze] Exploitable filter ({exploitable_filter}): {original_count} -> {len(units)} units", file=sys.stderr)
 
     if limit:
-        units = units[:limit]
+        # Priority-sort before truncating so a --limit run keeps the most
+        # security-relevant units rather than the alphabetically-first ones.
+        units = _apply_limit(units, limit)
 
     total = len(units)
     print(f"[Analyze] Analyzing {total} units...", file=sys.stderr)
