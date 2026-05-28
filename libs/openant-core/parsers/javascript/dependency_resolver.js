@@ -84,10 +84,15 @@ class DependencyResolver {
         }
       }
 
-      this.callGraph[funcId] = calls;
+      // Drop self-edges: the standalone-call regex matches a function's own
+      // name in its declaration/body, and recursion is not a dependency on a
+      // different unit. Mirrors the C sibling's `c != func_id` invariant.
+      const resolvedCalls = calls.filter((calledId) => calledId !== funcId);
+
+      this.callGraph[funcId] = resolvedCalls;
 
       // Build reverse graph
-      for (const calledId of calls) {
+      for (const calledId of resolvedCalls) {
         if (!this.reverseCallGraph[calledId]) {
           this.reverseCallGraph[calledId] = [];
         }
@@ -221,24 +226,32 @@ class DependencyResolver {
    * Resolve a simple function call to a function ID
    */
   _resolveCall(funcName, callerFile, callerFuncId) {
-    // 1. First check same file
+    // A bare call `foo()` is a free-function reference. It must not bind to a
+    // class method (`Class.foo`): a method is reached via `this.foo()`,
+    // `obj.foo()`, or `Class.foo()`, which are resolved by _resolveThisCall /
+    // _resolveMethodCall. Mirrors the Ruby/PHP siblings, which exclude
+    // class-owned candidates from bare-call resolution.
+
+    // 1. First check same file (free functions only)
     const sameFileFuncs = this.functionsByFile[callerFile];
     if (sameFileFuncs && Array.isArray(sameFileFuncs)) {
       for (const funcId of sameFileFuncs) {
         const funcData = this.functions[funcId];
-        if (funcData && (funcData.name === funcName || funcData.name.endsWith('.' + funcName))) {
+        if (funcData && !funcData.className && funcData.name === funcName) {
           return funcId;
         }
       }
     }
 
-    // 2. Check by simple name across all files
-    const candidates = this.functionsByName[funcName];
-    if (candidates && Array.isArray(candidates) && candidates.length === 1) {
+    // 2. Check by simple name across all files (free functions only)
+    const candidates = (this.functionsByName[funcName] || []).filter(
+      (funcId) => !(this.functions[funcId] && this.functions[funcId].className)
+    );
+    if (candidates.length === 1) {
       return candidates[0];
     }
 
-    // 3. Multiple candidates - return null (ambiguous)
+    // 3. Zero or multiple candidates - return null (ambiguous)
     // A more sophisticated implementation would parse imports to disambiguate
     return null;
   }
@@ -285,6 +298,25 @@ class DependencyResolver {
       }
     }
 
+    // 1b. Local-variable type dispatch: `const x = new C(); x.method()`.
+    //     Map the receiver var to the class it was constructed with, then
+    //     reuse the exact-class-name match. Built-in constructors (Map, Set,
+    //     Promise, ...) are skipped so e.g. `new Map().get()` does not bind to
+    //     a repo `get`.
+    if (callerFuncId) {
+      const callerFunc = this.functions[callerFuncId];
+      const localTypes = this._extractLocalTypes(callerFunc && callerFunc.code);
+      const localClass = localTypes[objectName];
+      if (localClass && !this._isBuiltIn(localClass)) {
+        for (const funcId of candidates) {
+          const funcData = this.functions[funcId];
+          if (funcData && funcData.className === localClass) {
+            return funcId;
+          }
+        }
+      }
+    }
+
     // 2. DI-aware resolution: look up objectName in caller's constructorDeps
     //    e.g., this.callService.getById() -> constructorDeps says callService: CallService
     //    -> resolve to CallService.getById
@@ -327,6 +359,26 @@ class DependencyResolver {
     }
 
     return null;
+  }
+
+  /**
+   * Scan a function body for `const/let/var x = new C()` declarations and
+   * return a { varName -> ClassName } map. Single-identifier constructors only;
+   * member/computed constructors (e.g. new ns.C(), new arr[i]()) are ignored.
+   */
+  _extractLocalTypes(code) {
+    const localTypes = Object.create(null);
+    if (!code) return localTypes;
+
+    const declPattern =
+      /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+([A-Za-z_$][\w$]*)\s*\(/g;
+    let match;
+    while ((match = declPattern.exec(code)) !== null) {
+      const [, varName, className] = match;
+      // Last write wins, matching JS reassignment order within a body.
+      localTypes[varName] = className;
+    }
+    return localTypes;
   }
 
   /**
@@ -493,7 +545,13 @@ if (require.main === module) {
     process.exit(1);
   }
 
-  const analyzerOutput = JSON.parse(fs.readFileSync(inputFile, 'utf-8'));
+  let analyzerOutput;
+  try {
+    analyzerOutput = JSON.parse(fs.readFileSync(inputFile, 'utf-8'));
+  } catch (err) {
+    console.error(`Failed to read/parse JSON from ${inputFile}: ${err.message}`);
+    process.exit(1);
+  }
 
   // Build call graph
   console.error(`Processing ${Object.keys(analyzerOutput.functions || {}).length} functions...`);
