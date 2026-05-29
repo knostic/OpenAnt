@@ -40,7 +40,7 @@ def test_extract_all_excludes_on_path_components_not_substring(tmp_path, monkeyp
     ex = FunctionExtractor(str(repo))
     processed = []
     monkeypatch.setattr(ex, "process_file",
-                        lambda fp: processed.append(str(Path(fp).relative_to(ex.repo_path))))
+                        lambda fp: processed.append(Path(fp).relative_to(ex.repo_path).as_posix()))
     ex.extract_all()
     procset = set(processed)
 
