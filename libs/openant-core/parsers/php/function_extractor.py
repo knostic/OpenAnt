@@ -655,8 +655,11 @@ class FunctionExtractor:
         else:
             for ext in ('.php', '.phtml'):
                 for file_path in self.repo_path.rglob(f'*{ext}'):
-                    path_str = str(file_path)
-                    if any(excl in path_str for excl in ['.git', 'vendor', 'node_modules', 'tmp', '.cache']):
+                    # Exclude vendored/transient dirs by path COMPONENT relative to the repo, not by
+                    # absolute-path substring -- an ancestor dir (e.g. a /tmp working dir, as on Linux CI)
+                    # or a name like 'template' must not exclude the repo's own files.
+                    rel_parts = file_path.relative_to(self.repo_path).parts
+                    if any(excl in rel_parts for excl in ('.git', 'vendor', 'node_modules', 'tmp', '.cache')):
                         continue
                     self.process_file(file_path)
 
