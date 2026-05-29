@@ -22,6 +22,15 @@ import pytest
 from utilities.rate_limiter import is_retryable_error
 
 
+@pytest.fixture(autouse=True)
+def _anthropic_api_key(monkeypatch):
+    """Provide a dummy API key so ContextEnhancer's default AnthropicClient
+    constructs without a real credential. No network call is made: every test
+    monkeypatches the actual enhancement methods, so the SDK client is never
+    used to issue a request."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
+
+
 # --------------------------------------------------------------------------
 # 529 / overloaded must be retryable via the string branch.
 # --------------------------------------------------------------------------
