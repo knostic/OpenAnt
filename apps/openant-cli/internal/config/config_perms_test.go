@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -11,6 +12,9 @@ import (
 // when it creates the file; if the config (which may hold an API key) already exists with
 // looser perms (e.g. 0644), the secret stays world-readable after Save().
 func TestSaveEnforcesRestrictivePermsOnPreexistingFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file-mode bits not enforced on Windows")
+	}
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
 
