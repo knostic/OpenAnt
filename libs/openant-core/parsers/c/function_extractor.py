@@ -148,11 +148,18 @@ class FunctionExtractor:
         if node.type == 'qualified_identifier':
             return self._node_text(node, source)
 
-        # template_function
+        # operator overload (operator+, operator==, operator[], ...)
+        if node.type == 'operator_name':
+            return self._node_text(node, source)
+
+        # conversion operator (operator int, operator MyType)
+        if node.type == 'operator_cast':
+            return self._node_text(node, source)
+
+        # template_function: g<int> — keep the template arguments so an
+        # explicit specialization does not collide with the primary template.
         if node.type == 'template_function':
-            name_node = node.child_by_field_name('name')
-            if name_node:
-                return self._extract_identifier_from_declarator(name_node, source)
+            return self._node_text(node, source)
 
         # reference_declarator (C++ int& func())
         if node.type == 'reference_declarator':
@@ -170,7 +177,8 @@ class FunctionExtractor:
             if child.type in ('identifier', 'field_identifier', 'qualified_identifier',
                               'function_declarator', 'pointer_declarator',
                               'parenthesized_declarator', 'destructor_name',
-                              'template_function', 'reference_declarator'):
+                              'template_function', 'reference_declarator',
+                              'operator_name', 'operator_cast'):
                 result = self._extract_identifier_from_declarator(child, source)
                 if result:
                     return result
@@ -257,10 +265,15 @@ class FunctionExtractor:
             return 'main'
 
         if is_cpp and class_name:
-            if name == class_name:
-                return 'constructor'
-            if name.startswith('~'):
+            # Compare the UNqualified leaves: an out-of-line definition arrives
+            # as a qualified name (e.g. 'Foo::Foo', 'Foo::~Foo') whose whole
+            # string never equals the bare class_name.
+            unqualified = name.rsplit('::', 1)[-1]
+            class_leaf = class_name.rsplit('::', 1)[-1]
+            if unqualified.startswith('~'):
                 return 'destructor'
+            if unqualified == class_leaf:
+                return 'constructor'
             return 'method'
 
         if '__attribute__((constructor))' in code:
@@ -355,23 +368,38 @@ class FunctionExtractor:
         """Extract all function definitions from a parsed tree."""
         is_header = os.path.splitext(file_path)[1].lower() in ('.h', '.hpp', '.hxx', '.hh')
 
-        # Iterative traversal with explicit stack carrying (node, namespace_prefix)
-        stack = [(tree.root_node, '')]
+        # Iterative traversal with explicit stack carrying
+        # (node, namespace_prefix, class_context). namespace_prefix is the
+        # qualified prefix used to build the func_id; class_context is the
+        # enclosing class/struct/union name (or None) used for metadata so a
+        # namespace qualifier is never mistaken for a class qualifier.
+        stack = [(tree.root_node, '', None)]
+
+        # struct/union member functions are C++ methods exactly like class
+        # members; only `class_specifier` was special-cased originally.
+        record_specifiers = ('class_specifier', 'struct_specifier', 'union_specifier')
 
         while stack:
-            node, namespace_prefix = stack.pop()
+            node, namespace_prefix, class_context = stack.pop()
 
             if node.type == 'function_definition':
                 self._process_function_node(node, source, relative_path,
-                                            is_cpp, is_header, namespace_prefix)
+                                            is_cpp, is_header, namespace_prefix,
+                                            class_context)
 
             elif node.type == 'declaration' and not is_header:
-                # Skip standalone declarations in .c files (prototypes only)
-                pass
+                # Standalone declarations in .c/.cpp files are prototypes, EXCEPT
+                # a declaration whose initializer is a lambda — a named callable.
+                if is_cpp:
+                    self._process_lambda_declaration(node, source, relative_path,
+                                                     namespace_prefix)
 
             elif node.type == 'declaration' and is_header:
                 # In headers, track prototypes for call resolution
                 self._process_declaration_node(node, source, relative_path)
+                if is_cpp:
+                    self._process_lambda_declaration(node, source, relative_path,
+                                                     namespace_prefix)
 
             elif node.type == 'namespace_definition' and is_cpp:
                 ns_name_node = node.child_by_field_name('name')
@@ -380,10 +408,11 @@ class FunctionExtractor:
                 body_node = node.child_by_field_name('body')
                 if body_node:
                     for child in reversed(body_node.children):
-                        stack.append((child, new_prefix))
+                        # class_context unchanged: a namespace is NOT a class.
+                        stack.append((child, new_prefix, class_context))
                 continue  # Don't walk children again
 
-            elif node.type == 'class_specifier' and is_cpp:
+            elif node.type in record_specifiers and is_cpp:
                 class_name_node = node.child_by_field_name('name')
                 if class_name_node:
                     class_name = self._node_text(class_name_node, source)
@@ -394,28 +423,38 @@ class FunctionExtractor:
                             if child.type == 'function_definition':
                                 self._process_function_node(
                                     child, source, relative_path,
-                                    is_cpp, is_header, new_prefix
+                                    is_cpp, is_header, new_prefix, class_name
                                 )
                             elif child.type == 'access_specifier':
                                 pass
                             else:
-                                stack.append((child, new_prefix))
+                                stack.append((child, new_prefix, class_name))
                 continue
 
             else:
                 for child in reversed(node.children):
-                    stack.append((child, namespace_prefix))
+                    stack.append((child, namespace_prefix, class_context))
 
     def _process_function_node(self, node, source: bytes, relative_path: str,
                                 is_cpp: bool, is_header: bool,
-                                namespace_prefix: str = '') -> None:
+                                namespace_prefix: str = '',
+                                class_context: Optional[str] = None) -> None:
         """Process a single function_definition node."""
         name = self._get_function_name(node, source)
         if not name:
             return
 
         full_name = namespace_prefix + name if namespace_prefix and '::' not in name else name
-        class_name = self._get_class_name_from_qualified(full_name)
+        # class_name comes from the lexical enclosing class/struct/union
+        # (class_context) OR from a qualifier written in the source name
+        # (out-of-line def: Foo::method). A namespace qualifier in
+        # namespace_prefix must NOT become a class_name.
+        if class_context is not None:
+            class_name = class_context
+        elif '::' in name:
+            class_name = self._get_class_name_from_qualified(name)
+        else:
+            class_name = None
 
         code = self._node_text(node, source)
         start_line = node.start_point[0] + 1  # tree-sitter is 0-indexed
@@ -456,6 +495,52 @@ class FunctionExtractor:
             self.stats['inline_functions'] += 1
 
         self.stats['by_type'][unit_type] = self.stats['by_type'].get(unit_type, 0) + 1
+
+    def _process_lambda_declaration(self, node, source: bytes, relative_path: str,
+                                    namespace_prefix: str = '') -> None:
+        """Extract a named lambda from a declaration (auto f = [](){...};).
+
+        A lambda is a `lambda_expression` initializer inside an
+        `init_declarator`; the declaration node is otherwise skipped by the
+        traversal, so the callable would never be recorded as a unit.
+        """
+        # A declaration may declare several init_declarators.
+        stack = list(node.children)
+        while stack:
+            child = stack.pop()
+            if child.type != 'init_declarator':
+                stack.extend(child.children)
+                continue
+
+            value_node = child.child_by_field_name('value')
+            if value_node is None or value_node.type != 'lambda_expression':
+                continue
+
+            decl_node = child.child_by_field_name('declarator')
+            name = (self._extract_identifier_from_declarator(decl_node, source)
+                    if decl_node is not None else None)
+            if not name:
+                continue
+
+            full_name = (namespace_prefix + name
+                         if namespace_prefix and '::' not in name else name)
+            func_id = f"{relative_path}:{full_name}"
+            self.functions[func_id] = {
+                'name': full_name,
+                'file_path': relative_path,
+                'start_line': node.start_point[0] + 1,
+                'end_line': node.end_point[0] + 1,
+                'code': self._node_text(node, source),
+                'parameters': self._get_parameters(value_node, source),
+                'return_type': 'auto',
+                'is_static': False,
+                'is_exported': False,
+                'is_inline': False,
+                'unit_type': 'lambda',
+                'class_name': None,
+            }
+            self.stats['total_functions'] += 1
+            self.stats['by_type']['lambda'] = self.stats['by_type'].get('lambda', 0) + 1
 
     def _process_declaration_node(self, node, source: bytes, relative_path: str) -> None:
         """Process a declaration node in a header to track prototypes."""
