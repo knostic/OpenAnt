@@ -176,20 +176,118 @@ class CallGraphBuilder:
         except Exception:
             return self._extract_calls_regex(code, caller_id)
 
+        # First pass: collect local-variable names (assignment LHS) and
+        # method-object bindings (`m = method(:sym)` / proc / lambda). These
+        # inform parenless-call precision [BUG 1] and `.call` resolution [BUG 31].
+        local_vars: Set[str] = set()
+        method_object_bindings: Dict[str, str] = {}
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.type == 'assignment':
+                lhs = node.children[0] if node.children else None
+                if lhs is not None and lhs.type == 'identifier':
+                    var_name = self._node_str(lhs, code_bytes)
+                    local_vars.add(var_name)
+                    bound = self._method_object_target(node, code_bytes)
+                    if bound:
+                        method_object_bindings[var_name] = bound
+            stack.extend(reversed(node.children))
+
+        # Second pass: resolve calls and bare (parenless) identifier calls.
         stack = [tree.root_node]
         while stack:
             node = stack.pop()
             if node.type == 'call':
-                resolved = self._resolve_call_node(node, code_bytes, caller_file, caller_class)
+                resolved = self._resolve_call_node(
+                    node, code_bytes, caller_file, caller_class,
+                    method_object_bindings
+                )
+                if resolved:
+                    calls.add(resolved)
+            elif node.type == 'identifier':
+                resolved = self._resolve_bare_identifier(
+                    node, code_bytes, caller_file, caller_class, local_vars
+                )
                 if resolved:
                     calls.add(resolved)
             stack.extend(reversed(node.children))
 
         return calls
 
+    def _node_str(self, node, source: bytes) -> str:
+        return source[node.start_byte:node.end_byte].decode('utf-8', errors='replace')
+
+    def _method_object_target(self, assignment_node, source: bytes) -> Optional[str]:
+        """If RHS is method(:sym)/proc/lambda binding a named method, return the name.
+
+        Tracks `m = method(:helper)` so a later `m.call` resolves to `helper`.
+        """
+        rhs = assignment_node.children[-1] if assignment_node.children else None
+        if rhs is None or rhs.type != 'call':
+            return None
+        callee = None
+        arg_list = None
+        for child in rhs.children:
+            if child.type == 'identifier' and callee is None:
+                callee = self._node_str(child, source)
+            elif child.type == 'argument_list':
+                arg_list = child
+        if callee != 'method' or arg_list is None:
+            return None
+        for arg in arg_list.children:
+            if arg.type in ('simple_symbol', 'symbol'):
+                sym = self._node_str(arg, source)
+                return sym.lstrip(':')
+        return None
+
+    def _resolve_bare_identifier(self, node, source: bytes, caller_file: str,
+                                 caller_class: Optional[str],
+                                 local_vars: Set[str]) -> Optional[str]:
+        """Resolve a bare (parenless) identifier used as a call.
+
+        Precision guard: only treat a bare identifier as a call when its name
+        is a KNOWN user function, it is NOT a Ruby builtin, and it is NOT a
+        local variable / assignment target in this method body. We also skip
+        identifiers that are a structural part of a call/method/assignment
+        (their own handlers cover those) to avoid double-counting.
+        """
+        parent = node.parent
+        if parent is not None and parent.type in (
+            'call', 'method', 'singleton_method', 'assignment', 'method_call',
+        ):
+            return None
+        name = self._node_str(node, source)
+        if name in local_vars:
+            return None
+        if self._is_builtin(name):
+            return None
+        if name not in self.functions_by_name:
+            return None
+        return self._resolve_simple_call(name, caller_file, caller_class)
+
     def _resolve_call_node(self, node, source: bytes, caller_file: str,
-                           caller_class: Optional[str]) -> Optional[str]:
+                           caller_class: Optional[str],
+                           method_object_bindings: Optional[Dict[str, str]] = None
+                           ) -> Optional[str]:
         """Resolve a tree-sitter call node to a function ID."""
+        method_object_bindings = method_object_bindings or {}
+
+        # Method-object call: `m = method(:helper)` then `m.call` resolves to the
+        # bound target [BUG 31]. The positional heuristic below mis-parses a
+        # lowercase-variable receiver (it captures the var as the method name),
+        # so detect this precisely via tree-sitter's named receiver/method fields.
+        recv_field = node.child_by_field_name('receiver')
+        meth_field = node.child_by_field_name('method')
+        if recv_field is not None and meth_field is not None:
+            recv_text = source[recv_field.start_byte:recv_field.end_byte].decode(
+                'utf-8', errors='replace')
+            meth_text = source[meth_field.start_byte:meth_field.end_byte].decode(
+                'utf-8', errors='replace')
+            if meth_text == 'call' and recv_text in method_object_bindings:
+                target_name = method_object_bindings[recv_text]
+                return self._resolve_simple_call(target_name, caller_file, caller_class)
+
         # Extract method name
         method_name = None
         receiver = None
@@ -210,7 +308,16 @@ class CallGraphBuilder:
         if not method_name:
             return None
 
+        # A user method may share a name with a Ruby builtin (e.g. render, log,
+        # open). Don't let the builtin filter drop a call that resolves to a
+        # user-defined function visible in scope. Scope = same class or same
+        # file ONLY (no global cross-file single-match) so a genuine builtin
+        # call isn't wired to an unrelated same-named user method elsewhere.
         if self._is_builtin(method_name):
+            if receiver is None and self._has_scoped_user_function(
+                method_name, caller_file, caller_class
+            ):
+                return self._resolve_simple_call(method_name, caller_file, caller_class)
             return None
 
         # self.method(...) - same class
@@ -247,9 +354,16 @@ class CallGraphBuilder:
         file_imports = self.imports.get(caller_file, {})
         for import_name, import_type in file_imports.items():
             if import_type in ('require', 'require_relative'):
-                # Try matching import path to file
+                # Try matching import path to file by basename equality (the
+                # require's last path segment must equal the file's stem). An
+                # unanchored substring test (`import_name in file_path`) wrongly
+                # matched e.g. require 'auth' -> authentication.rb.
+                import_basename = import_name.replace('\\', '/').rsplit('/', 1)[-1]
                 for file_path in self.functions_by_file:
-                    if file_path.endswith(f"{import_name}.rb") or import_name in file_path:
+                    file_stem = file_path.replace('\\', '/').rsplit('/', 1)[-1]
+                    if file_stem.endswith('.rb'):
+                        file_stem = file_stem[:-len('.rb')]
+                    if file_stem == import_basename:
                         file_funcs = self.functions_by_file[file_path]
                         for func_id in file_funcs:
                             func_data = self.functions.get(func_id, {})
@@ -263,6 +377,25 @@ class CallGraphBuilder:
             return candidates[0]
 
         return None
+
+    def _has_scoped_user_function(self, name: str, caller_file: str,
+                                  caller_class: Optional[str]) -> bool:
+        """True if `name` is a user function visible in the caller's scope.
+
+        Scope is deliberately narrow (same class or same file). This lets a
+        user method that shadows a builtin name resolve, without globally
+        rescuing a genuine builtin call into an unrelated same-named method.
+        """
+        if caller_class:
+            class_key = f"{caller_file}:{caller_class}"
+            for func_id in self.methods_by_class.get(class_key, []):
+                if self.functions.get(func_id, {}).get('name') == name:
+                    return True
+        for func_id in self.functions_by_file.get(caller_file, []):
+            func_data = self.functions.get(func_id, {})
+            if func_data.get('name') == name and not func_data.get('class_name'):
+                return True
+        return False
 
     def _resolve_self_call(self, method_name: str, caller_file: str,
                            caller_class: str) -> Optional[str]:
@@ -288,15 +421,37 @@ class CallGraphBuilder:
                 if func_data.get('name') == method_name:
                     return func_id
 
-        # Check all files for the class
+        # Cross-file fallback. The previous behaviour linked the FIRST same-named
+        # class found ANYWHERE, which is unsound: it wired callers to unrelated
+        # files (and is wrong under same-name class collisions). Scope it: only
+        # accept a cross-file class when the caller's file require/require_relative
+        # resolves to the file that defines the class.
         for key, func_ids in self.methods_by_class.items():
-            if key.endswith(f":{class_name}"):
-                for func_id in func_ids:
-                    func_data = self.functions.get(func_id, {})
-                    if func_data.get('name') == method_name:
-                        return func_id
+            if not key.endswith(f":{class_name}"):
+                continue
+            key_file = key.rsplit(':', 1)[0]
+            if not self._file_is_required_by(key_file, caller_file):
+                continue
+            for func_id in func_ids:
+                func_data = self.functions.get(func_id, {})
+                if func_data.get('name') == method_name:
+                    return func_id
 
         return None
+
+    def _file_is_required_by(self, target_file: str, caller_file: str) -> bool:
+        """True if caller_file has a require/require_relative resolving to target_file."""
+        target_stem = target_file.replace('\\', '/').rsplit('/', 1)[-1]
+        if target_stem.endswith('.rb'):
+            target_stem = target_stem[:-len('.rb')]
+        file_imports = self.imports.get(caller_file, {})
+        for import_name, import_type in file_imports.items():
+            if import_type not in ('require', 'require_relative'):
+                continue
+            import_basename = import_name.replace('\\', '/').rsplit('/', 1)[-1]
+            if import_basename == target_stem:
+                return True
+        return False
 
     def _extract_calls_regex(self, code: str, caller_id: str) -> Set[str]:
         """Fallback regex-based call extraction for unparseable code."""
