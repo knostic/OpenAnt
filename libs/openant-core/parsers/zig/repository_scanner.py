@@ -31,8 +31,8 @@ class RepositoryScanner:
         "target",
     }
 
-    # Test directory patterns to skip when skip_tests is True
-    TEST_PATTERNS = {"test", "tests", "spec", "specs", "_test", "test_"}
+    # Test directory names (matched as whole path components, not substrings).
+    TEST_DIRS = {"test", "tests", "spec", "specs"}
 
     def __init__(
         self,
@@ -113,20 +113,34 @@ class RepositoryScanner:
         return False
 
     def _is_test_directory(self, dirname: str) -> bool:
-        """Check if a directory name indicates test code."""
-        dirname_lower = dirname.lower()
-        return any(pattern in dirname_lower for pattern in self.TEST_PATTERNS)
+        """Check if a directory name indicates test code.
+
+        Matches whole directory names exactly (``test``/``tests``/``spec``/
+        ``specs``) so that real dirs whose name merely *contains* a test token
+        as a substring (``latest_dir``, ``inspector``) are NOT excluded.
+        """
+        return dirname.lower() in self.TEST_DIRS
 
     def _is_test_file(self, filepath: str) -> bool:
-        """Check if a file path indicates test code."""
+        """Check if a file path indicates test code.
+
+        Anchored to path components / basename conventions so that real sources
+        whose name merely *contains* a test token as a substring (``latest.zig``,
+        ``contest.zig``, ``attestation.zig``, ``inspector/foo.zig``) are NOT
+        skipped. A path is a test iff a directory component is exactly a test
+        dir OR the basename follows a test convention (``test_*``,
+        ``*_test.zig``, ``*_spec.zig``).
+        """
         filepath_lower = filepath.lower()
-        # Check for test in path components
         parts = Path(filepath_lower).parts
-        for part in parts:
-            if any(pattern in part for pattern in self.TEST_PATTERNS):
+        # Directory-component match (exact, not substring).
+        for part in parts[:-1]:
+            if part in self.TEST_DIRS:
                 return True
-        # Check for _test.zig suffix
-        if filepath_lower.endswith("_test.zig"):
+        basename = parts[-1] if parts else filepath_lower
+        if basename.startswith("test_"):
+            return True
+        if basename.endswith("_test.zig") or basename.endswith("_spec.zig"):
             return True
         return False
 

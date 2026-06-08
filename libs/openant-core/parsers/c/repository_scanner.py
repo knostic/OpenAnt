@@ -102,11 +102,26 @@ class RepositoryScanner:
         return ext in self.source_extensions
 
     def is_test_file(self, relative_path: str) -> bool:
-        """Check if a file is a test file."""
-        path_lower = relative_path.lower()
-        for pattern in self.test_patterns:
-            if pattern in path_lower:
+        """Check if a file is a test file.
+
+        Anchored to path components / basename conventions so that real sources
+        whose name merely *contains* a test token as a substring (e.g.
+        ``latest_dir/main.c``, ``contest/sol.c``, ``protest.c``) are NOT skipped.
+        A path is a test iff a directory component is exactly a test dir
+        (``test``/``tests``/``fuzz``) OR the basename follows a test convention
+        (``test_*``, ``*_test.c``, ``*_test.cpp``).
+        """
+        path_lower = relative_path.lower().replace('\\', '/')
+        parts = path_lower.split('/')
+        # Directory-component match (exact, not substring).
+        for component in parts[:-1]:
+            if component in {'test', 'tests', 'fuzz'}:
                 return True
+        basename = parts[-1]
+        if basename.startswith('test_'):
+            return True
+        if basename.endswith('_test.c') or basename.endswith('_test.cpp'):
+            return True
         return False
 
     def scan_directory(self, dir_path: Path, relative_path: str = '') -> None:

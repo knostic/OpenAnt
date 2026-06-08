@@ -112,11 +112,30 @@ class RepositoryScanner:
         return ext in self.source_extensions
 
     def is_test_file(self, relative_path: str) -> bool:
-        """Check if a file is a test file."""
-        path_lower = relative_path.lower()
-        for pattern in self.test_patterns:
-            if pattern.lower() in path_lower:
+        """Check if a file is a test file.
+
+        Anchored to path components / basename conventions so that real sources
+        whose name merely *contains* a test token as a substring (e.g.
+        ``latest_controller.php``, ``protest_api.php``) are NOT skipped. A path
+        is a test iff a directory component is exactly a test dir
+        (``test``/``tests``/``spec``) OR the basename follows a test convention
+        (``test_*``, ``*_test.php``, ``*Test.php``, ``phpunit*``).
+        """
+        normalized = relative_path.replace('\\', '/')
+        parts = normalized.split('/')
+        # Directory-component match (exact, not substring).
+        for component in parts[:-1]:
+            if component.lower() in {'test', 'tests', 'spec'}:
                 return True
+        basename = parts[-1]
+        basename_lower = basename.lower()
+        if basename_lower.startswith('test_') or basename_lower.startswith('phpunit'):
+            return True
+        if basename_lower.endswith('_test.php'):
+            return True
+        # PHPUnit class convention `<ClassName>Test.php` (CamelCase `Test` suffix).
+        if basename.endswith('Test.php'):
+            return True
         return False
 
     def scan_directory(self, dir_path: Path, relative_path: str = '') -> None:
