@@ -300,7 +300,7 @@ func (c *Config) LLMConfigExists(name string) bool {
 	return exists
 }
 
-// LLMConfigNames returns the sorted names of user-authored llm-configs.
+// LLMConfigNames returns the names of user-authored llm-configs.
 // Used by the setup wizard's intro to show the user what they already
 // have. Does NOT include the built-in “openant-default“.
 func (c *Config) LLMConfigNames() []string {
@@ -318,7 +318,7 @@ func (c *Config) LLMConfigNames() []string {
 	return out
 }
 
-// ProviderNames returns the sorted names of user-authored providers.
+// ProviderNames returns the names of user-authored providers.
 // Same intro-display purpose as LLMConfigNames.
 func (c *Config) ProviderNames() []string {
 	if c.raw == nil {
@@ -451,11 +451,16 @@ func ScanDir(projectName, shortSHA, language string) (string, error) {
 	return filepath.Join(projDir, "scans", shortSHA, language), nil
 }
 
-// MaskKey returns a masked version of an API key for display.
-// Shows the first 7 and last 4 characters.
+// MaskKey returns a masked version of an API key for display. Long keys
+// show the first 7 and last 4 characters; short keys (which shouldn't
+// occur for real provider keys) are fully masked so we never slice out
+// of range or reveal a whole key.
 func MaskKey(key string) string {
 	if key == "" {
 		return "(not set)"
+	}
+	if len(key) < 8 {
+		return "****"
 	}
 	if len(key) <= 12 {
 		return key[:3] + "..." + key[len(key)-2:]

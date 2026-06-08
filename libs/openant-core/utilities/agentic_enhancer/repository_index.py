@@ -231,7 +231,14 @@ class RepositoryIndex:
         if not self.repo_path:
             return None
 
-        full_path = self.repo_path / file_path
+        # file_path is model-controlled (the agent's read_file_section tool
+        # arg). Resolve and confine to the repo root so a ``..`` or absolute
+        # path can't read arbitrary host files; resolve() also collapses
+        # symlink escapes.
+        repo_root = self.repo_path.resolve()
+        full_path = (self.repo_path / file_path).resolve()
+        if not full_path.is_relative_to(repo_root):
+            return None
         if not full_path.exists():
             return None
 
