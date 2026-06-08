@@ -542,6 +542,15 @@ func probeAllPhases(
 			return fmt.Errorf("internal: provider %q referenced by phase %q but not collected", ref.Provider, phase)
 		}
 		fmt.Fprintf(os.Stderr, "  %s/%s ... ", ref.Provider, ref.Model)
+		if prov.APIKey == "" {
+			// Blank key means "read from the environment" (the wizard
+			// offers this and WriteLLMConfig persists the env-read shape).
+			// The Go probe can't read the provider's env var, so skip it;
+			// Python's registry.validate() surfaces a missing/blank env
+			// key at scan start instead.
+			fmt.Fprintln(os.Stderr, "SKIPPED (key from environment)")
+			continue
+		}
 		var probeErr error
 		switch prov.Type {
 		case "anthropic":
