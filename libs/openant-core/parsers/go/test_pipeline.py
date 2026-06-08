@@ -52,6 +52,41 @@ if str(_core_root) not in sys.path:
 from utilities.file_io import open_utf8, read_json, run_utf8, write_json
 
 
+def normalize_go_function_records(raw_functions: dict) -> dict:
+    """Normalize Go FunctionInfo records to the snake_case consumer contract.
+
+    The Go parser is a separate Go binary whose FunctionInfo records
+    (parsers/go/go_parser/types.go) use camelCase json keys
+    (``unitType``/``startLine``/``endLine``/``isExported``/``filePath``/
+    ``className``), while every other parser emits snake_case. The Python
+    reachability/entry-point consumers (EntryPointDetector, etc.) read
+    snake_case — e.g. ``func_data.get('unit_type')``. Without normalization the
+    Go records' snake keys are ``None`` and any unit_type-based logic is
+    silently broken for Go (BUG-NEW 5).
+
+    This maps the known FunctionInfo fields to snake_case, reading from either
+    shape so it is idempotent: already-snake records pass through unchanged.
+    Scope is the call_graph.json ``functions`` map only — the separate
+    analyzer_output.json camelCase contract is intentionally NOT touched.
+    """
+    normalized: dict = {}
+    for func_id, fd in raw_functions.items():
+        normalized[func_id] = {
+            'name': fd.get('name', ''),
+            'unit_type': fd.get('unit_type', fd.get('unitType', 'function')),
+            'code': fd.get('code', ''),
+            'file_path': fd.get('file_path', fd.get('filePath', '')),
+            'start_line': fd.get('start_line', fd.get('startLine', 0)),
+            'end_line': fd.get('end_line', fd.get('endLine', 0)),
+            'package': fd.get('package', ''),
+            'receiver': fd.get('receiver', ''),
+            'is_exported': fd.get('is_exported', fd.get('isExported', False)),
+            'class_name': fd.get('class_name', fd.get('className', '')),
+            'decorators': fd.get('decorators', []),
+        }
+    return normalized
+
+
 def _stdout_supports_unicode() -> bool:
     """Return True if sys.stdout can emit the symbols we use for status.
 
@@ -298,21 +333,10 @@ class GoPipelineTest:
                 dataset_for_cg = read_json(self.dataset_file)
 
                 raw_functions = analyzer.get("functions", {})
-                # Normalise to the camelCase shape EntryPointDetector expects.
-                normalized_functions = {
-                    func_id: {
-                        'name': fd.get('name', ''),
-                        'unitType': fd.get('unit_type', fd.get('unitType', 'function')),
-                        'code': fd.get('code', ''),
-                        'filePath': fd.get('file_path', fd.get('filePath', '')),
-                        'startLine': fd.get('start_line', fd.get('startLine', 0)),
-                        'endLine': fd.get('end_line', fd.get('endLine', 0)),
-                        'package': fd.get('package', ''),
-                        'receiver': fd.get('receiver', ''),
-                        'isExported': fd.get('is_exported', fd.get('isExported', False)),
-                    }
-                    for func_id, fd in raw_functions.items()
-                }
+                # Normalise to the snake_case shape the Python consumers read
+                # (EntryPointDetector reads func_data.get('unit_type'), etc.).
+                # Idempotent: already-snake records pass through unchanged.
+                normalized_functions = normalize_go_function_records(raw_functions)
 
                 call_graph: dict = {}
                 reverse_call_graph: dict = {}
@@ -368,21 +392,11 @@ class GoPipelineTest:
 
             functions = analyzer.get("functions", {})
 
-            # Convert to expected format for EntryPointDetector
-            # Go parser uses snake_case, EntryPointDetector expects camelCase
-            normalized_functions = {}
-            for func_id, func_data in functions.items():
-                normalized_functions[func_id] = {
-                    'name': func_data.get('name', ''),
-                    'unitType': func_data.get('unit_type', func_data.get('unitType', 'function')),
-                    'code': func_data.get('code', ''),
-                    'filePath': func_data.get('file_path', func_data.get('filePath', '')),
-                    'startLine': func_data.get('start_line', func_data.get('startLine', 0)),
-                    'endLine': func_data.get('end_line', func_data.get('endLine', 0)),
-                    'package': func_data.get('package', ''),
-                    'receiver': func_data.get('receiver', ''),
-                    'isExported': func_data.get('is_exported', func_data.get('isExported', False)),
-                }
+            # Convert to the snake_case shape the Python consumers read.
+            # The Go binary's analyzer_output uses camelCase FunctionInfo keys;
+            # EntryPointDetector / ReachabilityAnalyzer read snake_case
+            # (func_data.get('unit_type'), etc.). Idempotent normalization.
+            normalized_functions = normalize_go_function_records(functions)
 
             # Load call graph from dataset (go_parser puts it in statistics)
             dataset = read_json(self.dataset_file)
