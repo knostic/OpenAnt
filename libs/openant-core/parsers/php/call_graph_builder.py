@@ -162,18 +162,27 @@ class CallGraphBuilder:
         caller_func = self.functions.get(caller_id, {})
         caller_class = caller_func.get('class_name')
 
+        # The extractor stores each function/method body as a raw PHP fragment
+        # WITHOUT a leading "<?php" open tag. tree-sitter-php treats untagged
+        # input as inline HTML 'text' and yields no call nodes, so prepend an
+        # open tag before re-parsing. All node byte offsets used below are
+        # relative to this tagged buffer, so resolution stays consistent.
+        if not code.lstrip().startswith('<?'):
+            code = '<?php ' + code
         code_bytes = code.encode('utf-8', errors='replace')
         try:
             tree = self.php_parser.parse(code_bytes)
         except Exception:
             return self._extract_calls_regex(code, caller_id)
 
-        stack = [tree.root_node]
+        root = tree.root_node
+        stack = [root]
         while stack:
             node = stack.pop()
             if node.type in ('function_call_expression', 'member_call_expression',
                              'scoped_call_expression'):
-                resolved = self._resolve_call_node(node, code_bytes, caller_file, caller_class)
+                resolved = self._resolve_call_node(node, code_bytes, caller_file,
+                                                   caller_class, root)
                 if resolved:
                     calls.add(resolved)
             stack.extend(reversed(node.children))
@@ -181,10 +190,10 @@ class CallGraphBuilder:
         return calls
 
     def _resolve_call_node(self, node, source: bytes, caller_file: str,
-                           caller_class: Optional[str]) -> Optional[str]:
+                           caller_class: Optional[str], root=None) -> Optional[str]:
         """Resolve a tree-sitter call node to a function ID."""
         if node.type == 'function_call_expression':
-            return self._resolve_function_call(node, source, caller_file, caller_class)
+            return self._resolve_function_call(node, source, caller_file, caller_class, root)
         elif node.type == 'member_call_expression':
             return self._resolve_member_call(node, source, caller_file, caller_class)
         elif node.type == 'scoped_call_expression':
@@ -192,7 +201,7 @@ class CallGraphBuilder:
         return None
 
     def _resolve_function_call(self, node, source: bytes, caller_file: str,
-                                caller_class: Optional[str]) -> Optional[str]:
+                                caller_class: Optional[str], root=None) -> Optional[str]:
         """Resolve a simple function call like func()."""
         func_name = None
 
@@ -206,6 +215,12 @@ class CallGraphBuilder:
                 if '\\' in func_name:
                     func_name = func_name.rsplit('\\', 1)[-1]
                 break
+            elif child.type == 'variable_name':
+                # Variable-function call like $f(). Follow a single
+                # string-literal binding ($f = 'helper';) to recover the name.
+                var_name = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
+                func_name = self._resolve_variable_function(var_name, root, source)
+                break
 
         if not func_name:
             return None
@@ -214,6 +229,56 @@ class CallGraphBuilder:
             return None
 
         return self._resolve_simple_call(func_name, caller_file, caller_class)
+
+    def _resolve_variable_function(self, var_name: str, root,
+                                   source: bytes) -> Optional[str]:
+        """Follow a single string-literal binding for a $var() callee.
+
+        Scans the enclosing function body for assignments to ``var_name``.
+        Only a single, unambiguous string-literal binding
+        (``$f = 'helper';``) is followed; if the variable is assigned more
+        than once, or from a non-literal, resolution is declined for
+        precision (no guessing).
+        """
+        if root is None:
+            return None
+        literal_names: Set[str] = set()
+        non_literal = False
+
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            if n.type == 'assignment_expression':
+                children = [c for c in n.children if c.type not in ('=',)]
+                # Shape: <variable_name> = <rhs>
+                if len(children) >= 2 and children[0].type == 'variable_name':
+                    lhs = source[children[0].start_byte:children[0].end_byte].decode(
+                        'utf-8', errors='replace')
+                    if lhs == var_name:
+                        rhs = children[1]
+                        literal = self._string_literal_value(rhs, source)
+                        if literal is not None:
+                            literal_names.add(literal)
+                        else:
+                            non_literal = True
+            stack.extend(n.children)
+
+        # Single unambiguous string binding only.
+        if non_literal or len(literal_names) != 1:
+            return None
+        return next(iter(literal_names))
+
+    @staticmethod
+    def _string_literal_value(node, source: bytes) -> Optional[str]:
+        """Return the content of a string-literal node, else None."""
+        if node.type != 'string':
+            return None
+        for child in node.children:
+            if child.type == 'string_content':
+                return source[child.start_byte:child.end_byte].decode(
+                    'utf-8', errors='replace')
+        # Empty string literal ('') has no string_content child.
+        return ''
 
     def _resolve_member_call(self, node, source: bytes, caller_file: str,
                               caller_class: Optional[str]) -> Optional[str]:
@@ -250,7 +315,8 @@ class CallGraphBuilder:
         for child in node.children:
             if child.type == 'name' and scope is not None:
                 method_name = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
-            elif child.type in ('name', 'qualified_name') and scope is None:
+            elif child.type in ('name', 'qualified_name', 'relative_scope') and scope is None:
+                # 'relative_scope' is the grammar node for self / static / parent.
                 scope = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
                 if '\\' in scope:
                     scope = scope.rsplit('\\', 1)[-1]
@@ -264,8 +330,17 @@ class CallGraphBuilder:
             return None
 
         # self::method() or static::method() - same class
-        if scope in ('self', 'static', 'parent') and caller_class:
+        if scope in ('self', 'static') and caller_class:
             return self._resolve_self_call(method_name, caller_file, caller_class)
+
+        # parent::method() - the method is inherited from the parent class,
+        # which may be defined in a different file. Resolve via the
+        # class->parent index, then a cross-file class-method lookup.
+        if scope == 'parent' and caller_class:
+            parent_class = self._resolve_parent_class(caller_file, caller_class)
+            if parent_class:
+                return self._resolve_class_call(parent_class, method_name, caller_file)
+            return None
 
         # ClassName::method()
         return self._resolve_class_call(scope, method_name, caller_file)
@@ -340,6 +415,33 @@ class CallGraphBuilder:
                         return func_id
 
         return None
+
+    def _resolve_parent_class(self, caller_file: str,
+                              caller_class: str) -> Optional[str]:
+        """Return the parent (superclass) name of caller_class, if known.
+
+        The class index records each class's ``superclass`` (the ``extends``
+        target). The parent class may be defined in a different file, so a
+        same-file lookup is tried first, then any file declaring the class.
+        """
+        # Same-file class declaration first (most precise).
+        class_data = self.classes.get(f"{caller_file}:{caller_class}")
+        if class_data and class_data.get('superclass'):
+            return self._strip_namespace(class_data['superclass'])
+
+        # Fall back to any class with this name across files.
+        for key, data in self.classes.items():
+            if key.endswith(f":{caller_class}") and data.get('superclass'):
+                return self._strip_namespace(data['superclass'])
+
+        return None
+
+    @staticmethod
+    def _strip_namespace(name: str) -> str:
+        """Reduce a possibly namespace-qualified class name to its last segment."""
+        if '\\' in name:
+            return name.rsplit('\\', 1)[-1]
+        return name
 
     def _extract_calls_regex(self, code: str, caller_id: str) -> Set[str]:
         """Fallback regex-based call extraction for unparseable code."""
