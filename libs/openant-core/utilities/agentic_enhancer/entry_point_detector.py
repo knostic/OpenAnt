@@ -29,6 +29,7 @@ ENTRY_POINT_TYPES = {
     'view_function',      # Django views
     'websocket_handler',  # WebSocket endpoints
     'cli_handler',        # CLI commands
+    'main',               # Program execution root (C/Go binaries, etc.)
 }
 
 # Decorator patterns indicating entry points (case-insensitive matching)
@@ -176,6 +177,14 @@ class EntryPointDetector:
         unit_type = func_data.get('unit_type', '')
         if unit_type in ENTRY_POINT_TYPES:
             reasons.append(f'unit_type:{unit_type}')
+
+        # Check 1b: A function named `main` is a program execution root by name,
+        # even when the extractor classified its unit_type as something else
+        # (defensive: covers language extractors that emit a generic unit_type
+        # for main). A program's main is an entry point; over-approximating it
+        # is reachability-safe.
+        elif func_data.get('name') == 'main':
+            reasons.append('name:main')
 
         # Check 2: Decorators indicate entry point
         decorators = func_data.get('decorators', [])
