@@ -127,15 +127,23 @@ class FunctionExtractor:
 
     def _classify_function(self, func_name: str, class_name: Optional[str],
                            module_name: Optional[str], is_singleton: bool,
-                           file_path: str) -> str:
+                           file_path: str, visibility: str = 'public') -> str:
         """Classify a function by its type/purpose."""
         path_lower = file_path.lower()
+
+        # is_singleton must be checked BEFORE the initialize/constructor branch:
+        # `def self.initialize` is a class-level singleton method, not the
+        # instance constructor (Ruby's constructor is the instance `initialize`).
+        if is_singleton:
+            return 'singleton_method'
 
         if func_name == 'initialize':
             return 'constructor'
 
-        if is_singleton:
-            return 'singleton_method'
+        # Explicit Ruby visibility keyword (`private` / `protected`) shadows the
+        # leading-underscore heuristic below.
+        if class_name and visibility in ('private', 'protected'):
+            return f'{visibility}_method'
 
         # Callbacks
         if func_name.startswith(('before_', 'after_', 'around_')):
@@ -209,31 +217,89 @@ class FunctionExtractor:
 
         return imports
 
+    def _body_node(self, node):
+        """Return a node's body (`body` field, else a `body_statement` child)."""
+        body_node = node.child_by_field_name('body')
+        if body_node is None:
+            for child in node.children:
+                if child.type == 'body_statement':
+                    body_node = child
+                    break
+        return body_node
+
+    def _push_body_in_order(self, stack, body_node, class_name, module_name) -> None:
+        """Push a class/module body's children, tracking the `private`/`public`/
+        `protected` visibility keyword state across the body in document order.
+
+        Pushed reversed so the LIFO stack pops them in document order; each child
+        carries the visibility in effect at its position.
+        """
+        visibility = 'public'
+        annotated = []
+        for child in body_node.children:
+            # Bare visibility keyword (no arguments) flips the body-level state.
+            if child.type == 'identifier':
+                kw = self._node_text(child, source=self._current_source)
+                if kw in ('private', 'public', 'protected'):
+                    visibility = kw
+                    continue
+            annotated.append((child, class_name, module_name, visibility))
+        for entry in reversed(annotated):
+            stack.append(entry)
+
     def _extract_functions_from_tree(self, tree, source: bytes, file_path: Path,
                                      relative_path: str) -> None:
         """Extract all method definitions from a parsed tree."""
-        # Stack-based traversal: (node, class_name, module_name)
-        stack = [(tree.root_node, None, None)]
+        # `_push_body_in_order` reads source for visibility keywords.
+        self._current_source = source
+        # Stack-based traversal: (node, class_name, module_name, visibility)
+        stack = [(tree.root_node, None, None, 'public')]
 
         while stack:
-            node, class_name, module_name = stack.pop()
+            node, class_name, module_name, visibility = stack.pop()
 
-            if node.type == 'method':
+            if node.type in ('method', 'singleton_method'):
                 self._process_method_node(
                     node, source, relative_path, class_name, module_name,
-                    is_singleton=False
+                    is_singleton=(node.type == 'singleton_method'),
+                    visibility=visibility,
                 )
+                # A nested `def` lives in the method's body — keep traversing so
+                # methods defined inside another method are not lost. Nested defs
+                # inherit the enclosing class but default to public visibility.
+                body_node = self._body_node(node)
+                if body_node:
+                    for child in reversed(body_node.children):
+                        stack.append((child, class_name, module_name, 'public'))
+                continue
 
-            elif node.type == 'singleton_method':
-                self._process_method_node(
-                    node, source, relative_path, class_name, module_name,
-                    is_singleton=True
+            elif node.type == 'alias':
+                # `alias <new> <old>` — register the new name as a method.
+                self._process_alias_node(
+                    node, source, relative_path, class_name, module_name, visibility
                 )
+                continue
+
+            elif node.type == 'call':
+                # Metaprogramming: `define_method(:name) {...}` and
+                # `alias_method :new, :old` define methods via a call node.
+                if self._process_call_definition(
+                    node, source, relative_path, class_name, module_name, visibility
+                ):
+                    continue
+                for child in reversed(node.children):
+                    stack.append((child, class_name, module_name, visibility))
 
             elif node.type == 'class':
                 # Extract class name
                 name_node = node.child_by_field_name('name')
-                new_class_name = self._node_text(name_node, source) if name_node else None
+                local_class_name = self._node_text(name_node, source) if name_node else None
+                # Compose with the enclosing class so a nested class keeps its
+                # outer qualifier, e.g. `Outer::Inner`.
+                if local_class_name and class_name:
+                    new_class_name = f"{class_name}::{local_class_name}"
+                else:
+                    new_class_name = local_class_name
 
                 # Extract superclass
                 superclass = None
@@ -271,11 +337,10 @@ class FunctionExtractor:
                     }
                     self.stats['total_classes'] += 1
 
-                # Recurse into class body with updated class_name
+                # Recurse into class body with updated class_name + visibility tracking
                 body_node = node.child_by_field_name('body')
                 if body_node:
-                    for child in reversed(body_node.children):
-                        stack.append((child, new_class_name, module_name))
+                    self._push_body_in_order(stack, body_node, new_class_name, module_name)
                 continue  # Don't walk children again
 
             elif node.type == 'module':
@@ -288,26 +353,18 @@ class FunctionExtractor:
                 new_module_name = self._node_text(name_node, source) if name_node else module_name
 
                 # Recurse into module body
-                body_node = node.child_by_field_name('body')
-                if body_node is None:
-                    # Try finding body_statement child
-                    for child in node.children:
-                        if child.type == 'body_statement':
-                            body_node = child
-                            break
-
+                body_node = self._body_node(node)
                 if body_node:
-                    for child in reversed(body_node.children):
-                        stack.append((child, class_name, new_module_name))
+                    self._push_body_in_order(stack, body_node, class_name, new_module_name)
                 continue  # Don't walk children again
 
             else:
                 for child in reversed(node.children):
-                    stack.append((child, class_name, module_name))
+                    stack.append((child, class_name, module_name, visibility))
 
     def _process_method_node(self, node, source: bytes, relative_path: str,
                               class_name: Optional[str], module_name: Optional[str],
-                              is_singleton: bool) -> None:
+                              is_singleton: bool, visibility: str = 'public') -> None:
         """Process a single method or singleton_method node."""
         name = self._get_method_name(node, source)
         if not name:
@@ -319,7 +376,7 @@ class FunctionExtractor:
         parameters = self._get_parameters(node, source)
 
         unit_type = self._classify_function(
-            name, class_name, module_name, is_singleton, relative_path
+            name, class_name, module_name, is_singleton, relative_path, visibility
         )
 
         # Build qualified name and function ID
@@ -358,6 +415,113 @@ class FunctionExtractor:
             self.stats['singleton_methods'] += 1
 
         self.stats['by_type'][unit_type] = self.stats['by_type'].get(unit_type, 0) + 1
+
+    def _register_synthetic_method(self, name: str, node, source: bytes,
+                                   relative_path: str, class_name: Optional[str],
+                                   module_name: Optional[str], visibility: str) -> None:
+        """Register a method defined by metaprogramming (define_method / alias /
+        alias_method), where there is no `method` AST node to mine.
+
+        `node` supplies the source span/lines; parameters are unknown so they are
+        recorded empty.
+        """
+        if not name:
+            return
+
+        unit_type = self._classify_function(
+            name, class_name, module_name, False, relative_path, visibility
+        )
+
+        if class_name:
+            qualified_name = f"{class_name}.{name}"
+        elif module_name:
+            qualified_name = f"{module_name}.{name}"
+        else:
+            qualified_name = name
+
+        func_id = f"{relative_path}:{qualified_name}"
+        if func_id in self.functions:
+            return  # don't clobber a real def of the same name
+
+        self.functions[func_id] = {
+            'name': name,
+            'qualified_name': qualified_name,
+            'file_path': relative_path,
+            'start_line': node.start_point[0] + 1,
+            'end_line': node.end_point[0] + 1,
+            'code': self._node_text(node, source),
+            'class_name': class_name,
+            'module_name': module_name,
+            'parameters': [],
+            'is_singleton': False,
+            'unit_type': unit_type,
+        }
+        self.stats['total_functions'] += 1
+        if class_name:
+            self.stats['total_methods'] += 1
+        else:
+            self.stats['standalone_functions'] += 1
+        self.stats['by_type'][unit_type] = self.stats['by_type'].get(unit_type, 0) + 1
+
+    def _process_alias_node(self, node, source: bytes, relative_path: str,
+                            class_name: Optional[str], module_name: Optional[str],
+                            visibility: str) -> None:
+        """Handle an `alias <new> <old>` keyword node: register the new name."""
+        # The `alias` node holds two name children (identifier / symbol); the
+        # first is the new (aliased) name.
+        names = [c for c in node.children
+                 if c.type in ('identifier', 'simple_symbol', 'symbol', 'constant')]
+        if not names:
+            return
+        new_name = self._node_text(names[0], source).lstrip(':')
+        self._register_synthetic_method(
+            new_name, node, source, relative_path, class_name, module_name, visibility
+        )
+
+    def _process_call_definition(self, node, source: bytes, relative_path: str,
+                                 class_name: Optional[str], module_name: Optional[str],
+                                 visibility: str) -> bool:
+        """Handle method-defining call nodes (`define_method(:x)`, `alias_method
+        :new, :old`). Returns True if the call was a method definition (so the
+        traversal should not recurse into it).
+        """
+        method_node = None
+        for child in node.children:
+            if child.type == 'identifier':
+                method_node = child
+                break
+        if method_node is None:
+            return False
+        call_name = self._node_text(method_node, source)
+        if call_name not in ('define_method', 'alias_method'):
+            return False
+
+        arg_list = None
+        for child in node.children:
+            if child.type == 'argument_list':
+                arg_list = child
+                break
+        if arg_list is None:
+            return False
+
+        # First symbol/string argument is the method name being defined.
+        sym_args = [c for c in arg_list.children
+                    if c.type in ('simple_symbol', 'symbol', 'string')]
+        if not sym_args:
+            return False
+        first = sym_args[0]
+        if first.type == 'string':
+            new_name = ''.join(
+                self._node_text(sc, source)
+                for sc in first.children if sc.type == 'string_content'
+            )
+        else:
+            new_name = self._node_text(first, source).lstrip(':')
+
+        self._register_synthetic_method(
+            new_name, node, source, relative_path, class_name, module_name, visibility
+        )
+        return True
 
     def process_file(self, file_path: Path) -> None:
         """Process a single Ruby file."""
