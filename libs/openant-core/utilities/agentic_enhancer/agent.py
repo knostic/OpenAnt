@@ -340,8 +340,11 @@ class ContextAgent:
                     cost_usd=call_record.get("cost_usd", 0.0),
                 )
 
-            # Add assistant message and tool results to conversation
-            messages.append(Message(role="assistant", content=assistant_content))
+            # Add assistant message and tool results to conversation.
+            # Echo only the block kinds the loop consumes (Text + ToolUse);
+            # a future 4th block kind would throw on re-serialization.
+            echoed = [b for b in assistant_content if isinstance(b, (TextBlock, ToolUseBlock))]
+            messages.append(Message(role="assistant", content=echoed))
 
             # Only add user message with tool results if there are results
             # (empty content triggers API error: "user messages must have non-empty content")

@@ -343,12 +343,30 @@ def _response_to_unified(response: Any) -> CompletionResult:
             text = getattr(part, "text", None)
             if text:
                 content_blocks.append(TextBlock(text=text))
+    else:
+        # No candidates → the prompt itself was blocked/filtered (Gemini
+        # reports this on prompt_feedback, not a candidate finish_reason).
+        # Surface it instead of returning an empty end_turn, which pipeline
+        # code would read as a clean (passing) result — for a security tool
+        # that would mask a refusal as a non-finding.
+        feedback = getattr(response, "prompt_feedback", None)
+        block_reason = getattr(feedback, "block_reason", None) if feedback else None
+        raise LLMResponseError(
+            f"Gemini returned no candidates "
+            f"(prompt blocked: {block_reason or 'unknown reason'})"
+        )
 
     # Usage metadata lives on response.usage_metadata for the new SDK.
     usage = getattr(response, "usage_metadata", None)
     if usage is not None:
         input_tokens = getattr(usage, "prompt_token_count", 0) or 0
-        output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+        # Gemini bills output as candidates + thoughts (thinking models
+        # like gemini-2.5-* emit thoughts_token_count); count both so the
+        # cost isn't undercounted.
+        output_tokens = (
+            (getattr(usage, "candidates_token_count", 0) or 0)
+            + (getattr(usage, "thoughts_token_count", 0) or 0)
+        )
 
     stop_reason: StopReason
     has_tool_use = any(isinstance(b, ToolUseBlock) for b in content_blocks)

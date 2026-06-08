@@ -429,7 +429,29 @@ class FindingVerifier:
                     total_input_tokens + total_output_tokens
                 )
 
-            messages.append(Message(role="assistant", content=assistant_content))
+            # Echo only the block kinds the loop consumes (Text + ToolUse);
+            # a future 4th block kind would otherwise throw when the next
+            # turn re-serializes the assistant history.
+            echoed = [b for b in assistant_content if isinstance(b, (TextBlock, ToolUseBlock))]
+            messages.append(Message(role="assistant", content=echoed))
+            # Mirror the enhancer's guard: an empty tool_results turn (the
+            # model truncated at max_tokens / stop_sequence before any tool
+            # call) would send an empty-content user message, which the next
+            # complete() rejects. Treat it as verification-incomplete.
+            if not tool_results:
+                self.tracker.record_call(
+                    model=self.binding.model,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
+                )
+                return VerificationResult(
+                    agree=True,
+                    correct_finding=finding,
+                    explanation="Verification incomplete (no tool calls)",
+                    iterations=iterations,
+                    total_tokens=total_input_tokens + total_output_tokens,
+                )
             messages.append(Message(role="user", content=list(tool_results)))
 
         # Max iterations reached
