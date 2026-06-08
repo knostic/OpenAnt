@@ -41,26 +41,35 @@ def _run_pipeline(src: str) -> dict:
 
 
 def test_bug3_local_type_dispatch_method_call_edge():
-    """`const o = C{}; o.m()` must yield an `f -> m` call-graph edge."""
+    """`const o = C{}; o.m()` must yield an `f -> C.m` call-graph edge.
+
+    Note: the target id is the QUALIFIED `m.zig:C.m`. Prior to the u14 [BUG 37]
+    fix, struct methods were (incorrectly) emitted under their bare name, so this
+    assertion read `m.zig:m`. The method is now correctly keyed by its qualified
+    `Container.method` id; the edge itself is unchanged.
+    """
     src = (
         "const C = struct { fn m(self: C) i32 { _ = self; return 1; } };\n"
         "fn f() i32 { const o = C{}; return o.m(); }\n"
     )
     cg = _run_pipeline(src)["call_graph"]
-    assert "m.zig:m" in cg.get("m.zig:f", []), (
-        f"Expected f -> m method-call edge, got call_graph={cg}"
+    assert "m.zig:C.m" in cg.get("m.zig:f", []), (
+        f"Expected f -> C.m method-call edge, got call_graph={cg}"
     )
 
 
 def test_bug3_direct_struct_init_method_call_edge():
-    """The direct `C{}.m()` form must also yield an `f -> m` edge."""
+    """The direct `C{}.m()` form must also yield an `f -> C.m` edge.
+
+    See the qualified-id note on test_bug3_local_type_dispatch_method_call_edge.
+    """
     src = (
         "const C = struct { fn m(self: C) i32 { _ = self; return 1; } };\n"
         "fn f() i32 { return C{}.m(); }\n"
     )
     cg = _run_pipeline(src)["call_graph"]
-    assert "m.zig:m" in cg.get("m.zig:f", []), (
-        f"Expected f -> m direct-init method-call edge, got call_graph={cg}"
+    assert "m.zig:C.m" in cg.get("m.zig:f", []), (
+        f"Expected f -> C.m direct-init method-call edge, got call_graph={cg}"
     )
 
 

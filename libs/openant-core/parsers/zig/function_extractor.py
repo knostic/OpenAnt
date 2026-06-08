@@ -19,6 +19,22 @@ class FunctionExtractor:
 
     ZIG_LANGUAGE = Language(ts_zig.language())
 
+    # Real tree-sitter-zig node types for container declarations. The container
+    # body (struct/enum/union/opaque) is a child of a `variable_declaration`
+    # (`const Foo = struct {...}`). Legacy names (ContainerDecl/VarDecl) are kept
+    # for forward/back compatibility with other grammar revisions.
+    _CONTAINER_BODY_TYPES = frozenset(
+        {
+            "struct_declaration",
+            "enum_declaration",
+            "union_declaration",
+            "opaque_declaration",
+            "container_decl",
+            "ContainerDecl",
+        }
+    )
+    _VAR_DECL_TYPES = frozenset({"variable_declaration", "VarDecl"})
+
     def __init__(self, repo_path: str, scan_results: Dict[str, Any]):
         self.repo_path = Path(repo_path).resolve()
         self.scan_results = scan_results
@@ -103,19 +119,30 @@ class FunctionExtractor:
                 func_id = f"{file_path}:{func_info['qualified_name']}"
                 functions[func_id] = func_info
 
-        elif node.type == "VarDecl":
-            # Check if this is a struct/enum definition
+        elif node.type in self._VAR_DECL_TYPES:
+            # Check if this is a struct/enum/union/opaque container definition.
             struct_info = self._extract_struct_from_var_decl(node, source, file_path)
             if struct_info:
                 struct_id = f"{file_path}:{struct_info['name']}"
                 structs[struct_id] = struct_info
-                # Extract methods within the struct
-                self._extract_struct_methods(
-                    node, source, file_path, struct_info["name"], functions
-                )
+                # Recurse into the container body with the struct name as
+                # context, so member functions are qualified `Foo.method`
+                # rather than being re-emitted as bare `method` by the generic
+                # recursion below.
+                for child in node.children:
+                    self._walk_node(
+                        child,
+                        source,
+                        file_path,
+                        functions,
+                        structs,
+                        imports,
+                        struct_info["name"],
+                    )
+                return
 
-        elif node.type == "container_decl" or node.type == "ContainerDecl":
-            # Direct struct/enum declarations
+        elif node.type in self._CONTAINER_BODY_TYPES:
+            # Direct struct/enum declarations (anonymous container).
             struct_info = self._extract_container(node, source, file_path)
             if struct_info:
                 struct_id = f"{file_path}:{struct_info['name']}"
@@ -145,7 +172,11 @@ class FunctionExtractor:
 
         for child in node.children:
             if child.type == "identifier" or child.type == "IDENTIFIER":
-                name = self._get_node_text(child, source)
+                # The FIRST identifier is the function name. A later identifier
+                # child is the return type (e.g. `fn makeWidget() Widget`) and
+                # must not overwrite the name.
+                if name is None:
+                    name = self._get_node_text(child, source)
             elif child.type == "parameters" or child.type == "ParamDeclList":
                 parameters = self._extract_parameters(child, source)
 
@@ -196,8 +227,9 @@ class FunctionExtractor:
 
         for child in node.children:
             if child.type == "identifier" or child.type == "IDENTIFIER":
-                name = self._get_node_text(child, source)
-            elif child.type == "container_decl" or child.type == "ContainerDecl":
+                if name is None:
+                    name = self._get_node_text(child, source)
+            elif child.type in self._CONTAINER_BODY_TYPES:
                 is_struct = True
 
         if name and is_struct:
@@ -261,8 +293,11 @@ class FunctionExtractor:
         """Classify the function type based on name and context."""
         name_lower = name.lower()
 
-        # Test functions
-        if name_lower.startswith("test") or "_test" in name_lower:
+        # Test functions. Anchor on the underscore-delimited test convention
+        # (`test_foo`, `foo_test`, or a bare `test`). A camelCase identifier
+        # that merely starts with "test" (e.g. `testConnection`) is an ordinary
+        # function, not a zig `test "..." {}` block.
+        if name_lower == "test" or name_lower.startswith("test_") or name_lower.endswith("_test"):
             return "test"
 
         # Init/constructor patterns
