@@ -237,6 +237,7 @@ class UnitGenerator:
             'metadata': {
                 'is_static': func_data.get('is_static', False),
                 'is_exported': func_data.get('is_exported', True),
+                'is_inline': func_data.get('is_inline', False),
                 'return_type': func_data.get('return_type', ''),
                 'parameters': func_data.get('parameters', []),
                 'generator': 'c_unit_generator.py',
@@ -306,6 +307,7 @@ class UnitGenerator:
                 'endLine': func_data.get('end_line', 0),
                 'isStatic': func_data.get('is_static', False),
                 'isExported': func_data.get('is_exported', True),
+                'isInline': func_data.get('is_inline', False),
                 'returnType': func_data.get('return_type', ''),
                 'parameters': func_data.get('parameters', []),
                 'className': func_data.get('class_name'),
