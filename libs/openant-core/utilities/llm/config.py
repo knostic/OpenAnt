@@ -191,8 +191,10 @@ def parse_config(raw: dict) -> ConfigFile:
             f"{raw_version!r}"
         ) from exc
 
-    legacy_api_key = raw.get("api_key") or None
-    legacy_default_model = raw.get("default_model") or None
+    # Coerce + validate like the v2 fields: a non-string here (e.g.
+    # ``"api_key": 12345``) is a config error, not a silently-kept value.
+    legacy_api_key = _optional_str(raw.get("api_key"))
+    legacy_default_model = _optional_str(raw.get("default_model"))
 
     providers = _parse_providers(raw.get("llm_providers") or {})
     configs = _parse_configs(raw.get("llm_configs") or {})
@@ -336,7 +338,10 @@ def _optional_str(value) -> Optional[str]:
     if value is None:
         return None
     if not isinstance(value, str):
-        return None
+        raise ConfigError(
+            f"config.json: expected a string or null, got "
+            f"{type(value).__name__} ({value!r})"
+        )
     stripped = value.strip()
     return stripped or None
 

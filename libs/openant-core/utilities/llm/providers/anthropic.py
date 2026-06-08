@@ -35,7 +35,7 @@ from typing import Any, Optional
 
 import anthropic
 
-from ...rate_limiter import get_rate_limiter
+from ._ratelimit import report_rate_limit, wait_for_rate_limit
 from ..adapter import (
     CompletionResult,
     ContentBlock,
@@ -68,6 +68,36 @@ _ANTHROPIC_STOP_REASONS: dict[str, StopReason] = {
 # units, and we don't want even a benign double-warning race.
 _warned_stop_reasons: set[str] = set()
 _warned_stop_reasons_lock = threading.Lock()
+
+# Response content-block kinds we received but don't translate (dropped
+# on the way to the pipeline). Warn once per kind. Per-process, lock-guarded.
+_warned_block_kinds: set[str] = set()
+_warned_block_kinds_lock = threading.Lock()
+
+
+def _warn_unknown_block_kind(kind: str) -> None:
+    """One-time stderr warning when the response carries a content-block
+    kind the adapter doesn't translate, so a dropped block isn't silent."""
+    should_warn = False
+    with _warned_block_kinds_lock:
+        if kind not in _warned_block_kinds:
+            _warned_block_kinds.add(kind)
+            should_warn = True
+    if should_warn:
+        sys.stderr.write(
+            f"warning: AnthropicAdapter received unknown content block "
+            f"kind {kind!r}; dropping it. If the pipeline should consume "
+            f"this, add a ContentBlock kind in utilities/llm/adapter.py "
+            f"and translate it here.\n"
+        )
+
+
+def reset_warnings() -> None:
+    """Clear this adapter's one-time-warning memory (for tests / new scans)."""
+    with _warned_stop_reasons_lock:
+        _warned_stop_reasons.clear()
+    with _warned_block_kinds_lock:
+        _warned_block_kinds.clear()
 
 
 class AnthropicAdapter:
@@ -150,9 +180,9 @@ class AnthropicAdapter:
             request["tools"] = [_tool_to_anthropic(t) for t in tools]
 
         # Cooperate with the cross-worker backoff before issuing the
-        # call — same pattern the legacy AnthropicClient used.
-        rate_limiter = get_rate_limiter()
-        rate_limiter.wait_if_needed()
+        # call — same pattern the legacy AnthropicClient used, now
+        # shared with the OpenAI and Google adapters (see _ratelimit.py).
+        wait_for_rate_limit()
 
         try:
             response = self._client.messages.create(**request)
@@ -164,7 +194,7 @@ class AnthropicAdapter:
             raise LLMAuthError(str(exc)) from exc
         except anthropic.RateLimitError as exc:
             retry_after = _retry_after_from(exc)
-            rate_limiter.report_rate_limit(retry_after or 0.0)
+            report_rate_limit(retry_after)
             raise LLMRateLimitError(str(exc), retry_after=retry_after) from exc
         except anthropic.NotFoundError as exc:
             raise LLMNotFoundError(str(exc)) from exc
@@ -178,7 +208,7 @@ class AnthropicAdapter:
             status = getattr(exc, "status_code", None)
             if status == 529:
                 retry_after = _retry_after_from(exc)
-                rate_limiter.report_rate_limit(retry_after or 0.0)
+                report_rate_limit(retry_after)
                 raise LLMRateLimitError(str(exc), retry_after=retry_after) from exc
             # Everything else (400, 422, 500, ...) is a structural
             # response problem from the pipeline's perspective.
@@ -287,10 +317,14 @@ def _response_to_unified(response: Any) -> CompletionResult:
                     input=block.input or {},
                 )
             )
-        # Any other block kind (e.g. a future "thinking" block) is
-        # dropped — pipeline code only knows about Text and ToolUse
-        # in assistant turns. If a future phase wants thinking, we
-        # add a kind to the union (and update every adapter).
+        elif kind:
+            # Unknown block kind (e.g. a future "thinking" or "refusal"
+            # block). Pipeline code only knows Text and ToolUse in
+            # assistant turns, so we drop it — but warn once so the
+            # symptom isn't silent. For a security tool, a silently
+            # dropped "refusal" paired with a benign stop_reason could
+            # read as an empty success.
+            _warn_unknown_block_kind(str(kind))
 
     usage = response.usage
     raw_stop = getattr(response, "stop_reason", None) or "end_turn"

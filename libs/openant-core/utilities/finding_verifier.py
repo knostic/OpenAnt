@@ -40,7 +40,6 @@ from typing import Callable, Optional
 
 from .llm_client import TokenTracker, get_global_tracker
 from .llm import (
-    LLMError,
     LLMRateLimitError,
     Message,
     PhaseBinding,
@@ -50,7 +49,6 @@ from .llm import (
     ToolUseBlock,
     lookup_pricing,
 )
-from .rate_limiter import get_rate_limiter
 
 # Null logger that discards all messages (used when no logger provided)
 _null_logger = logging.getLogger("null_verifier")
@@ -404,6 +402,7 @@ class FindingVerifier:
                         tool_results.append(
                             ToolResultBlock(
                                 tool_use_id=tool_use_id,
+                                name=tool_name,
                                 content=json.dumps({"status": "complete"}),
                             )
                         )
@@ -413,6 +412,7 @@ class FindingVerifier:
                         tool_results.append(
                             ToolResultBlock(
                                 tool_use_id=tool_use_id,
+                                name=tool_name,
                                 content=json.dumps(outcome),
                             )
                         )

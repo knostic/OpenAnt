@@ -16,7 +16,6 @@ from typing import Optional, Set, List
 
 from ..llm_client import TokenTracker, get_global_tracker
 from ..llm import (
-    LLMRateLimitError,
     Message,
     PhaseBinding,
     TextBlock,
@@ -301,6 +300,7 @@ class ContextAgent:
                         tool_results.append(
                             ToolResultBlock(
                                 tool_use_id=tool_use_id,
+                                name=tool_name,
                                 content=json.dumps(tool_outcome),
                             )
                         )
@@ -309,6 +309,7 @@ class ContextAgent:
                         tool_results.append(
                             ToolResultBlock(
                                 tool_use_id=tool_use_id,
+                                name=tool_name,
                                 content=json.dumps(tool_outcome),
                             )
                         )

@@ -46,6 +46,11 @@ def _extract_usage(
 
         pricing = MODEL_PRICING.get(model)
     if pricing is None:
+        # Same one-time warning record_call emits, so an unknown model's
+        # $0 cost isn't silently inconsistent between the two paths.
+        from utilities.llm_client import _warn_unknown_pricing
+
+        _warn_unknown_pricing(model)
         total_cost = 0.0
     else:
         input_cost = (input_tokens / 1_000_000) * pricing["input"]

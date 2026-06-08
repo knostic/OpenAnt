@@ -90,10 +90,18 @@ class ToolResultBlock:
             triggered this result.
         content: JSON-serialised tool output. Adapters wrap this in
             whatever shape the provider expects.
+        name: Originating tool's name, copied from the matching
+            ``ToolUseBlock.name``. Optional — Anthropic and OpenAI key
+            tool results on ``tool_use_id`` and ignore this. The Gemini
+            adapter REQUIRES it: Gemini matches a ``function_response``
+            to its ``function_call`` by NAME, not id, so a result built
+            without ``name`` would never match its call. Defaults to
+            ``None`` so existing call sites and adapters keep working.
     """
 
     tool_use_id: str
     content: str
+    name: Optional[str] = None
 
 
 ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock

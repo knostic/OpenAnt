@@ -19,13 +19,18 @@ Usage:
     print(f"Total cost: ${tracker.total_cost_usd:.4f}")
 """
 
+import importlib
 import sys
 import threading
 
 
-# Pricing per million tokens. Unknown models report $0 with a
-# one-time warning rather than silently estimating against Sonnet
-# rates — see issue #65.
+# Pricing per million tokens. LEGACY fallback: issue #65 moved pricing
+# onto each adapter (``AnthropicAdapter.pricing`` is the source of truth),
+# so this global only backstops call sites that don't yet pass an
+# adapter-provided ``pricing`` (record_call's fallback, report/generator).
+# It MUST mirror ``AnthropicAdapter.pricing`` — ``tests/test_pricing_drift_guard.py``
+# fails if the two drift. Unknown models report $0 with a one-time warning
+# rather than silently estimating against Sonnet rates.
 MODEL_PRICING = {
     "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
     "claude-opus-4-6": {"input": 15.00, "output": 75.00},
@@ -208,9 +213,32 @@ def get_global_tracker() -> TokenTracker:
     return _global_tracker
 
 
+def reset_warning_state() -> None:
+    """Clear all one-time-warning memory so a fresh scan (or test) re-warns.
+
+    The pricing-warning set here plus each adapter's warn sets (unknown
+    stop/finish reasons, dropped block kinds, malformed tool JSON) are
+    intentionally process-global, so production prints one line per
+    novel value. Tests asserting "warned once" — and a brand-new scan —
+    want a clean slate. Adapter modules are imported lazily and guarded
+    so this stays safe even if a provider SDK isn't installed.
+    """
+    with _unknown_pricing_lock:
+        _unknown_pricing_warned.clear()
+    for modname in ("anthropic", "openai", "google"):
+        try:
+            mod = importlib.import_module(f"utilities.llm.providers.{modname}")
+        except Exception:
+            continue
+        reset = getattr(mod, "reset_warnings", None)
+        if callable(reset):
+            reset()
+
+
 def reset_global_tracker():
-    """Reset the global token tracker."""
+    """Reset the global token tracker (and one-time-warning state)."""
     _global_tracker.reset()
+    reset_warning_state()
 
 
 # NOTE: the ``AnthropicClient`` class that used to live here was deleted

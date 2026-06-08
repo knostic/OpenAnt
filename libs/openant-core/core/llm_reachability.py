@@ -380,7 +380,7 @@ def analyze_reachability(
 
     # Lazy import so this module stays usable when callers explicitly
     # provide a binding and never want the registry fallback above.
-    from utilities.llm import simple_text
+    from utilities.llm import LLMAuthError, simple_text
 
     signals: List[ReachabilitySignal] = []
     batches = _chunk(units, batch_size)
@@ -390,6 +390,11 @@ def analyze_reachability(
         )
         try:
             text = simple_text(binding, prompt, max_tokens=4096)
+        except LLMAuthError:
+            # Auth failures are fatal and recur on every batch — surface
+            # them instead of burying them as a per-batch "failed" line,
+            # so the caller can stop and tell the user the key is bad.
+            raise
         except Exception as exc:  # noqa: BLE001 — advisory stage; never crash pipeline
             msg = f"batch {i + 1}/{len(batches)} failed: {exc}"
             if on_error:

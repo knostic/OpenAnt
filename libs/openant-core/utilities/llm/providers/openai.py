@@ -37,17 +37,22 @@ Translation details (read ``HOW_TO_ADD_AN_ADAPTER.md`` §3 first):
 
 OpenAI's protocol does not include a 529-equivalent "overloaded"
 status; their backpressure is communicated via 429 + retry-after.
-The adapter does NOT integrate with the global ``RateLimiter`` like
-the Anthropic adapter does because OpenAI's SDK already implements
-client-side retry with backoff (``max_retries``). Multi-worker
-coordination is therefore best-effort via the SDK's retry — the
-pipeline-level rate limiter remains specific to the Anthropic adapter
-where it was previously load-bearing.
+On top of the SDK's own client-side retry (``max_retries``), the
+adapter reports 429s to the process-global ``RateLimiter`` (via
+``_ratelimit``) and waits on it before each request — so one worker's
+429 backs the *other* workers off, exactly like the Anthropic adapter.
+The SDK retry handles the failing call itself; the global limiter
+handles the fan-out to sibling workers.
+
+Reasoning models (o1/o3/o4 families) require ``max_completion_tokens``
+instead of ``max_tokens`` on Chat Completions; ``_token_param`` picks
+the right key per model so a probe or scan against ``o1`` doesn't 400.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 from typing import Any, Optional
@@ -69,6 +74,7 @@ from ..adapter import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from ._ratelimit import report_rate_limit, wait_for_rate_limit
 
 
 _OPENAI_FINISH_REASONS: dict[str, StopReason] = {
@@ -77,9 +83,59 @@ _OPENAI_FINISH_REASONS: dict[str, StopReason] = {
     "length": "max_tokens",
 }
 
+# OpenAI reasoning models (o1/o3/o4 families) reject ``max_tokens`` and
+# require ``max_completion_tokens``. Match the bare ``o<digit>`` family
+# — NOT ``gpt-4o`` / ``gpt-4o-mini``, which are regular chat models.
+_REASONING_MODEL_RE = re.compile(r"^o[1-9]")
+
 # Track finish_reasons we've already warned about. Per-process, lock-guarded.
 _warned_finish_reasons: set[str] = set()
 _warned_finish_reasons_lock = threading.Lock()
+
+# Tool calls whose ``arguments`` we couldn't parse as JSON, keyed by tool
+# name so a malformed-args bug is visible once instead of silently
+# collapsing to an empty input dict (PR #69 H5). Per-process, lock-guarded.
+_warned_bad_tool_json: set[str] = set()
+_warned_bad_tool_json_lock = threading.Lock()
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """True for OpenAI reasoning models (o1/o3/o4…) that need
+    ``max_completion_tokens`` instead of ``max_tokens``.
+
+    Strips any proxy prefix (``openai/o1`` → ``o1``) and matches the
+    bare ``o<digit>`` family. ``gpt-4o`` is NOT a reasoning model.
+    """
+    bare = model.lower().rsplit("/", 1)[-1]
+    return bool(_REASONING_MODEL_RE.match(bare))
+
+
+def _token_param(model: str) -> str:
+    """The request key for the output-token cap, per model family."""
+    return "max_completion_tokens" if _is_reasoning_model(model) else "max_tokens"
+
+
+def _warn_bad_tool_json(tool_name: str) -> None:
+    """One-time stderr warning when a tool call's ``arguments`` aren't valid JSON."""
+    should_warn = False
+    with _warned_bad_tool_json_lock:
+        if tool_name not in _warned_bad_tool_json:
+            _warned_bad_tool_json.add(tool_name)
+            should_warn = True
+    if should_warn:
+        sys.stderr.write(
+            f"warning: OpenAIAdapter could not parse tool-call arguments for "
+            f"{tool_name!r} as JSON; passing empty input {{}}. The tool call "
+            f"will likely fail downstream with a missing-field error.\n"
+        )
+
+
+def reset_warnings() -> None:
+    """Clear this adapter's one-time-warning memory (for tests / new scans)."""
+    with _warned_finish_reasons_lock:
+        _warned_finish_reasons.clear()
+    with _warned_bad_tool_json_lock:
+        _warned_bad_tool_json.clear()
 
 
 class OpenAIAdapter:
@@ -148,11 +204,14 @@ class OpenAIAdapter:
     ) -> CompletionResult:
         request: dict[str, Any] = {
             "model": model,
-            "max_tokens": max_tokens,
+            _token_param(model): max_tokens,
             "messages": _messages_to_openai(messages, system),
         }
         if tools:
             request["tools"] = [_tool_to_openai(t) for t in tools]
+
+        # Cooperate with cross-worker backoff before issuing the call.
+        wait_for_rate_limit()
 
         try:
             response = self._client.chat.completions.create(**request)
@@ -162,6 +221,7 @@ class OpenAIAdapter:
             raise LLMAuthError(str(exc)) from exc
         except openai.RateLimitError as exc:
             retry_after = _retry_after_from(exc)
+            report_rate_limit(retry_after)
             raise LLMRateLimitError(str(exc), retry_after=retry_after) from exc
         except openai.NotFoundError as exc:
             raise LLMNotFoundError(str(exc)) from exc
@@ -179,11 +239,11 @@ class OpenAIAdapter:
 
     def validate(self, model: str) -> None:
         try:
-            self._client.chat.completions.create(
-                model=model,
-                max_tokens=1,
-                messages=[{"role": "user", "content": "hi"}],
-            )
+            self._client.chat.completions.create(**{
+                "model": model,
+                _token_param(model): 1,
+                "messages": [{"role": "user", "content": "hi"}],
+            })
         except openai.AuthenticationError as exc:
             raise LLMAuthError(str(exc)) from exc
         except openai.PermissionDeniedError as exc:
@@ -305,11 +365,12 @@ def _response_to_unified(response: Any) -> CompletionResult:
         try:
             input_dict = json.loads(arguments) if arguments else {}
         except json.JSONDecodeError:
-            # Malformed JSON from the model is rare but possible.
-            # Surface as an empty dict so pipeline code doesn't see a
-            # ToolUseBlock with a stringy input attribute — the
-            # subsequent tool execution will fail with a clearer
-            # "missing required field" error than a JSON parse error.
+            # Malformed JSON from the model is rare but possible. Warn
+            # once per tool so the failure mode is visible, then fall
+            # back to an empty dict: the subsequent tool execution
+            # surfaces a clear "missing required field" error, and a
+            # multi-tool turn's other calls still proceed.
+            _warn_bad_tool_json(getattr(tc.function, "name", "<unknown>"))
             input_dict = {}
         content_blocks.append(ToolUseBlock(
             id=tc.id,

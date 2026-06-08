@@ -86,7 +86,6 @@ def scan_repository(
         generate_report: If True, generate summary + disclosure reports.
         skip_tests: If True, exclude test files from parsing (default: True).
         limit: Max number of units to analyze.
-        model: ``"opus"`` or ``"sonnet"``.
         enhance: If True, run agentic/single-shot context enhancement.
         enhance_mode: ``"agentic"`` (thorough) or ``"single-shot"`` (fast).
         dynamic_test: If True, run Docker-isolated dynamic testing (requires Docker).

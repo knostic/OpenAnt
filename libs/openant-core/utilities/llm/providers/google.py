@@ -78,6 +78,7 @@ from ..adapter import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from ._ratelimit import report_rate_limit, wait_for_rate_limit
 
 
 # Gemini's FinishReason enum values, mapped to our StopReason union.
@@ -92,6 +93,12 @@ _GEMINI_FINISH_REASONS: dict[str, StopReason] = {
 
 _warned_finish_reasons: set[str] = set()
 _warned_finish_reasons_lock = threading.Lock()
+
+
+def reset_warnings() -> None:
+    """Clear this adapter's one-time-warning memory (for tests / new scans)."""
+    with _warned_finish_reasons_lock:
+        _warned_finish_reasons.clear()
 
 
 class GoogleAdapter:
@@ -170,6 +177,10 @@ class GoogleAdapter:
         if tools:
             config_kwargs["tools"] = [_tool_to_gemini(t) for t in tools]
 
+        # Cooperate with cross-worker backoff before issuing the call —
+        # same dance the Anthropic adapter does (see _ratelimit.py).
+        wait_for_rate_limit()
+
         try:
             response = self._client.models.generate_content(
                 model=model,
@@ -184,6 +195,7 @@ class GoogleAdapter:
                 raise LLMNotFoundError(str(exc)) from exc
             if code == 429:
                 retry_after = _retry_after_from(exc)
+                report_rate_limit(retry_after)
                 raise LLMRateLimitError(str(exc), retry_after=retry_after) from exc
             raise LLMResponseError(str(exc)) from exc
         except genai_errors.ServerError as exc:
@@ -248,12 +260,13 @@ def _message_to_gemini(message: Message) -> genai_types.Content:
                 args=block.input or {},
             ))
         elif isinstance(block, ToolResultBlock):
-            # Gemini's function_response keys on the function name, not
-            # the original call's id. We carry the tool_use_id through
-            # the pipeline but Gemini doesn't use it for matching.
-            # ``response`` must be a dict; wrap raw string content in
-            # ``{"result": ...}`` since Gemini's contract expects an
-            # object, not a bare value.
+            # Gemini's function_response keys on the function NAME, not
+            # the original call's id. The pipeline carries that name on
+            # ``ToolResultBlock.name`` (copied from the matching
+            # ToolUseBlock); the tool_use_id rides along but isn't used
+            # for matching. ``response`` must be a dict; wrap raw string
+            # content in ``{"result": ...}`` since Gemini's contract
+            # expects an object, not a bare value.
             parts.append(genai_types.Part.from_function_response(
                 name=_name_for_tool_result(block),
                 response={"result": block.content},
@@ -266,24 +279,22 @@ def _message_to_gemini(message: Message) -> genai_types.Content:
 
 
 def _name_for_tool_result(block: ToolResultBlock) -> str:
-    """Recover the function name from a ToolResultBlock.
+    """Recover the function name Gemini needs on a ``function_response``.
 
-    The pipeline's ToolResultBlock carries only ``tool_use_id`` and
-    ``content``, not the function name. Gemini's ``function_response``
-    Part requires a ``name``. By convention, the pipeline's tool ids
-    are prefixed with the tool name (e.g.
-    ``toolu_<random>``-style for Anthropic, ``call_<random>``-style
-    for OpenAI). For Gemini-originated tool calls, the id IS the
-    function name. When we can't recover a name (id doesn't help),
-    use the id as a placeholder — Gemini will accept it but won't
-    match it to the original call, which is OK because Gemini's
-    multi-tool-call sequencing is order-dependent rather than
-    id-matched within a single turn.
+    Gemini matches each ``function_response`` to its originating
+    ``function_call`` by NAME, not by id. The pipeline carries that
+    name on ``ToolResultBlock.name`` (populated from the matching
+    ``ToolUseBlock.name`` at the tool-result construction sites), so
+    prefer it.
+
+    Fall back to ``tool_use_id`` only for legacy callers that didn't
+    set a name — note this is the *broken* path: the synthesised id
+    (``gemini_<name>_<idx>``, see ``_response_to_unified``) does NOT
+    equal the function name, so Gemini won't match it. The final
+    ``"tool_response"`` constant just guarantees the SDK gets a
+    non-empty string rather than ``None``.
     """
-    # Best-effort recovery. The pipeline never inspects this value
-    # downstream, so the choice here only affects whether Gemini's
-    # context tracking is happy.
-    return block.tool_use_id or "tool_response"
+    return block.name or block.tool_use_id or "tool_response"
 
 
 def _tool_to_gemini(tool: ToolDef) -> genai_types.Tool:
