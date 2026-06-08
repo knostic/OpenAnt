@@ -22,13 +22,13 @@ import (
 var errStdinClosed = errors.New("stdin closed before answer provided")
 
 // Pipeline phases that every llm-config must list. Mirrors PHASES in
-// ``libs/openant-core/utilities/llm/config.py`` — adding a phase requires
+// “libs/openant-core/utilities/llm/config.py“ — adding a phase requires
 // touching both lists. The order here drives the wizard's question flow
-// and matches the actual scan execution order in ``core/scanner.py``, so
+// and matches the actual scan execution order in “core/scanner.py“, so
 // a user setting up their config walks through phases in the same
-// sequence they'll see when they run ``openant scan``.
+// sequence they'll see when they run “openant scan“.
 //
-// ``defaultModels`` maps a provider type to the model the wizard
+// “defaultModels“ maps a provider type to the model the wizard
 // pre-fills as the default for THIS phase. Picks reflect the
 // project's recommendation: stronger reasoning models for detection /
 // verification / reachability review, lighter/faster models for
@@ -129,16 +129,12 @@ var knownModels = map[string][]string{
 	},
 }
 
-// Provider adapter types the wizard offers in the picker. The wizard
+// Provider adapter types the wizard offers in the picker. All three
+// ship with a Python adapter (anthropic, openai, google) — see
+// “libs/openant-core/utilities/llm/providers/__init__.py“ — so a
+// completed wizard config runs without further changes. The wizard
 // probes each provider+model pair against the real provider API
-// before saving, so a typo'd key surfaces immediately. Note that the
-// Python pipeline today only ships the ``anthropic`` adapter — see
-// ``libs/openant-core/utilities/llm/providers/__init__.py``. When a
-// user picks a non-anthropic type, the wizard writes the config
-// anyway (key validation passes against the real provider endpoint)
-// and prints a heads-up that ``openant scan`` will fail until the
-// matching Python adapter ships. Once the adapter lands, no wizard
-// change is needed — the same config just works.
+// before saving, so a typo'd key or model ID surfaces immediately.
 var supportedProviderTypes = []string{"anthropic", "openai", "google"}
 
 // apiKeyHints maps a provider type to a one-line reminder shown right
@@ -151,24 +147,6 @@ var supportedProviderTypes = []string{"anthropic", "openai", "google"}
 // can grow their own reminders later without touching the prompt loop.
 var apiKeyHints = map[string]string{
 	"openai": "Note: ChatGPT/Codex subscriptions do NOT include API access — get an API key at platform.openai.com (separate billing).",
-}
-
-// adapterShipped reports whether the Python pipeline currently has an
-// adapter implementation for a provider type. Picking a non-shipped
-// type during setup is allowed (so a user can pre-configure for an
-// adapter expected to land soon) but the wizard prints a warning so
-// the user isn't surprised when ``openant scan`` fails. Today
-// anthropic, openai, and google all ship with their respective Python
-// adapters — anything else gets the warning.
-func adapterShipped(providerType string) bool {
-	// Keep in sync with ``known_provider_types()`` in
-	// ``libs/openant-core/utilities/llm/providers/__init__.py``.
-	switch providerType {
-	case "anthropic", "openai", "google":
-		return true
-	default:
-		return false
-	}
 }
 
 type phaseSpec struct {
@@ -424,19 +402,6 @@ func promptNewProvider(reader *bufio.Reader, name string) (config.ProviderEntry,
 			fmt.Fprintln(os.Stderr, "To use a provider not listed here, contribute an adapter — see docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md.")
 			continue
 		}
-		// Heads-up for provider types where the Python adapter hasn't
-		// landed yet. The wizard still writes the config (and probes
-		// successfully against the real provider API) so a user can
-		// pre-configure in anticipation of the adapter shipping —
-		// but ``openant scan`` will fail until then.
-		if !adapterShipped(provType) {
-			fmt.Fprintln(os.Stderr)
-			fmt.Fprintf(os.Stderr, "Note: the Python adapter for %q has not shipped yet.\n", provType)
-			fmt.Fprintln(os.Stderr, "The wizard will validate your API key against the real provider API, but")
-			fmt.Fprintln(os.Stderr, "`openant scan` will fail with 'Unknown provider type' until the adapter lands.")
-			fmt.Fprintln(os.Stderr, "Track progress at docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md.")
-			fmt.Fprintln(os.Stderr)
-		}
 		// Per-provider subscription-vs-API reminder — the wizard needs
 		// an API key, not consumer-subscription credentials. ChatGPT /
 		// Claude Pro / Gemini Advanced subscriptions are separate
@@ -470,7 +435,7 @@ func exitOnInputError(err error) {
 	os.Exit(1)
 }
 
-// readLine reads one line. Returns ``errStdinClosed`` if the reader
+// readLine reads one line. Returns “errStdinClosed“ if the reader
 // hits EOF on an empty line — which is how non-interactive contexts
 // (piped input exhausted, no TTY) surface "no answer". Without this
 // signal, every required-prompt loop would spin forever.
@@ -483,7 +448,7 @@ func readLine(reader *bufio.Reader) (string, error) {
 	return line, nil
 }
 
-// promptString reads a line. Empty input → returns ``defaultVal``. The
+// promptString reads a line. Empty input → returns “defaultVal“. The
 // prompt is printed to stderr (not stdout) so the wizard composes
 // cleanly with shell redirection — a user piping output to a file
 // still sees the questions.
@@ -521,7 +486,7 @@ func promptRequired(reader *bufio.Reader, prompt, defaultVal string) (string, er
 }
 
 // promptYesNo accepts y/n/yes/no (case-insensitive). Empty input
-// returns ``defaultVal`` so the user can mash enter to accept.
+// returns “defaultVal“ so the user can mash enter to accept.
 func promptYesNo(reader *bufio.Reader, prompt string, defaultVal bool) (bool, error) {
 	hint := "[y/N]"
 	if defaultVal {
@@ -605,7 +570,7 @@ func probeAllPhases(
 func defaultStartingProvider(cfg *config.Config) string {
 	// If the user already has providers on disk, default to the first
 	// one alphabetically (most likely "anthropic"). Otherwise default
-	// to "anthropic" which is the only adapter type that ships today.
+	// to "anthropic" — the reference adapter and the most common choice.
 	names := cfg.ProviderNames()
 	sort.Strings(names)
 	if len(names) > 0 {

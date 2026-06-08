@@ -17,11 +17,11 @@ import (
 // Config holds the persistent CLI configuration.
 //
 // The typed fields below are the ones the Go CLI reads and writes
-// directly. v2 fields (``llm_providers``, ``llm_configs``,
-// ``default_llm``, ``$schema_version``) are interpreted by the
+// directly. v2 fields (“llm_providers“, “llm_configs“,
+// “default_llm“, “$schema_version“) are interpreted by the
 // Python pipeline; the Go side preserves them through a private
-// ``raw`` map so a round-trip ``Load`` → ``Save`` (triggered by
-// e.g. ``openant set-api-key``) doesn't silently wipe whatever the
+// “raw“ map so a round-trip “Load“ → “Save“ (triggered by
+// e.g. “openant set-api-key“) doesn't silently wipe whatever the
 // user authored.
 type Config struct {
 	APIKey        string `json:"api_key,omitempty"`
@@ -110,7 +110,7 @@ func Load() (*Config, error) {
 // Save writes the config to disk with restricted permissions.
 //
 // Preserves unknown (v2) fields by merging the typed view into the
-// raw map loaded earlier. A fresh ``Config{}`` (e.g. a brand-new
+// raw map loaded earlier. A fresh “Config{}“ (e.g. a brand-new
 // install) round-trips cleanly because the raw map is nil and the
 // merge produces a typed-only dict.
 func Save(cfg *Config) error {
@@ -141,8 +141,49 @@ func Save(cfg *Config) error {
 	}
 	data = append(data, '\n')
 
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	// Atomic write: stage to a temp file in the same directory, then
+	// rename over the target. A crash mid-write can no longer truncate
+	// the live config (which may hold multiple provider keys) — the
+	// rename either fully succeeds or leaves the old file intact.
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp config: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }() // no-op once the rename succeeds
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to set config permissions: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("failed to write config: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to flush config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close temp config: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		if runtime.GOOS != "windows" {
+			return fmt.Errorf("failed to replace config: %w", err)
+		}
+		// Windows can't rename onto an existing file. Move the live
+		// config aside first, then swap the new one in — so a failed
+		// replace never destroys the original (which may hold multiple
+		// provider keys). On failure, roll the original back.
+		backup := path + ".bak"
+		_ = os.Remove(backup)
+		if err := os.Rename(path, backup); err != nil {
+			return fmt.Errorf("failed to stage config replace: %w", err)
+		}
+		if err := os.Rename(tmpName, path); err != nil {
+			_ = os.Rename(backup, path) // restore the original
+			return fmt.Errorf("failed to replace config: %w", err)
+		}
+		_ = os.Remove(backup)
 	}
 
 	return nil
@@ -156,13 +197,13 @@ func setOrDelete(m map[string]any, key, value string) {
 	m[key] = value
 }
 
-// SetAPIKey writes ``key`` to both the legacy top-level ``api_key``
-// field and (if present) the v2 ``llm_providers["anthropic"].api_key``
+// SetAPIKey writes “key“ to both the legacy top-level “api_key“
+// field and (if present) the v2 “llm_providers["anthropic"].api_key“
 // entry. The two must stay in sync: the Python pipeline reads the
 // v2 entry when present, the v1 migration projects the legacy field
 // into the v2 entry when it isn't. Set both so a user who has
-// hand-authored an ``llm_providers["anthropic"]`` doesn't see a
-// stale provider key after running ``openant set-api-key``.
+// hand-authored an “llm_providers["anthropic"]“ doesn't see a
+// stale provider key after running “openant set-api-key“.
 func (c *Config) SetAPIKey(key string) {
 	c.APIKey = key
 	if c.raw == nil {
@@ -180,9 +221,9 @@ func (c *Config) SetAPIKey(key string) {
 }
 
 // HasV2Providers reports whether the user has explicitly authored an
-// ``llm_providers`` section. The Python subprocess invoker uses this
-// to decide whether to inject the legacy ``api_key`` as an
-// ``ANTHROPIC_API_KEY`` env var — for v2 users that injection would
+// “llm_providers“ section. The Python subprocess invoker uses this
+// to decide whether to inject the legacy “api_key“ as an
+// “ANTHROPIC_API_KEY“ env var — for v2 users that injection would
 // override the explicit per-provider keys, so the Go side stays
 // out of the way once a v2 config is on disk.
 func (c *Config) HasV2Providers() bool {
@@ -196,7 +237,7 @@ func (c *Config) HasV2Providers() bool {
 	return len(providers) > 0
 }
 
-// ProviderEntry is the typed view of one ``llm_providers[<name>]``
+// ProviderEntry is the typed view of one “llm_providers[<name>]“
 // entry that the setup wizard consumes. The Go side never types out
 // the full v2 schema — only the fields the wizard needs to read or
 // reuse when the user names an existing provider.
@@ -206,8 +247,8 @@ type ProviderEntry struct {
 	BaseURL string
 }
 
-// LLMPhaseRef is one ``{provider, model}`` pair inside an llm-config.
-// Mirrors ``utilities.llm.PhaseRef`` on the Python side; kept here to
+// LLMPhaseRef is one “{provider, model}“ pair inside an llm-config.
+// Mirrors “utilities.llm.PhaseRef“ on the Python side; kept here to
 // avoid threading the v2 schema through every Go caller.
 type LLMPhaseRef struct {
 	Provider string
@@ -215,7 +256,7 @@ type LLMPhaseRef struct {
 }
 
 // GetProvider returns the provider entry currently authored under
-// ``llm_providers[name]``. The second return value reports presence
+// “llm_providers[name]“. The second return value reports presence
 // so the setup wizard can skip re-prompting for credentials when a
 // phase names a provider already on disk.
 func (c *Config) GetProvider(name string) (ProviderEntry, bool) {
@@ -244,7 +285,7 @@ func (c *Config) GetProvider(name string) (ProviderEntry, bool) {
 }
 
 // LLMConfigExists reports whether a user-authored llm-config with this
-// name is present. The built-in ``openant-default`` is NOT considered
+// name is present. The built-in “openant-default“ is NOT considered
 // an existing entry — it always resolves regardless of file contents,
 // so trying to overwrite it via the wizard would be confusing.
 func (c *Config) LLMConfigExists(name string) bool {
@@ -261,7 +302,7 @@ func (c *Config) LLMConfigExists(name string) bool {
 
 // LLMConfigNames returns the sorted names of user-authored llm-configs.
 // Used by the setup wizard's intro to show the user what they already
-// have. Does NOT include the built-in ``openant-default``.
+// have. Does NOT include the built-in “openant-default“.
 func (c *Config) LLMConfigNames() []string {
 	if c.raw == nil {
 		return nil
@@ -298,16 +339,16 @@ func (c *Config) ProviderNames() []string {
 // providers it depends on. The wizard collects user input into typed
 // structures; this method handles the v2 schema gymnastics
 // (initialising the raw map on fresh installs, pinning
-// ``$schema_version``, merging into existing ``llm_providers`` /
-// ``llm_configs`` sections without clobbering siblings).
+// “$schema_version“, merging into existing “llm_providers“ /
+// “llm_configs“ sections without clobbering siblings).
 //
-// ``providers`` MAY include entries already present in the config —
+// “providers“ MAY include entries already present in the config —
 // the wizard re-passes them when the user named an existing provider
 // for a new phase. Overwrites are intentional: a key rotation
-// (re-running ``setup llm`` with a fresh key) should update the
+// (re-running “setup llm“ with a fresh key) should update the
 // stored credential.
 //
-// ``makeDefault`` flips ``default_llm`` to ``name``. The previous
+// “makeDefault“ flips “default_llm“ to “name“. The previous
 // value is silently overwritten; the wizard is expected to confirm
 // with the user first.
 func (c *Config) WriteLLMConfig(
@@ -330,12 +371,24 @@ func (c *Config) WriteLLMConfig(
 		c.raw["llm_providers"] = provSection
 	}
 	for pname, p := range providers {
-		entry := map[string]any{"type": p.Type}
+		// Merge into any existing entry so hand-authored sibling keys
+		// (e.g. a future ``organization_id``) survive a wizard re-run,
+		// instead of rebuilding the entry from the typed view and
+		// dropping them.
+		entry, _ := provSection[pname].(map[string]any)
+		if entry == nil {
+			entry = map[string]any{}
+		}
+		entry["type"] = p.Type
 		if p.APIKey != "" {
 			entry["api_key"] = p.APIKey
+		} else {
+			delete(entry, "api_key")
 		}
 		if p.BaseURL != "" {
 			entry["base_url"] = p.BaseURL
+		} else {
+			delete(entry, "base_url")
 		}
 		provSection[pname] = entry
 	}

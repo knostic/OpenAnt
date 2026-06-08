@@ -29,11 +29,11 @@ func (e *AnthropicProbeError) Error() string {
 }
 
 // anthropicEndpoint resolves the messages URL for a given provider's
-// base_url. An empty base_url resolves to ``anthropicAPIURL`` (which
+// base_url. An empty base_url resolves to “anthropicAPIURL“ (which
 // production-defaults to api.anthropic.com but is test-overridable).
 // Otherwise the base_url is treated as the provider root and
-// ``/v1/messages`` is appended — matching how the Anthropic SDK
-// composes URLs against ``base_url``.
+// “/v1/messages“ is appended — matching how the Anthropic SDK
+// composes URLs against “base_url“.
 func anthropicEndpoint(baseURL string) string {
 	if baseURL == "" {
 		return anthropicAPIURL
@@ -46,7 +46,7 @@ func anthropicEndpoint(baseURL string) string {
 // resolves, and (c) the endpoint is reachable. baseURL is optional — when
 // empty, hits the default Anthropic endpoint.
 //
-// This is the same probe shape used by ``openant set-api-key``,
+// This is the same probe shape used by “openant set-api-key“,
 // generalised over base_url and model so the setup wizard can probe each
 // phase's resolved (provider, model) pair against the user's chosen
 // endpoint.
@@ -102,11 +102,10 @@ func probeAnthropic(apiKey, baseURL, model string) error {
 	}
 }
 
-// asProbeError unwraps an error into an AnthropicProbeError. Currently
-// unused by the wizard (which just prints err.Error()), but kept for
-// future callers that need tailored per-kind handling.
-//
-//nolint:unused // intentionally kept as a typed-unwrap helper
+// asProbeError unwraps an error into an AnthropicProbeError so callers
+// can branch on the failure Kind — e.g. “set-api-key“ treats a
+// “model_not_found“ as a soft pass because it only needs to confirm
+// the key authenticated.
 func asProbeError(err error) (*AnthropicProbeError, bool) {
 	var pe *AnthropicProbeError
 	if errors.As(err, &pe) {

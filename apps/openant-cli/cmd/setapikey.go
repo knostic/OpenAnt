@@ -10,12 +10,23 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// validateAPIKey is the back-compat wrapper for ``openant set-api-key``.
-// Delegates to the shared ``probeAnthropic`` helper which is also used by
-// ``openant setup llm`` so both code paths agree on what "the key works"
+// validateAPIKey is the back-compat wrapper for “openant set-api-key“.
+// Delegates to the shared “probeAnthropic“ helper which is also used by
+// “openant setup llm“ so both code paths agree on what "the key works"
 // means.
 func validateAPIKey(key string) error {
-	return probeAnthropic(key, "", "claude-haiku-4-5-20251001")
+	err := probeAnthropic(key, "", "claude-haiku-4-5-20251001")
+	if err == nil {
+		return nil
+	}
+	// A 404 (model_not_found) means the key AUTHENTICATED — auth is
+	// checked before model resolution — but this account can't see the
+	// probe model (e.g. enterprise/allow-listed orgs without Haiku
+	// access). The key is valid, so don't reject it over the model.
+	if pe, ok := asProbeError(err); ok && pe.Kind == "model_not_found" {
+		return nil
+	}
+	return err
 }
 
 var setAPIKeyCmd = &cobra.Command{

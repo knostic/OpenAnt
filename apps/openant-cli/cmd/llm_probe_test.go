@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -180,22 +181,65 @@ func TestProbeGoogle_HandlesSpecialCharsInModel(t *testing.T) {
 	}
 }
 
+// TestProbeGoogle_DoesNotLeakKeyOnNetworkError verifies that a transport
+// failure (connection refused) does NOT surface the API key in the returned
+// error. Gemini puts the key in the URL as “?key=...“, so a raw
+// “*url.Error“ from client.Do() would otherwise echo the whole URL —
+// including the secret — into stderr (setup.go -> output.PrintError).
+func TestProbeGoogle_DoesNotLeakKeyOnNetworkError(t *testing.T) {
+	// 127.0.0.1:1 forces a connection-refused transport error while the
+	// key still rides in the request URL.
+	err := probeGoogle("SECRETKEY123", "http://127.0.0.1:1", "gemini-2.5-pro")
+	if err == nil {
+		t.Fatal("expected a network error, got nil")
+	}
+	if strings.Contains(err.Error(), "SECRETKEY123") {
+		t.Errorf("API key leaked into error string: %s", err.Error())
+	}
+}
+
 // ---------------------------------------------------------------------------
-// adapterShipped sanity
+// probeOpenAI reasoning models (o1/o3/o4 use max_completion_tokens)
 // ---------------------------------------------------------------------------
 
-func TestAdapterShipped(t *testing.T) {
-	// anthropic, openai, and google all ship with adapters today.
-	// New provider types beyond that set should still trigger the
-	// heads-up warning until their adapter lands in Python.
-	for _, shipped := range []string{"anthropic", "openai", "google"} {
-		if !adapterShipped(shipped) {
-			t.Errorf("adapterShipped(%q) = false, expected true", shipped)
-		}
+func TestProbeOpenAI_ReasoningModelsUseMaxCompletionTokens(t *testing.T) {
+	cases := []struct {
+		model           string
+		wantCompletion  bool // body should contain "max_completion_tokens"
+		wantPlainMaxTok bool // body should contain "max_tokens"
+	}{
+		{"o1", true, false},
+		{"o3-mini", true, false},
+		{"o4-mini", true, false},
+		{"gpt-4o", false, true},
+		{"gpt-4o-mini", false, true},
 	}
-	for _, unshipped := range []string{"ollama", "groq", "future"} {
-		if adapterShipped(unshipped) {
-			t.Errorf("adapterShipped(%q) = true, expected false — update tests if the adapter shipped", unshipped)
-		}
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			var gotBody string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				gotBody = string(b)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+			orig := openaiAPIURL
+			defer func() { openaiAPIURL = orig }()
+			openaiAPIURL = server.URL
+
+			if err := probeOpenAI("sk-test", "", tc.model); err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			hasCompletion := strings.Contains(gotBody, "max_completion_tokens")
+			// "max_tokens" is a substring of "max_completion_tokens", so check
+			// for the standalone JSON key form to disambiguate.
+			hasPlainMaxTok := strings.Contains(gotBody, `"max_tokens"`)
+			if hasCompletion != tc.wantCompletion {
+				t.Errorf("model %q: max_completion_tokens present=%v, want %v (body=%s)", tc.model, hasCompletion, tc.wantCompletion, gotBody)
+			}
+			if hasPlainMaxTok != tc.wantPlainMaxTok {
+				t.Errorf("model %q: max_tokens present=%v, want %v (body=%s)", tc.model, hasPlainMaxTok, tc.wantPlainMaxTok, gotBody)
+			}
+		})
 	}
 }

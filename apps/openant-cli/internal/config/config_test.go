@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -370,6 +371,110 @@ func TestWriteLLMConfigPreservesExistingSiblings(t *testing.T) {
 
 	if out["default_llm"] != "beta" {
 		t.Errorf("default_llm overwritten despite makeDefault=false: got %v, want 'beta'", out["default_llm"])
+	}
+}
+
+func TestSaveIsAtomicAndLeavesNoTempFile(t *testing.T) {
+	// Save must write via a temp file + rename so a crash mid-write can't
+	// truncate config.json (which now holds multiple provider keys). After
+	// a successful Save, no leftover *.tmp file should remain in the dir,
+	// and a reload must round-trip the data.
+	withConfigJSON(t, `{
+  "$schema_version": 2,
+  "api_key": "sk-ant-legacy",
+  "default_llm": "cheap",
+  "llm_providers": {
+    "anthropic": {"type": "anthropic", "api_key": "sk-ant", "base_url": "https://openrouter.ai/api/v1"}
+  },
+  "llm_configs": {
+    "cheap": {"analyze": {"provider": "anthropic", "model": "qwen/qwen-3-coder-480b"}}
+  }
+}`)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := Save(cfg); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Reload and assert round-trip equality on the fields we care about.
+	cfg2, err := Load()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if cfg2.APIKey != "sk-ant-legacy" {
+		t.Errorf("api_key not round-tripped: %q", cfg2.APIKey)
+	}
+	if !cfg2.HasV2Providers() {
+		t.Error("v2 providers lost across atomic Save")
+	}
+
+	// No leftover temp files.
+	path, _ := Path()
+	dir := filepath.Dir(path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("leftover temp file after Save: %s", e.Name())
+		}
+	}
+}
+
+func TestWriteLLMConfigPreservesUnknownProviderFields(t *testing.T) {
+	// A user hand-authored a provider entry with an extra field
+	// (organization_id) the Go typed surface doesn't know about. Updating
+	// that provider via WriteLLMConfig must merge — preserving the unknown
+	// sibling key — not rebuild the entry from scratch and drop it.
+	withConfigJSON(t, `{
+  "$schema_version": 2,
+  "llm_providers": {
+    "myprov": {
+      "type": "openai",
+      "api_key": "sk-old",
+      "base_url": "https://proxy.example/v1",
+      "organization_id": "keep-me"
+    }
+  }
+}`)
+	cfg, _ := Load()
+
+	cfg.WriteLLMConfig(
+		"my-config",
+		map[string]LLMPhaseRef{
+			"analyze": {Provider: "myprov", Model: "gpt-4o"},
+		},
+		map[string]ProviderEntry{
+			"myprov": {Type: "openai", APIKey: "sk-new", BaseURL: "https://proxy.example/v1"},
+		},
+		false,
+	)
+	if err := Save(cfg); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	path, _ := Path()
+	data, _ := os.ReadFile(path)
+	var out map[string]any
+	_ = json.Unmarshal(data, &out)
+
+	provs, _ := out["llm_providers"].(map[string]any)
+	myprov, ok := provs["myprov"].(map[string]any)
+	if !ok {
+		t.Fatalf("myprov entry missing")
+	}
+	if myprov["organization_id"] != "keep-me" {
+		t.Errorf("unknown sibling field organization_id dropped: %v", myprov["organization_id"])
+	}
+	if myprov["api_key"] != "sk-new" {
+		t.Errorf("typed field api_key not updated: %v", myprov["api_key"])
+	}
+	if myprov["type"] != "openai" {
+		t.Errorf("type field = %v, want openai", myprov["type"])
 	}
 }
 

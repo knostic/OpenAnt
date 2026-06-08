@@ -71,6 +71,26 @@ func TestValidateAPIKey_SendsCorrectHeaders(t *testing.T) {
 	}
 }
 
+// TestValidateAPIKey_Accepts404AsModelNotFound verifies that a 404 from the
+// Anthropic endpoint (the hardcoded Haiku probe model isn't available on
+// allow-listed / enterprise accounts) is treated as a VALID key. Auth is
+// checked before model resolution, so a model_not_found response proves the
+// key authenticated.
+func TestValidateAPIKey_Accepts404AsModelNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	orig := anthropicAPIURL
+	defer func() { anthropicAPIURL = orig }()
+	anthropicAPIURL = server.URL
+
+	if err := validateAPIKey("sk-valid-but-no-haiku"); err != nil {
+		t.Fatalf("expected nil error for 404 model_not_found (key authenticated), got: %v", err)
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
 }
