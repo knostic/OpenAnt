@@ -56,4 +56,7 @@ def test_zig_other_classifications_unchanged():
     # Guard against over-broadening the fix.
     assert _classify("init") == "constructor"
     assert _classify("create") == "constructor"
-    assert _classify("testThing") == "test"
+    # u14 (PR #110) anchored test detection to the underscore convention:
+    # camelCase `testThing` is an ordinary function, `test_thing` is a test.
+    assert _classify("test_thing") == "test"
+    assert _classify("testThing") == "function"
