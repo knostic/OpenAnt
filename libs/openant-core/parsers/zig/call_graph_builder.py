@@ -155,18 +155,22 @@ class CallGraphBuilder:
         # Build an index of function names to IDs for resolution
         name_to_ids = self._build_name_index()
 
+        # Build per-file simple const fn-alias bindings (`const f = handler;`)
+        # so that a later `f()` resolves to `handler`.
+        alias_to_target = self._build_alias_index(name_to_ids)
+
         # For each function, find calls in its body
         for func_id, func_info in self.functions.items():
             code = func_info.get("code", "")
             file_path = func_info.get("file_path", "")
 
             # Parse the function code to find call sites
-            calls = self._find_calls_in_code(code)
+            calls = self._find_calls_in_code(code, file_path)
 
             # Resolve each call to a function ID
             for call_name in calls:
                 resolved_ids = self._resolve_call(
-                    call_name, file_path, name_to_ids
+                    call_name, file_path, name_to_ids, alias_to_target
                 )
                 for resolved_id in resolved_ids:
                     if resolved_id != func_id:  # No self-calls
@@ -219,7 +223,59 @@ class CallGraphBuilder:
 
         return name_to_ids
 
-    def _find_calls_in_code(self, code: str) -> Set[str]:
+    def _build_alias_index(
+        self, name_to_ids: Dict[str, List[str]]
+    ) -> Dict[str, Dict[str, str]]:
+        """Index simple const fn-aliases per file: `const f = handler;` -> {f: handler}.
+
+        Only bindings whose right-hand side is a bare identifier naming a known
+        function are tracked (a genuine fn alias), so arbitrary const dataflow
+        (`const x = 1;`) is ignored. Scoped per file to avoid cross-file leaks.
+        """
+        alias_to_target: Dict[str, Dict[str, str]] = defaultdict(dict)
+
+        for func_info in self.functions.values():
+            file_path = func_info.get("file_path", "")
+            code = func_info.get("code", "")
+            if not code:
+                continue
+            try:
+                tree = self.parser.parse(code.encode("utf-8"))
+            except Exception:
+                continue
+            self._collect_aliases_from_node(
+                tree.root_node,
+                code.encode("utf-8"),
+                name_to_ids,
+                alias_to_target[file_path],
+            )
+
+        return alias_to_target
+
+    def _collect_aliases_from_node(
+        self,
+        node: Node,
+        source: bytes,
+        name_to_ids: Dict[str, List[str]],
+        aliases: Dict[str, str],
+    ) -> None:
+        """Collect `const <alias> = <known-fn>;` bindings from a parse tree."""
+        if node.type in ("variable_declaration", "VarDecl"):
+            ident_children = [
+                c for c in node.children if c.type in ("identifier", "IDENTIFIER")
+            ]
+            # A simple alias is exactly: const <alias> = <target-identifier>;
+            if len(ident_children) == 2:
+                alias_name = self._get_node_text(ident_children[0], source)
+                target_name = self._get_node_text(ident_children[1], source)
+                # Only record when the target is a known function name.
+                if alias_name and target_name in name_to_ids:
+                    aliases[alias_name] = target_name
+
+        for child in node.children:
+            self._collect_aliases_from_node(child, source, name_to_ids, aliases)
+
+    def _find_calls_in_code(self, code: str, caller_file: str = "") -> Set[str]:
         """Find all function calls in a code snippet."""
         calls = set()
 
@@ -230,10 +286,31 @@ class CallGraphBuilder:
             # Fallback to regex-based extraction
             calls = self._find_calls_with_regex(code)
 
-        # Filter out builtins
-        calls = {c for c in calls if c not in self.ZIG_BUILTINS and not c.startswith("@")}
+        # Filter out builtins, but NEVER filter a name that a same-file user
+        # function actually defines. A user fn whose name collides with a
+        # ZIG_BUILTINS entry (e.g. `expect`) must keep its edge. Scope the
+        # shadow check to the caller's own file so a builtin call is not
+        # spuriously linked to an unrelated same-named user fn elsewhere.
+        shadowing = self._same_file_function_names(caller_file)
+        calls = {
+            c
+            for c in calls
+            if c in shadowing or (c not in self.ZIG_BUILTINS and not c.startswith("@"))
+        }
 
         return calls
+
+    def _same_file_function_names(self, caller_file: str) -> Set[str]:
+        """Names of user functions defined in `caller_file` (same-file scope)."""
+        if not caller_file:
+            return set()
+        names: Set[str] = set()
+        for func_info in self.functions.values():
+            if func_info.get("file_path") == caller_file:
+                name = func_info.get("name", "")
+                if name:
+                    names.add(name)
+        return names
 
     def _extract_calls_from_node(
         self, node: Node, source: bytes, calls: Set[str]
@@ -243,7 +320,25 @@ class CallGraphBuilder:
         if node.type in ("call_expr", "call_expression", "CallExpr"):
             # Get the function being called
             for child in node.children:
-                if child.type in ("identifier", "IDENTIFIER", "field_access"):
+                if child.type in (
+                    "identifier",
+                    "IDENTIFIER",
+                    "field_access",
+                    "field_expression",
+                ):
+                    # For a field access / expression (e.g. `o.m` or `C{}.m`),
+                    # the method name is the trailing identifier child. Prefer
+                    # that over text-splitting, which is brittle when the
+                    # receiver itself contains punctuation (e.g. `C{}.m`).
+                    if child.type in ("field_access", "field_expression"):
+                        method_name = None
+                        for sub in child.children:
+                            if sub.type in ("identifier", "IDENTIFIER"):
+                                method_name = self._get_node_text(sub, source)
+                        if method_name:
+                            calls.add(method_name)  # the method name
+                        calls.add(self._get_node_text(child, source))  # full path
+                        break
                     call_name = self._get_node_text(child, source)
                     # Handle method calls (obj.method)
                     if "." in call_name:
@@ -286,6 +381,7 @@ class CallGraphBuilder:
         call_name: str,
         caller_file: str,
         name_to_ids: Dict[str, List[str]],
+        alias_to_target: Dict[str, Dict[str, str]] | None = None,
     ) -> List[str]:
         """
         Resolve a call name to function ID(s).
@@ -295,6 +391,13 @@ class CallGraphBuilder:
         2. Imported files
         3. Unique name match
         """
+        # Resolve a same-file const fn-alias (`const f = handler; f()`) to its
+        # target function name before looking up candidates.
+        if alias_to_target is not None:
+            target = alias_to_target.get(caller_file, {}).get(call_name)
+            if target is not None:
+                call_name = target
+
         candidates = name_to_ids.get(call_name, [])
 
         if not candidates:
