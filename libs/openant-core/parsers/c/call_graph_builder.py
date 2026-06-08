@@ -229,8 +229,29 @@ class CallGraphBuilder:
 
         return text if text.isidentifier() else None
 
+    def _resolve_same_file(self, call_name: str, caller_file: str) -> Optional[str]:
+        """Resolve a call to a user-defined function in the same file, if any."""
+        same_file_funcs = self.functions_by_file.get(caller_file, [])
+        for func_id in same_file_funcs:
+            func_data = self.functions.get(func_id, {})
+            fname = func_data.get('name', '')
+            base_name = fname.split('::')[-1] if '::' in fname else fname
+            if base_name == call_name:
+                return func_id
+        return None
+
     def _resolve_call(self, call_name: str, caller_file: str) -> Optional[str]:
         """Resolve a function call name to a function ID."""
+        # A user-defined function in the SAME FILE shadows any stdlib/builtin
+        # of the same name, so it must be checked BEFORE the stdlib filter.
+        # Scope is deliberately same-file only: a genuine stdlib call (no
+        # same-file definition) still falls through to _is_stdlib below, so we
+        # never wrongly link a real stdlib call (e.g. printf/open) to an
+        # unrelated same-named user function in another file.
+        same_file_user_func = self._resolve_same_file(call_name, caller_file)
+        if same_file_user_func:
+            return same_file_user_func
+
         if self._is_stdlib(call_name):
             return None
 
@@ -243,13 +264,9 @@ class CallGraphBuilder:
                 return result
 
         # 1. Same-file functions
-        same_file_funcs = self.functions_by_file.get(caller_file, [])
-        for func_id in same_file_funcs:
-            func_data = self.functions.get(func_id, {})
-            fname = func_data.get('name', '')
-            base_name = fname.split('::')[-1] if '::' in fname else fname
-            if base_name == call_name:
-                return func_id
+        same_file_match = self._resolve_same_file(call_name, caller_file)
+        if same_file_match:
+            return same_file_match
 
         # 2. Functions in included headers
         included_files = self.include_map.get(caller_file, set())
@@ -292,10 +309,13 @@ class CallGraphBuilder:
             if func_name in ('if', 'while', 'for', 'switch', 'return', 'sizeof',
                              'typeof', 'alignof', 'offsetof', 'case', 'else'):
                 continue
-            if not self._is_stdlib(func_name):
-                resolved = self._resolve_call(func_name, caller_file)
-                if resolved:
-                    calls.add(resolved)
+            # No _is_stdlib gate here: _resolve_call applies the same-file-first
+            # rule and the stdlib filter internally, so a user function whose
+            # name collides with a builtin still resolves (same leak as the
+            # tree-sitter path otherwise).
+            resolved = self._resolve_call(func_name, caller_file)
+            if resolved:
+                calls.add(resolved)
 
         return calls
 
