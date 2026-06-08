@@ -138,11 +138,14 @@ class FunctionExtractor:
         """
         path_lower = file_path.lower()
 
-        if func_name == 'initialize':
-            return 'constructor'
-
+        # is_singleton must be checked BEFORE the initialize/constructor branch:
+        # `def self.initialize` is a class-level singleton method, not the
+        # instance constructor (Ruby's constructor is the instance `initialize`).
         if is_singleton:
             return 'singleton_method'
+
+        if func_name == 'initialize':
+            return 'constructor'
 
         # Non-public methods inside a class are helpers/callbacks, never
         # route handlers or callbacks-by-name, regardless of the enclosing
@@ -281,6 +284,16 @@ class FunctionExtractor:
 
         return imports
 
+    def _body_node(self, node):
+        """Return a node's body (`body` field, else a `body_statement` child)."""
+        body_node = node.child_by_field_name('body')
+        if body_node is None:
+            for child in node.children:
+                if child.type == 'body_statement':
+                    body_node = child
+                    break
+        return body_node
+
     def _extract_functions_from_tree(self, tree, source: bytes, file_path: Path,
                                      relative_path: str) -> None:
         """Extract all method definitions from a parsed tree.
@@ -303,12 +316,27 @@ class FunctionExtractor:
                     node, source, relative_path, class_name, module_name,
                     is_singleton=False, visibility=vis_state[0],
                 )
+                # A nested `def` lives in the method's body -- keep traversing so
+                # methods defined inside another method are not lost. Nested defs
+                # inherit the enclosing class but default to public visibility.
+                body_node = self._body_node(node)
+                if body_node:
+                    nested_vis = ['public']
+                    for child in reversed(body_node.children):
+                        stack.append((child, class_name, module_name, nested_vis))
+                continue
 
             elif node.type == 'singleton_method':
                 self._process_method_node(
                     node, source, relative_path, class_name, module_name,
                     is_singleton=True, visibility=vis_state[0],
                 )
+                body_node = self._body_node(node)
+                if body_node:
+                    nested_vis = ['public']
+                    for child in reversed(body_node.children):
+                        stack.append((child, class_name, module_name, nested_vis))
+                continue
 
             elif node.type == 'alias':
                 # `alias new old` keyword form.
@@ -364,7 +392,13 @@ class FunctionExtractor:
             elif node.type == 'class':
                 # Extract class name
                 name_node = node.child_by_field_name('name')
-                new_class_name = self._node_text(name_node, source) if name_node else None
+                local_class_name = self._node_text(name_node, source) if name_node else None
+                # Compose with the enclosing class so a nested class keeps its
+                # outer qualifier, e.g. `Outer::Inner`.
+                if local_class_name and class_name:
+                    new_class_name = f"{class_name}::{local_class_name}"
+                else:
+                    new_class_name = local_class_name
 
                 # Extract superclass
                 superclass = None
@@ -532,6 +566,7 @@ class FunctionExtractor:
         else:
             self.stats['standalone_functions'] += 1
         self.stats['by_type'][unit_type] = self.stats['by_type'].get(unit_type, 0) + 1
+
 
     def _process_method_node(self, node, source: bytes, relative_path: str,
                               class_name: Optional[str], module_name: Optional[str],
