@@ -216,10 +216,12 @@ class FunctionExtractor:
                 return 'constructor'
             if func_name.startswith('__') and func_name.endswith('__'):
                 return 'dunder_method'
-            # @property getter and @<name>.setter/.deleter are all property
-            # accessors. Matching only '@property' mislabels setters/deleters
-            # as plain methods.
-            if '@property' in dec_str or '.setter' in dec_str or '.deleter' in dec_str:
+            # @property getter, @<name>.setter/.deleter, and @cached_property/
+            # @functools.cached_property are all property accessors. Reuse the
+            # single _property_role predicate so classification can't drift from
+            # the qualified_name role-suffix logic (a literal '@property' match
+            # silently mislabels @cached_property as a plain method).
+            if self._property_role(decorators) is not None:
                 return 'property'
             if '@staticmethod' in dec_str:
                 return 'static_method'
@@ -284,15 +286,20 @@ class FunctionExtractor:
 
     def _property_role(self, decorators: List[str]) -> Optional[str]:
         """Classify a property accessor from its decorators: getter | setter |
-        deleter | None. `@x.setter`/`@x.deleter` render with that suffix;
-        `@property`/`@cached_property` are getters; anything else -> None."""
+        deleter | None. Match on the decorator's final dotted segment (TOKEN),
+        not a bare substring, so `@property`/`@cached_property`/
+        `@functools.cached_property`/`@x.setter`/`@x.deleter` are recognized but
+        a method whose decorator merely CONTAINS the text (e.g.
+        `@some_property_validator`, `@app.property_route`) is NOT misclassified."""
         for d in decorators:
-            if '.setter' in d:
+            leaf = d.lstrip('@').split('(')[0].rsplit('.', 1)[-1]
+            if leaf == 'setter':
                 return 'setter'
-            if '.deleter' in d:
+            if leaf == 'deleter':
                 return 'deleter'
         for d in decorators:
-            if 'property' in d:
+            leaf = d.lstrip('@').split('(')[0].rsplit('.', 1)[-1]
+            if leaf in ('property', 'cached_property'):
                 return 'getter'
         return None
 

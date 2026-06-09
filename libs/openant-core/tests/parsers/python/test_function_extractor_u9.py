@@ -156,3 +156,76 @@ def test_bug48_real_test_file_still_classified_test(tmp_path):
     assert result["functions"][fid]["unit_type"] == "test", (
         f"genuine test file not classified test: got {result['functions'][fid]['unit_type']}"
     )
+
+
+# --- BUG 34 re-verification (2026-06-09): property-classification edge cases -----
+def test_bug34_cached_property_getter_classified_property(tmp_path):
+    source = (
+        "from functools import cached_property\n"
+        "class C:\n"
+        "    @cached_property\n"
+        "    def x(self):\n"
+        "        return self._x\n"
+    )
+    funcs = _extract(tmp_path, "m.py", source)["functions"]
+    assert "m.py:C.x" in funcs, list(funcs)
+    assert funcs["m.py:C.x"]["property_role"] == "getter"
+    assert funcs["m.py:C.x"]["unit_type"] == "property", (
+        f"cached_property getter misclassified: {funcs['m.py:C.x']['unit_type']}"
+    )
+
+
+def test_bug34_functools_cached_property_classified_property(tmp_path):
+    source = (
+        "import functools\n"
+        "class C:\n"
+        "    @functools.cached_property\n"
+        "    def x(self):\n"
+        "        return self._x\n"
+    )
+    funcs = _extract(tmp_path, "m.py", source)["functions"]
+    assert funcs["m.py:C.x"]["unit_type"] == "property"
+
+
+def test_bug34_orphan_setter_not_lost(tmp_path):
+    source = "class C:\n    @x.setter\n    def x(self, v):\n        self._x = v\n"
+    funcs = _extract(tmp_path, "m.py", source)["functions"]
+    assert "m.py:C.x.setter" in funcs, list(funcs)
+    assert funcs["m.py:C.x.setter"]["property_role"] == "setter"
+    assert funcs["m.py:C.x.setter"]["unit_type"] == "property"
+
+
+def test_bug34_isolated_deleter(tmp_path):
+    source = "class C:\n    @x.deleter\n    def x(self):\n        del self._x\n"
+    funcs = _extract(tmp_path, "m.py", source)["functions"]
+    assert "m.py:C.x.deleter" in funcs, list(funcs)
+    assert funcs["m.py:C.x.deleter"]["property_role"] == "deleter"
+
+
+def test_bug34_two_classes_same_property_no_collision(tmp_path):
+    source = (
+        "class C:\n    @property\n    def x(self):\n        return 1\n"
+        "class D:\n    @property\n    def x(self):\n        return 2\n"
+    )
+    funcs = _extract(tmp_path, "m.py", source)["functions"]
+    assert "m.py:C.x" in funcs and "m.py:D.x" in funcs, list(funcs)
+
+
+def test_bug34_non_property_decorator_not_misclassified(tmp_path):
+    """Narrowing guard: a method whose decorator merely CONTAINS 'property' as
+    a substring (not the property protocol) must NOT classify as 'property'."""
+    source = (
+        "class C:\n"
+        "    @app.property_route\n"
+        "    def a(self):\n"
+        "        return 1\n"
+        "    @some_property_validator\n"
+        "    def b(self):\n"
+        "        return 2\n"
+    )
+    funcs = _extract(tmp_path, "m.py", source)["functions"]
+    a = next(fd for fd in funcs.values() if fd["name"] == "a")
+    b = next(fd for fd in funcs.values() if fd["name"] == "b")
+    assert a["unit_type"] != "property", f"@app.property_route mis-classified: {a['unit_type']}"
+    assert b["unit_type"] != "property", f"@some_property_validator mis-classified: {b['unit_type']}"
+    assert a["property_role"] is None and b["property_role"] is None
