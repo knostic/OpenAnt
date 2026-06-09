@@ -66,6 +66,10 @@ class FunctionExtractor:
         self.macros: Dict[str, List[Dict]] = {}
         self.macro_aliases: Dict[str, str] = {}  # e.g. OPENSSL_malloc -> CRYPTO_malloc
         self.prototypes: Dict[str, Dict] = {}  # function name -> declaration info
+        # class/struct name -> list of direct base-class names, for inheritance
+        # walks in member dispatch (bug [30]). Populated from the
+        # base_class_clause of each class_specifier/struct_specifier.
+        self.class_bases: Dict[str, List[str]] = {}
 
         self.c_parser = Parser(C_LANGUAGE)
         self.cpp_parser = Parser(CPP_LANGUAGE)
@@ -302,6 +306,27 @@ class FunctionExtractor:
                 return '::'.join(parts[:-1])
         return None
 
+    def _extract_base_classes(self, record_node, source: bytes) -> List[str]:
+        """Return the direct base-class names of a class/struct specifier.
+
+        tree-sitter represents inheritance as a `base_class_clause` child of the
+        class_specifier/struct_specifier (sibling of name and body). The clause
+        holds one `type_identifier` per base, interleaved with optional
+        access_specifier / `virtual` / `,` tokens; we collect only the simple
+        `type_identifier` bases. Qualified or templated bases (ns::Base,
+        Base<T>) are NOT recorded — matching the same-name keying used for
+        class_name elsewhere, so the inheritance walk stays sound (an unknown
+        base simply yields no edge rather than a wrong one).
+        """
+        bases: List[str] = []
+        for child in record_node.children:
+            if child.type != 'base_class_clause':
+                continue
+            for sub in child.children:
+                if sub.type == 'type_identifier':
+                    bases.append(self._node_text(sub, source))
+        return bases
+
     def _extract_includes(self, tree, source: bytes) -> List[str]:
         """Extract #include directives from a file."""
         includes = []
@@ -417,6 +442,15 @@ class FunctionExtractor:
                 if class_name_node:
                     class_name = self._node_text(class_name_node, source)
                     new_prefix = f"{namespace_prefix}{class_name}::"
+                    # Record direct base classes for the inheritance walk in
+                    # member dispatch (bug [30]). Keyed by the bare class name
+                    # (matching the class_name stored on each method).
+                    bases = self._extract_base_classes(node, source)
+                    if bases:
+                        existing = self.class_bases.setdefault(class_name, [])
+                        for base in bases:
+                            if base not in existing:
+                                existing.append(base)
                     body_node = node.child_by_field_name('body')
                     if body_node:
                         for child in reversed(body_node.children):
@@ -632,6 +666,7 @@ class FunctionExtractor:
             'macros': self.macros,
             'macro_aliases': self.macro_aliases,
             'prototypes': self.prototypes,
+            'class_bases': self.class_bases,
             'statistics': self.stats,
         }
 
