@@ -81,6 +81,44 @@ def test_function_value_alias_resolves():
     )
 
 
+# ---------------------------------------------------- [12] single-assign GUARD
+def test_alias_reassignment_not_resolved():
+    """GUARD (reassignment): `fn = a; fn = b; fn()` is last-write-wins, so the
+    binding is a "maybe". The guard must NOT assert a definite edge to EITHER
+    target — pinned behavior: no alias edge at all (fall through to no edge)."""
+    builder = _build({
+        "m.py": (
+            "def a():\n    return 1\n\n"
+            "def b():\n    return 2\n\n"
+            "def main():\n    fn = a\n    fn = b\n    fn()\n"
+        ),
+    })
+    caller = "m.py:main"
+    edges = builder.call_graph.get(caller, [])
+    assert "m.py:a" not in edges and "m.py:b" not in edges, (
+        f"reassigned alias asserted a maybe-binding as definite: {edges}"
+    )
+
+
+def test_alias_conditional_binding_not_resolved():
+    """GUARD (conditional): an alias bound inside if/else is not unconditional,
+    so it must NOT be resolved (no edge to either branch's target)."""
+    builder = _build({
+        "m.py": (
+            "def a():\n    return 1\n\n"
+            "def b():\n    return 2\n\n"
+            "def main(cond):\n"
+            "    if cond:\n        fn = a\n    else:\n        fn = b\n"
+            "    fn()\n"
+        ),
+    })
+    caller = "m.py:main"
+    edges = builder.call_graph.get(caller, [])
+    assert "m.py:a" not in edges and "m.py:b" not in edges, (
+        f"conditional alias resolved despite non-unconditional binding: {edges}"
+    )
+
+
 # ---------------------------------------------------------------- [27]
 def test_import_module_call_does_not_false_link_to_samename_free_fn():
     """`import alpha; alpha.run()` must NOT link caller -> free fn `alpha`."""
