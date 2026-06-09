@@ -144,3 +144,45 @@ def test_go_main_seeds_reachability_via_unit_type(go_pipeline_output):
         f"main entry-point reason lacks unit_type:main (BUG-5 still drifting); reason = {reason!r}"
     )
     assert units[helper_id].get("reachable") is True, "helper not reachable from main"
+
+
+def test_normalize_camel_record_to_snake_full_schema():
+    """BUG-5 re-verify (no Go toolchain needed): a representative camelCase Go
+    FunctionInfo record normalizes to the FULL snake_case consumer schema,
+    including the parameters / returns / is_async fields that were previously
+    omitted from normalize_go_function_records."""
+    from parsers.go.test_pipeline import normalize_go_function_records
+    camel = {"f.go:Pkg.M": {
+        "name": "M", "code": "func ...", "startLine": 10, "endLine": 20,
+        "unitType": "method", "className": "Pkg", "isExported": True,
+        "package": "main", "filePath": "f.go", "receiver": "Pkg",
+        "parameters": ["x int"], "returns": ["error"], "isAsync": True,
+        "decorators": ["// note"],
+    }}
+    out = normalize_go_function_records(camel)["f.go:Pkg.M"]
+    expected = {
+        "name": "M", "unit_type": "method", "file_path": "f.go",
+        "start_line": 10, "end_line": 20, "is_exported": True,
+        "class_name": "Pkg", "package": "main", "receiver": "Pkg",
+        "parameters": ["x int"], "returns": ["error"], "is_async": True,
+        "decorators": ["// note"],
+    }
+    for k, v in expected.items():
+        assert out.get(k) == v, f"{k!r}: got {out.get(k)!r}, expected {v!r}"
+    # No camelCase keys leak through.
+    assert not any(k in out for k in ("unitType", "filePath", "isAsync", "className")), out
+
+
+def test_normalize_is_idempotent_on_snake_records():
+    """Already-snake records pass through unchanged (idempotency)."""
+    from parsers.go.test_pipeline import normalize_go_function_records
+    snake = {"f.go:h": {
+        "name": "h", "unit_type": "function", "code": "", "file_path": "f.go",
+        "start_line": 1, "end_line": 2, "package": "main", "receiver": "",
+        "is_exported": False, "class_name": "", "decorators": [],
+        "parameters": [], "returns": [], "is_async": False,
+    }}
+    once = normalize_go_function_records(snake)
+    twice = normalize_go_function_records(once)
+    assert once == twice, "normalization not idempotent on snake records"
+    assert once["f.go:h"]["unit_type"] == "function"

@@ -83,6 +83,13 @@ def normalize_go_function_records(raw_functions: dict) -> dict:
             'is_exported': fd.get('is_exported', fd.get('isExported', False)),
             'class_name': fd.get('class_name', fd.get('className', '')),
             'decorators': fd.get('decorators', []),
+            # Schema-completeness (BUG-5 re-verify): carry the remaining
+            # FunctionInfo fields so a Go func record matches the snake_case
+            # shape the other parsers emit. No live consumer reads these today,
+            # but leaving them None is a latent drift for future consumers.
+            'parameters': fd.get('parameters', []),
+            'returns': fd.get('returns', []),
+            'is_async': fd.get('is_async', fd.get('isAsync', False)),
         }
     return normalized
 
