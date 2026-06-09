@@ -179,8 +179,20 @@ class CallGraphBuilder:
         # First pass: collect local-variable names (assignment LHS) and
         # method-object bindings (`m = method(:sym)` / proc / lambda). These
         # inform parenless-call precision [BUG 1] and `.call` resolution [BUG 31].
+        #
+        # SINGLE-UNCONDITIONAL-ASSIGNMENT GUARD for method-object bindings: a
+        # binding is kept ONLY when the variable is assigned exactly once AND at
+        # the method/program top level (a direct statement of the body, not
+        # nested inside an `if`/`unless`/`while`/`case`/`begin`/block). A var
+        # assigned 2+ times (last-write-wins) or bound conditionally is a
+        # "maybe" binding; resolving its `.call` would assert a maybe as
+        # definite, so we drop it and let `m.call` go unresolved (no edge).
+        # `local_vars` (for parenless precision) is NOT narrowed -- any
+        # assignment target is still a local variable for the bare-identifier
+        # guard, regardless of how many times / where it is bound.
         local_vars: Set[str] = set()
-        method_object_bindings: Dict[str, str] = {}
+        assign_counts: Dict[str, int] = {}
+        top_level_binding: Dict[str, str] = {}
         stack = [tree.root_node]
         while stack:
             node = stack.pop()
@@ -189,10 +201,20 @@ class CallGraphBuilder:
                 if lhs is not None and lhs.type == 'identifier':
                     var_name = self._node_str(lhs, code_bytes)
                     local_vars.add(var_name)
-                    bound = self._method_object_target(node, code_bytes)
-                    if bound:
-                        method_object_bindings[var_name] = bound
+                    assign_counts[var_name] = assign_counts.get(var_name, 0) + 1
+                    if self._is_top_level_statement(node):
+                        bound = self._method_object_target(node, code_bytes)
+                        if bound:
+                            top_level_binding[var_name] = bound
             stack.extend(reversed(node.children))
+
+        # Keep a method-object binding only if it is single + unconditional:
+        # exactly one assignment to that name, and that binding is top-level.
+        method_object_bindings: Dict[str, str] = {
+            name: bound
+            for name, bound in top_level_binding.items()
+            if assign_counts.get(name, 0) == 1
+        }
 
         # Second pass: resolve calls and bare (parenless) identifier calls.
         stack = [tree.root_node]
@@ -217,6 +239,18 @@ class CallGraphBuilder:
 
     def _node_str(self, node, source: bytes) -> str:
         return source[node.start_byte:node.end_byte].decode('utf-8', errors='replace')
+
+    @staticmethod
+    def _is_top_level_statement(node) -> bool:
+        """True if `node` is a direct statement of a method/program body.
+
+        Top-level means the parent is the method body (`body_statement`) or the
+        file program node. Anything nested in an `if`/`then`/`else`/`while`/
+        `case`/`begin`/block has some other parent, so it is conditional/looped
+        and not a single-unconditional binding.
+        """
+        parent = node.parent
+        return parent is not None and parent.type in ('body_statement', 'program')
 
     def _method_object_target(self, assignment_node, source: bytes) -> Optional[str]:
         """If RHS is method(:sym)/proc/lambda binding a named method, return the name.

@@ -165,6 +165,45 @@ def test_method_object_call_is_an_edge():
     )
 
 
+# ------------------------------------------- [31] single-unconditional GUARD
+def test_method_object_reassignment_not_resolved():
+    """GUARD (reassignment): `m = method(:a); m = method(:b); m.call` is
+    last-write-wins, so the binding is a "maybe". The guard must NOT assert a
+    definite edge to EITHER target — pinned behavior: no edge at all."""
+    output, builder = _build(
+        {
+            "m.rb": "def a\n  1\nend\n\ndef b\n  2\nend\n\n"
+            "def caller_fn\n  m = method(:a)\n  m = method(:b)\n  m.call\nend\n"
+        }
+    )
+    caller = _fid(output, ":caller_fn")
+    a_id = _fid(output, "m.rb:a")
+    b_id = _fid(output, "m.rb:b")
+    edges = builder.call_graph[caller]
+    assert a_id not in edges and b_id not in edges, (
+        f"reassigned method-object asserted a maybe-binding as definite: {edges}"
+    )
+
+
+def test_method_object_conditional_binding_not_resolved():
+    """GUARD (conditional): a binding inside an `if`/`else` branch is not
+    unconditional, so `m.call` must NOT resolve (no edge to either target)."""
+    output, builder = _build(
+        {
+            "m.rb": "def a\n  1\nend\n\ndef b\n  2\nend\n\n"
+            "def caller_fn(cond)\n  if cond\n    m = method(:a)\n  else\n"
+            "    m = method(:b)\n  end\n  m.call\nend\n"
+        }
+    )
+    caller = _fid(output, ":caller_fn")
+    a_id = _fid(output, "m.rb:a")
+    b_id = _fid(output, "m.rb:b")
+    edges = builder.call_graph[caller]
+    assert a_id not in edges and b_id not in edges, (
+        f"conditional method-object resolved despite non-unconditional binding: {edges}"
+    )
+
+
 # ------------------------------------------------ [49] substring import over-match
 def test_require_does_not_substring_match_longer_filename():
     """require 'auth' must NOT match authentication.rb by substring.
