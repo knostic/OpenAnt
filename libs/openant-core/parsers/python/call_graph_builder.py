@@ -203,22 +203,75 @@ class CallGraphBuilder:
         (same-file or via the global single-name index) to a user function. This
         lets `fn = helper; fn()` recover the `helper` edge. Class/method targets
         are out of scope (only ast.Name = ast.Name single-target assigns).
+
+        SINGLE-UNCONDITIONAL-ASSIGNMENT GUARD: an alias is kept ONLY when the
+        name is bound exactly once AND at the function/module top level (a direct
+        statement of the body, not nested inside an If/For/While/Try/With or any
+        other block). A name bound 2+ times (last-write-wins) or bound inside a
+        conditional/loop/try/with is a "maybe" binding; resolving it would assert
+        a maybe as definite, so we drop it and let `x()` fall through to normal
+        resolution (no edge). Precision over recall.
         """
-        aliases: Dict[str, str] = {}
+        # Count EVERY assignment to each name anywhere in the body (any nesting,
+        # both Assign targets and AnnAssign), so a reassignment or a conditional
+        # rebinding disqualifies the name even if one binding is top-level.
+        assign_counts: Dict[str, int] = {}
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    for name in self._assigned_names(target):
+                        assign_counts[name] = assign_counts.get(name, 0) + 1
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                for name in self._assigned_names(node.target):
+                    assign_counts[name] = assign_counts.get(name, 0) + 1
+
+        # Only consider candidate aliases declared at the body's TOP LEVEL.
+        top_level = self._function_body_statements(tree)
+        aliases: Dict[str, str] = {}
+        for stmt in top_level:
+            if not isinstance(stmt, ast.Assign):
                 continue
-            if not isinstance(node.value, ast.Name):
+            if not isinstance(stmt.value, ast.Name):
                 continue
-            for target in node.targets:
-                if not isinstance(target, ast.Name):
-                    continue
-                if target.id == node.value.id:
-                    continue
-                resolved = self._resolve_simple_call(node.value.id, caller_file)
-                if resolved:
-                    aliases[target.id] = resolved
+            if len(stmt.targets) != 1:
+                continue
+            target = stmt.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id == stmt.value.id:
+                continue
+            # GUARD: bound exactly once across the whole body (single +
+            # unconditional, because a conditional binding would push the
+            # top-level count higher OR not appear at top level at all).
+            if assign_counts.get(target.id, 0) != 1:
+                continue
+            resolved = self._resolve_simple_call(stmt.value.id, caller_file)
+            if resolved:
+                aliases[target.id] = resolved
         return aliases
+
+    @staticmethod
+    def _assigned_names(target: ast.AST):
+        """Yield the simple Name ids bound by an assignment target (recursively
+        through tuple/list unpacking)."""
+        if isinstance(target, ast.Name):
+            yield target.id
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                yield from CallGraphBuilder._assigned_names(elt)
+
+    @staticmethod
+    def _function_body_statements(tree: ast.AST) -> List[ast.stmt]:
+        """Return the top-level statements of the analysed function body.
+
+        The extractor's `code` includes the `def` line, so a single function
+        parses to Module(body=[FunctionDef]); the real body is that def's body.
+        Fall back to the module body for bare module-level code.
+        """
+        body = getattr(tree, 'body', [])
+        if len(body) == 1 and isinstance(body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return list(body[0].body)
+        return list(body)
 
     def _resolve_local_function(self, func_name: str, caller_file: str) -> Optional[str]:
         """Resolve a bare name to a same-file, non-method user function.
