@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 
@@ -19,11 +20,23 @@ func validateAPIKey(key string) error {
 	if err == nil {
 		return nil
 	}
+	pe, ok := asProbeError(err)
+	if !ok {
+		return err
+	}
 	// A 404 (model_not_found) means the key AUTHENTICATED — auth is
 	// checked before model resolution — but this account can't see the
 	// probe model (e.g. enterprise/allow-listed orgs without Haiku
 	// access). The key is valid, so don't reject it over the model.
-	if pe, ok := asProbeError(err); ok && pe.Kind == "model_not_found" {
+	if pe.Kind == "model_not_found" {
+		return nil
+	}
+	// Transient server-side failures (429 rate-limit, 5xx) are NOT a
+	// verdict on the key — rejecting here would refuse a likely-valid
+	// key just because Anthropic was busy. Soft-pass and save it; the
+	// next real call will surface a genuinely bad key. Only a
+	// conclusive auth failure (401/403, Kind=="auth") should reject.
+	if pe.Status == http.StatusTooManyRequests || pe.Status >= http.StatusInternalServerError {
 		return nil
 	}
 	return err

@@ -118,7 +118,6 @@ var knownModels = map[string][]string{
 		"gpt-4o",
 		"gpt-4o-mini",
 		"o1",
-		"o1-mini",
 		"o3-mini",
 	},
 	"google": {
