@@ -303,10 +303,15 @@ def regenerate_test(
     return parsed
 
 
-def _generate_one(finding, repo_info, tracker):
-    """Generate a test for a single finding, tracking cost."""
+def _generate_one(finding, repo_info, binding, tracker):
+    """Generate a test for a single finding, tracking cost.
+
+    ``binding`` precedes ``tracker`` to match :func:`generate_test`'s
+    signature — previously this passed ``tracker`` straight into the
+    ``binding`` positional, which mis-bound the call.
+    """
     cost_before = tracker.total_cost_usd
-    result = generate_test(finding, repo_info, tracker)
+    result = generate_test(finding, repo_info, binding, tracker)
     cost_after = tracker.total_cost_usd
     cost = cost_after - cost_before
     worker = threading.current_thread().name
@@ -316,6 +321,7 @@ def _generate_one(finding, repo_info, tracker):
 def generate_tests_batch(
     findings: list[dict],
     repo_info: dict,
+    binding: PhaseBinding,
     tracker: TokenTracker = None,
     workers: int = 10,
 ) -> list[tuple[dict, dict | None, float]]:
@@ -326,6 +332,8 @@ def generate_tests_batch(
     Args:
         findings: List of finding dicts
         repo_info: Repository info
+        binding: Phase binding for the dynamic_test phase. Threaded
+            through to :func:`generate_test` for every finding.
         tracker: Optional TokenTracker
         workers: Number of parallel workers (default: 10).
 
@@ -341,7 +349,7 @@ def generate_tests_batch(
     if workers <= 1:
         results = []
         for i, finding in enumerate(findings):
-            _finding, result, cost, _worker = _generate_one(finding, repo_info, tracker)
+            _finding, result, cost, _worker = _generate_one(finding, repo_info, binding, tracker)
             print(f"[DynamicTest] {i+1}/{total}  ${cost:.2f}", file=sys.stderr, flush=True)
             results.append((_finding, result, cost))
         return results
@@ -350,7 +358,7 @@ def generate_tests_batch(
     results = []
     completed = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(_generate_one, finding, repo_info, tracker) for finding in findings]
+        futures = [executor.submit(_generate_one, finding, repo_info, binding, tracker) for finding in findings]
         for future in as_completed(futures):
             _finding, result, cost, worker = future.result()
             completed += 1

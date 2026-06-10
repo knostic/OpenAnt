@@ -42,8 +42,12 @@ OPENANT_DEFAULT = LLMConfig(
         "enhance": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-20250514"),
         # Stage 2 attacker simulation. Opus, uses tool calling.
         "verify": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-6"),
-        # Disclosure + summary + remediation HTML generation. Sonnet.
-        "report": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-20250514"),
+        # Disclosure + summary + remediation HTML generation. Opus —
+        # matches master's report/generator.py (MODEL="claude-opus-4-6").
+        # The refactor briefly moved this to Sonnet; restored so the
+        # report output (incl. the HTML-remediation sub-call) stays on
+        # Opus on a fresh, config-less install.
+        "report": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-6"),
         # Docker exploit-test generation. Sonnet.
         "dynamic_test": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-20250514"),
         # LLM-driven reachability review (opt-in stage). Opus.

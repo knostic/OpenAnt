@@ -296,7 +296,11 @@ def run_analysis(
         app_context_path: Path to application_context.json (reduces false positives).
         repo_path: Path to the repository (for context correction).
         limit: Max number of units to analyze.
-        model: "opus" or "sonnet".
+        registry: Pre-built PhaseRegistry. Scanners pass theirs;
+            standalone callers leave this None and a registry is
+            constructed from ``llm_config_name`` (and probed upfront).
+        llm_config_name: Name of the llm-config when ``registry`` is
+            None. ``None`` falls through to the active/default config.
         exploitable_filter: Filter by enhancement classification. Options:
             None (default) — no filtering, analyze all units.
             "all" — keep exploitable + vulnerable_internal (recommended).

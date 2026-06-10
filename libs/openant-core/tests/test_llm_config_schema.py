@@ -93,6 +93,41 @@ class TestReferenceValidation:
             )
         assert "type" in str(exc.value).lower()
 
+    def test_anthropic_reference_without_provider_entry_is_allowed(self):
+        # A hand-authored v2 config may reference the ``anthropic`` provider
+        # on its phases while relying on ``ANTHROPIC_API_KEY`` in the env,
+        # with NO ``llm_providers`` entry. ``resolve_provider`` synthesises a
+        # credential-less ProviderConfig for that case, so parse must NOT die
+        # here (it would break the documented v1 -> v2 upgrade path).
+        cf = parse_config(
+            {
+                "$schema_version": 2,
+                # No llm_providers at all.
+                "llm_configs": {
+                    "mine": _all_phases("anthropic", "claude-opus-4-6")
+                },
+            }
+        )
+        assert cf.llm_providers == {}
+        assert set(cf.llm_configs["mine"].phases) == set(PHASES)
+        assert cf.llm_configs["mine"].phases["analyze"].provider == "anthropic"
+
+    def test_unknown_non_anthropic_provider_still_rejected(self):
+        # The ``anthropic`` exemption is scoped to that one name. An unknown
+        # non-anthropic provider (here ``ghost``) has no env-key fallback and
+        # must still fail at parse.
+        with pytest.raises(ConfigError) as exc:
+            parse_config(
+                {
+                    "$schema_version": 2,
+                    "llm_configs": {
+                        "mine": _all_phases("ghost", "claude-opus-4-6")
+                    },
+                }
+            )
+        assert "ghost" in str(exc.value)
+        assert "unknown provider" in str(exc.value)
+
 
 # ---------------------------------------------------------------------------
 # openant-default is reserved

@@ -17,7 +17,9 @@ Supported Application Types:
 Usage:
     from context import generate_application_context, save_context
 
-    context = generate_application_context(Path("/path/to/repo"))
+    # ``binding`` is the app_context-phase binding from a PhaseRegistry
+    # (registry.get("app_context")); it is required.
+    context = generate_application_context(Path("/path/to/repo"), binding)
     save_context(context, Path("application_context.json"))
 """
 

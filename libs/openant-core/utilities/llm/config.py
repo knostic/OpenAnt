@@ -235,7 +235,8 @@ def parse_config(raw: dict) -> ConfigFile:
     # Cross-reference check: every phase reference in every config
     # must point at a provider defined here OR at "anthropic" (which
     # gets auto-synthesised from the env when missing — see
-    # ``registry.build_provider_registry``).
+    # ``registry.resolve_provider``, called during
+    # ``registry.build_phase_registry``).
     _validate_phase_references(cf)
 
     return cf
@@ -317,16 +318,22 @@ def _parse_phase_ref(config_name: str, phase: str, entry) -> PhaseRef:
 
 
 def _validate_phase_references(cf: ConfigFile) -> None:
-    """Every user-authored config phase must reference a defined provider.
+    """Validate provider references in user-authored llm-configs.
 
-    The openant-default builtin (added by the registry) is allowed to
-    reference ``anthropic`` even when the config file doesn't define
-    that provider yet — the user may have ``ANTHROPIC_API_KEY`` set in
-    the env but no provider entry. The registry handles that case.
+    Only the configs in ``cf.llm_configs`` (i.e. those parsed from
+    config.json) flow through here — the ``openant-default`` builtin is
+    constructed by the registry and never passes through this function.
+
+    Every referenced provider must be defined in ``llm_providers``,
+    EXCEPT ``anthropic``: that name is allowed to go undefined because
+    ``registry.resolve_provider`` synthesises a credential-less
+    ProviderConfig for it and lets the SDK read ``ANTHROPIC_API_KEY``
+    from the env. This keeps the v1 -> v2 upgrade path working for users
+    who have the env key but no ``llm_providers`` entry yet.
     """
     for config in cf.llm_configs.values():
         for phase, ref in config.phases.items():
-            if ref.provider not in cf.llm_providers:
+            if ref.provider not in cf.llm_providers and ref.provider != "anthropic":
                 raise ConfigError(
                     f"llm-config {config.name!r} phase {phase!r} references "
                     f"unknown provider {ref.provider!r}. Defined providers: "

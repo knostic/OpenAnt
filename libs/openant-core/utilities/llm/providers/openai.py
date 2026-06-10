@@ -144,17 +144,26 @@ class OpenAIAdapter:
     name = "openai"
     supports_tools = True
 
-    # Per-million-token rates. Models absent here report $0 with a
-    # one-time stderr warning per issue #65 §9. Add to this dict in
-    # your local fork if you scan against a model OpenAI added after
-    # this file's last update.
+    # Per-million-token rates (USD per 1M tokens). Models absent here
+    # report $0 with a one-time stderr warning per issue #65 §9. Add to
+    # this dict in your local fork if you scan against a model OpenAI
+    # added after this file's last update. Prices drift — verify against
+    # OpenAI's current list (https://openai.com/api/pricing/).
+    #
+    # o1-mini / o1-preview are intentionally absent: they reject the
+    # ``developer`` role and lack tool support, so the adapter does not
+    # advertise them (PR #69 H3). ``o1`` / ``o3-mini`` / ``o3`` / ``o4-mini``
+    # accept ``developer`` + tools and stay supported.
     pricing: dict[str, dict[str, float]] = {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+        "gpt-4.1": {"input": 2.00, "output": 8.00},
+        "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
+        "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
         "o1": {"input": 15.00, "output": 60.00},
-        "o1-mini": {"input": 3.00, "output": 12.00},
-        "o1-preview": {"input": 15.00, "output": 60.00},
+        "o3": {"input": 2.00, "output": 8.00},
         "o3-mini": {"input": 1.10, "output": 4.40},
+        "o4-mini": {"input": 1.10, "output": 4.40},
     }
 
     def __init__(
@@ -205,7 +214,7 @@ class OpenAIAdapter:
         request: dict[str, Any] = {
             "model": model,
             _token_param(model): max_tokens,
-            "messages": _messages_to_openai(messages, system),
+            "messages": _messages_to_openai(messages, system, model),
         }
         if tools:
             request["tools"] = [_tool_to_openai(t) for t in tools]
@@ -267,22 +276,28 @@ class OpenAIAdapter:
 
 
 def _messages_to_openai(
-    messages: list[Message], system: Optional[str]
+    messages: list[Message], system: Optional[str], model: str
 ) -> list[dict[str, Any]]:
     """Translate unified messages to OpenAI Chat Completions shape.
 
-    System prompts are sent as a leading ``{role: "system"}`` message
-    rather than a separate parameter. Tool results in a user turn
-    become N standalone ``{role: "tool"}`` messages, each with its
-    own ``tool_call_id``. Plain text in a user turn becomes a
-    trailing ``{role: "user"}`` message — so a mixed user turn
-    (rare but allowed by the contract) emits tools-then-text in that
-    order, matching how OpenAI expects tool responses to immediately
-    follow the assistant call that triggered them.
+    System prompts are sent as a leading message rather than a separate
+    parameter. The *role* of that leading message is model-aware:
+    reasoning models (o1/o3/o4…) reject the ``system`` role with a 400,
+    so the prompt is routed to a ``{role: "developer"}`` message — the
+    replacement OpenAI defines for steering reasoning models. Regular
+    chat models (``gpt-4o`` etc.) keep ``{role: "system"}``.
+
+    Tool results in a user turn become N standalone ``{role: "tool"}``
+    messages, each with its own ``tool_call_id``. Plain text in a user
+    turn becomes a trailing ``{role: "user"}`` message — so a mixed
+    user turn (rare but allowed by the contract) emits tools-then-text
+    in that order, matching how OpenAI expects tool responses to
+    immediately follow the assistant call that triggered them.
     """
     out: list[dict[str, Any]] = []
     if system:
-        out.append({"role": "system", "content": system})
+        system_role = "developer" if _is_reasoning_model(model) else "system"
+        out.append({"role": system_role, "content": system})
 
     for message in messages:
         text_blocks = [b for b in message.content if isinstance(b, TextBlock)]
@@ -346,7 +361,17 @@ def _tool_to_openai(tool: ToolDef) -> dict[str, Any]:
 
 def _response_to_unified(response: Any) -> CompletionResult:
     """Translate an OpenAI ChatCompletion response into our types."""
-    choice = response.choices[0]
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        # No choices → nothing the pipeline can act on. Surface it via
+        # the taxonomy instead of letting an IndexError escape unmapped
+        # (mirrors the Gemini empty-``candidates`` guard); for a security
+        # tool an empty end_turn would read as a clean, passing result.
+        raise LLMResponseError(
+            "OpenAI returned no choices (empty completion); the request "
+            "may have been filtered or the response was malformed"
+        )
+    choice = choices[0]
     message = choice.message
 
     content_blocks: list[ContentBlock] = []

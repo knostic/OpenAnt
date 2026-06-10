@@ -1214,6 +1214,16 @@ def main():
     rd_p = subparsers.add_parser("report-data", help="(internal) Prepare report data for Go renderer")
     rd_p.add_argument("results", help="Path to results/experiment JSON")
     rd_p.add_argument("--dataset", required=True, help="Path to dataset JSON")
+    rd_p.add_argument(
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config in ~/.config/openant/config.json. "
+            "Defaults to the file's default_llm (or the built-in "
+            "`openant-default` when no config file exists). Used by the "
+            "HTML-report remediation guidance, which rides the report phase."
+        ),
+    )
     rd_p.set_defaults(func=cmd_report_data)
 
     # ---------------------------------------------------------------

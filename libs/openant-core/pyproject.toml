@@ -6,8 +6,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.40.0",
-    "openai>=1.30.0",
-    "google-genai>=0.3.0",
+    # openai adapter sends ``max_completion_tokens`` (reasoning models),
+    # added to the SDK in 1.45.0.
+    "openai>=1.45.0",
+    # google adapter uses keyword-only ``Part.from_text(text=...)`` and
+    # ``HttpOptions(base_url=...)``, both stabilised in google-genai 1.0.0.
+    "google-genai>=1.0.0",
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
     "httpx>=0.24.0",

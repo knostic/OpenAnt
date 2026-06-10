@@ -15,6 +15,29 @@ from pathlib import Path
 from .generator import generate_summary_report, generate_disclosure, generate_all
 from .schema import validate_pipeline_output, ValidationError
 from utilities.file_io import open_utf8, read_json
+from utilities.llm import (
+    PhaseBinding,
+    build_phase_registry,
+    load_config_file,
+    probe_registry_or_raise,
+    resolve_llm_config,
+)
+
+
+def _build_report_binding(llm_config_name: str | None = None) -> PhaseBinding:
+    """Resolve the ``report``-phase binding for a standalone CLI invocation.
+
+    ``generate_summary_report`` / ``generate_disclosure`` now require a
+    :class:`PhaseBinding` (issue #65). Mirror the registry-build pattern
+    used by ``report.generator.generate_all`` and ``core.scanner`` so the
+    standalone ``python -m report`` commands resolve the same per-phase
+    model — and surface a clean LLMError on a bad key / typo'd model via
+    the 1-token probe, rather than crashing mid-generation.
+    """
+    cf = load_config_file()
+    registry = build_phase_registry(cf, resolve_llm_config(cf, llm_config_name))
+    probe_registry_or_raise(registry)
+    return registry.get("report")
 
 
 def cmd_summary(args):
@@ -27,8 +50,10 @@ def cmd_summary(args):
         print(f"Validation error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    report_binding = _build_report_binding()
+
     print("Generating summary report...")
-    report, usage = generate_summary_report(pipeline_data)
+    report, usage = generate_summary_report(pipeline_data, report_binding)
 
     output_path = Path(args.output) if args.output else Path("SUMMARY_REPORT.md")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -51,6 +76,8 @@ def cmd_disclosures(args):
     output_dir = Path(args.output) if args.output else Path("disclosures")
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    report_binding = _build_report_binding()
+
     product_name = pipeline_data["repository"]["name"]
     count = 0
 
@@ -59,7 +86,7 @@ def cmd_disclosures(args):
             continue
 
         print(f"Generating disclosure for {finding['short_name']}...")
-        disclosure, _usage = generate_disclosure(finding, product_name)
+        disclosure, _usage = generate_disclosure(finding, product_name, report_binding)
 
         safe_name = finding["short_name"].replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"

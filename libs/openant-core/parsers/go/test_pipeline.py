@@ -811,8 +811,21 @@ class GoPipelineTest:
             # Load dataset
             dataset = read_json(self.dataset_file)
 
-            # Enhance with LLM
-            enhancer = ContextEnhancer()
+            # Enhance with LLM. Build a phase registry from the default
+            # llm-config (name=None) and hand the enhancer the
+            # enhance-phase binding — mirrors core/enhancer.py. The bare
+            # ContextEnhancer() form no longer works (binding required).
+            from utilities.llm import (
+                build_phase_registry,
+                load_config_file,
+                probe_registry_or_raise,
+                resolve_llm_config,
+            )
+
+            cf = load_config_file()
+            registry = build_phase_registry(cf, resolve_llm_config(cf, None))
+            probe_registry_or_raise(registry)
+            enhancer = ContextEnhancer(binding=registry.get("enhance"))
 
             if self.agentic:
                 # Agentic mode - iterative tool use

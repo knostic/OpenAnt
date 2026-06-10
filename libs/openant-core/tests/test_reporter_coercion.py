@@ -119,8 +119,9 @@ class TestCoerceToStr:
             def __str__(self):
                 return "weird-repr"
 
-        # complex() isn't JSON-serialisable.
-        assert "j" in _coerce_to_str(complex(1, 2)).lower() or _coerce_to_str(complex(1, 2)) != ""
+        # complex() isn't JSON-serialisable, so json.dumps raises and the
+        # fallback to str() kicks in: str(complex(1, 2)) == "(1+2j)".
+        assert _coerce_to_str(complex(1, 2)) == "(1+2j)"
         assert _coerce_to_str(_Weird()) == "weird-repr"
 
 
@@ -189,3 +190,74 @@ class TestBuildPipelineOutputCoercion:
         assert "GET /user?id=' OR 1=1--" in steps
         assert "Data flow: request.query.id -> db.execute(sql)" in steps
         assert "Verification: no input validation" in steps
+
+
+class TestBuildPipelineOutputDataFlowContainer:
+    """M3: ``data_flow`` is supposed to be ``list[str]`` per the verify
+    schema, but a model can violate that and hand back any JSON shape.
+
+    The original guard iterated the container blindly
+    (``for step in data_flow``), which:
+
+    * crashes on a scalar (``TypeError: 'int' object is not iterable``),
+    * garbles a bare string into char-by-char ``g -> e -> t ...``,
+    * silently drops a dict's values (iterating a dict yields keys).
+
+    The fix coerces the *container* first: list/tuple → join coerced
+    steps, anything else → coerce the whole value. These tests drive the
+    REAL ``build_pipeline_output`` path with each malformed shape and
+    assert no crash plus sensible, lossless output.
+    """
+
+    def test_scalar_data_flow_does_not_crash(self, tmp_path):
+        # Truthy int — the exact schema-violation class that used to
+        # raise ``TypeError: 'int' object is not iterable``.
+        out = _run_build(tmp_path, finding={
+            "attack_vector": "GET /user?id=evil",
+            "exploit_path": {"data_flow": 42},
+        })
+        steps = out["findings"][0]["steps_to_reproduce"] or ""
+        # The scalar value is preserved, not dropped.
+        assert "Data flow: 42" in steps, (
+            f"scalar data_flow lost / crashed: {steps!r}"
+        )
+
+    def test_bare_string_data_flow_not_garbled(self, tmp_path):
+        # A bare string is iterable, so the old code char-walked it into
+        # 'r -> e -> q -> u -> ...'. The container coercion must keep it
+        # whole.
+        out = _run_build(tmp_path, finding={
+            "attack_vector": "GET /user?id=evil",
+            "exploit_path": {"data_flow": "request.query.id"},
+        })
+        steps = out["findings"][0]["steps_to_reproduce"] or ""
+        assert "Data flow: request.query.id" in steps, (
+            f"bare-string data_flow garbled: {steps!r}"
+        )
+        # Proof of "not char-by-char": no single-char arrow joins.
+        assert "r -> e -> q" not in steps
+
+    def test_dict_data_flow_preserves_data(self, tmp_path):
+        # Iterating a dict yields its keys, so the old code dropped the
+        # values entirely. Coercing the whole dict to JSON keeps both.
+        out = _run_build(tmp_path, finding={
+            "attack_vector": "GET /user?id=evil",
+            "exploit_path": {"data_flow": {"source": "request.query.id",
+                                           "sink": "db.execute(sql)"}},
+        })
+        steps = out["findings"][0]["steps_to_reproduce"] or ""
+        # Both the value(s) survive — not just the keys.
+        assert "request.query.id" in steps
+        assert "db.execute(sql)" in steps
+
+    def test_none_data_flow_is_skipped(self, tmp_path):
+        # Falsy / absent data_flow must be omitted entirely, not render
+        # an empty "Data flow: " line.
+        out = _run_build(tmp_path, finding={
+            "attack_vector": "GET /user?id=evil",
+            "exploit_path": {"data_flow": None},
+        })
+        steps = out["findings"][0]["steps_to_reproduce"] or ""
+        assert "Data flow" not in steps
+        # The other part still renders, proving we only skipped data_flow.
+        assert "GET /user?id=evil" in steps

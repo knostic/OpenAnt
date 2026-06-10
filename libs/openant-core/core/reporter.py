@@ -307,10 +307,19 @@ def build_pipeline_output(
             if finding.get("attack_vector"):
                 parts.append(_coerce_to_str(finding["attack_vector"]))
             exploit_path = finding.get("exploit_path") or {}
-            if exploit_path.get("data_flow"):
-                parts.append("Data flow: " + " -> ".join(
-                    _coerce_to_str(step) for step in exploit_path["data_flow"]
-                ))
+            data_flow = exploit_path.get("data_flow")
+            if data_flow:
+                # ``data_flow`` is meant to be ``list[str]`` (verify
+                # schema), but a model can violate that. Coerce the
+                # CONTAINER first — only join step-by-step when it really
+                # is a sequence; otherwise coerce the whole value. A bare
+                # iterate-and-join here would crash on a scalar, char-walk
+                # a bare string, and drop a dict's values. See M3.
+                if isinstance(data_flow, (list, tuple)):
+                    flow_str = " -> ".join(_coerce_to_str(step) for step in data_flow)
+                else:
+                    flow_str = _coerce_to_str(data_flow)
+                parts.append("Data flow: " + flow_str)
             if finding.get("verification_explanation"):
                 parts.append("Verification: " + _coerce_to_str(finding["verification_explanation"]))
             steps_to_reproduce = "\n\n".join(parts) if parts else None

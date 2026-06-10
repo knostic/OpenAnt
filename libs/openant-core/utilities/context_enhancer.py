@@ -86,6 +86,23 @@ def _build_error_info(exc: Exception) -> dict:
     elif isinstance(exc, LLMResponseError):
         info["type"] = "api_status"
 
+    # Best-effort diagnostics. The unified LLMError taxonomy is
+    # provider-neutral and does not itself carry status_code/request_id,
+    # but the original SDK exception is chained on ``__cause__`` (adapters
+    # re-raise ``... from exc``) and the major SDKs expose those there.
+    # Surface them when present without reaching into adapter internals.
+    for source in (exc, getattr(exc, "__cause__", None)):
+        if source is None:
+            continue
+        if "status_code" not in info:
+            status_code = getattr(source, "status_code", None)
+            if status_code is not None:
+                info["status_code"] = status_code
+        if "request_id" not in info:
+            request_id = getattr(source, "request_id", None)
+            if request_id is not None:
+                info["request_id"] = request_id
+
     # Agent iteration state (attached by agent.py)
     agent_state = getattr(exc, "agent_state", None)
     if agent_state:
@@ -1002,8 +1019,22 @@ def main():
 
     dataset = read_json(input_path)
 
+    # Build a phase registry from the default llm-config (name=None) and
+    # hand the enhancer the enhance-phase binding — mirrors core/enhancer.py.
+    # The bare ContextEnhancer() form no longer works (binding required).
+    from .llm import (
+        build_phase_registry,
+        load_config_file,
+        probe_registry_or_raise,
+        resolve_llm_config,
+    )
+
+    cf = load_config_file()
+    registry = build_phase_registry(cf, resolve_llm_config(cf, None))
+    probe_registry_or_raise(registry)
+
     # Enhance
-    enhancer = ContextEnhancer()
+    enhancer = ContextEnhancer(binding=registry.get("enhance"))
 
     if args.agentic:
         # Agentic mode - requires analyzer output
