@@ -15,7 +15,8 @@ All notable changes to OpenAnt are documented in this file.
   **Anthropic** (reference), **OpenAI** (Chat Completions), and
   **Google Gemini** (`google-genai` SDK) — all supporting tool
   calling. Adding more (Ollama, vLLM, OpenRouter-native, etc.) is
-  a four-file recipe; see
+  a small Python adapter recipe — plus a few Go wizard/probe
+  touch-points if you want it offered by `openant setup llm`; see
   `docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md`. The
   surface is deliberately minimal — one `complete()` method, one
   `validate()` method, a closed set of three content-block kinds,
@@ -56,11 +57,13 @@ All notable changes to OpenAnt are documented in this file.
   message names the phase, the offending provider, and what to do
   about it — fails at registry-build time, never at first call.
 
-- **Contract test harness.** An 11-test parametrised suite runs
-  against every shipped adapter (33 tests across Anthropic, OpenAI,
-  Google) pinning each one's behaviour for text completion,
-  tool-use round trips, and error mapping. Adding an adapter means
-  adding one scenario factory file and one row in
+- **Contract test harness.** A 12-test parametrised suite runs
+  against every shipped adapter (36 cases across Anthropic, OpenAI,
+  Google; one tool-related case skips per adapter depending on
+  `supports_tools`, so all three tool-capable shipped adapters
+  execute 11 and skip 1) pinning each one's behaviour for text
+  completion, tool-use round trips, and error mapping. Adding an
+  adapter means adding one scenario factory file and one row in
   `tests/test_llm_adapter_contract.py::ADAPTERS`.
 
 ### Changed

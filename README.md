@@ -130,7 +130,7 @@ Providers accept a custom `base_url` for OpenAI-compatible / Anthropic-compatibl
 
 #### Adding a new provider adapter
 
-OpenAnt's adapter layer is a four-file recipe — one Python file implementing the `LLMAdapter` Protocol, one factory for the contract-test harness, plus a registry entry and the wizard's provider list. The 11-test contract harness runs automatically against your adapter once it's wired in. See [`docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md`](docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md) for the full recipe.
+OpenAnt's adapter layer is a small Python recipe — one Python file implementing the `LLMAdapter` Protocol, one factory for the contract-test harness, plus a registry entry — and that alone is enough to run the adapter from a hand-authored config. To also have it offered by the `openant setup llm` wizard and pass its pre-save probe, add a few Go touch-points in `apps/openant-cli/cmd/setup.go` (the supported-provider list, a probe `case`, the per-phase default-model maps) plus a Go probe function. The 12 contract tests run automatically against your adapter once it's wired in. See [`docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md`](docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md) for the full recipe.
 
 ### Python runtime
 
@@ -214,7 +214,7 @@ openant project switch <org/repo> # switch active project
 
 Things on the list, in no particular order:
 
-- **More provider adapters.** Ollama (local models), vLLM, Cohere, Mistral, Groq, Amazon Bedrock, Azure OpenAI — each is a four-file PR per the contributor recipe. Lower the barrier to local / on-prem inference.
+- **More provider adapters.** Ollama (local models), vLLM, Cohere, Mistral, Groq, Amazon Bedrock, Azure OpenAI — each is a small Python adapter recipe (plus a few Go wizard/probe touch-points if you want it offered by `openant setup llm`) per the contributor guide. Lower the barrier to local / on-prem inference.
 - **Subscription-based auth.** ChatGPT / Codex, Claude Pro / Max, and Gemini Advanced subscriptions don't currently grant API quota — users have to maintain a separate API-tier key per provider. OAuth-based adapters that ride the consumer subscription would close that gap.
 - **Cross-provider tool-call quirks.** All three shipped adapters support tool calling, but the long tail (parallel tool calls, strict-mode schema enforcement, retry semantics on partial JSON) behaves differently per provider. Real-world scans surface these — PRs welcome.
 - **More languages.** The supported-languages list above is current coverage. Rust, Java, C#, and Swift come up frequently.
