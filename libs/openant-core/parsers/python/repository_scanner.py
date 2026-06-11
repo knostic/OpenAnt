@@ -100,7 +100,14 @@ class RepositoryScanner:
 
         # Skip test files by default (can be overridden)
         self.skip_tests = options.get('skip_tests', False)
-        self.test_patterns = {'test_', '_test.py', 'tests/', '/test/', 'conftest.py'}
+        # Native Python test conventions. Directory names are matched as whole
+        # path segments; filename rules are anchored to the basename so that
+        # ordinary sources like ``latest_release.py``/``contests/foo.py`` are
+        # NOT misclassified as tests (an unanchored substring scan would).
+        self.test_dir_names = {'test', 'tests'}
+        self.test_file_prefixes = ('test_',)
+        self.test_file_suffixes = ('_test.py',)
+        self.test_file_names = {'conftest.py'}
 
         # Statistics
         self.stats = {
@@ -133,11 +140,23 @@ class RepositoryScanner:
         return ext in self.source_extensions
 
     def is_test_file(self, relative_path: str) -> bool:
-        """Check if a file is a test file."""
-        path_lower = relative_path.lower()
-        for pattern in self.test_patterns:
-            if pattern in path_lower:
-                return True
+        """Check if a file is a test file.
+
+        Matches on path *components* and *anchored* filename rules rather than
+        unanchored substrings, so non-test files whose name merely contains a
+        token (``latest_release.py``, ``contests/foo.py``) are not skipped.
+        """
+        p = Path(relative_path)
+        # Any directory component named exactly test/tests (case-insensitive).
+        if any(part.lower() in self.test_dir_names for part in p.parts[:-1]):
+            return True
+        name_lower = p.name.lower()
+        if name_lower in self.test_file_names:
+            return True
+        if name_lower.startswith(self.test_file_prefixes):
+            return True
+        if name_lower.endswith(self.test_file_suffixes):
+            return True
         return False
 
     def scan_directory(self, dir_path: Path, relative_path: str = '') -> None:
