@@ -31,6 +31,20 @@ import os
 import sys
 from utilities.file_io import read_json
 
+# Characters that make a spreadsheet treat a cell as a formula on open (CSV / formula
+# injection, CWE-1236 / OWASP). Cells written from scanned source or LLM text must be
+# neutralized so opening the export in Excel / Google Sheets can't execute a payload.
+_CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    """Prefix a leading formula-trigger character with a single quote, neutralizing CSV
+    formula injection. Non-string/None values become '' / their str form first."""
+    s = "" if value is None else str(value)
+    if s and s[0] in _CSV_FORMULA_TRIGGERS:
+        return "'" + s
+    return s
+
 
 def _load_diff_block(experiment_path: str) -> dict | None:
     """Look for the ``diff`` block in pipeline_output.json next to the
@@ -159,7 +173,8 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
             'stage1_confidence': result.get('confidence', ''),
             'agentic_classification': llm_context.get('security_classification', '')
         }
-        rows.append(row)
+        # Neutralize CSV / formula injection on every cell before writing.
+        rows.append({k: _csv_safe(v) for k, v in row.items()})
 
     # Write CSV
     fieldnames = [
