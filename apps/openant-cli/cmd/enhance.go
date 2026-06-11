@@ -32,6 +32,7 @@ var (
 	enhanceCheckpoint     string
 	enhanceWorkers        int
 	enhanceBackoff        int
+	enhanceLimit          int
 )
 
 func init() {
@@ -42,6 +43,7 @@ func init() {
 	enhanceCmd.Flags().StringVar(&enhanceCheckpoint, "checkpoint", "", "Path to save/resume checkpoint (agentic mode)")
 	enhanceCmd.Flags().IntVar(&enhanceWorkers, "workers", 8, "Number of parallel workers for LLM steps (default: 8)")
 	enhanceCmd.Flags().IntVar(&enhanceBackoff, "backoff", 30, "Seconds to wait when rate-limited (default: 30)")
+	enhanceCmd.Flags().IntVar(&enhanceLimit, "limit", 0, "Max units to enhance (0 = no limit)")
 }
 
 func runEnhance(cmd *cobra.Command, args []string) {
@@ -103,6 +105,9 @@ func runEnhance(cmd *cobra.Command, args []string) {
 	}
 	if enhanceBackoff != 30 {
 		pyArgs = append(pyArgs, "--backoff", fmt.Sprintf("%d", enhanceBackoff))
+	}
+	if enhanceLimit > 0 {
+		pyArgs = append(pyArgs, "--limit", fmt.Sprintf("%d", enhanceLimit))
 	}
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())

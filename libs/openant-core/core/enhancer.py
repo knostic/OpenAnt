@@ -30,6 +30,7 @@ def enhance_dataset(
     model: str = "sonnet",
     workers: int = 8,
     backoff_seconds: int = 30,
+    limit: int | None = None,
 ) -> EnhanceResult:
     """Enhance a parsed dataset with security context.
 
@@ -44,6 +45,7 @@ def enhance_dataset(
         model: "sonnet" (default, cost-effective).
         workers: Number of parallel workers (default: 8).
         backoff_seconds: Seconds to wait on rate limit before retry (default: 30).
+        limit: Max number of units to enhance (None = all). Mirrors `analyze --limit`.
 
     Returns:
         EnhanceResult with output path, stats, and usage.
@@ -72,6 +74,9 @@ def enhance_dataset(
     print(f"[Enhance] Loading dataset: {dataset_path}", file=sys.stderr)
     dataset = read_json(dataset_path)
     units = dataset.get("units", [])
+    if limit:
+        units = units[:limit]
+        dataset["units"] = units  # so the agentic/single-shot paths enhance only these
     print(f"[Enhance] Units to enhance: {len(units)}", file=sys.stderr)
 
     # Set up progress reporter
