@@ -160,7 +160,11 @@ class UnitGenerator:
         file_path = func_data.get('file_path', '')
         func_name = func_data.get('name', '')
         class_name = func_data.get('class_name')
-        namespace = func_data.get('namespace')
+        # The extractor (function_extractor.py) writes the declared namespace
+        # under 'namespace_name'; read that canonical key so it reaches the
+        # unit instead of always being None (key-drift bug).
+        namespace = func_data.get('namespace_name')
+        is_static = func_data.get('is_static', False)
         unit_type = func_data.get('unit_type', 'function')
 
         # Get upstream dependencies (functions this calls)
@@ -239,6 +243,7 @@ class UnitGenerator:
             'metadata': {
                 'visibility': func_data.get('visibility', 'public'),
                 'namespace': namespace,
+                'is_static': is_static,
                 'parameters': func_data.get('parameters', []),
                 'generator': 'php_unit_generator.py',
                 'direct_calls': direct_calls,
@@ -307,7 +312,8 @@ class UnitGenerator:
                 'endLine': func_data.get('end_line', 0),
                 'visibility': func_data.get('visibility', 'public'),
                 'isExported': True,  # PHP doesn't have explicit exports
-                'namespace': func_data.get('namespace'),
+                'namespace': func_data.get('namespace_name'),
+                'isStatic': func_data.get('is_static', False),
                 'parameters': func_data.get('parameters', []),
                 'className': func_data.get('class_name'),
             }
