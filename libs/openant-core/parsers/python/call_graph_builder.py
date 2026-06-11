@@ -183,17 +183,76 @@ class CallGraphBuilder:
             # Fall back to regex-based extraction
             return self._extract_calls_regex(code, caller_id)
 
+        # Local variable -> constructor-type map, so that `v = ClassName(); v.method()`
+        # dispatches to the bound type's method.
+        local_types = self._collect_local_types(tree)
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
-                resolved = self._resolve_call_node(node, caller_file, caller_class)
+                resolved = self._resolve_call_node(node, caller_file, caller_class, local_types)
                 if resolved:
                     calls.add(resolved)
+                # Higher-order-function callbacks: a function reference passed as an
+                # argument (map(func, xs), sorted(xs, key=func)) is a real reachability
+                # edge but lives in node.args / node.keywords, not node.func, so the
+                # main resolver above never sees it.
+                for callee in self._resolve_callback_args(node, caller_file):
+                    calls.add(callee)
 
         return calls
 
-    def _resolve_call_node(self, node: ast.Call, caller_file: str, caller_class: Optional[str]) -> Optional[str]:
+    def _collect_local_types(self, tree: ast.AST) -> Dict[str, str]:
+        """Map local variable names to the class name they are constructed from.
+
+        Handles the conservative, unambiguous case ``var = ClassName(...)`` where the
+        right-hand side is a direct call of a bare Name (the constructor). Used to resolve
+        ``var.method()`` against the constructed type. If the same
+        name is rebound to different types, it is treated as ambiguous and dropped.
+        """
+        types: Dict[str, str] = {}
+        ambiguous: Set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            value = node.value
+            if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)):
+                continue
+            ctor = value.func.id
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                name = target.id
+                if name in ambiguous:
+                    continue
+                if name in types and types[name] != ctor:
+                    ambiguous.add(name)
+                    types.pop(name, None)
+                else:
+                    types[name] = ctor
+        return types
+
+    def _resolve_callback_args(self, node: ast.Call, caller_file: str) -> List[str]:
+        """Resolve function references passed as call arguments to function ids.
+
+        Inspects positional args and keyword values for bare ``ast.Name`` references that
+        resolve to a known function (e.g. the callbacks of ``map``/``filter``/``sorted``).
+        Only Name references are considered -- inline lambdas and attribute references have
+        no standalone function id to point at.
+        """
+        callees: List[str] = []
+        candidates = list(node.args) + [kw.value for kw in node.keywords]
+        for arg in candidates:
+            if isinstance(arg, ast.Name) and not self._is_builtin(arg.id):
+                resolved = self._resolve_simple_call(arg.id, caller_file)
+                if resolved:
+                    callees.append(resolved)
+        return callees
+
+    def _resolve_call_node(self, node: ast.Call, caller_file: str, caller_class: Optional[str],
+                           local_types: Optional[Dict[str, str]] = None) -> Optional[str]:
         """Resolve an AST Call node to a function ID."""
         func = node.func
+        local_types = local_types or {}
 
         # Simple function call: func_name(...)
         if isinstance(func, ast.Name):
@@ -221,12 +280,20 @@ class CallGraphBuilder:
 
             # super().method(...)
             if isinstance(obj, ast.Call) and isinstance(obj.func, ast.Name) and obj.func.id == 'super':
-                # Would need to resolve parent class - skip for now
+                if caller_class:
+                    return self._resolve_super_call(method_name, caller_file, caller_class)
                 return None
 
             # module.func(...) or object.method(...)
             if isinstance(obj, ast.Name):
                 obj_name = obj.id
+                # Local variable of a locally-known type: `v = ClassName(); v.method()`
+                # resolves to the constructed class's method,
+                # which _resolve_module_call (imports / same-file class NAMES only) cannot do.
+                if obj_name in local_types:
+                    typed = self._resolve_class_method(local_types[obj_name], method_name, caller_file)
+                    if typed:
+                        return typed
                 return self._resolve_module_call(obj_name, method_name, caller_file)
 
             # Chained calls: obj.method1().method2(...)
@@ -273,6 +340,75 @@ class CallGraphBuilder:
 
         return None
 
+    def _resolve_super_call(self, method_name: str, caller_file: str, caller_class: str) -> Optional[str]:
+        """Resolve a ``super().method(...)`` call to the inherited parent method.
+
+        The previous implementation returned ``None`` unconditionally, so any method
+        reachable only through ``super()`` was dropped from the call graph -- including
+        cross-file inheritance, where the parent class lives in a different module.
+
+        Resolution walks the caller class's declared bases (``self.classes[...]['bases']``,
+        populated by the extractor) up the inheritance chain, looking for the first base
+        class -- in ANY file -- that defines ``method_name``. Base classes are matched by
+        their simple name, so a base declared as ``module.Base`` still matches the class
+        named ``Base``. Returns the parent method's function id, or ``None`` if the parent
+        class (e.g. an external library type) is not present in the parsed repo.
+        """
+        seen_classes: Set[str] = set()
+        # Seed the BFS with the caller's own class key.
+        queue: List[str] = [f"{caller_file}:{caller_class}"]
+        while queue:
+            class_key = queue.pop(0)
+            if class_key in seen_classes:
+                continue
+            seen_classes.add(class_key)
+            class_data = self.classes.get(class_key)
+            if not class_data:
+                continue
+            for base in class_data.get('bases', []):
+                base_simple = base.split('.')[-1]            # 'pkg.Base' -> 'Base'
+                # Find every class (across files) whose simple name matches this base.
+                for cand_key, cand_data in self.classes.items():
+                    if cand_data.get('name') != base_simple or cand_key in seen_classes:
+                        continue
+                    method_id = self._method_in_class(cand_key, method_name)
+                    if method_id:
+                        return method_id
+                    # Parent doesn't define it directly -- keep walking its own bases.
+                    queue.append(cand_key)
+        return None
+
+    def _method_in_class(self, class_key: str, method_name: str) -> Optional[str]:
+        """Return the function id of ``method_name`` declared on ``class_key``, or None."""
+        for func_id in self.methods_by_class.get(class_key, []):
+            if self.functions.get(func_id, {}).get('name') == method_name:
+                return func_id
+        return None
+
+    def _resolve_class_method(self, class_name: str, method_name: str, caller_file: str) -> Optional[str]:
+        """Resolve ``ClassName.method`` to a function id, same-file first then cross-file.
+
+        Used to dispatch a call on a local variable whose type is known.
+        Same-file resolution is preferred; otherwise the class
+        is matched by simple name across all parsed files (unambiguous single match only,
+        to avoid binding to an unrelated same-named class).
+        """
+        class_simple = class_name.split('.')[-1]
+        # 1. Same file.
+        same_file = self._method_in_class(f"{caller_file}:{class_simple}", method_name)
+        if same_file:
+            return same_file
+        # 2. Cross-file: exactly one class with this simple name that defines the method.
+        matches = []
+        for class_key, class_data in self.classes.items():
+            if class_data.get('name') == class_simple:
+                method_id = self._method_in_class(class_key, method_name)
+                if method_id:
+                    matches.append(method_id)
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def _resolve_module_call(self, obj_name: str, method_name: str, caller_file: str) -> Optional[str]:
         """Resolve a module.function() or object.method() call."""
         # Skip builtin modules
@@ -297,7 +433,8 @@ class CallGraphBuilder:
 
         return None
 
-    def _resolve_import(self, import_path: str, func_name: str, caller_file: str) -> Optional[str]:
+    def _resolve_import(self, import_path: str, func_name: str, caller_file: str,
+                        _seen: Optional[Set[str]] = None) -> Optional[str]:
         """Resolve an imported function to a function ID."""
         # import_path might be "module.submodule.function" or "module.ClassName"
         parts = import_path.split('.')
@@ -327,6 +464,15 @@ class CallGraphBuilder:
                 if target_id in self.functions:
                     return target_id
 
+        # Strategy 1b: package re-export via __init__.py.
+        # `from pkg import name` records import_path 'pkg.name', but `name` may not live in
+        # pkg.py -- it is commonly re-exported from pkg/__init__.py via
+        # `from .submodule import name`. Probe the package __init__.py, then follow the
+        # recorded re-export to the name's true origin module. _seen guards re-export cycles.
+        reexported = self._resolve_via_package_init(parts, func_name, _seen)
+        if reexported:
+            return reexported
+
         # Strategy 2: Check if import_path itself is a function
         for func_id in self.functions:
             func_data = self.functions[func_id]
@@ -338,6 +484,36 @@ class CallGraphBuilder:
                 if module_path.endswith(expected_module) or expected_module.endswith(module_path):
                     return func_id
 
+        return None
+
+    def _resolve_via_package_init(self, parts: List[str], func_name: str,
+                                  _seen: Optional[Set[str]]) -> Optional[str]:
+        """Follow a name re-exported through a package ``__init__.py`` to its origin.
+
+        Given the dotted import parts (e.g. ['utils', 'sanitize']) and the imported
+        ``func_name``, this walks the longest-to-shortest package prefixes, and for any
+        prefix whose ``<prefix>/__init__.py`` was parsed, looks up ``func_name`` in that
+        package's recorded import map. When the package re-exports the name (e.g.
+        ``from .helpers import sanitize`` -> 'utils.helpers.sanitize'), resolution recurses
+        on the re-export target to reach the true origin module.
+        """
+        seen = _seen if _seen is not None else set()
+        for i in range(len(parts), 0, -1):
+            init_file = '/'.join(parts[:i]) + '/__init__.py'
+            if init_file not in self.imports:
+                continue
+            if init_file in seen:                       # re-export cycle guard
+                continue
+            pkg_imports = self.imports[init_file]
+            if func_name not in pkg_imports:
+                continue
+            seen.add(init_file)
+            origin_path = pkg_imports[func_name]         # e.g. 'utils.helpers.sanitize'
+            if origin_path == '.'.join(parts):           # would re-resolve to itself
+                continue
+            resolved = self._resolve_import(origin_path, func_name, init_file, seen)
+            if resolved:
+                return resolved
         return None
 
     def _extract_calls_regex(self, code: str, caller_id: str) -> Set[str]:
@@ -380,8 +556,11 @@ class CallGraphBuilder:
             # Extract all function calls from this function's code
             calls = self._extract_calls_from_code(code, func_id)
 
-            # Filter to valid function IDs (must exist in our codebase, not self-calls)
-            valid_calls = [c for c in calls if c in self.functions and c != func_id]
+            # Filter to valid function IDs (must exist in our codebase, not self-calls).
+            # `calls` is a set, whose iteration order depends on PYTHONHASHSEED; sort the
+            # filtered list so call_graph (and, below, reverse_call_graph) emit a stable,
+            # reproducible ordering on identical input.
+            valid_calls = sorted(c for c in calls if c in self.functions and c != func_id)
             self.call_graph[func_id] = valid_calls
 
             # Build reverse graph: for each called function, record this caller
@@ -390,6 +569,10 @@ class CallGraphBuilder:
                     self.reverse_call_graph[called_id] = []
                 if func_id not in self.reverse_call_graph[called_id]:
                     self.reverse_call_graph[called_id].append(func_id)
+
+        # Sort reverse-graph caller lists for the same determinism guarantee.
+        for called_id in self.reverse_call_graph:
+            self.reverse_call_graph[called_id].sort()
 
     def get_dependencies(self, func_id: str, depth: Optional[int] = None) -> List[str]:
         """Get all dependencies (callees) for a function up to max depth."""
