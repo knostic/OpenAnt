@@ -201,8 +201,7 @@ func CheckOpenantInstalled(pythonPath string) error {
 	}
 
 	// Save dependency hash so CheckDepsStale knows this is the baseline.
-	pyprojectPath := filepath.Join(corePath, "pyproject.toml")
-	if h, err := hashFile(pyprojectPath); err == nil {
+	if h, err := depsHash(corePath); err == nil {
 		if err := writeStoredHash(h); err != nil {
 			fmt.Fprintf(os.Stderr,
 				"warning: could not save dependency hash at %s: %v (next run may reinstall)\n",
@@ -285,13 +284,26 @@ func readStoredHash() string { return readHashAt(depsHashPath()) }
 // writeStoredHash saves the dependency hash to the venv marker file.
 func writeStoredHash(hash string) error { return writeHashAt(depsHashPath(), hash) }
 
+// depsHash keys the dependency stamp on BOTH pyproject.toml contents AND corePath (the
+// editable-install source). The managed venv is a single global path shared across worktrees;
+// without corePath in the key, two worktrees with identical pyproject.toml share one editable
+// install and a binary built in one silently imports the other's source. Including corePath forces
+// a reinstall (re-pointing the editable install) when the active source changes.
+func depsHash(corePath string) (string, error) {
+	pyproject, err := os.ReadFile(filepath.Join(corePath, "pyproject.toml"))
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(append([]byte(corePath+"\x00"), pyproject...))
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // depsStalenessAt inspects pyproject.toml at corePath and the hash stored at
 // hashPath, and reports whether a reinstall is needed. The boolean is true
 // when deps are stale (i.e. the hash differs and a reinstall is warranted).
 // The caller is expected to skip the check on any error.
 func depsStalenessAt(corePath, hashPath string) (stale bool, currentHash string, err error) {
-	pyprojectPath := filepath.Join(corePath, "pyproject.toml")
-	currentHash, err = hashFile(pyprojectPath)
+	currentHash, err = depsHash(corePath)
 	if err != nil {
 		return false, "", err
 	}
