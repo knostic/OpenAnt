@@ -67,22 +67,29 @@ class GlobalRateLimiter:
 
         Call this before every API request. Returns the time waited (0 if none).
         """
-        with self._lock:
-            now = time.monotonic()
-            if now >= self._backoff_until:
-                return 0.0
+        total_wait = 0.0
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                if now >= self._backoff_until:
+                    break
 
-            wait_time = self._backoff_until - now
-            # Add jitter (0-2s) to prevent thundering herd when backoff expires
-            jitter = random.uniform(0, 2.0)
-            total_wait = wait_time + jitter
+                wait_time = self._backoff_until - now
+                # Add jitter (0-2s) to prevent thundering herd when backoff expires
+                jitter = random.uniform(0, 2.0)
+                this_wait = wait_time + jitter
 
-        # Sleep outside the lock so other threads can also read backoff_until
-        time.sleep(total_wait)
+            # Sleep outside the lock so other threads can also read backoff_until.
+            # Re-check after sleeping: another worker may have EXTENDED _backoff_until
+            # (a fresh 429 via report_rate_limit) while we slept. Without the re-check we
+            # would wake into the still-active backoff window and re-trigger the storm.
+            time.sleep(this_wait)
+            total_wait += this_wait
 
-        with self._lock:
-            self._total_waits += 1
-            self._total_wait_time += total_wait
+        if total_wait > 0.0:
+            with self._lock:
+                self._total_waits += 1
+                self._total_wait_time += total_wait
 
         return total_wait
 
