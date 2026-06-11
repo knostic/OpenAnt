@@ -138,3 +138,65 @@ def test_callee_is_not_isolated_in_statistics():
         f"  call_graph: {builder.call_graph}\n"
         f"  reverse_call_graph: {builder.reverse_call_graph}"
     )
+
+
+# --- self / cls alias edges (byproduct-deepcheck 2026-06-12) ---
+# `obj = self; obj.method()` and `alias = cls; alias.method()` are real
+# self/class-method calls, but _resolve_call_node only matched a receiver
+# literally named `self`/`cls`, so the edge was DROPPED (under-resolution ->
+# the callee can look unreachable). Fixing ADDS the missing edge; it never
+# removes one (raises reachability, never lowers it).
+
+def _alias_extractor_output(body: str, decorator: str = "") -> dict:
+    """Two methods on one class; `caller` reaches `target` via a self/cls alias."""
+    file_path = "m.py"
+    dec = f"    {decorator}\n" if decorator else ""
+    return {
+        "repository": "/tmp/fake",
+        "imports": {file_path: {}},
+        "classes": {f"{file_path}:C": {"name": "C", "file_path": file_path}},
+        "functions": {
+            f"{file_path}:C.target": {
+                "name": "target", "qualified_name": "C.target", "file_path": file_path,
+                "class_name": "C", "unit_type": "method",
+                "code": f"{dec}    def target(self):\n        return 1\n",
+            },
+            f"{file_path}:C.caller": {
+                "name": "caller", "qualified_name": "C.caller", "file_path": file_path,
+                "class_name": "C", "unit_type": "method", "code": body,
+            },
+        },
+    }
+
+
+def test_self_alias_method_call_edge():
+    """`obj = self; obj.target()` must produce the C.caller -> C.target edge."""
+    body = "    def caller(self):\n        obj = self\n        return obj.target()\n"
+    builder = CallGraphBuilder(_alias_extractor_output(body))
+    builder.build_call_graph()
+    assert "m.py:C.target" in builder.call_graph["m.py:C.caller"], (
+        f"self-alias edge missing; got {builder.call_graph['m.py:C.caller']}"
+    )
+
+
+def test_cls_alias_method_call_edge():
+    """`alias = cls; alias.target()` in a classmethod must produce the edge."""
+    body = ("    @classmethod\n    def caller(cls):\n"
+            "        alias = cls\n        return alias.target()\n")
+    builder = CallGraphBuilder(_alias_extractor_output(body, decorator="@classmethod"))
+    builder.build_call_graph()
+    assert "m.py:C.target" in builder.call_graph["m.py:C.caller"], (
+        f"cls-alias edge missing; got {builder.call_graph['m.py:C.caller']}"
+    )
+
+
+def test_reassigned_alias_does_not_force_self_edge():
+    """Guard: a name reassigned away from self must NOT be treated as a self-alias
+    (single-unconditional binding only) — keeps the fix sound, no spurious edges."""
+    body = ("    def caller(self, other):\n        obj = self\n"
+            "        obj = other\n        return obj.target()\n")
+    builder = CallGraphBuilder(_alias_extractor_output(body))
+    builder.build_call_graph()
+    assert "m.py:C.target" not in builder.call_graph.get("m.py:C.caller", []), (
+        "reassigned alias wrongly resolved to a self-method edge"
+    )
