@@ -32,6 +32,7 @@ Output (JSON):
 """
 
 import json
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -131,6 +132,11 @@ class CallGraphBuilder:
         self.functions_by_name: Dict[str, List[str]] = {}
         self.functions_by_file: Dict[str, List[str]] = {}
         self.methods_by_class: Dict[str, List[str]] = {}
+        # Module-level functions, keyed by module_name. Ruby module functions
+        # carry module_name (class_name is None), so methods_by_class never
+        # indexed them and their Module.method / same-module sibling calls were
+        # unresolvable while a bare call to one could leak into an unrelated file.
+        self.methods_by_module: Dict[str, List[str]] = {}
 
         self._build_indexes()
 
@@ -159,6 +165,12 @@ class CallGraphBuilder:
                     self.methods_by_class[class_key] = []
                 self.methods_by_class[class_key].append(func_id)
 
+            module_name = func_data.get('module_name')
+            if module_name and not class_name:
+                if module_name not in self.methods_by_module:
+                    self.methods_by_module[module_name] = []
+                self.methods_by_module[module_name].append(func_id)
+
     def _is_builtin(self, name: str) -> bool:
         """Check if name is a Ruby builtin or common method."""
         return name in RUBY_BUILTINS
@@ -169,6 +181,8 @@ class CallGraphBuilder:
         caller_file = caller_id.split(':')[0]
         caller_func = self.functions.get(caller_id, {})
         caller_class = caller_func.get('class_name')
+        caller_module = caller_func.get('module_name')
+        caller_method = caller_func.get('name')
 
         code_bytes = code.encode('utf-8', errors='replace')
         try:
@@ -180,19 +194,34 @@ class CallGraphBuilder:
         while stack:
             node = stack.pop()
             if node.type == 'call':
-                resolved = self._resolve_call_node(node, code_bytes, caller_file, caller_class)
+                resolved = self._resolve_call_node(node, code_bytes, caller_file,
+                                                   caller_class, caller_module, caller_method)
                 if resolved:
                     calls.add(resolved)
+            elif node.type == 'super':
+                # A bare `super` is its own node (not a `call`); `super(args)` is a
+                # `call` whose first child is a `super` node, handled below.
+                if node.parent is None or node.parent.type != 'call':
+                    resolved = self._resolve_super_call(caller_file, caller_class, caller_method)
+                    if resolved:
+                        calls.add(resolved)
             stack.extend(reversed(node.children))
 
         return calls
 
     def _resolve_call_node(self, node, source: bytes, caller_file: str,
-                           caller_class: Optional[str]) -> Optional[str]:
+                           caller_class: Optional[str],
+                           caller_module: Optional[str] = None,
+                           caller_method: Optional[str] = None) -> Optional[str]:
         """Resolve a tree-sitter call node to a function ID."""
+        # `super(args)` is a call node whose head is a `super` node, not an
+        # identifier method name -- resolve it against the superclass.
+        if any(c.type == 'super' for c in node.children):
+            return self._resolve_super_call(caller_file, caller_class, caller_method)
         # Extract method name
         method_name = None
         receiver = None
+        args_node = None
 
         for child in node.children:
             if child.type == 'identifier' and method_name is None:
@@ -200,6 +229,8 @@ class CallGraphBuilder:
             elif child.type == '.':
                 continue
             elif child.type in ('argument_list', 'block', 'do_block'):
+                if child.type == 'argument_list' and args_node is None:
+                    args_node = child
                 continue
             elif method_name is None and child.type not in ('identifier',):
                 # This might be the receiver
@@ -210,59 +241,195 @@ class CallGraphBuilder:
         if not method_name:
             return None
 
+        # ClassName.new(...) -> the class's initialize. `new` is in RUBY_BUILTINS,
+        # so this must precede the builtin filter below or the edge is dropped.
+        if method_name == 'new' and receiver and receiver[0:1].isupper():
+            return self._resolve_class_call(receiver, 'initialize', caller_file)
+
+        # send/public_send/__send__ with a literal symbol/string argument: the
+        # dispatched method is the first literal arg. Runtime-string targets are
+        # not statically recoverable. These verbs are filtered as builtins below,
+        # so resolve the literal-symbol case before that filter.
+        if method_name in ('send', 'public_send', '__send__'):
+            target = self._literal_symbol_arg(args_node, source)
+            if target is None:
+                return None
+            if receiver == 'self' or receiver is None:
+                if caller_class:
+                    return self._resolve_self_call(target, caller_file, caller_class)
+                return self._resolve_simple_call(target, caller_file, caller_class, caller_module)
+            if receiver[0:1].isupper():
+                return self._resolve_class_call(receiver, target, caller_file)
+            return None
+
         if self._is_builtin(method_name):
             return None
 
         # self.method(...) - same class
         if receiver == 'self' and caller_class:
             return self._resolve_self_call(method_name, caller_file, caller_class)
+        # self.method(...) inside a module function (module_name, no class)
+        if receiver == 'self' and caller_module:
+            return self._resolve_module_call(caller_module, method_name, caller_file)
 
         # No receiver - simple function call
         if receiver is None:
-            return self._resolve_simple_call(method_name, caller_file, caller_class)
+            return self._resolve_simple_call(method_name, caller_file, caller_class, caller_module)
 
-        # Receiver is a constant (ClassName.method) - class method call
+        # Receiver is a constant (ClassName.method or ModuleName.method)
         if receiver and receiver[0:1].isupper():
             return self._resolve_class_call(receiver, method_name, caller_file)
 
         return None
 
+    @staticmethod
+    def _literal_symbol_arg(args_node, source: bytes) -> Optional[str]:
+        """Return the first literal symbol/string argument value, or None.
+
+        Handles ``:foo`` (simple_symbol) and ``"foo"``/``'foo'`` (string). A
+        non-literal first argument (variable, interpolation) has no static target.
+        """
+        if args_node is None:
+            return None
+        for child in args_node.children:
+            if child.type == 'simple_symbol':
+                text = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
+                return text[1:] if text.startswith(':') else text
+            if child.type == 'string':
+                for sc in child.children:
+                    if sc.type == 'string_content':
+                        return source[sc.start_byte:sc.end_byte].decode('utf-8', errors='replace')
+                return None
+            if child.type in ('(', ')', ','):
+                continue
+            # First non-literal positional argument: no static target.
+            return None
+        return None
+
+    def _resolve_super_call(self, caller_file: str, caller_class: Optional[str],
+                            caller_method: Optional[str]) -> Optional[str]:
+        """Resolve a `super` call to the same-named method in the superclass.
+
+        `super` re-dispatches the CURRENT method name (caller_method) up the
+        ancestor chain, so the target is the superclass's method of the same name.
+        """
+        if not caller_class or not caller_method:
+            return None
+        superclass = self._superclass_of(caller_file, caller_class)
+        if not superclass:
+            return None
+        if '::' in superclass:
+            superclass = superclass.rsplit('::', 1)[-1]
+        return self._resolve_class_call(superclass, caller_method, caller_file)
+
+    def _superclass_of(self, caller_file: str, caller_class: str) -> Optional[str]:
+        """Return the superclass of caller_class defined in caller_file, or None."""
+        class_data = self.classes.get(f"{caller_file}:{caller_class}")
+        if class_data:
+            return class_data.get('superclass')
+        for data in self.classes.values():
+            if data.get('name') == caller_class and data.get('file_path') == caller_file:
+                return data.get('superclass')
+        return None
+
     def _resolve_simple_call(self, func_name: str, caller_file: str,
-                             caller_class: Optional[str]) -> Optional[str]:
-        """Resolve a simple function call to a function ID."""
+                             caller_class: Optional[str],
+                             caller_module: Optional[str] = None) -> Optional[str]:
+        """Resolve a simple (no-receiver) function call to a function ID."""
         # 1. Check same class first (implicit self)
         if caller_class:
             result = self._resolve_self_call(func_name, caller_file, caller_class)
             if result:
                 return result
 
-        # 2. Check same file
+        # 1b. Inside a module function, a bare call resolves to a sibling of the
+        #     SAME module first (any file), before falling through to file/global
+        #     lookups. This is the same-module-sibling path.
+        if caller_module:
+            result = self._resolve_module_call(caller_module, func_name, caller_file)
+            if result:
+                return result
+
+        # 2. Check same file. A module function is only a valid same-file target
+        #    when the caller is in the same module (handled in 1b); a bare call
+        #    from outside any module must not bind to a same-file module fn, so
+        #    require both class_name and module_name to be unset here.
         same_file_funcs = self.functions_by_file.get(caller_file, [])
         for func_id in same_file_funcs:
             func_data = self.functions.get(func_id, {})
-            if func_data.get('name') == func_name and not func_data.get('class_name'):
+            if (func_data.get('name') == func_name
+                    and not func_data.get('class_name')
+                    and not func_data.get('module_name')):
                 return func_id
 
-        # 3. Check require-resolved files
+        # 3. Check require-resolved files (anchored).
         file_imports = self.imports.get(caller_file, {})
         for import_name, import_type in file_imports.items():
-            if import_type in ('require', 'require_relative'):
-                # Try matching import path to file
-                for file_path in self.functions_by_file:
-                    if file_path.endswith(f"{import_name}.rb") or import_name in file_path:
-                        file_funcs = self.functions_by_file[file_path]
-                        for func_id in file_funcs:
-                            func_data = self.functions.get(func_id, {})
-                            if func_data.get('name') == func_name:
-                                return func_id
+            if import_type not in ('require', 'require_relative'):
+                continue
+            target_file = self._resolve_import_file(import_name, import_type, caller_file)
+            if target_file is None:
+                continue
+            for func_id in self.functions_by_file.get(target_file, []):
+                func_data = self.functions.get(func_id, {})
+                if (func_data.get('name') == func_name
+                        and not func_data.get('class_name')
+                        and not func_data.get('module_name')):
+                    return func_id
 
-        # 4. Unique name match across files
+        # 4. Unique name match across files. Restrict to genuine top-level
+        #    functions (neither class- nor module-bound) so a module function
+        #    never leaks an edge to an unrelated bare call.
         candidates = self.functions_by_name.get(func_name, [])
-        candidates = [c for c in candidates if not self.functions.get(c, {}).get('class_name')]
+        candidates = [c for c in candidates
+                      if not self.functions.get(c, {}).get('class_name')
+                      and not self.functions.get(c, {}).get('module_name')]
         if len(candidates) == 1:
             return candidates[0]
 
         return None
+
+    def _resolve_import_file(self, import_name: str, import_type: str,
+                             caller_file: str) -> Optional[str]:
+        """Resolve a require / require_relative target to a known file path.
+
+        `require_relative` is anchored to the caller file's directory and
+        normalized (so `./helper` and `../lib/util` resolve correctly even when
+        the basename collides). `require` matches by anchored file name, never an
+        unanchored substring (which over-matched any path containing the string).
+        """
+        if import_type == 'require_relative':
+            base_dir = posixpath.dirname(caller_file)
+            anchored = posixpath.normpath(posixpath.join(base_dir, import_name))
+            target = anchored if anchored.endswith('.rb') else f"{anchored}.rb"
+            return target if target in self.functions_by_file else None
+
+        # `require 'name'` / `require 'path/name'`: match the file by its name
+        # component, anchored -- not a bare substring.
+        candidate = import_name if import_name.endswith('.rb') else f"{import_name}.rb"
+        if candidate in self.functions_by_file:
+            return candidate
+        base = candidate.rsplit('/', 1)[-1]
+        matches = [fp for fp in self.functions_by_file
+                   if fp == base or fp.endswith(f"/{base}")]
+        return matches[0] if len(matches) == 1 else None
+
+    def _resolve_module_call(self, module_name: str, method_name: str,
+                             caller_file: str) -> Optional[str]:
+        """Resolve a ModuleName.method() / same-module sibling call.
+
+        Prefers a same-file definition, then any file defining the module.
+        """
+        fallback = None
+        for func_id in self.methods_by_module.get(module_name, []):
+            func_data = self.functions.get(func_id, {})
+            if func_data.get('name') != method_name:
+                continue
+            if func_data.get('file_path') == caller_file:
+                return func_id
+            if fallback is None:
+                fallback = func_id
+        return fallback
 
     def _resolve_self_call(self, method_name: str, caller_file: str,
                            caller_class: str) -> Optional[str]:
@@ -279,7 +446,11 @@ class CallGraphBuilder:
 
     def _resolve_class_call(self, class_name: str, method_name: str,
                             caller_file: str) -> Optional[str]:
-        """Resolve a ClassName.method() call."""
+        """Resolve a ClassName.method() or ModuleName.method() call.
+
+        A constant receiver may name a class or a module; module functions are not
+        in methods_by_class, so fall back to the module index.
+        """
         # Check same file first
         class_key = f"{caller_file}:{class_name}"
         if class_key in self.methods_by_class:
@@ -296,7 +467,8 @@ class CallGraphBuilder:
                     if func_data.get('name') == method_name:
                         return func_id
 
-        return None
+        # The receiver may be a module (e.g. Utils.helper for a module_function).
+        return self._resolve_module_call(class_name, method_name, caller_file)
 
     def _extract_calls_regex(self, code: str, caller_id: str) -> Set[str]:
         """Fallback regex-based call extraction for unparseable code."""

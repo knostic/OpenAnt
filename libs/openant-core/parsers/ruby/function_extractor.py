@@ -366,7 +366,7 @@ class FunctionExtractor:
             self.stats['files_with_errors'] += 1
             return
 
-        relative_path = str(file_path.relative_to(self.repo_path))
+        relative_path = file_path.relative_to(self.repo_path).as_posix()  # posix-normalize keys for cross-platform call-graph resolution
 
         try:
             tree = self.parser.parse(source)
