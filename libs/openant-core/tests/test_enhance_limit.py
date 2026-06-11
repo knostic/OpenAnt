@@ -21,7 +21,7 @@ class _DummyEnhancer:
     def __init__(self, **kw):
         pass
 
-    def enhance_dataset(self, dataset, progress_callback=None, workers=8):
+    def enhance_dataset(self, dataset, progress_callback=None, workers=8, **kw):
         _received["units"] = len(dataset.get("units", []))
         return dataset
 
