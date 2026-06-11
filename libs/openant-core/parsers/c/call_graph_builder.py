@@ -159,7 +159,10 @@ class CallGraphBuilder:
             for inc in inc_list:
                 # Match included header to files in repo
                 for other_file in self.functions_by_file:
-                    if other_file.endswith(inc) or other_file.endswith('/' + inc):
+                    # Require a path-component boundary. A bare `endswith(inc)`
+                    # matched any tail (include "x.h" -> "src/prefix-x.h"), so only
+                    # an exact match or a '/'-delimited basename match is valid.
+                    if other_file == inc or other_file.endswith('/' + inc):
                         self.include_map[file_path].add(other_file)
 
     def _is_stdlib(self, name: str) -> bool:
@@ -199,8 +202,35 @@ class CallGraphBuilder:
                         resolved = self._resolve_call(call_name, caller_file)
                         if resolved:
                             calls.add(resolved)
+                # A function passed by name as an argument (e.g.
+                # qsort(..., my_cmp), pthread_create(..., worker, ...)) is invoked
+                # indirectly by the callee. Resolve bare-identifier arguments that
+                # name a known function; non-function identifiers (variables) do not
+                # resolve and so do not create edges.
+                calls.update(self._extract_callback_args(node, code_bytes, caller_file))
             stack.extend(reversed(node.children))
         return calls
+
+    def _extract_callback_args(self, call_node, source: bytes, caller_file: str) -> Set[str]:
+        """Resolve function-name arguments passed to a call (higher-order/callback)."""
+        found: Set[str] = set()
+        arg_list = call_node.child_by_field_name('arguments')
+        if arg_list is None:
+            return found
+        for arg in arg_list.children:
+            name: Optional[str] = None
+            if arg.type == 'identifier':
+                name = source[arg.start_byte:arg.end_byte].decode('utf-8', errors='replace')
+            elif arg.type in ('pointer_expression', 'unary_expression'):
+                # &handler -> handler
+                operand = arg.child_by_field_name('argument')
+                if operand is not None and operand.type == 'identifier':
+                    name = source[operand.start_byte:operand.end_byte].decode('utf-8', errors='replace')
+            if name and not self._is_stdlib(name):
+                resolved = self._resolve_call(name, caller_file)
+                if resolved:
+                    found.add(resolved)
+        return found
 
     def _extract_call_name(self, node, source: bytes) -> Optional[str]:
         """Extract the function name from a call_expression's function child."""
@@ -210,10 +240,12 @@ class CallGraphBuilder:
             return text
 
         if node.type == 'field_expression':
-            # obj->method or obj.method - extract the field name
-            field = node.child_by_field_name('field')
-            if field:
-                return source[field.start_byte:field.end_byte].decode('utf-8', errors='replace')
+            # obj->method() / obj.method() is a member or function-pointer
+            # call, not a free-function call. The resolver only does name-only lookup
+            # (no struct-member / receiver-type model), so binding the bare field name
+            # wired the call to any unrelated free function of the same name. Decline
+            # here instead of emitting that false edge.
+            return None
 
         if node.type == 'qualified_identifier':
             return text
@@ -228,6 +260,19 @@ class CallGraphBuilder:
             return None
 
         return text if text.isidentifier() else None
+
+    def _is_visible_from(self, func_id: str, caller_file: str) -> bool:
+        """Whether a candidate definition is linkable from caller_file.
+
+        A `static` function has internal linkage and is only callable
+        within its own translation unit, so a static definition in another file
+        must not resolve a call made elsewhere. Same-file definitions are always
+        visible; cross-file resolution requires external (non-static) linkage.
+        """
+        func_data = self.functions.get(func_id, {})
+        if func_data.get('file_path', '') == caller_file:
+            return True
+        return not func_data.get('is_static', False)
 
     def _resolve_call(self, call_name: str, caller_file: str) -> Optional[str]:
         """Resolve a function call name to a function ID."""
@@ -253,18 +298,25 @@ class CallGraphBuilder:
 
         # 2. Functions in included headers
         included_files = self.include_map.get(caller_file, set())
-        for inc_file in included_files:
+        # Iterate in sorted order so resolution is deterministic regardless of
+        # set-iteration order (PYTHONHASHSEED); stable lexicographic tiebreak on file path
+        # when same-basename headers in different dirs define the same function name.
+        for inc_file in sorted(included_files):
             file_funcs = self.functions_by_file.get(inc_file, [])
             for func_id in file_funcs:
                 func_data = self.functions.get(func_id, {})
                 fname = func_data.get('name', '')
                 base_name = fname.split('::')[-1] if '::' in fname else fname
-                if base_name == call_name:
+                # A static function in an included header has internal linkage
+                # and is not callable from the including file.
+                if base_name == call_name and self._is_visible_from(func_id, caller_file):
                     return func_id
 
         # 3. Unique name match across entire repo
         candidates = self.functions_by_name.get(call_name, [])
-        if len(candidates) == 1:
+        # Do not resolve a call to a file-local (static) definition in a
+        # different translation unit; the repo-wide fallback previously ignored linkage.
+        if len(candidates) == 1 and self._is_visible_from(candidates[0], caller_file):
             return candidates[0]
 
         # 4. If prototype exists, try to find the definition
@@ -275,16 +327,64 @@ class CallGraphBuilder:
                 func_data = self.functions.get(func_id, {})
                 fp = func_data.get('file_path', '')
                 ext = Path(fp).suffix.lower()
-                if ext in {'.c', '.cpp', '.cc', '.cxx'}:
+                if ext in {'.c', '.cpp', '.cc', '.cxx'} and self._is_visible_from(func_id, caller_file):
                     return func_id
 
         return None
+
+    @staticmethod
+    def _strip_comments_and_literals(code: str) -> str:
+        """Blank out C comments and string/char literals, preserving length and
+        newlines.
+
+        The regex fallback scanned raw code, so a call-shaped token inside
+        a // or /* */ comment or a "..." / '...' literal produced a phantom edge.
+        Replacing those regions with spaces (newlines kept) removes the false matches
+        without disturbing offsets.
+        """
+        out = []
+        i, n = 0, len(code)
+        while i < n:
+            c = code[i]
+            nxt = code[i + 1] if i + 1 < n else ''
+            if c == '/' and nxt == '/':
+                while i < n and code[i] != '\n':
+                    out.append(' ')
+                    i += 1
+            elif c == '/' and nxt == '*':
+                out.append('  ')
+                i += 2
+                while i < n and not (code[i] == '*' and i + 1 < n and code[i + 1] == '/'):
+                    out.append('\n' if code[i] == '\n' else ' ')
+                    i += 1
+                if i < n:
+                    out.append('  ')
+                    i += 2
+            elif c in ('"', "'"):
+                quote = c
+                out.append(' ')
+                i += 1
+                while i < n and code[i] != quote:
+                    if code[i] == '\\' and i + 1 < n:
+                        out.append('  ')
+                        i += 2
+                        continue
+                    out.append('\n' if code[i] == '\n' else ' ')
+                    i += 1
+                if i < n:
+                    out.append(' ')
+                    i += 1
+            else:
+                out.append(c)
+                i += 1
+        return ''.join(out)
 
     def _extract_calls_regex(self, code: str, caller_id: str) -> Set[str]:
         """Fallback regex-based call extraction."""
         calls = set()
         caller_file = caller_id.split(':')[0]
 
+        code = self._strip_comments_and_literals(code)
         pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
         for match in re.finditer(pattern, code):
             func_name = match.group(1)
