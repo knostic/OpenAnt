@@ -9,6 +9,20 @@ vulnerabilities from internal-only vulnerabilities.
 from typing import List, Optional
 
 
+# Input budget for the inlined unit code.
+# primary_code was previously inlined verbatim, so a large unit overflowed the
+# model context. ~4 chars/token, so this stays well under the model window.
+MAX_PRIMARY_CODE_CHARS = 60_000
+
+
+def _cap_primary_code(primary_code: str, limit: int = MAX_PRIMARY_CODE_CHARS) -> str:
+    """Cap inlined unit code so the prompt stays within the input budget."""
+    if len(primary_code) <= limit:
+        return primary_code
+    marker = "\n... (truncated)"
+    return primary_code[: limit - len(marker)] + marker
+
+
 SYSTEM_PROMPT = """You are a security code analyst. Your task is to classify code based on:
 
 1. Does it contain security flaws (dangerous operations)?
@@ -100,6 +114,9 @@ def get_user_prompt(
     """
     deps_str = ", ".join(static_deps[:10]) if static_deps else "None identified"
     callers_str = ", ".join(static_callers[:10]) if static_callers else "None identified"
+
+    # Cap the inlined code so a large unit cannot overflow the model context.
+    primary_code = _cap_primary_code(primary_code)
 
     # Build reachability section
     reachability_section = ""
