@@ -194,6 +194,19 @@ class FunctionExtractor:
         """Extract docstring from a function or class."""
         return ast.get_docstring(node)
 
+    def _path_has_segment(self, file_path: str, token: str) -> bool:
+        """True if `token` equals a whole path segment (a directory name or the filename stem),
+        case-insensitively -- used instead of a bare ``token in path`` substring test so that, for
+        example, 'views' classifies ``app/views.py`` and ``app/views/x.py`` but NOT ``interviews/a.py``
+        or ``app/previews/b.py``."""
+        p = Path(file_path)
+        try:
+            p = p.relative_to(self.repo_path)
+        except ValueError:
+            pass
+        segments = {s.lower() for s in p.with_suffix('').parts}
+        return token.lower() in segments
+
     def classify_function(self, func_name: str, decorators: List[str],
                           class_name: Optional[str], file_path: str) -> str:
         """Classify a function by its type/purpose."""
@@ -207,7 +220,7 @@ class FunctionExtractor:
             return 'route_handler'
 
         # Django views
-        if 'views' in path_lower and class_name is None:
+        if self._path_has_segment(file_path, 'views') and class_name is None:
             return 'view_function'
 
         # Class methods
@@ -225,10 +238,15 @@ class FunctionExtractor:
             return 'method'
 
         # Middleware/decorators
-        if 'middleware' in func_name.lower() or 'middleware' in path_lower:
+        if 'middleware' in func_name.lower() or self._path_has_segment(file_path, 'middleware'):
             return 'middleware'
 
-        # Test functions
+        # Test functions.
+        # 'test' is matched as a substring here on purpose: test-file conventions use plural/affixed
+        # forms ('tests/' dir, 'test_*'/'*_test' files) that a whole-segment match would miss. The
+        # substring over-match (e.g. 'latest'/'contest') is the is_test_file family handled in its own
+        # scheduled units -- 'test' is NOT an entry-point type, so unlike 'views' it seeds no false
+        # reachability and is intentionally left as a substring test in this fix.
         if func_name.startswith('test_') or 'test' in path_lower:
             return 'test'
 
@@ -261,9 +279,21 @@ class FunctionExtractor:
                     imports[name] = alias.name
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ''
+                level = node.level or 0
+                if level > 0:
+                    # Relative import: reconstruct the absolute package anchor from the importing
+                    # file's location so the dotted path resolves to a real module. file_path is
+                    # repo-relative (e.g. 'pkg/sub/mod.py'); its package is the directory parts.
+                    # level=1 -> the file's own package, level=2 -> the parent package, etc.
+                    pkg_parts = list(Path(file_path).parts[:-1])
+                    keep = max(0, len(pkg_parts) - (level - 1))
+                    anchor = pkg_parts[:keep]
+                    base_parts = anchor + ([module] if module else [])
+                else:
+                    base_parts = [module] if module else []
                 for alias in node.names:
                     name = alias.asname or alias.name
-                    full_path = f"{module}.{alias.name}" if module else alias.name
+                    full_path = '.'.join(base_parts + [alias.name]) if base_parts else alias.name
                     imports[name] = full_path
 
         return imports
@@ -552,9 +582,12 @@ class FunctionExtractor:
         else:
             # Scan all .py files
             for file_path in self.repo_path.rglob('*.py'):
-                # Skip common exclude patterns
-                path_str = str(file_path)
-                if any(excl in path_str for excl in ['__pycache__', '.git', 'venv', '.venv', 'node_modules']):
+                # Skip common excluded directories. Match whole path SEGMENTS (not a substring of the
+                # full path) so e.g. 'venv' excludes a real venv/ dir but not 'myvenv/keep.py', and an
+                # ancestor dir whose name contains a token cannot poison the whole scan. rglob yields
+                # paths under repo_path, so relative_to never raises.
+                excluded = {'__pycache__', '.git', 'venv', '.venv', 'node_modules'}
+                if excluded & set(file_path.relative_to(self.repo_path).parts):
                     continue
                 self.process_file(file_path)
 
