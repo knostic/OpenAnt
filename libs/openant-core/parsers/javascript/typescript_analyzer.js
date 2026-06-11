@@ -59,7 +59,12 @@ class TypeScriptAnalyzer {
     });
     this.functions = {}; // functionId -> function metadata
     this.classes = {};   // "filePath:className" -> { constructorDeps, fieldDeps, baseTypes }
-    this.callGraph = {}; // callerId -> array of call info
+    this.callGraph = {}; // callerId -> array of call info { resolved, name }
+    // Resolved bidirectional graph (snake_case, list-of-resolved-ids) matching
+    // the C/Python/Ruby sibling contract consumed by the Python pipeline.
+    this.resolvedCallGraph = {};  // callerId -> [resolvedCalleeId]
+    this.reverseCallGraph = {};   // calleeId -> [callerId]
+    this.indirectCalls = {};      // callerId -> [unresolved/dynamic call names]
   }
 
   /**
@@ -100,16 +105,24 @@ class TypeScriptAnalyzer {
   }
 
   /**
-   * Check if function has route handler signature (req, res) or (request, response)
+   * Check if a function's parameter shape matches a known web-framework route
+   * handler (Express / Koa / Fastify).
+   *
+   * The bare `(request, response)` pattern was removed: it is ambiguous and
+   * misfires on React components (`function MyComponent(request, response)`)
+   * which share those parameter names. Fastify's distinctive
+   * `(request, reply)` shape is added. The
+   * remaining patterns (`(req, res)`, Koa `(ctx)`, TS `: Request`/`: Response`
+   * type annotations) are framework-specific enough to be reliable.
    */
   _hasRouteHandlerSignature(code) {
-    // Match common Express handler patterns
     const handlerPatterns = [
-      /\(\s*req\s*,\s*res\s*[,\)]/, // (req, res) or (req, res, next)
-      /\(\s*request\s*,\s*response\s*[,\)]/, // (request, response)
+      /\(\s*req\s*,\s*res\s*[,\)]/, // Express (req, res) / (req, res, next)
+      /\(\s*request\s*,\s*reply\s*[,\)]/, // Fastify (request, reply)
       /\(\s*ctx\s*[,\)]/, // Koa style (ctx)
       /:\s*Request\s*,/, // TypeScript: Request type
       /:\s*Response\s*[,\)]/, // TypeScript: Response type
+      /:\s*FastifyRequest\b/, // TypeScript Fastify: FastifyRequest type
     ];
     return handlerPatterns.some((pattern) => pattern.test(code));
   }
@@ -162,10 +175,44 @@ class TypeScriptAnalyzer {
       this.buildCallGraphForFile(sourceFile);
     }
 
+    // Step 4: Backstop the Pattern-A companion invariant — every function in
+    // the inventory must have a callGraph key.
+    // The emit-time companions above cover the AST-walked paths; this fills any
+    // remaining function (e.g. re-export references) with an empty edge list so
+    // `len(callGraph) === len(functions)` always holds.
+    for (const functionId of Object.keys(this.functions)) {
+      if (!(functionId in this.callGraph)) {
+        this.callGraph[functionId] = [];
+      }
+    }
+
+    // Step 4.5: Stamp the snake_case schema-contract fields downstream Python
+    // consumers expect. EntryPointDetector keys off `unit_type`;
+    // without it no Express route is ever seen as an entry point and every
+    // reachable callee is filtered out. We keep the camelCase `unitType` too so
+    // the JS unit_generator continues to work.
+    for (const funcData of Object.values(this.functions)) {
+      if (funcData.unit_type === undefined) {
+        funcData.unit_type = funcData.unitType || "function";
+      }
+      if (funcData.parameters === undefined) {
+        funcData.parameters = [];
+      }
+    }
+
+    // Step 5: Build the resolved bidirectional graph + per-function metadata
+    // expected by downstream Python consumers (snake_case call_graph /
+    // reverse_call_graph of resolved ids, repository, per-fn parameters).
+    this._buildResolvedGraphs();
+
     return {
+      repository: this.repoPath,
       functions: this.functions,
       classes: this.classes,
       callGraph: this.callGraph,
+      call_graph: this.resolvedCallGraph,
+      reverse_call_graph: this.reverseCallGraph,
+      indirect_calls: this.indirectCalls,
     };
   }
 
@@ -194,18 +241,24 @@ class TypeScriptAnalyzer {
         unitType: this.classifyFunction(name, code, false, null),
         startLine: func.getStartLineNumber(),
         endLine: func.getEndLineNumber(),
+        parameters: this._extractParameters(func),
       };
     }
 
-    // Extract arrow functions assigned to variables/constants
+    // Extract arrow functions assigned to variables/constants.
+    // Also covers Higher-Order-Component wrappers whose initializer is a call
+    // expression containing an inline function — `const X = memo(() => {})`,
+    // `forwardRef((p, r) => {})`, `styled.div\`...\``.
     for (const statement of sourceFile.getVariableStatements()) {
       for (const declaration of statement.getDeclarations()) {
         const initializer = declaration.getInitializer();
-        if (
-          initializer &&
-          (initializer.getKindName() === "ArrowFunction" ||
-            initializer.getKindName() === "FunctionExpression")
-        ) {
+        if (!initializer) continue;
+        const initKind = initializer.getKindName();
+        const isDirectFunction =
+          initKind === "ArrowFunction" || initKind === "FunctionExpression";
+        const isHocWrapper =
+          !isDirectFunction && this._isFunctionProducingInitializer(initializer);
+        if (isDirectFunction || isHocWrapper) {
           const name = declaration.getName();
           const code = statement.getFullText();
           const functionId = `${relativePath}:${name}`;
@@ -218,6 +271,9 @@ class TypeScriptAnalyzer {
             unitType: this.classifyFunction(name, code, false, null),
             startLine: statement.getStartLineNumber(),
             endLine: statement.getEndLineNumber(),
+            parameters: isDirectFunction
+              ? this._extractParameters(initializer)
+              : [],
           };
         }
       }
@@ -227,7 +283,14 @@ class TypeScriptAnalyzer {
     for (const classDecl of sourceFile.getClasses()) {
       const className = classDecl.getName() || "AnonymousClass";
 
-      for (const method of classDecl.getMethods()) {
+      // getMethods() excludes get/set accessors, so iterate the
+      // accessor lists too. They share the member-naming contract (Class.name).
+      const classMembers = [
+        ...classDecl.getMethods(),
+        ...classDecl.getGetAccessors(),
+        ...classDecl.getSetAccessors(),
+      ];
+      for (const method of classMembers) {
         const methodName = method.getName();
         const code = method.getFullText();
         const functionId = `${relativePath}:${className}.${methodName}`;
@@ -240,6 +303,7 @@ class TypeScriptAnalyzer {
           startLine: method.getStartLineNumber(),
           endLine: method.getEndLineNumber(),
           className: className,
+          parameters: this._extractParameters(method),
         };
       }
 
@@ -340,11 +404,427 @@ class TypeScriptAnalyzer {
     // Extract anonymous callbacks used as Express route handlers / middleware
     // Pattern: app.get('/x', auth, async (req, res) => {...})
     this._extractExpressRouteCallbacks(sourceFile, relativePath);
+
+    // Extract methods from class *expressions* (module.exports = class {...},
+    // const X = class {...}) which getClasses() does not return.
+    this._extractClassExpressionMethods(sourceFile, relativePath);
+
+    // Extract anonymous `export default function(){...}`.
+    this._extractAnonymousDefaultExport(sourceFile, relativePath);
+
+    // Extract prototype / this-assignment / Object.assign / defineProperty
+    // method shapes that aren't class members or top-level functions.
+    this._extractAssignedMethods(sourceFile, relativePath);
+
+    // Extract a synthetic unit for files whose only meaningful content is a
+    // bare top-level side-effect call, e.g. preload scripts calling
+    // contextBridge.exposeInMainWorld({...}).
+    this._extractTopLevelSideEffects(sourceFile, relativePath);
   }
 
   /**
-   * Express HTTP verbs we recognise on a router/app object.
-   * `use` is included to pick up middleware-mount callbacks.
+   * True if `node` is a call/tagged-template whose argument list contains an
+   * inline function — the Higher-Order-Component pattern. Examples:
+   *   memo(() => {})            forwardRef((p, r) => {})
+   *   React.memo(function(){})  styled.div`...`
+   */
+  _isFunctionProducingInitializer(node) {
+    if (!node) return false;
+    const kind = node.getKindName();
+    if (kind === "CallExpression") {
+      const args = node.getArguments ? node.getArguments() : [];
+      return args.some((a) => {
+        const k = a.getKindName();
+        return k === "ArrowFunction" || k === "FunctionExpression";
+      });
+    }
+    if (kind === "TaggedTemplateExpression") {
+      // styled.div`...` / css`...` — component-producing template tags.
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * True if `node` is a re-export reference value, e.g. `require('./x').foo`
+   * or a bare identifier/property-access that names an exported symbol.
+   */
+  _isReexportInitializer(node) {
+    if (!node) return false;
+    const kind = node.getKindName();
+    if (kind === "PropertyAccessExpression") {
+      // require('./x').foo  or  mod.foo
+      return /require\s*\(|\./.test(node.getText());
+    }
+    return false;
+  }
+
+  /**
+   * Extract methods declared inside class *expressions* (not ClassDeclarations,
+   * which getClasses() already covers). Names the class from the binding it is
+   * assigned to where possible, else "AnonymousClass".
+   */
+  _extractClassExpressionMethods(sourceFile, relativePath) {
+    const classExprs = sourceFile.getDescendantsOfKind(
+      ts.SyntaxKind.ClassExpression,
+    );
+    for (const classExpr of classExprs) {
+      const className =
+        (classExpr.getName && classExpr.getName()) ||
+        this._inferAssignedName(classExpr) ||
+        "AnonymousClass";
+
+      const methods = classExpr.getMethods ? classExpr.getMethods() : [];
+      for (const method of methods) {
+        const methodName = method.getName();
+        const functionId = `${relativePath}:${className}.${methodName}`;
+        if (this.functions[functionId]) continue;
+        const code = method.getFullText();
+        this.functions[functionId] = {
+          name: `${className}.${methodName}`,
+          code: code,
+          isExported: false,
+          unitType: this.classifyFunction(methodName, code, true, className),
+          startLine: method.getStartLineNumber(),
+          endLine: method.getEndLineNumber(),
+          className: className,
+        };
+        this.callGraph[functionId] = this.extractCallsFromFunction(
+          method,
+          relativePath,
+        );
+      }
+    }
+  }
+
+  /**
+   * Infer the binding name a node is assigned to:
+   *   const X = <node>            -> "X"
+   *   module.exports = <node>     -> "exports"
+   */
+  _inferAssignedName(node) {
+    const parent = node.getParent && node.getParent();
+    if (!parent) return null;
+    const pk = parent.getKindName();
+    if (pk === "VariableDeclaration" && parent.getName) {
+      return parent.getName();
+    }
+    if (pk === "BinaryExpression" && parent.getLeft) {
+      const leftText = parent.getLeft().getText();
+      if (leftText === "module.exports" || leftText === "exports") {
+        return "exports";
+      }
+      return leftText;
+    }
+    return null;
+  }
+
+  /**
+   * Extract anonymous `export default function(){...}`.
+   *
+   * ts-morph parses `export default function(){}` as a *nameless* exported
+   * FunctionDeclaration (the named-declaration loop skips it via
+   * `if (!name) continue`), and parses `export default () => {}` as an
+   * ExportAssignment. Handle both.
+   */
+  _extractAnonymousDefaultExport(sourceFile, relativePath) {
+    const emit = (node, code, bodyNode) => {
+      const functionId = `${relativePath}:default`;
+      if (this.functions[functionId]) return;
+      this.functions[functionId] = {
+        name: "default",
+        code: code,
+        isExported: true,
+        unitType: this.classifyFunction("default", code, false, null),
+        startLine: node.getStartLineNumber(),
+        endLine: node.getEndLineNumber(),
+        exportType: "default",
+      };
+      this.callGraph[functionId] = this.extractCallsFromFunction(
+        bodyNode,
+        relativePath,
+      );
+    };
+
+    // Nameless default-exported function declaration.
+    for (const func of sourceFile.getFunctions()) {
+      if (func.getName()) continue;
+      if (func.isDefaultExport && func.isDefaultExport()) {
+        emit(func, func.getFullText(), func);
+      }
+    }
+
+    // `export default () => {}` / `export default function(){}` expressions.
+    for (const exportDecl of sourceFile.getExportAssignments()) {
+      if (exportDecl.isExportEquals && exportDecl.isExportEquals()) continue;
+      const expr = exportDecl.getExpression();
+      if (!expr) continue;
+      const k = expr.getKindName();
+      if (k === "ArrowFunction" || k === "FunctionExpression") {
+        emit(exportDecl, exportDecl.getFullText(), expr);
+      }
+    }
+  }
+
+  /**
+   * Extract function-valued assignments that aren't class members or named
+   * declarations:
+   *   Foo.prototype.bar = function(){}
+   *   function Ctor(){ this.method = fn; }
+   *   Object.assign(Foo.prototype, { m(){}, n: fn })
+   *   Object.defineProperty(X.prototype, "n", { value: fn })
+   *
+   * We walk every CallExpression / BinaryExpression descendant so the shape is
+   * found regardless of whether it lives at top level or inside a constructor
+   * function body.
+   */
+  _extractAssignedMethods(sourceFile, relativePath) {
+    // 1. Assignment expressions: X.prototype.m = fn  /  this.m = fn
+    for (const bin of sourceFile.getDescendantsOfKind(
+      ts.SyntaxKind.BinaryExpression,
+    )) {
+      if (bin.getOperatorToken().getText() !== "=") continue;
+      const left = bin.getLeft();
+      const right = bin.getRight();
+      if (!left || left.getKindName() !== "PropertyAccessExpression") continue;
+      const rk = right && right.getKindName();
+      if (rk !== "ArrowFunction" && rk !== "FunctionExpression") continue;
+
+      const qualified = this._qualifiedNameForAssignmentTarget(
+        left,
+        bin,
+        relativePath,
+      );
+      if (!qualified) continue;
+      this._emitAssignedFunction(qualified, right, relativePath);
+    }
+
+    // 2. Object.assign(<ClassOrProto>, { ... })  and
+    //    Object.defineProperty(<ClassOrProto>, "name", { value: fn })
+    for (const call of sourceFile.getDescendantsOfKind(
+      ts.SyntaxKind.CallExpression,
+    )) {
+      const callee = call.getExpression();
+      if (!callee || callee.getKindName() !== "PropertyAccessExpression") {
+        continue;
+      }
+      const objText =
+        callee.getExpression && callee.getExpression()
+          ? callee.getExpression().getText()
+          : null;
+      const member = callee.getName ? callee.getName() : null;
+      if (objText !== "Object") continue;
+      const args = call.getArguments();
+
+      if (member === "assign" && args.length >= 2) {
+        const target = this._receiverClassName(args[0]);
+        if (!target) continue;
+        const objLit = args[1];
+        if (objLit.getKindName() !== "ObjectLiteralExpression") continue;
+        for (const prop of objLit.getProperties()) {
+          const pk = prop.getKindName();
+          let propName = null;
+          let fnNode = null;
+          if (pk === "MethodDeclaration") {
+            propName = prop.getName();
+            fnNode = prop;
+          } else if (pk === "PropertyAssignment") {
+            propName = prop.getName();
+            const init = prop.getInitializer();
+            const ik = init && init.getKindName();
+            if (ik === "ArrowFunction" || ik === "FunctionExpression") {
+              fnNode = init;
+            }
+          }
+          if (propName && fnNode) {
+            this._emitAssignedFunction(
+              `${target}.${propName}`,
+              fnNode,
+              relativePath,
+            );
+          }
+        }
+      } else if (member === "defineProperty" && args.length >= 3) {
+        const target = this._receiverClassName(args[0]);
+        const nameArg = args[1];
+        const descriptor = args[2];
+        if (!target) continue;
+        if (
+          nameArg.getKindName() !== "StringLiteral" ||
+          descriptor.getKindName() !== "ObjectLiteralExpression"
+        ) {
+          continue;
+        }
+        const propName = nameArg.getLiteralValue
+          ? nameArg.getLiteralValue()
+          : nameArg.getText().slice(1, -1);
+        for (const prop of descriptor.getProperties()) {
+          if (prop.getKindName() !== "PropertyAssignment") continue;
+          const dName = prop.getName();
+          if (dName !== "value" && dName !== "get" && dName !== "set") continue;
+          const init = prop.getInitializer();
+          const ik = init && init.getKindName();
+          if (ik === "ArrowFunction" || ik === "FunctionExpression") {
+            this._emitAssignedFunction(
+              `${target}.${propName}`,
+              init,
+              relativePath,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Map an assignment target PropertyAccessExpression to a qualified
+   * "Class.member" name.
+   *   Foo.prototype.bar  -> "Foo.bar"
+   *   this.bar (in fn F)  -> "F.bar"
+   */
+  _qualifiedNameForAssignmentTarget(left, binExpr, relativePath) {
+    const member = left.getName ? left.getName() : null;
+    if (!member) return null;
+    const obj = left.getExpression ? left.getExpression() : null;
+    if (!obj) return null;
+    const objKind = obj.getKindName();
+
+    if (objKind === "PropertyAccessExpression") {
+      // Foo.prototype.bar  ->  obj is `Foo.prototype`
+      if (obj.getName && obj.getName() === "prototype") {
+        const cls = obj.getExpression ? obj.getExpression().getText() : null;
+        if (cls) return `${cls}.${member}`;
+      }
+      return null;
+    }
+
+    if (objKind === "ThisKeyword") {
+      // this.bar — name the enclosing function as the class.
+      const cls = this._enclosingFunctionName(binExpr);
+      if (cls) return `${cls}.${member}`;
+    }
+    return null;
+  }
+
+  /**
+   * The name of the nearest enclosing named function declaration (used to
+   * label `this.method = fn` assignments inside constructor functions).
+   */
+  _enclosingFunctionName(node) {
+    let cur = node.getParent && node.getParent();
+    while (cur) {
+      const k = cur.getKindName();
+      if (k === "FunctionDeclaration" && cur.getName && cur.getName()) {
+        return cur.getName();
+      }
+      cur = cur.getParent && cur.getParent();
+    }
+    return null;
+  }
+
+  /**
+   * Resolve a `Object.assign`/`Object.defineProperty` first argument to a class
+   * name. Accepts `Foo.prototype` -> "Foo" and bare `Foo` -> "Foo".
+   */
+  _receiverClassName(arg) {
+    if (!arg) return null;
+    const k = arg.getKindName();
+    if (k === "PropertyAccessExpression") {
+      if (arg.getName && arg.getName() === "prototype") {
+        return arg.getExpression ? arg.getExpression().getText() : null;
+      }
+      return null;
+    }
+    if (k === "Identifier") {
+      return arg.getText();
+    }
+    return null;
+  }
+
+  /**
+   * Emit a function entry for an assigned method shape, keyed
+   * "<relativePath>:<qualifiedName>".
+   */
+  _emitAssignedFunction(qualifiedName, fnNode, relativePath) {
+    const functionId = `${relativePath}:${qualifiedName}`;
+    if (this.functions[functionId]) return;
+    const code = fnNode.getFullText();
+    const methodName = qualifiedName.includes(".")
+      ? qualifiedName.split(".").pop()
+      : qualifiedName;
+    const className = qualifiedName.includes(".")
+      ? qualifiedName.slice(0, qualifiedName.lastIndexOf("."))
+      : null;
+    this.functions[functionId] = {
+      name: qualifiedName,
+      code: code,
+      isExported: false,
+      unitType: this.classifyFunction(methodName, code, className !== null, className),
+      startLine: fnNode.getStartLineNumber(),
+      endLine: fnNode.getEndLineNumber(),
+      className: className,
+    };
+    // Pattern-A companion: emit the callGraph entry alongside the function so
+    // `len(callGraph) === len(functions)` holds.
+    this.callGraph[functionId] = this.extractCallsFromFunction(
+      fnNode,
+      relativePath,
+    );
+  }
+
+  /**
+   * Emit a synthetic unit when a file's top-level statements are dominated by
+   * a bare side-effect call (e.g. an Electron preload script that only calls
+   * contextBridge.exposeInMainWorld({...})). Without this, such files yield
+   * zero units even though they carry analysable behaviour.
+   */
+  _extractTopLevelSideEffects(sourceFile, relativePath) {
+    // Only synthesise when the regular extractors produced nothing for this
+    // file — otherwise we'd duplicate real functions/methods.
+    const filePrefix = `${relativePath}:`;
+    const hasAny = Object.keys(this.functions).some((id) =>
+      id.startsWith(filePrefix),
+    );
+    if (hasAny) return;
+
+    for (const statement of sourceFile.getStatements()) {
+      if (statement.getKindName() !== "ExpressionStatement") continue;
+      const expr = statement.getExpression();
+      if (!expr || expr.getKindName() !== "CallExpression") continue;
+
+      const callee = expr.getExpression();
+      let label = "module";
+      if (callee && callee.getKindName() === "PropertyAccessExpression") {
+        const obj = callee.getExpression
+          ? callee.getExpression().getText()
+          : "";
+        const member = callee.getName ? callee.getName() : "";
+        label = member ? `${obj}.${member}` : obj || "module";
+      } else if (callee && callee.getKindName() === "Identifier") {
+        label = callee.getText();
+      }
+
+      const functionId = `${relativePath}:${label}`;
+      if (this.functions[functionId]) continue;
+      const code = statement.getFullText();
+      this.functions[functionId] = {
+        name: label,
+        code: code,
+        isExported: false,
+        unitType: "module_level",
+        startLine: statement.getStartLineNumber(),
+        endLine: statement.getEndLineNumber(),
+      };
+      // One synthetic unit per file is enough to make the file analysable.
+      return;
+    }
+  }
+
+  /**
+   * HTTP verbs we recognise on a router/app/server object. Shared by Express,
+   * Fastify and Koa router DSLs. `use` is included to pick
+   * up middleware-mount callbacks; `route` covers `app.route('/x', handler)`
+   * style registrations.
    */
   static EXPRESS_VERBS = new Set([
     "get",
@@ -355,6 +835,7 @@ class TypeScriptAnalyzer {
     "options",
     "head",
     "all",
+    "route",
     "use",
   ]);
 
@@ -386,13 +867,15 @@ class TypeScriptAnalyzer {
    * receivers so generic `.get(...)` calls on caches / clients / query-builders
    * aren't misread as routes.
    *
-   * Accepted stems: app, router, routes, server, web, api, endpoints, controller.
-   * Codebases using single-word identifiers outside this list (e.g. `http`) will
-   * not be extracted; add the stem here if needed.
+   * Accepted stems: app, router, routes, server, web, api, endpoints,
+   * controller, plus framework names fastify and koa so
+   * `fastify.get(...)` / `koa.get(...)` registrations are recognised alongside
+   * Express. Codebases using single-word identifiers outside this list (e.g.
+   * `http`) will not be extracted; add the stem here if needed.
    */
-  // Stems that strongly suggest an Express app/router object.
+  // Stems that strongly suggest an Express/Fastify/Koa app/router/server object.
   static EXPRESS_RECEIVER_STEMS =
-    "app|router|routes|server|web|api|endpoints|controller";
+    "app|router|routes|server|web|api|endpoints|controller|fastify|koa";
 
   _isPlausibleExpressReceiver(receiver) {
     if (!receiver) return false;
@@ -667,6 +1150,11 @@ class TypeScriptAnalyzer {
                   endLine: statement.getEndLineNumber(),
                   exportType: "commonjs",
                 };
+                // Pattern-A companion.
+                this.callGraph[functionId] = this.extractCallsFromFunction(
+                  right,
+                  relativePath,
+                );
               }
             }
           }
@@ -688,11 +1176,15 @@ class TypeScriptAnalyzer {
         kindName === "PropertyAssignment"
       ) {
         let name, code;
+        // The AST node whose body holds the function's call expressions, used
+        // to emit the Pattern-A callGraph companion. null for re-exports.
+        let bodyNode = null;
 
         if (kindName === "MethodDeclaration") {
           // Pattern: { methodName() { ... } }
           name = property.getName();
           code = property.getFullText();
+          bodyNode = property;
         } else if (kindName === "ShorthandPropertyAssignment") {
           // Pattern: { methodName } - references a variable defined elsewhere
           name = property.getName();
@@ -701,6 +1193,9 @@ class TypeScriptAnalyzer {
           continue;
         } else if (kindName === "PropertyAssignment") {
           // Pattern: { methodName: () => { ... } } or { methodName: function() { ... } }
+          // Also re-export barrels: { foo: require('./x').foo } — the value is
+          // a function reference, not an inline function. We surface
+          // the property so the re-exported symbol is visible downstream.
           name = property.getName();
           const initializer = property.getInitializer();
           if (
@@ -709,8 +1204,11 @@ class TypeScriptAnalyzer {
               initializer.getKindName() === "FunctionExpression")
           ) {
             code = property.getFullText();
+            bodyNode = initializer;
+          } else if (initializer && this._isReexportInitializer(initializer)) {
+            code = property.getFullText();
           } else {
-            continue; // Not a function
+            continue; // Not a function or re-export
           }
         }
 
@@ -727,6 +1225,14 @@ class TypeScriptAnalyzer {
               endLine: property.getEndLineNumber(),
               exportType: exportType,
             };
+            // Pattern-A companion. Re-export references have no
+            // inline body; the Step-4 backstop fills them with [].
+            if (bodyNode) {
+              this.callGraph[functionId] = this.extractCallsFromFunction(
+                bodyNode,
+                relativePath,
+              );
+            }
           }
         }
       }
@@ -778,7 +1284,14 @@ class TypeScriptAnalyzer {
     for (const classDecl of sourceFile.getClasses()) {
       const className = classDecl.getName() || "AnonymousClass";
 
-      for (const method of classDecl.getMethods()) {
+      // Mirror the inventory builder: include get/set accessors so
+      // every emitted function gets a callGraph companion (Pattern-A).
+      const classMembers = [
+        ...classDecl.getMethods(),
+        ...classDecl.getGetAccessors(),
+        ...classDecl.getSetAccessors(),
+      ];
+      for (const method of classMembers) {
         const methodName = method.getName();
         const callerId = `${relativePath}:${className}.${methodName}`;
         this.callGraph[callerId] = this.extractCallsFromFunction(
@@ -790,29 +1303,164 @@ class TypeScriptAnalyzer {
   }
 
   /**
-   * Extract function calls from within a function body
+   * Parameter names for a function-like node, used to populate the per-function
+   * `parameters` schema field. Returns [] when the node has no
+   * getParameters() accessor.
+   */
+  _extractParameters(node) {
+    if (!node || !node.getParameters) return [];
+    try {
+      return node.getParameters().map((p) => p.getName());
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Normalise a call-expression callee to a simple identifier name, matching
+   * the C parser's `_extract_call_name` contract:
+   *   plain(...)                 -> "plain"
+   *   obj.method(...)            -> "method"   (trailing member)
+   *   foo.bar().baz(...)         -> "baz"      (trailing member of the chain)
+   *   obj['m'](...)              -> null       (dynamic / element access)
+   *   (expr)(...)                -> null
+   * Returns null when no stable identifier name can be derived (the call is
+   * then treated as dynamic/indirect).
+   */
+  _normalizeCallName(calleeExpr) {
+    if (!calleeExpr) return null;
+    const kind = calleeExpr.getKindName();
+    if (kind === "Identifier") {
+      return calleeExpr.getText();
+    }
+    if (kind === "PropertyAccessExpression") {
+      // Trailing member name (e.g. `baz` from `foo.bar().baz`).
+      return calleeExpr.getName ? calleeExpr.getName() : null;
+    }
+    // ElementAccessExpression (obj['m']), ParenthesizedExpression, etc. have no
+    // stable identifier name — treat as dynamic.
+    return null;
+  }
+
+  /**
+   * Extract function calls from within a function body.
+   *
+   * Each entry is { resolved, name, dynamic }:
+   *  - `name` is the normalised callee identifier or null.
+   *  - `dynamic` is true when the callee has no stable identifier name
+   *    (element access, IIFE, etc.) — bucketed into indirect_calls.
+   * Identifier arguments passed to a call (callback arguments) are also
+   * recorded as edges so `addEventListener('click', handler)` / `setTimeout(cb)`
+   * / `arr.forEach(cb)` relationships are visible.
    */
   extractCallsFromFunction(funcNode, currentFile) {
     const calls = [];
-    const callExpressions = funcNode
-      .getDescendantsOfKind(funcNode.getKind())
-      .filter((n) => n.getKindName() === "CallExpression");
+    const seen = new Set();
+    const pushName = (name, dynamic) => {
+      const key = `${name} ${dynamic ? 1 : 0}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      calls.push({ resolved: false, name: name, dynamic: dynamic });
+    };
 
-    // This is simplified - a full implementation would:
-    // 1. Resolve import/require statements
-    // 2. Track variable assignments
-    // 3. Resolve member expressions (obj.method())
-    // 4. Handle dynamic calls
+    const callExpressions = funcNode.getDescendantsOfKind(
+      ts.SyntaxKind.CallExpression,
+    );
 
-    // For now, just track that calls exist without full resolution
     for (const callExpr of callExpressions) {
-      calls.push({
-        resolved: false,
-        name: callExpr.getExpression().getText(),
-      });
+      const callee = callExpr.getExpression();
+      const normalized = this._normalizeCallName(callee);
+      if (normalized) {
+        pushName(normalized, false);
+      } else {
+        // Dynamic / element-access callee — record the raw span trimmed to a
+        // single line so node names never become multiline blobs.
+        const raw = callee ? callee.getText().replace(/\s+/g, " ").trim() : "";
+        pushName(raw, true);
+      }
+
+      // Callback arguments: bare identifiers handed to the call become edges.
+      for (const arg of callExpr.getArguments()) {
+        if (arg.getKindName() === "Identifier") {
+          pushName(arg.getText(), false);
+        }
+      }
     }
 
     return calls;
+  }
+
+  /**
+   * Build the resolved bidirectional call graph and indirect-call buckets in
+   * the snake_case shape the Python pipeline consumes. Resolution is JS-native
+   * and conservative:
+   * same-file name match, else unique-name match across the repo — mirroring
+   * the contract the C/Ruby siblings satisfy, without lifting their code.
+   *
+   * Also stamps per-function `parameters` metadata so the schema contract is
+   * complete.
+   */
+  _buildResolvedGraphs() {
+    // Index functions by file and by simple name for resolution.
+    const byFile = Object.create(null);
+    const byName = Object.create(null);
+    for (const funcId of Object.keys(this.functions)) {
+      const file = funcId.slice(0, funcId.lastIndexOf(":"));
+      (byFile[file] = byFile[file] || []).push(funcId);
+      const simple = (this.functions[funcId].name || "").split(".").pop();
+      (byName[simple] = byName[simple] || []).push(funcId);
+    }
+
+    const resolveName = (name, callerFile) => {
+      // 1. Same-file simple-name match.
+      for (const funcId of byFile[callerFile] || []) {
+        const fname = this.functions[funcId].name || "";
+        if (fname === name || fname.endsWith("." + name)) return funcId;
+      }
+      // 2. Unique-name match across the repo.
+      const candidates = byName[name];
+      if (candidates && candidates.length === 1) return candidates[0];
+      return null;
+    };
+
+    for (const [callerId, edges] of Object.entries(this.callGraph)) {
+      const callerFile = callerId.slice(0, callerId.lastIndexOf(":"));
+      const resolvedTargets = [];
+      const indirect = [];
+
+      for (const edge of edges) {
+        const name = edge && edge.name;
+        if (!name) continue;
+        if (edge.dynamic) {
+          if (!indirect.includes(name)) indirect.push(name);
+          continue;
+        }
+        const target = resolveName(name, callerFile);
+        if (target && target !== callerId) {
+          if (!resolvedTargets.includes(target)) resolvedTargets.push(target);
+        } else if (!target) {
+          // Unresolvable static name — bucket as indirect so it isn't lost.
+          if (!indirect.includes(name)) indirect.push(name);
+        }
+      }
+
+      this.resolvedCallGraph[callerId] = resolvedTargets;
+      if (indirect.length > 0) this.indirectCalls[callerId] = indirect;
+
+      for (const target of resolvedTargets) {
+        (this.reverseCallGraph[target] = this.reverseCallGraph[target] || []);
+        if (!this.reverseCallGraph[target].includes(callerId)) {
+          this.reverseCallGraph[target].push(callerId);
+        }
+      }
+    }
+
+    // Ensure every function has a (possibly empty) resolved entry.
+    for (const funcId of Object.keys(this.functions)) {
+      if (!(funcId in this.resolvedCallGraph)) {
+        this.resolvedCallGraph[funcId] = [];
+      }
+    }
   }
 }
 
@@ -857,7 +1505,14 @@ function extractSingleFunction(filePath, functionRef) {
       for (const classDecl of sourceFile.getClasses()) {
         const classNameMatch = classDecl.getName();
         if (classNameMatch === className) {
-          for (const method of classDecl.getMethods()) {
+          // getMethods() excludes get/set accessors, so search the
+          // accessor lists too when resolving a single member by name.
+          const classMembers = [
+            ...classDecl.getMethods(),
+            ...classDecl.getGetAccessors(),
+            ...classDecl.getSetAccessors(),
+          ];
+          for (const method of classMembers) {
             if (method.getName() === functionName) {
               foundFunction = {
                 node: method,

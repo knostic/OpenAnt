@@ -877,8 +877,11 @@ class PipelineTest:
             # Build mapping of file -> [(start_line, end_line, func_id)]
             file_functions = {}
             for func_id, func_data in functions.items():
-                # Extract file path from func_id (format: "file/path.ts:functionName")
-                colon_idx = func_id.rfind(":")
+                # Extract file path from func_id (format: "file/path.ts:functionName").
+                # The separator is the FIRST colon: functionName may itself contain
+                # colons (e.g. "src/r.ts:express(GET:/items/:id)"). This matches the
+                # dependency_resolver contract (`funcId.split(':')[0]`).
+                colon_idx = func_id.find(":")
                 if colon_idx > 0:
                     file_path = func_id[:colon_idx]
                     start_line = func_data.get('startLine', 0)
