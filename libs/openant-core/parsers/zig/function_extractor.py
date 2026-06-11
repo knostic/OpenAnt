@@ -10,19 +10,37 @@ from typing import Dict, Any, Optional, List
 
 from utilities.file_io import write_json
 
-import tree_sitter_zig as ts_zig
 from tree_sitter import Language, Parser, Node
+
+
+def _load_zig_language() -> Language:
+    """Load the Zig tree-sitter grammar lazily.
+
+    The grammar package (``tree-sitter-zig``) is an optional runtime
+    dependency. Importing it at module top level made the entire Zig parser
+    unimportable in any environment where the package is absent (e.g. a clean
+    install that does not need Zig support). Resolving it here, on first use,
+    lets the module import unconditionally and surfaces a clear, actionable
+    error only when the Zig parser is actually exercised.
+    """
+    try:
+        import tree_sitter_zig as ts_zig
+    except ImportError as exc:  # pragma: no cover - exercised via the no-dep test
+        raise ImportError(
+            "The Zig parser requires the 'tree-sitter-zig' package, which is not "
+            "installed. Install it with `pip install tree-sitter-zig` "
+            "(declared in pyproject.toml / requirements.txt)."
+        ) from exc
+    return Language(ts_zig.language())
 
 
 class FunctionExtractor:
     """Extracts functions and structs from Zig source files using tree-sitter."""
 
-    ZIG_LANGUAGE = Language(ts_zig.language())
-
     def __init__(self, repo_path: str, scan_results: Dict[str, Any]):
         self.repo_path = Path(repo_path).resolve()
         self.scan_results = scan_results
-        self.parser = Parser(self.ZIG_LANGUAGE)
+        self.parser = Parser(_load_zig_language())
 
     def extract(self) -> Dict[str, Any]:
         """
@@ -95,58 +113,70 @@ class FunctionExtractor:
         imports: List[str],
         current_struct: Optional[str],
     ) -> None:
-        """Recursively walk the AST to extract definitions."""
+        """Recursively walk the AST to extract definitions.
 
-        if node.type == "function_declaration" or node.type == "FnProto":
+        Node-type names match the tree-sitter-zig grammar actually in use
+        (variable_declaration / struct_declaration / function_declaration /
+        builtin_function). Earlier names (VarDecl / container_decl / FnProto /
+        builtin_call_expr) were from a different grammar revision and never
+        matched, leaving struct extraction dead and methods mis-emitted.
+        """
+
+        # The struct context for any children we recurse into. It only changes
+        # when this node is itself a `const Name = struct {...}` declaration.
+        child_struct = current_struct
+
+        if node.type == "function_declaration":
             func_info = self._extract_function(node, source, file_path, current_struct)
             if func_info:
                 func_id = f"{file_path}:{func_info['qualified_name']}"
                 functions[func_id] = func_info
 
-        elif node.type == "VarDecl":
-            # Check if this is a struct/enum definition
+        elif node.type == "variable_declaration":
+            # `const Foo = struct { ... };` -- a named struct/enum definition.
             struct_info = self._extract_struct_from_var_decl(node, source, file_path)
             if struct_info:
                 struct_id = f"{file_path}:{struct_info['name']}"
                 structs[struct_id] = struct_info
-                # Extract methods within the struct
-                self._extract_struct_methods(
-                    node, source, file_path, struct_info["name"], functions
-                )
+                # Thread the struct name down into the body so its method
+                # function_declarations are emitted ONCE, qualified as
+                # Struct.method (a method visited via recursion produces the
+                # same func_id as the eager scan, so there is no bare duplicate).
+                child_struct = struct_info["name"]
 
-        elif node.type == "container_decl" or node.type == "ContainerDecl":
-            # Direct struct/enum declarations
-            struct_info = self._extract_container(node, source, file_path)
-            if struct_info:
-                struct_id = f"{file_path}:{struct_info['name']}"
-                structs[struct_id] = struct_info
-
-        elif node.type == "@import" or (
-            node.type == "builtin_call_expr"
-            and self._get_node_text(node, source).startswith("@import")
-        ):
+        elif node.type == "builtin_function" and self._get_node_text(
+            node, source
+        ).startswith("@import"):
             import_path = self._extract_import(node, source)
             if import_path:
                 imports.append(import_path)
 
-        # Recurse into children
+        # Recurse into children with the (possibly updated) struct context so
+        # nested function_declarations are qualified correctly. Struct FIELDS
+        # (`container_field`) are not function_declarations, so they are never
+        # emitted as units.
         for child in node.children:
             self._walk_node(
-                child, source, file_path, functions, structs, imports, current_struct
+                child, source, file_path, functions, structs, imports, child_struct
             )
 
     def _extract_function(
         self, node: Node, source: bytes, file_path: str, current_struct: Optional[str]
     ) -> Optional[Dict[str, Any]]:
         """Extract function information from a function declaration node."""
-        # Find function name
+        # Find function name. In the grammar a function_declaration is
+        # `[pub] fn <identifier> (params) [return-type] block`; the function
+        # name is the FIRST identifier. A return type can also be a bare
+        # identifier (e.g. `fn init(...) Point {`), so capture the name once
+        # and stop -- otherwise the return-type identifier overwrites it.
         name = None
         parameters = []
 
         for child in node.children:
             if child.type == "identifier" or child.type == "IDENTIFIER":
-                name = self._get_node_text(child, source)
-            elif child.type == "parameters" or child.type == "ParamDeclList":
+                if name is None:
+                    name = self._get_node_text(child, source)
+            elif child.type in ("parameters", "ParamDeclList"):
                 parameters = self._extract_parameters(child, source)
 
         if not name:
@@ -195,9 +225,10 @@ class FunctionExtractor:
         is_struct = False
 
         for child in node.children:
-            if child.type == "identifier" or child.type == "IDENTIFIER":
-                name = self._get_node_text(child, source)
-            elif child.type == "container_decl" or child.type == "ContainerDecl":
+            if child.type in ("identifier", "IDENTIFIER"):
+                if name is None:
+                    name = self._get_node_text(child, source)
+            elif child.type == "struct_declaration":
                 is_struct = True
 
         if name and is_struct:
@@ -209,38 +240,6 @@ class FunctionExtractor:
                 "code": self._get_node_text(node, source),
             }
         return None
-
-    def _extract_container(
-        self, node: Node, source: bytes, file_path: str
-    ) -> Optional[Dict[str, Any]]:
-        """Extract struct/enum from a container declaration."""
-        # Anonymous container - try to find name from parent
-        return None
-
-    def _extract_struct_methods(
-        self,
-        node: Node,
-        source: bytes,
-        file_path: str,
-        struct_name: str,
-        functions: Dict[str, Any],
-    ) -> None:
-        """Extract methods from within a struct definition."""
-        for child in node.children:
-            if child.type == "container_decl" or child.type == "ContainerDecl":
-                for member in child.children:
-                    if (
-                        member.type == "function_declaration"
-                        or member.type == "FnProto"
-                        or member.type == "container_field"
-                    ):
-                        # Check if it's a function field
-                        func_info = self._extract_function(
-                            member, source, file_path, struct_name
-                        )
-                        if func_info:
-                            func_id = f"{file_path}:{func_info['qualified_name']}"
-                            functions[func_id] = func_info
 
     def _extract_import(self, node: Node, source: bytes) -> Optional[str]:
         """Extract import path from an @import call."""
