@@ -236,8 +236,17 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
         
         return False
     
-    # String-based error checking
+    # String-based error checking.
+    # NOTE: the analyzer detection path (core/analyzer.py) stores the raw
+    # str(e) of an exception rather than a structured dict, so an Anthropic
+    # HTTP 529 surfaces here as e.g.
+    #   "Error code: 529 - {...'type':'overloaded_error'...}"
+    # 529 ("overloaded") is the most common transient Anthropic failure under
+    # load and is a 5xx, so it must be retried. The structured dict branch
+    # above already retries it via status_code >= 500; mirror that here so the
+    # string path is not silently non-retryable.
     error_str = str(error_info).lower()
     return any(term in error_str for term in (
-        "rate_limit", "connection", "timeout", "500", "502", "503", "504"
+        "rate_limit", "connection", "timeout",
+        "500", "502", "503", "504", "529", "overloaded",
     ))
