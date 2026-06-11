@@ -183,17 +183,45 @@ class CallGraphBuilder:
             # Fall back to regex-based extraction
             return self._extract_calls_regex(code, caller_id)
 
+        self_aliases = {'self', 'cls'} | self._collect_self_aliases(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
-                resolved = self._resolve_call_node(node, caller_file, caller_class)
+                resolved = self._resolve_call_node(node, caller_file, caller_class, self_aliases)
                 if resolved:
                     calls.add(resolved)
 
         return calls
 
-    def _resolve_call_node(self, node: ast.Call, caller_file: str, caller_class: Optional[str]) -> Optional[str]:
-        """Resolve an AST Call node to a function ID."""
+    def _collect_self_aliases(self, tree: ast.AST) -> Set[str]:
+        """Local names single-bound to ``self``/``cls`` (e.g. ``obj = self``).
+
+        Only single, unconditional bindings count: a name assigned more than
+        once — or ever rebound to something other than self/cls — is NOT an
+        alias, so no spurious self-method edge is created.
+        """
+        assign_count: dict = {}
+        self_bound: Set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        assign_count[tgt.id] = assign_count.get(tgt.id, 0) + 1
+                        if isinstance(node.value, ast.Name) and node.value.id in ('self', 'cls'):
+                            self_bound.add(tgt.id)
+        return {name for name in self_bound if assign_count.get(name) == 1}
+
+    def _resolve_call_node(self, node: ast.Call, caller_file: str, caller_class: Optional[str],
+                           self_aliases: Optional[Set[str]] = None) -> Optional[str]:
+        """Resolve an AST Call node to a function ID.
+
+        ``self_aliases`` is the set of receiver names that refer to the current
+        instance/class — always includes ``self``/``cls`` plus any local name
+        single-bound to them (``obj = self; obj.method()``). Defaults to the
+        bare ``{'self', 'cls'}`` so direct callers keep working.
+        """
         func = node.func
+        if self_aliases is None:
+            self_aliases = {'self', 'cls'}
 
         # Simple function call: func_name(...)
         if isinstance(func, ast.Name):
@@ -207,14 +235,9 @@ class CallGraphBuilder:
             method_name = func.attr
             obj = func.value
 
-            # self.method(...) - same class
-            if isinstance(obj, ast.Name) and obj.id == 'self':
-                if caller_class:
-                    return self._resolve_self_call(method_name, caller_file, caller_class)
-                return None
-
-            # cls.method(...) - classmethod
-            if isinstance(obj, ast.Name) and obj.id == 'cls':
+            # self.method(...) / cls.method(...) — same class, including a local
+            # alias single-bound to self/cls (obj = self; obj.method()).
+            if isinstance(obj, ast.Name) and obj.id in self_aliases:
                 if caller_class:
                     return self._resolve_self_call(method_name, caller_file, caller_class)
                 return None
