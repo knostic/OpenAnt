@@ -86,13 +86,7 @@ class RepositoryScanner:
 
         # Skip test files by default (can be overridden)
         self.skip_tests = options.get('skip_tests', False)
-        # Native Ruby test conventions (Minitest/RSpec). Directory names match
-        # whole path segments; filename rules are anchored to the basename so
-        # that ordinary sources like ``latest_release.rb``/``contest/foo.rb``
-        # are NOT misclassified as tests (an unanchored substring scan would).
-        self.test_dir_names = {'test', 'tests', 'spec'}
-        self.test_file_prefixes = ('test_',)
-        self.test_file_suffixes = ('_test.rb', '_spec.rb')
+        self.test_patterns = {'test_', '_test.rb', '_spec.rb', 'test/', 'tests/', 'spec/'}
 
         # Statistics
         self.stats = {
@@ -124,17 +118,23 @@ class RepositoryScanner:
     def is_test_file(self, relative_path: str) -> bool:
         """Check if a file is a test file.
 
-        Matches on path *components* and *anchored* filename rules rather than
-        unanchored substrings, so non-test files whose name merely contains a
-        token (``latest_release.rb``, ``contest/foo.rb``) are not skipped.
+        Anchored to path components / basename conventions so that real sources
+        whose name merely *contains* a test token as a substring (e.g.
+        ``latest_x.rb``, ``contest.rb``) are NOT skipped. A path is a test iff a
+        directory component is exactly a test dir (``test``/``tests``/``spec``)
+        OR the basename follows a test convention (``test_*``, ``*_test.rb``,
+        ``*_spec.rb``).
         """
-        p = Path(relative_path)
-        if any(part.lower() in self.test_dir_names for part in p.parts[:-1]):
+        path_lower = relative_path.lower().replace('\\', '/')
+        parts = path_lower.split('/')
+        # Directory-component match (exact, not substring).
+        for component in parts[:-1]:
+            if component in {'test', 'tests', 'spec'}:
+                return True
+        basename = parts[-1]
+        if basename.startswith('test_'):
             return True
-        name_lower = p.name.lower()
-        if name_lower.startswith(self.test_file_prefixes):
-            return True
-        if name_lower.endswith(self.test_file_suffixes):
+        if basename.endswith('_test.rb') or basename.endswith('_spec.rb'):
             return True
         return False
 

@@ -104,31 +104,27 @@ class RepositoryScanner:
     def is_test_file(self, relative_path: str) -> bool:
         """Check if a file is a test file.
 
-        Patterns are matched against path *segments* and filename boundaries,
-        not as bare substrings, so ordinary files whose name/path merely
-        contains a pattern (e.g. ``latest_value.c`` contains ``test_``;
-        ``contest/foo.c`` contains ``test/``) are not misclassified as tests.
+        Anchored to path components / basename conventions so that real sources
+        whose name merely *contains* a test token as a substring (e.g.
+        ``latest_dir/main.c``, ``contest/sol.c``, ``protest.c``) are NOT skipped.
+        A path is a test iff a directory component is exactly a test dir
+        (``test``/``tests``/``fuzz``) OR the basename follows a test convention
+        (``test_*``, ``*_test.<ext>`` for any C/C++ source extension).
         """
-        path_lower = relative_path.lower()
-        segments = path_lower.split('/')
-        basename = segments[-1]
-        dir_segments = segments[:-1]
-        for pattern in self.test_patterns:
-            if pattern.endswith('/'):
-                # directory pattern: match a whole path segment (test/, tests/, fuzz/)
-                if pattern[:-1] in dir_segments:
-                    return True
-            elif '.' in pattern:
-                # filename-suffix pattern (e.g. _test.c, _test.cpp): compare the stem
-                # before the extension, so _test.cc / _test.cxx (common C/C++ test
-                # extensions the old substring check also matched) stay detected —
-                # without re-introducing substring over-match. Bounded by is_source_file.
-                if basename.rsplit('.', 1)[0].endswith(pattern.rsplit('.', 1)[0]):
-                    return True
-            else:
-                # filename-prefix token (test_)
-                if basename.startswith(pattern):
-                    return True
+        path_lower = relative_path.lower().replace('\\', '/')
+        parts = path_lower.split('/')
+        # Directory-component match (exact, not substring).
+        for component in parts[:-1]:
+            if component in {'test', 'tests', 'fuzz'}:
+                return True
+        basename = parts[-1]
+        if basename.startswith('test_'):
+            return True
+        # Suffix match on the stem so _test.cc/_test.cxx stay detected alongside
+        # _test.c/_test.cpp, without re-introducing substring over-match.
+        # Bounded by is_source_file.
+        if '.' in basename and basename.rsplit('.', 1)[0].endswith('_test'):
+            return True
         return False
 
     def scan_directory(self, dir_path: Path, relative_path: str = '') -> None:

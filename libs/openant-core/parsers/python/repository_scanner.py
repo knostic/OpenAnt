@@ -100,14 +100,7 @@ class RepositoryScanner:
 
         # Skip test files by default (can be overridden)
         self.skip_tests = options.get('skip_tests', False)
-        # Native Python test conventions. Directory names are matched as whole
-        # path segments; filename rules are anchored to the basename so that
-        # ordinary sources like ``latest_release.py``/``contests/foo.py`` are
-        # NOT misclassified as tests (an unanchored substring scan would).
-        self.test_dir_names = {'test', 'tests'}
-        self.test_file_prefixes = ('test_',)
-        self.test_file_suffixes = ('_test.py',)
-        self.test_file_names = {'conftest.py'}
+        self.test_patterns = {'test_', '_test.py', 'tests/', '/test/', 'conftest.py'}
 
         # Statistics
         self.stats = {
@@ -142,20 +135,25 @@ class RepositoryScanner:
     def is_test_file(self, relative_path: str) -> bool:
         """Check if a file is a test file.
 
-        Matches on path *components* and *anchored* filename rules rather than
-        unanchored substrings, so non-test files whose name merely contains a
-        token (``latest_release.py``, ``contests/foo.py``) are not skipped.
+        Anchored to path components / basename conventions so that real sources
+        whose name merely *contains* a test token as a substring (e.g.
+        ``latest.py``, ``greatest_helper.py``) are NOT skipped. A path is a test
+        iff a directory component is exactly a test dir (``test``/``tests``) OR
+        the basename follows a test convention (``test_*``, ``*_test.py``,
+        ``conftest.py``).
         """
-        p = Path(relative_path)
-        # Any directory component named exactly test/tests (case-insensitive).
-        if any(part.lower() in self.test_dir_names for part in p.parts[:-1]):
+        path_lower = relative_path.lower().replace('\\', '/')
+        parts = path_lower.split('/')
+        # Directory-component match (exact, not substring).
+        for component in parts[:-1]:
+            if component in {'test', 'tests'}:
+                return True
+        basename = parts[-1]
+        if basename == 'conftest.py':
             return True
-        name_lower = p.name.lower()
-        if name_lower in self.test_file_names:
+        if basename.startswith('test_'):
             return True
-        if name_lower.startswith(self.test_file_prefixes):
-            return True
-        if name_lower.endswith(self.test_file_suffixes):
+        if basename.endswith('_test.py'):
             return True
         return False
 

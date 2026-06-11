@@ -82,17 +82,7 @@ class RepositoryScanner:
 
         # Skip test files by default (can be overridden)
         self.skip_tests = options.get('skip_tests', False)
-        # Native PHP test conventions (PHPUnit). Directory names match whole
-        # path segments; filename rules are anchored to the basename so that
-        # ordinary sources like ``Contest.php``/``latest_helper.php`` are NOT
-        # misclassified as tests (an unanchored substring scan would).
-        self.test_dir_names = {'test', 'tests', 'spec'}
-        # Case-insensitive basename rules.
-        self.test_file_prefixes = ('test_', 'phpunit')
-        self.test_file_suffixes = ('_test.php',)
-        # PSR PascalCase suffix matched on the original-case basename so that
-        # ``FooTest.php`` is a test while ``Contest.php`` is not.
-        self.test_file_pascal_suffix = 'Test.php'
+        self.test_patterns = {'test_', '_test.php', 'Test.php', 'test/', 'tests/', 'spec/', 'phpunit'}
 
         # Statistics
         self.stats = {
@@ -124,20 +114,27 @@ class RepositoryScanner:
     def is_test_file(self, relative_path: str) -> bool:
         """Check if a file is a test file.
 
-        Matches on path *components* and *anchored* filename rules rather than
-        unanchored substrings, so non-test files whose name merely contains a
-        token (``Contest.php``, ``latest_helper.php``) are not skipped.
+        Anchored to path components / basename conventions so that real sources
+        whose name merely *contains* a test token as a substring (e.g.
+        ``latest_controller.php``, ``protest_api.php``) are NOT skipped. A path
+        is a test iff a directory component is exactly a test dir
+        (``test``/``tests``/``spec``) OR the basename follows a test convention
+        (``test_*``, ``*_test.php``, ``*Test.php``, ``phpunit*``).
         """
-        p = Path(relative_path)
-        if any(part.lower() in self.test_dir_names for part in p.parts[:-1]):
+        normalized = relative_path.replace('\\', '/')
+        parts = normalized.split('/')
+        # Directory-component match (exact, not substring).
+        for component in parts[:-1]:
+            if component.lower() in {'test', 'tests', 'spec'}:
+                return True
+        basename = parts[-1]
+        basename_lower = basename.lower()
+        if basename_lower.startswith('test_') or basename_lower.startswith('phpunit'):
             return True
-        name = p.name
-        if name.endswith(self.test_file_pascal_suffix):
+        if basename_lower.endswith('_test.php'):
             return True
-        name_lower = name.lower()
-        if name_lower.startswith(self.test_file_prefixes):
-            return True
-        if name_lower.endswith(self.test_file_suffixes):
+        # PHPUnit class convention `<ClassName>Test.php` (CamelCase `Test` suffix).
+        if basename.endswith('Test.php'):
             return True
         return False
 
