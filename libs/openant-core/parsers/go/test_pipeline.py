@@ -93,6 +93,13 @@ class ProcessingLevel(Enum):
     EXPLOITABLE = "exploitable"    # Level 4: Filter to reachable + CodeQL-flagged + exploitable
 
 
+# CodeQL stage subprocess timeouts (seconds). DB `create` compiles the source -- the slower stage for
+# compiled languages -- so it must not get a smaller budget than `analyze`: a too-short create times out,
+# the stage degrades to reachable-only, and CodeQL security findings are silently lost.
+CODEQL_DB_CREATE_TIMEOUT_SECS = 1800
+CODEQL_ANALYZE_TIMEOUT_SECS = 1800
+
+
 class GoPipelineTest:
     def __init__(
         self,
@@ -517,7 +524,7 @@ class GoPipelineTest:
                 create_db_cmd,
                 capture_output=True,
                 text=True,
-                timeout=600  # 10 minute timeout
+                timeout=CODEQL_DB_CREATE_TIMEOUT_SECS
             )
 
             if result.returncode != 0:
@@ -548,7 +555,7 @@ class GoPipelineTest:
                 analyze_cmd,
                 capture_output=True,
                 text=True,
-                timeout=1800  # 30 minute timeout
+                timeout=CODEQL_ANALYZE_TIMEOUT_SECS
             )
 
             if result.returncode != 0:
