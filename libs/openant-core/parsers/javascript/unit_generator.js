@@ -49,6 +49,11 @@ const fs = require('fs');
 const path = require('path');
 const { DependencyResolver } = require('./dependency_resolver');
 
+// File boundary marker for enhanced code (module-level for parity with the
+// python/php/c/ruby parsers, so external consumers can import the canonical
+// marker instead of re-defining it and risking silent drift).
+const FILE_BOUNDARY = '\n\n// ========== File Boundary ==========\n\n';
+
 class UnitGenerator {
     constructor(repoPath, datasetName = null, options = {}) {
         this.repoPath = repoPath;
@@ -162,7 +167,6 @@ class UnitGenerator {
      * Matches DVNA enhanced dataset format expected by experiment.py
      */
     _assembleEnhancedCode(funcData, upstreamDependencies, downstreamCallers) {
-        const FILE_BOUNDARY = '\n\n// ========== File Boundary ==========\n\n';
         const parts = [];
         const includedCode = new Set();
 
@@ -485,4 +489,4 @@ if (require.main === module) {
     }
 }
 
-module.exports = { UnitGenerator };
+module.exports = { UnitGenerator, FILE_BOUNDARY };
