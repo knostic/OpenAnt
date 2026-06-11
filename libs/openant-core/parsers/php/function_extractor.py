@@ -246,6 +246,13 @@ class FunctionExtractor:
                     node, source, relative_path, class_name, namespace_name,
                     is_static=False
                 )
+                # Recurse into the body so nested closures/arrow functions are
+                # reached; named definitions cannot lexically nest other named
+                # functions/classes in PHP, so this only surfaces
+                # anonymous_function / arrow_function units.
+                for child in reversed(node.children):
+                    stack.append((child, class_name, namespace_name))
+                continue
 
             elif node.type == 'method_declaration':
                 is_static = self._is_static_method(node, source)
@@ -253,6 +260,24 @@ class FunctionExtractor:
                     node, source, relative_path, class_name, namespace_name,
                     is_static=is_static
                 )
+                for child in reversed(node.children):
+                    stack.append((child, class_name, namespace_name))
+                continue
+
+            elif node.type in ('anonymous_function', 'arrow_function'):
+                # Anonymous closures (`function ($x) {...}`) and arrow functions
+                # (`fn($z) => ...`) are unnamed; tree-sitter emits them as
+                # `anonymous_function` / `arrow_function`. Without this branch
+                # they fell through the catch-all else and were never modeled as
+                # units, so callback-heavy PHP was invisible.
+                self._process_closure_node(
+                    node, source, relative_path, class_name, namespace_name
+                )
+                # Still recurse so a closure declared inside another closure
+                # (or anything else nested in its body) is reached.
+                for child in reversed(node.children):
+                    stack.append((child, class_name, namespace_name))
+                continue
 
             elif node.type == 'class_declaration':
                 # Extract class name
@@ -470,6 +495,129 @@ class FunctionExtractor:
 
         self.stats['by_type'][unit_type] = self.stats['by_type'].get(unit_type, 0) + 1
 
+    def _process_closure_node(self, node, source: bytes, relative_path: str,
+                               class_name: Optional[str],
+                               namespace_name: Optional[str]) -> None:
+        """Process an anonymous_function or arrow_function node as a closure unit.
+
+        Closures are unnamed, so a synthetic name keyed on the source position
+        keeps the func_id unique within a file.
+        """
+        start_line = node.start_point[0] + 1  # tree-sitter is 0-indexed
+        end_line = node.end_point[0] + 1
+        start_col = node.start_point[1]
+
+        kind = 'arrow' if node.type == 'arrow_function' else 'closure'
+        name = f'{{{kind}@{start_line}:{start_col}}}'
+
+        code = self._node_text(node, source)
+        parameters = self._get_parameters(node, source)
+
+        # Qualify the synthetic name with the lexical owner so distinct closures
+        # in the same file do not collide.
+        if class_name:
+            qualified_name = f"{class_name}.{name}"
+        elif namespace_name:
+            qualified_name = f"{namespace_name}\\{name}"
+        else:
+            qualified_name = name
+
+        func_id = f"{relative_path}:{qualified_name}"
+
+        self.functions[func_id] = {
+            'name': name,
+            'qualified_name': qualified_name,
+            'file_path': relative_path,
+            'start_line': start_line,
+            'end_line': end_line,
+            'code': code,
+            'class_name': class_name,
+            'namespace_name': namespace_name,
+            'parameters': parameters,
+            'is_static': False,
+            'unit_type': 'closure',
+        }
+        self.stats['total_functions'] += 1
+        self.stats['standalone_functions'] += 1
+        self.stats['by_type']['closure'] = self.stats['by_type'].get('closure', 0) + 1
+
+    def _extract_module_level_unit(self, tree, source: bytes,
+                                    relative_path: str) -> None:
+        """Synthesise a `module_level` unit for top-level procedural statements.
+
+        PHP scripts (WordPress plugins, legacy procedural files) run top-to-bottom
+        and register hooks / read superglobals at file scope. The named-definition
+        walk in `_extract_functions_from_tree` never emits a unit for that
+        file-scope code, so it was invisible to reachability seeding. This
+        mirrors the Python parser's `extract_module_level_code`,
+        emitting a single synthetic `<file>:__module__` unit whose code is the
+        concatenation of the program-level statements that are not themselves
+        function/class/interface/trait/namespace declarations.
+        """
+        root = tree.root_node
+
+        # Named definitions (each already emitted as its own unit) and pure
+        # structural/import tokens are NOT executable top-level code.
+        skip_types = {
+            'function_definition', 'class_declaration', 'interface_declaration',
+            'trait_declaration', 'enum_declaration', 'namespace_use_declaration',
+            'use_declaration', 'php_tag', 'text_interpolation', 'text', ';',
+            'comment', 'declare_statement', '{', '}',
+        }
+
+        def program_statements(node):
+            """Yield file-scope statement nodes.
+
+            A braceless `namespace App;` is a self-contained node whose following
+            statements are program-level SIBLINGS (tree-sitter-php does not nest
+            them), so we simply skip the namespace token-node. A braced
+            `namespace App { ... }` wraps its statements in a body, so we descend
+            into that body.
+            """
+            for child in node.children:
+                if child.type == 'namespace_definition':
+                    body = child.child_by_field_name('body')
+                    if body is not None:
+                        yield from program_statements(body)
+                    # braceless: its real statements are program-level siblings,
+                    # reached later in this same loop; the namespace node itself
+                    # contributes no executable code.
+                    continue
+                if child.type in skip_types:
+                    continue
+                yield child
+
+        statements = list(program_statements(root))
+        if not statements:
+            return
+
+        code = '\n'.join(self._node_text(s, source) for s in statements).strip()
+        if not code:
+            return
+
+        start_line = statements[0].start_point[0] + 1
+        end_line = statements[-1].end_point[0] + 1
+
+        func_id = f"{relative_path}:__module__"
+        self.functions[func_id] = {
+            'name': '__module__',
+            'qualified_name': '__module__',
+            'file_path': relative_path,
+            'start_line': start_line,
+            'end_line': end_line,
+            'code': code,
+            'class_name': None,
+            'namespace_name': None,
+            'parameters': [],
+            'is_static': False,
+            'unit_type': 'module_level',
+            'is_module_level': True,
+        }
+        self.stats['total_functions'] += 1
+        self.stats['standalone_functions'] += 1
+        self.stats['by_type']['module_level'] = \
+            self.stats['by_type'].get('module_level', 0) + 1
+
     def process_file(self, file_path: Path) -> None:
         """Process a single PHP file."""
         source = self.read_file(file_path)
@@ -494,6 +642,9 @@ class FunctionExtractor:
         # Extract functions
         self._extract_functions_from_tree(tree, source, file_path, relative_path)
 
+        # Synthesise a module_level unit for any top-level procedural statements
+        self._extract_module_level_unit(tree, source, relative_path)
+
     def extract_from_scan(self, scan_result: Dict) -> Dict:
         """Extract functions from files listed in a scan result."""
         for file_info in scan_result.get('files', []):
@@ -512,8 +663,11 @@ class FunctionExtractor:
         else:
             for ext in ('.php', '.phtml'):
                 for file_path in self.repo_path.rglob(f'*{ext}'):
-                    path_str = str(file_path)
-                    if any(excl in path_str for excl in ['.git', 'vendor', 'node_modules', 'tmp', '.cache']):
+                    # Exclude vendored/transient dirs by path COMPONENT relative to the repo, not by
+                    # absolute-path substring -- an ancestor dir (e.g. a /tmp working dir, as on Linux CI)
+                    # or a name like 'template' must not exclude the repo's own files.
+                    rel_parts = file_path.relative_to(self.repo_path).parts
+                    if any(excl in rel_parts for excl in ('.git', 'vendor', 'node_modules', 'tmp', '.cache')):
                         continue
                     self.process_file(file_path)
 

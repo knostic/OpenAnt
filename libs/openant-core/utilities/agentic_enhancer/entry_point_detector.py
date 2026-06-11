@@ -114,6 +114,12 @@ USER_INPUT_PATTERNS = [
     # WebSocket message handlers
     r'on_message|onmessage|message\.data',
     r'websocket\.receive',
+    # PHP superglobals (request/server/file/cookie input)
+    r'\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES|ENV|SESSION)\b',
+    r'\$HTTP_RAW_POST_DATA\b',
+    r'php://input',
+    r'\bfile_get_contents\s*\(\s*["\']php://input',
+    r'\bfilter_input\s*\(',
 ]
 
 # Patterns that indicate module-level scripts with user input
@@ -122,6 +128,14 @@ MODULE_LEVEL_INPUT_PATTERNS = [
     r'sys\.argv',
     r'\binput\s*\(',
     r'argparse\.',
+    # PHP file-scope scripts: superglobal reads and WordPress hook dispatch
+    # (procedural plugins/themes register handlers at the top level).
+    r'\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES|ENV|SESSION)\b',
+    r'php://input',
+    r'\badd_action\s*\(',
+    r'\badd_filter\s*\(',
+    r'\bdo_action\s*\(',
+    r'\bapply_filters\s*\(',
 ]
 
 
