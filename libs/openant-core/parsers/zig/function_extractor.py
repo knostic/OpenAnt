@@ -228,7 +228,8 @@ class FunctionExtractor:
             if child.type in ("identifier", "IDENTIFIER"):
                 if name is None:
                     name = self._get_node_text(child, source)
-            elif child.type == "struct_declaration":
+            elif child.type in ("struct_declaration", "enum_declaration",
+                                "union_declaration", "opaque_declaration"):
                 is_struct = True
 
         if name and is_struct:
@@ -260,8 +261,11 @@ class FunctionExtractor:
         """Classify the function type based on name and context."""
         name_lower = name.lower()
 
-        # Test functions
-        if name_lower.startswith("test") or "_test" in name_lower:
+        # Test functions. Anchor on the underscore-delimited test convention
+        # (`test_foo`, `foo_test`, or a bare `test`). A camelCase identifier
+        # that merely starts with "test" (e.g. `testConnection`) is an ordinary
+        # function, not a zig `test "..." {}` block.
+        if name_lower == "test" or name_lower.startswith("test_") or name_lower.endswith("_test"):
             return "test"
 
         # Init/constructor patterns
