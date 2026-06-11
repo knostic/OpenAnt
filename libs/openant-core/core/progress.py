@@ -85,7 +85,9 @@ class ProgressReporter:
         if self.completed == 0:
             return "~?"
         avg = elapsed / self.completed
-        remaining_units = self.total - self.completed
+        # Floor at 0: retries can double-count `completed` past `total`, which would otherwise
+        # make remaining_units negative and render the ETA as a negative duration.
+        remaining_units = max(0, self.total - self.completed)
         remaining_secs = avg * remaining_units
         return f"~{_fmt_duration(remaining_secs)}"
 
