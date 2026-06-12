@@ -426,13 +426,6 @@ class CallGraphBuilder:
         # ClassName::method()
         return self._resolve_class_call(scope, method_name, caller_file)
 
-    def _superclass_of(self, caller_file: str, caller_class: str) -> Optional[str]:
-        """Return the superclass (extends) name of caller_class defined in caller_file, or None."""
-        for class_data in self.classes.values():
-            if class_data.get('name') == caller_class and class_data.get('file_path') == caller_file:
-                return class_data.get('superclass')
-        return None
-
     def _resolve_simple_call(self, func_name: str, caller_file: str,
                              caller_class: Optional[str],
                              caller_namespace: Optional[str] = None) -> Optional[str]:
