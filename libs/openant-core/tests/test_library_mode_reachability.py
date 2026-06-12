@@ -5,11 +5,17 @@ finds nothing and `apply_reachability_filter` drops EVERY unit — the library
 (including any vulnerable sink it contains) is never analysed. Library-mode seeds
 the public API surface so the forward BFS pulls in the rest.
 
-These tests pin: (1) the blackout when the mode is OFF, (2) the public API becomes
+These tests pin: (1) the mode-OFF baseline, (2) the public API becomes
 reachable when ON (and its private callee comes along via the call edge), (3) a
 truly-unreferenced private function stays out, and — adversarially — (4) turning
 the mode ON for an APP can only ADD reachable units, never remove one (union-only
 seed merge), so existing app scans are never degraded.
+
+NOTE: stacked on PR #75. On master a no-entry-point library blacks out (0 units),
+which is the bug this PR fixes. PR #75's zero-seed fallback already prevents that
+blackout — bluntly — by returning ALL units unfiltered when no entry point is
+detected. So the mode-OFF baseline here is "all units unfiltered" (#75), and
+library-mode ON refines it to the precise public-API-reachable subset.
 """
 
 import json
@@ -46,10 +52,12 @@ _LIB_FNS = ["lib.py:public_api", "lib.py:_sink"]
 _LIB_CG = {"lib.py:public_api": ["lib.py:_sink"]}
 
 
-def test_library_blackout_when_mode_off(tmp_path):
-    """Default (mode off): a pure library is entirely filtered out — the bug."""
+def test_library_mode_off_returns_all_unfiltered(tmp_path):
+    """Mode off (stacked on #75): a no-entry-point library is NOT blacked out —
+    #75's zero-seed fallback returns all units unfiltered. Library-mode ON refines
+    this to the public-API-reachable subset (see precision test below)."""
     kept = _run(tmp_path, _LIB_FNS, _LIB_CG, library_mode=False)
-    assert kept == set(), f"expected blackout (0 reachable) with mode off, got {kept}"
+    assert kept == set(_LIB_FNS), f"expected #75 all-unfiltered fallback, got {kept}"
 
 
 def test_library_public_api_reachable_when_mode_on(tmp_path):
@@ -105,7 +113,10 @@ def test_parse_repository_wiring(tmp_path):
         ds = _json.loads((out / "dataset.json").read_text())
         return {u.get("id") for u in ds.get("units", [])}
 
-    assert _kept(False) == set(), "library should black out with mode off"
+    # Stacked on #75: mode off returns all units unfiltered (zero-seed fallback),
+    # not a blackout. Mode on refines to the public-API-reachable subset.
+    assert _kept(False) == {"lib.py:public_api", "lib.py:_sink"}, \
+        "mode off: expected #75 all-unfiltered fallback"
     on = _kept(True)
     assert any(i.endswith(":public_api") for i in on), f"public api not analysed: {on}"
     assert any(i.endswith(":_sink") for i in on), f"eval sink not analysed: {on}"
