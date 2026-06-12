@@ -48,7 +48,7 @@ from typing import Set
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from utilities.file_io import open_utf8, read_json, run_utf8, write_json
 from utilities.context_enhancer import ContextEnhancer
-from utilities.agentic_enhancer import EntryPointDetector, ReachabilityAnalyzer
+from utilities.agentic_enhancer import EntryPointDetector, ReachabilityAnalyzer, blackout_warning
 
 # Local imports
 from repository_scanner import RepositoryScanner
@@ -313,6 +313,13 @@ class RubyPipelineTest:
                 "filtered_out": original_count - len(filtered_units),
                 "reduction_percentage": round((1 - len(filtered_units) / original_count) * 100, 1) if original_count > 0 else 0
             }
+
+            _blackout = blackout_warning(detector.entry_point_details, original_count,
+                                         len(filtered_units),
+                                         library_mode=getattr(self, "library_mode", False))
+            if _blackout:
+                dataset["metadata"]["reachability_filter"]["warning"] = _blackout
+                print(f"  [Warning] {_blackout}", file=sys.stderr)
 
             write_json(self.dataset_file, dataset)
 

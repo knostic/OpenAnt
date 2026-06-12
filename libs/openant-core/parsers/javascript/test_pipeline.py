@@ -78,7 +78,7 @@ SYM_ARROW = "→" if _UNICODE_OK else "->"
 # Add parent directory to path for utilities import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from utilities.context_enhancer import ContextEnhancer
-from utilities.agentic_enhancer import EntryPointDetector, ReachabilityAnalyzer
+from utilities.agentic_enhancer import EntryPointDetector, ReachabilityAnalyzer, blackout_warning
 
 
 class ProcessingLevel(Enum):
@@ -658,6 +658,13 @@ class PipelineTest:
                 "filtered_out": original_count - len(filtered_units),
                 "reduction_percentage": round((1 - len(filtered_units) / original_count) * 100, 1) if original_count > 0 else 0
             }
+
+            _blackout = blackout_warning(detector.entry_point_details, original_count,
+                                         len(filtered_units),
+                                         library_mode=getattr(self, "library_mode", False))
+            if _blackout:
+                dataset["metadata"]["reachability_filter"]["warning"] = _blackout
+                print(f"  [Warning] {_blackout}", file=sys.stderr)
 
             # Write filtered dataset
             write_json(self.dataset_file, dataset)

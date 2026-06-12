@@ -201,7 +201,7 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str) -> dict:
     --processing-level reachable.
     """
     try:
-        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector
+        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector, blackout_warning
         from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
     except ImportError:
         print(
@@ -246,6 +246,11 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str) -> dict:
         for k, vs in reverse_call_graph.items()
         if k in reachable
     }
+
+    _blackout = blackout_warning(detector.entry_point_details, len(functions),
+                                 len(filtered_functions))
+    if _blackout:
+        print(f"  [Warning] {_blackout}", file=sys.stderr)
 
     return result
 

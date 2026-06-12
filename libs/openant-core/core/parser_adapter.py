@@ -254,6 +254,7 @@ def apply_reachability_filter(
     _epd = _load_module("entry_point_detector", "entry_point_detector.py")
     _ra = _load_module("reachability_analyzer", "reachability_analyzer.py")
     EntryPointDetector = _epd.EntryPointDetector
+    blackout_warning = _epd.blackout_warning
     ReachabilityAnalyzer = _ra.ReachabilityAnalyzer
 
     call_graph_path = os.path.join(output_dir, "call_graph.json")
@@ -348,6 +349,12 @@ def apply_reachability_filter(
         f"({reduction_pct}% reduction)",
         file=sys.stderr,
     )
+
+    _blackout = blackout_warning(detector.entry_point_details, original_count,
+                                 len(filtered_units), library_mode=library_mode)
+    if _blackout:
+        dataset["metadata"]["reachability_filter"]["warning"] = _blackout
+        print(f"  [Warning] {_blackout}", file=sys.stderr)
 
     # Warn about unimplemented higher-level filters
     if processing_level == "codeql":
