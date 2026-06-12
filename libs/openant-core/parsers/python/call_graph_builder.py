@@ -631,11 +631,27 @@ class CallGraphBuilder:
         for func_id in self.functions:
             func_data = self.functions[func_id]
             if func_data.get('name') == func_name:
-                # Check if file path matches module path
+                # Check if file path matches module path, by dotted COMPONENTS in EITHER
+                # direction:
+                #   - imported module is a component-suffix of the file path — a repo-root
+                #     prefix on the file (e.g. `src/pkg/auth.py` for `from pkg.auth ...`); OR
+                #   - the file path is a component-suffix of the imported module — the
+                #     repo-IS-the-package self-import (e.g. `auth.py` == `myapp/auth.py`
+                #     recorded shallow via relative_to(repo_path), for `from myapp.auth ...`).
+                # Both are real layouts, so both are kept (recall). The OLD bare `endswith`
+                # ALSO matched ACROSS component boundaries — `'extra_utils'.endswith('utils')`
+                # bound `from utils import helper` to `extra_utils.py`. No module layout
+                # produces that, so those substring-crossing matches are the ONLY edges
+                # dropped. `not em` keeps the prior name-only behavior for relative/bare
+                # imports (`from . import foo`).
                 file_path = func_data.get('file_path', '')
                 module_path = file_path.replace('/', '.').replace('.py', '')
                 expected_module = '.'.join(parts[:-1])
-                if module_path.endswith(expected_module) or expected_module.endswith(module_path):
+                mp = module_path.split('.')
+                em = expected_module.split('.') if expected_module else []
+                if (not em
+                        or (len(em) <= len(mp) and mp[-len(em):] == em)
+                        or (len(mp) <= len(em) and em[-len(mp):] == mp)):
                     return func_id
 
         return None
