@@ -79,6 +79,7 @@ def parse_repository(
     skip_tests: bool = True,
     name: str = None,
     diff_manifest: str | None = None,
+    library_mode: bool = False,
 ) -> ParseResult:
     """Parse a repository into an OpenAnt dataset.
 
@@ -111,7 +112,7 @@ def parse_repository(
 
     # Dispatch to the right parser
     if language == "python":
-        result = _parse_python(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_python(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
     elif language == "javascript":
         result = _parse_javascript(repo_path, output_dir, processing_level, skip_tests, name)
     elif language == "go":
@@ -191,11 +192,34 @@ def _maybe_apply_diff_filter(
 # Reachability filter (shared by Python path; JS/Go handle it internally)
 # ---------------------------------------------------------------------------
 
+def _library_seed_ids(functions: dict) -> "set[str]":
+    """Public-API seed set for library-mode reachability.
+
+    A pure library exposes no main/route/CLI entry point, so the structural
+    detector finds nothing and the whole library is filtered out (0 reachable).
+    In library-mode the *public surface* IS the entry surface: seed every
+    exported/public function and let the forward BFS pull in its callees.
+
+    Public = exported AND not name-private. ``is_exported`` is honoured when the
+    parser provides it (C/Go/JS — excludes ``static``/unexported); for parsers
+    without the field (python/ruby/php) it defaults True and the name heuristic
+    (leading underscore = private) decides. The bias is intentionally toward
+    over-seeding (more reachable = more analysed), never under-seeding.
+    """
+    seeds: set[str] = set()
+    for func_id, fd in functions.items():
+        name = (fd.get("name") or func_id.rsplit(":", 1)[-1]).split(".")[-1]
+        if fd.get("is_exported", True) and not name.startswith("_"):
+            seeds.add(func_id)
+    return seeds
+
+
 def apply_reachability_filter(
     dataset: dict,
     output_dir: str,
     processing_level: str,
     extra_entry_points: "set[str] | None" = None,
+    library_mode: bool = False,
 ) -> dict:
     """Filter dataset units to only those reachable from entry points.
 
@@ -261,6 +285,11 @@ def apply_reachability_filter(
     entry_points = detector.detect_entry_points()
     if extra_entry_points:
         entry_points = entry_points | extra_entry_points
+    # Library-mode (opt-in): the public API is the entry surface. Union-only —
+    # never demotes a structurally-detected app entry point, so an app scan with
+    # the flag on can only gain reachable units, never lose one.
+    if library_mode:
+        entry_points = entry_points | _library_seed_ids(functions)
 
     # Compute reachable set (BFS forward from entry points)
     reachability = ReachabilityAnalyzer(
@@ -332,7 +361,7 @@ _apply_reachability_filter = apply_reachability_filter
 # Python parser
 # ---------------------------------------------------------------------------
 
-def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None) -> ParseResult:
+def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
     """Invoke the Python parser.
 
     The Python parser has a clean `parse_repository()` function that we can
@@ -360,7 +389,8 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
 
     # Apply reachability filter if processing_level requires it
     if processing_level != "all":
-        dataset = _apply_reachability_filter(dataset, output_dir, processing_level)
+        dataset = _apply_reachability_filter(dataset, output_dir, processing_level,
+                                             library_mode=library_mode)
 
     # Write outputs
     write_json(dataset_path, dataset)
