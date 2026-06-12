@@ -79,7 +79,7 @@ def parse_repository(
     skip_tests: bool = True,
     name: str = None,
     diff_manifest: str | None = None,
-    fresh: bool = False,
+    library_mode: bool = False,
 ) -> ParseResult:
     """Parse a repository into an OpenAnt dataset.
 
@@ -93,9 +93,6 @@ def parse_repository(
         processing_level: "all", "reachable", "codeql", or "exploitable".
         skip_tests: If True, exclude test files from parsing (default: True).
         name: Dataset name override (default: derived from repo path basename).
-        fresh: If True, delete existing dataset.json before parsing so all
-            units are regenerated from scratch. Only dataset.json is deleted;
-            other artifacts in output_dir (e.g. analyzer outputs) are preserved.
 
     Returns:
         ParseResult with paths to generated files and stats.
@@ -108,18 +105,6 @@ def parse_repository(
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    if fresh:
-        dataset_path = os.path.join(output_dir, "dataset.json")
-        # Use try/except instead of exists()+remove() to avoid a TOCTOU race
-        # if a concurrent --fresh run removes the file between the two calls.
-        # Only dataset.json is deleted; other artifacts (analyzer outputs, etc.)
-        # in output_dir are preserved.
-        try:
-            os.remove(dataset_path)
-            print("[Parser] --fresh: deleted existing dataset.json", file=sys.stderr)
-        except FileNotFoundError:
-            pass
-
     # Detect language if auto
     if language == "auto":
         language = detect_language(repo_path)
@@ -127,7 +112,7 @@ def parse_repository(
 
     # Dispatch to the right parser
     if language == "python":
-        result = _parse_python(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_python(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
     elif language == "javascript":
         result = _parse_javascript(repo_path, output_dir, processing_level, skip_tests, name)
     elif language == "go":
@@ -207,11 +192,34 @@ def _maybe_apply_diff_filter(
 # Reachability filter (shared by Python path; JS/Go handle it internally)
 # ---------------------------------------------------------------------------
 
+def _library_seed_ids(functions: dict) -> "set[str]":
+    """Public-API seed set for library-mode reachability.
+
+    A pure library exposes no main/route/CLI entry point, so the structural
+    detector finds nothing and the whole library is filtered out (0 reachable).
+    In library-mode the *public surface* IS the entry surface: seed every
+    exported/public function and let the forward BFS pull in its callees.
+
+    Public = exported AND not name-private. ``is_exported`` is honoured when the
+    parser provides it (C/Go/JS — excludes ``static``/unexported); for parsers
+    without the field (python/ruby/php) it defaults True and the name heuristic
+    (leading underscore = private) decides. The bias is intentionally toward
+    over-seeding (more reachable = more analysed), never under-seeding.
+    """
+    seeds: set[str] = set()
+    for func_id, fd in functions.items():
+        name = (fd.get("name") or func_id.rsplit(":", 1)[-1]).split(".")[-1]
+        if fd.get("is_exported", True) and not name.startswith("_"):
+            seeds.add(func_id)
+    return seeds
+
+
 def apply_reachability_filter(
     dataset: dict,
     output_dir: str,
     processing_level: str,
     extra_entry_points: "set[str] | None" = None,
+    library_mode: bool = False,
 ) -> dict:
     """Filter dataset units to only those reachable from entry points.
 
@@ -277,6 +285,11 @@ def apply_reachability_filter(
     entry_points = detector.detect_entry_points()
     if extra_entry_points:
         entry_points = entry_points | extra_entry_points
+    # Library-mode (opt-in): the public API is the entry surface. Union-only —
+    # never demotes a structurally-detected app entry point, so an app scan with
+    # the flag on can only gain reachable units, never lose one.
+    if library_mode:
+        entry_points = entry_points | _library_seed_ids(functions)
 
     units = dataset.get("units", [])
     original_count = len(units)
@@ -374,7 +387,7 @@ _apply_reachability_filter = apply_reachability_filter
 # Python parser
 # ---------------------------------------------------------------------------
 
-def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None) -> ParseResult:
+def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
     """Invoke the Python parser.
 
     The Python parser has a clean `parse_repository()` function that we can
@@ -402,7 +415,8 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
 
     # Apply reachability filter if processing_level requires it
     if processing_level != "all":
-        dataset = _apply_reachability_filter(dataset, output_dir, processing_level)
+        dataset = _apply_reachability_filter(dataset, output_dir, processing_level,
+                                             library_mode=library_mode)
 
     # Write outputs
     write_json(dataset_path, dataset)
