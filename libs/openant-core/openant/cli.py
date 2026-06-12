@@ -959,7 +959,7 @@ def main():
     scan_p.add_argument("--output", "-o", help="Output directory (default: temp dir)")
     scan_p.add_argument(
         "--language", "-l",
-        choices=["auto", "python", "javascript", "go", "c", "ruby", "php"],
+        choices=["auto", "python", "javascript", "go", "c", "ruby", "php", "zig"],
         default="auto",
         help="Language (default: auto-detect)",
     )
@@ -1025,7 +1025,7 @@ def main():
     parse_p.add_argument("--output", "-o", help="Output directory (default: temp dir)")
     parse_p.add_argument(
         "--language", "-l",
-        choices=["auto", "python", "javascript", "go", "c", "ruby", "php"],
+        choices=["auto", "python", "javascript", "go", "c", "ruby", "php", "zig"],
         default="auto",
         help="Language (default: auto-detect)",
     )
