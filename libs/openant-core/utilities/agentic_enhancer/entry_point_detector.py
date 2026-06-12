@@ -278,6 +278,31 @@ class EntryPointDetector:
         }
 
 
+def library_seed_ids(functions):
+    """Public-API seed set for library-mode reachability.
+
+    A pure library exposes no main/route/CLI entry point, so the structural
+    detector finds nothing and the whole library is filtered out (0 reachable).
+    In library-mode the *public surface* IS the entry surface: seed every
+    exported/public function and let the forward BFS pull in its callees.
+
+    Public = exported AND not name-private. Honours ``is_exported``/``isExported``
+    when the parser provides it (C/Go/JS exclude static/unexported); for parsers
+    without the field (python/ruby/php) it defaults True and the leading-underscore
+    name heuristic decides. Both key casings are accepted because the subprocess
+    pipelines normalize to camelCase while the on-disk call_graph is snake_case.
+    The bias is intentionally toward over-seeding (more reachable = more analysed),
+    never under-seeding.
+    """
+    seeds = set()
+    for func_id, fd in functions.items():
+        name = (fd.get("name") or func_id.rsplit(":", 1)[-1]).split(".")[-1]
+        exported = fd.get("is_exported", fd.get("isExported", True))
+        if exported and not name.startswith("_"):
+            seeds.add(func_id)
+    return seeds
+
+
 # Reason categories that indicate a STRUCTURAL entry point — a real route, program
 # main, CLI command, framework handler, or decorator-marked endpoint — as opposed
 # to an INCIDENTAL match (code merely contains an input-reading pattern). A result

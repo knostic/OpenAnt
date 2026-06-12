@@ -20,7 +20,7 @@ from .agent import (
 )
 from .repository_index import RepositoryIndex, load_index_from_file
 from .tools import TOOL_DEFINITIONS, ToolExecutor
-from .entry_point_detector import EntryPointDetector, blackout_warning
+from .entry_point_detector import EntryPointDetector, blackout_warning, library_seed_ids
 from .reachability_analyzer import ReachabilityAnalyzer
 
 __all__ = [
@@ -34,5 +34,6 @@ __all__ = [
     "ToolExecutor",
     "EntryPointDetector",
     "blackout_warning",
+    "library_seed_ids",
     "ReachabilityAnalyzer"
 ]

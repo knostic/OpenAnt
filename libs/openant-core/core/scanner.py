@@ -62,6 +62,7 @@ def scan_repository(
     diff_manifest: str | None = None,
     llm_reachability: bool = False,
     llm_reachability_max_code_bytes: int = 1500,
+    library_mode: bool = False,
 ) -> ScanResult:
     """Scan a repository for vulnerabilities.
 
@@ -171,6 +172,7 @@ def scan_repository(
             processing_level=effective_parse_level,
             skip_tests=skip_tests,
             diff_manifest=diff_manifest,
+            library_mode=library_mode,
         )
 
         ctx.summary = {

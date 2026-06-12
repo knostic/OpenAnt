@@ -80,6 +80,7 @@ def parse_repository(
     name: str = None,
     diff_manifest: str | None = None,
     fresh: bool = False,
+    library_mode: bool = False,
 ) -> ParseResult:
     """Parse a repository into an OpenAnt dataset.
 
@@ -96,6 +97,8 @@ def parse_repository(
         fresh: If True, delete existing dataset.json before parsing so all
             units are regenerated from scratch. Only dataset.json is deleted;
             other artifacts in output_dir (e.g. analyzer outputs) are preserved.
+        library_mode: If True, seed the public API surface as reachability
+            entry points (opt-in, union-only).
 
     Returns:
         ParseResult with paths to generated files and stats.
@@ -127,19 +130,19 @@ def parse_repository(
 
     # Dispatch to the right parser
     if language == "python":
-        result = _parse_python(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_python(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
     elif language == "javascript":
-        result = _parse_javascript(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_javascript(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
     elif language == "go":
-        result = _parse_go(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_go(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
     elif language == "c":
-        result = _parse_c(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_c(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
     elif language == "ruby":
-        result = _parse_ruby(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_ruby(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
     elif language == "php":
-        result = _parse_php(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_php(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
     elif language == "zig":
-        result = _parse_zig(repo_path, output_dir, processing_level, skip_tests, name)
+        result = _parse_zig(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
     else:
         raise ValueError(f"Unsupported language: {language}")
 
@@ -207,11 +210,18 @@ def _maybe_apply_diff_filter(
 # Reachability filter (shared by Python path; JS/Go handle it internally)
 # ---------------------------------------------------------------------------
 
+# library_seed_ids is now shared in utilities/agentic_enhancer/entry_point_detector.py
+# so every parser pipeline (not just Python) can seed the public API. It is loaded
+# below via the same importlib path as EntryPointDetector to dodge the heavy
+# utilities/__init__ imports.
+
+
 def apply_reachability_filter(
     dataset: dict,
     output_dir: str,
     processing_level: str,
     extra_entry_points: "set[str] | None" = None,
+    library_mode: bool = False,
 ) -> dict:
     """Filter dataset units to only those reachable from entry points.
 
@@ -255,6 +265,7 @@ def apply_reachability_filter(
     _ra = _load_module("reachability_analyzer", "reachability_analyzer.py")
     EntryPointDetector = _epd.EntryPointDetector
     blackout_warning = _epd.blackout_warning
+    library_seed_ids = _epd.library_seed_ids
     ReachabilityAnalyzer = _ra.ReachabilityAnalyzer
 
     call_graph_path = os.path.join(output_dir, "call_graph.json")
@@ -278,6 +289,11 @@ def apply_reachability_filter(
     entry_points = detector.detect_entry_points()
     if extra_entry_points:
         entry_points = entry_points | extra_entry_points
+    # Library-mode (opt-in): the public API is the entry surface. Union-only —
+    # never demotes a structurally-detected app entry point, so an app scan with
+    # the flag on can only gain reachable units, never lose one.
+    if library_mode:
+        entry_points = entry_points | library_seed_ids(functions)
 
     units = dataset.get("units", [])
     original_count = len(units)
@@ -381,7 +397,7 @@ _apply_reachability_filter = apply_reachability_filter
 # Python parser
 # ---------------------------------------------------------------------------
 
-def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None) -> ParseResult:
+def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
     """Invoke the Python parser.
 
     The Python parser has a clean `parse_repository()` function that we can
@@ -409,7 +425,8 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
 
     # Apply reachability filter if processing_level requires it
     if processing_level != "all":
-        dataset = _apply_reachability_filter(dataset, output_dir, processing_level)
+        dataset = _apply_reachability_filter(dataset, output_dir, processing_level,
+                                             library_mode=library_mode)
 
     # Write outputs
     write_json(dataset_path, dataset)
@@ -530,7 +547,7 @@ def _file_lock(lock_path: Path):
         f.close()
 
 
-def _parse_javascript(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None) -> ParseResult:
+def _parse_javascript(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
     """Invoke the JavaScript/TypeScript parser.
 
     The JS parser is a PipelineTest class that runs Node.js subprocesses.
@@ -554,6 +571,8 @@ def _parse_javascript(repo_path: str, output_dir: str, processing_level: str, sk
         cmd.extend(["--name", name])
     if skip_tests:
         cmd.append("--skip-tests")
+    if library_mode:
+        cmd.append("--library-mode")
 
     result = subprocess.run(
         cmd,
@@ -589,7 +608,7 @@ def _parse_javascript(repo_path: str, output_dir: str, processing_level: str, sk
 # Go parser
 # ---------------------------------------------------------------------------
 
-def _parse_go(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None) -> ParseResult:
+def _parse_go(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
     """Invoke the Go parser.
 
     The Go parser is a PipelineTest class that calls a compiled Go binary.
@@ -610,6 +629,8 @@ def _parse_go(repo_path: str, output_dir: str, processing_level: str, skip_tests
         cmd.extend(["--name", name])
     if skip_tests:
         cmd.append("--skip-tests")
+    if library_mode:
+        cmd.append("--library-mode")
 
     result = subprocess.run(
         cmd,
@@ -645,7 +666,7 @@ def _parse_go(repo_path: str, output_dir: str, processing_level: str, skip_tests
 # C/C++ parser
 # ---------------------------------------------------------------------------
 
-def _parse_c(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None) -> ParseResult:
+def _parse_c(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
     """Invoke the C/C++ parser.
 
     The C parser uses tree-sitter for function extraction and call graph
@@ -668,6 +689,8 @@ def _parse_c(repo_path: str, output_dir: str, processing_level: str, skip_tests:
         cmd.extend(["--name", name])
     if skip_tests:
         cmd.append("--skip-tests")
+    if library_mode:
+        cmd.append("--library-mode")
 
     result = subprocess.run(
         cmd,
@@ -704,7 +727,7 @@ def _parse_c(repo_path: str, output_dir: str, processing_level: str, skip_tests:
 # Ruby parser
 # ---------------------------------------------------------------------------
 
-def _parse_ruby(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None) -> ParseResult:
+def _parse_ruby(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
     """Invoke the Ruby parser.
 
     The Ruby parser uses tree-sitter for function extraction and call graph
@@ -727,6 +750,8 @@ def _parse_ruby(repo_path: str, output_dir: str, processing_level: str, skip_tes
         cmd.extend(["--name", name])
     if skip_tests:
         cmd.append("--skip-tests")
+    if library_mode:
+        cmd.append("--library-mode")
 
     result = subprocess.run(
         cmd,
@@ -763,7 +788,7 @@ def _parse_ruby(repo_path: str, output_dir: str, processing_level: str, skip_tes
 # PHP parser
 # ---------------------------------------------------------------------------
 
-def _parse_php(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None) -> ParseResult:
+def _parse_php(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
     """Invoke the PHP parser.
 
     The PHP parser uses tree-sitter for function extraction and call graph
@@ -786,6 +811,8 @@ def _parse_php(repo_path: str, output_dir: str, processing_level: str, skip_test
         cmd.extend(["--name", name])
     if skip_tests:
         cmd.append("--skip-tests")
+    if library_mode:
+        cmd.append("--library-mode")
 
     result = subprocess.run(
         cmd,
@@ -822,7 +849,7 @@ def _parse_php(repo_path: str, output_dir: str, processing_level: str, skip_test
 # Zig parser
 # ---------------------------------------------------------------------------
 
-def _parse_zig(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None) -> ParseResult:
+def _parse_zig(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
     """Invoke the Zig parser.
 
     The Zig parser uses tree-sitter for function extraction and call graph
@@ -845,6 +872,8 @@ def _parse_zig(repo_path: str, output_dir: str, processing_level: str, skip_test
         cmd.extend(["--name", name])
     if skip_tests:
         cmd.append("--skip-tests")
+    if library_mode:
+        cmd.append("--library-mode")
 
     result = subprocess.run(
         cmd,
