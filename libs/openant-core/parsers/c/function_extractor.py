@@ -66,6 +66,10 @@ class FunctionExtractor:
         self.macros: Dict[str, List[Dict]] = {}
         self.macro_aliases: Dict[str, str] = {}  # e.g. OPENSSL_malloc -> CRYPTO_malloc
         self.prototypes: Dict[str, Dict] = {}  # function name -> declaration info
+        # class/struct name -> list of direct base-class names, for inheritance
+        # walks in member dispatch (bug [30]). Populated from the
+        # base_class_clause of each class_specifier/struct_specifier.
+        self.class_bases: Dict[str, List[str]] = {}
 
         self.c_parser = Parser(C_LANGUAGE)
         self.cpp_parser = Parser(CPP_LANGUAGE)
@@ -148,11 +152,18 @@ class FunctionExtractor:
         if node.type == 'qualified_identifier':
             return self._node_text(node, source)
 
-        # template_function
+        # operator overload (operator+, operator==, operator[], ...)
+        if node.type == 'operator_name':
+            return self._node_text(node, source)
+
+        # conversion operator (operator int, operator MyType)
+        if node.type == 'operator_cast':
+            return self._node_text(node, source)
+
+        # template_function: g<int> — keep the template arguments so an
+        # explicit specialization does not collide with the primary template.
         if node.type == 'template_function':
-            name_node = node.child_by_field_name('name')
-            if name_node:
-                return self._extract_identifier_from_declarator(name_node, source)
+            return self._node_text(node, source)
 
         # reference_declarator (C++ int& func())
         if node.type == 'reference_declarator':
@@ -170,7 +181,8 @@ class FunctionExtractor:
             if child.type in ('identifier', 'field_identifier', 'qualified_identifier',
                               'function_declarator', 'pointer_declarator',
                               'parenthesized_declarator', 'destructor_name',
-                              'template_function', 'reference_declarator'):
+                              'template_function', 'reference_declarator',
+                              'operator_name', 'operator_cast'):
                 result = self._extract_identifier_from_declarator(child, source)
                 if result:
                     return result
@@ -218,6 +230,62 @@ class FunctionExtractor:
                 params.append('...')
         return params
 
+    @staticmethod
+    def _signature_discriminator(parameters: List[str]) -> str:
+        """A deterministic, COLON-FREE signature string for the parameter list.
+
+        Colon-free is mandatory: the func_id is split on ':' downstream
+        (`core/diff_filter.py`, `utilities/agentic_enhancer/repository_index.py`
+        rsplit on ':' to recover the file), so any colon a C++ type carries
+        (`std::string`, a ternary default arg) is mapped to '.' here.
+        """
+        joined = ','.join(p.strip() for p in parameters)
+        joined = ' '.join(joined.split())  # collapse newlines/runs of whitespace
+        return joined.replace(':', '.')
+
+    @staticmethod
+    def _same_signature(a: dict, b: dict) -> bool:
+        """Two definitions share a signature iff their parameter lists match.
+
+        Identical params => a redefinition of the SAME function under a different
+        preprocessor branch (#ifdef/#else) or an ODR-duplicate. Different params
+        => a genuine C++ overload.
+        """
+        return a.get('parameters', []) == b.get('parameters', [])
+
+    def _store_function(self, func_id: str, func_data: dict) -> None:
+        """Store a function, disambiguating same-(file,name) collisions instead
+        of silently overwriting (Bug 1: #ifdef/#else stubs and C++ overloads
+        collapsed onto one node — see reachability-bugs.md / bug-3482.md).
+
+        Collision-only: when func_id is free, store byte-identically (the
+        hardcoded `path:name` id literals across the suite depend on unique names
+        keeping the plain `path:name` id). On a collision:
+          - SAME signature -> keep ONE node, prefer the larger body. The #else
+            stub is shorter than the real implementation regardless of which
+            preprocessor arm tree-sitter emits first, so this is order- and
+            direction-independent.
+          - DIFFERENT signature -> a genuine overload; both are real. Mint a
+            distinct key by folding the colon-free signature into the func_id.
+            The `name` field is left bare (`area`, not `area(int,int)`) because
+            the call-graph builder resolves calls by `name` (functions_by_name),
+            so both overloads stay findable. (Contrast bug [39], which folds the
+            template-arg discriminator into the NAME — correct there because a
+            template call is written `g<int>`; an overload call is written bare.)
+        """
+        existing = self.functions.get(func_id)
+        if existing is None:
+            self.functions[func_id] = func_data
+            return
+        if self._same_signature(existing, func_data):
+            if len(func_data.get('code', '')) > len(existing.get('code', '')):
+                self.functions[func_id] = func_data
+            return
+        overload_id = f"{func_id}({self._signature_discriminator(func_data.get('parameters', []))})"
+        prior = self.functions.get(overload_id)
+        if prior is None or len(func_data.get('code', '')) > len(prior.get('code', '')):
+            self.functions[overload_id] = func_data
+
     def _find_function_declarator(self, node):
         """Find the function_declarator within a declarator tree."""
         if node.type == 'function_declarator':
@@ -257,10 +325,15 @@ class FunctionExtractor:
             return 'main'
 
         if is_cpp and class_name:
-            if name == class_name:
-                return 'constructor'
-            if name.startswith('~'):
+            # Compare the UNqualified leaves: an out-of-line definition arrives
+            # as a qualified name (e.g. 'Foo::Foo', 'Foo::~Foo') whose whole
+            # string never equals the bare class_name.
+            unqualified = name.rsplit('::', 1)[-1]
+            class_leaf = class_name.rsplit('::', 1)[-1]
+            if unqualified.startswith('~'):
                 return 'destructor'
+            if unqualified == class_leaf:
+                return 'constructor'
             return 'method'
 
         if '__attribute__((constructor))' in code:
@@ -288,6 +361,27 @@ class FunctionExtractor:
             if len(parts) >= 2:
                 return '::'.join(parts[:-1])
         return None
+
+    def _extract_base_classes(self, record_node, source: bytes) -> List[str]:
+        """Return the direct base-class names of a class/struct specifier.
+
+        tree-sitter represents inheritance as a `base_class_clause` child of the
+        class_specifier/struct_specifier (sibling of name and body). The clause
+        holds one `type_identifier` per base, interleaved with optional
+        access_specifier / `virtual` / `,` tokens; we collect only the simple
+        `type_identifier` bases. Qualified or templated bases (ns::Base,
+        Base<T>) are NOT recorded — matching the same-name keying used for
+        class_name elsewhere, so the inheritance walk stays sound (an unknown
+        base simply yields no edge rather than a wrong one).
+        """
+        bases: List[str] = []
+        for child in record_node.children:
+            if child.type != 'base_class_clause':
+                continue
+            for sub in child.children:
+                if sub.type == 'type_identifier':
+                    bases.append(self._node_text(sub, source))
+        return bases
 
     def _extract_includes(self, tree, source: bytes) -> List[str]:
         """Extract #include directives from a file."""
@@ -355,23 +449,38 @@ class FunctionExtractor:
         """Extract all function definitions from a parsed tree."""
         is_header = os.path.splitext(file_path)[1].lower() in ('.h', '.hpp', '.hxx', '.hh')
 
-        # Iterative traversal with explicit stack carrying (node, namespace_prefix)
-        stack = [(tree.root_node, '')]
+        # Iterative traversal with explicit stack carrying
+        # (node, namespace_prefix, class_context). namespace_prefix is the
+        # qualified prefix used to build the func_id; class_context is the
+        # enclosing class/struct/union name (or None) used for metadata so a
+        # namespace qualifier is never mistaken for a class qualifier.
+        stack = [(tree.root_node, '', None)]
+
+        # struct/union member functions are C++ methods exactly like class
+        # members; only `class_specifier` was special-cased originally.
+        record_specifiers = ('class_specifier', 'struct_specifier', 'union_specifier')
 
         while stack:
-            node, namespace_prefix = stack.pop()
+            node, namespace_prefix, class_context = stack.pop()
 
             if node.type == 'function_definition':
                 self._process_function_node(node, source, relative_path,
-                                            is_cpp, is_header, namespace_prefix)
+                                            is_cpp, is_header, namespace_prefix,
+                                            class_context)
 
             elif node.type == 'declaration' and not is_header:
-                # Skip standalone declarations in .c files (prototypes only)
-                pass
+                # Standalone declarations in .c/.cpp files are prototypes, EXCEPT
+                # a declaration whose initializer is a lambda — a named callable.
+                if is_cpp:
+                    self._process_lambda_declaration(node, source, relative_path,
+                                                     namespace_prefix)
 
             elif node.type == 'declaration' and is_header:
                 # In headers, track prototypes for call resolution
                 self._process_declaration_node(node, source, relative_path)
+                if is_cpp:
+                    self._process_lambda_declaration(node, source, relative_path,
+                                                     namespace_prefix)
 
             elif node.type == 'namespace_definition' and is_cpp:
                 ns_name_node = node.child_by_field_name('name')
@@ -380,42 +489,62 @@ class FunctionExtractor:
                 body_node = node.child_by_field_name('body')
                 if body_node:
                     for child in reversed(body_node.children):
-                        stack.append((child, new_prefix))
+                        # class_context unchanged: a namespace is NOT a class.
+                        stack.append((child, new_prefix, class_context))
                 continue  # Don't walk children again
 
-            elif node.type == 'class_specifier' and is_cpp:
+            elif node.type in record_specifiers and is_cpp:
                 class_name_node = node.child_by_field_name('name')
                 if class_name_node:
                     class_name = self._node_text(class_name_node, source)
                     new_prefix = f"{namespace_prefix}{class_name}::"
+                    # Record direct base classes for the inheritance walk in
+                    # member dispatch (bug [30]). Keyed by the bare class name
+                    # (matching the class_name stored on each method).
+                    bases = self._extract_base_classes(node, source)
+                    if bases:
+                        existing = self.class_bases.setdefault(class_name, [])
+                        for base in bases:
+                            if base not in existing:
+                                existing.append(base)
                     body_node = node.child_by_field_name('body')
                     if body_node:
                         for child in reversed(body_node.children):
                             if child.type == 'function_definition':
                                 self._process_function_node(
                                     child, source, relative_path,
-                                    is_cpp, is_header, new_prefix
+                                    is_cpp, is_header, new_prefix, class_name
                                 )
                             elif child.type == 'access_specifier':
                                 pass
                             else:
-                                stack.append((child, new_prefix))
+                                stack.append((child, new_prefix, class_name))
                 continue
 
             else:
                 for child in reversed(node.children):
-                    stack.append((child, namespace_prefix))
+                    stack.append((child, namespace_prefix, class_context))
 
     def _process_function_node(self, node, source: bytes, relative_path: str,
                                 is_cpp: bool, is_header: bool,
-                                namespace_prefix: str = '') -> None:
+                                namespace_prefix: str = '',
+                                class_context: Optional[str] = None) -> None:
         """Process a single function_definition node."""
         name = self._get_function_name(node, source)
         if not name:
             return
 
         full_name = namespace_prefix + name if namespace_prefix and '::' not in name else name
-        class_name = self._get_class_name_from_qualified(full_name)
+        # class_name comes from the lexical enclosing class/struct/union
+        # (class_context) OR from a qualifier written in the source name
+        # (out-of-line def: Foo::method). A namespace qualifier in
+        # namespace_prefix must NOT become a class_name.
+        if class_context is not None:
+            class_name = class_context
+        elif '::' in name:
+            class_name = self._get_class_name_from_qualified(name)
+        else:
+            class_name = None
 
         code = self._node_text(node, source)
         start_line = node.start_point[0] + 1  # tree-sitter is 0-indexed
@@ -447,7 +576,7 @@ class FunctionExtractor:
             'class_name': class_name,
         }
 
-        self.functions[func_id] = func_data
+        self._store_function(func_id, func_data)
         self.stats['total_functions'] += 1
 
         if is_static:
@@ -456,6 +585,52 @@ class FunctionExtractor:
             self.stats['inline_functions'] += 1
 
         self.stats['by_type'][unit_type] = self.stats['by_type'].get(unit_type, 0) + 1
+
+    def _process_lambda_declaration(self, node, source: bytes, relative_path: str,
+                                    namespace_prefix: str = '') -> None:
+        """Extract a named lambda from a declaration (auto f = [](){...};).
+
+        A lambda is a `lambda_expression` initializer inside an
+        `init_declarator`; the declaration node is otherwise skipped by the
+        traversal, so the callable would never be recorded as a unit.
+        """
+        # A declaration may declare several init_declarators.
+        stack = list(node.children)
+        while stack:
+            child = stack.pop()
+            if child.type != 'init_declarator':
+                stack.extend(child.children)
+                continue
+
+            value_node = child.child_by_field_name('value')
+            if value_node is None or value_node.type != 'lambda_expression':
+                continue
+
+            decl_node = child.child_by_field_name('declarator')
+            name = (self._extract_identifier_from_declarator(decl_node, source)
+                    if decl_node is not None else None)
+            if not name:
+                continue
+
+            full_name = (namespace_prefix + name
+                         if namespace_prefix and '::' not in name else name)
+            func_id = f"{relative_path}:{full_name}"
+            self._store_function(func_id, {
+                'name': full_name,
+                'file_path': relative_path,
+                'start_line': node.start_point[0] + 1,
+                'end_line': node.end_point[0] + 1,
+                'code': self._node_text(node, source),
+                'parameters': self._get_parameters(value_node, source),
+                'return_type': 'auto',
+                'is_static': False,
+                'is_exported': False,
+                'is_inline': False,
+                'unit_type': 'lambda',
+                'class_name': None,
+            })
+            self.stats['total_functions'] += 1
+            self.stats['by_type']['lambda'] = self.stats['by_type'].get('lambda', 0) + 1
 
     def _process_declaration_node(self, node, source: bytes, relative_path: str) -> None:
         """Process a declaration node in a header to track prototypes."""
@@ -550,6 +725,7 @@ class FunctionExtractor:
             'macros': self.macros,
             'macro_aliases': self.macro_aliases,
             'prototypes': self.prototypes,
+            'class_bases': self.class_bases,
             'statistics': self.stats,
         }
 
