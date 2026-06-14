@@ -219,6 +219,68 @@ class TypeScriptAnalyzer {
   /**
    * Extract all functions/methods from a source file
    */
+  // Module-level FunctionDeclarations: top-level OR nested only inside blocks /
+  // control-flow statements (if/else, try/catch, for/while, switch, bare {}) —
+  // NOT inside another function/method/accessor (their text already rides inside
+  // the parent unit) and NOT inside a class `static {}` block (block-scoped to
+  // the initializer, callable nowhere). `getFunctions()` returned only top-level
+  // declarations, so block-scoped functions were silently dropped from both the
+  // inventory and the call graph. Returns [{node, id}] with COLLISION-ONLY
+  // `#L<line>` disambiguation (sibling-block same-name functions are both
+  // runtime-reachable, so keep both; unique names keep the plain `path:name`
+  // id). Both the inventory and call-graph builders iterate this same list so
+  // their keys match exactly (the `len(callGraph) === len(functions)` lockstep).
+  // The named FunctionDeclaration nodes that are module-level (top-level OR only
+  // block-nested), excluding function-nested and static-block-scoped ones. Used
+  // by the inventory builder, the call-graph builder, AND the resolver — all
+  // three must see the same set so a block function is a unit, has its own
+  // edges, and is resolvable as a call target.
+  _moduleLevelFunctionNodes(sourceFile) {
+    const STOP = new Set([
+      ts.SyntaxKind.FunctionDeclaration,
+      ts.SyntaxKind.FunctionExpression,
+      ts.SyntaxKind.ArrowFunction,
+      ts.SyntaxKind.MethodDeclaration,
+      ts.SyntaxKind.Constructor,
+      ts.SyntaxKind.GetAccessor,
+      ts.SyntaxKind.SetAccessor,
+      ts.SyntaxKind.ClassStaticBlockDeclaration,
+    ]);
+    const isModuleLevel = (fn) => {
+      for (let p = fn.getParent(); p; p = p.getParent()) {
+        if (STOP.has(p.getKind())) return false;
+      }
+      return true;
+    };
+    return sourceFile
+      .getDescendantsOfKind(ts.SyntaxKind.FunctionDeclaration)
+      .filter((fn) => fn.getName() && isModuleLevel(fn));
+  }
+
+  _moduleLevelFunctionEntries(sourceFile, relativePath) {
+    const fns = this._moduleLevelFunctionNodes(sourceFile);
+    const countByName = {};
+    for (const fn of fns) {
+      const n = fn.getName();
+      countByName[n] = (countByName[n] || 0) + 1;
+    }
+    const seen = new Set();
+    return fns.map((fn) => {
+      const name = fn.getName();
+      let id = `${relativePath}:${name}`;
+      if (countByName[name] > 1) {
+        // collision-only: keep both, deterministic by source line (never by
+        // emit order). Colon-free `#L` suffix survives the downstream
+        // `split(':')[0]` (file) / `rsplit(':',1)[-1]` (name) id contracts.
+        let uid = `${id}#L${fn.getStartLineNumber()}`;
+        while (seen.has(uid)) uid = `${uid}.x`;
+        seen.add(uid);
+        id = uid;
+      }
+      return { node: fn, id };
+    });
+  }
+
   extractFunctionsFromFile(sourceFile) {
     // Always emit POSIX-style relative paths so functionId values are
     // stable across platforms (Python downstream consumers and dataset
@@ -227,13 +289,13 @@ class TypeScriptAnalyzer {
       path.relative(this.repoPath, sourceFile.getFilePath()),
     );
 
-    // Extract function declarations
-    for (const func of sourceFile.getFunctions()) {
+    // Extract function declarations (top-level + module-level block-scoped).
+    for (const { node: func, id: functionId } of this._moduleLevelFunctionEntries(
+      sourceFile,
+      relativePath,
+    )) {
       const name = func.getName();
-      if (!name) continue;
-
       const code = func.getFullText();
-      const functionId = `${relativePath}:${name}`;
       this.functions[functionId] = {
         name: name,
         code: code,
@@ -1249,12 +1311,13 @@ class TypeScriptAnalyzer {
       path.relative(this.repoPath, sourceFile.getFilePath()),
     );
 
-    // Analyze function declarations
-    for (const func of sourceFile.getFunctions()) {
-      const name = func.getName();
-      if (!name) continue;
-
-      const callerId = `${relativePath}:${name}`;
+    // Analyze function declarations (same enumeration + id scheme as the
+    // inventory builder, so callGraph keys match functions keys exactly —
+    // a block function must get its REAL outgoing edges, not a backstop []).
+    for (const { node: func, id: callerId } of this._moduleLevelFunctionEntries(
+      sourceFile,
+      relativePath,
+    )) {
       this.callGraph[callerId] = this.extractCallsFromFunction(
         func,
         relativePath,
@@ -1529,9 +1592,10 @@ function extractSingleFunction(filePath, functionRef) {
       }
     }
 
-    // 2. Try standalone function declarations
+    // 2. Try standalone function declarations (incl. module-level block-scoped,
+    // so a call TO a function defined inside an if/try/for block resolves).
     if (!foundFunction) {
-      for (const func of sourceFile.getFunctions()) {
+      for (const func of this._moduleLevelFunctionNodes(sourceFile)) {
         if (func.getName() === functionName) {
           foundFunction = {
             node: func,
