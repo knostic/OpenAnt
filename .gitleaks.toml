@@ -1,0 +1,28 @@
+# gitleaks configuration for OpenAnt.
+#
+# Keeps gitleaks' full default ruleset (useDefault) and adds a NARROW allowlist
+# for the deliberately-fake API-key fixtures used to exercise the secret-redaction
+# helper (utilities/llm/_redact.py). Those tests must feed key-shaped inputs, so
+# the scanner flags them as generic-api-keys even though no real secret exists.
+#
+# The allowlist is intentionally tight: it only suppresses secrets that carry an
+# unmistakable FAKE marker (the digit run 1234567890, or LEAKED/EXAMPLE/FAKE) AND
+# live in the two redaction-test files. Any real-looking key in those files — or a
+# fake marker anywhere else — is still reported. New fake fixtures must include one
+# of these markers to be allowlisted.
+
+title = "OpenAnt"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Fake key fixtures for redact_secrets() tests (marker-gated, path-scoped)"
+condition = "AND"
+paths = [
+  '''libs/openant-core/tests/test_llm_round4_fixes\.py''',
+  '''libs/openant-core/tests/test_llm_round5_fixes\.py''',
+]
+regexes = [
+  '''(1234567890|LEAKED|EXAMPLE|FAKE)''',
+]
