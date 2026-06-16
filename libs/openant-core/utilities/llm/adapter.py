@@ -260,6 +260,25 @@ class LLMResponseError(LLMError):
     """
 
 
+class LLMRefusalError(LLMResponseError):
+    """Provider refused to answer or content-filtered the response.
+
+    Raised when a completion's finish/stop reason explicitly signals a
+    refusal or safety block — Anthropic ``stop_reason == "refusal"``,
+    OpenAI ``finish_reason == "content_filter"``, or a Gemini candidate
+    whose ``finish_reason`` is in the safety/blocked set (SAFETY,
+    RECITATION, PROHIBITED_CONTENT, BLOCKLIST, SPII, …).
+
+    Subclasses :class:`LLMResponseError` on purpose: every existing
+    ``except LLMResponseError`` handler keeps catching these, so the
+    pipeline's retry/error-reporting paths don't need to change. The
+    distinct type only matters to a caller that wants to treat a
+    deliberate refusal differently from a malformed response — for a
+    SECURITY tool that distinction is load-bearing, because a silently
+    swallowed refusal would otherwise read as a clean, finding-free pass.
+    """
+
+
 # ---------------------------------------------------------------------------
 # The adapter protocol
 # ---------------------------------------------------------------------------

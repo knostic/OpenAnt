@@ -66,6 +66,7 @@ from ..adapter import (
     LLMConnectionError,
     LLMNotFoundError,
     LLMRateLimitError,
+    LLMRefusalError,
     LLMResponseError,
     Message,
     StopReason,
@@ -75,6 +76,7 @@ from ..adapter import (
     ToolUseBlock,
 )
 from ._ratelimit import report_rate_limit, wait_for_rate_limit
+from .._redact import redact_secrets, redacted_cause_from
 
 
 _OPENAI_FINISH_REASONS: dict[str, StopReason] = {
@@ -82,6 +84,13 @@ _OPENAI_FINISH_REASONS: dict[str, StopReason] = {
     "tool_calls": "tool_use",
     "length": "max_tokens",
 }
+
+# OpenAI's ``finish_reason`` literal includes ``"content_filter"`` — the
+# response was withheld or truncated by the moderation layer. We surface
+# it as a typed ``LLMRefusalError`` rather than normalising to
+# ``end_turn``, so a security scan doesn't read a filtered response as a
+# clean, finding-free pass.
+_OPENAI_CONTENT_FILTER_REASON = "content_filter"
 
 # OpenAI reasoning models (o1/o3/o4 families) reject ``max_tokens`` and
 # require ``max_completion_tokens``. Match the bare ``o<digit>`` family
@@ -225,24 +234,24 @@ class OpenAIAdapter:
         try:
             response = self._client.chat.completions.create(**request)
         except openai.AuthenticationError as exc:
-            raise LLMAuthError(str(exc)) from exc
+            raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except openai.PermissionDeniedError as exc:
-            raise LLMAuthError(str(exc)) from exc
+            raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except openai.RateLimitError as exc:
             retry_after = _retry_after_from(exc)
             report_rate_limit(retry_after)
-            raise LLMRateLimitError(str(exc), retry_after=retry_after) from exc
+            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
         except openai.NotFoundError as exc:
-            raise LLMNotFoundError(str(exc)) from exc
+            raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except openai.APIConnectionError as exc:
             # Covers DNS, TCP, TLS, and SDK-mapped timeouts (the SDK's
             # APITimeoutError inherits from APIConnectionError).
-            raise LLMConnectionError(str(exc)) from exc
+            raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except openai.BadRequestError as exc:
-            raise LLMResponseError(str(exc)) from exc
+            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except openai.APIStatusError as exc:
             # Everything else (5xx, unexpected statuses).
-            raise LLMResponseError(str(exc)) from exc
+            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
         return _response_to_unified(response)
 
@@ -254,20 +263,20 @@ class OpenAIAdapter:
                 "messages": [{"role": "user", "content": "hi"}],
             })
         except openai.AuthenticationError as exc:
-            raise LLMAuthError(str(exc)) from exc
+            raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except openai.PermissionDeniedError as exc:
-            raise LLMAuthError(str(exc)) from exc
+            raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except openai.RateLimitError as exc:
             retry_after = _retry_after_from(exc)
-            raise LLMRateLimitError(str(exc), retry_after=retry_after) from exc
+            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
         except openai.NotFoundError as exc:
-            raise LLMNotFoundError(str(exc)) from exc
+            raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except openai.APIConnectionError as exc:
-            raise LLMConnectionError(str(exc)) from exc
+            raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except openai.BadRequestError as exc:
-            raise LLMResponseError(str(exc)) from exc
+            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except openai.APIStatusError as exc:
-            raise LLMResponseError(str(exc)) from exc
+            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
 
 # ----------------------------------------------------------------------
@@ -404,6 +413,17 @@ def _response_to_unified(response: Any) -> CompletionResult:
         ))
 
     raw_finish = getattr(choice, "finish_reason", None) or "stop"
+
+    # R4-2: a content-filter finish is the more specific signal — raise
+    # it regardless of whether the message carried partial text/tool
+    # calls. OpenAI reports this as ``finish_reason == "content_filter"``.
+    if raw_finish == _OPENAI_CONTENT_FILTER_REASON:
+        raise LLMRefusalError(
+            "OpenAI content-filtered the response "
+            "(finish_reason='content_filter'); the completion was withheld "
+            "or truncated by the moderation layer"
+        )
+
     if raw_finish not in _OPENAI_FINISH_REASONS:
         should_warn = False
         with _warned_finish_reasons_lock:

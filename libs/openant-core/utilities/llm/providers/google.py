@@ -70,6 +70,7 @@ from ..adapter import (
     LLMConnectionError,
     LLMNotFoundError,
     LLMRateLimitError,
+    LLMRefusalError,
     LLMResponseError,
     Message,
     StopReason,
@@ -79,6 +80,7 @@ from ..adapter import (
     ToolUseBlock,
 )
 from ._ratelimit import report_rate_limit, wait_for_rate_limit
+from .._redact import redact_secrets, redacted_cause_from
 
 
 # Gemini's FinishReason enum values, mapped to our StopReason union.
@@ -90,6 +92,46 @@ _GEMINI_FINISH_REASONS: dict[str, StopReason] = {
     "MAX_TOKENS": "max_tokens",
     "FinishReason.MAX_TOKENS": "max_tokens",
 }
+
+# Gemini candidate finish reasons that mean "blocked / refused" rather
+# than a normal termination. We surface these as a typed
+# ``LLMRefusalError`` so a security scan doesn't read a safety-blocked
+# candidate as a clean, finding-free pass.
+#
+# We verified against the pinned google-genai SDK (v2.4.0) that
+# ``types.FinishReason`` exposes SAFETY / RECITATION / BLOCKLIST /
+# PROHIBITED_CONTENT / SPII (among others). We build the comparison set
+# from the enum when importable so the names stay in sync with the SDK,
+# and fall back to the bare string names otherwise. ``raw_finish`` is
+# compared against BOTH the bare name (``"SAFETY"`` — what a test stub or
+# a string-valued field yields) and the ``str(enum)`` form
+# (``"FinishReason.SAFETY"`` — what the live SDK enum stringifies to).
+_GEMINI_REFUSAL_NAMES = (
+    "SAFETY",
+    "RECITATION",
+    "BLOCKLIST",
+    "PROHIBITED_CONTENT",
+    "SPII",
+)
+
+
+def _build_gemini_refusal_set() -> frozenset[str]:
+    names: set[str] = set()
+    finish_enum = getattr(genai_types, "FinishReason", None)
+    for name in _GEMINI_REFUSAL_NAMES:
+        names.add(name)
+        member = getattr(finish_enum, name, None) if finish_enum is not None else None
+        if member is not None:
+            # Cover both ``str(member)`` ("FinishReason.SAFETY") and the
+            # raw ``.value`` ("SAFETY") forms the SDK may surface.
+            names.add(str(member))
+            value = getattr(member, "value", None)
+            if value is not None:
+                names.add(str(value))
+    return frozenset(names)
+
+
+_GEMINI_REFUSAL_FINISH_REASONS = _build_gemini_refusal_set()
 
 _warned_finish_reasons: set[str] = set()
 _warned_finish_reasons_lock = threading.Lock()
@@ -137,10 +179,13 @@ class GoogleAdapter:
             base_url: Override the API host. ``None`` means the SDK's
                 default (generativelanguage.googleapis.com). Required
                 when pointing at Vertex AI or a Gemini-compat proxy.
-            max_retries: Accepted for parity with the other adapters;
-                the google-genai SDK doesn't expose a max_retries
-                parameter today, so this value is currently ignored.
-                Kept in the signature for forward compatibility.
+            max_retries: Forwarded to the SDK as
+                ``HttpOptions(retry_options=HttpRetryOptions(attempts=...))``.
+                The google-genai SDK DOES expose retry configuration this
+                way (verified against the pinned v2.4.0:
+                ``HttpRetryOptions.attempts``); on top of the SDK's own
+                retry, our rate limiter coordinates 429 backoff across
+                workers — same division of labour as the other adapters.
             _client: Injected SDK instance for testing.
         """
         if _client is not None:
@@ -150,12 +195,33 @@ class GoogleAdapter:
         kwargs: dict[str, Any] = {}
         if api_key is not None:
             kwargs["api_key"] = api_key
+
+        # Build HttpOptions whenever we need to set base_url and/or
+        # retry_options. The SDK takes both on the same object, so we
+        # assemble one set of fields and only construct it if non-empty —
+        # passing an empty HttpOptions would needlessly override the SDK
+        # defaults. ``max_retries`` maps to ``HttpRetryOptions.attempts``.
+        http_options_fields: dict[str, Any] = {}
         if base_url is not None:
-            kwargs["http_options"] = genai_types.HttpOptions(base_url=base_url)
+            http_options_fields["base_url"] = base_url
+        if max_retries is not None:
+            # F3 (round-5): the SDK's ``attempts`` field is the "Maximum
+            # number of attempts, INCLUDING the original request" (verified
+            # against pinned google-genai v2.4.0: "If 0 or 1, it means no
+            # retries"). OpenAI/Anthropic ``max_retries`` instead counts
+            # retries BEYOND the first request. So forwarding
+            # ``attempts=max_retries`` was off-by-one — ``max_retries=5``
+            # gave 6 attempts on the other adapters but only 5 here. Add 1
+            # for parity: ``max_retries`` retries + the original request.
+            # ``max_retries=0`` correctly maps to ``attempts=1`` (no
+            # retries), matching the other adapters' zero-retry semantics.
+            http_options_fields["retry_options"] = genai_types.HttpRetryOptions(
+                attempts=max_retries + 1,
+            )
+        if http_options_fields:
+            kwargs["http_options"] = genai_types.HttpOptions(**http_options_fields)
+
         self._client = genai.Client(**kwargs)
-        # max_retries is unused today; ack the parameter so static
-        # analyzers don't flag it as dead.
-        _ = max_retries
 
     # ------------------------------------------------------------------
     # Public API
@@ -190,20 +256,20 @@ class GoogleAdapter:
         except genai_errors.ClientError as exc:
             code = _http_code_from(exc)
             if code in (401, 403):
-                raise LLMAuthError(str(exc)) from exc
+                raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
             if code == 404:
-                raise LLMNotFoundError(str(exc)) from exc
+                raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
             if code == 429:
                 retry_after = _retry_after_from(exc)
                 report_rate_limit(retry_after)
-                raise LLMRateLimitError(str(exc), retry_after=retry_after) from exc
-            raise LLMResponseError(str(exc)) from exc
+                raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
+            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.ServerError as exc:
-            raise LLMResponseError(str(exc)) from exc
+            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.APIError as exc:
-            raise LLMResponseError(str(exc)) from exc
+            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, httpx.TimeoutException) as exc:
-            raise LLMConnectionError(str(exc)) from exc
+            raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
         return _response_to_unified(response)
 
@@ -220,19 +286,19 @@ class GoogleAdapter:
         except genai_errors.ClientError as exc:
             code = _http_code_from(exc)
             if code in (401, 403):
-                raise LLMAuthError(str(exc)) from exc
+                raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
             if code == 404:
-                raise LLMNotFoundError(str(exc)) from exc
+                raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
             if code == 429:
                 retry_after = _retry_after_from(exc)
-                raise LLMRateLimitError(str(exc), retry_after=retry_after) from exc
-            raise LLMResponseError(str(exc)) from exc
+                raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
+            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.ServerError as exc:
-            raise LLMResponseError(str(exc)) from exc
+            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.APIError as exc:
-            raise LLMResponseError(str(exc)) from exc
+            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, httpx.TimeoutException) as exc:
-            raise LLMConnectionError(str(exc)) from exc
+            raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
 
 # ----------------------------------------------------------------------
@@ -366,6 +432,16 @@ def _response_to_unified(response: Any) -> CompletionResult:
         output_tokens = (
             (getattr(usage, "candidates_token_count", 0) or 0)
             + (getattr(usage, "thoughts_token_count", 0) or 0)
+        )
+
+    # R4-2: a safety/blocked candidate finish reason is the more
+    # specific signal — raise it regardless of whether the candidate
+    # carried partial text or a function_call. Gemini reports these as
+    # SAFETY / RECITATION / BLOCKLIST / PROHIBITED_CONTENT / SPII.
+    if raw_finish in _GEMINI_REFUSAL_FINISH_REASONS:
+        raise LLMRefusalError(
+            f"Gemini blocked the response (finish_reason={raw_finish!r}); "
+            "the candidate was withheld for safety or policy reasons"
         )
 
     stop_reason: StopReason
