@@ -324,10 +324,23 @@ def build_pipeline_output(
                 parts.append("Verification: " + _coerce_to_str(finding["verification_explanation"]))
             steps_to_reproduce = "\n\n".join(parts) if parts else None
 
-        # Determine stage2 verdict
+        # Determine stage2 verdict.
+        #
+        # PR #69 F4: distinguish an INCOMPLETE verification from a genuine
+        # rejection. R4-7 made the verifier fail-safe — on its four degenerate
+        # paths (unparseable text / no tool calls / max iterations / finish
+        # without `agree`) and on an adapter raise it returns ``agree=False``
+        # but preserves the Stage-1 verdict and flags ``incomplete=True``.
+        # ``agree=False`` alone is ambiguous: it can mean "Stage 2 disagreed"
+        # OR "Stage 2 could not complete". Mapping the latter to "rejected" is
+        # wrong (verify never rejected) and silently drops it from disclosures.
+        # Map incomplete → "unverified" so it renders distinctly and stays
+        # disclosure-eligible (surfaced for manual review).
         verification = finding.get("verification", {})
         if verification.get("agree", False):
             stage2_verdict = "confirmed" if finding.get("exploit_path") else "agreed"
+        elif verification.get("incomplete"):
+            stage2_verdict = "unverified"
         elif verification:
             stage2_verdict = "rejected"
         else:
@@ -603,10 +616,18 @@ def generate_disclosure_docs(
     all_usages = []
     count = 0
 
-    # Collect confirmed findings first
+    # Collect findings eligible for a disclosure document.
+    #
+    # PR #69 F4: include "unverified" alongside the confirmed verdicts. An
+    # "unverified" finding is a Stage-1 potential vulnerability whose Stage-2
+    # verification could NOT COMPLETE (degenerate path or adapter error). It is
+    # NOT a rejection — fail-safe, it must be SURFACED for manual review, not
+    # silently dropped. Generating its disclosure (clearly stamped via the
+    # ``stage2_verdict`` the disclosure prompt reads) keeps it on the triage
+    # radar. "rejected" stays excluded (Stage 2 actively downgraded it).
     confirmed = [
         (i, finding) for i, finding in enumerate(pipeline_data["findings"], 1)
-        if finding.get("stage2_verdict") in ("confirmed", "agreed", "vulnerable")
+        if finding.get("stage2_verdict") in ("confirmed", "agreed", "vulnerable", "unverified")
     ]
 
     if not confirmed:

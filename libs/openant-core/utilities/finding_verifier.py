@@ -227,6 +227,16 @@ class VerificationResult:
     total_tokens: int
     exploit_path: Optional[ExploitPath] = None
     security_weakness: Optional[str] = None
+    # First-class "incomplete verification" state (PR #69 F4/F5). True on the
+    # four degenerate fail-safe paths (unparseable text, no tool calls, max
+    # iterations, finish-without-agree) where Stage 2 could NOT COMPLETE a
+    # verdict. Distinct from a genuine disagreement: those paths keep
+    # ``agree=False`` + ``correct_finding=finding`` (the Stage-1 verdict is
+    # preserved, the finding stays surfaced), but downstream consumers must
+    # NOT read ``agree=False`` here as "Stage 2 actively rejected". This flag
+    # lets the reporter render "unverified" (not "rejected") and lets the
+    # metrics bucket it as needs-review (not "safe").
+    incomplete: bool = False
 
     def to_dict(self) -> dict:
         result = {
@@ -240,6 +250,9 @@ class VerificationResult:
             result["exploit_path"] = self.exploit_path.to_dict()
         if self.security_weakness:
             result["security_weakness"] = self.security_weakness
+        # Always serialize the incomplete flag so downstream consumers
+        # (core/reporter.py, core/verifier.py) can branch on it explicitly.
+        result["incomplete"] = self.incomplete
         return result
 
 
@@ -376,13 +389,22 @@ class FindingVerifier:
                 if result:
                     return result
 
-                # Default: agree with Stage 1
+                # Fail-safe (R4-7): a degenerate path must NOT auto-agree with
+                # Stage 1 (that reads downstream as "Verification agreed" — a
+                # silent rubber-stamp for a security verifier). Mark agree=False
+                # so it never reads as agreed/clean, but PRESERVE the Stage-1
+                # verdict in correct_finding so the finding stays surfaced:
+                # the agree=False consumer (:644-651, experiment.py:775-778)
+                # sets result["finding"] = correct_finding, and the report
+                # filters on that field — using "inconclusive" here would drop
+                # a Stage-1 "vulnerable" from the report entirely.
                 return VerificationResult(
-                    agree=True,
+                    agree=False,
                     correct_finding=finding,
                     explanation="Verification incomplete",
                     iterations=iterations,
-                    total_tokens=total_input_tokens + total_output_tokens
+                    total_tokens=total_input_tokens + total_output_tokens,
+                    incomplete=True,
                 )
 
             # Process tool calls
@@ -445,12 +467,15 @@ class FindingVerifier:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                 )
+                # Fail-safe (R4-7): see the :380 path above. Don't auto-agree;
+                # keep the Stage-1 verdict surfaced for human triage.
                 return VerificationResult(
-                    agree=True,
+                    agree=False,
                     correct_finding=finding,
                     explanation="Verification incomplete (no tool calls)",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
+                    incomplete=True,
                 )
             messages.append(Message(role="user", content=list(tool_results)))
 
@@ -461,12 +486,15 @@ class FindingVerifier:
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
         )
+        # Fail-safe (R4-7): exhausting the iteration budget is not agreement.
+        # Don't auto-agree; keep the Stage-1 verdict surfaced for human triage.
         return VerificationResult(
-            agree=True,
+            agree=False,
             correct_finding=finding,
             explanation="Max iterations reached",
             iterations=iterations,
-            total_tokens=total_input_tokens + total_output_tokens
+            total_tokens=total_input_tokens + total_output_tokens,
+            incomplete=True,
         )
 
     def verify_batch(
@@ -656,7 +684,21 @@ class FindingVerifier:
 
         except Exception as e:
             detail = "error"
-            print(f"[Verify] ERROR {route_key}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            # L4 (PR #69 round-5): record the error ON the result dict, not just
+            # in the local ``detail``. The downstream counter (core/verifier.py)
+            # buckets on ``r.get("error")``; without this the errored finding
+            # falls through to "disagreed" and is folded into the ``safe`` count.
+            # Fail-safe: an adapter raise (e.g. R4-1/R4-2 empty/refusal) must
+            # NEVER read as safe — it is unverified and needs manual review.
+            err_msg = f"{type(e).__name__}: {e}"
+            result["error"] = err_msg
+            # Surface a minimal verification dict marked incomplete so any
+            # consumer that branches on ``verification.incomplete`` also treats
+            # it as needs-review rather than a clean verdict.
+            result.setdefault("verification", {})
+            result["verification"]["incomplete"] = True
+            result["verification_note"] = f"Verification errored: {err_msg}"
+            print(f"[Verify] ERROR {route_key}: {err_msg}", file=sys.stderr, flush=True)
 
         unit_elapsed = time.monotonic() - unit_start
         usage = self.tracker.get_unit_usage()
@@ -921,14 +963,28 @@ class FindingVerifier:
                 path_broken_at=ep.get("path_broken_at")
             )
 
+        # Fail-safe (R4-7): a `finish` call that omits `agree` must NOT
+        # default to agreement — an absent field is not a confirmed verdict.
+        # Default to False so it can never silently read as "Verification
+        # agreed"; correct_finding still falls back to the Stage-1 verdict,
+        # keeping the finding surfaced.
+        #
+        # F4/F5: an absent `agree` is the fourth degenerate path — the model
+        # finished without asserting a verdict, so the verification did NOT
+        # COMPLETE. Mark it incomplete so downstream reads "unverified" /
+        # needs-review rather than "rejected" / "safe". A finish call that DOES
+        # carry `agree` (True or False) is a real, completed verdict and stays
+        # incomplete=False.
+        agree_missing = "agree" not in finish_result
         return VerificationResult(
-            agree=finish_result.get("agree", True),
+            agree=finish_result.get("agree", False),
             correct_finding=finish_result.get("correct_finding", original_finding),
             explanation=finish_result.get("explanation", ""),
             iterations=iterations,
             total_tokens=total_tokens,
             exploit_path=exploit_path,
-            security_weakness=finish_result.get("security_weakness")
+            security_weakness=finish_result.get("security_weakness"),
+            incomplete=agree_missing,
         )
 
     def _try_parse_text_response(

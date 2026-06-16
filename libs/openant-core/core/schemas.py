@@ -80,6 +80,11 @@ class AnalysisMetrics:
     verified: int = 0
     stage2_agreed: int = 0
     stage2_disagreed: int = 0
+    # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
+    # (degenerate path or adapter error). These are preserved Stage-1
+    # potential vulnerabilities awaiting manual review — they must NOT be
+    # folded into ``safe``.
+    needs_review: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -198,6 +203,11 @@ class VerifyResult:
     agreed: int = 0
     disagreed: int = 0
     confirmed_vulnerabilities: int = 0
+    # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
+    # (degenerate path or adapter error). Counted separately so the scanner
+    # never folds them into ``safe``.
+    needs_review: int = 0
+    error_count: int = 0
     usage: UsageInfo = field(default_factory=UsageInfo)
 
     def to_dict(self) -> dict:
@@ -208,6 +218,8 @@ class VerifyResult:
             "agreed": self.agreed,
             "disagreed": self.disagreed,
             "confirmed_vulnerabilities": self.confirmed_vulnerabilities,
+            "needs_review": self.needs_review,
+            "error_count": self.error_count,
             "usage": self.usage.to_dict(),
         }
 

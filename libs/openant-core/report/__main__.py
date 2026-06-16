@@ -82,7 +82,9 @@ def cmd_disclosures(args):
     count = 0
 
     for i, finding in enumerate(pipeline_data["findings"], 1):
-        if finding.get("stage2_verdict") not in ("confirmed", "agreed", "vulnerable"):
+        # "unverified" (Stage-2 could not complete) is disclosure-eligible —
+        # consistent with core/reporter and report/generator.
+        if finding.get("stage2_verdict") not in ("confirmed", "agreed", "vulnerable", "unverified"):
             continue
 
         print(f"Generating disclosure for {finding['short_name']}...")

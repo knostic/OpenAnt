@@ -190,26 +190,16 @@ def run_verification(
 
     progress.finish()
 
-    # Count outcomes
-    agreed = 0
-    disagreed = 0
-    confirmed_vulnerabilities = 0
-    error_count = 0
-
-    for r in verified_results:
-        if r.get("error"):
-            error_count += 1
-            continue
-        verification = r.get("verification", {})
-        if verification.get("agree", False):
-            agreed += 1
-            finding = r.get("finding", "").lower()
-            if finding in ("vulnerable", "bypassable"):
-                confirmed_vulnerabilities += 1
-        else:
-            disagreed += 1
+    # Count outcomes (see _count_verification_outcomes for the bucketing rules).
+    _counts = _count_verification_outcomes(verified_results)
+    agreed = _counts["agreed"]
+    disagreed = _counts["disagreed"]
+    confirmed_vulnerabilities = _counts["confirmed_vulnerabilities"]
+    needs_review = _counts["needs_review"]
+    error_count = _counts["error_count"]
 
     print(f"\n[Verify] Results: {agreed} agreed, {disagreed} disagreed, "
+          f"{needs_review} need manual review, "
           f"{confirmed_vulnerabilities} confirmed vulnerabilities", file=sys.stderr)
     if error_count:
         print(f"[Verify] Errors: {error_count}", file=sys.stderr)
@@ -246,8 +236,54 @@ def run_verification(
         agreed=agreed,
         disagreed=disagreed,
         confirmed_vulnerabilities=confirmed_vulnerabilities,
+        needs_review=needs_review,
+        error_count=error_count,
         usage=tracking.get_usage(),
     )
+
+
+def _count_verification_outcomes(verified_results: list) -> dict:
+    """Bucket verified results into agreed / disagreed / needs_review / error.
+
+    PR #69 F5/L4 — the four buckets are mutually exclusive and, crucially,
+    keep "incomplete" and "errored" findings OUT of the path that the scanner
+    later folds into ``safe`` (``safe += disagreed``):
+
+      * ``error``        — ``result["error"]`` is set (adapter raised; L4). The
+                           verification could not run; never read as safe.
+      * ``needs_review`` — verification ran but could NOT COMPLETE
+                           (``verification.incomplete``). A preserved Stage-1
+                           potential vuln awaiting manual triage.
+      * ``agreed``       — Stage 2 completed and agreed; if the final finding is
+                           vulnerable/bypassable it is a confirmed vulnerability.
+      * ``disagreed``    — Stage 2 completed and actively disagreed (e.g.
+                           downgraded the verdict). ONLY this bucket is safe to
+                           fold into ``safe`` downstream.
+    """
+    counts = {
+        "agreed": 0,
+        "disagreed": 0,
+        "needs_review": 0,
+        "confirmed_vulnerabilities": 0,
+        "error_count": 0,
+    }
+    for r in verified_results:
+        if r.get("error"):
+            counts["error_count"] += 1
+            continue
+        verification = r.get("verification", {})
+        if verification.get("incomplete"):
+            # Could not complete — needs manual review, NOT a disagreement.
+            counts["needs_review"] += 1
+            continue
+        if verification.get("agree", False):
+            counts["agreed"] += 1
+            finding = r.get("finding", "").lower()
+            if finding in ("vulnerable", "bypassable"):
+                counts["confirmed_vulnerabilities"] += 1
+        else:
+            counts["disagreed"] += 1
+    return counts
 
 
 def _write_verified_results(

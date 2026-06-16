@@ -503,6 +503,8 @@ def scan_repository(
                 "agreed": verify_result.agreed,
                 "disagreed": verify_result.disagreed,
                 "confirmed_vulnerabilities": verify_result.confirmed_vulnerabilities,
+                "needs_review": verify_result.needs_review,
+                "error_count": verify_result.error_count,
             }
             ctx.outputs = {
                 "verified_results_path": verify_result.verified_results_path,
@@ -514,8 +516,17 @@ def scan_repository(
 
         print(f"  Confirmed: {verify_result.confirmed_vulnerabilities} vulnerabilities",
               file=sys.stderr)
+        if verify_result.needs_review:
+            print(f"  Needs manual review: {verify_result.needs_review} "
+                  f"(verification incomplete)", file=sys.stderr)
 
-        # Update metrics from verified results
+        # Update metrics from verified results.
+        #
+        # PR #69 F5: ONLY genuine Stage-2 disagreements (verdict downgraded)
+        # fold into ``safe``. Findings whose verification could not COMPLETE
+        # (``needs_review``) or that errored (``error_count``) must NOT inflate
+        # ``safe`` — they are preserved Stage-1 potential vulnerabilities
+        # awaiting manual review. Errors stay in the ``errors`` bucket.
         result.metrics = AnalysisMetrics(
             total=analyze_result.metrics.total,
             vulnerable=verify_result.confirmed_vulnerabilities,
@@ -523,10 +534,11 @@ def scan_repository(
             inconclusive=analyze_result.metrics.inconclusive,
             protected=analyze_result.metrics.protected,
             safe=analyze_result.metrics.safe + verify_result.disagreed,
-            errors=analyze_result.metrics.errors,
+            errors=analyze_result.metrics.errors + verify_result.error_count,
             verified=verify_result.findings_verified,
             stage2_agreed=verify_result.agreed,
             stage2_disagreed=verify_result.disagreed,
+            needs_review=verify_result.needs_review,
         )
     elif verify and not has_findings:
         print(_step_label("Skipping verification (no vulnerable findings)."),
@@ -820,6 +832,11 @@ def _print_summary(result: ScanResult) -> None:
     print(f"  Protected:      {result.metrics.protected}", file=sys.stderr)
     print(f"  Safe:           {result.metrics.safe}", file=sys.stderr)
     print(f"  Inconclusive:   {result.metrics.inconclusive}", file=sys.stderr)
+    # PR #69 F5: surface findings whose Stage-2 verification could not complete
+    # so they read distinctly from "safe" in the headline summary.
+    if result.metrics.needs_review:
+        print(f"  Needs review:   {result.metrics.needs_review} "
+              f"(verification incomplete)", file=sys.stderr)
     print(f"  Errors:         {result.metrics.errors}", file=sys.stderr)
     if result.metrics.verified:
         print(f"  Verified:       {result.metrics.verified} "

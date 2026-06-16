@@ -313,7 +313,10 @@ def generate_all(
     product_name = pipeline_data["repository"]["name"]
 
     for i, finding in enumerate(pipeline_data["findings"], 1):
-        if finding.get("stage2_verdict") not in ("confirmed", "agreed", "vulnerable"):
+        # "unverified" (Stage-2 could not complete) is disclosure-eligible:
+        # a degenerate verify must not silently drop a Stage-1 potential vuln
+        # from triage. Kept consistent with core/reporter.generate_disclosure_docs.
+        if finding.get("stage2_verdict") not in ("confirmed", "agreed", "vulnerable", "unverified"):
             continue
 
         print(f"Generating disclosure for {finding['short_name']}...")
