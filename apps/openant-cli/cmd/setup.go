@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/charmbracelet/x/term"
 	"github.com/knostic/open-ant-cli/internal/config"
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/spf13/cobra"
@@ -409,7 +410,10 @@ func promptNewProvider(reader *bufio.Reader, name string) (config.ProviderEntry,
 		if hint, ok := apiKeyHints[provType]; ok {
 			fmt.Fprintln(os.Stderr, hint)
 		}
-		apiKey, err := promptString(reader, "API key (paste; leave blank to read from environment)", "")
+		// No-echo read so the pasted key never lands in the terminal
+		// scrollback. Blank input is still allowed (read from env), and
+		// on a non-TTY this transparently falls back to a normal line read.
+		apiKey, err := promptSecret(reader, "API key (paste; leave blank to read from environment)")
 		if err != nil {
 			return config.ProviderEntry{}, err
 		}
@@ -465,6 +469,38 @@ func promptString(reader *bufio.Reader, prompt, defaultVal string) (string, erro
 		return defaultVal, nil
 	}
 	return line, nil
+}
+
+// promptSecret reads a single secret line (e.g. an API key) WITHOUT
+// echoing it to the terminal — closing the shoulder-surf / scrollback
+// leak that the plain ``promptString`` path left open for the API key.
+//
+// On an interactive terminal it uses term.ReadPassword (no echo) and
+// prints a trailing newline to stderr (the no-echo read swallows the
+// user's Enter). When stdin is NOT a terminal — piped/scripted input,
+// CI, or the test suite — there is no echo to suppress and ReadPassword
+// would error on the non-TTY fd, so it falls back to the ordinary
+// reader-based ``promptString`` path. This keeps scripted setup and the
+// existing tests working while protecting real interactive use.
+//
+// The prompt is written to stderr (like every other wizard prompt) so
+// the secret read composes with shell redirection of stdout.
+func promptSecret(reader *bufio.Reader, prompt string) (string, error) {
+	if !term.IsTerminal(os.Stdin.Fd()) {
+		// Non-interactive: nothing to hide, and ReadPassword can't
+		// operate on a pipe — defer to the standard line read.
+		return promptString(reader, prompt, "")
+	}
+	fmt.Fprintf(os.Stderr, "%s: ", prompt)
+	raw, err := term.ReadPassword(os.Stdin.Fd())
+	// ReadPassword consumes the Enter keystroke without echoing it, so
+	// emit the newline ourselves to keep subsequent output on its own
+	// line — even on the error path.
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(raw)), nil
 }
 
 // promptRequired loops until the user supplies a non-empty value.

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"net/http"
 	"os"
@@ -43,9 +44,15 @@ func validateAPIKey(key string) error {
 }
 
 var setAPIKeyCmd = &cobra.Command{
-	Use:   "set-api-key <key>",
+	Use:   "set-api-key [key]",
 	Short: "Save your Anthropic API key",
 	Long: `Save your Anthropic API key to the OpenAnt config file.
+
+Run without an argument to be prompted for the key interactively. The
+prompt does NOT echo what you type/paste, so the key never lands in your
+terminal scrollback:
+
+  openant set-api-key
 
 The key is stored in ~/.config/openant/config.json with restricted
 permissions (0600). This is required before running enhance, analyze,
@@ -53,14 +60,34 @@ verify, or scan.
 
 Get an API key at https://console.anthropic.com/settings/keys
 
-Examples:
-  openant set-api-key sk-ant-api03-...`,
-	Args: cobra.ExactArgs(1),
+You may also pass the key as an argument for back-compat:
+
+  openant set-api-key sk-ant-api03-...
+
+WARNING: passing the key as an argument exposes it to your shell history
+and to other users via process listings (e.g. ` + "`ps`" + `). Prefer the
+interactive no-echo prompt above.`,
+	Args: cobra.MaximumNArgs(1),
 	Run:  runSetAPIKey,
 }
 
 func runSetAPIKey(cmd *cobra.Command, args []string) {
-	key := strings.TrimSpace(args[0])
+	var key string
+	if len(args) == 1 {
+		// Back-compat: key passed as an argv. Exposed to shell history /
+		// `ps`; the command help warns against this.
+		key = strings.TrimSpace(args[0])
+	} else {
+		// No argv: read the key interactively WITHOUT echo (falls back to
+		// a plain line read when stdin is not a terminal — pipes, CI).
+		reader := bufio.NewReader(os.Stdin)
+		k, err := promptSecret(reader, "Anthropic API key")
+		if err != nil {
+			output.PrintError(err.Error())
+			os.Exit(1)
+		}
+		key = strings.TrimSpace(k)
+	}
 	if key == "" {
 		output.PrintError("API key cannot be empty")
 		os.Exit(1)
