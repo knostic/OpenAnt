@@ -138,6 +138,23 @@ class FunctionExtractor:
                 return True
         return False
 
+    def _extract_trait_names(self, use_node, source: bytes) -> List[str]:
+        """Extract trait names from an in-class `use_declaration` node.
+
+        Handles grouped uses (`use A, B\\C;`). Each trait is a `name` or
+        `qualified_name` child; namespace-qualified names are reduced to their
+        last segment so resolution matches the trait's unqualified class name.
+        """
+        names = []
+        for child in use_node.children:
+            if child.type in ('name', 'qualified_name'):
+                trait = self._node_text(child, source)
+                if '\\' in trait:
+                    trait = trait.rsplit('\\', 1)[-1]
+                if trait:
+                    names.append(trait)
+        return names
+
     def _get_visibility(self, node, source: bytes) -> Optional[str]:
         """Extract visibility modifier from a method_declaration node."""
         for child in node.children:
@@ -306,6 +323,7 @@ class FunctionExtractor:
                 if new_class_name:
                     class_id = f"{relative_path}:{new_class_name}"
                     methods = []
+                    traits = []
                     # Find declaration_list (class body)
                     body_node = node.child_by_field_name('body')
                     if body_node is None:
@@ -323,6 +341,13 @@ class FunctionExtractor:
                                         methods.append(f"static:{mname}")
                                     else:
                                         methods.append(mname)
+                            elif child.type == 'use_declaration':
+                                # In-class `use TraitA, NS\TraitB;` composes traits into the class.
+                                # tree-sitter-php emits this as `use_declaration` (distinct from the
+                                # top-level `namespace_use_declaration`), with each trait as a
+                                # `name`/`qualified_name` child. Record the unqualified trait name so
+                                # the call-graph builder can resolve $this->/self:: into the trait.
+                                traits.extend(self._extract_trait_names(child, source))
 
                     self.classes[class_id] = {
                         'name': new_class_name,
@@ -330,6 +355,7 @@ class FunctionExtractor:
                         'start_line': node.start_point[0] + 1,
                         'end_line': node.end_point[0] + 1,
                         'methods': methods,
+                        'traits': traits,
                         'superclass': superclass,
                         'interfaces': interfaces,
                         'namespace_name': namespace_name,
