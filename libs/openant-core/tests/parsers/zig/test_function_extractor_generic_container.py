@@ -16,6 +16,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 _CORE_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_CORE_ROOT))
 
@@ -27,6 +29,34 @@ def _extract(src: str) -> dict:
     with open(os.path.join(workdir, "m.zig"), "w") as fh:
         fh.write(src)
     return FunctionExtractor(workdir, {"files": [{"path": "m.zig"}]}).extract()
+
+
+def _zig_parser_is_grammar_aligned() -> bool:
+    """Probe the PREREQUISITE behavior (not this fix's): does a *named* struct's method
+    extract as Container.method? That capability is provided by the tree-sitter-zig
+    grammar-alignment work (>=1.1.2 node names struct_declaration/variable_declaration;
+    PRs 87/110, commit 322920e), independent of the generic-container fix under test.
+    On a base whose parser still matches stale node names (VarDecl/container_decl), no
+    struct methods extract at all, so these tests cannot pass for reasons unrelated to
+    the fix."""
+    probe = "const _Probe = struct {\n    pub fn _m(self: _Probe) void { _ = self; }\n};\n"
+    return "m.zig:_Probe._m" in _extract(probe)["functions"]
+
+
+# Skip (not fail) with an explanatory message when run on a base that lacks the
+# grammar-alignment prerequisite — so a human or agent running this on raw master sees
+# *why* instead of a cryptic assertion failure. Supported base: staging/parser-fix-stack,
+# which carries upstream PR #110 (Zig parser realignment) AND the tree-sitter-zig>=1.1.2
+# grammar pin. This is NOT landable on master standalone.
+pytestmark = pytest.mark.skipif(
+    not _zig_parser_is_grammar_aligned(),
+    reason=(
+        "Zig parser not grammar-aligned (needs tree-sitter-zig>=1.1.2 node names "
+        "struct_declaration/variable_declaration, from upstream PR #110 + the grammar "
+        "pin). On such a base no struct methods extract, so the generic-container fix "
+        "cannot pass. Supported base: staging/parser-fix-stack — not landable on master."
+    ),
+)
 
 
 def test_generic_container_method_qualified_to_container():

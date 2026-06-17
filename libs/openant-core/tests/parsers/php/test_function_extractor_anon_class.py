@@ -7,6 +7,12 @@ anonymous classes that both define e.g. handle() then collided on one unit id an
 later silently overwrote the earlier (data loss).
 
 Driven through the REAL extractor (FunctionExtractor.extract_all) on a temp .php file.
+
+DEPENDENCY (human reviewers + agents): this fix assumes the reworked
+`_extract_functions_from_tree` traversal added by upstream PR #111 (PHP parser). On raw
+`master` the PHP extractor has a materially different shape and these tests fail — this
+change is NOT landable on master standalone. Depends-on: #111. Base this on
+staging/parser-fix-stack (which already contains #111) to run it green.
 """
 
 import os
