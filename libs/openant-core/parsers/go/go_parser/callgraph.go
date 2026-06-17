@@ -214,17 +214,29 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 func (c *CallGraphBuilder) analyzeCallExpr(call *ast.CallExpr) CallInfo {
 	info := CallInfo{}
 
-	switch fun := call.Fun.(type) {
+	// Unwrap a generic instantiation so fn[T](), fn[K,V](), obj.M[T]() and obj.M[K,V]() are
+	// analyzed identically to their non-generic forms. A single type argument parses as
+	// *ast.IndexExpr, multiple as *ast.IndexListExpr; both wrap the underlying function
+	// expression (an Ident or a SelectorExpr) in .X.
+	fun := call.Fun
+	switch idx := fun.(type) {
+	case *ast.IndexExpr:
+		fun = idx.X
+	case *ast.IndexListExpr:
+		fun = idx.X
+	}
+
+	switch f := fun.(type) {
 	case *ast.Ident:
-		// Simple call: funcName()
-		info.Name = fun.Name
+		// Simple call: funcName() (or generic Gen[..]())
+		info.Name = f.Name
 
 	case *ast.SelectorExpr:
-		// Method or package call: obj.Method() or pkg.Func()
-		info.Name = fun.Sel.Name
+		// Method or package call: obj.Method() or pkg.Func() (or generic obj.M[..]())
+		info.Name = f.Sel.Name
 		info.IsMethod = true
 
-		switch x := fun.X.(type) {
+		switch x := f.X.(type) {
 		case *ast.Ident:
 			info.Receiver = x.Name
 			// Check if it looks like a package (lowercase) or object
@@ -240,12 +252,6 @@ func (c *CallGraphBuilder) analyzeCallExpr(call *ast.CallExpr) CallInfo {
 		case *ast.CallExpr:
 			// Result of another call: getObj().Method()
 			info.Receiver = "~call_result~"
-		}
-
-	case *ast.IndexExpr:
-		// Generic function call: fn[T]()
-		if ident, ok := fun.X.(*ast.Ident); ok {
-			info.Name = ident.Name
 		}
 	}
 
