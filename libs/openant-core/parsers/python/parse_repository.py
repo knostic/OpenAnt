@@ -55,7 +55,7 @@ from unit_generator import UnitGenerator
 from utilities.file_io import read_json, write_json, open_utf8
 
 
-def generate_analyzer_output(extractor_result: dict) -> dict:
+def generate_analyzer_output(extractor_result: dict, call_graph_result: dict | None = None) -> dict:
     """
     Generate analyzer_output.json format for Stage 2 verification.
 
@@ -65,9 +65,13 @@ def generate_analyzer_output(extractor_result: dict) -> dict:
 
     Args:
         extractor_result: Output from FunctionExtractor
+        call_graph_result: Optional CallGraphBuilder.export() result. When provided, the
+            top-level callGraph / reverseCallGraph are surfaced (matching the analyzer_output
+            schema consumed by dependency resolvers); omitted when None (back-compat).
 
     Returns:
-        Dict in analyzer_output.json format:
+        Dict in analyzer_output.json format (callGraph/reverseCallGraph included when
+        call_graph_result is provided):
         {
             "functions": {
                 "file.py:func_name": {
@@ -99,7 +103,16 @@ def generate_analyzer_output(extractor_result: dict) -> dict:
         if class_name:
             functions[func_id]["className"] = class_name
 
-    return {"functions": functions}
+    output = {"functions": functions}
+
+    # Surface the call graph top-level: the analyzer_output schema carries callGraph /
+    # reverseCallGraph (func_id -> [func_ids]), already computed in call_graph_result.
+    # (filePath is derived from the func_id key by consumers, so it is not a per-function field.)
+    if call_graph_result is not None:
+        output["callGraph"] = call_graph_result.get("call_graph", {})
+        output["reverseCallGraph"] = call_graph_result.get("reverse_call_graph", {})
+
+    return output
 
 
 def parse_repository(repo_path: str, options: dict = None) -> tuple:
@@ -191,8 +204,9 @@ def parse_repository(repo_path: str, options: dict = None) -> tuple:
     for unit_type, count in sorted(stats['by_type'].items()):
         print(f"    {unit_type}: {count}", file=sys.stderr)
 
-    # Generate analyzer output for Stage 2 verification
-    analyzer_output = generate_analyzer_output(extractor_result)
+    # Generate analyzer output for Stage 2 verification (pass the call graph so the output
+    # surfaces top-level callGraph / reverseCallGraph, matching the analyzer_output schema).
+    analyzer_output = generate_analyzer_output(extractor_result, call_graph_result)
     print(f"\n[Stage 2 Support] Generated analyzer output: {len(analyzer_output['functions'])} functions", file=sys.stderr)
 
     if output_dir:
