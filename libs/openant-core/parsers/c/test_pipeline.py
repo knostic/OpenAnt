@@ -68,6 +68,15 @@ class ProcessingLevel(Enum):
     EXPLOITABLE = "exploitable"
 
 
+# Pipeline stages that are OPTIONAL: they may fail or be skipped (e.g. CodeQL not installed, no entry
+# points) without the run being a failure. They record success=False on failure, so they must be
+# excluded from the overall-success conjunction -- otherwise an optional-stage failure forces exit 1.
+OPTIONAL_STAGES = frozenset({
+    'reachability_filter', 'codeql_analysis', 'codeql_filter',
+    'context_enhancer', 'exploitable_filter',
+})
+
+
 class CPipelineTest:
     def __init__(
         self,
@@ -376,6 +385,11 @@ class CPipelineTest:
                 codeql_db_path,
                 f'--language={language}',
                 f'--source-root={self.repo_path}',
+                # These repos carry extracted source with no build system to run, so use the
+                # build-mode-none extractor: a compiled language (cpp) is indexed without autobuild,
+                # which would otherwise fail/degrade on no-build/autotools repos and silently drop
+                # CodeQL findings.
+                '--build-mode=none',
                 '--overwrite'
             ]
 
@@ -817,6 +831,19 @@ class CPipelineTest:
             self.results['stages']['exploitable_filter'] = result
             return False
 
+    def _compute_success(self) -> bool:
+        """Overall success = all REQUIRED stages succeeded.
+
+        Optional stages (CodeQL, reachability filter, context enhancer, exploitable filter) write
+        success=False on failure/skip; ANDing them into overall success made an optional-stage
+        failure a spurious pipeline failure (exit 1). Exclude them from the conjunction.
+        """
+        return all(
+            stage.get('success', False)
+            for name, stage in self.results['stages'].items()
+            if name not in OPTIONAL_STAGES
+        )
+
     def run_full_pipeline(self):
         """Run the complete pipeline."""
         print("=" * 60)
@@ -875,10 +902,7 @@ class CPipelineTest:
         print("PIPELINE SUMMARY")
         print("=" * 60)
 
-        all_success = all(
-            stage.get('success', False)
-            for stage in self.results['stages'].values()
-        )
+        all_success = self._compute_success()
 
         self.results['success'] = all_success
 
