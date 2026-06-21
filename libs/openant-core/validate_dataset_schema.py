@@ -18,7 +18,7 @@ def validate_unit(unit, index):
     if not unit.get("id"):
         errors.append(f"Unit {index}: missing 'id'")
 
-    # 2. Check unit.code structure (experiment.py lines 186-196)
+    # 2. Check unit.code structure (built by experiment.py analyze_unit())
     code_field = unit.get("code", {})
     if not isinstance(code_field, dict):
         errors.append(f"Unit {index}: 'code' must be dict, got {type(code_field)}")
@@ -43,7 +43,7 @@ def validate_unit(unit, index):
     elif not isinstance(primary_origin.get(deps_inlined_key), bool):
         errors.append(f"Unit {index}: 'code.primary_origin.deps_inlined' must be bool")
 
-    # 6. CRITICAL: Check files_included (experiment.py line 192)
+    # 6. CRITICAL: Check files_included (set by experiment.py analyze_unit())
     if "files_included" not in primary_origin:
         errors.append(f"Unit {index}: MISSING 'code.primary_origin.files_included'")
     elif not isinstance(primary_origin.get("files_included"), list):
