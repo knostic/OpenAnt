@@ -30,6 +30,7 @@ var (
 	analyzeAppContext     string
 	analyzeRepoPath       string
 	analyzeExploitOnly    bool
+	analyzeExploitAll     bool
 	analyzeLimit          int
 	analyzeLLMConfig      string
 	analyzeWorkers        int
@@ -43,12 +44,66 @@ func init() {
 	analyzeCmd.Flags().StringVar(&analyzeAnalyzerOutput, "analyzer-output", "", "Path to analyzer_output.json (for Stage 2)")
 	analyzeCmd.Flags().StringVar(&analyzeAppContext, "app-context", "", "Path to application_context.json")
 	analyzeCmd.Flags().StringVar(&analyzeRepoPath, "repo-path", "", "Path to the repository (for context correction)")
-	analyzeCmd.Flags().BoolVar(&analyzeExploitOnly, "exploitable-only", false, "Only analyze units classified as exploitable by enhancer")
+	analyzeCmd.Flags().BoolVar(&analyzeExploitAll, "exploitable-all", false, "Analyze units classified as exploitable or vulnerable_internal (safer, compensates for parser gaps)")
+	analyzeCmd.Flags().BoolVar(&analyzeExploitOnly, "exploitable-only", false, "Analyze only units classified as exploitable (strict, use after parser entry point fixes)")
+	analyzeCmd.MarkFlagsMutuallyExclusive("exploitable-all", "exploitable-only")
 	analyzeCmd.Flags().IntVar(&analyzeLimit, "limit", 0, "Max units to analyze (0 = no limit)")
 	analyzeCmd.Flags().StringVar(&analyzeLLMConfig, "llm-config", "", "Name of the llm-config in ~/.config/openant/config.json (defaults to the file's default_llm, or the built-in 'openant-default' if no config file exists).")
 	analyzeCmd.Flags().IntVar(&analyzeWorkers, "workers", 8, "Number of parallel workers for LLM steps (default: 8)")
 	analyzeCmd.Flags().StringVar(&analyzeCheckpoint, "checkpoint", "", "Path to checkpoint directory for save/resume")
 	analyzeCmd.Flags().IntVar(&analyzeBackoff, "backoff", 30, "Seconds to wait when rate-limited (default: 30)")
+}
+
+// buildAnalyzePyArgs assembles the argv passed to the Python `openant analyze`
+// subprocess. Extracted as a pure function (mirrors buildParsePyArgs) so the
+// flag-forwarding contract — including the exploitable filter parity with the
+// Python backend — is unit-testable without spawning Python.
+func buildAnalyzePyArgs(
+	datasetPath, output string,
+	verify bool,
+	analyzerOutput, appContext, repoPath string,
+	exploitOnly, exploitAll bool,
+	limit int,
+	llmConfig string,
+	workers int,
+	checkpoint string,
+	backoff int,
+) []string {
+	pyArgs := []string{"analyze", datasetPath, "--output", output}
+	if verify {
+		pyArgs = append(pyArgs, "--verify")
+	}
+	if analyzerOutput != "" {
+		pyArgs = append(pyArgs, "--analyzer-output", analyzerOutput)
+	}
+	if appContext != "" {
+		pyArgs = append(pyArgs, "--app-context", appContext)
+	}
+	if repoPath != "" {
+		pyArgs = append(pyArgs, "--repo-path", repoPath)
+	}
+	if exploitAll {
+		pyArgs = append(pyArgs, "--exploitable-all")
+	}
+	if exploitOnly {
+		pyArgs = append(pyArgs, "--exploitable-only")
+	}
+	if limit > 0 {
+		pyArgs = append(pyArgs, "--limit", fmt.Sprintf("%d", limit))
+	}
+	if llmConfig != "" {
+		pyArgs = append(pyArgs, "--llm-config", llmConfig)
+	}
+	if workers != 8 {
+		pyArgs = append(pyArgs, "--workers", fmt.Sprintf("%d", workers))
+	}
+	if checkpoint != "" {
+		pyArgs = append(pyArgs, "--checkpoint", checkpoint)
+	}
+	if backoff != 30 {
+		pyArgs = append(pyArgs, "--backoff", fmt.Sprintf("%d", backoff))
+	}
+	return pyArgs
 }
 
 func runAnalyze(cmd *cobra.Command, args []string) {
@@ -92,37 +147,12 @@ func runAnalyze(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	pyArgs := []string{"analyze", datasetPath, "--output", analyzeOutput}
-	if analyzeVerify {
-		pyArgs = append(pyArgs, "--verify")
-	}
-	if analyzeAnalyzerOutput != "" {
-		pyArgs = append(pyArgs, "--analyzer-output", analyzeAnalyzerOutput)
-	}
-	if analyzeAppContext != "" {
-		pyArgs = append(pyArgs, "--app-context", analyzeAppContext)
-	}
-	if analyzeRepoPath != "" {
-		pyArgs = append(pyArgs, "--repo-path", analyzeRepoPath)
-	}
-	if analyzeExploitOnly {
-		pyArgs = append(pyArgs, "--exploitable-only")
-	}
-	if analyzeLimit > 0 {
-		pyArgs = append(pyArgs, "--limit", fmt.Sprintf("%d", analyzeLimit))
-	}
-	if analyzeLLMConfig != "" {
-		pyArgs = append(pyArgs, "--llm-config", analyzeLLMConfig)
-	}
-	if analyzeWorkers != 8 {
-		pyArgs = append(pyArgs, "--workers", fmt.Sprintf("%d", analyzeWorkers))
-	}
-	if analyzeCheckpoint != "" {
-		pyArgs = append(pyArgs, "--checkpoint", analyzeCheckpoint)
-	}
-	if analyzeBackoff != 30 {
-		pyArgs = append(pyArgs, "--backoff", fmt.Sprintf("%d", analyzeBackoff))
-	}
+	pyArgs := buildAnalyzePyArgs(
+		datasetPath, analyzeOutput, analyzeVerify,
+		analyzeAnalyzerOutput, analyzeAppContext, analyzeRepoPath,
+		analyzeExploitOnly, analyzeExploitAll, analyzeLimit,
+		analyzeLLMConfig, analyzeWorkers, analyzeCheckpoint, analyzeBackoff,
+	)
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())
 	if err != nil {
