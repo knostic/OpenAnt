@@ -9,6 +9,7 @@ explicitly, preventing ``'charmap' codec can't decode byte ...`` errors.
 import json
 import os
 import subprocess
+import tempfile
 from typing import Any, Union
 
 # Accept str, Path, or any os.PathLike
@@ -34,10 +35,31 @@ def read_json(path: PathLike) -> Any:
 
 
 def write_json(path: PathLike, data: Any, **kwargs) -> None:
-    """Write data as JSON to a file using UTF-8 encoding."""
+    """Write data as JSON to a file using UTF-8 encoding, atomically.
+
+    Serialize to a temp file in the same directory, fsync, then ``os.replace`` onto the
+    target. An interrupted write (SIGKILL / OOM / power loss) leaves the temp file behind
+    but never truncates or clobbers the existing target — the prior good copy survives.
+    """
     kwargs.setdefault("indent", 2)
-    with open_utf8(path, "w") as f:
-        json.dump(data, f, **kwargs)
+    target = os.fspath(path)
+    directory = os.path.dirname(target) or "."
+    # `.tmp` suffix (not `.json`): a leftover from a hard crash (where the except-cleanup
+    # below never runs) must not match directory scanners that do `endswith(".json")`
+    # (e.g. core/checkpoint.py's os.listdir loops, which also see dotfiles).
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, **kwargs)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def run_utf8(*args, **kwargs) -> subprocess.CompletedProcess:
