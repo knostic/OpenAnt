@@ -215,7 +215,7 @@ def build_pipeline_output(
     application_type: str = "web_app",
     processing_level: str | None = None,
     step_reports: list[dict] | None = None,
-) -> str:
+) -> tuple[str, int]:
     """Build ``pipeline_output.json`` from analysis results.
 
     Reads ``results.json`` or ``results_verified.json`` and transforms
@@ -234,7 +234,8 @@ def build_pipeline_output(
         step_reports: Optional list of step report dicts for duration/cost info.
 
     Returns:
-        The *output_path* written to.
+        A ``(output_path, findings_count)`` tuple: the *output_path* written
+        to and the number of findings emitted into ``pipeline_output.json``.
     """
     print(f"[Report] Building pipeline_output.json...", file=sys.stderr)
 
