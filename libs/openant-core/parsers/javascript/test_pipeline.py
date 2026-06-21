@@ -126,6 +126,11 @@ class PipelineTest:
         self.analyzer_output_file = None
         self.dataset_file = None
 
+        # Set when the repository contains zero JS-family source files. An empty
+        # repo is a valid 0-unit result (mirroring the Python/Ruby/Zig parsers),
+        # not a failure, so the downstream unit-generator stage is skipped.
+        self.empty_repo = False
+
         # Reachability data (populated if processing_level >= REACHABLE)
         self.entry_points: Set[str] = set()
         self.reachable_units: Set[str] = set()
@@ -278,8 +283,18 @@ class PipelineTest:
             files = [f['path'] for f in scan_data.get('files', [])]
 
         if not files:
-            print("No files to analyze")
-            return False
+            # A repository with zero JS-family source files is a valid 0-unit
+            # result, not a failure. The Python, Ruby and Zig parsers all handle
+            # an empty repo gracefully; previously the JS pipeline returned False
+            # here, which made run_full_pipeline early-return without
+            # results['success'], so main() did sys.exit(1) and the adapter's
+            # _parse_javascript raised RuntimeError, aborting the entire scan.
+            # Mirror the zig graceful-empty pattern: write empty analyzer and
+            # dataset outputs and report success so the adapter reads
+            # units_count=0.
+            print("No files to analyze; treating as empty repository (0 units)")
+            self._write_empty_outputs()
+            return True
 
         # Write file list to a temporary file to avoid command-line length limits
         file_list_path = os.path.join(self.output_dir, 'file_list.txt')
@@ -325,6 +340,56 @@ class PipelineTest:
                 print(f"Warning: could not write call_graph.json: {e}")
 
         return result.get('success', False)
+
+    def _write_empty_outputs(self) -> None:
+        """Write valid empty analyzer + dataset outputs for a zero-file repo.
+
+        Mirrors the zig parser's graceful-empty pattern so a repository with no
+        JS-family source files yields a valid 0-unit result instead of a fatal
+        non-zero exit. Records synthetic successful stage entries and sets
+        ``self.empty_repo`` so run_full_pipeline skips the unit-generator stage.
+        """
+        self.empty_repo = True
+
+        analyzer_output = {
+            "repository": self.repo_path,
+            "functions": {},
+            "callGraph": {},
+        }
+        write_json(self.analyzer_output_file, analyzer_output)
+
+        self.dataset_file = os.path.join(self.output_dir, 'dataset.json')
+        empty_dataset = {
+            "name": self.dataset_name or os.path.basename(self.repo_path),
+            "repository": self.repo_path,
+            "units": [],
+            "statistics": {"totalUnits": 0, "byType": {}},
+            "metadata": {"generator": "test_pipeline.py", "empty_repository": True},
+        }
+        write_json(self.dataset_file, empty_dataset)
+
+        call_graph_file = os.path.join(self.output_dir, 'call_graph.json')
+        write_json(call_graph_file, {"functions": {}, "call_graph": {}, "reverse_call_graph": {}})
+
+        empty_stage = {
+            'success': True,
+            'elapsed_seconds': 0.0,
+            'output_file': self.analyzer_output_file,
+            'summary': {'total_functions': 0, 'by_unit_type': {}, 'call_graph_entries': 0},
+        }
+        self.results['stages']['typescript_analyzer'] = empty_stage
+        self.results['stages']['unit_generator'] = {
+            'success': True,
+            'elapsed_seconds': 0.0,
+            'output_file': self.dataset_file,
+            'summary': {
+                'total_units': 0,
+                'by_type': {},
+                'units_with_dependencies': 0,
+                'call_graph_edges': 0,
+                'avg_out_degree': 0,
+            },
+        }
 
     def run_stage_with_stdout_capture(self, name: str, command: list, output_file: str) -> dict:
         """Run a stage that outputs JSON to stdout, capturing to a file."""
@@ -1099,6 +1164,18 @@ class PipelineTest:
         # Stage 2: TypeScript Analyzer
         if not self.run_typescript_analyzer():
             print("Pipeline stopped: TypeScript analyzer failed")
+            return self.results
+
+        # Empty repository (zero JS-family files): the analyzer already wrote
+        # valid empty outputs and recorded synthetic successful stages. There is
+        # nothing for the unit generator or optional downstream stages to do, so
+        # report success directly instead of crashing.
+        if self.empty_repo:
+            self.results['success'] = True
+            print("=" * 60)
+            print("PIPELINE SUMMARY")
+            print("=" * 60)
+            print(f"{SYM_OK} Empty repository: 0 units (graceful)")
             return self.results
 
         # Stage 3: Unit Generator
