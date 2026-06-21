@@ -232,11 +232,11 @@ def scan_repository(
     elif generate_context:
         print(_step_label("Skipping application context (module not available)."),
               file=sys.stderr)
-        result.skipped_steps.append("app-context")
+        _record_skip(result, "app-context", "module_unavailable")
     else:
         print(_step_label("Skipping application context (--no-context)."),
               file=sys.stderr)
-        result.skipped_steps.append("app-context")
+        _record_skip(result, "app-context", "not_requested")
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
@@ -365,7 +365,7 @@ def scan_repository(
             _load_step_report(output_dir, "llm-reachability")
         )
     else:
-        result.skipped_steps.append("llm-reachability")
+        _record_skip(result, "llm-reachability", "not_requested")
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
@@ -384,41 +384,51 @@ def scan_repository(
             "repo_path": repo_path,
             "mode": enhance_mode,
         }) as ctx:
-            enhance_result = enhance_dataset(
-                dataset_path=active_dataset_path,
-                output_path=enhanced_path,
-                analyzer_output_path=parse_result.analyzer_output_path,
-                repo_path=repo_path,
-                mode=enhance_mode,
-                registry=registry,
-                workers=workers,
-                backoff_seconds=backoff_seconds,
-                # checkpoint_path auto-derived from output_path
-            )
+            # Enhance is OPTIONAL: a failure here must not discard the completed
+            # parse work. Catch-and-continue (matching app-context /
+            # llm-reachability), since step_context re-raises otherwise.
+            try:
+                enhance_result = enhance_dataset(
+                    dataset_path=active_dataset_path,
+                    output_path=enhanced_path,
+                    analyzer_output_path=parse_result.analyzer_output_path,
+                    repo_path=repo_path,
+                    mode=enhance_mode,
+                    registry=registry,
+                    workers=workers,
+                    backoff_seconds=backoff_seconds,
+                    # checkpoint_path auto-derived from output_path
+                )
 
-            ctx.summary = {
-                "units_enhanced": enhance_result.units_enhanced,
-                "error_count": enhance_result.error_count,
-                "classifications": enhance_result.classifications,
-                "mode": enhance_mode,
-            }
-            if enhance_result.error_summary:
-                ctx.summary["error_summary"] = enhance_result.error_summary
-            ctx.outputs = {
-                "enhanced_dataset_path": enhance_result.enhanced_dataset_path,
-            }
+                ctx.summary = {
+                    "units_enhanced": enhance_result.units_enhanced,
+                    "error_count": enhance_result.error_count,
+                    "classifications": enhance_result.classifications,
+                    "mode": enhance_mode,
+                }
+                if enhance_result.error_summary:
+                    ctx.summary["error_summary"] = enhance_result.error_summary
+                ctx.outputs = {
+                    "enhanced_dataset_path": enhance_result.enhanced_dataset_path,
+                }
 
-        result.enhanced_dataset_path = enhance_result.enhanced_dataset_path
-        active_dataset_path = enhance_result.enhanced_dataset_path
+                result.enhanced_dataset_path = enhance_result.enhanced_dataset_path
+                active_dataset_path = enhance_result.enhanced_dataset_path
+
+                print(f"  Enhanced: {enhance_result.units_enhanced} units", file=sys.stderr)
+                print(f"  Classifications: {enhance_result.classifications}", file=sys.stderr)
+                if enhance_result.error_summary:
+                    print(f"  Errors: {enhance_result.error_count} ({enhance_result.error_summary})", file=sys.stderr)
+            except Exception as e:
+                print(f"  WARNING: Enhancement failed: {e}", file=sys.stderr)
+                print("  Continuing with the un-enhanced dataset.", file=sys.stderr)
+                ctx.summary = {"skipped": True, "reason": str(e)}
+                _record_skip(result, "enhance", "failed")
+
         collected_step_reports.append(_load_step_report(output_dir, "enhance"))
-
-        print(f"  Enhanced: {enhance_result.units_enhanced} units", file=sys.stderr)
-        print(f"  Classifications: {enhance_result.classifications}", file=sys.stderr)
-        if enhance_result.error_summary:
-            print(f"  Errors: {enhance_result.error_count} ({enhance_result.error_summary})", file=sys.stderr)
     else:
         print(_step_label("Skipping enhancement (--no-enhance)."), file=sys.stderr)
-        result.skipped_steps.append("enhance")
+        _record_skip(result, "enhance", "not_requested")
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
@@ -486,68 +496,77 @@ def scan_repository(
             "results_path": analyze_result.results_path,
             "analyzer_output_path": parse_result.analyzer_output_path,
         }) as ctx:
-            verify_result = run_verification(
-                results_path=analyze_result.results_path,
-                output_dir=output_dir,
-                analyzer_output_path=parse_result.analyzer_output_path,
-                app_context_path=app_context_path,
-                repo_path=repo_path,
-                workers=workers,
-                backoff_seconds=backoff_seconds,
-                registry=registry,
-            )
+            # Verify is OPTIONAL: a failure here must not discard completed
+            # parse/analyze work (step_context re-raises otherwise).
+            try:
+                verify_result = run_verification(
+                    results_path=analyze_result.results_path,
+                    output_dir=output_dir,
+                    analyzer_output_path=parse_result.analyzer_output_path,
+                    app_context_path=app_context_path,
+                    repo_path=repo_path,
+                    workers=workers,
+                    backoff_seconds=backoff_seconds,
+                    registry=registry,
+                )
 
-            ctx.summary = {
-                "findings_input": verify_result.findings_input,
-                "findings_verified": verify_result.findings_verified,
-                "agreed": verify_result.agreed,
-                "disagreed": verify_result.disagreed,
-                "confirmed_vulnerabilities": verify_result.confirmed_vulnerabilities,
-                "needs_review": verify_result.needs_review,
-                "error_count": verify_result.error_count,
-            }
-            ctx.outputs = {
-                "verified_results_path": verify_result.verified_results_path,
-            }
+                ctx.summary = {
+                    "findings_input": verify_result.findings_input,
+                    "findings_verified": verify_result.findings_verified,
+                    "agreed": verify_result.agreed,
+                    "disagreed": verify_result.disagreed,
+                    "confirmed_vulnerabilities": verify_result.confirmed_vulnerabilities,
+                    "needs_review": verify_result.needs_review,
+                    "error_count": verify_result.error_count,
+                }
+                ctx.outputs = {
+                    "verified_results_path": verify_result.verified_results_path,
+                }
 
-        result.verified_results_path = verify_result.verified_results_path
-        active_results_path = verify_result.verified_results_path
+                result.verified_results_path = verify_result.verified_results_path
+                active_results_path = verify_result.verified_results_path
+
+                print(f"  Confirmed: {verify_result.confirmed_vulnerabilities} vulnerabilities",
+                      file=sys.stderr)
+                if verify_result.needs_review:
+                    print(f"  Needs manual review: {verify_result.needs_review} "
+                          f"(verification incomplete)", file=sys.stderr)
+
+                # Update metrics from verified results.
+                #
+                # PR #69 F5: ONLY genuine Stage-2 disagreements (verdict downgraded)
+                # fold into ``safe``. Findings whose verification could not COMPLETE
+                # (``needs_review``) or that errored (``error_count``) must NOT inflate
+                # ``safe`` — they are preserved Stage-1 potential vulnerabilities
+                # awaiting manual review. Errors stay in the ``errors`` bucket.
+                result.metrics = AnalysisMetrics(
+                    total=analyze_result.metrics.total,
+                    vulnerable=verify_result.confirmed_vulnerabilities,
+                    bypassable=0,
+                    inconclusive=analyze_result.metrics.inconclusive,
+                    protected=analyze_result.metrics.protected,
+                    safe=analyze_result.metrics.safe + verify_result.disagreed,
+                    errors=analyze_result.metrics.errors + verify_result.error_count,
+                    verified=verify_result.findings_verified,
+                    stage2_agreed=verify_result.agreed,
+                    stage2_disagreed=verify_result.disagreed,
+                    needs_review=verify_result.needs_review,
+                )
+            except Exception as e:
+                print(f"  WARNING: Verification failed: {e}", file=sys.stderr)
+                print("  Continuing with unverified Stage 1 results.", file=sys.stderr)
+                ctx.summary = {"skipped": True, "reason": str(e)}
+                _record_skip(result, "verify", "failed")
+
         collected_step_reports.append(_load_step_report(output_dir, "verify"))
-
-        print(f"  Confirmed: {verify_result.confirmed_vulnerabilities} vulnerabilities",
-              file=sys.stderr)
-        if verify_result.needs_review:
-            print(f"  Needs manual review: {verify_result.needs_review} "
-                  f"(verification incomplete)", file=sys.stderr)
-
-        # Update metrics from verified results.
-        #
-        # PR #69 F5: ONLY genuine Stage-2 disagreements (verdict downgraded)
-        # fold into ``safe``. Findings whose verification could not COMPLETE
-        # (``needs_review``) or that errored (``error_count``) must NOT inflate
-        # ``safe`` — they are preserved Stage-1 potential vulnerabilities
-        # awaiting manual review. Errors stay in the ``errors`` bucket.
-        result.metrics = AnalysisMetrics(
-            total=analyze_result.metrics.total,
-            vulnerable=verify_result.confirmed_vulnerabilities,
-            bypassable=0,
-            inconclusive=analyze_result.metrics.inconclusive,
-            protected=analyze_result.metrics.protected,
-            safe=analyze_result.metrics.safe + verify_result.disagreed,
-            errors=analyze_result.metrics.errors + verify_result.error_count,
-            verified=verify_result.findings_verified,
-            stage2_agreed=verify_result.agreed,
-            stage2_disagreed=verify_result.disagreed,
-            needs_review=verify_result.needs_review,
-        )
     elif verify and not has_findings:
         print(_step_label("Skipping verification (no vulnerable findings)."),
               file=sys.stderr)
-        result.skipped_steps.append("verify")
+        _record_skip(result, "verify", "no_candidates")
     else:
         print(_step_label("Skipping verification (--no-verify or not requested)."),
               file=sys.stderr)
-        result.skipped_steps.append("verify")
+        _record_skip(result, "verify", "not_requested")
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
@@ -589,7 +608,7 @@ def scan_repository(
         if not shutil.which("docker"):
             print(_step_label("Skipping dynamic test (Docker not found)."),
                   file=sys.stderr)
-            result.skipped_steps.append("dynamic-test")
+            _record_skip(result, "dynamic-test", "docker_unavailable")
         else:
             from core.dynamic_tester import run_tests
 
@@ -598,39 +617,48 @@ def scan_repository(
             with step_context("dynamic-test", output_dir, inputs={
                 "pipeline_output_path": pipeline_output_path,
             }) as ctx:
-                dt_result = run_tests(
-                    pipeline_output_path=pipeline_output_path,
-                    output_dir=output_dir,
-                    registry=registry,
-                )
+                # Dynamic test is OPTIONAL: a failure here must not discard
+                # completed work (step_context re-raises otherwise).
+                try:
+                    dt_result = run_tests(
+                        pipeline_output_path=pipeline_output_path,
+                        output_dir=output_dir,
+                        registry=registry,
+                    )
 
-                ctx.summary = {
-                    "findings_tested": dt_result.findings_tested,
-                    "confirmed": dt_result.confirmed,
-                    "not_reproduced": dt_result.not_reproduced,
-                    "blocked": dt_result.blocked,
-                    "inconclusive": dt_result.inconclusive,
-                    "errors": dt_result.errors,
-                }
-                ctx.outputs = {
-                    "results_json_path": dt_result.results_json_path,
-                    "results_md_path": dt_result.results_md_path,
-                }
+                    ctx.summary = {
+                        "findings_tested": dt_result.findings_tested,
+                        "confirmed": dt_result.confirmed,
+                        "not_reproduced": dt_result.not_reproduced,
+                        "blocked": dt_result.blocked,
+                        "inconclusive": dt_result.inconclusive,
+                        "errors": dt_result.errors,
+                    }
+                    ctx.outputs = {
+                        "results_json_path": dt_result.results_json_path,
+                        "results_md_path": dt_result.results_md_path,
+                    }
 
-            result.dynamic_test_path = dt_result.results_json_path
+                    result.dynamic_test_path = dt_result.results_json_path
+
+                    print(f"  Dynamic test: {dt_result.confirmed} confirmed, "
+                          f"{dt_result.not_reproduced} not reproduced", file=sys.stderr)
+                except Exception as e:
+                    print(f"  WARNING: Dynamic test failed: {e}", file=sys.stderr)
+                    print("  Continuing without dynamic-test results.", file=sys.stderr)
+                    ctx.summary = {"skipped": True, "reason": str(e)}
+                    _record_skip(result, "dynamic-test", "failed")
+
             collected_step_reports.append(
                 _load_step_report(output_dir, "dynamic-test"),
             )
-
-            print(f"  Dynamic test: {dt_result.confirmed} confirmed, "
-                  f"{dt_result.not_reproduced} not reproduced", file=sys.stderr)
     elif dynamic_test and not has_findings:
         print(_step_label("Skipping dynamic test (no findings to test)."),
               file=sys.stderr)
-        result.skipped_steps.append("dynamic-test")
+        _record_skip(result, "dynamic-test", "no_candidates")
     else:
         print(_step_label("Skipping dynamic test (not enabled)."), file=sys.stderr)
-        result.skipped_steps.append("dynamic-test")
+        _record_skip(result, "dynamic-test", "not_requested")
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
@@ -677,7 +705,7 @@ def scan_repository(
         collected_step_reports.append(_load_step_report(output_dir, "report"))
     else:
         print(_step_label("Skipping report generation (--no-report)."), file=sys.stderr)
-        result.skipped_steps.append("report")
+        _record_skip(result, "report", "not_requested")
     print(file=sys.stderr)
 
     # ---------------------------------------------------------------
@@ -721,6 +749,19 @@ def _count_steps(
     return count
 
 
+def _record_skip(result: ScanResult, step: str, reason: str) -> None:
+    """Record that ``step`` was skipped.
+
+    Appends the bare step name to ``result.skipped_steps`` (UNCHANGED behaviour
+    — telemetry consumers read this flat list) and ADDITIVELY records the
+    disambiguated cause in ``result.skipped_step_reasons`` so distinct causes
+    (e.g. verify auto-skip 'no_candidates' vs opt-out 'not_requested') are no
+    longer conflated to one bare string.
+    """
+    result.skipped_steps.append(step)
+    result.skipped_step_reasons[step] = reason
+
+
 def _load_step_report(output_dir: str, step: str) -> dict:
     """Load a step report JSON from disk. Returns empty dict on failure."""
     path = os.path.join(output_dir, f"{step}.report.json")
@@ -762,6 +803,9 @@ def _write_scan_report(
             "metrics": result.metrics.to_dict(),
             "steps_completed": [sr.get("step") for sr in step_reports],
             "steps_skipped": result.skipped_steps,
+            # ADDITIVE / non-breaking: disambiguated skip cause per step.
+            # `steps_skipped` above stays a flat bare list (consumers read it).
+            "steps_skipped_reasons": result.skipped_step_reasons,
         },
         inputs={"repo_path": result.output_dir.replace(os.path.abspath("."), ".")},
         outputs={

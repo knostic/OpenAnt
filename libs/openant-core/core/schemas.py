@@ -140,6 +140,11 @@ class ScanResult:
     usage: UsageInfo = field(default_factory=UsageInfo)
     step_reports: list = field(default_factory=list)
     skipped_steps: list = field(default_factory=list)
+    # Disambiguated skip cause per skipped step. ADDITIVE / non-breaking:
+    # `skipped_steps` stays a flat bare list of step names (telemetry consumers
+    # read it). This map records WHY each step was skipped (e.g. 'verify' ->
+    # 'no_candidates' for an auto-skip vs 'not_requested' for an opt-out).
+    skipped_step_reasons: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -160,6 +165,7 @@ class ScanResult:
             "usage": self.usage.to_dict(),
             "step_reports": self.step_reports,
             "skipped_steps": self.skipped_steps,
+            "skipped_step_reasons": self.skipped_step_reasons,
         }
 
 
