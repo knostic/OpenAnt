@@ -398,3 +398,68 @@ module.exports = router;
     assert any(
         f.get("name") == "namedHandler" for f in out["functions"].values()
     )
+
+
+# --- route REGISTRATION broadened to Fastify/Koa --------
+
+def test_fastify_inline_handler_synthesised(tmp_path):
+    """fastify.get('/users', async (request, reply) => {...}) must synthesise a
+    route_handler unit (is_entry_point) even though the receiver is `fastify`,
+    not an Express app/router. Express-only registration would skip it."""
+    file_path = _write_fixture(
+        tmp_path,
+        "fastify_route",
+        """
+const fastify = require('fastify')();
+fastify.get('/users', async (request, reply) => {
+  return { users: [] };
+});
+""",
+    )
+    repo = file_path.parent
+    out = _analyze(repo, file_path)
+    express_funcs = {k: v for k, v in out["functions"].items() if "express(" in k}
+    assert len(express_funcs) == 1, (
+        f"expected 1 synthesised Fastify handler, got {list(express_funcs)}"
+    )
+    fid, fdata = next(iter(express_funcs.items()))
+    assert fdata["unitType"] == "route_handler"
+    assert fdata["isEntryPoint"] is True
+    meta = fdata["routeMetadata"]
+    assert meta["http_method"] == "GET"
+    assert meta["http_path"] == "/users"
+
+    # End-to-end through unit_generator: is_entry_point must survive.
+    analyzer_path = tmp_path / "analyzer.json"
+    analyzer_path.write_text(json.dumps(out))
+    dataset_path = tmp_path / "dataset.json"
+    dataset = _generate_units(analyzer_path, dataset_path)
+    handler_unit = next(u for u in dataset["units"] if u["id"] == fid)
+    assert handler_unit["unit_type"] == "route_handler"
+    assert handler_unit["is_entry_point"] is True
+
+
+def test_koa_inline_handler_synthesised(tmp_path):
+    """Bare `koa.get('/x', ctx => {})` must also synthesise a route handler.
+    (router.get already works because `router` is an Express stem; this checks
+    the additional `koa` receiver stem.)"""
+    file_path = _write_fixture(
+        tmp_path,
+        "koa_route",
+        """
+const Koa = require('koa');
+const koa = new Koa();
+koa.get('/x', ctx => { ctx.body = 'hi'; });
+""",
+    )
+    repo = file_path.parent
+    out = _analyze(repo, file_path)
+    express_funcs = {k: v for k, v in out["functions"].items() if "express(" in k}
+    assert len(express_funcs) == 1, (
+        f"expected 1 synthesised Koa handler, got {list(express_funcs)}"
+    )
+    fid, fdata = next(iter(express_funcs.items()))
+    assert fdata["unitType"] == "route_handler"
+    assert fdata["isEntryPoint"] is True
+    assert fdata["routeMetadata"]["http_method"] == "GET"
+    assert fdata["routeMetadata"]["http_path"] == "/x"
