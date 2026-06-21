@@ -186,6 +186,12 @@ func Save(cfg *Config) error {
 		_ = os.Remove(backup)
 	}
 
+	// os.WriteFile only applies the mode when it CREATES the file; a pre-existing config
+	// may hold an API key under looser permissions, so enforce 0600 explicitly (CWE-732).
+	if err := os.Chmod(path, 0600); err != nil {
+		return fmt.Errorf("failed to restrict config permissions: %w", err)
+	}
+
 	return nil
 }
 
