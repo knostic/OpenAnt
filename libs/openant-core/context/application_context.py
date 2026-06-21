@@ -272,6 +272,32 @@ def get_directory_structure(repo_path: Path, max_depth: int = 2) -> str:
     return "\n".join(lines[:100])  # Limit output
 
 
+# Directory names (exact path SEGMENTS, not substrings) to skip when scanning for entry points.
+_PY_EXCLUDE_DIRS = {'node_modules', '__pycache__', 'venv', '.venv', 'test', 'tests'}
+_JS_EXCLUDE_DIRS = {'node_modules', 'dist', 'build'}
+
+
+def _path_excluded(file_path: Path, repo_path: Path, exclude_dirs: set, anchored_test: bool = False) -> bool:
+    """Whether file_path should be skipped, matching on relative-path COMPONENTS.
+
+    Anchors on path *segments* relative to repo_path rather than a substring of the absolute
+    path, so a parent directory or a partial token ('protest_api.py', 'latest/', 'redistribute.js')
+    no longer wrongly excludes a real entry point — and a token in some ancestor of repo_path
+    (e.g. a CI checkout under '/build/' or '/latest/') can no longer suppress every file.
+    """
+    try:
+        parts = file_path.relative_to(repo_path).parts
+    except ValueError:
+        parts = file_path.parts
+    if exclude_dirs.intersection(parts):
+        return True
+    if anchored_test:
+        name = file_path.name
+        if name.startswith("test_") or name.endswith("_test.py"):
+            return True
+    return False
+
+
 def detect_entry_points(repo_path: Path) -> str:
     """Detect entry point patterns in the codebase.
 
@@ -289,7 +315,7 @@ def detect_entry_points(repo_path: Path) -> str:
     for py_file in repo_path.rglob("*.py"):
         if files_checked >= max_files:
             break
-        if any(p in str(py_file) for p in ['node_modules', '__pycache__', 'venv', '.venv', 'test', 'tests']):
+        if _path_excluded(py_file, repo_path, _PY_EXCLUDE_DIRS, anchored_test=True):
             continue
 
         try:
@@ -309,7 +335,7 @@ def detect_entry_points(repo_path: Path) -> str:
 
     # Check JavaScript/TypeScript files
     for js_file in list(repo_path.rglob("*.js"))[:20] + list(repo_path.rglob("*.ts"))[:20]:
-        if any(p in str(js_file) for p in ['node_modules', 'dist', 'build']):
+        if _path_excluded(js_file, repo_path, _JS_EXCLUDE_DIRS):
             continue
 
         try:
