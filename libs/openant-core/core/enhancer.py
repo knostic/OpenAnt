@@ -46,7 +46,7 @@ def enhance_dataset(
         analyzer_output_path: Path to analyzer_output.json (required for agentic mode).
         repo_path: Path to the repository (required for agentic mode).
         mode: "agentic" (thorough, tool-use) or "single-shot" (fast, cheaper).
-        checkpoint_path: Path to save/resume checkpoint (agentic mode only).
+        checkpoint_path: Path to save/resume checkpoint (both modes).
             If None, auto-derived from output_path.
         registry: Pre-built PhaseRegistry. Scanners pass theirs;
             standalone callers leave this None and a registry is
@@ -75,8 +75,11 @@ def enhance_dataset(
     print(f"[Enhance] Mode: {mode}", file=sys.stderr)
     print(f"[Enhance] Provider: {binding.provider_name}, Model: {binding.model}", file=sys.stderr)
 
-    # Auto-derive checkpoint path for agentic mode
-    if mode == "agentic" and checkpoint_path is None:
+    # Auto-derive checkpoint path for BOTH modes so single-shot also resumes
+    # after an interrupt / cost-cap instead of reprocessing every unit
+    # Single-shot is the cheap, high-volume mode, so wasted
+    # re-enhancement there is the most costly to lose.
+    if checkpoint_path is None:
         output_dir = os.path.dirname(os.path.abspath(output_path))
         checkpoint_path = os.path.join(output_dir, "enhance_checkpoints")
 
@@ -125,6 +128,7 @@ def enhance_dataset(
             dataset,
             progress_callback=_on_unit_done,
             workers=workers,
+            checkpoint_path=checkpoint_path,
         )
     else:
         raise ValueError(f"Unknown enhancement mode: {mode}. Use 'agentic' or 'single-shot'.")

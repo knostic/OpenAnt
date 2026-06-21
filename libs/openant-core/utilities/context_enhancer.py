@@ -57,6 +57,11 @@ _null_logger.addHandler(logging.NullHandler())
 # constant is retained only for legacy log lines that reference it.
 CONTEXT_ENHANCEMENT_MODEL_LEGACY = "claude-sonnet-4-20250514"
 
+# Max bounded rounds of the post-loop transient-error retry. Each round
+# re-attempts units still carrying a retryable error; rounds stop early once
+# none remain or a round recovers nothing.
+MAX_RETRY_ROUNDS = 3
+
 
 def _build_error_info(exc: Exception) -> dict:
     """Build a structured error dict from an exception.
@@ -345,11 +350,17 @@ class ContextEnhancer:
         batch_size: int = 10,
         progress_callback: Optional[Callable] = None,
         workers: int = 10,
+        checkpoint_path: str = None,
     ) -> dict:
         """
         Enhance all units in a dataset (single-shot mode).
 
         Uses ThreadPoolExecutor for parallel processing when workers > 1.
+
+        Supports checkpoint/resume symmetrically with the agentic path
+        when ``checkpoint_path`` is provided, each completed
+        unit's ``llm_context`` is saved to its own file under that directory and
+        an interrupted run resumes without re-enhancing finished units.
 
         Args:
             dataset: The dataset from unit_generator.js
@@ -357,6 +368,8 @@ class ContextEnhancer:
             progress_callback: Optional callback(unit_id, classification, unit_elapsed)
                 called after each unit completes.
             workers: Number of parallel workers (default: 10).
+            checkpoint_path: Path to a checkpoint directory (enables resume).
+                When None, no checkpoints are written (prior behavior).
 
         Returns:
             Enhanced dataset
@@ -373,13 +386,41 @@ class ContextEnhancer:
 
         total = len(units)
 
+        # Checkpoint directory setup + resume (mirror enhance_dataset_agentic).
+        checkpoint_dir = None
+        processed_ids = set()
+        if checkpoint_path:
+            checkpoint_dir = (
+                checkpoint_path
+                if os.path.isdir(checkpoint_path) or not checkpoint_path.endswith(".json")
+                else os.path.splitext(checkpoint_path)[0] + "_checkpoints"
+            )
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            processed_ids = self._load_completed_units(checkpoint_dir, context_key="llm_context")
+            # Restore llm_context for already-completed units.
+            for unit in units:
+                unit_id = unit.get("id")
+                if unit_id in processed_ids:
+                    cp_file = os.path.join(checkpoint_dir, f"{self._safe_filename(unit_id)}.json")
+                    if os.path.exists(cp_file):
+                        cp_data = read_json(cp_file)
+                        unit["llm_context"] = cp_data.get("llm_context", {})
+                        if "code" in cp_data:
+                            unit["code"] = cp_data["code"]
+            if processed_ids:
+                self._log("info",
+                          f"Restored {len(processed_ids)} already-processed units from checkpoints",
+                          units=len(processed_ids))
+
         self._log("info", f"Enhancing {total} units with LLM context (single-shot mode)", units=total)
         self._log("info", f"Provider: {self.binding.provider_name}, Model: {self.binding.model}")
         mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
         self._log("info", f"Mode: {mode}")
 
-        # Build lookup dict for context gathering
+        # Build lookup dict for context gathering (over ALL units, so cross-unit
+        # context lookup still works even when some are restored/skipped).
         units_by_id = {u.get("id"): u for u in units}
+        units_to_process = [u for u in units if u.get("id") not in processed_ids]
 
         def _process_one(unit):
             """Process a single unit. Mutates unit in-place."""
@@ -389,20 +430,33 @@ class ContextEnhancer:
             ctx = unit.get("llm_context", {})
             classification = ctx.get("confidence", "unknown")
             worker = threading.current_thread().name
+            if checkpoint_dir:
+                self._save_unit_checkpoint(unit, checkpoint_dir, context_key="llm_context")
             return unit.get("id", "?"), str(classification), unit_elapsed, worker
 
         if workers <= 1:
-            for unit in units:
-                uid, classification, elapsed, _worker = _process_one(unit)
-                if progress_callback:
-                    progress_callback(uid, classification, elapsed)
+            try:
+                for unit in units_to_process:
+                    uid, classification, elapsed, _worker = _process_one(unit)
+                    if progress_callback:
+                        progress_callback(uid, classification, elapsed)
+            except KeyboardInterrupt:
+                self._log("warning", "Interrupted — progress saved to checkpoints")
+                return dataset
         else:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(_process_one, unit): unit for unit in units}
+            executor = ThreadPoolExecutor(max_workers=workers)
+            futures = {executor.submit(_process_one, unit): unit for unit in units_to_process}
+            try:
                 for future in as_completed(futures):
                     uid, classification, elapsed, worker = future.result()
                     if progress_callback:
                         progress_callback(uid, f"{classification}  [{worker}]", elapsed)
+            except KeyboardInterrupt:
+                self._log("warning", "Interrupted — cancelling pending work...")
+                executor.shutdown(wait=False, cancel_futures=True)
+                self._log("info", "Progress saved to checkpoints")
+                return dataset
+            executor.shutdown(wait=False)
 
         # Recompute stats from unit results (thread-safe)
         self.stats = {
@@ -694,23 +748,35 @@ class ContextEnhancer:
                 return dataset
             executor.shutdown(wait=False)
 
-        # Auto-retry failed units with transient errors (rate limit, connection, timeout, 5xx)
-        retryable_units = [
-            (i, unit) for i, unit in enumerate(units)
-            if is_retryable_error(unit.get("agent_context", {}).get("error"))
-        ]
-        if retryable_units:
+        # Auto-retry failed units with transient errors (rate limit, connection,
+        # timeout, 5xx). This is a BOUNDED MULTI-ROUND loop: a unit that fails
+        # again with a still-transient error gets re-attempted on the next round
+        # (up to MAX_RETRY_ROUNDS). The previous single-pass version abandoned a
+        # unit after one retry even if its error was still transient
+        # Rounds stop early once no retryable
+        # units remain or no progress is made.
+        for _retry_round in range(MAX_RETRY_ROUNDS):
+            retryable_units = [
+                (i, unit) for i, unit in enumerate(units)
+                if is_retryable_error(unit.get("agent_context", {}).get("error"))
+            ]
+            if not retryable_units:
+                break
+
             rate_limiter = get_rate_limiter()
             backoff = rate_limiter.time_until_ready()
             if backoff > 0:
                 self._log("info",
-                    f"Retrying {len(retryable_units)} failed units "
+                    f"Retry round {_retry_round + 1}/{MAX_RETRY_ROUNDS}: "
+                    f"{len(retryable_units)} failed units "
                     f"(waiting {backoff:.0f}s for rate limit to clear)...")
                 rate_limiter.wait_if_needed()
             else:
                 self._log("info",
-                    f"Retrying {len(retryable_units)} failed units (transient errors)...")
+                    f"Retry round {_retry_round + 1}/{MAX_RETRY_ROUNDS}: "
+                    f"{len(retryable_units)} failed units (transient errors)...")
 
+            round_recovered = 0
             # Retry sequentially to avoid re-triggering rate limit
             for i, unit in retryable_units:
                 # Clear previous error
@@ -719,6 +785,7 @@ class ContextEnhancer:
 
                 # Update summary: retry succeeded → flip error to completed
                 if classification != "error":
+                    round_recovered += 1
                     _summary_errors = max(0, _summary_errors - 1)
                     _summary_completed += 1
                     # Decrement the old error type count (best effort)
@@ -741,6 +808,11 @@ class ContextEnhancer:
 
                 if progress_callback:
                     progress_callback(uid, f"{classification} (retry)", elapsed)
+
+            # No unit recovered this round → further rounds would just repeat the
+            # same persistent failures. Stop to avoid burning quota.
+            if round_recovered == 0:
+                break
 
         # Write final summary with phase="done"
         if _summary_cp is not None:
@@ -790,20 +862,27 @@ class ContextEnhancer:
         from utilities.safe_filename import safe_filename
         return safe_filename(unit_id)
 
-    def _save_unit_checkpoint(self, unit: dict, checkpoint_dir: str):
-        """Save a single unit's result to its own checkpoint file."""
+    def _save_unit_checkpoint(self, unit: dict, checkpoint_dir: str, context_key: str = "agent_context"):
+        """Save a single unit's result to its own checkpoint file.
+
+        ``context_key`` selects which enhancement context to persist:
+        ``agent_context`` for agentic mode, ``llm_context`` for single-shot.
+        The key is recorded so resume knows where to restore.
+        """
         unit_id = unit.get("id", "unknown")
         filename = self._safe_filename(unit_id) + ".json"
         filepath = os.path.join(checkpoint_dir, filename)
+        ctx = unit.get(context_key, {})
         cp_data = {
             "id": unit_id,
-            "agent_context": unit.get("agent_context", {}),
+            "context_key": context_key,
+            context_key: ctx,
         }
         # Include code if it was modified by the agent
         if "code" in unit:
             cp_data["code"] = unit["code"]
-        # Include per-unit usage from agent_metadata
-        meta = cp_data["agent_context"].get("agent_metadata", {})
+        # Include per-unit usage from agent_metadata (agentic only)
+        meta = ctx.get("agent_metadata", {}) if isinstance(ctx, dict) else {}
         if meta.get("input_tokens") or meta.get("output_tokens"):
             cp_data["usage"] = {
                 "input_tokens": meta.get("input_tokens", 0),
@@ -812,8 +891,13 @@ class ContextEnhancer:
             }
         write_json(filepath, cp_data)
 
-    def _load_completed_units(self, checkpoint_dir: str) -> set:
-        """Load the set of completed unit IDs from per-unit checkpoint files."""
+    def _load_completed_units(self, checkpoint_dir: str, context_key: str = "agent_context") -> set:
+        """Load the set of completed unit IDs from per-unit checkpoint files.
+
+        A unit counts as completed if its persisted context (for the relevant
+        ``context_key``) is present and carries no error. Older agentic-only
+        checkpoints have no ``context_key`` field and are read as agent_context.
+        """
         completed = set()
         if not os.path.isdir(checkpoint_dir):
             return completed
@@ -824,8 +908,9 @@ class ContextEnhancer:
             try:
                 cp_data = read_json(filepath)
                 unit_id = cp_data.get("id")
-                agent_ctx = cp_data.get("agent_context", {})
-                if unit_id and agent_ctx and not agent_ctx.get("error"):
+                key = cp_data.get("context_key", context_key)
+                ctx = cp_data.get(key, {})
+                if unit_id and ctx and not (isinstance(ctx, dict) and ctx.get("error")):
                     completed.add(unit_id)
             except (json.JSONDecodeError, OSError):
                 continue
