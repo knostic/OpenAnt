@@ -35,6 +35,30 @@ from .reachability_analyzer import ReachabilityAnalyzer
 MAX_ITERATIONS = 20
 MAX_TOKENS_PER_RESPONSE = 4096
 
+# Input budget.
+# The conversation input had no budget: primary_code was inlined verbatim and
+# raw tool results were appended every iteration, so input grew unbounded until
+# it overflowed the model context (400). We cap each oversized input at its
+# consumption point. ~4 chars/token, so these stay well under the model window.
+MAX_PROMPT_CHARS = 60_000          # cap on inlined primary_code in the prompt
+MAX_TOOL_RESULT_CHARS = 24_000     # cap on each serialized tool result
+
+
+def cap_tool_result_content(result: dict, limit: int = MAX_TOOL_RESULT_CHARS) -> str:
+    """Serialize a tool result to JSON, truncating to ``limit`` chars.
+
+    Tool results (e.g. ``read_function`` returning a whole function body) are
+    otherwise appended raw to the conversation, growing the input without
+    bound across iterations. Small results round-trip as valid JSON; oversized
+    results are truncated with an explicit marker so the model knows content
+    was elided.
+    """
+    content = json.dumps(result)
+    if len(content) <= limit:
+        return content
+    marker = "\n... (truncated)"
+    return content[: limit - len(marker)] + marker
+
 
 # Convert the dict-form TOOL_DEFINITIONS list to typed ToolDef instances
 # once at import time so we're not rebuilding them on every iteration of
@@ -301,7 +325,7 @@ class ContextAgent:
                             ToolResultBlock(
                                 tool_use_id=tool_use_id,
                                 name=tool_name,
-                                content=json.dumps(tool_outcome),
+                                content=cap_tool_result_content(tool_outcome),
                             )
                         )
                         break
@@ -310,7 +334,7 @@ class ContextAgent:
                             ToolResultBlock(
                                 tool_use_id=tool_use_id,
                                 name=tool_name,
-                                content=json.dumps(tool_outcome),
+                                content=cap_tool_result_content(tool_outcome),
                             )
                         )
 
