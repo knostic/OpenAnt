@@ -268,9 +268,12 @@ class FunctionExtractor:
         if name in ("init", "create", "new"):
             return "constructor"
 
-        # Main entry point
+        # Main entry point. Classify as 'main' (matching the C and Go parsers)
+        # so the reachability seeder recognises a Zig binary's program entry —
+        # 'main' is an ENTRY_POINT_TYPE. Returning the generic 'function' here
+        # left every Zig binary with zero seeded entry points.
         if name == "main":
-            return "function"
+            return "main"
 
         return "function"
 

@@ -188,51 +188,66 @@ def apply_processing_filter(
 
 
 def apply_reachability_filter(call_graph_output: dict, repo_path: str) -> dict:
-    """Filter to functions reachable from entry points."""
+    """Filter to functions reachable from entry points.
+
+    Uses the real EntryPointDetector / ReachabilityAnalyzer contract, matching
+    the central core/parser_adapter.apply_reachability_filter and the C/Go/PHP/
+    Ruby/JS sibling pipelines. The previous implementation called an API that
+    never existed (``EntryPointDetector(repo_path)``, ``detector.detect()``,
+    ``ReachabilityAnalyzer(call_graph_output, entry_points)``,
+    ``analyzer.get_reachable_functions()``); because libs/openant-core is on
+    sys.path the imports succeeded, so the ``except ImportError`` guard never
+    fired and the resulting wrong-arity TypeError crashed every Zig parse at
+    --processing-level reachable.
+    """
     try:
-        # Try to import the reachability analyzer
         from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector
         from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
-
-        # Detect entry points
-        detector = EntryPointDetector(repo_path)
-        entry_points = detector.detect()
-
-        # Analyze reachability
-        analyzer = ReachabilityAnalyzer(call_graph_output, entry_points)
-        reachable = analyzer.get_reachable_functions()
-
-        # Filter functions to only reachable ones
-        filtered_functions = {
-            fid: finfo
-            for fid, finfo in call_graph_output["functions"].items()
-            if fid in reachable
-        }
-
-        # Update the output with filtered functions
-        result = call_graph_output.copy()
-        result["functions"] = filtered_functions
-
-        # Filter call graphs too
-        result["call_graph"] = {
-            k: [v for v in vs if v in reachable]
-            for k, vs in call_graph_output.get("call_graph", {}).items()
-            if k in reachable
-        }
-        result["reverse_call_graph"] = {
-            k: [v for v in vs if v in reachable]
-            for k, vs in call_graph_output.get("reverse_call_graph", {}).items()
-            if k in reachable
-        }
-
-        return result
-
     except ImportError:
         print(
             "  Warning: Reachability analyzer not available, skipping filter",
             file=sys.stderr,
         )
         return call_graph_output
+
+    functions = call_graph_output.get("functions", {})
+    call_graph = call_graph_output.get("call_graph", {})
+    reverse_call_graph = call_graph_output.get("reverse_call_graph", {})
+
+    # Detect entry points structurally (functions carry the snake_case
+    # 'unit_type' the Zig extractor emits, which the detector reads directly).
+    detector = EntryPointDetector(functions, call_graph)
+    entry_points = detector.detect_entry_points()
+
+    # Compute the reachable set via reverse-BFS from the entry points.
+    analyzer = ReachabilityAnalyzer(
+        functions=functions,
+        reverse_call_graph=reverse_call_graph,
+        entry_points=entry_points,
+    )
+    reachable = analyzer.get_all_reachable()
+
+    # Filter functions to only reachable ones.
+    filtered_functions = {
+        fid: finfo for fid, finfo in functions.items() if fid in reachable
+    }
+
+    result = call_graph_output.copy()
+    result["functions"] = filtered_functions
+
+    # Filter the call graphs to the reachable subgraph too.
+    result["call_graph"] = {
+        k: [v for v in vs if v in reachable]
+        for k, vs in call_graph.items()
+        if k in reachable
+    }
+    result["reverse_call_graph"] = {
+        k: [v for v in vs if v in reachable]
+        for k, vs in reverse_call_graph.items()
+        if k in reachable
+    }
+
+    return result
 
 
 if __name__ == "__main__":

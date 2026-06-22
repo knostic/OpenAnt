@@ -278,6 +278,34 @@ def apply_reachability_filter(
     if extra_entry_points:
         entry_points = entry_points | extra_entry_points
 
+    units = dataset.get("units", [])
+    original_count = len(units)
+
+    # Empty-seed safety-net: a zero entry-point seed would prune EVERY unit
+    # (the BFS frontier starts empty), silently emptying the dataset and
+    # reporting a 100% reduction as success. That is the dominant failure mode
+    # for non-web library / stdlib targets, whose ordinary functions are not a
+    # seedable entry type. Rather than a silent total blackout, degrade to
+    # pass-through (keep all units, unfiltered) and record a loud warning so the
+    # degraded result is never silent. Higher-level callers may still seed
+    # ``extra_entry_points`` to get real filtering.
+    if not entry_points and original_count > 0:
+        warning = (
+            "No entry points detected — reachability cannot seed a frontier. "
+            "Returning all units unfiltered to avoid a silent blackout; "
+            f"'{processing_level}' filtering was NOT applied."
+        )
+        print(f"  [Warning] {warning}", file=sys.stderr)
+        dataset.setdefault("metadata", {})["reachability_filter"] = {
+            "original_units": original_count,
+            "entry_points": 0,
+            "reachable_units": original_count,
+            "filtered_out": 0,
+            "reduction_percentage": 0,
+            "warning": warning,
+        }
+        return dataset
+
     # Compute reachable set (BFS forward from entry points)
     reachability = ReachabilityAnalyzer(
         functions=functions,
@@ -287,8 +315,6 @@ def apply_reachability_filter(
     reachable_ids = reachability.get_all_reachable()
 
     # Filter dataset units and stamp reachability tags
-    units = dataset.get("units", [])
-    original_count = len(units)
     filtered_units = []
     for u in units:
         unit_id = u.get("id", "")

@@ -22,6 +22,19 @@ import re
 from typing import Dict, List, Set
 
 
+def _unit_type(func_data: Dict) -> str:
+    """Read a unit's type tolerating both key casings.
+
+    The per-parser reachable path normalizes function metadata under the
+    camelCase key ``unitType`` (parsers/{c,php,ruby}/test_pipeline.py), while the
+    central Python path and this detector historically used the snake_case
+    ``unit_type``. Reading only one casing left Check-1 (and the module_level
+    Check-4) dead on the camelCase path — a valid entry type was silently
+    ignored. Prefer snake_case, fall back to camelCase.
+    """
+    return func_data.get('unit_type') or func_data.get('unitType') or ''
+
+
 # Entry point patterns by unit_type (from function extractor classification)
 ENTRY_POINT_TYPES = {
     'route_handler',      # Flask/FastAPI/Express routes
@@ -29,6 +42,15 @@ ENTRY_POINT_TYPES = {
     'view_function',      # Django views
     'websocket_handler',  # WebSocket endpoints
     'cli_handler',        # CLI commands
+    # Native program entry points emitted by the systems-language parsers.
+    # The C and Go extractors classify a top-level `main` as unit_type='main'
+    # (parsers/c/function_extractor.py, go_parser/types.go UnitTypeMain); the
+    # Zig extractor does too once its `main` classifier branch is fixed. Without
+    # these the only seed for a compiled binary is absent, so reachability seeds
+    # zero entry points and silently empties the dataset for every C/Go/Zig repo.
+    'main',               # C/Go/Zig program entry
+    'http_handler',       # Go net/http handlers (go_parser/types.go UnitTypeHTTPHandler)
+    'middleware',         # Go HTTP middleware (go_parser/types.go UnitTypeMiddleware)
 }
 
 # Decorator patterns indicating entry points (case-insensitive matching)
@@ -168,7 +190,7 @@ class EntryPointDetector:
                 self.entry_points.add(func_id)
                 self.entry_point_details[func_id] = {
                     'reasons': reasons,
-                    'unit_type': func_data.get('unit_type'),
+                    'unit_type': _unit_type(func_data),
                     'name': func_data.get('name'),
                 }
 
@@ -187,7 +209,7 @@ class EntryPointDetector:
         reasons = []
 
         # Check 1: Unit type indicates entry point
-        unit_type = func_data.get('unit_type', '')
+        unit_type = _unit_type(func_data)
         if unit_type in ENTRY_POINT_TYPES:
             reasons.append(f'unit_type:{unit_type}')
 
@@ -208,7 +230,7 @@ class EntryPointDetector:
                 break  # One input pattern is enough
 
         # Check 4: Module-level code with input patterns
-        if func_data.get('unit_type') == 'module_level':
+        if unit_type == 'module_level':
             for pattern in self._module_input_patterns:
                 if pattern.search(code):
                     reasons.append('module_level_with_input')
