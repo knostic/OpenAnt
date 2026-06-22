@@ -172,6 +172,7 @@ class CallGraphBuilder:
         caller_file = caller_id.split(':')[0]
         caller_func = self.functions.get(caller_id, {})
         caller_class = caller_func.get('class_name')
+        caller_namespace = caller_func.get('namespace_name')
 
         code_bytes = code.encode('utf-8', errors='replace')
         try:
@@ -184,7 +185,8 @@ class CallGraphBuilder:
             node = stack.pop()
             if node.type in ('function_call_expression', 'member_call_expression',
                              'scoped_call_expression', 'object_creation_expression'):
-                resolved = self._resolve_call_node(node, code_bytes, caller_file, caller_class)
+                resolved = self._resolve_call_node(node, code_bytes, caller_file,
+                                                   caller_class, caller_namespace)
                 if resolved:
                     calls.add(resolved)
             stack.extend(reversed(node.children))
@@ -192,10 +194,12 @@ class CallGraphBuilder:
         return calls
 
     def _resolve_call_node(self, node, source: bytes, caller_file: str,
-                           caller_class: Optional[str]) -> Optional[str]:
+                           caller_class: Optional[str],
+                           caller_namespace: Optional[str] = None) -> Optional[str]:
         """Resolve a tree-sitter call node to a function ID."""
         if node.type == 'function_call_expression':
-            return self._resolve_function_call(node, source, caller_file, caller_class)
+            return self._resolve_function_call(node, source, caller_file, caller_class,
+                                               caller_namespace)
         elif node.type == 'member_call_expression':
             return self._resolve_member_call(node, source, caller_file, caller_class)
         elif node.type == 'scoped_call_expression':
@@ -205,7 +209,8 @@ class CallGraphBuilder:
         return None
 
     def _resolve_function_call(self, node, source: bytes, caller_file: str,
-                                caller_class: Optional[str]) -> Optional[str]:
+                                caller_class: Optional[str],
+                                caller_namespace: Optional[str] = None) -> Optional[str]:
         """Resolve a simple function call like func()."""
         func_name = None
 
@@ -231,7 +236,7 @@ class CallGraphBuilder:
                 return self._resolve_callback_arg(node, source, caller_file, caller_class, cb_idx)
             return None
 
-        return self._resolve_simple_call(func_name, caller_file, caller_class)
+        return self._resolve_simple_call(func_name, caller_file, caller_class, caller_namespace)
 
     def _resolve_callback_arg(self, node, source: bytes, caller_file: str,
                               caller_class: Optional[str], idx: int) -> Optional[str]:
@@ -365,8 +370,9 @@ class CallGraphBuilder:
         return None
 
     def _resolve_simple_call(self, func_name: str, caller_file: str,
-                             caller_class: Optional[str]) -> Optional[str]:
-        """Resolve a simple function call to a function ID."""
+                             caller_class: Optional[str],
+                             caller_namespace: Optional[str] = None) -> Optional[str]:
+        """Resolve a simple (unqualified) function call to a function ID."""
         # 1. Check same class first (implicit $this)
         if caller_class:
             result = self._resolve_self_call(func_name, caller_file, caller_class)
@@ -397,13 +403,29 @@ class CallGraphBuilder:
                             if func_data.get('name') == func_name:
                                 return func_id
 
-        # 4. Unique name match across files
+        # 4. Unique name match across files. An unqualified call resolves within
+        #    the caller's own namespace; a function in a different namespace is not
+        #    reachable this way, so a same-named function elsewhere must not leak an
+        #    edge across the namespace boundary.
         candidates = self.functions_by_name.get(func_name, [])
-        candidates = [c for c in candidates if not self.functions.get(c, {}).get('class_name')]
+        candidates = [c for c in candidates
+                      if not self.functions.get(c, {}).get('class_name')
+                      and self._namespace_compatible(
+                          self.functions.get(c, {}).get('namespace_name'), caller_namespace)]
         if len(candidates) == 1:
             return candidates[0]
 
         return None
+
+    @staticmethod
+    def _namespace_compatible(candidate_ns: Optional[str],
+                              caller_ns: Optional[str]) -> bool:
+        """Whether an unqualified call from caller_ns may bind a function in
+        candidate_ns. They must be the same namespace (treating None / '' / '\\'
+        as the global namespace)."""
+        def norm(ns):
+            return (ns or '').strip('\\')
+        return norm(candidate_ns) == norm(caller_ns)
 
     def _resolve_self_call(self, method_name: str, caller_file: str,
                            caller_class: str) -> Optional[str]:
