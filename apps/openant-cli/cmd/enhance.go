@@ -33,6 +33,7 @@ var (
 	enhanceWorkers        int
 	enhanceBackoff        int
 	enhanceLLMConfig      string
+	enhanceLimit          int
 )
 
 func init() {
@@ -44,6 +45,7 @@ func init() {
 	enhanceCmd.Flags().IntVar(&enhanceWorkers, "workers", 8, "Number of parallel workers for LLM steps (default: 8)")
 	enhanceCmd.Flags().IntVar(&enhanceBackoff, "backoff", 30, "Seconds to wait when rate-limited (default: 30)")
 	enhanceCmd.Flags().StringVar(&enhanceLLMConfig, "llm-config", "", "Name of the llm-config in ~/.config/openant/config.json (defaults to the file's default_llm, or the built-in 'openant-default' if no config file exists).")
+	enhanceCmd.Flags().IntVar(&enhanceLimit, "limit", 0, "Max units to enhance (0 = no limit)")
 }
 
 func runEnhance(cmd *cobra.Command, args []string) {
@@ -108,6 +110,9 @@ func runEnhance(cmd *cobra.Command, args []string) {
 	}
 	if enhanceLLMConfig != "" {
 		pyArgs = append(pyArgs, "--llm-config", enhanceLLMConfig)
+	}
+	if enhanceLimit > 0 {
+		pyArgs = append(pyArgs, "--limit", fmt.Sprintf("%d", enhanceLimit))
 	}
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())

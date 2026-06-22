@@ -191,6 +191,7 @@ def cmd_enhance(args):
                 llm_config_name=args.llm_config,
                 workers=args.workers,
                 backoff_seconds=args.backoff,
+                limit=args.limit,
             )
 
             ctx.summary = {
@@ -1072,6 +1073,7 @@ def main():
     enhance_p.add_argument("--repo-path", help="Path to the repository (required for agentic mode)")
     enhance_p.add_argument("--output", "-o", help="Output path for enhanced dataset (default: {input}_enhanced.json)")
     enhance_p.add_argument("--checkpoint", help="Path to save/resume checkpoint (agentic mode)")
+    enhance_p.add_argument("--limit", type=int, help="Max units to enhance")
     enhance_p.add_argument(
         "--mode",
         choices=["agentic", "single-shot"],
