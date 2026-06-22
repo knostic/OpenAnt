@@ -37,6 +37,26 @@ from core import scanner as scanner_mod  # noqa: E402
 from core.schemas import AnalysisMetrics, ScanResult  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _stub_registry_probe(monkeypatch):
+    """Neutralize the real Anthropic credential probe.
+
+    Post-#69, ``scan_repository`` calls ``probe_registry_or_raise(registry)``
+    (core/scanner.py) which issues a real 1-token Anthropic request to
+    validate credentials before any work begins. These orchestration tests
+    run fully offline, so we replace the probe with a no-op. The registry is
+    still built (from the dummy key) and threaded through every stage exactly
+    as in production; only the network round-trip is removed. ``scan_repository``
+    does ``from utilities.llm import ... probe_registry_or_raise`` at call time,
+    so patching the attribute on ``utilities.llm`` takes effect.
+    """
+    import utilities.llm as llm_mod
+
+    monkeypatch.setattr(
+        llm_mod, "probe_registry_or_raise", lambda *a, **k: None, raising=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shared stubs — make parse + analyze succeed cheaply, with no LLM/network.
 # ---------------------------------------------------------------------------

@@ -24,11 +24,42 @@ from utilities.rate_limiter import is_retryable_error
 
 @pytest.fixture(autouse=True)
 def _anthropic_api_key(monkeypatch):
-    """Provide a dummy API key so ContextEnhancer's default AnthropicClient
-    constructs without a real credential. No network call is made: every test
-    monkeypatches the actual enhancement methods, so the SDK client is never
-    used to issue a request."""
+    """Provide a dummy API key for parity with real runs. No network call is
+    made: every test monkeypatches the actual enhancement methods, and the
+    ContextEnhancer is handed a fake PhaseBinding whose adapter is never
+    exercised, so no SDK client ever issues a request."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
+
+
+class _FakeAdapter:
+    """Minimal LLMAdapter stand-in. Never called: these tests monkeypatch the
+    enhancement entry points, so the binding's adapter is inert."""
+
+    name = "anthropic"
+    supports_tools = True
+
+    def complete(self, *, model, system, messages, max_tokens, tools=None):  # pragma: no cover
+        raise AssertionError("adapter.complete must not be called in these tests")
+
+    def validate(self, model):  # pragma: no cover
+        pass
+
+
+def _fake_binding():
+    """Build a PhaseBinding the post-#69 ContextEnhancer requires.
+
+    Mirrors the canonical helper in tests/test_llm_helpers.py: a frozen
+    PhaseBinding wrapping a fake adapter, used wherever a real (provider,
+    model) binding would otherwise be needed.
+    """
+    from utilities.llm import PhaseBinding
+
+    return PhaseBinding(
+        phase="enhance",
+        adapter=_FakeAdapter(),
+        model="claude-test",
+        provider_name="anthropic",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -62,7 +93,7 @@ class TestIsRetryable529:
 def _make_enhancer():
     from utilities.context_enhancer import ContextEnhancer
 
-    return ContextEnhancer(client=None, tracker=None)
+    return ContextEnhancer(binding=_fake_binding(), tracker=None)
 
 
 def _dataset(n=3):
@@ -91,7 +122,7 @@ class TestAgenticBoundedRetry:
         # attempts[uid] = how many times we've enhanced that unit.
         attempts = {}
 
-        def fake_agent(unit, index, tracker, verbose, client=None):
+        def fake_agent(unit, index, binding, tracker, verbose):
             uid = unit.get("id")
             attempts[uid] = attempts.get(uid, 0) + 1
             # u1 stays transiently-broken for the first 2 attempts, then succeeds.
@@ -133,7 +164,7 @@ class TestSingleShotCheckpoint:
         per-unit results so an interrupted run can resume."""
         from utilities.context_enhancer import ContextEnhancer
 
-        enh = ContextEnhancer(client=None, tracker=None)
+        enh = ContextEnhancer(binding=_fake_binding(), tracker=None)
 
         def fake_enhance_unit(unit, units_by_id):
             unit["llm_context"] = {
@@ -158,7 +189,7 @@ class TestSingleShotCheckpoint:
         cp_dir = str(tmp_path / "enhance_checkpoints")
 
         # First run: complete all units.
-        enh1 = ContextEnhancer(client=None, tracker=None)
+        enh1 = ContextEnhancer(binding=_fake_binding(), tracker=None)
         monkeypatch.setattr(
             enh1, "enhance_unit",
             lambda unit, by_id: unit.update(
@@ -168,7 +199,7 @@ class TestSingleShotCheckpoint:
         enh1.enhance_dataset(_dataset(3), workers=1, checkpoint_path=cp_dir)
 
         # Second run: count how many units get (re-)enhanced.
-        enh2 = ContextEnhancer(client=None, tracker=None)
+        enh2 = ContextEnhancer(binding=_fake_binding(), tracker=None)
         seen = []
 
         def counting_enhance(unit, by_id):

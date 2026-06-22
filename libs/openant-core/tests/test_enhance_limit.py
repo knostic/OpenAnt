@@ -11,17 +11,72 @@ import sys
 
 import core.enhancer as enh
 import utilities.context_enhancer as _ce
+import utilities.llm as _llm_mod
 import utilities.llm_client as _llm
 
 
 _received = {}
 
 
+class _FakeAdapter:
+    """Inert LLMAdapter stand-in; never called (ContextEnhancer is stubbed)."""
+
+    name = "anthropic"
+    supports_tools = True
+
+    def complete(self, *, model, system, messages, max_tokens, tools=None):  # pragma: no cover
+        raise AssertionError("adapter.complete must not be called")
+
+    def validate(self, model):  # pragma: no cover
+        pass
+
+
+class _StubRegistry:
+    """Stand-in PhaseRegistry: returns a fake binding and skips probing.
+
+    #69 routes ``core.enhancer.enhance_dataset`` through the registry
+    (build_phase_registry -> probe_registry_or_raise -> registry.get('enhance'))
+    instead of constructing an AnthropicClient directly. ``_DummyEnhancer``
+    ignores the binding, but enhance_dataset reads ``binding.provider_name`` /
+    ``binding.model`` for a log line, so we hand back a real PhaseBinding
+    wrapping an inert adapter. The point is to keep the path fully offline.
+    """
+
+    config_name = "openant-default"
+
+    def get(self, phase):
+        from utilities.llm import PhaseBinding
+
+        return PhaseBinding(
+            phase=phase,
+            adapter=_FakeAdapter(),
+            model="claude-test",
+            provider_name="anthropic",
+        )
+
+
+def _stub_registry_plumbing(monkeypatch):
+    """Replace the real (network-probing) registry build with offline stubs.
+
+    Mirrors the canonical pattern in tests/test_entrypoint_bindings.py:
+    stub config load + resolve + build on the importing module, and the probe
+    on utilities.llm (enhance_dataset imports probe_registry_or_raise lazily
+    from there). Replaces the old ``AnthropicClient`` monkeypatch #69 deleted.
+    """
+    monkeypatch.setattr(enh, "load_config_file", lambda *a, **k: object())
+    monkeypatch.setattr(enh, "resolve_llm_config", lambda *a, **k: object())
+    monkeypatch.setattr(enh, "build_phase_registry", lambda *a, **k: _StubRegistry())
+    monkeypatch.setattr(_llm_mod, "probe_registry_or_raise", lambda *a, **k: None)
+
+
 class _DummyEnhancer:
     def __init__(self, **kw):
         pass
 
-    def enhance_dataset(self, dataset, progress_callback=None, workers=8):
+    def enhance_dataset(self, dataset, progress_callback=None, workers=8, **kw):
+        # **kw absorbs checkpoint_path (added post-#69 single-shot resume) and
+        # any other keywords core.enhancer threads through; this dummy only
+        # cares about the unit count it received.
         _received["units"] = len(dataset.get("units", []))
         return dataset
 
@@ -35,7 +90,7 @@ def test_enhance_dataset_limit_slices_units(tmp_path, monkeypatch):
     monkeypatch.setattr(enh, "read_json", lambda p: {"units": list(five)})
     monkeypatch.setattr(enh, "write_json", lambda p, d: None)
     monkeypatch.setattr(enh, "configure_rate_limiter", lambda **k: None)
-    monkeypatch.setattr(_llm, "AnthropicClient", lambda **k: object())
+    _stub_registry_plumbing(monkeypatch)
     monkeypatch.setattr(_llm, "get_global_tracker", lambda: None)
     monkeypatch.setattr(_ce, "ContextEnhancer", _DummyEnhancer)
 
