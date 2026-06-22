@@ -86,7 +86,13 @@ class RepositoryScanner:
 
         # Skip test files by default (can be overridden)
         self.skip_tests = options.get('skip_tests', False)
-        self.test_patterns = {'test_', '_test.rb', '_spec.rb', 'test/', 'tests/', 'spec/'}
+        # Native Ruby test conventions (Minitest/RSpec). Directory names match
+        # whole path segments; filename rules are anchored to the basename so
+        # that ordinary sources like ``latest_release.rb``/``contest/foo.rb``
+        # are NOT misclassified as tests (an unanchored substring scan would).
+        self.test_dir_names = {'test', 'tests', 'spec'}
+        self.test_file_prefixes = ('test_',)
+        self.test_file_suffixes = ('_test.rb', '_spec.rb')
 
         # Statistics
         self.stats = {
@@ -116,11 +122,20 @@ class RepositoryScanner:
         return ext in self.source_extensions
 
     def is_test_file(self, relative_path: str) -> bool:
-        """Check if a file is a test file."""
-        path_lower = relative_path.lower()
-        for pattern in self.test_patterns:
-            if pattern in path_lower:
-                return True
+        """Check if a file is a test file.
+
+        Matches on path *components* and *anchored* filename rules rather than
+        unanchored substrings, so non-test files whose name merely contains a
+        token (``latest_release.rb``, ``contest/foo.rb``) are not skipped.
+        """
+        p = Path(relative_path)
+        if any(part.lower() in self.test_dir_names for part in p.parts[:-1]):
+            return True
+        name_lower = p.name.lower()
+        if name_lower.startswith(self.test_file_prefixes):
+            return True
+        if name_lower.endswith(self.test_file_suffixes):
+            return True
         return False
 
     def scan_directory(self, dir_path: Path, relative_path: str = '') -> None:
