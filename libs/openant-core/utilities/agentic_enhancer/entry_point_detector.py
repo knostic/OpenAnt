@@ -84,7 +84,7 @@ USER_INPUT_PATTERNS = [
     r'request\.environ',
     # FastAPI
     r'request\.(query_params|body|json)',
-    r'(Query|Body|Form|File|Header|Cookie)\s*\(',
+    r'\b(Query|Body|Form|File|Header|Cookie)\s*\(',
     # Django
     r'request\.(GET|POST|data|FILES|body)',
     r'self\.request\.(GET|POST|data)',
@@ -94,7 +94,7 @@ USER_INPUT_PATTERNS = [
     # CLI arguments
     r'sys\.argv',
     r'argparse\.',
-    r'ArgumentParser\s*\(',
+    r'\bArgumentParser\s*\(',
     r'click\.(argument|option)',
     # Standard input
     r'\binput\s*\(',
