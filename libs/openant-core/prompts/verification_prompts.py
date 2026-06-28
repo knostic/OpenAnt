@@ -35,7 +35,7 @@ def get_verification_system_prompt(app_context: "ApplicationContext" = None) -> 
     """
     base_prompt = VERIFICATION_SYSTEM_PROMPT
 
-    if app_context and not app_context.requires_remote_trigger:
+    if app_context and app_context.suppress_local_only():
         base_prompt += """
 
 IMPORTANT: This is a CLI tool or library. The user running this code has local filesystem access.
@@ -74,7 +74,7 @@ def format_app_context_for_verification(app_context: "ApplicationContext") -> st
             lines.append(f"- {item}")
         lines.append("")
 
-    if not app_context.requires_remote_trigger:
+    if app_context.suppress_local_only():
         lines.append("**CRITICAL:** This is a CLI tool/library. Users have local filesystem access.")
         lines.append("A vulnerability requires a REMOTE attacker to exploit it.")
         lines.append("If the 'attack' requires running CLI commands locally, it's NOT a vulnerability.")
@@ -149,7 +149,7 @@ Context:
 {fence}"""
 
     # Adjust attacker description based on app context
-    if app_context and not app_context.requires_remote_trigger:
+    if app_context and app_context.suppress_local_only():
         attacker_description = """You are an attacker on the internet. You have a browser and nothing else.
 No server access, no admin credentials, no ability to modify files on the server, and NO ABILITY TO RUN CLI COMMANDS.
 

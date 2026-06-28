@@ -147,6 +147,26 @@ class ApplicationContext:
         """Get detailed information about this application type."""
         return APPLICATION_TYPE_INFO.get(self.application_type, {})
 
+    def suppress_local_only(self) -> bool:
+        """Whether to tell the analyzer to flag only REMOTE-attacker vulnerabilities.
+
+        The "local users have access, only flag remote" framing is correct for a
+        CLI/library whose inputs are all operator-controlled. But a data-processing
+        library (parser, deserializer, codec) takes UNTRUSTED INPUT DATA — and that
+        data crossing into the code IS the attack surface, even with no network
+        listener. ``requires_remote_trigger`` alone (False for every library) would
+        suppress exactly those bugs. Gate on the already-captured ``trust_boundaries``:
+        if any input source is ``untrusted``, do NOT suppress, regardless of type.
+        """
+        if self.requires_remote_trigger:
+            return False
+        # Case-insensitive: trust_boundaries values are LLM-generated and may
+        # deviate from the schema's lowercase 'untrusted' (e.g. 'Untrusted').
+        return not any(
+            str(level).lower() == "untrusted"
+            for level in (self.trust_boundaries or {}).values()
+        )
+
 
 # Files to check for manual override (in order of priority)
 MANUAL_OVERRIDE_FILES = [
@@ -488,7 +508,7 @@ Respond with a JSON object (no other text):
 
 **Guidelines:**
 - `application_type`: MUST be one of: web_app, cli_tool, library, agent_framework, unsupported
-- `requires_remote_trigger`: Set to `false` for cli_tool, library, agent_framework. Set to `true` for web_app.
+- `requires_remote_trigger`: Set to `true` for web_app, AND for any cli_tool/library/agent_framework that PROCESSES UNTRUSTED INPUT DATA (a parser, deserializer, codec, file/format reader, or anything where `trust_boundaries` marks an input source `untrusted` — the untrusted data crossing into the code is the attack surface even with no network listener). Set to `false` only when every input source is operator-controlled/trusted.
 - `confidence`: 0.0-1.0 based on how much information was available.
 - Be specific in `not_a_vulnerability` - these will directly prevent false positives.
 """
@@ -644,7 +664,7 @@ def format_context_for_prompt(context: ApplicationContext) -> str:
             lines.append(f"- {item}")
         lines.append("")
 
-    if not context.requires_remote_trigger:
+    if context.suppress_local_only():
         lines.append("**IMPORTANT:** This is a CLI tool/library. Users running this code have local access.")
         lines.append("Only flag vulnerabilities that could be exploited by a REMOTE attacker, not by local users.")
         lines.append("")
