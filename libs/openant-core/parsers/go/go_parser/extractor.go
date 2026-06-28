@@ -72,6 +72,9 @@ func (e *Extractor) extractFromFile(filePath string, output *AnalyzerOutput) err
 		case *ast.FuncDecl:
 			funcInfo := e.extractFunctionDecl(d, relPath, pkgName, content)
 			funcID := e.makeFunctionID(relPath, funcInfo)
+			if w := duplicateIDWarning(output.Functions, funcID, funcInfo); w != "" {
+				fmt.Fprintln(os.Stderr, "Warning: "+w)
+			}
 			output.Functions[funcID] = funcInfo
 		}
 	}
@@ -186,6 +189,14 @@ func (e *Extractor) typeToString(expr ast.Expr) string {
 		return "*" + e.typeToString(t.X)
 	case *ast.SelectorExpr:
 		return e.typeToString(t.X) + "." + t.Sel.Name
+	case *ast.IndexExpr:
+		// Generic type with one type parameter, e.g. Stack[T]. The class key is the
+		// base type, so drop the type argument and recurse into the base (t.X).
+		return e.typeToString(t.X)
+	case *ast.IndexListExpr:
+		// Generic type with multiple type parameters, e.g. Pair[K, V]. Same as above:
+		// the class key is the bare base type, so recurse into t.X and drop the args.
+		return e.typeToString(t.X)
 	case *ast.ArrayType:
 		if t.Len == nil {
 			return "[]" + e.typeToString(t.Elt)
@@ -334,6 +345,21 @@ func (e *Extractor) isMiddleware(params, returns []string, code string) bool {
 	}
 
 	return false
+}
+
+// duplicateIDWarning returns a non-empty diagnostic when funcID already maps to a unit in fns.
+// A collision means two distinct declarations resolved to the same unit id — typically a
+// class-key collapse (e.g. an unhandled receiver shape falling back to "unknown") — and the
+// subsequent `fns[funcID] = ...` write would silently overwrite the earlier unit (data loss).
+// The caller logs the returned string so the collapse is observable instead of silent. An empty
+// string means no collision (the common case).
+func duplicateIDWarning(fns map[string]FunctionInfo, funcID string, incoming FunctionInfo) string {
+	existing, ok := fns[funcID]
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("duplicate unit id %q: %s:%d would overwrite %s:%d (class-key collapse?)",
+		funcID, incoming.FilePath, incoming.StartLine, existing.FilePath, existing.StartLine)
 }
 
 func (e *Extractor) makeFunctionID(filePath string, info FunctionInfo) string {
