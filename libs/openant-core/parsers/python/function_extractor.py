@@ -365,6 +365,57 @@ class FunctionExtractor:
         unit_type = func_data['unit_type']
         self.stats['by_type'][unit_type] = self.stats['by_type'].get(unit_type, 0) + 1
 
+    # Block-statement containers whose bodies may hold def/class nodes the
+    # def/class-only recursion never reaches. Built defensively so Python
+    # versions lacking TryStar (<3.11) / Match (<3.10) don't raise.
+    _BLOCK_CONTAINERS = tuple(filter(None, (
+        getattr(ast, _n, None) for _n in (
+            'If', 'For', 'AsyncFor', 'While', 'With', 'AsyncWith',
+            'Try', 'TryStar', 'Match',
+        )
+    )))
+
+    @staticmethod
+    def _block_bodies(stmt: ast.AST) -> List[list]:
+        """Every statement-list body of a block container (if/try/for/.../match)."""
+        bodies: List[list] = []
+        for field in ('body', 'orelse', 'finalbody'):
+            v = getattr(stmt, field, None)
+            if isinstance(v, list):
+                bodies.append(v)
+        for handler in getattr(stmt, 'handlers', None) or []:      # except arms
+            b = getattr(handler, 'body', None)
+            if isinstance(b, list):
+                bodies.append(b)
+        for case in getattr(stmt, 'cases', None) or []:            # match arms
+            b = getattr(case, 'body', None)
+            if isinstance(b, list):
+                bodies.append(b)
+        return bodies
+
+    def _descend_into_blocks(self, stmts: list, file_path: Path, content: str) -> None:
+        """Find def/class nodes inside block statements at ANY depth and emit them.
+
+        A `def`/`class` inside an `if`/`try`/`for`/`while`/`with`/`match` block is
+        runtime-reachable (version guards, `try/except ImportError` fallbacks,
+        CBV `if/else` dispatchers) but the def/class-only recursion never entered
+        a block body, so it was dropped from both the inventory and the call
+        graph. This descends ONLY into block-container nodes — direct
+        `FunctionDef`/`ClassDef` children of a body are emitted by the caller, so
+        there is no double-processing (the two node sets are disjoint). Surfaced
+        defs reuse the existing keep-both (`#L<line>`) machinery.
+        """
+        for stmt in stmts:
+            if not isinstance(stmt, self._BLOCK_CONTAINERS):
+                continue
+            for body in self._block_bodies(stmt):
+                for child in body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        self._process_function_tree(child, file_path, content, class_name=None)
+                    elif isinstance(child, ast.ClassDef):
+                        self._process_class_tree(child, file_path, content, outer_qualifier=None)
+                self._descend_into_blocks(body, file_path, content)
+
     def _process_function_tree(self, node: ast.AST, file_path: Path, content: str,
                                class_name: Optional[str] = None) -> None:
         """Register a function and recurse into its body.
@@ -387,6 +438,8 @@ class FunctionExtractor:
                 self._process_function_tree(child, file_path, content, class_name=None)
             elif isinstance(child, ast.ClassDef):
                 self._process_class_tree(child, file_path, content, outer_qualifier=None)
+        # defs/classes wrapped in a block inside this function's body
+        self._descend_into_blocks(node.body, file_path, content)
 
     def _process_class_tree(self, node: ast.ClassDef, file_path: Path, content: str,
                             outer_qualifier: Optional[str] = None) -> None:
@@ -411,6 +464,9 @@ class FunctionExtractor:
         for item in node.body:
             if isinstance(item, ast.ClassDef):
                 self._process_class_tree(item, file_path, content, outer_qualifier=qualified_class)
+        # defs/classes wrapped in a block inside the class body (e.g. an
+        # `if TYPE_CHECKING:` block declaring conditional members).
+        self._descend_into_blocks(node.body, file_path, content)
 
     def extract_assigned_lambdas(self, tree: ast.AST, file_path: Path, content: str) -> None:
         """Emit a function unit for each module-level `name = lambda ...`.
@@ -591,10 +647,13 @@ class FunctionExtractor:
         lines = content.split('\n')
         total_lines = len(lines)
 
-        # Track which lines are covered by functions/classes
+        # Track which lines are covered by functions/classes. Walk the WHOLE
+        # tree (not just top-level children) so a def/class wrapped in a block
+        # (if/try/for/with/match) is covered too — otherwise its body, now its
+        # own unit, would also leak verbatim into this synthetic :__module__ text.
         covered_lines: Set[int] = set()
 
-        for node in ast.iter_child_nodes(tree):
+        for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 start_line = node.lineno
                 end_line = getattr(node, 'end_lineno', start_line)
@@ -714,6 +773,10 @@ class FunctionExtractor:
                 self._process_function_tree(node, file_path, content, class_name=None)
             elif isinstance(node, ast.ClassDef):
                 self._process_class_tree(node, file_path, content, outer_qualifier=None)
+
+        # defs/classes wrapped in a top-level block (version guard, try/except
+        # ImportError fallback, with-guarded handler, etc.).
+        self._descend_into_blocks(tree.body, file_path, content)
 
         # Module-level lambdas bound to a name (handler = lambda ...).
         self.extract_assigned_lambdas(tree, file_path, content)
