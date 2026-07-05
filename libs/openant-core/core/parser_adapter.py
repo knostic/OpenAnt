@@ -111,6 +111,18 @@ def parse_repository(
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
+    if fresh:
+        dataset_path = os.path.join(output_dir, "dataset.json")
+        # Use try/except instead of exists()+remove() to avoid a TOCTOU race
+        # if a concurrent --fresh run removes the file between the two calls.
+        # Only dataset.json is deleted; other artifacts (analyzer outputs, etc.)
+        # in output_dir are preserved.
+        try:
+            os.remove(dataset_path)
+            print("[Parser] --fresh: deleted existing dataset.json", file=sys.stderr)
+        except FileNotFoundError:
+            pass
+
     # Detect language if auto
     if language == "auto":
         language = detect_language(repo_path)

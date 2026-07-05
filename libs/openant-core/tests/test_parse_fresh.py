@@ -21,7 +21,7 @@ def _make_stub_parser(record):
     time it is invoked, then writes a fresh dataset itself so the rest of
     `parse_repository` has something to work with.
     """
-    def _stub(repo_path, output_dir, processing_level, skip_tests=True, name=None):
+    def _stub(repo_path, output_dir, processing_level, skip_tests=True, name=None, library_mode=False):
         dataset_path = os.path.join(output_dir, "dataset.json")
         record["dataset_existed_when_parser_ran"] = os.path.exists(dataset_path)
         # Mimic real parser output
