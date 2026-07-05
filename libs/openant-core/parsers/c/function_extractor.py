@@ -230,6 +230,62 @@ class FunctionExtractor:
                 params.append('...')
         return params
 
+    @staticmethod
+    def _signature_discriminator(parameters: List[str]) -> str:
+        """A deterministic, COLON-FREE signature string for the parameter list.
+
+        Colon-free is mandatory: the func_id is split on ':' downstream
+        (`core/diff_filter.py`, `utilities/agentic_enhancer/repository_index.py`
+        rsplit on ':' to recover the file), so any colon a C++ type carries
+        (`std::string`, a ternary default arg) is mapped to '.' here.
+        """
+        joined = ','.join(p.strip() for p in parameters)
+        joined = ' '.join(joined.split())  # collapse newlines/runs of whitespace
+        return joined.replace(':', '.')
+
+    @staticmethod
+    def _same_signature(a: dict, b: dict) -> bool:
+        """Two definitions share a signature iff their parameter lists match.
+
+        Identical params => a redefinition of the SAME function under a different
+        preprocessor branch (#ifdef/#else) or an ODR-duplicate. Different params
+        => a genuine C++ overload.
+        """
+        return a.get('parameters', []) == b.get('parameters', [])
+
+    def _store_function(self, func_id: str, func_data: dict) -> None:
+        """Store a function, disambiguating same-(file,name) collisions instead
+        of silently overwriting (Bug 1: #ifdef/#else stubs and C++ overloads
+        collapsed onto one node — see reachability-bugs.md / bug-3482.md).
+
+        Collision-only: when func_id is free, store byte-identically (the
+        hardcoded `path:name` id literals across the suite depend on unique names
+        keeping the plain `path:name` id). On a collision:
+          - SAME signature -> keep ONE node, prefer the larger body. The #else
+            stub is shorter than the real implementation regardless of which
+            preprocessor arm tree-sitter emits first, so this is order- and
+            direction-independent.
+          - DIFFERENT signature -> a genuine overload; both are real. Mint a
+            distinct key by folding the colon-free signature into the func_id.
+            The `name` field is left bare (`area`, not `area(int,int)`) because
+            the call-graph builder resolves calls by `name` (functions_by_name),
+            so both overloads stay findable. (Contrast bug [39], which folds the
+            template-arg discriminator into the NAME — correct there because a
+            template call is written `g<int>`; an overload call is written bare.)
+        """
+        existing = self.functions.get(func_id)
+        if existing is None:
+            self.functions[func_id] = func_data
+            return
+        if self._same_signature(existing, func_data):
+            if len(func_data.get('code', '')) > len(existing.get('code', '')):
+                self.functions[func_id] = func_data
+            return
+        overload_id = f"{func_id}({self._signature_discriminator(func_data.get('parameters', []))})"
+        prior = self.functions.get(overload_id)
+        if prior is None or len(func_data.get('code', '')) > len(prior.get('code', '')):
+            self.functions[overload_id] = func_data
+
     def _find_function_declarator(self, node):
         """Find the function_declarator within a declarator tree."""
         if node.type == 'function_declarator':
@@ -520,7 +576,7 @@ class FunctionExtractor:
             'class_name': class_name,
         }
 
-        self.functions[func_id] = func_data
+        self._store_function(func_id, func_data)
         self.stats['total_functions'] += 1
 
         if is_static:
@@ -559,7 +615,7 @@ class FunctionExtractor:
             full_name = (namespace_prefix + name
                          if namespace_prefix and '::' not in name else name)
             func_id = f"{relative_path}:{full_name}"
-            self.functions[func_id] = {
+            self._store_function(func_id, {
                 'name': full_name,
                 'file_path': relative_path,
                 'start_line': node.start_point[0] + 1,
@@ -572,7 +628,7 @@ class FunctionExtractor:
                 'is_inline': False,
                 'unit_type': 'lambda',
                 'class_name': None,
-            }
+            })
             self.stats['total_functions'] += 1
             self.stats['by_type']['lambda'] = self.stats['by_type'].get('lambda', 0) + 1
 

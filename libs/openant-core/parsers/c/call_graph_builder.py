@@ -497,9 +497,18 @@ class CallGraphBuilder:
                 func_data = self.functions.get(func_id, {})
                 fname = func_data.get('name', '')
                 base_name = fname.split('::')[-1] if '::' in fname else fname
-                # A static function in an included header has internal linkage
-                # and is not callable from the including file.
-                if base_name == call_name and self._is_visible_from(func_id, caller_file):
+                # A function in an INCLUDED header is callable from the including
+                # TU regardless of `static`: a `static inline` header helper (the
+                # C header-inline idiom) is copied into every includer. The
+                # cross-file static-linkage rejection in _is_visible_from is
+                # correct only for a .c TU, so it must not gate an included-header
+                # candidate. (Repo-wide and prototype fallbacks below stay strict.)
+                header_candidate = func_data.get('file_path', '').endswith(
+                    ('.h', '.hpp', '.hxx', '.hh')
+                )
+                if base_name == call_name and (
+                    header_candidate or self._is_visible_from(func_id, caller_file)
+                ):
                     return func_id
 
         # 3. Unique name match across entire repo
