@@ -546,7 +546,7 @@ class FunctionExtractor:
             qualified_name = name
 
         func_id = f"{relative_path}:{qualified_name}"
-        self.functions[func_id] = {
+        self._store_function(func_id, {
             'name': name,
             'qualified_name': qualified_name,
             'file_path': relative_path,
@@ -559,7 +559,7 @@ class FunctionExtractor:
             'is_singleton': False,
             'visibility': visibility,
             'unit_type': unit_type,
-        }
+        })
         self.stats['total_functions'] += 1
         if class_name:
             self.stats['total_methods'] += 1
@@ -567,6 +567,32 @@ class FunctionExtractor:
             self.stats['standalone_functions'] += 1
         self.stats['by_type'][unit_type] = self.stats['by_type'].get(unit_type, 0) + 1
 
+
+    def _store_function(self, func_id: str, func_data: dict) -> str:
+        """Insert a function unit, keeping BOTH on a same-(file,name) collision.
+
+        Ruby `def` executes when reached, so same-name defs in mutually-exclusive
+        conditional branches (`if/else`) are both runtime-reachable depending on
+        the condition, and the EARLIER branch may be the live one. A plain
+        keep-last store let the later (possibly dead) branch overwrite the
+        earlier (possibly live) one — a silent false negative, confirmed against
+        the real `ruby` interpreter. Keep BOTH via a deterministic `#L<line>`
+        suffix (earlier-in-source keeps the clean id), mirroring the Python
+        extractor's `_store_function`. Unconditional reopening is last-wins at
+        runtime; keeping both there is the same benign tradeoff Python accepts.
+        Collision-only: a unique name keeps its byte-identical `path:name` id.
+        """
+        if func_id not in self.functions:
+            self.functions[func_id] = func_data
+            return func_id
+        line = func_data.get('start_line', 0)
+        unique_id = f"{func_id}#L{line}"
+        n = 2
+        while unique_id in self.functions:
+            unique_id = f"{func_id}#L{line}.{n}"
+            n += 1
+        self.functions[unique_id] = func_data
+        return unique_id
 
     def _process_method_node(self, node, source: bytes, relative_path: str,
                               class_name: Optional[str], module_name: Optional[str],
@@ -610,7 +636,7 @@ class FunctionExtractor:
             'unit_type': unit_type,
         }
 
-        self.functions[func_id] = func_data
+        self._store_function(func_id, func_data)
         self.stats['total_functions'] += 1
 
         if class_name:

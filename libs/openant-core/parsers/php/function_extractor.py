@@ -555,7 +555,7 @@ class FunctionExtractor:
             'unit_type': unit_type,
         }
 
-        self.functions[func_id] = func_data
+        self._store_function(func_id, func_data)
         self.stats['total_functions'] += 1
 
         if class_name:
@@ -597,7 +597,7 @@ class FunctionExtractor:
 
         func_id = f"{relative_path}:{qualified_name}"
 
-        self.functions[func_id] = {
+        self._store_function(func_id, {
             'name': name,
             'qualified_name': qualified_name,
             'file_path': relative_path,
@@ -609,10 +609,34 @@ class FunctionExtractor:
             'parameters': parameters,
             'is_static': False,
             'unit_type': 'closure',
-        }
+        })
         self.stats['total_functions'] += 1
         self.stats['standalone_functions'] += 1
         self.stats['by_type']['closure'] = self.stats['by_type'].get('closure', 0) + 1
+
+    def _store_function(self, func_id: str, func_data: dict) -> str:
+        """Insert a function unit, keeping BOTH on a same-(file,name) collision.
+
+        PHP forbids plain redefinition (fatal), so legal duplicates arise only
+        from mutually-exclusive conditional branches — an `if/else` or a
+        defensive double `if(!function_exists('x')){...}` — where which branch
+        is live is environment-dependent and the EARLIER branch may be the one
+        that runs. Keying solely on `qualified_name` let the later branch
+        overwrite the earlier (a silent false negative). Disambiguate
+        DETERMINISTICALLY by source line (`#L<line>`); the earlier-in-source
+        unit keeps the clean id. Mirrors the Python extractor's `_store_function`.
+        """
+        if func_id not in self.functions:
+            self.functions[func_id] = func_data
+            return func_id
+        line = func_data.get('start_line', 0)
+        unique_id = f"{func_id}#L{line}"
+        n = 2
+        while unique_id in self.functions:
+            unique_id = f"{func_id}#L{line}.{n}"
+            n += 1
+        self.functions[unique_id] = func_data
+        return unique_id
 
     def _extract_module_level_unit(self, tree, source: bytes,
                                     relative_path: str) -> None:
