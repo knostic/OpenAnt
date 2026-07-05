@@ -127,7 +127,7 @@ class PythonRouteParser:
             "code": {
                 "primary_code": code,
                 "primary_origin": {
-                    "file_path": str(file_path.relative_to(self.repo_path)),
+                    "file_path": file_path.relative_to(self.repo_path).as_posix(),
                     "start_line": start_line,
                     "end_line": end_line,
                     "function_name": handler,
@@ -153,7 +153,7 @@ class PythonRouteParser:
             "metadata": {
                 "parser": "python_ast_parser.py",
                 "framework": self.framework,
-                "route_file": str(file_path.relative_to(self.repo_path)),
+                "route_file": file_path.relative_to(self.repo_path).as_posix(),
                 "route_line": start_line
             }
         }

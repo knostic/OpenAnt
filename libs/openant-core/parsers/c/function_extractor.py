@@ -661,7 +661,7 @@ class FunctionExtractor:
             self.stats['files_with_errors'] += 1
             return
 
-        relative_path = str(file_path.relative_to(self.repo_path))
+        relative_path = file_path.relative_to(self.repo_path).as_posix()
         is_cpp = self._is_cpp_file(str(file_path))
         parser = self._get_parser(str(file_path))
 

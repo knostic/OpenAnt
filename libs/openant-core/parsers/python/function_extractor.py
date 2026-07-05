@@ -476,7 +476,7 @@ class FunctionExtractor:
         to it cannot resolve. Capture module-level single-target name bindings to
         a lambda as functions.
         """
-        relative_path = str(file_path.relative_to(self.repo_path))
+        relative_path = file_path.relative_to(self.repo_path).as_posix()
         for node in ast.iter_child_nodes(tree):
             if not isinstance(node, ast.Assign):
                 continue
@@ -516,7 +516,7 @@ class FunctionExtractor:
                          content: str, class_name: Optional[str] = None) -> Dict:
         """Process a function definition and extract metadata."""
         func_name = node.name
-        relative_path = str(Path(file_path).relative_to(self.repo_path))
+        relative_path = Path(file_path).relative_to(self.repo_path).as_posix()
 
         # Extract metadata
         decorators = self.extract_decorators(node)
@@ -575,7 +575,7 @@ class FunctionExtractor:
         its methods become 'Outer.Inner.method'.
         """
         class_name = f"{outer_qualifier}.{node.name}" if outer_qualifier else node.name
-        relative_path = str(Path(file_path).relative_to(self.repo_path))
+        relative_path = Path(file_path).relative_to(self.repo_path).as_posix()
         class_id = f"{relative_path}:{class_name}"
 
         # Extract base classes
@@ -720,7 +720,7 @@ class FunctionExtractor:
         if not module_code:
             return None
 
-        relative_path = str(file_path.relative_to(self.repo_path))
+        relative_path = file_path.relative_to(self.repo_path).as_posix()
         func_id = f"{relative_path}:__module__"
 
         # Determine start and end lines
@@ -760,7 +760,7 @@ class FunctionExtractor:
             return
 
         self.stats['files_processed'] += 1
-        relative_path = str(file_path.relative_to(self.repo_path))
+        relative_path = file_path.relative_to(self.repo_path).as_posix()
 
         # Extract imports
         self.imports[relative_path] = self.extract_imports(tree, relative_path)

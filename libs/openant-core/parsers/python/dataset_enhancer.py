@@ -198,7 +198,7 @@ class PythonDependencyResolver:
                             dependencies.append({
                                 "code": dep_code,
                                 "origin": {
-                                    "file_path": str(resolved_path.relative_to(self.repo_path)),
+                                    "file_path": resolved_path.relative_to(self.repo_path).as_posix(),
                                     "start_line": start,
                                     "end_line": end,
                                     "function_name": func_name
@@ -213,7 +213,7 @@ class PythonDependencyResolver:
                         dependencies.append({
                             "code": dep_code,
                             "origin": {
-                                "file_path": str(current_file.relative_to(self.repo_path)),
+                                "file_path": current_file.relative_to(self.repo_path).as_posix(),
                                 "start_line": start,
                                 "end_line": end,
                                 "function_name": func_ref
