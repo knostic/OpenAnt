@@ -284,3 +284,72 @@ class EntryPointDetector:
             'by_unit_type': by_type,
             'by_reason_category': by_reason,
         }
+
+
+def library_seed_ids(functions):
+    """Public-API seed set for library-mode reachability.
+
+    A pure library exposes no main/route/CLI entry point, so the structural
+    detector finds nothing and the whole library is filtered out (0 reachable).
+    In library-mode the *public surface* IS the entry surface: seed every
+    exported/public function and let the forward BFS pull in its callees.
+
+    Public = exported AND not name-private. Honours ``is_exported``/``isExported``
+    when the parser provides it (C/Go/JS exclude static/unexported); for parsers
+    without the field (python/ruby/php) it defaults True and the leading-underscore
+    name heuristic decides. Both key casings are accepted because the subprocess
+    pipelines normalize to camelCase while the on-disk call_graph is snake_case.
+    The bias is intentionally toward over-seeding (more reachable = more analysed),
+    never under-seeding.
+    """
+    seeds = set()
+    for func_id, fd in functions.items():
+        name = (fd.get("name") or func_id.rsplit(":", 1)[-1]).split(".")[-1]
+        exported = fd.get("is_exported", fd.get("isExported", True))
+        if exported and not name.startswith("_"):
+            seeds.add(func_id)
+    return seeds
+
+
+# Reason categories that indicate a STRUCTURAL entry point — a real route, program
+# main, CLI command, framework handler, or decorator-marked endpoint — as opposed
+# to an INCIDENTAL match (code merely contains an input-reading pattern). A result
+# seeded ONLY by incidental matches is the library-blackout signature: the public
+# API was never a seed, so the BFS dropped the core.
+_STRUCTURAL_REASON_CATEGORIES = {"unit_type", "decorator", "name"}
+
+
+def blackout_warning(entry_point_details, original_count, reachable_count,
+                     library_mode=False, reduction_threshold=0.90):
+    """Advisory string when a reachability result looks like a silent library
+    blackout, else None. This is ADVISORY ONLY — it never changes which units
+    are kept.
+
+    Two triggers (both off when ``library_mode`` is set, since then the public
+    API was deliberately seeded and a high reduction is the intended result):
+      * total blackout — 0 of N units kept (no seedable frontier); or
+      * partial blackout — >= ``reduction_threshold`` pruned AND no STRUCTURAL
+        entry point was found (every seed is an incidental ``input_pattern``
+        match). This is the case that slips past the zero-seed net: a handful of
+        incidental seeds yield a 96%+ reduction that looks like success while the
+        real public API surface was never analysed (e.g. a C/JS parser library).
+    """
+    if original_count <= 0 or library_mode:
+        return None
+    if reachable_count == 0:
+        return (f"Reachability kept 0 of {original_count} units — total blackout "
+                f"(no entry point could seed the frontier). If this is a library, "
+                f"re-run with --library-mode to seed the exported public API surface.")
+    reduction = 1.0 - (reachable_count / original_count)
+    structural = sum(
+        1 for d in (entry_point_details or {}).values()
+        if any(r.split(":", 1)[0] in _STRUCTURAL_REASON_CATEGORIES
+               for r in d.get("reasons", []))
+    )
+    if reduction >= reduction_threshold and structural == 0:
+        return (f"Reachability kept {reachable_count} of {original_count} units "
+                f"({reduction * 100:.0f}% pruned) but found NO structural entry point "
+                f"(route/main/CLI/handler) — only incidental code-pattern seeds. This is "
+                f"the library-blackout pattern: the public API was not seeded, so the core "
+                f"was dropped. Re-run with --library-mode to seed the exported public API.")
+    return None

@@ -48,7 +48,7 @@ from typing import Set
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from utilities.file_io import open_utf8, read_json, run_utf8, write_json
 from utilities.context_enhancer import ContextEnhancer
-from utilities.agentic_enhancer import EntryPointDetector, ReachabilityAnalyzer
+from utilities.agentic_enhancer import EntryPointDetector, ReachabilityAnalyzer, blackout_warning, library_seed_ids
 
 # Local imports
 from repository_scanner import RepositoryScanner
@@ -87,7 +87,8 @@ class CPipelineTest:
         processing_level: ProcessingLevel = ProcessingLevel.ALL,
         skip_tests: bool = False,
         depth: int = 3,
-        name: str = None
+        name: str = None,
+        library_mode: bool = False
     ):
         self.repo_path = os.path.abspath(repo_path)
         self.output_dir = output_dir or os.path.join(os.path.dirname(__file__), 'test_output')
@@ -98,6 +99,7 @@ class CPipelineTest:
         self.skip_tests = skip_tests
         self.depth = depth
         self.dataset_name = name
+        self.library_mode = library_mode
 
         # Pipeline artifacts
         self.scan_results_file = None
@@ -292,6 +294,13 @@ class CPipelineTest:
             detector = EntryPointDetector(normalized_functions, call_graph)
             self.entry_points = detector.detect_entry_points()
 
+            # Library-mode: a library's entry surface is its exported public API,
+            # which carries no main/route/CLI marker. Seed it so the BFS reaches
+            # the core instead of blacking out. Union-only — never drops a
+            # structurally-detected entry point.
+            if self.library_mode:
+                self.entry_points = self.entry_points | library_seed_ids(normalized_functions)
+
             # Build reachability
             reachability = ReachabilityAnalyzer(
                 functions=normalized_functions,
@@ -322,6 +331,13 @@ class CPipelineTest:
                 "filtered_out": original_count - len(filtered_units),
                 "reduction_percentage": round((1 - len(filtered_units) / original_count) * 100, 1) if original_count > 0 else 0
             }
+
+            _blackout = blackout_warning(detector.entry_point_details, original_count,
+                                         len(filtered_units),
+                                         library_mode=getattr(self, "library_mode", False))
+            if _blackout:
+                dataset["metadata"]["reachability_filter"]["warning"] = _blackout
+                print(f"  [Warning] {_blackout}", file=sys.stderr)
 
             write_json(self.dataset_file, dataset)
 
@@ -1027,6 +1043,11 @@ Examples:
         default=None,
         help='Dataset name (default: derived from repo path)'
     )
+    parser.add_argument(
+        '--library-mode',
+        action='store_true',
+        help='Seed the exported public API as entry points (for libraries with no main/route/CLI)'
+    )
 
     args = parser.parse_args()
 
@@ -1048,7 +1069,8 @@ Examples:
         processing_level=processing_level,
         skip_tests=args.skip_tests,
         depth=args.depth,
-        name=args.name
+        name=args.name,
+        library_mode=args.library_mode
     )
     results = pipeline.run_full_pipeline()
 

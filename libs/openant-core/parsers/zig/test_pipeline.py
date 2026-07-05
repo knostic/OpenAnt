@@ -50,6 +50,11 @@ def main():
     )
     parser.add_argument("--name", help="Dataset name (defaults to repo directory name)")
     parser.add_argument(
+        "--library-mode",
+        action="store_true",
+        help="Seed the exported public API as entry points (for libraries with no main/route/CLI)",
+    )
+    parser.add_argument(
         "--dependency-depth",
         type=int,
         default=3,
@@ -129,7 +134,8 @@ def main():
         # Apply processing level filters
         if args.processing_level != "all":
             call_graph_output = apply_processing_filter(
-                call_graph_output, args.processing_level, str(repo_path)
+                call_graph_output, args.processing_level, str(repo_path),
+                library_mode=args.library_mode,
             )
             print(
                 f"  After {args.processing_level} filter: {len(call_graph_output['functions'])} functions",
@@ -161,7 +167,7 @@ def main():
 
 
 def apply_processing_filter(
-    call_graph_output: dict, level: str, repo_path: str
+    call_graph_output: dict, level: str, repo_path: str, library_mode: bool = False
 ) -> dict:
     """
     Apply processing level filters to reduce the function set.
@@ -173,21 +179,22 @@ def apply_processing_filter(
     - exploitable: Filter to reachable + CodeQL + LLM-classified exploitable
     """
     if level == "reachable":
-        return apply_reachability_filter(call_graph_output, repo_path)
+        return apply_reachability_filter(call_graph_output, repo_path, library_mode=library_mode)
     elif level == "codeql":
         # First apply reachability, then would filter by CodeQL results
-        filtered = apply_reachability_filter(call_graph_output, repo_path)
+        filtered = apply_reachability_filter(call_graph_output, repo_path, library_mode=library_mode)
         # CodeQL filtering would be applied here if results exist
         return filtered
     elif level == "exploitable":
         # Apply all filters
-        filtered = apply_reachability_filter(call_graph_output, repo_path)
+        filtered = apply_reachability_filter(call_graph_output, repo_path, library_mode=library_mode)
         # CodeQL + LLM filtering would be applied here
         return filtered
     return call_graph_output
 
 
-def apply_reachability_filter(call_graph_output: dict, repo_path: str) -> dict:
+def apply_reachability_filter(call_graph_output: dict, repo_path: str,
+                              library_mode: bool = False) -> dict:
     """Filter to functions reachable from entry points.
 
     Uses the real EntryPointDetector / ReachabilityAnalyzer contract, matching
@@ -201,7 +208,7 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str) -> dict:
     --processing-level reachable.
     """
     try:
-        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector
+        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector, blackout_warning, library_seed_ids
         from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
     except ImportError:
         print(
@@ -218,6 +225,11 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str) -> dict:
     # 'unit_type' the Zig extractor emits, which the detector reads directly).
     detector = EntryPointDetector(functions, call_graph)
     entry_points = detector.detect_entry_points()
+
+    # Library-mode: seed the exported public API (a library has no main/route/CLI
+    # marker). Union-only — never drops a structurally-detected entry point.
+    if library_mode:
+        entry_points = entry_points | library_seed_ids(functions)
 
     # Compute the reachable set via reverse-BFS from the entry points.
     analyzer = ReachabilityAnalyzer(
@@ -246,6 +258,11 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str) -> dict:
         for k, vs in reverse_call_graph.items()
         if k in reachable
     }
+
+    _blackout = blackout_warning(detector.entry_point_details, len(functions),
+                                 len(filtered_functions), library_mode=library_mode)
+    if _blackout:
+        print(f"  [Warning] {_blackout}", file=sys.stderr)
 
     return result
 

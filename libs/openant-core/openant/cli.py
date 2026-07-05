@@ -75,6 +75,7 @@ def cmd_scan(args):
             repo_url=getattr(args, "repo_url", None),
             commit_sha=getattr(args, "commit_sha", None),
             diff_manifest=getattr(args, "diff_manifest", None),
+            library_mode=getattr(args, "library_mode", False),
             llm_reachability=getattr(args, "llm_reachability", False),
             llm_reachability_max_code_bytes=getattr(
                 args, "llm_reachability_max_code_bytes", 1500
@@ -129,6 +130,7 @@ def cmd_parse(args):
                 name=getattr(args, "name", None),
                 diff_manifest=getattr(args, "diff_manifest", None),
                 fresh=getattr(args, "fresh", False),
+                library_mode=getattr(args, "library_mode", False),
             )
 
             ctx.summary = {
@@ -995,6 +997,8 @@ def main():
     scan_p.add_argument("--dynamic-test", action="store_true",
                         help="Enable Docker-isolated dynamic testing (off by default)")
     scan_p.add_argument("--no-skip-tests", action="store_true", help="Include test files in parsing (default: tests are skipped)")
+    scan_p.add_argument("--library-mode", action="store_true",
+                        help="Seed the exported public API as entry points (for libraries with no main/route/CLI entry point)")
     scan_p.add_argument("--limit", type=int, help="Max units to analyze")
     scan_p.add_argument(
         "--llm-config",
@@ -1058,6 +1062,8 @@ def main():
         help="Processing level (default: reachable)",
     )
     parse_p.add_argument("--no-skip-tests", action="store_true", help="Include test files in parsing (default: tests are skipped)")
+    parse_p.add_argument("--library-mode", action="store_true",
+                         help="Seed the exported public API as entry points (for libraries with no main/route/CLI entry point)")
     parse_p.add_argument("--name", help="Dataset name (default: derived from repo path)")
     parse_p.add_argument("--diff-manifest", help="Path to diff_manifest.json; tags units with diff_selected")
     parse_p.add_argument("--fresh", action="store_true",
