@@ -284,11 +284,13 @@ var httpHandlerPatterns = []*regexp.Regexp{
 
 func (e *Extractor) isHTTPHandler(params, returns []string, code string) bool {
 	paramsStr := strings.Join(params, " ")
-	returnsStr := strings.Join(returns, " ")
 
-	// Check parameters for HTTP patterns
+	// Check parameters for HTTP patterns. A handler is identified by what it
+	// RECEIVES (request/context types in params), not by what it returns —
+	// matching these patterns against the return type mis-tagged factories
+	// such as `func Logger() gin.HandlerFunc` as http_handler entry points (F10).
 	for _, pattern := range httpHandlerPatterns {
-		if pattern.MatchString(paramsStr) || pattern.MatchString(returnsStr) {
+		if pattern.MatchString(paramsStr) {
 			return true
 		}
 	}
@@ -336,11 +338,20 @@ func (e *Extractor) isCLIHandler(params, returns []string, code string) bool {
 func (e *Extractor) isMiddleware(params, returns []string, code string) bool {
 	// Middleware often takes and returns http.Handler or similar
 	returnsStr := strings.Join(returns, " ")
+	paramsStr := strings.Join(params, " ")
+
+	// A bare `next(` substring previously matched any body with a next() call
+	// (Go 1.23 iterators, lexers, cursors), mislabelling them middleware (F7).
+	// Only treat a `next(` call as middleware when the function has an HTTP
+	// request signature, i.e. it is actually wrapping a handler.
+	hasHTTPSignature := strings.Contains(paramsStr, "http.ResponseWriter") ||
+		strings.Contains(paramsStr, "http.Request") ||
+		strings.Contains(paramsStr, "http.Handler")
 
 	if strings.Contains(returnsStr, "http.Handler") ||
 		strings.Contains(returnsStr, "http.HandlerFunc") ||
 		strings.Contains(code, "next.ServeHTTP") ||
-		strings.Contains(code, "next(") {
+		(hasHTTPSignature && strings.Contains(code, "next(")) {
 		return true
 	}
 
