@@ -484,6 +484,52 @@ class FunctionExtractor:
                         stack.append((child, class_name, new_namespace_name))
                 continue  # Don't walk children again
 
+            elif node.type == 'anonymous_class':
+                # `new class { ... }` (PHP 7+) has no source name. Without a synthetic
+                # identity its methods fall through the catch-all else with the OUTER
+                # class_name (None at top level), so they're keyed as bare functions and
+                # two distinct anonymous classes that both define e.g. handle() collide on
+                # one id (the later silently overwrites the earlier). Synthesize a stable,
+                # location-based name so each anonymous class is distinct and its methods
+                # are qualified (class@anonymous:<line>:<col>.method). Line AND column are
+                # both needed: two `new class {}` on one physical line share a start line,
+                # so column is what keeps them distinct (else they'd still collide).
+                anon_name = (
+                    f"class@anonymous:{node.start_point[0] + 1}:{node.start_point[1]}"
+                )
+                body_node = None
+                for child in node.children:
+                    if child.type == 'declaration_list':
+                        body_node = child
+                        break
+
+                if body_node:
+                    methods = []
+                    for child in body_node.children:
+                        if child.type == 'method_declaration':
+                            mname = self._get_function_name(child, source)
+                            if mname:
+                                if self._is_static_method(child, source):
+                                    methods.append(f"static:{mname}")
+                                else:
+                                    methods.append(mname)
+
+                    self.classes[f"{relative_path}:{anon_name}"] = {
+                        'name': anon_name,
+                        'file_path': relative_path,
+                        'start_line': node.start_point[0] + 1,
+                        'end_line': node.end_point[0] + 1,
+                        'methods': methods,
+                        'superclass': None,
+                        'interfaces': [],
+                        'namespace_name': namespace_name,
+                    }
+                    self.stats['total_classes'] += 1
+
+                    for child in reversed(body_node.children):
+                        stack.append((child, anon_name, namespace_name))
+                continue  # Don't walk children again
+
             else:
                 self._push_children(stack, node.children, source, class_name, namespace_name)
 

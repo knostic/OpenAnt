@@ -131,6 +131,15 @@ class FunctionExtractor:
             if func_info:
                 func_id = f"{file_path}:{func_info['qualified_name']}"
                 functions[func_id] = func_info
+                # Zig's generic-container idiom is a type-returning function:
+                # `fn List(comptime T: type) type { return struct { fn push() ... }; }`.
+                # The returned struct is anonymous in the AST (not a `const Name =
+                # struct {...}` variable_declaration), so without this its methods would
+                # recurse with current_struct unchanged and be emitted as bare top-level
+                # functions. Thread the function name as the struct context so they
+                # qualify as List.push and distinct containers' methods don't collide.
+                if self._returns_type(node, source):
+                    child_struct = func_info["name"]
 
         elif node.type == "variable_declaration":
             # `const Foo = struct { ... };` -- a named struct/enum definition.
@@ -205,6 +214,23 @@ class FunctionExtractor:
             "parameters": parameters,
             "unit_type": unit_type,
         }
+
+    def _returns_type(self, node: Node, source: bytes) -> bool:
+        """True if a function_declaration's return type is the builtin `type` — Zig's
+        generic-container idiom (`fn Foo(...) type { return struct {...} }`).
+
+        The return type is the function_declaration's direct child that follows the
+        `parameters` node (a `builtin_type`). This deliberately inspects only direct
+        children, so the `type` inside a `comptime T: type` parameter (nested under
+        `parameters`) is not mistaken for the return type.
+        """
+        seen_params = False
+        for child in node.children:
+            if child.type in ("parameters", "ParamDeclList"):
+                seen_params = True
+            elif seen_params and child.type == "builtin_type":
+                return self._get_node_text(child, source).strip() == "type"
+        return False
 
     def _extract_parameters(self, node: Node, source: bytes) -> List[str]:
         """Extract parameter names from a parameter list node."""
