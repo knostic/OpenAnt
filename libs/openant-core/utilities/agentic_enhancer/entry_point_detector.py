@@ -213,6 +213,14 @@ class EntryPointDetector:
         if unit_type in ENTRY_POINT_TYPES:
             reasons.append(f'unit_type:{unit_type}')
 
+        # Check 1b: A function named `main` is a program execution root by name,
+        # even when the extractor classified its unit_type as something else
+        # (defensive: covers language extractors that emit a generic unit_type
+        # for main). A program's main is an entry point; over-approximating it
+        # is reachability-safe.
+        elif func_data.get('name') == 'main':
+            reasons.append('name:main')
+
         # Check 2: Decorators indicate entry point
         decorators = func_data.get('decorators', [])
         decorators_str = ' '.join(decorators)
