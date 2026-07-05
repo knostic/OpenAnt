@@ -440,7 +440,8 @@ class CallGraphBuilder:
 
     def _resolve_call(self, call_name: str, caller_file: str,
                       receiver_type: Optional[str] = None,
-                      is_member: bool = False) -> Optional[str]:
+                      is_member: bool = False,
+                      _alias_chain: Optional[Set[str]] = None) -> Optional[str]:
         """Resolve a function call name to a function ID.
 
         When receiver_type is given (a member call like w.compute() whose receiver
@@ -476,10 +477,19 @@ class CallGraphBuilder:
         # Check for macro aliases
         resolved_name = self.macro_aliases.get(call_name, call_name)
         if resolved_name != call_name:
-            # Try resolving the aliased name instead
-            result = self._resolve_call(resolved_name, caller_file)
-            if result:
-                return result
+            # Guard against cyclic macro aliases (e.g. ``#define A B`` /
+            # ``#define B A`` -> {"A": "B", "B": "A"}). Without a visited-set
+            # the recursion below would loop A->B->A->... until RecursionError
+            # aborted the whole repo's call-graph build.
+            if _alias_chain is None:
+                _alias_chain = {call_name}
+            if resolved_name not in _alias_chain:
+                _alias_chain.add(resolved_name)
+                # Try resolving the aliased name instead
+                result = self._resolve_call(resolved_name, caller_file,
+                                            _alias_chain=_alias_chain)
+                if result:
+                    return result
 
         # 1. Same-file functions
         same_file_match = self._resolve_same_file(call_name, caller_file)
