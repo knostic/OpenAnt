@@ -134,6 +134,8 @@ class CallGraphBuilder:
         self.functions_by_name: Dict[str, List[str]] = {}
         self.functions_by_file: Dict[str, List[str]] = {}
         self.methods_by_class: Dict[str, List[str]] = {}
+        # class_key -> list of trait names the class composes via in-class `use`.
+        self.traits_by_class: Dict[str, List[str]] = {}
 
         self._build_indexes()
 
@@ -161,6 +163,13 @@ class CallGraphBuilder:
                 if class_key not in self.methods_by_class:
                     self.methods_by_class[class_key] = []
                 self.methods_by_class[class_key].append(func_id)
+
+        # Index each class's composed traits (in-class `use TraitName;`) so a
+        # $this->/self:: call can fall back to a method pulled in from a trait.
+        for class_key, class_data in self.classes.items():
+            traits = class_data.get('traits')
+            if traits:
+                self.traits_by_class[class_key] = list(traits)
 
     def _is_builtin(self, name: str) -> bool:
         """Check if name is a PHP builtin or common function."""
@@ -494,6 +503,15 @@ class CallGraphBuilder:
             func_data = self.functions.get(func_id, {})
             if func_data.get('name') == method_name:
                 return func_id
+
+        # Fall back to methods composed in via traits (`use TraitName;`). A trait
+        # method is invoked exactly like an own method ($this->m()/self::m()), but
+        # it lives under the trait's own class_key, so resolve it there. The trait
+        # may be declared in a different file, hence the cross-file lookup.
+        for trait_name in self.traits_by_class.get(class_key, []):
+            resolved = self._resolve_class_call(trait_name, method_name, caller_file)
+            if resolved:
+                return resolved
 
         return None
 
