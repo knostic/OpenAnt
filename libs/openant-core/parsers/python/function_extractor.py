@@ -759,7 +759,6 @@ class FunctionExtractor:
             self.stats['files_with_errors'] += 1
             return
 
-        self.stats['files_processed'] += 1
         relative_path = file_path.relative_to(self.repo_path).as_posix()
 
         # Extract imports
@@ -790,11 +789,27 @@ class FunctionExtractor:
             self.stats['module_level_units'] += 1
             self.stats['by_type']['module_level'] = self.stats['by_type'].get('module_level', 0) + 1
 
+        # Count as processed only after extraction fully succeeds, so a file that crashes
+        # mid-extraction (caught by _process_file_guarded) is counted once as an error and
+        # never as processed.
+        self.stats['files_processed'] += 1
+
+    def _process_file_guarded(self, file_path: Path) -> None:
+        """Process one file, isolating any failure so a single pathological file cannot
+        abort the whole repo's extraction (mirrors the Zig/Go per-file loop guard).
+        ast.parse SyntaxErrors are handled inside process_file; this backstops the rest
+        (RecursionError/MemoryError from deep nesting, ValueError, extractor bugs)."""
+        try:
+            self.process_file(file_path)
+        except Exception as e:
+            print(f"Warning: failed to process {file_path}: {type(e).__name__}: {e}", file=sys.stderr)
+            self.stats['files_with_errors'] += 1
+
     def extract_from_scan(self, scan_result: Dict) -> Dict:
         """Extract functions from files listed in a scan result."""
         for file_info in scan_result.get('files', []):
             file_path = self.repo_path / file_info['path']
-            self.process_file(file_path)
+            self._process_file_guarded(file_path)
 
         return self.export()
 
@@ -804,7 +819,7 @@ class FunctionExtractor:
             for file_rel_path in files:
                 file_path = self.repo_path / file_rel_path
                 if file_path.exists():
-                    self.process_file(file_path)
+                    self._process_file_guarded(file_path)
         else:
             # Scan all .py files
             for file_path in self.repo_path.rglob('*.py'):
@@ -815,7 +830,7 @@ class FunctionExtractor:
                 excluded = {'__pycache__', '.git', 'venv', '.venv', 'node_modules'}
                 if excluded & set(file_path.relative_to(self.repo_path).parts):
                     continue
-                self.process_file(file_path)
+                self._process_file_guarded(file_path)
 
         return self.export()
 
