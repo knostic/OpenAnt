@@ -579,6 +579,7 @@ def _parse_javascript(repo_path: str, output_dir: str, processing_level: str, sk
         stdout=sys.stderr,
         stderr=sys.stderr,
         cwd=str(_CORE_ROOT),
+        timeout=1800,  # 30 min — parity with the C/Ruby/PHP/Zig parse subprocesses
     )
 
     if result.returncode != 0:
@@ -637,6 +638,7 @@ def _parse_go(repo_path: str, output_dir: str, processing_level: str, skip_tests
         stdout=sys.stderr,
         stderr=sys.stderr,
         cwd=str(_CORE_ROOT),
+        timeout=1800,  # 30 min — parity with the C/Ruby/PHP/Zig parse subprocesses
     )
 
     if result.returncode != 0:
