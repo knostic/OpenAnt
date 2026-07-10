@@ -77,6 +77,19 @@ ENTRY_POINT_DECORATORS = [
     r'@WebSocketGateway',
 ]
 
+# PHP 8 routing attributes (Symfony / API-Platform): `#[Route(...)]`, `#[Get]`,
+# `#[Post]`, ... A method carrying one of these IS a route handler regardless of
+# the class name, so a handler on a class NOT named *Controller (which the PHP
+# extractor's name/path-based classifier leaves as a plain `method`) is still
+# seeded as an entry point.
+ROUTE_ATTRIBUTE_PATTERNS = [
+    # A PHP 8 routing attribute anywhere in the attribute list — not only right
+    # after `#[`. Allows a namespace prefix (#[Routing\Route], #[\Symfony\...\Route]),
+    # grouped attributes (#[Foo, Route(...)]), and (with IGNORECASE at compile)
+    # case-insensitive class names, since PHP class names are case-insensitive.
+    r'#\[[^\]]*\b(Route|Get|Post|Put|Delete|Patch|Options|Head)\b',
+]
+
 # Code patterns indicating direct user input sources
 USER_INPUT_PATTERNS = [
     # Flask
@@ -120,6 +133,14 @@ USER_INPUT_PATTERNS = [
     r'php://input',
     r'\bfile_get_contents\s*\(\s*["\']php://input',
     r'\bfilter_input\s*\(',
+    # Symfony request reads, anchored to a $request / $req / $this->request
+    # receiver so they read HTTP input, not an unrelated ->query->all() on an
+    # ORM builder or a ->headers->get() on the app's own response object.
+    #  - request bags:   $request->query->get(...) / ->request-> / ->cookies-> / ...
+    #  - direct methods: $request->get(...) / ->getPayload() / ->getContent() /
+    #                    ->toArray() / ->input(...) / ->all()
+    r'(\$(request|req)\b|\$this\s*->\s*request\b)\s*->\s*(query|request|cookies|attributes|headers|files)\s*->\s*(get|all)\s*\(',
+    r'(\$(request|req)\b|\$this\s*->\s*request\b)\s*->\s*(get|getPayload|getContent|toArray|input|all)\s*\(',
 ]
 
 # Patterns that indicate module-level scripts with user input
@@ -169,6 +190,9 @@ class EntryPointDetector:
         # Compile regex patterns for efficiency
         self._decorator_patterns = [
             re.compile(p, re.IGNORECASE) for p in ENTRY_POINT_DECORATORS
+        ]
+        self._route_attribute_patterns = [
+            re.compile(p, re.IGNORECASE) for p in ROUTE_ATTRIBUTE_PATTERNS
         ]
         self._input_patterns = [
             re.compile(p) for p in USER_INPUT_PATTERNS
@@ -221,9 +245,19 @@ class EntryPointDetector:
         elif func_data.get('name') == 'main':
             reasons.append('name:main')
 
-        # Check 2: Decorators indicate entry point
+        # Check 1c: A PHP 8 routing attribute (#[Route]/#[Get]/#[Post]/...) marks
+        # the method as a route handler INDEPENDENT of the class name. Symfony /
+        # API-Platform endpoints live on classes not named *Controller, which the
+        # PHP extractor's name/path-based classifier leaves as a plain `method`;
+        # the attribute is the authoritative signal.
         decorators = func_data.get('decorators', [])
         decorators_str = ' '.join(decorators)
+        for pattern in self._route_attribute_patterns:
+            if pattern.search(decorators_str):
+                reasons.append('unit_type:route_handler')
+                break
+
+        # Check 2: Decorators indicate entry point
         for pattern in self._decorator_patterns:
             if pattern.search(decorators_str):
                 reasons.append(f'decorator:{pattern.pattern}')

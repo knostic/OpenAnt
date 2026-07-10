@@ -263,6 +263,12 @@ class PHPPipelineTest:
                     'endLine': func_data.get('endLine', func_data.get('end_line', 0)),
                     'isExported': func_data.get('isExported', True),
                     'isSingleton': func_data.get('isSingleton', func_data.get('is_singleton', False)),
+                    # Carry decorators/attributes so EntryPointDetector Check-1c
+                    # (PHP 8 #[Route] attribute routing) and Check-2 (decorator
+                    # patterns) fire on this per-parser reachable path — the
+                    # whitelist previously dropped them, silently disabling
+                    # attribute-based entry-point detection here.
+                    'decorators': func_data.get('decorators', []),
                 }
 
             # Build call graph from dataset unit metadata

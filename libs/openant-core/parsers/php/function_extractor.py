@@ -131,6 +131,21 @@ class FunctionExtractor:
 
         return params
 
+    def _get_attributes(self, node, source: bytes) -> List[str]:
+        """Extract PHP 8 attributes (`#[Route(...)]`, `#[Get]`, ...) as strings.
+
+        Attributes decorate a method/function via one or more `attribute_list`
+        children (`#[...]`). They carry routing/framework semantics (Symfony /
+        API-Platform `#[Route]`, `#[Get]`, `#[Post]`), so they are stored under
+        `decorators` — mirroring the Python/JS extractors — for the entry-point
+        detector to classify routed methods regardless of the class name.
+        """
+        attributes: List[str] = []
+        for child in node.children:
+            if child.type == 'attribute_list':
+                attributes.append(self._node_text(child, source))
+        return attributes
+
     def _is_static_method(self, node, source: bytes) -> bool:
         """Check if a method_declaration has a static modifier."""
         for child in node.children:
@@ -625,6 +640,7 @@ class FunctionExtractor:
             'parameters': parameters,
             'is_static': is_static,
             'unit_type': unit_type,
+            'decorators': self._get_attributes(node, source),
         }
 
         self._store_function(func_id, func_data)
