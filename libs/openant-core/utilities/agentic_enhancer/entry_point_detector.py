@@ -96,6 +96,15 @@ USER_INPUT_PATTERNS = [
     r'argparse\.',
     r'\bArgumentParser\s*\(',
     r'click\.(argument|option)',
+    # Ruby CLI / stdin / env: a method that reads these IS a user-input entry
+    # point, including the dominant `def run; ...ARGV...; end` behind an
+    # `if __FILE__ == $0` guard (the sink lives in a `function` unit, so it must
+    # be seeded by this check, not only the module_level check). Mirrors sys.argv.
+    r'\bARGV\b',
+    r'\bgets\b',
+    r'\bSTDIN\b',
+    r'\$stdin\b',
+    r'\bENV\s*(\[|\.(fetch|values_at|dig|to_h|slice)\b)',
     # Standard input
     r'\binput\s*\(',
     r'sys\.stdin',
@@ -136,6 +145,14 @@ MODULE_LEVEL_INPUT_PATTERNS = [
     r'\badd_filter\s*\(',
     r'\bdo_action\s*\(',
     r'\bapply_filters\s*\(',
+    # Ruby file-scope scripts (bin/ executables, Rakefiles): CLI args, stdin and
+    # env reads that run on load, so a module_level unit carrying them is a
+    # user-input entry point.
+    r'\bARGV\b',
+    r'\bSTDIN\b',
+    r'\$stdin\b',
+    r'\bgets\b',
+    r'\bENV\[',
 ]
 
 
