@@ -259,16 +259,19 @@ class FunctionExtractor:
             node, class_name, namespace_name = stack.pop()
 
             if node.type == 'function_definition':
+                # A named `function foo(){}` is ALWAYS a GLOBAL function in PHP,
+                # even when it lexically appears inside a method/function body:
+                # it is registered in the global function table when the
+                # enclosing code runs, not attached to the class. Emit it with
+                # class_name=None so it is not keyed as a phantom Class.foo, and
+                # recurse with class_name=None so anything nested in its body is
+                # likewise not attributed to the enclosing class.
                 self._process_function_node(
-                    node, source, relative_path, class_name, namespace_name,
+                    node, source, relative_path, None, namespace_name,
                     is_static=False
                 )
-                # Recurse into the body so nested closures/arrow functions are
-                # reached; named definitions cannot lexically nest other named
-                # functions/classes in PHP, so this only surfaces
-                # anonymous_function / arrow_function units.
                 for child in reversed(node.children):
-                    stack.append((child, class_name, namespace_name))
+                    stack.append((child, None, namespace_name))
                 continue
 
             elif node.type == 'method_declaration':
