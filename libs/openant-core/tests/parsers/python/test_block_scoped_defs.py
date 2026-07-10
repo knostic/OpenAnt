@@ -105,6 +105,40 @@ def test_block_def_colliding_with_top_level_keeps_both():
     assert len(dups) == 2, f"block def must not clobber top-level same-name: {dups}"
 
 
+def test_class_body_block_def_keeps_class_and_resolves_self_edge():
+    # REGRESSION from #134: a method defined under a conditional in a class
+    # body was mis-keyed module-level (class_name=None) because
+    # _descend_into_blocks, called from _process_class_tree, hardcoded
+    # class_name=None. The def must keep its enclosing class, and the sibling
+    # method's `self.handle()` self-call must resolve to it.
+    from parsers.python.call_graph_builder import CallGraphBuilder
+
+    src = (
+        "class Service:\n"
+        "    def caller(self): return self.handle()\n"
+        "    if True:\n"
+        "        def handle(self): return 1\n"
+    )
+    repo = Path(tempfile.mkdtemp()).resolve()
+    (repo / "m.py").write_text(src)
+    ex = FunctionExtractor(str(repo))
+    ex.process_file(repo / "m.py")
+    fns = ex.functions
+
+    handle = next(v for v in fns.values() if v["name"] == "handle")
+    assert handle["class_name"] == "Service", (
+        f"block-scoped class-body def mis-keyed: class_name={handle['class_name']!r}"
+    )
+
+    builder = CallGraphBuilder(ex.export())
+    builder.build_call_graph()
+    caller_id = next(k for k, v in fns.items() if v["name"] == "caller")
+    handle_id = next(k for k, v in fns.items() if v["name"] == "handle")
+    assert handle_id in builder.call_graph[caller_id], (
+        f"caller -> handle self-edge missing; got {builder.call_graph[caller_id]}"
+    )
+
+
 def test_module_unit_does_not_leak_block_def_body():
     # The block def's body (incl. its sink) must move into its own unit, not
     # leak verbatim into the synthetic :__module__ text.
