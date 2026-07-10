@@ -366,6 +366,7 @@ class TypeScriptAnalyzer {
           endLine: method.getEndLineNumber(),
           className: className,
           parameters: this._extractParameters(method),
+          decorators: this._decoratorTexts(classDecl, method),
         };
       }
 
@@ -550,6 +551,7 @@ class TypeScriptAnalyzer {
           startLine: method.getStartLineNumber(),
           endLine: method.getEndLineNumber(),
           className: className,
+          decorators: this._decoratorTexts(classExpr, method),
         };
         this.callGraph[functionId] = this.extractCallsFromFunction(
           method,
@@ -825,6 +827,7 @@ class TypeScriptAnalyzer {
       startLine: fnNode.getStartLineNumber(),
       endLine: fnNode.getEndLineNumber(),
       className: className,
+      decorators: this._decoratorTexts(fnNode),
     };
     // Pattern-A companion: emit the callGraph entry alongside the function so
     // `len(callGraph) === len(functions)` holds.
@@ -832,6 +835,33 @@ class TypeScriptAnalyzer {
       fnNode,
       relativePath,
     );
+  }
+
+  /**
+   * Decorator source texts for the given ts-morph nodes (a method and,
+   * optionally, its enclosing class), e.g. ['@Get()', '@Controller("users")'].
+   * The reachability EntryPointDetector reads func_data.decorators to seed
+   * framework route handlers (NestJS @Get/@Post/@Controller, Angular, ...); the
+   * analyzer previously never emitted them, so decorated handlers were never
+   * detected as entry points.
+   */
+  _decoratorTexts(...nodes) {
+    const out = [];
+    for (const node of nodes) {
+      if (!node || typeof node.getDecorators !== "function") continue;
+      for (const d of node.getDecorators()) {
+        try {
+          out.push(d.getText().replace(/\s+/g, " ").trim());
+        } catch (e) {
+          try {
+            out.push("@" + d.getName());
+          } catch (e2) {
+            /* skip an unreadable decorator */
+          }
+        }
+      }
+    }
+    return out;
   }
 
   /**
