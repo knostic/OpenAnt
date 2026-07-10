@@ -164,7 +164,7 @@ class CallGraphBuilder:
 
             for call_name in calls:
                 resolved_ids = self._resolve_call(
-                    call_name, file_path, name_to_ids, alias_to_target
+                    call_name, file_path, name_to_ids, alias_to_target, func_id
                 )
                 for resolved_id in resolved_ids:
                     if resolved_id != func_id:  # No self-calls
@@ -269,17 +269,19 @@ class CallGraphBuilder:
 
     def _build_alias_index(
         self, name_to_ids: Dict[str, List[str]]
-    ) -> Dict[str, Dict[str, str]]:
-        """Index simple const fn-aliases per file: `const f = handler;` -> {f: handler}.
+    ) -> Dict[str, Dict[str, Optional[str]]]:
+        """Index simple const fn-aliases per function: `const f = handler;` -> {f: handler}.
 
         Only bindings whose right-hand side is a bare identifier naming a known
         function are tracked (a genuine fn alias), so arbitrary const dataflow
-        (`const x = 1;`) is ignored. Scoped per file to avoid cross-file leaks.
+        (`const x = 1;`) is ignored. Scoped per FUNCTION (keyed by func_id), not
+        per file: two functions in the same file may bind the same alias name to
+        different targets (`const doit = foo` vs `const doit = bar`), and each
+        caller must resolve to its own target rather than clobbering the other.
         """
-        alias_to_target: Dict[str, Dict[str, str]] = defaultdict(dict)
+        alias_to_target: Dict[str, Dict[str, Optional[str]]] = defaultdict(dict)
 
-        for func_info in self.functions.values():
-            file_path = func_info.get("file_path", "")
+        for func_id, func_info in self.functions.items():
             code = func_info.get("code", "")
             if not code:
                 continue
@@ -291,7 +293,7 @@ class CallGraphBuilder:
                 tree.root_node,
                 code.encode("utf-8"),
                 name_to_ids,
-                alias_to_target[file_path],
+                alias_to_target[func_id],
             )
 
         return alias_to_target
@@ -301,7 +303,7 @@ class CallGraphBuilder:
         node: Node,
         source: bytes,
         name_to_ids: Dict[str, List[str]],
-        aliases: Dict[str, str],
+        aliases: Dict[str, Optional[str]],
     ) -> None:
         """Collect `const <alias> = <known-fn>;` bindings from a parse tree."""
         if node.type in ("variable_declaration", "VarDecl"):
@@ -312,7 +314,10 @@ class CallGraphBuilder:
             if len(ident_children) == 2:
                 alias_name = self._get_node_text(ident_children[0], source)
                 target_name = self._get_node_text(ident_children[1], source)
-                # Only record when the target is a known function name.
+                # Only record when the target is a known function name. A Zig
+                # `const` binding is immutable and cannot be rebound within a
+                # function, so a plain assignment (scoped per function by the
+                # caller) is sufficient here.
                 if alias_name and target_name in name_to_ids:
                     aliases[alias_name] = target_name
 
@@ -438,7 +443,8 @@ class CallGraphBuilder:
         call_name: str,
         caller_file: str,
         name_to_ids: Dict[str, List[str]],
-        alias_to_target: Dict[str, Dict[str, str]] | None = None,
+        alias_to_target: Dict[str, Dict[str, Optional[str]]] | None = None,
+        caller_id: Optional[str] = None,
     ) -> List[str]:
         """
         Resolve a call name to function ID(s).
@@ -448,10 +454,12 @@ class CallGraphBuilder:
         2. Imported files
         3. Unique name match
         """
-        # Resolve a same-file const fn-alias (`const f = handler; f()`) to its
-        # target function name before looking up candidates.
-        if alias_to_target is not None:
-            target = alias_to_target.get(caller_file, {}).get(call_name)
+        # Resolve a const fn-alias (`const f = handler; f()`) to its target
+        # function name before looking up candidates. Aliases are keyed by the
+        # CALLER function (not the file) so a same-named alias in another
+        # function in the same file cannot clobber this one.
+        if alias_to_target is not None and caller_id is not None:
+            target = alias_to_target.get(caller_id, {}).get(call_name)
             if target is not None:
                 call_name = target
 
