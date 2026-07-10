@@ -75,3 +75,52 @@ def test_bare_call_resolves_within_same_namespace():
     assert b.call_graph.get("consumer.php:caller") == ["utils.php:helper"], (
         f"same-namespace bare call must still resolve: {b.call_graph}"
     )
+
+
+def test_this_call_to_builtin_named_same_class_method_resolves():
+    """$this->count() must edge to the same-class count() method (B2).
+
+    A same-class method named like a PHP builtin (count/next/key) was dropped by a
+    premature _is_builtin() short-circuit in _resolve_member_call before it could
+    route to _resolve_self_call. Driven through the real builder on real PHP source.
+    """
+    funcs = {
+        "bag.php:Bag::count": {
+            "name": "count", "file_path": "bag.php", "class_name": "Bag",
+            "namespace_name": None,
+            "code": "function count() { return 1; }",
+        },
+        "bag.php:Bag::total": {
+            "name": "total", "file_path": "bag.php", "class_name": "Bag",
+            "namespace_name": None,
+            "code": "function total() { return $this->count() * 2; }",
+        },
+    }
+    b = _build(funcs)
+    assert b.call_graph.get("bag.php:Bag::total") == ["bag.php:Bag::count"], (
+        f"$this->count() must resolve to same-class count(): {b.call_graph}"
+    )
+
+
+def test_scoped_call_to_builtin_named_same_class_method_resolves():
+    """self::count() must edge to the same-class count() method (B2).
+
+    Same bug in _resolve_scoped_call: the premature _is_builtin() short-circuit
+    dropped self::/static::/Class:: calls to a builtin-named own method.
+    """
+    funcs = {
+        "bag.php:Bag::count": {
+            "name": "count", "file_path": "bag.php", "class_name": "Bag",
+            "namespace_name": None,
+            "code": "function count() { return 1; }",
+        },
+        "bag.php:Bag::total": {
+            "name": "total", "file_path": "bag.php", "class_name": "Bag",
+            "namespace_name": None,
+            "code": "function total() { return self::count() * 2; }",
+        },
+    }
+    b = _build(funcs)
+    assert b.call_graph.get("bag.php:Bag::total") == ["bag.php:Bag::count"], (
+        f"self::count() must resolve to same-class count(): {b.call_graph}"
+    )

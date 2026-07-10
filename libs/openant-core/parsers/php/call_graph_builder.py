@@ -384,9 +384,6 @@ class CallGraphBuilder:
         if not method_name:
             return None
 
-        if self._is_builtin(method_name):
-            return None
-
         # $this->method() - same class
         if receiver == '$this' and caller_class:
             return self._resolve_self_call(method_name, caller_file, caller_class)
@@ -414,9 +411,6 @@ class CallGraphBuilder:
                 continue
 
         if not method_name or not scope:
-            return None
-
-        if self._is_builtin(method_name):
             return None
 
         # self::method() or static::method() - same class
