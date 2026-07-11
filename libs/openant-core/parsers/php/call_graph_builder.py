@@ -416,6 +416,13 @@ class CallGraphBuilder:
         if not method_name or not scope:
             return None
 
+        # Closure::fromCallable('foo') / (['Class','method']) names a real callable
+        # statically. Resolve the string/array-literal target as a callback (the
+        # resulting Closure object's later invocation via $c() is untracked, but the
+        # referenced function is a genuine edge). Reuses the higher-order-builtin path.
+        if scope == 'Closure' and method_name == 'fromCallable':
+            return self._resolve_callback_arg(node, source, caller_file, caller_class, 0)
+
         if self._is_builtin(method_name):
             return None
 
