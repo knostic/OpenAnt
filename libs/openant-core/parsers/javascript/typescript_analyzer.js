@@ -1482,7 +1482,10 @@ class TypeScriptAnalyzer {
     const byFile = Object.create(null);
     const byName = Object.create(null);
     for (const funcId of Object.keys(this.functions)) {
-      const file = funcId.slice(0, funcId.lastIndexOf(":"));
+      // The file is the part before the FIRST colon; a function id's name part
+      // may itself contain colons (e.g. an express seed `app.js:express(GET:/x:4:0)`),
+      // so lastIndexOf would mangle the file and break same-file resolution.
+      const file = funcId.slice(0, funcId.indexOf(":"));
       (byFile[file] = byFile[file] || []).push(funcId);
       const simple = (this.functions[funcId].name || "").split(".").pop();
       (byName[simple] = byName[simple] || []).push(funcId);
@@ -1501,7 +1504,7 @@ class TypeScriptAnalyzer {
     };
 
     for (const [callerId, edges] of Object.entries(this.callGraph)) {
-      const callerFile = callerId.slice(0, callerId.lastIndexOf(":"));
+      const callerFile = callerId.slice(0, callerId.indexOf(":"));
       const resolvedTargets = [];
       const indirect = [];
 
