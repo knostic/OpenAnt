@@ -363,6 +363,14 @@ class FunctionExtractor:
                         name=args[0], unit_type=None, visibility=vis_state[0],
                     )
                     handled = True
+                elif method_name == 'define_singleton_method' and class_name and args:
+                    # Class/singleton method defined dynamically; mirror define_method
+                    # so its body (and any sink it reaches) is extracted as a unit.
+                    self._emit_synthetic_method(
+                        node, source, relative_path, class_name, module_name,
+                        name=args[0], unit_type=None, visibility=vis_state[0],
+                    )
+                    handled = True
                 elif (class_name is None and module_name is None
                       and method_name in self._SINATRA_VERBS
                       and self._has_block(node) and args):
