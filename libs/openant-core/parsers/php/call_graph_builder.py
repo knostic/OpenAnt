@@ -469,17 +469,26 @@ class CallGraphBuilder:
                             if func_data.get('name') == func_name:
                                 return func_id
 
-        # 4. Unique name match across files. An unqualified call resolves within
-        #    the caller's own namespace; a function in a different namespace is not
-        #    reachable this way, so a same-named function elsewhere must not leak an
-        #    edge across the namespace boundary.
-        candidates = self.functions_by_name.get(func_name, [])
-        candidates = [c for c in candidates
-                      if not self.functions.get(c, {}).get('class_name')
-                      and self._namespace_compatible(
-                          self.functions.get(c, {}).get('namespace_name'), caller_namespace)]
-        if len(candidates) == 1:
-            return candidates[0]
+        # 4. Unqualified call resolution across files. PHP resolves an unqualified
+        #    function call within the caller's own namespace FIRST; if there is no such
+        #    function it FALLS BACK to the global namespace. A same-named function in an
+        #    unrelated namespace is never reachable this way, so it must not leak an edge.
+        non_method = [c for c in self.functions_by_name.get(func_name, [])
+                      if not self.functions.get(c, {}).get('class_name')]
+        # (a) same-namespace binding takes precedence
+        same_ns = [c for c in non_method
+                   if self._namespace_compatible(
+                       self.functions.get(c, {}).get('namespace_name'), caller_namespace)]
+        if len(same_ns) == 1:
+            return same_ns[0]
+        # (b) global-namespace fallback for an unqualified call (only when the caller's
+        #     own namespace has no such function); still requires a unique target so an
+        #     ambiguous global name does not leak an edge.
+        if not same_ns:
+            global_ns = [c for c in non_method
+                         if not (self.functions.get(c, {}).get('namespace_name') or '').strip('\\')]
+            if len(global_ns) == 1:
+                return global_ns[0]
 
         return None
 
