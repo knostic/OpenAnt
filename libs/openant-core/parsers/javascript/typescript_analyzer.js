@@ -325,6 +325,11 @@ class TypeScriptAnalyzer {
           const code = statement.getFullText();
           const functionId = `${relativePath}:${name}`;
 
+          // First-wins: do not overwrite a function already emitted at this id (e.g. a
+          // block-scoped `function name(){...}` elsewhere in the file), which would
+          // silently drop that definition and its calls. Matches the other emit paths.
+          if (this.functions[functionId]) continue;
+
           // Include the full variable declaration (const name = ...) for context
           this.functions[functionId] = {
             name: name,
