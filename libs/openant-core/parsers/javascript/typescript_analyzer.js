@@ -536,7 +536,16 @@ class TypeScriptAnalyzer {
         this._inferAssignedName(classExpr) ||
         "AnonymousClass";
 
-      const methods = classExpr.getMethods ? classExpr.getMethods() : [];
+      // getMethods() excludes get/set accessors; iterate them too so a class
+      // expression's accessors (which can carry sinks) are emitted as units,
+      // mirroring the class-declaration path.
+      const methods = classExpr.getMethods
+        ? [
+            ...classExpr.getMethods(),
+            ...(classExpr.getGetAccessors ? classExpr.getGetAccessors() : []),
+            ...(classExpr.getSetAccessors ? classExpr.getSetAccessors() : []),
+          ]
+        : [];
       for (const method of methods) {
         const methodName = method.getName();
         const functionId = `${relativePath}:${className}.${methodName}`;
