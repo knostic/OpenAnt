@@ -98,6 +98,17 @@ CALLBACK_BUILTINS = {
     'usort': 1, 'uasort': 1, 'uksort': 1, 'preg_replace_callback': 1,
 }
 
+# Framework / registration functions that dispatch to a callback argument but are NOT
+# PHP builtins. A user could define a same-named function, so these are resolved as a
+# dispatcher only when NOT shadowed by a user function (see _resolve_function_call).
+# Maps name -> 0-based position of the callback argument.
+FRAMEWORK_CALLBACKS = {
+    'add_action': 1, 'add_filter': 1,                 # WordPress hooks
+    'register_shutdown_function': 0,
+    'set_error_handler': 0, 'set_exception_handler': 0,
+    'spl_autoload_register': 0,
+}
+
 # PHP keywords to skip in regex fallback
 PHP_KEYWORDS = {
     'if', 'else', 'elseif', 'while', 'for', 'foreach',
@@ -260,6 +271,14 @@ class CallGraphBuilder:
             if cb_idx is not None:
                 return self._resolve_callback_arg(node, source, caller_file, caller_class, cb_idx)
             return None
+
+        # Framework registration dispatchers (add_action, register_shutdown_function,
+        # ...) route to a callback argument. They are not PHP builtins, so treat them as
+        # a dispatcher only when NOT shadowed by a user-defined function of the same name
+        # (which would be the real call target).
+        fw_idx = FRAMEWORK_CALLBACKS.get(func_name.lower())
+        if fw_idx is not None and func_name not in self.functions_by_name:
+            return self._resolve_callback_arg(node, source, caller_file, caller_class, fw_idx)
 
         return self._resolve_simple_call(func_name, caller_file, caller_class, caller_namespace)
 
