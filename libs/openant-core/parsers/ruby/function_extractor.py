@@ -212,6 +212,48 @@ class FunctionExtractor:
             return ''
         return None
 
+    def _collect_const_literals(self, root, source: bytes) -> Dict[str, str]:
+        """Map CONST_NAME -> literal value for single-literal-assigned constants.
+
+        Determinacy guard: a constant assigned more than once, or ever assigned a
+        non-literal, is blacklisted -- so `define_method(CONST)` is resolved only
+        when CONST has exactly one literal (symbol/string) binding in the file.
+        """
+        literals: Dict[str, str] = {}
+        bad = set()
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            if n.type == 'assignment':
+                kids = [c for c in n.children if c.type != '=']
+                if len(kids) >= 2 and kids[0].type == 'constant':
+                    name = self._node_text(kids[0], source)
+                    if name not in bad:
+                        val = self._literal_arg_text(kids[1], source)
+                        if val is None or name in literals:
+                            bad.add(name)
+                            literals.pop(name, None)
+                        else:
+                            literals[name] = val
+            stack.extend(n.children)
+        return literals
+
+    def _resolve_const_name_arg(self, node, source: bytes,
+                                const_literals: Dict[str, str]) -> Optional[str]:
+        """If a call's first real argument is a CONSTANT with a known single-literal
+        binding, return that literal (the resolved method name); else None. Only a
+        `constant` node matches, so a lowercase local var or a dynamic expression is
+        never resolved."""
+        for child in node.children:
+            if child.type == 'argument_list':
+                for arg in child.children:
+                    if arg.type in ('(', ')', ','):
+                        continue
+                    if arg.type == 'constant':
+                        return const_literals.get(self._node_text(arg, source))
+                    return None  # first real arg is not a constant
+        return None
+
     def _call_receiver_and_method(self, node, source: bytes):
         """For a 'call' node, return (method_name, [literal positional args]).
 
@@ -318,6 +360,7 @@ class FunctionExtractor:
         by subsequent siblings popped from the same body (children are pushed in
         reverse so they pop in source order).
         """
+        const_literals = self._collect_const_literals(tree.root_node, source)
         stack = [(tree.root_node, None, None, ['public'])]
 
         while stack:
@@ -363,12 +406,19 @@ class FunctionExtractor:
                 # still found.
                 method_name, args = self._call_receiver_and_method(node, source)
                 handled = False
-                if method_name == 'define_method' and class_name and args:
-                    self._emit_synthetic_method(
-                        node, source, relative_path, class_name, module_name,
-                        name=args[0], unit_type=None, visibility=vis_state[0],
-                    )
-                    handled = True
+                if method_name == 'define_method' and class_name:
+                    # Literal-symbol/string name, or a CONSTANT bound to a single
+                    # literal (`NAME = :m; define_method(NAME)`). A non-literal /
+                    # reassigned constant or a lowercase local name stays unresolved
+                    # -> the unit falls through to child descent (0 phantom).
+                    dm_name = args[0] if args else self._resolve_const_name_arg(
+                        node, source, const_literals)
+                    if dm_name:
+                        self._emit_synthetic_method(
+                            node, source, relative_path, class_name, module_name,
+                            name=dm_name, unit_type=None, visibility=vis_state[0],
+                        )
+                        handled = True
                 elif method_name == 'alias_method' and class_name and args:
                     self._emit_synthetic_method(
                         node, source, relative_path, class_name, module_name,
