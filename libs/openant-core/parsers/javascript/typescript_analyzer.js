@@ -374,6 +374,28 @@ class TypeScriptAnalyzer {
         };
       }
 
+      // Emit the constructor as its own unit so `new X()` edges have a target and
+      // its body's calls (this.foo()) are walked. A class has at most one
+      // implemented constructor; overload signatures carry no body. The
+      // ConstructorDeclaration has no getName(), so it can't join classMembers above
+      // and needs the literal id `${className}.constructor`.
+      const ctorDecl =
+        classDecl.getConstructors().find((c) => c.getBody && c.getBody()) ||
+        classDecl.getConstructors()[0];
+      if (ctorDecl) {
+        const ctorCode = ctorDecl.getFullText();
+        this.functions[`${relativePath}:${className}.constructor`] = {
+          name: `${className}.constructor`,
+          code: ctorCode,
+          isExported: classDecl.isExported(),
+          unitType: this.classifyFunction("constructor", ctorCode, true, className),
+          startLine: ctorDecl.getStartLineNumber(),
+          endLine: ctorDecl.getEndLineNumber(),
+          className: className,
+          parameters: this._extractParameters(ctorDecl),
+        };
+      }
+
       // Build class-level metadata: constructorDeps and baseTypes
       const classEntry = {};
 
@@ -1376,6 +1398,20 @@ class TypeScriptAnalyzer {
           relativePath,
         );
       }
+
+      // Walk the constructor body too (ConstructorDeclaration has no getName(), so
+      // it can't join classMembers above). Same single-ctor selection as the
+      // inventory builder keeps functions[] and callGraph[] ids in lockstep.
+      const ctorDecl =
+        classDecl.getConstructors().find((c) => c.getBody && c.getBody()) ||
+        classDecl.getConstructors()[0];
+      if (ctorDecl) {
+        const callerId = `${relativePath}:${className}.constructor`;
+        this.callGraph[callerId] = this.extractCallsFromFunction(
+          ctorDecl,
+          relativePath,
+        );
+      }
     }
   }
 
@@ -1412,7 +1448,13 @@ class TypeScriptAnalyzer {
     }
     if (kind === "PropertyAccessExpression") {
       // Trailing member name (e.g. `baz` from `foo.bar().baz`).
-      return calleeExpr.getName ? calleeExpr.getName() : null;
+      const member = calleeExpr.getName ? calleeExpr.getName() : null;
+      // Now that `X.constructor` units exist, a bare `foo.constructor()` member call
+      // (simple-name token "constructor") would collide with every constructor unit
+      // and can't be tied to a specific class -> treat as indirect. The qualified
+      // `new X()` edges built in extractCallsFromFunction are unaffected.
+      if (member === "constructor") return null;
+      return member;
     }
     // ElementAccessExpression (obj['m']), ParenthesizedExpression, etc. have no
     // stable identifier name — treat as dynamic.
@@ -1461,6 +1503,24 @@ class TypeScriptAnalyzer {
         if (arg.getKindName() === "Identifier") {
           pushName(arg.getText(), false);
         }
+      }
+    }
+
+    // `new X()` is a NewExpression, not a CallExpression, so it is invisible to the
+    // loop above. Record an edge to the class constructor unit, using a QUALIFIED
+    // name (`X.constructor`, never bare `constructor`) so resolution targets X's
+    // constructor and only resolves same-file (a cross-file / builtin `new` stays
+    // indirect because byName is keyed by the simple name `constructor`).
+    const newExpressions = funcNode.getDescendantsOfKind(
+      ts.SyntaxKind.NewExpression,
+    );
+    for (const newExpr of newExpressions) {
+      const callee = newExpr.getExpression();
+      if (callee && callee.getKindName() === "Identifier") {
+        pushName(`${callee.getText()}.constructor`, false);
+      }
+      for (const arg of newExpr.getArguments() || []) {
+        if (arg.getKindName() === "Identifier") pushName(arg.getText(), false);
       }
     }
 
