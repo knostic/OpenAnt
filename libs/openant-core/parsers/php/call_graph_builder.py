@@ -235,7 +235,7 @@ class CallGraphBuilder:
             return self._resolve_function_call(node, source, caller_file, caller_class,
                                                caller_namespace, root)
         elif node.type == 'member_call_expression':
-            return self._resolve_member_call(node, source, caller_file, caller_class)
+            return self._resolve_member_call(node, source, caller_file, caller_class, root)
         elif node.type == 'scoped_call_expression':
             return self._resolve_scoped_call(node, source, caller_file, caller_class)
         elif node.type == 'object_creation_expression':
@@ -381,29 +381,59 @@ class CallGraphBuilder:
 
     @staticmethod
     def _string_literal_value(node, source: bytes) -> Optional[str]:
-        """Return the content of a string-literal node, else None."""
-        if node.type != 'string':
-            return None
-        for child in node.children:
-            if child.type == 'string_content':
-                return source[child.start_byte:child.end_byte].decode(
-                    'utf-8', errors='replace')
-        # Empty string literal ('') has no string_content child.
-        return ''
+        """Return the content of a string-literal node, else None.
+
+        Single-quoted strings parse as `string`; double-quoted as `encapsed_string`.
+        An `encapsed_string` is accepted only when it has NO interpolation (its only
+        meaningful child is a single `string_content`), so `"dang$p"` is not treated
+        as a static literal.
+        """
+        if node.type == 'string':
+            for child in node.children:
+                if child.type == 'string_content':
+                    return source[child.start_byte:child.end_byte].decode(
+                        'utf-8', errors='replace')
+            # Empty string literal ('') has no string_content child.
+            return ''
+        if node.type == 'encapsed_string':
+            content = None
+            for child in node.children:
+                if child.type == '"':
+                    continue
+                if child.type == 'string_content':
+                    if content is not None:
+                        return None  # multiple chunks -> unusual, decline
+                    content = source[child.start_byte:child.end_byte].decode(
+                        'utf-8', errors='replace')
+                else:
+                    return None  # interpolation / embedded expression -> not static
+            return content if content is not None else ''
+        return None
 
     def _resolve_member_call(self, node, source: bytes, caller_file: str,
-                              caller_class: Optional[str]) -> Optional[str]:
-        """Resolve a member call like $obj->method()."""
-        method_name = None
-        receiver = None
+                              caller_class: Optional[str], root=None) -> Optional[str]:
+        """Resolve a member call `$obj->method()`, including `$this->$m()` with a
+        literal-bound dynamic method name."""
+        obj_node = node.child_by_field_name('object')
+        name_node = node.child_by_field_name('name')
 
-        for child in node.children:
-            if child.type == 'name':
-                method_name = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
-            elif child.type in ('->', 'arguments'):
-                continue
-            elif child.type == 'variable_name':
-                receiver = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
+        receiver = None
+        if obj_node is not None and obj_node.type == 'variable_name':
+            receiver = source[obj_node.start_byte:obj_node.end_byte].decode(
+                'utf-8', errors='replace')
+
+        method_name = None
+        if name_node is not None:
+            if name_node.type == 'name':
+                method_name = source[name_node.start_byte:name_node.end_byte].decode(
+                    'utf-8', errors='replace')
+            elif name_node.type == 'variable_name':
+                # Dynamic method name `$this->$m()`: resolve ONLY a single literal
+                # binding of $m in the enclosing body; a param/runtime/interpolated
+                # name yields None (no guessing -> no phantom).
+                var_name = source[name_node.start_byte:name_node.end_byte].decode(
+                    'utf-8', errors='replace')
+                method_name = self._resolve_variable_function(var_name, root, source)
 
         if not method_name:
             return None
