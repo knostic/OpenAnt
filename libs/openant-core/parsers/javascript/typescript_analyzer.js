@@ -508,6 +508,7 @@ class TypeScriptAnalyzer {
     // Extract a synthetic unit for files whose only meaningful content is a
     // bare top-level side-effect call, e.g. preload scripts calling
     // contextBridge.exposeInMainWorld({...}).
+    this._extractLocalObjectLiteralMethods(sourceFile, relativePath);
     this._extractTopLevelSideEffects(sourceFile, relativePath);
   }
 
@@ -1337,6 +1338,69 @@ class TypeScriptAnalyzer {
     }
   }
 
+  // Methods of a var-declared object literal (`const ctrl = { handler(){...} }`),
+  // whether exported or not. These are only ever invoked through a receiver
+  // (`ctrl.handler()`), so units are marked `localObjectLiteral: true` and the
+  // resolver excludes them from bare cross-file unique-name resolution.
+  _extractLocalObjectLiteralMethods(sourceFile, relativePath) {
+    for (const statement of sourceFile.getVariableStatements()) {
+      const isExported = statement.isExported();
+      for (const declaration of statement.getDeclarations()) {
+        const initializer = declaration.getInitializer();
+        if (
+          !initializer ||
+          initializer.getKindName() !== "ObjectLiteralExpression"
+        ) {
+          continue;
+        }
+        const varName = declaration.getName();
+        for (const property of initializer.getProperties()) {
+          const kindName = property.getKindName();
+          let name;
+          let code;
+          let bodyNode = null;
+          if (kindName === "MethodDeclaration") {
+            name = property.getName();
+            code = property.getFullText();
+            bodyNode = property;
+          } else if (kindName === "PropertyAssignment") {
+            name = property.getName();
+            const init = property.getInitializer();
+            if (
+              init &&
+              (init.getKindName() === "ArrowFunction" ||
+                init.getKindName() === "FunctionExpression")
+            ) {
+              code = property.getFullText();
+              bodyNode = init;
+            } else {
+              continue;
+            }
+          } else {
+            continue;
+          }
+          if (!name || !code) continue;
+          const functionId = `${relativePath}:${varName}.${name}`;
+          if (this.functions[functionId]) continue;
+          this.functions[functionId] = {
+            name: `${varName}.${name}`,
+            code: code,
+            isExported: isExported,
+            unitType: this.classifyFunction(name, code, false, null),
+            startLine: property.getStartLineNumber(),
+            endLine: property.getEndLineNumber(),
+            localObjectLiteral: true,
+          };
+          // Pattern-A companion so len(callGraph) === len(functions).
+          this.callGraph[functionId] = this.extractCallsFromFunction(
+            bodyNode,
+            relativePath,
+          );
+        }
+      }
+    }
+  }
+
   /**
    * Build call graph for a source file
    *
@@ -1557,9 +1621,14 @@ class TypeScriptAnalyzer {
         const fname = this.functions[funcId].name || "";
         if (fname === name || fname.endsWith("." + name)) return funcId;
       }
-      // 2. Unique-name match across the repo.
-      const candidates = byName[name];
-      if (candidates && candidates.length === 1) return candidates[0];
+      // 2. Unique-name match across the repo. Exclude object-literal methods:
+      // they are only ever invoked through a receiver (`ctrl.handler()`), so a bare
+      // cross-file same-name call must never resolve to one (no phantom). Same-file
+      // member calls still resolve via step 1's endsWith('.'+name) match.
+      const candidates = (byName[name] || []).filter(
+        (id) => !this.functions[id].localObjectLiteral,
+      );
+      if (candidates.length === 1) return candidates[0];
       return null;
     };
 
