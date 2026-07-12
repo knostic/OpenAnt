@@ -314,10 +314,16 @@ class CallGraphBuilder:
         name = self._node_str(node, source)
         if name in local_vars:
             return None
-        if self._is_builtin(name):
-            return None
-        if name not in self.functions_by_name:
-            return None
+        # A same-class method (or same-file function) named like a builtin, called
+        # bare (implicit self, e.g. `first`), resolves to that user function -- the
+        # builtin filter must not shadow it. Mirrors the with-args path's
+        # _has_scoped_user_function rescue; the scope is narrow (same class / same
+        # file) so a genuine builtin call is never rescued to an unrelated method.
+        if not self._has_scoped_user_function(name, caller_file, caller_class):
+            if self._is_builtin(name):
+                return None
+            if name not in self.functions_by_name:
+                return None
         return self._resolve_simple_call(name, caller_file, caller_class)
 
     def _resolve_call_node(self, node, source: bytes, caller_file: str,
