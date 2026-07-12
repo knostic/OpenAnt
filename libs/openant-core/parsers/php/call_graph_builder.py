@@ -98,6 +98,17 @@ CALLBACK_BUILTINS = {
     'usort': 1, 'uasort': 1, 'uksort': 1, 'preg_replace_callback': 1,
 }
 
+# Framework / registration functions that dispatch to a callback argument but are NOT
+# PHP builtins. A user could define a same-named function, so these are resolved as a
+# dispatcher only when NOT shadowed by a user function (see _resolve_function_call).
+# Maps name -> 0-based position of the callback argument.
+FRAMEWORK_CALLBACKS = {
+    'add_action': 1, 'add_filter': 1,                 # WordPress hooks
+    'register_shutdown_function': 0,
+    'set_error_handler': 0, 'set_exception_handler': 0,
+    'spl_autoload_register': 0,
+}
+
 # PHP keywords to skip in regex fallback
 PHP_KEYWORDS = {
     'if', 'else', 'elseif', 'while', 'for', 'foreach',
@@ -136,6 +147,8 @@ class CallGraphBuilder:
         self.methods_by_class: Dict[str, List[str]] = {}
         # class_key -> list of trait names the class composes via in-class `use`.
         self.traits_by_class: Dict[str, List[str]] = {}
+        # class_key -> {alias -> [trait_or_None, orig]} from `use T { orig as alias; }`.
+        self.aliases_by_class: Dict[str, Dict[str, list]] = {}
 
         self._build_indexes()
 
@@ -170,6 +183,9 @@ class CallGraphBuilder:
             traits = class_data.get('traits')
             if traits:
                 self.traits_by_class[class_key] = list(traits)
+            aliases = class_data.get('trait_aliases')
+            if aliases:
+                self.aliases_by_class[class_key] = aliases
 
     def _is_builtin(self, name: str) -> bool:
         """Check if name is a PHP builtin or common function."""
@@ -219,7 +235,7 @@ class CallGraphBuilder:
             return self._resolve_function_call(node, source, caller_file, caller_class,
                                                caller_namespace, root)
         elif node.type == 'member_call_expression':
-            return self._resolve_member_call(node, source, caller_file, caller_class)
+            return self._resolve_member_call(node, source, caller_file, caller_class, root)
         elif node.type == 'scoped_call_expression':
             return self._resolve_scoped_call(node, source, caller_file, caller_class)
         elif node.type == 'object_creation_expression':
@@ -260,6 +276,14 @@ class CallGraphBuilder:
             if cb_idx is not None:
                 return self._resolve_callback_arg(node, source, caller_file, caller_class, cb_idx)
             return None
+
+        # Framework registration dispatchers (add_action, register_shutdown_function,
+        # ...) route to a callback argument. They are not PHP builtins, so treat them as
+        # a dispatcher only when NOT shadowed by a user-defined function of the same name
+        # (which would be the real call target).
+        fw_idx = FRAMEWORK_CALLBACKS.get(func_name.lower())
+        if fw_idx is not None and func_name not in self.functions_by_name:
+            return self._resolve_callback_arg(node, source, caller_file, caller_class, fw_idx)
 
         return self._resolve_simple_call(func_name, caller_file, caller_class, caller_namespace)
 
@@ -357,29 +381,59 @@ class CallGraphBuilder:
 
     @staticmethod
     def _string_literal_value(node, source: bytes) -> Optional[str]:
-        """Return the content of a string-literal node, else None."""
-        if node.type != 'string':
-            return None
-        for child in node.children:
-            if child.type == 'string_content':
-                return source[child.start_byte:child.end_byte].decode(
-                    'utf-8', errors='replace')
-        # Empty string literal ('') has no string_content child.
-        return ''
+        """Return the content of a string-literal node, else None.
+
+        Single-quoted strings parse as `string`; double-quoted as `encapsed_string`.
+        An `encapsed_string` is accepted only when it has NO interpolation (its only
+        meaningful child is a single `string_content`), so `"dang$p"` is not treated
+        as a static literal.
+        """
+        if node.type == 'string':
+            for child in node.children:
+                if child.type == 'string_content':
+                    return source[child.start_byte:child.end_byte].decode(
+                        'utf-8', errors='replace')
+            # Empty string literal ('') has no string_content child.
+            return ''
+        if node.type == 'encapsed_string':
+            content = None
+            for child in node.children:
+                if child.type == '"':
+                    continue
+                if child.type == 'string_content':
+                    if content is not None:
+                        return None  # multiple chunks -> unusual, decline
+                    content = source[child.start_byte:child.end_byte].decode(
+                        'utf-8', errors='replace')
+                else:
+                    return None  # interpolation / embedded expression -> not static
+            return content if content is not None else ''
+        return None
 
     def _resolve_member_call(self, node, source: bytes, caller_file: str,
-                              caller_class: Optional[str]) -> Optional[str]:
-        """Resolve a member call like $obj->method()."""
-        method_name = None
-        receiver = None
+                              caller_class: Optional[str], root=None) -> Optional[str]:
+        """Resolve a member call `$obj->method()`, including `$this->$m()` with a
+        literal-bound dynamic method name."""
+        obj_node = node.child_by_field_name('object')
+        name_node = node.child_by_field_name('name')
 
-        for child in node.children:
-            if child.type == 'name':
-                method_name = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
-            elif child.type in ('->', 'arguments'):
-                continue
-            elif child.type == 'variable_name':
-                receiver = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
+        receiver = None
+        if obj_node is not None and obj_node.type == 'variable_name':
+            receiver = source[obj_node.start_byte:obj_node.end_byte].decode(
+                'utf-8', errors='replace')
+
+        method_name = None
+        if name_node is not None:
+            if name_node.type == 'name':
+                method_name = source[name_node.start_byte:name_node.end_byte].decode(
+                    'utf-8', errors='replace')
+            elif name_node.type == 'variable_name':
+                # Dynamic method name `$this->$m()`: resolve ONLY a single literal
+                # binding of $m in the enclosing body; a param/runtime/interpolated
+                # name yields None (no guessing -> no phantom).
+                var_name = source[name_node.start_byte:name_node.end_byte].decode(
+                    'utf-8', errors='replace')
+                method_name = self._resolve_variable_function(var_name, root, source)
 
         if not method_name:
             return None
@@ -415,6 +469,13 @@ class CallGraphBuilder:
 
         if not method_name or not scope:
             return None
+
+        # Closure::fromCallable('foo') / (['Class','method']) names a real callable
+        # statically. Resolve the string/array-literal target as a callback (the
+        # resulting Closure object's later invocation via $c() is untracked, but the
+        # referenced function is a genuine edge). Reuses the higher-order-builtin path.
+        if scope == 'Closure' and method_name == 'fromCallable':
+            return self._resolve_callback_arg(node, source, caller_file, caller_class, 0)
 
         if self._is_builtin(method_name):
             return None
@@ -469,17 +530,26 @@ class CallGraphBuilder:
                             if func_data.get('name') == func_name:
                                 return func_id
 
-        # 4. Unique name match across files. An unqualified call resolves within
-        #    the caller's own namespace; a function in a different namespace is not
-        #    reachable this way, so a same-named function elsewhere must not leak an
-        #    edge across the namespace boundary.
-        candidates = self.functions_by_name.get(func_name, [])
-        candidates = [c for c in candidates
-                      if not self.functions.get(c, {}).get('class_name')
-                      and self._namespace_compatible(
-                          self.functions.get(c, {}).get('namespace_name'), caller_namespace)]
-        if len(candidates) == 1:
-            return candidates[0]
+        # 4. Unqualified call resolution across files. PHP resolves an unqualified
+        #    function call within the caller's own namespace FIRST; if there is no such
+        #    function it FALLS BACK to the global namespace. A same-named function in an
+        #    unrelated namespace is never reachable this way, so it must not leak an edge.
+        non_method = [c for c in self.functions_by_name.get(func_name, [])
+                      if not self.functions.get(c, {}).get('class_name')]
+        # (a) same-namespace binding takes precedence
+        same_ns = [c for c in non_method
+                   if self._namespace_compatible(
+                       self.functions.get(c, {}).get('namespace_name'), caller_namespace)]
+        if len(same_ns) == 1:
+            return same_ns[0]
+        # (b) global-namespace fallback for an unqualified call (only when the caller's
+        #     own namespace has no such function); still requires a unique target so an
+        #     ambiguous global name does not leak an edge.
+        if not same_ns:
+            global_ns = [c for c in non_method
+                         if not (self.functions.get(c, {}).get('namespace_name') or '').strip('\\')]
+            if len(global_ns) == 1:
+                return global_ns[0]
 
         return None
 
@@ -497,6 +567,25 @@ class CallGraphBuilder:
                            caller_class: str) -> Optional[str]:
         """Resolve a $this->method() or self::method() call within a class."""
         class_key = f"{caller_file}:{caller_class}"
+
+        # Trait method alias: `use T { orig as method_name; }` invokes the trait's
+        # original method under the alias. Resolve to the pinned trait (qualified
+        # form) or one of the class's composed traits (unqualified form). Scoped via
+        # _resolve_class_call to those traits, so an unrelated same-named method in
+        # another class is never connected.
+        alias = self.aliases_by_class.get(class_key, {}).get(method_name)
+        if alias:
+            trait_name, orig = alias[0], alias[1]
+            if trait_name:
+                resolved = self._resolve_class_call(trait_name, orig, caller_file)
+                if resolved:
+                    return resolved
+            else:
+                for trait in self.traits_by_class.get(class_key, []):
+                    resolved = self._resolve_class_call(trait, orig, caller_file)
+                    if resolved:
+                        return resolved
+
         class_methods = self.methods_by_class.get(class_key, [])
 
         for func_id in class_methods:
