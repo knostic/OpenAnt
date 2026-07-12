@@ -147,6 +147,8 @@ class CallGraphBuilder:
         self.methods_by_class: Dict[str, List[str]] = {}
         # class_key -> list of trait names the class composes via in-class `use`.
         self.traits_by_class: Dict[str, List[str]] = {}
+        # class_key -> {alias -> [trait_or_None, orig]} from `use T { orig as alias; }`.
+        self.aliases_by_class: Dict[str, Dict[str, list]] = {}
 
         self._build_indexes()
 
@@ -181,6 +183,9 @@ class CallGraphBuilder:
             traits = class_data.get('traits')
             if traits:
                 self.traits_by_class[class_key] = list(traits)
+            aliases = class_data.get('trait_aliases')
+            if aliases:
+                self.aliases_by_class[class_key] = aliases
 
     def _is_builtin(self, name: str) -> bool:
         """Check if name is a PHP builtin or common function."""
@@ -532,6 +537,25 @@ class CallGraphBuilder:
                            caller_class: str) -> Optional[str]:
         """Resolve a $this->method() or self::method() call within a class."""
         class_key = f"{caller_file}:{caller_class}"
+
+        # Trait method alias: `use T { orig as method_name; }` invokes the trait's
+        # original method under the alias. Resolve to the pinned trait (qualified
+        # form) or one of the class's composed traits (unqualified form). Scoped via
+        # _resolve_class_call to those traits, so an unrelated same-named method in
+        # another class is never connected.
+        alias = self.aliases_by_class.get(class_key, {}).get(method_name)
+        if alias:
+            trait_name, orig = alias[0], alias[1]
+            if trait_name:
+                resolved = self._resolve_class_call(trait_name, orig, caller_file)
+                if resolved:
+                    return resolved
+            else:
+                for trait in self.traits_by_class.get(class_key, []):
+                    resolved = self._resolve_class_call(trait, orig, caller_file)
+                    if resolved:
+                        return resolved
+
         class_methods = self.methods_by_class.get(class_key, [])
 
         for func_id in class_methods:
