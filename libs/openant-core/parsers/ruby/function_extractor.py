@@ -240,6 +240,18 @@ class FunctionExtractor:
         """True if the call node carries a do..end or { } block."""
         return any(c.type in ('do_block', 'block') for c in node.children)
 
+    def _is_sinatra_class(self, relative_path: str, class_name: Optional[str]) -> bool:
+        """True if `class_name` extends Sinatra::Base/Application (modular Sinatra).
+
+        The class was registered in self.classes (with its superclass) before its
+        body -- and therefore before any route DSL call inside it -- is walked.
+        """
+        if not class_name:
+            return False
+        cls = self.classes.get(f"{relative_path}:{class_name}", {})
+        superclass = cls.get('superclass') or ''
+        return 'Sinatra::Base' in superclass or 'Sinatra::Application' in superclass
+
     def _extract_imports(self, tree, source: bytes) -> Dict[str, str]:
         """Extract require/require_relative/include/extend/prepend from a file."""
         imports = {}
@@ -371,14 +383,19 @@ class FunctionExtractor:
                         name=args[0], unit_type=None, visibility=vis_state[0],
                     )
                     handled = True
-                elif (class_name is None and module_name is None
-                      and method_name in self._SINATRA_VERBS
-                      and self._has_block(node) and args):
-                    # Top-level `get '/path' do..end` Sinatra route.
+                elif (method_name in self._SINATRA_VERBS
+                      and self._has_block(node) and args
+                      and ((class_name is None and module_name is None)
+                           or self._is_sinatra_class(relative_path, class_name))):
+                    # `get '/path' do..end` -- a Sinatra route, either classic
+                    # top-level style or MODULAR style inside a `< Sinatra::Base`
+                    # subclass. The class case is gated on the class actually
+                    # extending Sinatra so an unrelated class method named like a
+                    # verb is not spuriously seeded as an entry point.
                     self._emit_synthetic_method(
-                        node, source, relative_path, class_name=None,
-                        module_name=None, name=args[0], unit_type='route_handler',
-                        visibility='public',
+                        node, source, relative_path, class_name=class_name,
+                        module_name=module_name, name=args[0],
+                        unit_type='route_handler', visibility='public',
                     )
                     handled = True
                 elif method_name in ('private', 'protected', 'public'):
