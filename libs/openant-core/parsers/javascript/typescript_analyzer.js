@@ -325,6 +325,11 @@ class TypeScriptAnalyzer {
           const code = statement.getFullText();
           const functionId = `${relativePath}:${name}`;
 
+          // First-wins: do not overwrite a function already emitted at this id (e.g. a
+          // block-scoped `function name(){...}` elsewhere in the file), which would
+          // silently drop that definition and its calls. Matches the other emit paths.
+          if (this.functions[functionId]) continue;
+
           // Include the full variable declaration (const name = ...) for context
           this.functions[functionId] = {
             name: name,
@@ -366,6 +371,28 @@ class TypeScriptAnalyzer {
           endLine: method.getEndLineNumber(),
           className: className,
           parameters: this._extractParameters(method),
+        };
+      }
+
+      // Emit the constructor as its own unit so `new X()` edges have a target and
+      // its body's calls (this.foo()) are walked. A class has at most one
+      // implemented constructor; overload signatures carry no body. The
+      // ConstructorDeclaration has no getName(), so it can't join classMembers above
+      // and needs the literal id `${className}.constructor`.
+      const ctorDecl =
+        classDecl.getConstructors().find((c) => c.getBody && c.getBody()) ||
+        classDecl.getConstructors()[0];
+      if (ctorDecl) {
+        const ctorCode = ctorDecl.getFullText();
+        this.functions[`${relativePath}:${className}.constructor`] = {
+          name: `${className}.constructor`,
+          code: ctorCode,
+          isExported: classDecl.isExported(),
+          unitType: this.classifyFunction("constructor", ctorCode, true, className),
+          startLine: ctorDecl.getStartLineNumber(),
+          endLine: ctorDecl.getEndLineNumber(),
+          className: className,
+          parameters: this._extractParameters(ctorDecl),
         };
       }
 
@@ -481,6 +508,7 @@ class TypeScriptAnalyzer {
     // Extract a synthetic unit for files whose only meaningful content is a
     // bare top-level side-effect call, e.g. preload scripts calling
     // contextBridge.exposeInMainWorld({...}).
+    this._extractLocalObjectLiteralMethods(sourceFile, relativePath);
     this._extractTopLevelSideEffects(sourceFile, relativePath);
   }
 
@@ -536,7 +564,16 @@ class TypeScriptAnalyzer {
         this._inferAssignedName(classExpr) ||
         "AnonymousClass";
 
-      const methods = classExpr.getMethods ? classExpr.getMethods() : [];
+      // getMethods() excludes get/set accessors; iterate them too so a class
+      // expression's accessors (which can carry sinks) are emitted as units,
+      // mirroring the class-declaration path.
+      const methods = classExpr.getMethods
+        ? [
+            ...classExpr.getMethods(),
+            ...(classExpr.getGetAccessors ? classExpr.getGetAccessors() : []),
+            ...(classExpr.getSetAccessors ? classExpr.getSetAccessors() : []),
+          ]
+        : [];
       for (const method of methods) {
         const methodName = method.getName();
         const functionId = `${relativePath}:${className}.${methodName}`;
@@ -1301,6 +1338,69 @@ class TypeScriptAnalyzer {
     }
   }
 
+  // Methods of a var-declared object literal (`const ctrl = { handler(){...} }`),
+  // whether exported or not. These are only ever invoked through a receiver
+  // (`ctrl.handler()`), so units are marked `localObjectLiteral: true` and the
+  // resolver excludes them from bare cross-file unique-name resolution.
+  _extractLocalObjectLiteralMethods(sourceFile, relativePath) {
+    for (const statement of sourceFile.getVariableStatements()) {
+      const isExported = statement.isExported();
+      for (const declaration of statement.getDeclarations()) {
+        const initializer = declaration.getInitializer();
+        if (
+          !initializer ||
+          initializer.getKindName() !== "ObjectLiteralExpression"
+        ) {
+          continue;
+        }
+        const varName = declaration.getName();
+        for (const property of initializer.getProperties()) {
+          const kindName = property.getKindName();
+          let name;
+          let code;
+          let bodyNode = null;
+          if (kindName === "MethodDeclaration") {
+            name = property.getName();
+            code = property.getFullText();
+            bodyNode = property;
+          } else if (kindName === "PropertyAssignment") {
+            name = property.getName();
+            const init = property.getInitializer();
+            if (
+              init &&
+              (init.getKindName() === "ArrowFunction" ||
+                init.getKindName() === "FunctionExpression")
+            ) {
+              code = property.getFullText();
+              bodyNode = init;
+            } else {
+              continue;
+            }
+          } else {
+            continue;
+          }
+          if (!name || !code) continue;
+          const functionId = `${relativePath}:${varName}.${name}`;
+          if (this.functions[functionId]) continue;
+          this.functions[functionId] = {
+            name: `${varName}.${name}`,
+            code: code,
+            isExported: isExported,
+            unitType: this.classifyFunction(name, code, false, null),
+            startLine: property.getStartLineNumber(),
+            endLine: property.getEndLineNumber(),
+            localObjectLiteral: true,
+          };
+          // Pattern-A companion so len(callGraph) === len(functions).
+          this.callGraph[functionId] = this.extractCallsFromFunction(
+            bodyNode,
+            relativePath,
+          );
+        }
+      }
+    }
+  }
+
   /**
    * Build call graph for a source file
    *
@@ -1362,6 +1462,20 @@ class TypeScriptAnalyzer {
           relativePath,
         );
       }
+
+      // Walk the constructor body too (ConstructorDeclaration has no getName(), so
+      // it can't join classMembers above). Same single-ctor selection as the
+      // inventory builder keeps functions[] and callGraph[] ids in lockstep.
+      const ctorDecl =
+        classDecl.getConstructors().find((c) => c.getBody && c.getBody()) ||
+        classDecl.getConstructors()[0];
+      if (ctorDecl) {
+        const callerId = `${relativePath}:${className}.constructor`;
+        this.callGraph[callerId] = this.extractCallsFromFunction(
+          ctorDecl,
+          relativePath,
+        );
+      }
     }
   }
 
@@ -1398,7 +1512,13 @@ class TypeScriptAnalyzer {
     }
     if (kind === "PropertyAccessExpression") {
       // Trailing member name (e.g. `baz` from `foo.bar().baz`).
-      return calleeExpr.getName ? calleeExpr.getName() : null;
+      const member = calleeExpr.getName ? calleeExpr.getName() : null;
+      // Now that `X.constructor` units exist, a bare `foo.constructor()` member call
+      // (simple-name token "constructor") would collide with every constructor unit
+      // and can't be tied to a specific class -> treat as indirect. The qualified
+      // `new X()` edges built in extractCallsFromFunction are unaffected.
+      if (member === "constructor") return null;
+      return member;
     }
     // ElementAccessExpression (obj['m']), ParenthesizedExpression, etc. have no
     // stable identifier name — treat as dynamic.
@@ -1450,6 +1570,24 @@ class TypeScriptAnalyzer {
       }
     }
 
+    // `new X()` is a NewExpression, not a CallExpression, so it is invisible to the
+    // loop above. Record an edge to the class constructor unit, using a QUALIFIED
+    // name (`X.constructor`, never bare `constructor`) so resolution targets X's
+    // constructor and only resolves same-file (a cross-file / builtin `new` stays
+    // indirect because byName is keyed by the simple name `constructor`).
+    const newExpressions = funcNode.getDescendantsOfKind(
+      ts.SyntaxKind.NewExpression,
+    );
+    for (const newExpr of newExpressions) {
+      const callee = newExpr.getExpression();
+      if (callee && callee.getKindName() === "Identifier") {
+        pushName(`${callee.getText()}.constructor`, false);
+      }
+      for (const arg of newExpr.getArguments() || []) {
+        if (arg.getKindName() === "Identifier") pushName(arg.getText(), false);
+      }
+    }
+
     return calls;
   }
 
@@ -1468,7 +1606,10 @@ class TypeScriptAnalyzer {
     const byFile = Object.create(null);
     const byName = Object.create(null);
     for (const funcId of Object.keys(this.functions)) {
-      const file = funcId.slice(0, funcId.lastIndexOf(":"));
+      // The file is the part before the FIRST colon; a function id's name part
+      // may itself contain colons (e.g. an express seed `app.js:express(GET:/x:4:0)`),
+      // so lastIndexOf would mangle the file and break same-file resolution.
+      const file = funcId.slice(0, funcId.indexOf(":"));
       (byFile[file] = byFile[file] || []).push(funcId);
       const simple = (this.functions[funcId].name || "").split(".").pop();
       (byName[simple] = byName[simple] || []).push(funcId);
@@ -1480,14 +1621,19 @@ class TypeScriptAnalyzer {
         const fname = this.functions[funcId].name || "";
         if (fname === name || fname.endsWith("." + name)) return funcId;
       }
-      // 2. Unique-name match across the repo.
-      const candidates = byName[name];
-      if (candidates && candidates.length === 1) return candidates[0];
+      // 2. Unique-name match across the repo. Exclude object-literal methods:
+      // they are only ever invoked through a receiver (`ctrl.handler()`), so a bare
+      // cross-file same-name call must never resolve to one (no phantom). Same-file
+      // member calls still resolve via step 1's endsWith('.'+name) match.
+      const candidates = (byName[name] || []).filter(
+        (id) => !this.functions[id].localObjectLiteral,
+      );
+      if (candidates.length === 1) return candidates[0];
       return null;
     };
 
     for (const [callerId, edges] of Object.entries(this.callGraph)) {
-      const callerFile = callerId.slice(0, callerId.lastIndexOf(":"));
+      const callerFile = callerId.slice(0, callerId.indexOf(":"));
       const resolvedTargets = [];
       const indirect = [];
 
