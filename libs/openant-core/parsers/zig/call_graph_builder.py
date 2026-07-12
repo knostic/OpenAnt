@@ -315,9 +315,67 @@ class CallGraphBuilder:
                 # Only record when the target is a known function name.
                 if alias_name and target_name in name_to_ids:
                     aliases[alias_name] = target_name
+            # Struct field-init fn pointers: `const h = T{ .cb = knownFn };` binds
+            # `h.cb` -> knownFn so a later `h.cb()` resolves. The first identifier
+            # child is the bound variable; the struct type name is nested inside the
+            # struct_initializer and is ignored.
+            if ident_children:
+                var_name = self._get_node_text(ident_children[0], source)
+                struct_init = next(
+                    (c for c in node.children
+                     if c.type in ("struct_initializer", "StructInit")),
+                    None,
+                )
+                if var_name and struct_init is not None:
+                    self._collect_field_fn_bindings(
+                        struct_init, source, name_to_ids, aliases, var_name
+                    )
 
         for child in node.children:
             self._collect_aliases_from_node(child, source, name_to_ids, aliases)
+
+    def _collect_field_fn_bindings(
+        self, struct_init, source, name_to_ids, aliases, var_name
+    ):
+        """Record `.field = knownFn` struct-init bindings as `<var>.<field>` aliases.
+
+        For `const h = T{ .cb = fn };` bind `h.cb` -> `fn` so a later `h.cb()`
+        resolves via the dotted-alias dereference. Only DETERMINATE bindings are
+        kept: the field value must be a bare identifier naming a KNOWN function. A
+        runtime/param funcptr (RHS not a known function) or an indeterminate
+        expression (e.g. a call `make()`) is skipped, so an unknown callback never
+        over-connects.
+        """
+        init_list = next(
+            (c for c in struct_init.children
+             if c.type in ("initializer_list", "InitList")),
+            None,
+        )
+        if init_list is None:
+            return
+        for child in init_list.children:
+            if child.type not in ("assignment_expression", "AssignExpr"):
+                continue
+            field_name = None
+            target_name = None
+            seen_eq = False
+            for sub in child.children:
+                if sub.type == "=":
+                    seen_eq = True
+                    continue
+                if not seen_eq and sub.type in ("field_expression", "field_access"):
+                    # Leading-dot `.field` has exactly one identifier (the field);
+                    # a qualified `a.b` has two and is not a field-init target.
+                    idents = [
+                        g for g in sub.children
+                        if g.type in ("identifier", "IDENTIFIER")
+                    ]
+                    if len(idents) == 1:
+                        field_name = self._get_node_text(idents[0], source)
+                elif seen_eq and sub.type in ("identifier", "IDENTIFIER"):
+                    target_name = self._get_node_text(sub, source)
+            if field_name and target_name and target_name in name_to_ids:
+                aliases[f"{var_name}.{field_name}"] = target_name
 
     def _find_calls_in_code(self, code: str, caller_file: str = "") -> Set[str]:
         """Find all function calls in a code snippet."""
