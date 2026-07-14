@@ -49,6 +49,13 @@ ENTRY_POINT_TYPES = {
     # these the only seed for a compiled binary is absent, so reachability seeds
     # zero entry points and silently empties the dataset for every C/Go/Zig repo.
     'main',               # C/Go/Zig program entry
+    # Go runs every package-level `func init()` automatically at startup, before
+    # main (Go spec: Package initialization). The Go extractor classifies it as
+    # unit_type='init' (go_parser/types.go UnitTypeInit). It is an execution root,
+    # so its transitive callees (config loaders, registrations, side-effecting
+    # startup code that can reach sinks) must be reachable; omitting it blacked
+    # them out. Over-approximating an auto-run root is reachability-safe.
+    'init',               # Go package init() — auto-run startup root
     'http_handler',       # Go net/http handlers (go_parser/types.go UnitTypeHTTPHandler)
     'middleware',         # Go HTTP middleware (go_parser/types.go UnitTypeMiddleware)
 }
