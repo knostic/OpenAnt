@@ -316,6 +316,9 @@ class UnitGenerator:
                 'isStatic': func_data.get('is_static', False),
                 'parameters': func_data.get('parameters', []),
                 'className': func_data.get('class_name'),
+                # Carry PHP 8 attributes (#[Route], ...) so the reachable pipeline's
+                # EntryPointDetector can seed attribute-routed handlers.
+                'decorators': func_data.get('decorators', []),
             }
 
         return {

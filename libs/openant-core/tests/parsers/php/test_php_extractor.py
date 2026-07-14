@@ -262,6 +262,83 @@ def test_closure_units_capture_their_body(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# PHP 8 #[Route] attribute handlers on a NON-*Controller class must seed (B11)
+# ---------------------------------------------------------------------------
+
+# Symfony/API-Platform style: the handler lives on a class that is NOT named
+# *Controller and the file path contains no 'controller' segment, so the
+# extractor's name/path-based route_handler classifier misses it. The routing
+# attribute (#[Route]) is what makes it an endpoint. The body reads user input
+# via the Symfony request bag ($request->query->get(...)).
+ROUTE_ATTRIBUTE_SOURCE = """<?php
+namespace App\\Api;
+
+class ProductApi {
+    #[Route("/p/{id}")]
+    public function show($id) {
+        $q = $request->query->get("x");
+        return $q;
+    }
+}
+"""
+
+
+def test_php_route_attribute_captured_by_extractor(tmp_path):
+    """The extractor must capture #[Route] into func_data['decorators']."""
+    result = _extract(tmp_path, "ProductApi.php", ROUTE_ATTRIBUTE_SOURCE)
+    show = next(fd for fd in result["functions"].values() if fd["name"] == "show")
+    decorators = show.get("decorators", [])
+    assert any("Route" in d for d in decorators), (
+        "extractor must capture the #[Route] PHP8 attribute into "
+        f"func_data['decorators']; got decorators={decorators!r}"
+    )
+
+
+def test_php_route_attribute_handler_is_entry_point(tmp_path):
+    """A #[Route] method on a non-*Controller class must seed as an entry point."""
+    result = _extract(tmp_path, "ProductApi.php", ROUTE_ATTRIBUTE_SOURCE)
+
+    # Sanity: on the buggy path this method is classified as a plain 'method'
+    # (class 'ProductApi' has no 'controller', path has no 'controller').
+    show = next(fd for fd in result["functions"].values() if fd["name"] == "show")
+    assert show["class_name"] == "ProductApi"
+
+    detector = EntryPointDetector(result["functions"], {})
+    detector.detect_entry_points()
+    show_id = next(
+        fid for fid, fd in result["functions"].items() if fd["name"] == "show"
+    )
+    assert detector.is_entry_point(show_id), (
+        "ProductApi::show carries a #[Route] attribute and must be seeded as an "
+        "entry point INDEPENDENT of the class name; "
+        f"reason={detector.get_entry_point_reason(show_id)!r}"
+    )
+
+
+def test_symfony_request_query_get_is_input_pattern(tmp_path):
+    """$request->query->get( / $request->request->get( must count as user input."""
+    src = """<?php
+class Widget {
+    public function build($request) {
+        $x = $request->query->get("q");
+        $y = $request->request->get("p");
+        return $x . $y;
+    }
+}
+"""
+    result = _extract(tmp_path, "Widget.php", src)
+    detector = EntryPointDetector(result["functions"], {})
+    detector.detect_entry_points()
+    build_id = next(
+        fid for fid, fd in result["functions"].items() if fd["name"] == "build"
+    )
+    assert detector.is_entry_point(build_id), (
+        "Widget::build reads Symfony request bags "
+        "($request->query->get / $request->request->get) and must be flagged as "
+        f"an entry point; reason={detector.get_entry_point_reason(build_id)!r}"
+    )
+
+
 # A named function nested in a method body is GLOBAL in PHP (bug B7)
 # ---------------------------------------------------------------------------
 
