@@ -222,6 +222,15 @@ class CallGraphBuilder:
                                                    caller_class, caller_namespace, root)
                 if resolved:
                     calls.add(resolved)
+                    if node.type == 'function_call_expression':
+                        # A bare call that resolved to a same-file global may be one
+                        # of several same-name globals in the file (e.g. two method-
+                        # nested `function g(){}` re-keyed to file-scope globals).
+                        # Emit an edge to EVERY same-name, same-namespace same-file
+                        # global, not just the first _resolve_simple_call picked —
+                        # dropping the others hides their reachable subtrees.
+                        calls.update(self._same_file_global_siblings(
+                            resolved, caller_file, caller_namespace))
             stack.extend(reversed(node.children))
 
         return calls
@@ -563,6 +572,33 @@ class CallGraphBuilder:
             return (ns or '').strip('\\')
         return norm(candidate_ns) == norm(caller_ns)
 
+    def _same_file_global_siblings(self, resolved_id: str, caller_file: str,
+                                   caller_namespace: Optional[str] = None) -> List[str]:
+        """Same-name, same-namespace global functions in ``caller_file`` other than
+        the one already resolved.
+
+        Over-approximates a bare call when several same-name globals collide in one
+        file (e.g. two method-nested ``function g(){}`` re-keyed to file-scope
+        globals get de-collided ids ``file:g`` / ``file:g#L13``, but
+        ``_resolve_simple_call`` returns only the first). Returns [] unless the
+        resolved target is itself a same-file global — a self-call (class_name set),
+        import, or cross-file-unique resolution is left as its single edge. Purely
+        additive: never drops the primary edge."""
+        data = self.functions.get(resolved_id, {})
+        if data.get('class_name') or resolved_id.split(':')[0] != caller_file:
+            return []
+        name = data.get('name')
+        siblings = []
+        for fid in self.functions_by_file.get(caller_file, []):
+            if fid == resolved_id:
+                continue
+            fd = self.functions.get(fid, {})
+            if (fd.get('name') == name and not fd.get('class_name')
+                    and self._namespace_compatible(
+                        fd.get('namespace_name'), caller_namespace)):
+                siblings.append(fid)
+        return siblings
+
     def _resolve_self_call(self, method_name: str, caller_file: str,
                            caller_class: str) -> Optional[str]:
         """Resolve a $this->method() or self::method() call within a class."""
@@ -656,6 +692,7 @@ class CallGraphBuilder:
         """Fallback regex-based call extraction for unparseable code."""
         calls = set()
         caller_file = caller_id.split(':')[0]
+        caller_namespace = self.functions.get(caller_id, {}).get('namespace_name')
 
         # Match function calls: name(
         pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*[\(]'
@@ -668,6 +705,10 @@ class CallGraphBuilder:
                 resolved = self._resolve_simple_call(func_name, caller_file, None)
                 if resolved:
                     calls.add(resolved)
+                    # Mirror the tree-walk path: widen a same-file-global resolution
+                    # to every same-name same-namespace global in the file.
+                    calls.update(self._same_file_global_siblings(
+                        resolved, caller_file, caller_namespace))
 
         return calls
 
