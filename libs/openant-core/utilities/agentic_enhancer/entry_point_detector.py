@@ -57,7 +57,11 @@ ENTRY_POINT_TYPES = {
 ENTRY_POINT_DECORATORS = [
     # Python web frameworks
     r'@app\.route',
-    r'@router\.(get|post|put|delete|patch|options|head)',
+    r'@router\.(get|post|put|delete|patch|options|head|websocket)',
+    # N3 fix: FastAPI / Flask 2.0 direct-app decorators (@app.get/@app.post/…),
+    # the canonical modern idiom, previously unmatched by any pattern here. The
+    # trailing \b keeps it from over-matching @app.getter / @app.headers.
+    r'@app\.(get|post|put|delete|patch|options|head|websocket)\b',
     r'@blueprint\.',
     r'@(get|post|put|delete|patch)\b',
     r'@api_view',
