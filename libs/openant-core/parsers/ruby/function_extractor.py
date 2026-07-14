@@ -212,6 +212,48 @@ class FunctionExtractor:
             return ''
         return None
 
+    def _collect_const_literals(self, root, source: bytes) -> Dict[str, str]:
+        """Map CONST_NAME -> literal value for single-literal-assigned constants.
+
+        Determinacy guard: a constant assigned more than once, or ever assigned a
+        non-literal, is blacklisted -- so `define_method(CONST)` is resolved only
+        when CONST has exactly one literal (symbol/string) binding in the file.
+        """
+        literals: Dict[str, str] = {}
+        bad = set()
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            if n.type == 'assignment':
+                kids = [c for c in n.children if c.type != '=']
+                if len(kids) >= 2 and kids[0].type == 'constant':
+                    name = self._node_text(kids[0], source)
+                    if name not in bad:
+                        val = self._literal_arg_text(kids[1], source)
+                        if val is None or name in literals:
+                            bad.add(name)
+                            literals.pop(name, None)
+                        else:
+                            literals[name] = val
+            stack.extend(n.children)
+        return literals
+
+    def _resolve_const_name_arg(self, node, source: bytes,
+                                const_literals: Dict[str, str]) -> Optional[str]:
+        """If a call's first real argument is a CONSTANT with a known single-literal
+        binding, return that literal (the resolved method name); else None. Only a
+        `constant` node matches, so a lowercase local var or a dynamic expression is
+        never resolved."""
+        for child in node.children:
+            if child.type == 'argument_list':
+                for arg in child.children:
+                    if arg.type in ('(', ')', ','):
+                        continue
+                    if arg.type == 'constant':
+                        return const_literals.get(self._node_text(arg, source))
+                    return None  # first real arg is not a constant
+        return None
+
     def _call_receiver_and_method(self, node, source: bytes):
         """For a 'call' node, return (method_name, [literal positional args]).
 
@@ -239,6 +281,18 @@ class FunctionExtractor:
     def _has_block(self, node) -> bool:
         """True if the call node carries a do..end or { } block."""
         return any(c.type in ('do_block', 'block') for c in node.children)
+
+    def _is_sinatra_class(self, relative_path: str, class_name: Optional[str]) -> bool:
+        """True if `class_name` extends Sinatra::Base/Application (modular Sinatra).
+
+        The class was registered in self.classes (with its superclass) before its
+        body -- and therefore before any route DSL call inside it -- is walked.
+        """
+        if not class_name:
+            return False
+        cls = self.classes.get(f"{relative_path}:{class_name}", {})
+        superclass = cls.get('superclass') or ''
+        return 'Sinatra::Base' in superclass or 'Sinatra::Application' in superclass
 
     def _extract_imports(self, tree, source: bytes) -> Dict[str, str]:
         """Extract require/require_relative/include/extend/prepend from a file."""
@@ -306,6 +360,7 @@ class FunctionExtractor:
         by subsequent siblings popped from the same body (children are pushed in
         reverse so they pop in source order).
         """
+        const_literals = self._collect_const_literals(tree.root_node, source)
         stack = [(tree.root_node, None, None, ['public'])]
 
         while stack:
@@ -351,26 +406,46 @@ class FunctionExtractor:
                 # still found.
                 method_name, args = self._call_receiver_and_method(node, source)
                 handled = False
-                if method_name == 'define_method' and class_name and args:
-                    self._emit_synthetic_method(
-                        node, source, relative_path, class_name, module_name,
-                        name=args[0], unit_type=None, visibility=vis_state[0],
-                    )
-                    handled = True
+                if method_name == 'define_method' and class_name:
+                    # Literal-symbol/string name, or a CONSTANT bound to a single
+                    # literal (`NAME = :m; define_method(NAME)`). A non-literal /
+                    # reassigned constant or a lowercase local name stays unresolved
+                    # -> the unit falls through to child descent (0 phantom).
+                    dm_name = args[0] if args else self._resolve_const_name_arg(
+                        node, source, const_literals)
+                    if dm_name:
+                        self._emit_synthetic_method(
+                            node, source, relative_path, class_name, module_name,
+                            name=dm_name, unit_type=None, visibility=vis_state[0],
+                        )
+                        handled = True
                 elif method_name == 'alias_method' and class_name and args:
                     self._emit_synthetic_method(
                         node, source, relative_path, class_name, module_name,
                         name=args[0], unit_type=None, visibility=vis_state[0],
                     )
                     handled = True
-                elif (class_name is None and module_name is None
-                      and method_name in self._SINATRA_VERBS
-                      and self._has_block(node) and args):
-                    # Top-level `get '/path' do..end` Sinatra route.
+                elif method_name == 'define_singleton_method' and class_name and args:
+                    # Class/singleton method defined dynamically; mirror define_method
+                    # so its body (and any sink it reaches) is extracted as a unit.
                     self._emit_synthetic_method(
-                        node, source, relative_path, class_name=None,
-                        module_name=None, name=args[0], unit_type='route_handler',
-                        visibility='public',
+                        node, source, relative_path, class_name, module_name,
+                        name=args[0], unit_type=None, visibility=vis_state[0],
+                    )
+                    handled = True
+                elif (method_name in self._SINATRA_VERBS
+                      and self._has_block(node) and args
+                      and ((class_name is None and module_name is None)
+                           or self._is_sinatra_class(relative_path, class_name))):
+                    # `get '/path' do..end` -- a Sinatra route, either classic
+                    # top-level style or MODULAR style inside a `< Sinatra::Base`
+                    # subclass. The class case is gated on the class actually
+                    # extending Sinatra so an unrelated class method named like a
+                    # verb is not spuriously seeded as an entry point.
+                    self._emit_synthetic_method(
+                        node, source, relative_path, class_name=class_name,
+                        module_name=module_name, name=args[0],
+                        unit_type='route_handler', visibility='public',
                     )
                     handled = True
                 elif method_name in ('private', 'protected', 'public'):
@@ -672,6 +747,74 @@ class FunctionExtractor:
 
         # Extract functions
         self._extract_functions_from_tree(tree, source, file_path, relative_path)
+
+        # Extract file-scope top-level script code
+        self._extract_module_level_code(tree, source, relative_path)
+
+    # Top-level program children that are NOT file-scope script statements:
+    # definitions (their bodies are their own units) and comments.
+    _MODULE_LEVEL_SKIP = frozenset({
+        'method', 'singleton_method', 'class', 'module', 'comment',
+    })
+    # Import/mixin DSL calls are not "significant" executable script code on
+    # their own -- a file that is only requires/includes gets no module unit.
+    _MODULE_LEVEL_IMPORTS = frozenset({
+        'require', 'require_relative', 'load', 'include', 'extend', 'prepend',
+    })
+
+    def _extract_module_level_code(self, tree, source: bytes, relative_path: str) -> None:
+        """Emit file-scope top-level script code as a synthetic module_level unit.
+
+        Ruby scripts run statements at the file top level (`name = ARGV[0];
+        process_input(name)`) with no enclosing class/module. Function-only
+        extraction dropped that code entirely, so it was neither a call-graph
+        node (its calls unreachable) nor an entry-point seed. Mirroring the
+        Python/PHP extractors, collect the top-level non-definition statements
+        into a `__module__` unit (unit_type='module_level') carrying the ARGV/
+        $stdin code, so the call-graph builder wires its calls and
+        entry_point_detector Check-4 can seed it.
+        """
+        stmts = [
+            child for child in tree.root_node.children
+            if child.type not in self._MODULE_LEVEL_SKIP
+        ]
+        if not stmts:
+            return
+
+        # Require at least one statement that is not a bare import/mixin call,
+        # so pure require/include files produce no module unit.
+        def _is_import_call(node) -> bool:
+            if node.type != 'call':
+                return False
+            method_name, _ = self._call_receiver_and_method(node, source)
+            return method_name in self._MODULE_LEVEL_IMPORTS
+
+        if all(_is_import_call(node) for node in stmts):
+            return
+
+        code = '\n'.join(self._node_text(node, source) for node in stmts).strip()
+        if not code:
+            return
+
+        func_id = f"{relative_path}:__module__"
+        self._store_function(func_id, {
+            'name': '__module__',
+            'qualified_name': '__module__',
+            'file_path': relative_path,
+            'start_line': stmts[0].start_point[0] + 1,
+            'end_line': stmts[-1].end_point[0] + 1,
+            'code': code,
+            'class_name': None,
+            'module_name': None,
+            'parameters': [],
+            'is_singleton': False,
+            'visibility': 'public',
+            'unit_type': 'module_level',
+            'is_module_level': True,
+        })
+        self.stats['total_functions'] += 1
+        self.stats['standalone_functions'] += 1
+        self.stats['by_type']['module_level'] = self.stats['by_type'].get('module_level', 0) + 1
 
     def extract_from_scan(self, scan_result: Dict) -> Dict:
         """Extract functions from files listed in a scan result."""

@@ -79,6 +79,21 @@ class TestIsRetryable529:
         for code in ("500", "502", "503", "504"):
             assert is_retryable_error(f"Error code: {code} - server error") is True
 
+    def test_cloudflare_edge_5xx_strings_are_retryable(self):
+        # B8: Cloudflare edge failures 520/522/523/524 are transient 5xx that
+        # surface on the analyzer detection path as str(e) (the string branch),
+        # exactly like 529. They must be retried. This is the exact shape the
+        # Anthropic SDK stringifies such an APIStatusError into.
+        err_520 = "Error code: 520 - {'error': {'type': 'api_error', 'message': 'Web server is returning an unknown error'}}"
+        assert is_retryable_error(err_520) is True
+        for code in ("520", "522", "523", "524"):
+            assert is_retryable_error(f"Error code: {code} - edge server error") is True
+        # Guard the two anchors from the spec in the same test path.
+        assert is_retryable_error("Error code: 400 - bad request") is False
+        assert is_retryable_error(
+            "Error code: 529 - {'type': 'error', 'error': {'type': 'overloaded_error'}}"
+        ) is True
+
     def test_client_error_400_still_not_retryable(self):
         # Guard against over-broadening: a 400 must remain non-retryable.
         assert is_retryable_error("Error code: 400 - bad request") is False

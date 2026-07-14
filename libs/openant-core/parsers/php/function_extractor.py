@@ -170,6 +170,44 @@ class FunctionExtractor:
                     names.append(trait)
         return names
 
+    def _extract_trait_aliases(self, use_node, source: bytes) -> Dict[str, List[Optional[str]]]:
+        """Extract `use T { orig as alias; }` mappings: alias -> [trait_or_None, orig].
+
+        The trait is None for the unqualified `orig as alias` form (resolve against
+        the class's composed traits); the qualified `T::orig as alias` form pins the
+        trait. A visibility-only clause (`orig as protected`) defines no new callable
+        name and is skipped.
+        """
+        aliases: Dict[str, List[Optional[str]]] = {}
+        use_list = next((c for c in use_node.children if c.type == 'use_list'), None)
+        if use_list is None:
+            return aliases
+        for clause in use_list.children:
+            if clause.type != 'use_as_clause':
+                continue
+            kids = clause.children
+            as_idx = next((i for i, c in enumerate(kids) if c.type == 'as'), None)
+            if as_idx is None:
+                continue
+            alias_node = next((c for c in kids[as_idx + 1:] if c.type == 'name'), None)
+            if alias_node is None:  # visibility-only clause: no new callable name
+                continue
+            alias = self._node_text(alias_node, source)
+            trait_name = None
+            method_name = None
+            for c in kids[:as_idx]:
+                if c.type == 'name':
+                    method_name = self._node_text(c, source)
+                elif c.type == 'class_constant_access_expression':
+                    parts = [self._node_text(g, source) for g in c.children
+                             if g.type in ('name', 'qualified_name')]
+                    if len(parts) >= 2:
+                        trait_name = parts[0].rsplit('\\', 1)[-1]
+                        method_name = parts[1]
+            if alias and method_name:
+                aliases[alias] = [trait_name, method_name]
+        return aliases
+
     def _get_visibility(self, node, source: bytes) -> Optional[str]:
         """Extract visibility modifier from a method_declaration node."""
         for child in node.children:
@@ -274,16 +312,19 @@ class FunctionExtractor:
             node, class_name, namespace_name = stack.pop()
 
             if node.type == 'function_definition':
+                # A named `function foo(){}` is ALWAYS a GLOBAL function in PHP,
+                # even when it lexically appears inside a method/function body:
+                # it is registered in the global function table when the
+                # enclosing code runs, not attached to the class. Emit it with
+                # class_name=None so it is not keyed as a phantom Class.foo, and
+                # recurse with class_name=None so anything nested in its body is
+                # likewise not attributed to the enclosing class.
                 self._process_function_node(
-                    node, source, relative_path, class_name, namespace_name,
+                    node, source, relative_path, None, namespace_name,
                     is_static=False
                 )
-                # Recurse into the body so nested closures/arrow functions are
-                # reached; named definitions cannot lexically nest other named
-                # functions/classes in PHP, so this only surfaces
-                # anonymous_function / arrow_function units.
                 for child in reversed(node.children):
-                    stack.append((child, class_name, namespace_name))
+                    stack.append((child, None, namespace_name))
                 continue
 
             elif node.type == 'method_declaration':
@@ -339,6 +380,7 @@ class FunctionExtractor:
                     class_id = f"{relative_path}:{new_class_name}"
                     methods = []
                     traits = []
+                    trait_aliases = {}
                     # Find declaration_list (class body)
                     body_node = node.child_by_field_name('body')
                     if body_node is None:
@@ -363,6 +405,8 @@ class FunctionExtractor:
                                 # `name`/`qualified_name` child. Record the unqualified trait name so
                                 # the call-graph builder can resolve $this->/self:: into the trait.
                                 traits.extend(self._extract_trait_names(child, source))
+                                trait_aliases.update(
+                                    self._extract_trait_aliases(child, source))
 
                     self.classes[class_id] = {
                         'name': new_class_name,
@@ -371,6 +415,7 @@ class FunctionExtractor:
                         'end_line': node.end_point[0] + 1,
                         'methods': methods,
                         'traits': traits,
+                        'trait_aliases': trait_aliases,
                         'superclass': superclass,
                         'interfaces': interfaces,
                         'namespace_name': namespace_name,

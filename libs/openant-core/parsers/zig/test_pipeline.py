@@ -239,6 +239,15 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
     )
     reachable = analyzer.get_all_reachable()
 
+    # N4 fix: empty-seed safety-net (mirrors core/parser_adapter.py). No entry
+    # points => the reachable set is empty => every function pruned, silently
+    # blacking out the dataset (dominant failure for library / no-entry targets).
+    # Degrade to keep-all + warn instead of a silent 0-unit result.
+    if not entry_points and functions:
+        print("  [Warning] No entry points detected — keeping all units unfiltered "
+              "to avoid a silent blackout.", file=sys.stderr)
+        reachable = set(functions.keys())
+
     # Filter functions to only reachable ones.
     filtered_functions = {
         fid: finfo for fid, finfo in functions.items() if fid in reachable

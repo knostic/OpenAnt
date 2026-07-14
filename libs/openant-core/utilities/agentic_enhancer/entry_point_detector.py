@@ -49,6 +49,13 @@ ENTRY_POINT_TYPES = {
     # these the only seed for a compiled binary is absent, so reachability seeds
     # zero entry points and silently empties the dataset for every C/Go/Zig repo.
     'main',               # C/Go/Zig program entry
+    # Go runs every package-level `func init()` automatically at startup, before
+    # main (Go spec: Package initialization). The Go extractor classifies it as
+    # unit_type='init' (go_parser/types.go UnitTypeInit). It is an execution root,
+    # so its transitive callees (config loaders, registrations, side-effecting
+    # startup code that can reach sinks) must be reachable; omitting it blacked
+    # them out. Over-approximating an auto-run root is reachability-safe.
+    'init',               # Go package init() — auto-run startup root
     'http_handler',       # Go net/http handlers (go_parser/types.go UnitTypeHTTPHandler)
     'middleware',         # Go HTTP middleware (go_parser/types.go UnitTypeMiddleware)
 }
@@ -57,7 +64,11 @@ ENTRY_POINT_TYPES = {
 ENTRY_POINT_DECORATORS = [
     # Python web frameworks
     r'@app\.route',
-    r'@router\.(get|post|put|delete|patch|options|head)',
+    r'@router\.(get|post|put|delete|patch|options|head|websocket)',
+    # N3 fix: FastAPI / Flask 2.0 direct-app decorators (@app.get/@app.post/…),
+    # the canonical modern idiom, previously unmatched by any pattern here. The
+    # trailing \b keeps it from over-matching @app.getter / @app.headers.
+    r'@app\.(get|post|put|delete|patch|options|head|websocket)\b',
     r'@blueprint\.',
     r'@(get|post|put|delete|patch)\b',
     r'@api_view',
@@ -109,6 +120,15 @@ USER_INPUT_PATTERNS = [
     r'argparse\.',
     r'\bArgumentParser\s*\(',
     r'click\.(argument|option)',
+    # Ruby CLI / stdin / env: a method that reads these IS a user-input entry
+    # point, including the dominant `def run; ...ARGV...; end` behind an
+    # `if __FILE__ == $0` guard (the sink lives in a `function` unit, so it must
+    # be seeded by this check, not only the module_level check). Mirrors sys.argv.
+    r'\bARGV\b',
+    r'\bgets\b',
+    r'\bSTDIN\b',
+    r'\$stdin\b',
+    r'\bENV\s*(\[|\.(fetch|values_at|dig|to_h|slice)\b)',
     # Standard input
     r'\binput\s*\(',
     r'sys\.stdin',
@@ -157,6 +177,14 @@ MODULE_LEVEL_INPUT_PATTERNS = [
     r'\badd_filter\s*\(',
     r'\bdo_action\s*\(',
     r'\bapply_filters\s*\(',
+    # Ruby file-scope scripts (bin/ executables, Rakefiles): CLI args, stdin and
+    # env reads that run on load, so a module_level unit carrying them is a
+    # user-input entry point.
+    r'\bARGV\b',
+    r'\bSTDIN\b',
+    r'\$stdin\b',
+    r'\bgets\b',
+    r'\bENV\[',
 ]
 
 

@@ -255,5 +255,11 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     error_str = str(error_info).lower()
     return any(term in error_str for term in (
         "rate_limit", "connection", "timeout",
-        "500", "502", "503", "504", "529", "overloaded",
+        # Transient Anthropic/Cloudflare-edge 5xx. 529 ("overloaded") is the
+        # Anthropic overload signal; 520/522/523/524 are Cloudflare edge
+        # failures (unknown error / connection timed out / origin unreachable /
+        # timeout) that are equally transient. 501 is a deterministic
+        # "not implemented" and is deliberately excluded.
+        "500", "502", "503", "504", "520", "522", "523", "524", "529",
+        "overloaded",
     ))

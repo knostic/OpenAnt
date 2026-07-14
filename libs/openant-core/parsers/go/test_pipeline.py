@@ -452,6 +452,15 @@ class GoPipelineTest:
             original_count = len(units)
 
             # Filter to reachable units and stamp reachability tags
+            # N4 fix: empty-seed safety-net (mirrors core/parser_adapter.py). No
+            # entry points => the reachable set is empty => every unit is pruned,
+            # silently blacking out the dataset (dominant failure for library /
+            # no-entry-point targets). Degrade to keep-all + warn instead.
+            if not self.entry_points and units:
+                print("  [Warning] No entry points detected — keeping all units "
+                      "unfiltered to avoid a silent blackout.", file=sys.stderr)
+                self.reachable_units = {u.get("id", "") for u in units}
+
             filtered_units = []
             for u in units:
                 unit_id = u.get("id", "")

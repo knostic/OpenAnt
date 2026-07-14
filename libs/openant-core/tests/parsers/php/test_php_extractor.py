@@ -339,5 +339,54 @@ class Widget {
     )
 
 
+# A named function nested in a method body is GLOBAL in PHP (bug B7)
+# ---------------------------------------------------------------------------
+
+NESTED_GLOBAL_FUNCTION_SOURCE = """<?php
+class Widget {
+    public function m() {
+        function format_label() {
+            return 1;
+        }
+        return format_label();
+    }
+}
+"""
+
+
+def test_named_function_nested_in_method_is_global_not_phantom_method(tmp_path):
+    """A `function foo(){}` declared inside a method body is a GLOBAL function in
+    PHP, not a method of the enclosing class. It must be keyed with
+    class_name=None (global), never as a phantom Widget.format_label."""
+    result = _extract(tmp_path, "widget.php", NESTED_GLOBAL_FUNCTION_SOURCE)
+    units = result["functions"]
+
+    fmt = [fd for fd in units.values() if fd["name"] == "format_label"]
+    assert len(fmt) == 1, (
+        "expected exactly one format_label unit; got "
+        f"{[fd['qualified_name'] for fd in fmt]}"
+    )
+    assert fmt[0]["class_name"] is None, (
+        "format_label is a GLOBAL PHP function (declared inside a method body); "
+        f"it must have class_name=None, got class_name={fmt[0]['class_name']!r} "
+        f"(qualified_name={fmt[0]['qualified_name']!r})"
+    )
+    assert fmt[0]["qualified_name"] == "format_label", (
+        "global function must not be qualified with the enclosing class; got "
+        f"{fmt[0]['qualified_name']!r}"
+    )
+    # The phantom Class.method key must not exist.
+    assert not any(
+        fd["qualified_name"] == "Widget.format_label" for fd in units.values()
+    ), "format_label must not be keyed as the phantom Widget.format_label"
+
+    # The enclosing method m must remain intact as Widget.m.
+    m_units = [fd for fd in units.values() if fd["name"] == "m"]
+    assert len(m_units) == 1 and m_units[0]["class_name"] == "Widget", (
+        "method m must stay intact as Widget.m; got "
+        f"{[(fd['name'], fd['class_name']) for fd in m_units]}"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

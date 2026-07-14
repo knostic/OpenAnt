@@ -307,6 +307,16 @@ class PHPPipelineTest:
             units = dataset.get("units", [])
             original_count = len(units)
 
+            # N4 fix: empty-seed safety-net (mirrors core/parser_adapter.py). No
+            # entry points => the reachable set is empty => every unit is pruned,
+            # silently blacking out the dataset (the dominant failure mode for
+            # library / no-entry-point targets). Degrade to keep-all + warn instead
+            # of a silent 0-unit result.
+            if not self.entry_points and original_count > 0:
+                print("  [Warning] No entry points detected — keeping all units "
+                      "unfiltered to avoid a silent blackout.", file=sys.stderr)
+                self.reachable_units = {u.get("id", "") for u in units}
+
             filtered_units = []
             for u in units:
                 unit_id = u.get("id", "")

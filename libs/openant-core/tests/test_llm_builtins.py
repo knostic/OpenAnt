@@ -46,24 +46,24 @@ class TestOpenantDefault:
         # Pin today's behavior. If Anthropic deprecates one of these
         # IDs, this test breaks loudly and the change is recorded in
         # the CHANGELOG.
-        assert OPENANT_DEFAULT.phases["analyze"].model == "claude-opus-4-6"
-        assert OPENANT_DEFAULT.phases["verify"].model == "claude-opus-4-6"
-        assert OPENANT_DEFAULT.phases["llm_reach"].model == "claude-opus-4-6"
+        assert OPENANT_DEFAULT.phases["analyze"].model == "claude-opus-4-8"
+        assert OPENANT_DEFAULT.phases["verify"].model == "claude-opus-4-8"
+        assert OPENANT_DEFAULT.phases["llm_reach"].model == "claude-opus-4-8"
         # report restored to Opus (H1) — matches master's report generator.
-        assert OPENANT_DEFAULT.phases["report"].model == "claude-opus-4-6"
-        assert OPENANT_DEFAULT.phases["enhance"].model == "claude-sonnet-4-20250514"
-        assert OPENANT_DEFAULT.phases["dynamic_test"].model == "claude-sonnet-4-20250514"
-        assert OPENANT_DEFAULT.phases["app_context"].model == "claude-sonnet-4-20250514"
+        assert OPENANT_DEFAULT.phases["report"].model == "claude-opus-4-8"
+        assert OPENANT_DEFAULT.phases["enhance"].model == "claude-sonnet-4-6"
+        assert OPENANT_DEFAULT.phases["dynamic_test"].model == "claude-sonnet-4-6"
+        assert OPENANT_DEFAULT.phases["app_context"].model == "claude-sonnet-4-6"
 
     def test_report_phase_defaults_to_opus(self):
         # H1 drift-guard. Master's report/generator.py used
-        # MODEL="claude-opus-4-6"; the LLM-provider refactor silently
+        # MODEL="claude-opus-4-8"; the LLM-provider refactor silently
         # moved the builtin ``report`` default to Sonnet. Restore Opus so
         # the HTML-remediation / summary / disclosure sub-calls keep
         # producing Opus-quality output on a fresh, config-less install.
         # If you intend to change the report default, that is a
         # CHANGELOG-worthy event — update this assertion deliberately.
-        assert OPENANT_DEFAULT.phases["report"].model == "claude-opus-4-6"
+        assert OPENANT_DEFAULT.phases["report"].model == "claude-opus-4-8"
 
     def test_accessor_returns_same_object(self):
         # Frozen dataclass, but if a future refactor turns it into a
@@ -83,7 +83,7 @@ def _fake_binding() -> PhaseBinding:
     return PhaseBinding(
         phase="report",
         adapter=object(),
-        model="claude-opus-4-6",
+        model="claude-opus-4-8",
         provider_name="anthropic",
     )
 
