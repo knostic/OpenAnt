@@ -130,3 +130,40 @@ def test_bug41_const_alias_call_edge():
     assert "m.zig:handler" in cg.get("m.zig:direct", []), (
         f"Direct call edge regressed, got call_graph={cg}"
     )
+
+
+def test_bugB9_per_function_const_alias_not_clobbered():
+    """[BUG B9] `const doit = X` in one fn must not clobber `const doit = Y` in another.
+
+    The local const-alias map was FILE-keyed, so two functions in the same file
+    that each bind the same alias name to a DIFFERENT target overwrote each other:
+    both callers resolved to whichever binding was collected last. Keyed by the
+    caller function, each `doit()` must resolve to ITS OWN target.
+    """
+    src = (
+        "fn foo() void {}\n"
+        "fn bar() void {}\n"
+        "fn caller_a() void {\n"
+        "    const doit = foo;\n"
+        "    doit();\n"
+        "}\n"
+        "fn caller_b() void {\n"
+        "    const doit = bar;\n"
+        "    doit();\n"
+        "}\n"
+    )
+    cg = _run_pipeline(src)["call_graph"]
+    # caller_a's `doit` is foo; caller_b's `doit` is bar.
+    assert "m.zig:foo" in cg.get("m.zig:caller_a", []), (
+        f"Expected caller_a -> foo (its own alias), got call_graph={cg}"
+    )
+    assert "m.zig:bar" in cg.get("m.zig:caller_b", []), (
+        f"Expected caller_b -> bar (its own alias), got call_graph={cg}"
+    )
+    # Neither caller must pick up the OTHER function's alias target.
+    assert "m.zig:bar" not in cg.get("m.zig:caller_a", []), (
+        f"caller_a wrongly resolved to bar (clobbered alias), got call_graph={cg}"
+    )
+    assert "m.zig:foo" not in cg.get("m.zig:caller_b", []), (
+        f"caller_b wrongly resolved to foo (clobbered alias), got call_graph={cg}"
+    )

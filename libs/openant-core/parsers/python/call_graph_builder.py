@@ -386,6 +386,15 @@ class CallGraphBuilder:
             # Local function-value alias: `fn = helper; fn()` resolves to helper.
             if aliases and func_name in aliases:
                 return aliases[func_name]
+            # A local variable of a locally-known type invoked directly
+            # (`h = H(); h(cmd)`) dispatches to that class's __call__. This mirrors
+            # the obj.method() path below, which already consults local_types for the
+            # same binding; without it, h() was dropped while h.method() resolved.
+            if func_name in local_types:
+                callable_target = self._resolve_class_method(
+                    local_types[func_name], '__call__', caller_file)
+                if callable_target:
+                    return callable_target
             # A same-file user function with the same name as a stdlib
             # module/builtin wins over the builtin filter: the call is
             # unambiguously to the local definition. SCOPE is deliberately

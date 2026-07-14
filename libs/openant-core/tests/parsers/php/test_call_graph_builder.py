@@ -124,3 +124,52 @@ def test_scoped_call_to_builtin_named_same_class_method_resolves():
     assert b.call_graph.get("bag.php:Bag::total") == ["bag.php:Bag::count"], (
         f"self::count() must resolve to same-class count(): {b.call_graph}"
     )
+
+
+def test_same_file_name_colliding_globals_all_resolved():
+    """Two method-nested `function g(){}` in one file (re-keyed to file-scope
+    globals with de-collided ids `app.php:g` / `app.php:g#L9`) must BOTH receive an
+    edge from a bare `g()` — not just the first.
+
+    `_resolve_simple_call` returns the first same-file global, so both Alpha::run
+    and Beta::run resolved only to `app.php:g`; `app.php:g#L9` (and its sink
+    subtree) was orphaned — a reachability false negative. The resolution must
+    over-approximate to every same-name same-namespace file-scope global.
+    """
+    funcs = {
+        "app.php:Alpha.run": {
+            "name": "run", "file_path": "app.php",
+            "class_name": "Alpha", "namespace_name": None,
+            "code": "<?php function run() { g(); }",
+        },
+        "app.php:Beta.run": {
+            "name": "run", "file_path": "app.php",
+            "class_name": "Beta", "namespace_name": None,
+            "code": "<?php function run() { g(); }",
+        },
+        "app.php:g": {
+            "name": "g", "file_path": "app.php",
+            "class_name": None, "namespace_name": None,
+            "code": "<?php function g() { sinkC(); }",
+        },
+        "app.php:g#L9": {
+            "name": "g", "file_path": "app.php",
+            "class_name": None, "namespace_name": None,
+            "code": "<?php function g() { sinkD(); }",
+        },
+        "app.php:sinkC": {
+            "name": "sinkC", "file_path": "app.php",
+            "class_name": None, "namespace_name": None, "code": "<?php function sinkC() {}",
+        },
+        "app.php:sinkD": {
+            "name": "sinkD", "file_path": "app.php",
+            "class_name": None, "namespace_name": None, "code": "<?php function sinkD() {}",
+        },
+    }
+    b = _build(funcs)
+    assert set(b.call_graph.get("app.php:Alpha.run", [])) == {"app.php:g", "app.php:g#L9"}, (
+        f"Alpha::run must edge to BOTH colliding globals: {b.call_graph.get('app.php:Alpha.run')}"
+    )
+    assert set(b.call_graph.get("app.php:Beta.run", [])) == {"app.php:g", "app.php:g#L9"}, (
+        f"Beta::run must edge to BOTH colliding globals: {b.call_graph.get('app.php:Beta.run')}"
+    )

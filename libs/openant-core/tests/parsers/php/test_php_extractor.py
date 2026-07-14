@@ -261,5 +261,132 @@ def test_closure_units_capture_their_body(tmp_path):
     assert "transform" in bodies  # from the arrow function body
 
 
+# ---------------------------------------------------------------------------
+# PHP 8 #[Route] attribute handlers on a NON-*Controller class must seed (B11)
+# ---------------------------------------------------------------------------
+
+# Symfony/API-Platform style: the handler lives on a class that is NOT named
+# *Controller and the file path contains no 'controller' segment, so the
+# extractor's name/path-based route_handler classifier misses it. The routing
+# attribute (#[Route]) is what makes it an endpoint. The body reads user input
+# via the Symfony request bag ($request->query->get(...)).
+ROUTE_ATTRIBUTE_SOURCE = """<?php
+namespace App\\Api;
+
+class ProductApi {
+    #[Route("/p/{id}")]
+    public function show($id) {
+        $q = $request->query->get("x");
+        return $q;
+    }
+}
+"""
+
+
+def test_php_route_attribute_captured_by_extractor(tmp_path):
+    """The extractor must capture #[Route] into func_data['decorators']."""
+    result = _extract(tmp_path, "ProductApi.php", ROUTE_ATTRIBUTE_SOURCE)
+    show = next(fd for fd in result["functions"].values() if fd["name"] == "show")
+    decorators = show.get("decorators", [])
+    assert any("Route" in d for d in decorators), (
+        "extractor must capture the #[Route] PHP8 attribute into "
+        f"func_data['decorators']; got decorators={decorators!r}"
+    )
+
+
+def test_php_route_attribute_handler_is_entry_point(tmp_path):
+    """A #[Route] method on a non-*Controller class must seed as an entry point."""
+    result = _extract(tmp_path, "ProductApi.php", ROUTE_ATTRIBUTE_SOURCE)
+
+    # Sanity: on the buggy path this method is classified as a plain 'method'
+    # (class 'ProductApi' has no 'controller', path has no 'controller').
+    show = next(fd for fd in result["functions"].values() if fd["name"] == "show")
+    assert show["class_name"] == "ProductApi"
+
+    detector = EntryPointDetector(result["functions"], {})
+    detector.detect_entry_points()
+    show_id = next(
+        fid for fid, fd in result["functions"].items() if fd["name"] == "show"
+    )
+    assert detector.is_entry_point(show_id), (
+        "ProductApi::show carries a #[Route] attribute and must be seeded as an "
+        "entry point INDEPENDENT of the class name; "
+        f"reason={detector.get_entry_point_reason(show_id)!r}"
+    )
+
+
+def test_symfony_request_query_get_is_input_pattern(tmp_path):
+    """$request->query->get( / $request->request->get( must count as user input."""
+    src = """<?php
+class Widget {
+    public function build($request) {
+        $x = $request->query->get("q");
+        $y = $request->request->get("p");
+        return $x . $y;
+    }
+}
+"""
+    result = _extract(tmp_path, "Widget.php", src)
+    detector = EntryPointDetector(result["functions"], {})
+    detector.detect_entry_points()
+    build_id = next(
+        fid for fid, fd in result["functions"].items() if fd["name"] == "build"
+    )
+    assert detector.is_entry_point(build_id), (
+        "Widget::build reads Symfony request bags "
+        "($request->query->get / $request->request->get) and must be flagged as "
+        f"an entry point; reason={detector.get_entry_point_reason(build_id)!r}"
+    )
+
+
+# A named function nested in a method body is GLOBAL in PHP (bug B7)
+# ---------------------------------------------------------------------------
+
+NESTED_GLOBAL_FUNCTION_SOURCE = """<?php
+class Widget {
+    public function m() {
+        function format_label() {
+            return 1;
+        }
+        return format_label();
+    }
+}
+"""
+
+
+def test_named_function_nested_in_method_is_global_not_phantom_method(tmp_path):
+    """A `function foo(){}` declared inside a method body is a GLOBAL function in
+    PHP, not a method of the enclosing class. It must be keyed with
+    class_name=None (global), never as a phantom Widget.format_label."""
+    result = _extract(tmp_path, "widget.php", NESTED_GLOBAL_FUNCTION_SOURCE)
+    units = result["functions"]
+
+    fmt = [fd for fd in units.values() if fd["name"] == "format_label"]
+    assert len(fmt) == 1, (
+        "expected exactly one format_label unit; got "
+        f"{[fd['qualified_name'] for fd in fmt]}"
+    )
+    assert fmt[0]["class_name"] is None, (
+        "format_label is a GLOBAL PHP function (declared inside a method body); "
+        f"it must have class_name=None, got class_name={fmt[0]['class_name']!r} "
+        f"(qualified_name={fmt[0]['qualified_name']!r})"
+    )
+    assert fmt[0]["qualified_name"] == "format_label", (
+        "global function must not be qualified with the enclosing class; got "
+        f"{fmt[0]['qualified_name']!r}"
+    )
+    # The phantom Class.method key must not exist.
+    assert not any(
+        fd["qualified_name"] == "Widget.format_label" for fd in units.values()
+    ), "format_label must not be keyed as the phantom Widget.format_label"
+
+    # The enclosing method m must remain intact as Widget.m.
+    m_units = [fd for fd in units.values() if fd["name"] == "m"]
+    assert len(m_units) == 1 and m_units[0]["class_name"] == "Widget", (
+        "method m must stay intact as Widget.m; got "
+        f"{[(fd['name'], fd['class_name']) for fd in m_units]}"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

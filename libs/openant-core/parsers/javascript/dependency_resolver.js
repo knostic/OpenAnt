@@ -163,10 +163,12 @@ class DependencyResolver {
       // Skip 'this' (handled above) and common built-ins
       if (objectName === 'this' || this._isBuiltIn(objectName)) continue;
 
-      const resolved = this._resolveMethodCall(objectName, methodName, callerFile, callerFuncId);
-      if (resolved && !seenCalls.has(resolved)) {
-        seenCalls.add(resolved);
-        calls.push(resolved);
+      const resolvedIds = this._resolveMethodCall(objectName, methodName, callerFile, callerFuncId);
+      for (const resolved of resolvedIds) {
+        if (resolved && !seenCalls.has(resolved)) {
+          seenCalls.add(resolved);
+          calls.push(resolved);
+        }
       }
     }
 
@@ -287,31 +289,43 @@ class DependencyResolver {
     const candidates = this.functionsByName[methodName];
 
     if (!candidates || !Array.isArray(candidates)) {
-      return null;
+      return [];
     }
 
     // 1. Exact class name match (existing behavior)
     for (const funcId of candidates) {
       const funcData = this.functions[funcId];
       if (funcData && funcData.className === objectName) {
-        return funcId;
+        return [funcId];
       }
     }
 
+    // Accumulate candidate edges across the local-var (1b) and DI (2) resolution
+    // steps and return their UNION — neither step may REPLACE the other. A
+    // receiver can be both locally reassigned (`this.svc = new FakeSvc()`) and
+    // DI-typed (constructorDeps says svc: RealSvc); emitting only one edge would
+    // hide the other method — a reachability false-negative, the dangerous
+    // direction for a security scan. Over-approximation is the safe direction.
+    const matches = [];
+    const addMatch = (funcId) => {
+      if (funcId && !matches.includes(funcId)) matches.push(funcId);
+    };
+
     // 1b. Local-variable type dispatch: `const x = new C(); x.method()`.
-    //     Map the receiver var to the class it was constructed with, then
-    //     reuse the exact-class-name match. Built-in constructors (Map, Set,
-    //     Promise, ...) are skipped so e.g. `new Map().get()` does not bind to
-    //     a repo `get`.
+    //     Map the receiver var to the class(es) it was constructed with; a var
+    //     reassigned across types (`y = new Foo(); y = new Bar()`) yields several
+    //     candidate classes, so emit an edge to each. Built-in constructors
+    //     (Map, Set, ...) are skipped so `new Map().get()` does not bind to a repo `get`.
     if (callerFuncId) {
       const callerFunc = this.functions[callerFuncId];
       const localTypes = this._extractLocalTypes(callerFunc && callerFunc.code);
-      const localClass = localTypes[objectName];
-      if (localClass && !this._isBuiltIn(localClass)) {
+      const localClasses = localTypes[objectName] || [];
+      for (const cls of localClasses) {
+        if (this._isBuiltIn(cls)) continue;
         for (const funcId of candidates) {
           const funcData = this.functions[funcId];
-          if (funcData && funcData.className === localClass) {
-            return funcId;
+          if (funcData && funcData.className === cls) {
+            addMatch(funcId);
           }
         }
       }
@@ -319,7 +333,9 @@ class DependencyResolver {
 
     // 2. DI-aware resolution: look up objectName in caller's constructorDeps
     //    e.g., this.callService.getById() -> constructorDeps says callService: CallService
-    //    -> resolve to CallService.getById
+    //    -> resolve to CallService.getById. Its internal precedence (exact 2a >
+    //    nominal 2b > prefix 2c) is preserved via diResolved, but the result
+    //    UNIONS with 1b rather than short-circuiting it.
     if (callerFuncId) {
       const callerFunc = this.functions[callerFuncId];
       const classEntry = callerFunc && callerFunc.className &&
@@ -328,37 +344,45 @@ class DependencyResolver {
         const typeName = (classEntry.constructorDeps || {})[objectName]
             ?? (classEntry.fieldDeps || {})[objectName];
         if (typeName) {
-          // 2a. Exact type match
+          let diResolved = false;
+
+          // 2a. Exact type match (first match wins within the DI branch)
           for (const funcId of candidates) {
             const funcData = this.functions[funcId];
             if (funcData && funcData.className === typeName) {
-              return funcId;
+              addMatch(funcId);
+              diResolved = true;
+              break;
             }
           }
 
           // 2b. Nominal type match: prefer candidates whose class implements or extends typeName.
           //     If exactly one such candidate exists, the resolution is unambiguous.
-          const nominalClassKeys = this.classesByBaseType[typeName] || [];
-          const nominalMatches = candidates.filter(funcId => {
-            const funcData = this.functions[funcId];
-            if (!funcData || !funcData.className) return false;
-            const funcClassKey = funcId.split(':')[0] + ':' + funcData.className;
-            return nominalClassKeys.includes(funcClassKey);
-          });
-          if (nominalMatches.length === 1) return nominalMatches[0];
+          if (!diResolved) {
+            const nominalClassKeys = this.classesByBaseType[typeName] || [];
+            const nominalMatches = candidates.filter(funcId => {
+              const funcData = this.functions[funcId];
+              if (!funcData || !funcData.className) return false;
+              const funcClassKey = funcId.split(':')[0] + ':' + funcData.className;
+              return nominalClassKeys.includes(funcClassKey);
+            });
+            if (nominalMatches.length === 1) { addMatch(nominalMatches[0]); diResolved = true; }
+          }
 
           // 2c. Prefix match: last resort for versioned names (e.g., CallService -> CallServiceV1).
           //     Skip if multiple candidates match to preserve no-false-positive property.
-          const prefixMatches = candidates.filter(funcId => {
-            const funcData = this.functions[funcId];
-            return funcData && funcData.className && funcData.className.startsWith(typeName);
-          });
-          if (prefixMatches.length === 1) return prefixMatches[0];
+          if (!diResolved) {
+            const prefixMatches = candidates.filter(funcId => {
+              const funcData = this.functions[funcId];
+              return funcData && funcData.className && funcData.className.startsWith(typeName);
+            });
+            if (prefixMatches.length === 1) addMatch(prefixMatches[0]);
+          }
         }
       }
     }
 
-    return null;
+    return matches;
   }
 
   /**
@@ -370,13 +394,21 @@ class DependencyResolver {
     const localTypes = Object.create(null);
     if (!code) return localTypes;
 
-    const declPattern =
-      /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+([A-Za-z_$][\w$]*)\s*\(/g;
+    // Track `x = new C(...)` bindings — both declarations and bare
+    // reassignments — and keep EVERY constructed class a var takes, not just the
+    // first. `let y = new Foo(); ...; y = new Bar()` means y may hold Foo or Bar
+    // at a given call site, so dispatch over-approximates to both. Dropping the
+    // binding (or keeping only one) would hide a genuinely reachable method — a
+    // reachability false-negative, the dangerous direction for a security scan.
+    // A non-constructor assignment (`y = 5`) contributes no type. Returns
+    // varName -> [className, ...].
+    const newPattern =
+      /(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*new\s+([A-Za-z_$][\w$]*)\s*\(/g;
     let match;
-    while ((match = declPattern.exec(code)) !== null) {
+    while ((match = newPattern.exec(code)) !== null) {
       const [, varName, className] = match;
-      // Last write wins, matching JS reassignment order within a body.
-      localTypes[varName] = className;
+      if (!localTypes[varName]) localTypes[varName] = [];
+      if (!localTypes[varName].includes(className)) localTypes[varName].push(className);
     }
     return localTypes;
   }

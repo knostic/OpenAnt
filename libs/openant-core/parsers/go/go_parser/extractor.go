@@ -76,10 +76,80 @@ func (e *Extractor) extractFromFile(filePath string, output *AnalyzerOutput) err
 				fmt.Fprintln(os.Stderr, "Warning: "+w)
 			}
 			output.Functions[funcID] = funcInfo
+		case *ast.GenDecl:
+			// Package-level `var name = func(){...}` — emit the function-valued var as
+			// a unit so its body is scanned. A func-literal initializer is not a
+			// *ast.FuncDecl and would otherwise be skipped entirely, orphaning any
+			// function reachable only through it.
+			if d.Tok == token.VAR {
+				for _, spec := range d.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for i, val := range vs.Values {
+						lit, ok := val.(*ast.FuncLit)
+						if !ok || i >= len(vs.Names) {
+							continue
+						}
+						name := vs.Names[i].Name
+						if name == "_" {
+							continue
+						}
+						funcInfo := e.extractVarFuncLit(lit, name, relPath, pkgName, content)
+						funcID := e.makeFunctionID(relPath, funcInfo)
+						if w := duplicateIDWarning(output.Functions, funcID, funcInfo); w != "" {
+							fmt.Fprintln(os.Stderr, "Warning: "+w)
+						}
+						output.Functions[funcID] = funcInfo
+					}
+				}
+			}
 		}
 	}
 
 	return nil
+}
+
+// extractVarFuncLit builds a unit for a package-level `var name = func(){...}` so its
+// body is scanned by the call-graph builder. Code is re-synthesized as
+// `var name = <literal>`, which is parseable on its own (a bare `func(){...}` is not
+// valid at file scope, so the call-graph builder's `package p\n`+Code wrap would fail).
+func (e *Extractor) extractVarFuncLit(lit *ast.FuncLit, name, filePath, pkgName string, content []byte) FunctionInfo {
+	startPos := e.fset.Position(lit.Pos())
+	endPos := e.fset.Position(lit.End())
+
+	var params []string
+	if lit.Type.Params != nil {
+		for _, field := range lit.Type.Params.List {
+			paramType := e.typeToString(field.Type)
+			if len(field.Names) > 0 {
+				for _, n := range field.Names {
+					params = append(params, fmt.Sprintf("%s %s", n.Name, paramType))
+				}
+			} else {
+				params = append(params, paramType)
+			}
+		}
+	}
+
+	litSrc := ""
+	if so, eo := startPos.Offset, endPos.Offset; so >= 0 && eo <= len(content) && so < eo {
+		litSrc = string(content[so:eo])
+	}
+	code := "var " + name + " = " + litSrc
+
+	return FunctionInfo{
+		Name:       name,
+		Code:       code,
+		StartLine:  startPos.Line,
+		EndLine:    endPos.Line,
+		UnitType:   UnitTypeFunction,
+		IsExported: len(name) > 0 && unicode.IsUpper(rune(name[0])),
+		Package:    pkgName,
+		FilePath:   filePath,
+		Parameters: params,
+	}
 }
 
 func (e *Extractor) extractFunctionDecl(decl *ast.FuncDecl, filePath, pkgName string, content []byte) FunctionInfo {

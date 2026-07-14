@@ -49,6 +49,13 @@ ENTRY_POINT_TYPES = {
     # these the only seed for a compiled binary is absent, so reachability seeds
     # zero entry points and silently empties the dataset for every C/Go/Zig repo.
     'main',               # C/Go/Zig program entry
+    # Go runs every package-level `func init()` automatically at startup, before
+    # main (Go spec: Package initialization). The Go extractor classifies it as
+    # unit_type='init' (go_parser/types.go UnitTypeInit). It is an execution root,
+    # so its transitive callees (config loaders, registrations, side-effecting
+    # startup code that can reach sinks) must be reachable; omitting it blacked
+    # them out. Over-approximating an auto-run root is reachability-safe.
+    'init',               # Go package init() — auto-run startup root
     'http_handler',       # Go net/http handlers (go_parser/types.go UnitTypeHTTPHandler)
     'middleware',         # Go HTTP middleware (go_parser/types.go UnitTypeMiddleware)
 }
@@ -57,7 +64,11 @@ ENTRY_POINT_TYPES = {
 ENTRY_POINT_DECORATORS = [
     # Python web frameworks
     r'@app\.route',
-    r'@router\.(get|post|put|delete|patch|options|head)',
+    r'@router\.(get|post|put|delete|patch|options|head|websocket)',
+    # N3 fix: FastAPI / Flask 2.0 direct-app decorators (@app.get/@app.post/…),
+    # the canonical modern idiom, previously unmatched by any pattern here. The
+    # trailing \b keeps it from over-matching @app.getter / @app.headers.
+    r'@app\.(get|post|put|delete|patch|options|head|websocket)\b',
     r'@blueprint\.',
     r'@(get|post|put|delete|patch)\b',
     r'@api_view',
@@ -75,6 +86,19 @@ ENTRY_POINT_DECORATORS = [
     r'@(Get|Post|Put|Delete|Patch)\(',
     r'@Controller\(',
     r'@WebSocketGateway',
+]
+
+# PHP 8 routing attributes (Symfony / API-Platform): `#[Route(...)]`, `#[Get]`,
+# `#[Post]`, ... A method carrying one of these IS a route handler regardless of
+# the class name, so a handler on a class NOT named *Controller (which the PHP
+# extractor's name/path-based classifier leaves as a plain `method`) is still
+# seeded as an entry point.
+ROUTE_ATTRIBUTE_PATTERNS = [
+    # A PHP 8 routing attribute anywhere in the attribute list — not only right
+    # after `#[`. Allows a namespace prefix (#[Routing\Route], #[\Symfony\...\Route]),
+    # grouped attributes (#[Foo, Route(...)]), and (with IGNORECASE at compile)
+    # case-insensitive class names, since PHP class names are case-insensitive.
+    r'#\[[^\]]*\b(Route|Get|Post|Put|Delete|Patch|Options|Head)\b',
 ]
 
 # Code patterns indicating direct user input sources
@@ -96,6 +120,15 @@ USER_INPUT_PATTERNS = [
     r'argparse\.',
     r'\bArgumentParser\s*\(',
     r'click\.(argument|option)',
+    # Ruby CLI / stdin / env: a method that reads these IS a user-input entry
+    # point, including the dominant `def run; ...ARGV...; end` behind an
+    # `if __FILE__ == $0` guard (the sink lives in a `function` unit, so it must
+    # be seeded by this check, not only the module_level check). Mirrors sys.argv.
+    r'\bARGV\b',
+    r'\bgets\b',
+    r'\bSTDIN\b',
+    r'\$stdin\b',
+    r'\bENV\s*(\[|\.(fetch|values_at|dig|to_h|slice)\b)',
     # Standard input
     r'\binput\s*\(',
     r'sys\.stdin',
@@ -120,6 +153,14 @@ USER_INPUT_PATTERNS = [
     r'php://input',
     r'\bfile_get_contents\s*\(\s*["\']php://input',
     r'\bfilter_input\s*\(',
+    # Symfony request reads, anchored to a $request / $req / $this->request
+    # receiver so they read HTTP input, not an unrelated ->query->all() on an
+    # ORM builder or a ->headers->get() on the app's own response object.
+    #  - request bags:   $request->query->get(...) / ->request-> / ->cookies-> / ...
+    #  - direct methods: $request->get(...) / ->getPayload() / ->getContent() /
+    #                    ->toArray() / ->input(...) / ->all()
+    r'(\$(request|req)\b|\$this\s*->\s*request\b)\s*->\s*(query|request|cookies|attributes|headers|files)\s*->\s*(get|all)\s*\(',
+    r'(\$(request|req)\b|\$this\s*->\s*request\b)\s*->\s*(get|getPayload|getContent|toArray|input|all)\s*\(',
 ]
 
 # Patterns that indicate module-level scripts with user input
@@ -136,6 +177,14 @@ MODULE_LEVEL_INPUT_PATTERNS = [
     r'\badd_filter\s*\(',
     r'\bdo_action\s*\(',
     r'\bapply_filters\s*\(',
+    # Ruby file-scope scripts (bin/ executables, Rakefiles): CLI args, stdin and
+    # env reads that run on load, so a module_level unit carrying them is a
+    # user-input entry point.
+    r'\bARGV\b',
+    r'\bSTDIN\b',
+    r'\$stdin\b',
+    r'\bgets\b',
+    r'\bENV\[',
 ]
 
 
@@ -169,6 +218,9 @@ class EntryPointDetector:
         # Compile regex patterns for efficiency
         self._decorator_patterns = [
             re.compile(p, re.IGNORECASE) for p in ENTRY_POINT_DECORATORS
+        ]
+        self._route_attribute_patterns = [
+            re.compile(p, re.IGNORECASE) for p in ROUTE_ATTRIBUTE_PATTERNS
         ]
         self._input_patterns = [
             re.compile(p) for p in USER_INPUT_PATTERNS
@@ -221,9 +273,19 @@ class EntryPointDetector:
         elif func_data.get('name') == 'main':
             reasons.append('name:main')
 
-        # Check 2: Decorators indicate entry point
+        # Check 1c: A PHP 8 routing attribute (#[Route]/#[Get]/#[Post]/...) marks
+        # the method as a route handler INDEPENDENT of the class name. Symfony /
+        # API-Platform endpoints live on classes not named *Controller, which the
+        # PHP extractor's name/path-based classifier leaves as a plain `method`;
+        # the attribute is the authoritative signal.
         decorators = func_data.get('decorators', [])
         decorators_str = ' '.join(decorators)
+        for pattern in self._route_attribute_patterns:
+            if pattern.search(decorators_str):
+                reasons.append('unit_type:route_handler')
+                break
+
+        # Check 2: Decorators indicate entry point
         for pattern in self._decorator_patterns:
             if pattern.search(decorators_str):
                 reasons.append(f'decorator:{pattern.pattern}')

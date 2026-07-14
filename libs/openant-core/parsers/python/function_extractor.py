@@ -60,6 +60,7 @@ Output (JSON):
 import ast
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -215,6 +216,12 @@ class FunctionExtractor:
 
         # Route handlers
         if '@app.route' in dec_str or '@router.' in dec_str or '@blueprint.' in dec_str:
+            return 'route_handler'
+        # N3 fix: FastAPI / Flask 2.0 direct-app decorators. '@app.get' does NOT
+        # contain the substring '@get', so the check below missed it entirely.
+        # The trailing \b avoids over-matching @app.getter / @app.headers while
+        # still matching both @app.get( and a bare @app.get.
+        if re.search(r'@app\.(get|post|put|delete|patch|options|head|websocket)\b', dec_str):
             return 'route_handler'
         if '@get' in dec_str or '@post' in dec_str or '@put' in dec_str or '@delete' in dec_str:
             return 'route_handler'
@@ -393,7 +400,8 @@ class FunctionExtractor:
                 bodies.append(b)
         return bodies
 
-    def _descend_into_blocks(self, stmts: list, file_path: Path, content: str) -> None:
+    def _descend_into_blocks(self, stmts: list, file_path: Path, content: str,
+                             enclosing_class: Optional[str] = None) -> None:
         """Find def/class nodes inside block statements at ANY depth and emit them.
 
         A `def`/`class` inside an `if`/`try`/`for`/`while`/`with`/`match` block is
@@ -411,10 +419,15 @@ class FunctionExtractor:
             for body in self._block_bodies(stmt):
                 for child in body:
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        self._process_function_tree(child, file_path, content, class_name=None)
+                        # A def surfaced from a class-body block is still a method
+                        # of that class; keep its enclosing class so it is keyed
+                        # (and classified) as a method, not module-level.
+                        self._process_function_tree(child, file_path, content,
+                                                    class_name=enclosing_class)
                     elif isinstance(child, ast.ClassDef):
-                        self._process_class_tree(child, file_path, content, outer_qualifier=None)
-                self._descend_into_blocks(body, file_path, content)
+                        self._process_class_tree(child, file_path, content,
+                                                 outer_qualifier=enclosing_class)
+                self._descend_into_blocks(body, file_path, content, enclosing_class)
 
     def _process_function_tree(self, node: ast.AST, file_path: Path, content: str,
                                class_name: Optional[str] = None) -> None:
@@ -465,8 +478,10 @@ class FunctionExtractor:
             if isinstance(item, ast.ClassDef):
                 self._process_class_tree(item, file_path, content, outer_qualifier=qualified_class)
         # defs/classes wrapped in a block inside the class body (e.g. an
-        # `if TYPE_CHECKING:` block declaring conditional members).
-        self._descend_into_blocks(node.body, file_path, content)
+        # `if TYPE_CHECKING:` block declaring conditional members). Thread the
+        # class so a block-nested def stays a method of this class.
+        self._descend_into_blocks(node.body, file_path, content,
+                                  enclosing_class=qualified_class)
 
     def extract_assigned_lambdas(self, tree: ast.AST, file_path: Path, content: str) -> None:
         """Emit a function unit for each module-level `name = lambda ...`.

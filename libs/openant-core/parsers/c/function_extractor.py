@@ -467,6 +467,12 @@ class FunctionExtractor:
                 self._process_function_node(node, source, relative_path,
                                             is_cpp, is_header, namespace_prefix,
                                             class_context)
+                # Descend into the body: GNU nested functions (a GCC extension) are
+                # `function_definition` nodes inside the compound_statement and would
+                # otherwise never be visited. A nested definition is processed on a
+                # later iteration with the same namespace/class context.
+                for child in reversed(node.children):
+                    stack.append((child, namespace_prefix, class_context))
 
             elif node.type == 'declaration' and not is_header:
                 # Standalone declarations in .c/.cpp files are prototypes, EXCEPT

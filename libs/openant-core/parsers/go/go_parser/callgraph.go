@@ -209,6 +209,23 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 
 	// Walk the AST looking for call expressions
 	ast.Inspect(file, func(n ast.Node) bool {
+		// Go 1.23 range-over-func: `for v := range seqFunc` invokes seqFunc as an
+		// iterator, so a bare function identifier as the range expression is a call
+		// edge. A slice/map/channel/int range expression is either not a bare ident
+		// or simply will not resolve to a function later, so no false edge is added.
+		if rng, ok := n.(*ast.RangeStmt); ok {
+			if ident, ok := rng.X.(*ast.Ident); ok {
+				name := ident.Name
+				if target, ok := aliases[name]; ok {
+					name = target
+				}
+				if name != "" && !c.builtins[name] {
+					calls = append(calls, CallInfo{Name: name})
+				}
+			}
+			return true
+		}
+
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
