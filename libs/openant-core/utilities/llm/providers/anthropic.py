@@ -124,10 +124,14 @@ class AnthropicAdapter:
     # warning — the user can add to this dict locally if they need
     # accurate cost for a specific non-Claude model.
     pricing: dict[str, dict[str, float]] = {
+        # Current model IDs (must match utilities/llm/builtins.py OPENANT_DEFAULT).
+        "claude-opus-4-8": {"input": 15.00, "output": 75.00},
+        "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
+        "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
+        # Retired IDs kept for historical reports / back-compat.
         "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
         "claude-opus-4-6": {"input": 15.00, "output": 75.00},
         "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-        "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
     }
 
     def __init__(

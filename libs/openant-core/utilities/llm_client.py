@@ -32,10 +32,14 @@ import threading
 # fails if the two drift. Unknown models report $0 with a one-time warning
 # rather than silently estimating against Sonnet rates.
 MODEL_PRICING = {
+    # Current model IDs (must match utilities/llm/builtins.py OPENANT_DEFAULT).
+    "claude-opus-4-8": {"input": 15.00, "output": 75.00},
+    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
+    # Retired IDs kept for historical reports / back-compat.
     "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
     "claude-opus-4-6": {"input": 15.00, "output": 75.00},
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
 }
 
 _unknown_pricing_warned: set[str] = set()
