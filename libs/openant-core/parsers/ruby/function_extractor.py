@@ -748,6 +748,74 @@ class FunctionExtractor:
         # Extract functions
         self._extract_functions_from_tree(tree, source, file_path, relative_path)
 
+        # Extract file-scope top-level script code
+        self._extract_module_level_code(tree, source, relative_path)
+
+    # Top-level program children that are NOT file-scope script statements:
+    # definitions (their bodies are their own units) and comments.
+    _MODULE_LEVEL_SKIP = frozenset({
+        'method', 'singleton_method', 'class', 'module', 'comment',
+    })
+    # Import/mixin DSL calls are not "significant" executable script code on
+    # their own -- a file that is only requires/includes gets no module unit.
+    _MODULE_LEVEL_IMPORTS = frozenset({
+        'require', 'require_relative', 'load', 'include', 'extend', 'prepend',
+    })
+
+    def _extract_module_level_code(self, tree, source: bytes, relative_path: str) -> None:
+        """Emit file-scope top-level script code as a synthetic module_level unit.
+
+        Ruby scripts run statements at the file top level (`name = ARGV[0];
+        process_input(name)`) with no enclosing class/module. Function-only
+        extraction dropped that code entirely, so it was neither a call-graph
+        node (its calls unreachable) nor an entry-point seed. Mirroring the
+        Python/PHP extractors, collect the top-level non-definition statements
+        into a `__module__` unit (unit_type='module_level') carrying the ARGV/
+        $stdin code, so the call-graph builder wires its calls and
+        entry_point_detector Check-4 can seed it.
+        """
+        stmts = [
+            child for child in tree.root_node.children
+            if child.type not in self._MODULE_LEVEL_SKIP
+        ]
+        if not stmts:
+            return
+
+        # Require at least one statement that is not a bare import/mixin call,
+        # so pure require/include files produce no module unit.
+        def _is_import_call(node) -> bool:
+            if node.type != 'call':
+                return False
+            method_name, _ = self._call_receiver_and_method(node, source)
+            return method_name in self._MODULE_LEVEL_IMPORTS
+
+        if all(_is_import_call(node) for node in stmts):
+            return
+
+        code = '\n'.join(self._node_text(node, source) for node in stmts).strip()
+        if not code:
+            return
+
+        func_id = f"{relative_path}:__module__"
+        self._store_function(func_id, {
+            'name': '__module__',
+            'qualified_name': '__module__',
+            'file_path': relative_path,
+            'start_line': stmts[0].start_point[0] + 1,
+            'end_line': stmts[-1].end_point[0] + 1,
+            'code': code,
+            'class_name': None,
+            'module_name': None,
+            'parameters': [],
+            'is_singleton': False,
+            'visibility': 'public',
+            'unit_type': 'module_level',
+            'is_module_level': True,
+        })
+        self.stats['total_functions'] += 1
+        self.stats['standalone_functions'] += 1
+        self.stats['by_type']['module_level'] = self.stats['by_type'].get('module_level', 0) + 1
+
     def extract_from_scan(self, scan_result: Dict) -> Dict:
         """Extract functions from files listed in a scan result."""
         for file_info in scan_result.get('files', []):
