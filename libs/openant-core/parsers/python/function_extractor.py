@@ -400,7 +400,8 @@ class FunctionExtractor:
                 bodies.append(b)
         return bodies
 
-    def _descend_into_blocks(self, stmts: list, file_path: Path, content: str) -> None:
+    def _descend_into_blocks(self, stmts: list, file_path: Path, content: str,
+                             enclosing_class: Optional[str] = None) -> None:
         """Find def/class nodes inside block statements at ANY depth and emit them.
 
         A `def`/`class` inside an `if`/`try`/`for`/`while`/`with`/`match` block is
@@ -418,10 +419,15 @@ class FunctionExtractor:
             for body in self._block_bodies(stmt):
                 for child in body:
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        self._process_function_tree(child, file_path, content, class_name=None)
+                        # A def surfaced from a class-body block is still a method
+                        # of that class; keep its enclosing class so it is keyed
+                        # (and classified) as a method, not module-level.
+                        self._process_function_tree(child, file_path, content,
+                                                    class_name=enclosing_class)
                     elif isinstance(child, ast.ClassDef):
-                        self._process_class_tree(child, file_path, content, outer_qualifier=None)
-                self._descend_into_blocks(body, file_path, content)
+                        self._process_class_tree(child, file_path, content,
+                                                 outer_qualifier=enclosing_class)
+                self._descend_into_blocks(body, file_path, content, enclosing_class)
 
     def _process_function_tree(self, node: ast.AST, file_path: Path, content: str,
                                class_name: Optional[str] = None) -> None:
@@ -472,8 +478,10 @@ class FunctionExtractor:
             if isinstance(item, ast.ClassDef):
                 self._process_class_tree(item, file_path, content, outer_qualifier=qualified_class)
         # defs/classes wrapped in a block inside the class body (e.g. an
-        # `if TYPE_CHECKING:` block declaring conditional members).
-        self._descend_into_blocks(node.body, file_path, content)
+        # `if TYPE_CHECKING:` block declaring conditional members). Thread the
+        # class so a block-nested def stays a method of this class.
+        self._descend_into_blocks(node.body, file_path, content,
+                                  enclosing_class=qualified_class)
 
     def extract_assigned_lambdas(self, tree: ast.AST, file_path: Path, content: str) -> None:
         """Emit a function unit for each module-level `name = lambda ...`.
