@@ -60,6 +60,7 @@ Output (JSON):
 import ast
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -215,6 +216,12 @@ class FunctionExtractor:
 
         # Route handlers
         if '@app.route' in dec_str or '@router.' in dec_str or '@blueprint.' in dec_str:
+            return 'route_handler'
+        # N3 fix: FastAPI / Flask 2.0 direct-app decorators. '@app.get' does NOT
+        # contain the substring '@get', so the check below missed it entirely.
+        # The trailing \b avoids over-matching @app.getter / @app.headers while
+        # still matching both @app.get( and a bare @app.get.
+        if re.search(r'@app\.(get|post|put|delete|patch|options|head|websocket)\b', dec_str):
             return 'route_handler'
         if '@get' in dec_str or '@post' in dec_str or '@put' in dec_str or '@delete' in dec_str:
             return 'route_handler'
