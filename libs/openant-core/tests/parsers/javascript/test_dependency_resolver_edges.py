@@ -195,6 +195,81 @@ def test_local_var_builtin_constructor_not_resolved():
     )
 
 
+def _two_class_graph(h2_code):
+    return _build_call_graph(
+        {
+            "functions": {
+                "a.js:Foo.doIt": {"name": "Foo.doIt", "className": "Foo", "code": "doIt(){return 1;}"},
+                "a.js:Bar.doIt": {"name": "Bar.doIt", "className": "Bar", "code": "doIt(){return 2;}"},
+                "a.js:h2": {"name": "h2", "code": h2_code},
+            },
+            "classes": {"a.js:Foo": {}, "a.js:Bar": {}},
+        }
+    )
+
+
+def test_local_var_reassignment_over_approximates_dispatch():
+    """A local reassigned across constructor types dispatches to EVERY candidate
+    class, never dropping one.
+
+    `let y = new Foo(); y = new Bar(); y.doIt();` — y may hold Foo or Bar at the
+    call. The old extractor kept only the first (y->Foo), so the real (last-
+    assigned) target Bar.doIt was unreachable — a call-graph false negative.
+    Resolve to BOTH: over-approximating a local type is reachability-safe (a
+    false-unreachable hides exploitable code; an extra edge does not).
+    """
+    edges = _two_class_graph("function h2(){ let y = new Foo(); y = new Bar(); y.doIt(); }")["a.js:h2"]
+    assert "a.js:Bar.doIt" in edges, f"the last-assigned target Bar.doIt must be reachable; edges={edges}"
+    assert "a.js:Foo.doIt" in edges, f"an earlier candidate type must also stay reachable (no dropped edge); edges={edges}"
+
+
+def test_local_var_call_before_reassignment_keeps_target():
+    """`let y = new Foo(); y.doIt(); y = new Bar();` — y IS Foo at the call, so
+    Foo.doIt must remain reachable. Dropping it on the later reassignment (a
+    precision choice) would be a reachability false negative."""
+    edges = _two_class_graph("function h2(){ let y = new Foo(); y.doIt(); y = new Bar(); }")["a.js:h2"]
+    assert "a.js:Foo.doIt" in edges, f"Foo.doIt (y's type at the call) must remain reachable; edges={edges}"
+
+
+def test_local_new_does_not_drop_di_edge():
+    """A receiver that is BOTH locally reassigned via `new` AND DI-typed must keep
+    BOTH edges — the local-type dispatch (1b) must not REPLACE the DI edge (2).
+
+    `handle(){ this.svc = new FakeSvc(); this.svc.run(); }` with the class's
+    constructorDeps declaring `svc: RealSvc`. The receiver may hold RealSvc (the
+    injected dependency) or FakeSvc (the in-method reassignment) at the call, so
+    both `RealSvc.run` and `FakeSvc.run` are reachable. Early-returning the local
+    match dropped `RealSvc.run` (and its subtree) — a reachability false negative.
+    Union is the reachability-safe resolution.
+    """
+    cg = _build_call_graph(
+        {
+            "functions": {
+                "a.js:RealSvc.run": {"name": "RealSvc.run", "className": "RealSvc", "code": "run(){ return auditLog(); }"},
+                "a.js:FakeSvc.run": {"name": "FakeSvc.run", "className": "FakeSvc", "code": "run(){ return 2; }"},
+                "a.js:auditLog": {"name": "auditLog", "code": "function auditLog(){ return 42; }"},
+                "a.js:Consumer.handle": {
+                    "name": "Consumer.handle",
+                    "className": "Consumer",
+                    "code": "handle(){ this.svc = new FakeSvc(); this.svc.run(); }",
+                },
+            },
+            "classes": {
+                "a.js:RealSvc": {},
+                "a.js:FakeSvc": {},
+                "a.js:Consumer": {"constructorDeps": {"svc": "RealSvc"}},
+            },
+        }
+    )
+    edges = cg["a.js:Consumer.handle"]
+    assert "a.js:RealSvc.run" in edges, (
+        f"the DI edge (RealSvc.run) must not be dropped by the local-new dispatch; edges={edges}"
+    )
+    assert "a.js:FakeSvc.run" in edges, (
+        f"the local-new edge (FakeSvc.run) must also be present (over-approximate); edges={edges}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # self-edge from own name in body
 # ---------------------------------------------------------------------------
