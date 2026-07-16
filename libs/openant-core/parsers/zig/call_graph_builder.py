@@ -269,8 +269,8 @@ class CallGraphBuilder:
 
     def _build_alias_index(
         self, name_to_ids: Dict[str, List[str]]
-    ) -> Dict[str, Dict[str, Optional[str]]]:
-        """Index simple const fn-aliases per function: `const f = handler;` -> {f: handler}.
+    ) -> Dict[str, Dict[str, Set[str]]]:
+        """Index simple const fn-aliases per function: `const f = handler;` -> {f: {handler}}.
 
         Only bindings whose right-hand side is a bare identifier naming a known
         function are tracked (a genuine fn alias), so arbitrary const dataflow
@@ -278,8 +278,15 @@ class CallGraphBuilder:
         per file: two functions in the same file may bind the same alias name to
         different targets (`const doit = foo` vs `const doit = bar`), and each
         caller must resolve to its own target rather than clobbering the other.
+
+        Each alias maps to a SET of targets, not a single one: within one
+        function the same alias name may bind to different targets on different
+        control-flow paths (`const doit = foo` in one branch, `= bar` in
+        another). We over-approximate by keeping every target so a later
+        `doit()` resolves to edges for all of them rather than last-wins losing
+        one.
         """
-        alias_to_target: Dict[str, Dict[str, Optional[str]]] = defaultdict(dict)
+        alias_to_target: Dict[str, Dict[str, Set[str]]] = defaultdict(dict)
 
         for func_id, func_info in self.functions.items():
             code = func_info.get("code", "")
@@ -303,7 +310,7 @@ class CallGraphBuilder:
         node: Node,
         source: bytes,
         name_to_ids: Dict[str, List[str]],
-        aliases: Dict[str, Optional[str]],
+        aliases: Dict[str, Set[str]],
     ) -> None:
         """Collect `const <alias> = <known-fn>;` bindings from a parse tree."""
         if node.type in ("variable_declaration", "VarDecl"):
@@ -315,11 +322,13 @@ class CallGraphBuilder:
                 alias_name = self._get_node_text(ident_children[0], source)
                 target_name = self._get_node_text(ident_children[1], source)
                 # Only record when the target is a known function name. A Zig
-                # `const` binding is immutable and cannot be rebound within a
-                # function, so a plain assignment (scoped per function by the
-                # caller) is sufficient here.
+                # `const` binding is immutable, but the SAME alias name can be
+                # declared on distinct control-flow paths within one function
+                # (`const doit = foo` in one branch, `= bar` in another).
+                # Accumulate every target in a set instead of last-wins
+                # overwriting, so a later `doit()` over-approximates to both.
                 if alias_name and target_name in name_to_ids:
-                    aliases[alias_name] = target_name
+                    aliases.setdefault(alias_name, set()).add(target_name)
             # Struct field-init fn pointers: `const h = T{ .cb = knownFn };` binds
             # `h.cb` -> knownFn so a later `h.cb()` resolves. The first identifier
             # child is the bound variable; the struct type name is nested inside the
@@ -380,7 +389,11 @@ class CallGraphBuilder:
                 elif seen_eq and sub.type in ("identifier", "IDENTIFIER"):
                     target_name = self._get_node_text(sub, source)
             if field_name and target_name and target_name in name_to_ids:
-                aliases[f"{var_name}.{field_name}"] = target_name
+                # Same over-approximation as the plain-alias case: a dotted
+                # `<var>.<field>` alias can bind to different targets across
+                # control-flow paths, so accumulate targets in a set rather
+                # than last-wins overwriting.
+                aliases.setdefault(f"{var_name}.{field_name}", set()).add(target_name)
 
     def _find_calls_in_code(self, code: str, caller_file: str = "") -> Set[str]:
         """Find all function calls in a code snippet."""
@@ -501,26 +514,50 @@ class CallGraphBuilder:
         call_name: str,
         caller_file: str,
         name_to_ids: Dict[str, List[str]],
-        alias_to_target: Dict[str, Dict[str, Optional[str]]] | None = None,
+        alias_to_target: Dict[str, Dict[str, Set[str]]] | None = None,
         caller_id: Optional[str] = None,
     ) -> List[str]:
         """
-        Resolve a call name to function ID(s).
+        Resolve a call name to function ID(s), unioning over all alias targets.
+
+        A const fn-alias (`const f = handler; f()`) is expanded to its target
+        function name(s) before candidate lookup. Aliases are keyed by the
+        CALLER function (not the file) so a same-named alias in another function
+        in the same file cannot clobber this one. An alias may bind to MULTIPLE
+        targets across control-flow paths (`const doit = foo` in one branch,
+        `= bar` in another); over-approximate by resolving every target name and
+        unioning the resulting ids, so `doit()` yields caller->{foo, bar}.
+        """
+        names: List[str] = [call_name]
+        if alias_to_target is not None and caller_id is not None:
+            targets = alias_to_target.get(caller_id, {}).get(call_name)
+            if targets:
+                # Alias shadows the bare name (matching prior single-target
+                # behavior): resolve only the alias targets, deterministically
+                # ordered.
+                names = sorted(targets)
+
+        resolved: List[str] = []
+        for name in names:
+            for rid in self._resolve_name(name, caller_file, name_to_ids):
+                if rid not in resolved:
+                    resolved.append(rid)
+        return resolved
+
+    def _resolve_name(
+        self,
+        call_name: str,
+        caller_file: str,
+        name_to_ids: Dict[str, List[str]],
+    ) -> List[str]:
+        """
+        Resolve a single (already alias-expanded) name to function ID(s).
 
         Resolution order:
         1. Same file
         2. Imported files
         3. Unique name match
         """
-        # Resolve a const fn-alias (`const f = handler; f()`) to its target
-        # function name before looking up candidates. Aliases are keyed by the
-        # CALLER function (not the file) so a same-named alias in another
-        # function in the same file cannot clobber this one.
-        if alias_to_target is not None and caller_id is not None:
-            target = alias_to_target.get(caller_id, {}).get(call_name)
-            if target is not None:
-                call_name = target
-
         candidates = name_to_ids.get(call_name, [])
 
         if not candidates:
