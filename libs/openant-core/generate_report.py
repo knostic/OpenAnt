@@ -30,6 +30,7 @@ import os
 from datetime import datetime
 
 from dotenv import load_dotenv
+from core.verdict_taxonomy import FINDING_VERDICT_ORDER
 from utilities.file_io import read_json
 from utilities.llm import (
     build_phase_registry,
@@ -340,7 +341,7 @@ def generate_html_report(
         file_verdict_counts[v] = file_verdict_counts.get(v, 0) + 1
 
     # Prepare chart data
-    verdict_order = ['vulnerable', 'bypassable', 'inconclusive', 'protected', 'safe']
+    verdict_order = list(FINDING_VERDICT_ORDER)
     unit_chart_labels = json.dumps([v for v in verdict_order if v in verdict_counts])
     unit_chart_data = json.dumps([verdict_counts.get(v, 0) for v in verdict_order if v in verdict_counts])
     unit_chart_colors = json.dumps([get_verdict_color(v) for v in verdict_order if v in verdict_counts])

@@ -22,6 +22,7 @@ import os
 import sys
 import tempfile
 
+from core.verdict_taxonomy import FINDING_VERDICT_ORDER
 from utilities.file_io import read_json
 
 
@@ -662,7 +663,7 @@ def cmd_report_data(args):
             # --- Prepare findings ---
             units_by_id = {u["id"]: u for u in dataset.get("units", [])}
 
-            verdict_order = ["vulnerable", "bypassable", "inconclusive", "protected", "safe"]
+            verdict_order = list(FINDING_VERDICT_ORDER)
             verdict_colors = {
                 "vulnerable": "#dc3545",
                 "bypassable": "#fd7e14",

@@ -11,6 +11,7 @@ import shutil
 import sys
 
 from core.schemas import DynamicTestStepResult, UsageInfo
+from core.verdict_taxonomy import DYNAMIC_TESTABLE
 from core import tracking
 from utilities.file_io import read_json, write_json
 
@@ -61,7 +62,7 @@ def run_tests(
     findings = pipeline_data.get("findings", [])
     testable = [
         f for f in findings
-        if f.get("stage2_verdict") in ("confirmed", "agreed", "vulnerable")
+        if f.get("stage2_verdict") in DYNAMIC_TESTABLE
     ]
 
     print(f"[Dynamic Test] {len(testable)} testable findings "

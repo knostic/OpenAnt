@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.schemas import ReportResult
+from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
 from utilities.file_io import open_utf8, read_json, write_json
 
 # Root of openant-core
@@ -619,16 +620,15 @@ def generate_disclosure_docs(
 
     # Collect findings eligible for a disclosure document.
     #
-    # PR #69 F4: include "unverified" alongside the confirmed verdicts. An
-    # "unverified" finding is a Stage-1 potential vulnerability whose Stage-2
-    # verification could NOT COMPLETE (degenerate path or adapter error). It is
-    # NOT a rejection — fail-safe, it must be SURFACED for manual review, not
-    # silently dropped. Generating its disclosure (clearly stamped via the
-    # ``stage2_verdict`` the disclosure prompt reads) keeps it on the triage
-    # radar. "rejected" stays excluded (Stage 2 actively downgraded it).
+    # Eligibility is defined once in core.verdict_taxonomy.DISCLOSURE_ELIGIBLE
+    # (shared with report/generator.py and report/__main__.py) so the producer
+    # (this module's stage2_verdict mapping) and every disclosure filter stay in
+    # lock-step -- a verdict the producer can emit but no filter accepts is a
+    # silently-dropped finding. "unverified" (Stage-2 could not COMPLETE) stays
+    # eligible; "rejected" (Stage 2 actively downgraded) stays excluded.
     confirmed = [
         (i, finding) for i, finding in enumerate(pipeline_data["findings"], 1)
-        if finding.get("stage2_verdict") in ("confirmed", "agreed", "vulnerable", "unverified")
+        if finding.get("stage2_verdict") in DISCLOSURE_ELIGIBLE
     ]
 
     if not confirmed:

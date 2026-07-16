@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
+from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
 from .schema import validate_pipeline_output, ValidationError
 from utilities.file_io import open_utf8, read_json
 from utilities.llm import (
@@ -313,10 +314,11 @@ def generate_all(
     product_name = pipeline_data["repository"]["name"]
 
     for i, finding in enumerate(pipeline_data["findings"], 1):
-        # "unverified" (Stage-2 could not complete) is disclosure-eligible:
-        # a degenerate verify must not silently drop a Stage-1 potential vuln
-        # from triage. Kept consistent with core/reporter.generate_disclosure_docs.
-        if finding.get("stage2_verdict") not in ("confirmed", "agreed", "vulnerable", "unverified"):
+        # Disclosure eligibility is defined once in
+        # core.verdict_taxonomy.DISCLOSURE_ELIGIBLE, shared with
+        # core/reporter.generate_disclosure_docs and report/__main__, so a
+        # degenerate verify never silently drops a Stage-1 potential vuln.
+        if finding.get("stage2_verdict") not in DISCLOSURE_ELIGIBLE:
             continue
 
         print(f"Generating disclosure for {finding['short_name']}...")
