@@ -80,6 +80,7 @@ from ..adapter import (
     ToolUseBlock,
 )
 from ._ratelimit import report_rate_limit, wait_for_rate_limit
+from ...model_config import GOOGLE_PRICING
 from .._redact import redact_secrets, redacted_cause_from
 
 
@@ -153,15 +154,7 @@ class GoogleAdapter:
     # 200K context vs over); we ship the more common <200K rates.
     # Users with long-context scans may need to override locally.
     # Models absent here report $0 + warning per issue #65 §9.
-    pricing: dict[str, dict[str, float]] = {
-        "gemini-2.5-pro": {"input": 1.25, "output": 10.00},
-        "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
-        "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
-        "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
-        "gemini-2.0-flash-lite": {"input": 0.075, "output": 0.30},
-        "gemini-1.5-pro": {"input": 1.25, "output": 5.00},
-        "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
-    }
+    pricing: dict[str, dict[str, float]] = {m: dict(p) for m, p in GOOGLE_PRICING.items()}
 
     def __init__(
         self,

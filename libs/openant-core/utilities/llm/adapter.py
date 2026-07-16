@@ -333,8 +333,9 @@ class LLMAdapter(Protocol):
         """Send one completion request, return the parsed result.
 
         Args:
-            model: Provider-specific model identifier (e.g.
-                ``"claude-opus-4-6"``, ``"gemini-2.5-flash"``).
+            model: Provider-specific model identifier (a Claude,
+                GPT, or Gemini model ID — see ``utilities.model_config``
+                for the canonical constants).
             system: Optional system prompt. Adapters pass it through
                 their provider's native system-prompt mechanism.
             messages: Conversation history. The last message may be
