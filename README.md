@@ -57,7 +57,7 @@ This compiles the Go source and outputs the binary to `apps/openant-cli/bin/open
 Symlink it onto your PATH so you can run `openant` from anywhere:
 
 ```bash
-ln -sf "$(pwd)/apps/openant-cli/bin/openant" /usr/local/bin/openant
+ln -sf "$(pwd)/bin/openant" /usr/local/bin/openant
 ```
 
 _Note: run this from the repo root so `$(pwd)` resolves to the correct absolute path._
