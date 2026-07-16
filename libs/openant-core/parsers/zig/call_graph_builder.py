@@ -160,11 +160,15 @@ class CallGraphBuilder:
             code = func_info.get("code", "")
             file_path = func_info.get("file_path", "")
 
+            # Per-body receiver-variable -> static-type model, so `var a = A{}; a.foo()`
+            # dispatches to A's foo, not to every same-named foo.
+            var_types = self._collect_var_types(code)
+
             calls = self._find_calls_in_code(code, file_path)
 
             for call_name in calls:
                 resolved_ids = self._resolve_call(
-                    call_name, file_path, name_to_ids, alias_to_target, func_id
+                    call_name, file_path, name_to_ids, alias_to_target, func_id, var_types
                 )
                 for resolved_id in resolved_ids:
                     if resolved_id != func_id:  # No self-calls
@@ -443,16 +447,15 @@ class CallGraphBuilder:
             if callee is not None and callee.type in ("identifier", "IDENTIFIER"):
                 calls.add(self._get_node_text(callee, source))
             elif callee is not None and callee.type in ("field_expression", "field_access"):
-                # The method name is the trailing identifier child. Prefer that
-                # over text-splitting, which is brittle when the receiver itself
-                # contains punctuation (e.g. `C{}.m`).
-                method_name = None
-                for sub in callee.children:
-                    if sub.type in ("identifier", "IDENTIFIER"):
-                        method_name = self._get_node_text(sub, source)
+                # Carry the RECEIVER by keeping only the full dotted form
+                # (`recv.method`); the resolver splits it and dispatches on the
+                # receiver's static TYPE. Adding the bare method name here would
+                # independently over-connect to EVERY same-named method (the
+                # namespace-leak FP), defeating type-based dispatch. An un-typed
+                # receiver still resolves by unique/same-file bare-name fallback
+                # inside _resolve_call, so recall is preserved.
                 text = self._get_node_text(callee, source)
-                calls.add(method_name if method_name else text.split(".")[-1])
-                calls.add(text)  # also the full dotted form
+                calls.add(text)  # full dotted `receiver.method`
         elif node.type == "builtin_function":
             # @call(.modifier, realFn, argsTuple): the wrapped function is the real call target;
             # other @builtins are filtered out downstream.
@@ -509,6 +512,97 @@ class CallGraphBuilder:
         """Get the source text for a node."""
         return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
 
+    def _collect_var_types(self, code: str) -> Dict[str, str]:
+        """Map local variable name -> its declared struct type within one body.
+
+        Captures the two sound, static forms: `var a = A{};` / `const a = A{}`
+        (struct-initializer) and `var a: A = ...;` (type annotation). A variable
+        redeclared with a different type is dropped (ambiguous) so a typed member
+        dispatch never binds to a wrong type.
+        """
+        var_types: Dict[str, str] = {}
+        ambiguous: Set[str] = set()
+        if not code:
+            return var_types
+        try:
+            tree = self.parser.parse(code.encode("utf-8"))
+        except Exception:
+            return var_types
+        src = code.encode("utf-8")
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.type in ("variable_declaration", "VarDecl"):
+                name, typ = self._var_decl_name_type(node, src)
+                if name and typ:
+                    if name in ambiguous:
+                        pass
+                    elif name in var_types and var_types[name] != typ:
+                        ambiguous.add(name)
+                        var_types.pop(name, None)
+                    else:
+                        var_types[name] = typ
+            stack.extend(node.children)
+        return var_types
+
+    def _var_decl_name_type(self, node: Node, src: bytes):
+        """Return (var_name, type_name) for a variable_declaration, or (name, None).
+
+        Recognizes `<name> = T{...}` (struct-initializer type) and `<name>: T = ...`
+        (type annotation). The bound variable is the first identifier child.
+        """
+        ident_children = [
+            c for c in node.children if c.type in ("identifier", "IDENTIFIER")
+        ]
+        if not ident_children:
+            return None, None
+        var_name = self._get_node_text(ident_children[0], src)
+        # struct-initializer form: `var a = A{};`
+        struct_init = next(
+            (c for c in node.children if c.type in ("struct_initializer", "StructInit")),
+            None,
+        )
+        if struct_init is not None:
+            for g in struct_init.children:
+                if g.type in ("identifier", "IDENTIFIER"):
+                    return var_name, self._get_node_text(g, src)
+        # type-annotation form: `var a: A = ...;`
+        seen_colon = False
+        for c in node.children:
+            if c.type == ":":
+                seen_colon = True
+                continue
+            if seen_colon and c.type == "=":
+                break
+            if seen_colon and c.type in ("identifier", "IDENTIFIER"):
+                return var_name, self._get_node_text(c, src)
+        return var_name, None
+
+    def _resolve_typed_member(
+        self,
+        recv_type: str,
+        method: str,
+        caller_file: str,
+        name_to_ids: Dict[str, List[str]],
+    ) -> List[str]:
+        """Resolve `method` to the method declared on `recv_type` only.
+
+        Filters the same-named candidates to those whose declaring struct is
+        recv_type; prefers same-file matches. Returns [] when the type declares
+        no such method (never over-connects to an unrelated type's method).
+        """
+        matches: List[str] = []
+        for cand in name_to_ids.get(method, []):
+            info = self.functions.get(cand, {})
+            if (
+                info.get("class_name") == recv_type
+                or info.get("qualified_name") == f"{recv_type}.{method}"
+            ):
+                if cand not in matches:
+                    matches.append(cand)
+        same_file = [c for c in matches if c.startswith(f"{caller_file}:")]
+        return same_file if same_file else matches
+
     def _resolve_call(
         self,
         call_name: str,
@@ -516,6 +610,7 @@ class CallGraphBuilder:
         name_to_ids: Dict[str, List[str]],
         alias_to_target: Dict[str, Dict[str, Set[str]]] | None = None,
         caller_id: Optional[str] = None,
+        var_types: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         """
         Resolve a call name to function ID(s), unioning over all alias targets.
@@ -539,7 +634,7 @@ class CallGraphBuilder:
 
         resolved: List[str] = []
         for name in names:
-            for rid in self._resolve_name(name, caller_file, name_to_ids):
+            for rid in self._resolve_name(name, caller_file, name_to_ids, var_types):
                 if rid not in resolved:
                     resolved.append(rid)
         return resolved
@@ -549,6 +644,7 @@ class CallGraphBuilder:
         call_name: str,
         caller_file: str,
         name_to_ids: Dict[str, List[str]],
+        var_types: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         """
         Resolve a single (already alias-expanded) name to function ID(s).
@@ -558,6 +654,24 @@ class CallGraphBuilder:
         2. Imported files
         3. Unique name match
         """
+        # Member call `receiver.method`: dispatch on the receiver's static TYPE.
+        # (Alias expansion already happened in _resolve_call; a directly-qualified
+        # `Type.method` whose full name is itself indexed -- e.g. a struct method's
+        # qualified_name -- is handled by the normal lookup below, so only names
+        # NOT in the index are treated as member calls.)
+        if "." in call_name and call_name not in name_to_ids:
+            receiver, _, method = call_name.rpartition(".")
+            recv_type = (var_types or {}).get(receiver)
+            if recv_type is not None:
+                # Known receiver type: resolve STRICTLY on that type -- return only
+                # its own method(s), never a same-named method on an unrelated
+                # type. Nothing if the type does not declare the method.
+                return self._resolve_typed_member(recv_type, method, caller_file, name_to_ids)
+            # Unknown receiver type: fall back to bare-name resolution of the
+            # method (unique/same-file/import), preserving recall for un-typed
+            # receivers (e.g. `obj.method()` with a single global `method`).
+            call_name = method
+
         candidates = name_to_ids.get(call_name, [])
 
         if not candidates:

@@ -181,6 +181,12 @@ type CallInfo struct {
 	Package  string // Package alias for package.Func() calls
 	IsMethod bool   // True if this is a method call
 	IsSelf   bool   // True if receiver is "self" or matches current receiver
+	// ReceiverTypes is the STATIC type(s) the receiver variable holds, inferred
+	// from the enclosing function's signature and body (var-decl / composite
+	// literal / receiver / params). Method dispatch keys on the TYPE, not the
+	// receiver's variable name. A receiver whose type is unknown yields an empty
+	// slice (no edge); a reassigned receiver yields several types (UNION).
+	ReceiverTypes []string
 }
 
 func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
@@ -206,6 +212,12 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 	// reassignment (or a non-ident RHS) marks the name ambiguous so we emit
 	// no false edge — precision over recall.
 	aliases := c.collectFuncValueAliases(file)
+
+	// Per-body receiver-variable -> static-type model. Method calls are resolved
+	// against the receiver's TYPE (walking below), never its variable name, so a
+	// local `w := Widget{}` / a `var w Widget` / a parameter / the method's own
+	// receiver all dispatch to the right type's method.
+	varTypes := c.collectVarTypes(file)
 
 	// Walk the AST looking for call expressions
 	ast.Inspect(file, func(n ast.Node) bool {
@@ -239,6 +251,11 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 				callInfo.Name = target
 			}
 		}
+		// Attach the receiver's static type(s) for method-call dispatch. Package
+		// calls (Package != "") and non-method calls keep no receiver type.
+		if callInfo.IsMethod && callInfo.Package == "" && callInfo.Receiver != "" {
+			callInfo.ReceiverTypes = varTypes[callInfo.Receiver]
+		}
 		if callInfo.Name != "" && !c.builtins[callInfo.Name] && !c.builtins[callInfo.Package] {
 			calls = append(calls, callInfo)
 		}
@@ -246,6 +263,115 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 	})
 
 	return calls
+}
+
+// exprTypeName returns the simple type name of a type expression: the identifier
+// for `T`, and the pointee's name for `*T`. Anything more complex (qualified,
+// generic, slice, map, ...) is not a receiver type we can key on, so "".
+func exprTypeName(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return exprTypeName(t.X)
+	}
+	return ""
+}
+
+// compositeTypeName returns the type constructed by an RHS expression when it is
+// a composite literal `T{...}` or `&T{...}`, else "". This is the sound, local,
+// unambiguous ctor case; a plain call `NewT()` is deliberately NOT inferred (its
+// return type is not available here), so we never emit a wrong-type edge.
+func compositeTypeName(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.CompositeLit:
+		return exprTypeName(e.Type)
+	case *ast.UnaryExpr:
+		if e.Op == token.AND {
+			return compositeTypeName(e.X)
+		}
+	}
+	return ""
+}
+
+// collectVarTypes builds a receiver-variable -> static-type-set model for a
+// parsed function body. Sources (all sound, static): the method's own receiver,
+// the function's parameters, `var x T` declarations, and `x := T{}` / `x := &T{}`
+// composite-literal assignments. A variable bound to several distinct types
+// keeps ALL of them (UNION) so a reassigned receiver never hides a reachable
+// method. Unknown / non-nameable types contribute nothing (no edge).
+func (c *CallGraphBuilder) collectVarTypes(file *ast.File) map[string][]string {
+	varTypes := make(map[string][]string)
+	add := func(name, typ string) {
+		if name == "" || name == "_" || typ == "" {
+			return
+		}
+		for _, existing := range varTypes[name] {
+			if existing == typ {
+				return
+			}
+		}
+		varTypes[name] = append(varTypes[name], typ)
+	}
+
+	// Method receiver + parameters, from each function signature.
+	for _, decl := range file.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fd.Recv != nil {
+			for _, field := range fd.Recv.List {
+				typ := exprTypeName(field.Type)
+				for _, n := range field.Names {
+					add(n.Name, typ)
+				}
+			}
+		}
+		if fd.Type != nil && fd.Type.Params != nil {
+			for _, field := range fd.Type.Params.List {
+				typ := exprTypeName(field.Type)
+				for _, n := range field.Names {
+					add(n.Name, typ)
+				}
+			}
+		}
+	}
+
+	// Local `var x T` declarations and `x := T{}` / `x := &T{}` bindings.
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch stmt := n.(type) {
+		case *ast.AssignStmt:
+			if len(stmt.Lhs) == len(stmt.Rhs) {
+				for i, lhs := range stmt.Lhs {
+					if lid, ok := lhs.(*ast.Ident); ok {
+						add(lid.Name, compositeTypeName(stmt.Rhs[i]))
+					}
+				}
+			}
+		case *ast.DeclStmt:
+			gd, ok := stmt.Decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.VAR {
+				return true
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				declType := exprTypeName(vs.Type)
+				for i, name := range vs.Names {
+					typ := declType
+					if typ == "" && i < len(vs.Values) {
+						typ = compositeTypeName(vs.Values[i])
+					}
+					add(name.Name, typ)
+				}
+			}
+		}
+		return true
+	})
+	return varTypes
 }
 
 // collectFuncValueAliases scans a parsed function body for single, unconditional
@@ -356,29 +482,30 @@ func (c *CallGraphBuilder) resolveCalls(callerID string, callerInfo FunctionInfo
 	var resolved []string
 	seen := make(map[string]bool)
 
-	for _, call := range calls {
-		var targetID string
-
-		// Try different resolution strategies
-		if callerInfo.ClassName != "" && (call.IsSelf || call.Receiver == callerInfo.ClassName) {
-			// Self/receiver call - look in same type's methods. Guarded on ClassName != "" so a
-			// plain function (ClassName=="") making a simple call (Receiver=="") is NOT misrouted
-			// here via ""=="" and lost; it falls through to resolveSimpleCall below.
-			targetID = c.resolveMethodCall(call.Name, callerInfo.ClassName, callerInfo.FilePath)
-		} else if call.IsMethod && call.Receiver != "" {
-			// Method call on some object
-			targetID = c.resolveMethodCall(call.Name, call.Receiver, callerInfo.FilePath)
-		} else if call.Package != "" {
-			// Package-qualified call
-			targetID = c.resolvePackageCall(call.Name, call.Package, callerInfo.FilePath)
-		} else {
-			// Simple function call
-			targetID = c.resolveSimpleCall(call.Name, callerInfo.FilePath, callerInfo.Package)
-		}
-
+	appendTarget := func(targetID string) {
 		if targetID != "" && targetID != callerID && !seen[targetID] {
 			resolved = append(resolved, targetID)
 			seen[targetID] = true
+		}
+	}
+
+	for _, call := range calls {
+		switch {
+		case call.IsMethod && call.Package == "":
+			// Method call: dispatch on the receiver's static TYPE(S), never its
+			// variable name. An unknown/ambiguous receiver type resolves to
+			// nothing (no edge) rather than to an unrelated same-named method;
+			// several candidate types (a reassigned receiver) UNION their
+			// methods so no reachable method is hidden.
+			for _, rt := range call.ReceiverTypes {
+				appendTarget(c.resolveMethodCall(call.Name, rt, callerInfo.FilePath))
+			}
+		case call.Package != "":
+			// Package-qualified call
+			appendTarget(c.resolvePackageCall(call.Name, call.Package, callerInfo.FilePath))
+		default:
+			// Simple function call
+			appendTarget(c.resolveSimpleCall(call.Name, callerInfo.FilePath, callerInfo.Package))
 		}
 	}
 

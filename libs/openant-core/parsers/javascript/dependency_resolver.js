@@ -292,14 +292,6 @@ class DependencyResolver {
       return [];
     }
 
-    // 1. Exact class name match (existing behavior)
-    for (const funcId of candidates) {
-      const funcData = this.functions[funcId];
-      if (funcData && funcData.className === objectName) {
-        return [funcId];
-      }
-    }
-
     // Accumulate candidate edges across the local-var (1b) and DI (2) resolution
     // steps and return their UNION — neither step may REPLACE the other. A
     // receiver can be both locally reassigned (`this.svc = new FakeSvc()`) and
@@ -378,6 +370,23 @@ class DependencyResolver {
             });
             if (prefixMatches.length === 1) addMatch(prefixMatches[0]);
           }
+        }
+      }
+    }
+
+    // 3. Static-style receiver: objectName is itself a class name (`Klass.foo()`).
+    //    This is a FALLBACK, not an early-return: it runs ONLY when the receiver
+    //    had no local-var (1b) or DI (2) type binding. Otherwise a local var that
+    //    merely shadows a class name (`const B = new A(); B.foo()`) would wrongly
+    //    dispatch on the collided class name (B.foo) and HIDE its real type's
+    //    method (A.foo) — the exact reachability false-negative the receiver-type
+    //    contract forbids. With no type binding, the class-name reading is the
+    //    only sound interpretation, so it applies here.
+    if (matches.length === 0) {
+      for (const funcId of candidates) {
+        const funcData = this.functions[funcId];
+        if (funcData && funcData.className === objectName) {
+          addMatch(funcId);
         }
       }
     }
