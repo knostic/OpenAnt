@@ -23,24 +23,18 @@ import importlib
 import sys
 import threading
 
+from .model_config import ANTHROPIC_PRICING
+
 
 # Pricing per million tokens. LEGACY fallback: issue #65 moved pricing
 # onto each adapter (``AnthropicAdapter.pricing`` is the source of truth),
 # so this global only backstops call sites that don't yet pass an
 # adapter-provided ``pricing`` (record_call's fallback, report/generator).
 # It MUST mirror ``AnthropicAdapter.pricing`` — ``tests/test_pricing_drift_guard.py``
-# fails if the two drift. Unknown models report $0 with a one-time warning
-# rather than silently estimating against Sonnet rates.
-MODEL_PRICING = {
-    # Current model IDs (must match utilities/llm/builtins.py OPENANT_DEFAULT).
-    "claude-opus-4-8": {"input": 15.00, "output": 75.00},
-    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
-    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
-    # Retired IDs kept for historical reports / back-compat.
-    "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
-    "claude-opus-4-6": {"input": 15.00, "output": 75.00},
-    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-}
+# fails if the two drift. Both are independent, value-equal copies of the
+# same canonical table in ``utilities/model_config.py`` — they can neither
+# drift nor bleed mutations into each other. Unknown models: $0 + one warn.
+MODEL_PRICING = {m: dict(p) for m, p in ANTHROPIC_PRICING.items()}
 
 _unknown_pricing_warned: set[str] = set()
 _unknown_pricing_lock = threading.Lock()

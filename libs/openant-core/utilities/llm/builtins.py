@@ -20,6 +20,7 @@ registry.
 
 from __future__ import annotations
 
+from ..model_config import CLAUDE_OPUS, CLAUDE_SONNET
 from .config import LLMConfig, PhaseRef
 
 
@@ -37,24 +38,24 @@ OPENANT_DEFAULT = LLMConfig(
     name="openant-default",
     phases={
         # Stage 1 detection. Opus by historical default.
-        "analyze": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-8"),
+        "analyze": PhaseRef(provider=_ANTHROPIC_PROVIDER, model=CLAUDE_OPUS),
         # Context enhancement (agentic + single-shot). Sonnet for cost.
-        "enhance": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-6"),
+        "enhance": PhaseRef(provider=_ANTHROPIC_PROVIDER, model=CLAUDE_SONNET),
         # Stage 2 attacker simulation. Opus, uses tool calling.
-        "verify": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-8"),
+        "verify": PhaseRef(provider=_ANTHROPIC_PROVIDER, model=CLAUDE_OPUS),
         # Disclosure + summary + remediation HTML generation. Opus —
-        # matches master's report/generator.py (MODEL="claude-opus-4-8").
+        # matches master's report/generator.py report-generator default.
         # The refactor briefly moved this to Sonnet; restored so the
         # report output (incl. the HTML-remediation sub-call) stays on
         # Opus on a fresh, config-less install.
-        "report": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-8"),
+        "report": PhaseRef(provider=_ANTHROPIC_PROVIDER, model=CLAUDE_OPUS),
         # Docker exploit-test generation. Sonnet.
-        "dynamic_test": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-6"),
+        "dynamic_test": PhaseRef(provider=_ANTHROPIC_PROVIDER, model=CLAUDE_SONNET),
         # LLM-driven reachability review (opt-in stage). Opus.
-        "llm_reach": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-opus-4-8"),
+        "llm_reach": PhaseRef(provider=_ANTHROPIC_PROVIDER, model=CLAUDE_OPUS),
         # Application-context classification (web_app / cli_tool / etc).
         # Single-shot, runs once per scan during ``openant scan``. Sonnet.
-        "app_context": PhaseRef(provider=_ANTHROPIC_PROVIDER, model="claude-sonnet-4-6"),
+        "app_context": PhaseRef(provider=_ANTHROPIC_PROVIDER, model=CLAUDE_SONNET),
     },
 )
 
