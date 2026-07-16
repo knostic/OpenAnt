@@ -96,7 +96,7 @@ def run_verification(
     # Filter to vulnerable/bypassable only
     vulnerable_results = [
         r for r in all_results
-        if r.get("finding", r.get("verdict", "").lower()) in ("vulnerable", "bypassable")
+        if str(r.get("finding") or r.get("verdict", "")).lower() in ("vulnerable", "bypassable")
     ]
 
     findings_input = len(vulnerable_results)

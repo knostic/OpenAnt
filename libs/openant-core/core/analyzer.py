@@ -139,8 +139,15 @@ def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_contex
         result["unit_id"] = uid
 
         # Ensure finding field is always set (may be None after JSON correction)
-        if not result.get("finding") and result.get("verdict"):
-            result["finding"] = result["verdict"].lower()
+        # and normalize its casing at ingestion. A model may emit a capitalized
+        # finding (e.g. "Vulnerable"); the downstream verifier/reporter gates
+        # compare against lowercase literals, so an un-normalized value would be
+        # silently dropped (a security false-negative). Recover-only: lowercase
+        # an existing verdict/finding string, never manufacture one.
+        if result.get("finding"):
+            result["finding"] = str(result["finding"]).lower()
+        elif result.get("verdict"):
+            result["finding"] = str(result["verdict"]).lower()
 
         # Extract code for verify step
         route_key = result.get("route_key", uid)
