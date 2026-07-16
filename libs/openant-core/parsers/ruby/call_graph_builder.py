@@ -230,6 +230,12 @@ class CallGraphBuilder:
             if assign_counts.get(name, 0) == 1
         }
 
+        # Receiver static types: `a = A.new` binds local `a` to type A, so a later
+        # `a.foo` dispatches to A#foo. Ambiguous vars (rebound to a different type)
+        # are dropped so an unknown/ambiguous receiver never binds to a same-named
+        # method on an unrelated type.
+        local_types = self._collect_receiver_types(tree.root_node, code_bytes)
+
         # Second pass: resolve calls and bare (parenless) identifier calls.
         stack = [tree.root_node]
         while stack:
@@ -237,7 +243,7 @@ class CallGraphBuilder:
             if node.type == 'call':
                 resolved = self._resolve_call_node(node, code_bytes, caller_file,
                                                    caller_class, caller_module, caller_method,
-                                                   method_object_bindings)
+                                                   method_object_bindings, local_types)
                 if resolved:
                     calls.add(resolved)
             elif node.type == 'identifier':
@@ -259,6 +265,69 @@ class CallGraphBuilder:
 
     def _node_str(self, node, source: bytes) -> str:
         return source[node.start_byte:node.end_byte].decode('utf-8', errors='replace')
+
+    def _collect_receiver_types(self, root, source: bytes) -> Dict[str, str]:
+        """Map local variable name -> class it is constructed from (`a = A.new`).
+
+        Only the unambiguous ctor case is recorded: the RHS is a `Const.new`
+        call. A variable rebound to a different type is dropped (treated as
+        ambiguous) so a typed-receiver dispatch never picks a wrong type. Mirrors
+        the Python gold sibling's `_collect_local_types` contract.
+        """
+        types: Dict[str, str] = {}
+        ambiguous: Set[str] = set()
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type == 'assignment' and node.children:
+                lhs = node.children[0]
+                rhs = node.children[-1]
+                if lhs is not None and lhs.type == 'identifier':
+                    name = self._node_str(lhs, source)
+                    cls = self._ctor_class_of(rhs, source)
+                    if cls is not None:
+                        if name in ambiguous:
+                            pass
+                        elif name in types and types[name] != cls:
+                            ambiguous.add(name)
+                            types.pop(name, None)
+                        else:
+                            types[name] = cls
+            stack.extend(reversed(node.children))
+        return types
+
+    def _ctor_class_of(self, rhs, source: bytes) -> Optional[str]:
+        """Return the class name if `rhs` is a `Const.new(...)` call, else None."""
+        if rhs is None or rhs.type != 'call':
+            return None
+        recv = rhs.child_by_field_name('receiver')
+        meth = rhs.child_by_field_name('method')
+        if recv is None or meth is None:
+            return None
+        if self._node_str(meth, source) != 'new':
+            return None
+        cls = self._node_str(recv, source)
+        return cls if cls[0:1].isupper() else None
+
+    def _resolve_typed_receiver(self, class_name: str, method_name: str,
+                                caller_file: str) -> Optional[str]:
+        """Resolve `method_name` on the receiver's known TYPE (class_name).
+
+        Same-file class first, then a UNIQUE cross-file class of that name that
+        declares the method. Ambiguous (multiple) cross-file matches resolve to
+        nothing rather than binding to an unrelated same-named method.
+        """
+        hit = self._resolve_self_call(method_name, caller_file, class_name)
+        if hit:
+            return hit
+        matches: List[str] = []
+        for key, func_ids in self.methods_by_class.items():
+            if not key.endswith(f":{class_name}"):
+                continue
+            for func_id in func_ids:
+                if self.functions.get(func_id, {}).get('name') == method_name:
+                    matches.append(func_id)
+        return matches[0] if len(matches) == 1 else None
 
     @staticmethod
     def _is_top_level_statement(node) -> bool:
@@ -330,7 +399,8 @@ class CallGraphBuilder:
                            caller_class: Optional[str],
                            caller_module: Optional[str] = None,
                            caller_method: Optional[str] = None,
-                           method_object_bindings: Optional[Dict[str, str]] = None
+                           method_object_bindings: Optional[Dict[str, str]] = None,
+                           local_types: Optional[Dict[str, str]] = None
                            ) -> Optional[str]:
         """Resolve a tree-sitter call node to a function ID."""
         # `super(args)` is a call node whose head is a `super` node, not an
@@ -339,41 +409,26 @@ class CallGraphBuilder:
             return self._resolve_super_call(caller_file, caller_class, caller_method)
 
         method_object_bindings = method_object_bindings or {}
+        local_types = local_types or {}
 
-        # Method-object call: `m = method(:helper)` then `m.call` resolves to the
-        # bound target [BUG 31]. The positional heuristic below mis-parses a
-        # lowercase-variable receiver (it captures the var as the method name),
-        # so detect this precisely via tree-sitter's named receiver/method fields.
+        # Extract receiver and method via tree-sitter's NAMED fields, not a
+        # positional child scan. A `obj.foo` call lists the receiver identifier
+        # BEFORE the method identifier, so the old first-identifier heuristic
+        # captured the lowercase receiver var as the method name and dropped the
+        # real edge (or phantom-bound it). The receiver field is None for a bare
+        # `foo(args)` call.
         recv_field = node.child_by_field_name('receiver')
         meth_field = node.child_by_field_name('method')
-        if recv_field is not None and meth_field is not None:
-            recv_text = source[recv_field.start_byte:recv_field.end_byte].decode(
-                'utf-8', errors='replace')
-            meth_text = source[meth_field.start_byte:meth_field.end_byte].decode(
-                'utf-8', errors='replace')
-            if meth_text == 'call' and recv_text in method_object_bindings:
-                target_name = method_object_bindings[recv_text]
-                return self._resolve_simple_call(target_name, caller_file, caller_class)
+        args_node = node.child_by_field_name('arguments')
 
-        # Extract method name
-        method_name = None
-        receiver = None
-        args_node = None
+        receiver = self._node_str(recv_field, source) if recv_field is not None else None
+        method_name = self._node_str(meth_field, source) if meth_field is not None else None
 
-        for child in node.children:
-            if child.type == 'identifier' and method_name is None:
-                method_name = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
-            elif child.type == '.':
-                continue
-            elif child.type in ('argument_list', 'block', 'do_block'):
-                if child.type == 'argument_list' and args_node is None:
-                    args_node = child
-                continue
-            elif method_name is None and child.type not in ('identifier',):
-                # This might be the receiver
-                receiver_text = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
-                # The next identifier after '.' will be the method name
-                receiver = receiver_text
+        # Method-object call: `m = method(:helper)` then `m.call` resolves to the
+        # bound target [BUG 31].
+        if method_name == 'call' and receiver in method_object_bindings:
+            target_name = method_object_bindings[receiver]
+            return self._resolve_simple_call(target_name, caller_file, caller_class)
 
         if not method_name:
             return None
@@ -398,6 +453,17 @@ class CallGraphBuilder:
             if receiver[0:1].isupper():
                 return self._resolve_class_call(receiver, target, caller_file)
             return None
+
+        # Typed local receiver: `a = A.new; a.foo` dispatches to A#foo. Resolve on
+        # the receiver's known TYPE (walking same-class then a unique cross-file
+        # class of that name); an unknown/ambiguous receiver type resolves to
+        # nothing rather than binding to a same-named method on an unrelated type.
+        # Runs before the builtin filter so a typed call to a builtin-named method
+        # the type actually defines is not dropped.
+        if receiver is not None and receiver in local_types:
+            typed = self._resolve_typed_receiver(local_types[receiver], method_name, caller_file)
+            if typed:
+                return typed
 
         # A user method may share a name with a Ruby builtin (e.g. render, log,
         # open). Don't let the builtin filter drop a call that resolves to a
