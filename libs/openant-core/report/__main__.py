@@ -12,6 +12,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
 from .generator import generate_summary_report, generate_disclosure, generate_all
 from .schema import validate_pipeline_output, ValidationError
 from utilities.file_io import open_utf8, read_json
@@ -82,9 +83,10 @@ def cmd_disclosures(args):
     count = 0
 
     for i, finding in enumerate(pipeline_data["findings"], 1):
-        # "unverified" (Stage-2 could not complete) is disclosure-eligible —
-        # consistent with core/reporter and report/generator.
-        if finding.get("stage2_verdict") not in ("confirmed", "agreed", "vulnerable", "unverified"):
+        # Disclosure eligibility is defined once in
+        # core.verdict_taxonomy.DISCLOSURE_ELIGIBLE -- consistent with
+        # core/reporter and report/generator.
+        if finding.get("stage2_verdict") not in DISCLOSURE_ELIGIBLE:
             continue
 
         print(f"Generating disclosure for {finding['short_name']}...")
