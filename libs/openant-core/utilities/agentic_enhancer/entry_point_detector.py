@@ -70,6 +70,17 @@ ENTRY_POINT_DECORATORS = [
     # trailing \b keeps it from over-matching @app.getter / @app.headers.
     r'@app\.(get|post|put|delete|patch|options|head|websocket)\b',
     r'@blueprint\.',
+    # F4 additive: custom APIRouter / router instances — `@api.get`, `@v1.post`,
+    # `@router.api_route`, any method on an `api`/`v1`/`router` receiver. ADDED
+    # alongside the `@router\.(get|...)` pattern above (which stays); this widens
+    # to custom-named routers the fixed verb list misses. Over-seeding is safe.
+    r'@(api|v1|router)\.\w',
+    # F4 additive: aiohttp RouteTableDef — `@routes.get`/`@routes.post`/`@routes.view`/...
+    r'@routes\.(get|post|put|delete|patch|options|head|view|route|static)\b',
+    # F4 additive: Starlette websocket route decorator `@app.websocket_route`
+    # (the `@app\.(...|websocket)\b` pattern below misses it — the `_route` suffix
+    # defeats the word boundary after `websocket`).
+    r'@app\.websocket_route',
     r'@(get|post|put|delete|patch)\b',
     r'@api_view',
     r'@action\b',

@@ -225,9 +225,37 @@ class FunctionExtractor:
             return 'route_handler'
         if '@get' in dec_str or '@post' in dec_str or '@put' in dec_str or '@delete' in dec_str:
             return 'route_handler'
+        # F4 additive: custom APIRouter / router instances. `@api.get`, `@v1.post`,
+        # `@router.api_route`, etc. — the common `api = APIRouter()` / `v1 = APIRouter()`
+        # idiom whose receiver is NOT the literal `app`/`router`/`blueprint` name the
+        # bare-substring checks above look for. Any method on an `@api.`/`@v1.`/`@router.`
+        # receiver is a route. This is ADDED alongside (never replaces) those checks;
+        # over-approximating a route is reachability-safe.
+        if re.search(r'@(api|v1|router)\.\w', dec_str):
+            return 'route_handler'
+        # F4 additive: aiohttp RouteTableDef — `routes = web.RouteTableDef()` then
+        # `@routes.get(...)` / `@routes.post(...)` / `@routes.view(...)` / `@routes.route(...)`.
+        if re.search(r'@routes\.(get|post|put|delete|patch|options|head|view|route|static)\b', dec_str):
+            return 'route_handler'
+        # F4 additive: Starlette websocket route decorator `@app.websocket_route(...)`.
+        # (`@app.route` is already caught above; the trailing `_route` on
+        # `websocket_route` defeats the `@app.(get|...|websocket)\b` boundary check.)
+        if '@app.websocket_route' in dec_str:
+            return 'route_handler'
 
         # Django views
         if self._path_has_segment(file_path, 'views') and class_name is None:
+            return 'view_function'
+        # F4 additive: Django class-based view (CBV) HTTP dispatch method. A CBV
+        # handler is a method NAMED for an HTTP verb (get/post/put/...) living in a
+        # `views` module, so `class_name is not None` and the class_name-is-None
+        # branch above skips it entirely. This ADDS the CBV dispatch method as a
+        # view_function entry WITHOUT touching that pristine branch; helper methods
+        # (get_queryset, get_context_data, ...) are excluded by the exact-verb match.
+        if (class_name is not None
+                and func_name.lower() in {'get', 'post', 'put', 'patch', 'delete',
+                                          'head', 'options', 'trace'}
+                and self._path_has_segment(file_path, 'views')):
             return 'view_function'
 
         # Class methods
