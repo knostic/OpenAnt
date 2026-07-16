@@ -155,6 +155,12 @@ class JSONCorrector:
         extracted = extract_json_with_llm(self.binding, raw_response)
 
         if extracted:
+            # Normalize the extracted finding casing so downstream lowercase
+            # gates (verifier/reporter) don't silently drop a capitalized
+            # "Vulnerable". Recover-only: lowercase, never invent a verdict.
+            if "finding" in extracted and isinstance(extracted["finding"], str):
+                extracted["finding"] = extracted["finding"].lower()
+
             # Normalize finding -> verdict
             if "verdict" not in extracted and "finding" in extracted:
                 finding = extracted["finding"]

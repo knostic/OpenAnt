@@ -253,7 +253,7 @@ def build_pipeline_output(
         # dict = assumed confirmed).
         confirmed = [
             r for r in all_results
-            if r.get("finding", r.get("verdict", "").lower()) in ("vulnerable", "bypassable")
+            if str(r.get("finding") or r.get("verdict", "")).lower() in ("vulnerable", "bypassable")
         ]
 
     # ---------------------------------------------------------------
