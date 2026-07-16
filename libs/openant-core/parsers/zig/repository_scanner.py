@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from utilities.file_io import write_json
+from utilities.path_filters import should_exclude_directory
 
 
 class RepositoryScanner:
@@ -111,11 +112,8 @@ class RepositoryScanner:
         }
 
     def _matches_exclude_pattern(self, name: str) -> bool:
-        """Check if a name matches any exclude pattern."""
-        for pattern in self.exclude_patterns:
-            if pattern in name:
-                return True
-        return False
+        """Check if a name matches any exclude pattern (whole-segment match)."""
+        return should_exclude_directory(name, self.exclude_patterns)
 
     def _is_test_directory(self, dirname: str) -> bool:
         """Check if a directory name indicates test code.

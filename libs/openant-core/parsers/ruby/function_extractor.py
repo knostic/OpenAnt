@@ -43,6 +43,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import tree_sitter_ruby as ts_ruby
 from tree_sitter import Language, Parser
 from utilities.file_io import read_json, write_json, open_utf8
+from utilities.path_filters import should_exclude_directory
 
 
 RUBY_LANGUAGE = Language(ts_ruby.language())
@@ -834,8 +835,9 @@ class FunctionExtractor:
         else:
             for ext in ('.rb', '.rake'):
                 for file_path in self.repo_path.rglob(f'*{ext}'):
-                    path_str = str(file_path)
-                    if any(excl in path_str for excl in ['.git', 'vendor', '.bundle', 'tmp', 'node_modules']):
+                    if should_exclude_directory(
+                        file_path, ['.git', 'vendor', '.bundle', 'tmp', 'node_modules']
+                    ):
                         continue
                     self.process_file(file_path)
 
