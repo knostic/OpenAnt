@@ -107,20 +107,25 @@ func runGit(repoPath string, stderr *bytes.Buffer, args ...string) error {
 // symmetric diff BASE...HEAD. Rename detection is enabled; the new-side path
 // is returned for renamed files.
 func ChangedFiles(repoPath, baseSHA string) ([]string, error) {
+	// -z: NUL-terminate each path and emit it verbatim. Unlike the default
+	// line output, -z is NEVER core.quotepath-escaped and NEVER ambiguous —
+	// it does not octal-escape/double-quote non-ASCII names (e.g. café.py)
+	// nor escape special characters (embedded newlines, quotes, backslashes,
+	// tabs). A line scanner would split an embedded-newline path into two or
+	// hand back a quoted string that never matches the real file, silently
+	// dropping such changes from the diff scope. Splitting on NUL is exact.
 	cmd := exec.Command("git", "-C", repoPath, "diff",
-		baseSHA+"...HEAD", "--name-only", "--find-renames")
+		baseSHA+"...HEAD", "--name-only", "-z", "--find-renames")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("git diff --name-only: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("git diff --name-only -z: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	var files []string
-	scanner := bufio.NewScanner(bytes.NewReader(out))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
-			files = append(files, line)
+	for _, path := range strings.Split(string(out), "\x00") {
+		if path != "" {
+			files = append(files, path)
 		}
 	}
 	sort.Strings(files)
