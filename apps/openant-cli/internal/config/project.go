@@ -183,18 +183,10 @@ func NewProject(name, repoURL, repoPath, source, language, commitSHA string) *Pr
 //	./repos/grafana                           → grafana
 //	/absolute/path/to/myproject              → myproject
 func DeriveProjectName(input string) string {
-	// Try SSH format: git@github.com:org/repo.git
-	if strings.Contains(input, ":") && strings.Contains(input, "@") {
-		parts := strings.SplitN(input, ":", 2)
-		if len(parts) == 2 {
-			name := parts[1]
-			name = strings.TrimSuffix(name, ".git")
-			return name
-		}
-	}
-
-	// Try HTTP(S) URL
-	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
+	// Scheme URLs (http/https/ssh) — parse with net/url so the scheme's own
+	// ':' (e.g. "ssh:", or a userinfo/port ':') isn't mistaken for the
+	// scp-like host:path separator. Must precede the scp-like branch below.
+	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") || strings.HasPrefix(input, "ssh://") {
 		u, err := url.Parse(input)
 		if err == nil {
 			path := strings.TrimPrefix(u.Path, "/")
@@ -207,6 +199,14 @@ func DeriveProjectName(input string) string {
 			if len(parts) == 1 && parts[0] != "" {
 				return parts[0]
 			}
+		}
+	}
+
+	// scp-like SSH form: git@github.com:org/repo.git (schemeless; no "://").
+	if !strings.Contains(input, "://") && strings.Contains(input, "@") && strings.Contains(input, ":") {
+		parts := strings.SplitN(input, ":", 2)
+		if len(parts) == 2 {
+			return strings.TrimSuffix(parts[1], ".git")
 		}
 	}
 
