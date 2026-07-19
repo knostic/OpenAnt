@@ -49,6 +49,41 @@ const PERMISSIVE_COMPILER_OPTIONS = {
   allowSyntheticDefaultImports: true,
 };
 
+// The source file plus every TypeScript namespace/module body (at any nesting
+// depth) that is NOT inside a function. Each is a StatementedNode whose
+// getClasses()/getVariableStatements() return its OWN direct members, so
+// iterating all of them extracts namespaced classes/arrows without double-
+// counting (each member belongs to exactly one direct container). Namespaces
+// nested inside a function are excluded — their text already rides inside the
+// enclosing unit, matching _moduleLevelFunctionNodes' isModuleLevel filter.
+// Module-level so the inventory builder, the call-graph builder, and the
+// single-function extractor all share one definition of the unit set.
+function statementedContainers(sourceFile) {
+  const FN_KINDS = new Set([
+    ts.SyntaxKind.FunctionDeclaration,
+    ts.SyntaxKind.FunctionExpression,
+    ts.SyntaxKind.ArrowFunction,
+    ts.SyntaxKind.MethodDeclaration,
+    ts.SyntaxKind.Constructor,
+    ts.SyntaxKind.GetAccessor,
+    ts.SyntaxKind.SetAccessor,
+    ts.SyntaxKind.ClassStaticBlockDeclaration,
+  ]);
+  const notInsideFunction = (node) => {
+    for (let p = node.getParent(); p; p = p.getParent()) {
+      if (FN_KINDS.has(p.getKind())) return false;
+    }
+    return true;
+  };
+  const containers = [sourceFile];
+  for (const mod of sourceFile.getDescendantsOfKind(
+    ts.SyntaxKind.ModuleDeclaration,
+  )) {
+    if (notInsideFunction(mod)) containers.push(mod);
+  }
+  return containers;
+}
+
 class TypeScriptAnalyzer {
   constructor(repoPath) {
     // Normalise immediately so all later path operations (path.relative,
@@ -235,6 +270,17 @@ class TypeScriptAnalyzer {
   // by the inventory builder, the call-graph builder, AND the resolver — all
   // three must see the same set so a block function is a unit, has its own
   // edges, and is resolvable as a call target.
+  // The source file plus every TypeScript namespace/module body (at any nesting
+  // depth) that is NOT inside a function. Each is a StatementedNode whose
+  // getClasses()/getVariableStatements() return its OWN direct members, so
+  // iterating all of them extracts namespaced classes/arrows without double-
+  // counting (each member belongs to exactly one direct container). Namespaces
+  // nested inside a function are excluded — their text already rides inside the
+  // enclosing unit, matching _moduleLevelFunctionNodes' isModuleLevel filter.
+  _statementedContainers(sourceFile) {
+    return statementedContainers(sourceFile);
+  }
+
   _moduleLevelFunctionNodes(sourceFile) {
     const STOP = new Set([
       ts.SyntaxKind.FunctionDeclaration,
@@ -289,6 +335,14 @@ class TypeScriptAnalyzer {
       path.relative(this.repoPath, sourceFile.getFilePath()),
     );
 
+    // TypeScript `namespace {}` / `module {}` bodies are their own statemented
+    // scopes: classes and `const fn = () =>` declared inside a namespace are NOT
+    // returned by sourceFile.getClasses()/getVariableStatements(), so their
+    // methods/arrows were silently dropped. Descend every namespace so members
+    // are extracted like top-level ones (function declarations already are, via
+    // _moduleLevelFunctionNodes' getDescendantsOfKind walk).
+    const containers = this._statementedContainers(sourceFile);
+
     // Extract function declarations (top-level + module-level block-scoped).
     for (const { node: func, id: functionId } of this._moduleLevelFunctionEntries(
       sourceFile,
@@ -311,7 +365,9 @@ class TypeScriptAnalyzer {
     // Also covers Higher-Order-Component wrappers whose initializer is a call
     // expression containing an inline function — `const X = memo(() => {})`,
     // `forwardRef((p, r) => {})`, `styled.div\`...\``.
-    for (const statement of sourceFile.getVariableStatements()) {
+    for (const statement of containers.flatMap((c) =>
+      c.getVariableStatements(),
+    )) {
       for (const declaration of statement.getDeclarations()) {
         const initializer = declaration.getInitializer();
         if (!initializer) continue;
@@ -347,7 +403,7 @@ class TypeScriptAnalyzer {
     }
 
     // Extract methods from classes
-    for (const classDecl of sourceFile.getClasses()) {
+    for (const classDecl of containers.flatMap((c) => c.getClasses())) {
       const className = classDecl.getName() || "AnonymousClass";
 
       // getMethods() excludes get/set accessors, so iterate the
@@ -362,6 +418,14 @@ class TypeScriptAnalyzer {
         const code = method.getFullText();
         const functionId = `${relativePath}:${className}.${methodName}`;
 
+        // First-wins: a namespace class and a top-level class can share a name
+        // (namespaces exist precisely to allow duplicate identifiers), producing
+        // the same `${className}.${methodName}` id. Since containers lists the
+        // source file before its namespaces, the top-level definition is emitted
+        // first; do not let a later namespace member overwrite it and silently
+        // drop the top-level unit. Matches the var-loop guard above.
+        if (this.functions[functionId]) continue;
+
         this.functions[functionId] = {
           name: `${className}.${methodName}`,
           code: code,
@@ -375,6 +439,38 @@ class TypeScriptAnalyzer {
         };
       }
 
+      // Emit class properties initialised with an arrow function / function
+      // expression as class-member units (NestJS/Angular `@Get() findAll = (req,
+      // res) => {...}`). getMethods() excludes these, so without this loop a
+      // decorated arrow-function handler is never seeded as a route_handler entry
+      // point. NOTE: this loop only makes the handler a UNIT; its outgoing edges
+      // (the transitive rescue of `this.svc.findAll()` from pruning) are filled
+      // by the matching getProperties() walk in buildCallGraphForFile — both
+      // sites are required for the callees to actually be reached.
+      for (const prop of classDecl.getProperties()) {
+        const init = prop.getInitializer();
+        if (!init) continue;
+        const ik = init.getKindName();
+        if (ik !== "ArrowFunction" && ik !== "FunctionExpression") continue;
+        const propName = prop.getName();
+        const code = prop.getFullText();
+        const functionId = `${relativePath}:${className}.${propName}`;
+        // First-wins: a real method of the same name already emitted above owns
+        // the id; do not overwrite it.
+        if (this.functions[functionId]) continue;
+        this.functions[functionId] = {
+          name: `${className}.${propName}`,
+          code: code,
+          isExported: classDecl.isExported(),
+          unitType: this.classifyFunction(propName, code, true, className),
+          startLine: prop.getStartLineNumber(),
+          endLine: prop.getEndLineNumber(),
+          className: className,
+          parameters: this._extractParameters(init),
+          decorators: this._decoratorTexts(classDecl, prop),
+        };
+      }
+
       // Emit the constructor as its own unit so `new X()` edges have a target and
       // its body's calls (this.foo()) are walked. A class has at most one
       // implemented constructor; overload signatures carry no body. The
@@ -383,9 +479,10 @@ class TypeScriptAnalyzer {
       const ctorDecl =
         classDecl.getConstructors().find((c) => c.getBody && c.getBody()) ||
         classDecl.getConstructors()[0];
-      if (ctorDecl) {
+      const ctorId = `${relativePath}:${className}.constructor`;
+      if (ctorDecl && !this.functions[ctorId]) {
         const ctorCode = ctorDecl.getFullText();
-        this.functions[`${relativePath}:${className}.constructor`] = {
+        this.functions[ctorId] = {
           name: `${className}.constructor`,
           code: ctorCode,
           isExported: classDecl.isExported(),
@@ -592,6 +689,40 @@ class TypeScriptAnalyzer {
         };
         this.callGraph[functionId] = this.extractCallsFromFunction(
           method,
+          relativePath,
+        );
+      }
+
+      // Sibling of the class-DECLARATION property path: a class *expression* can
+      // also carry decorated arrow-function / function-expression properties
+      // (`module.exports = class { @Get() findAll = (req, res) => {...} }`).
+      // getMethods() excludes them, so emit them as units here — and, because
+      // buildCallGraphForFile only walks getClasses() (declarations), populate
+      // their outgoing edges inline so the handler's callees are actually
+      // rescued from pruning.
+      const props = classExpr.getProperties ? classExpr.getProperties() : [];
+      for (const prop of props) {
+        const init = prop.getInitializer();
+        if (!init) continue;
+        const ik = init.getKindName();
+        if (ik !== "ArrowFunction" && ik !== "FunctionExpression") continue;
+        const propName = prop.getName();
+        const functionId = `${relativePath}:${className}.${propName}`;
+        if (this.functions[functionId]) continue;
+        const code = prop.getFullText();
+        this.functions[functionId] = {
+          name: `${className}.${propName}`,
+          code: code,
+          isExported: false,
+          unitType: this.classifyFunction(propName, code, true, className),
+          startLine: prop.getStartLineNumber(),
+          endLine: prop.getEndLineNumber(),
+          className: className,
+          parameters: this._extractParameters(init),
+          decorators: this._decoratorTexts(classExpr, prop),
+        };
+        this.callGraph[functionId] = this.extractCallsFromFunction(
+          init,
           relativePath,
         );
       }
@@ -1441,6 +1572,14 @@ class TypeScriptAnalyzer {
       path.relative(this.repoPath, sourceFile.getFilePath()),
     );
 
+    // Descend `namespace {}` / `module {}` bodies just like the inventory
+    // builder does: their arrows and class methods are their own StatementedNode
+    // scope, so sourceFile.getVariableStatements()/getClasses() do NOT return
+    // them. Without this the inventory emits those units but this arm never walks
+    // their bodies, so the Step-4 backstop stamps them with an empty edge list —
+    // silently dropping real outgoing edges (e.g. namespace Shape.render -> area).
+    const containers = statementedContainers(sourceFile);
+
     // Analyze function declarations (same enumeration + id scheme as the
     // inventory builder, so callGraph keys match functions keys exactly —
     // a block function must get its REAL outgoing edges, not a backstop []).
@@ -1455,7 +1594,9 @@ class TypeScriptAnalyzer {
     }
 
     // Analyze arrow functions
-    for (const statement of sourceFile.getVariableStatements()) {
+    for (const statement of containers.flatMap((c) =>
+      c.getVariableStatements(),
+    )) {
       for (const declaration of statement.getDeclarations()) {
         const initializer = declaration.getInitializer();
         if (
@@ -1465,6 +1606,11 @@ class TypeScriptAnalyzer {
         ) {
           const name = declaration.getName();
           const callerId = `${relativePath}:${name}`;
+          // First-wins, mirroring the inventory builder so callGraph picks the
+          // SAME unit as functions on an id collision (top-level vs namespace, or
+          // a same-name function declaration already walked above). Otherwise the
+          // kept unit would carry a dropped sibling's edges.
+          if (this.callGraph[callerId]) continue;
           this.callGraph[callerId] = this.extractCallsFromFunction(
             initializer,
             relativePath,
@@ -1474,7 +1620,7 @@ class TypeScriptAnalyzer {
     }
 
     // Analyze class methods
-    for (const classDecl of sourceFile.getClasses()) {
+    for (const classDecl of containers.flatMap((c) => c.getClasses())) {
       const className = classDecl.getName() || "AnonymousClass";
 
       // Mirror the inventory builder: include get/set accessors so
@@ -1487,6 +1633,10 @@ class TypeScriptAnalyzer {
       for (const method of classMembers) {
         const methodName = method.getName();
         const callerId = `${relativePath}:${className}.${methodName}`;
+        // First-wins, lockstep with the inventory class-method guard: a top-level
+        // and a namespace class can share `${className}.${methodName}`; keep the
+        // top-level unit's edges (it is walked first, containers = [file, ...ns]).
+        if (this.callGraph[callerId]) continue;
         this.callGraph[callerId] = this.extractCallsFromFunction(
           method,
           relativePath,
@@ -1499,10 +1649,31 @@ class TypeScriptAnalyzer {
       const ctorDecl =
         classDecl.getConstructors().find((c) => c.getBody && c.getBody()) ||
         classDecl.getConstructors()[0];
-      if (ctorDecl) {
-        const callerId = `${relativePath}:${className}.constructor`;
-        this.callGraph[callerId] = this.extractCallsFromFunction(
+      const ctorCallerId = `${relativePath}:${className}.constructor`;
+      if (ctorDecl && !this.callGraph[ctorCallerId]) {
+        this.callGraph[ctorCallerId] = this.extractCallsFromFunction(
           ctorDecl,
+          relativePath,
+        );
+      }
+
+      // Walk arrow-function / function-expression class properties too, so the
+      // property units emitted by the inventory builder get their REAL outgoing
+      // edges (e.g. `@Get() findAll = (req, res) => this.svc.findAll()`), not an
+      // empty Step-4 backstop. Without this the handler is seeded as an entry
+      // point but its callees are never reached through it and stay pruned.
+      // callGraph is already populated for methods/accessors/ctor above; the
+      // guard preserves a real method's edges when a property shares its name
+      // (mirrors the inventory builder's first-wins ownership of the id).
+      for (const prop of classDecl.getProperties()) {
+        const init = prop.getInitializer();
+        if (!init) continue;
+        const ik = init.getKindName();
+        if (ik !== "ArrowFunction" && ik !== "FunctionExpression") continue;
+        const callerId = `${relativePath}:${className}.${prop.getName()}`;
+        if (this.callGraph[callerId]) continue;
+        this.callGraph[callerId] = this.extractCallsFromFunction(
+          init,
           relativePath,
         );
       }
@@ -1569,11 +1740,14 @@ class TypeScriptAnalyzer {
   extractCallsFromFunction(funcNode, currentFile) {
     const calls = [];
     const seen = new Set();
-    const pushName = (name, dynamic) => {
+    // `member` marks a call through a receiver (`obj.foo()`, `this.foo()`); a
+    // bare `foo()` (member=false) can only target a free function in scope, never
+    // a sibling method, so the resolver must not match it to a `Class.foo` unit.
+    const pushName = (name, dynamic, member = false) => {
       const key = `${name} ${dynamic ? 1 : 0}`;
       if (seen.has(key)) return;
       seen.add(key);
-      calls.push({ resolved: false, name: name, dynamic: dynamic });
+      calls.push({ resolved: false, name: name, dynamic: dynamic, member: member });
     };
 
     const callExpressions = funcNode.getDescendantsOfKind(
@@ -1584,7 +1758,10 @@ class TypeScriptAnalyzer {
       const callee = callExpr.getExpression();
       const normalized = this._normalizeCallName(callee);
       if (normalized) {
-        pushName(normalized, false);
+        // A PropertyAccess callee (`obj.foo()`, `this.foo()`) is a receiver call.
+        const isMember =
+          !!callee && callee.getKindName() === "PropertyAccessExpression";
+        pushName(normalized, false, isMember);
       } else {
         // Dynamic / element-access callee — record the raw span trimmed to a
         // single line so node names never become multiline blobs.
@@ -1645,18 +1822,33 @@ class TypeScriptAnalyzer {
       (byName[simple] = byName[simple] || []).push(funcId);
     }
 
-    const resolveName = (name, callerFile) => {
-      // 1. Same-file simple-name match.
+    const resolveName = (name, callerFile, isMember) => {
+      // 1b. Same-file member/method-suffix match (`Class.foo` for `this.foo()` /
+      // `obj.foo()`). ONLY for receiver calls: a bare `foo()` never targets a
+      // sibling method, so gating this on `isMember` stops a same-named method
+      // from poisoning a bare call before the cross-file free function (step 2)
+      // is even considered. This runs BEFORE the exact 1a match: for a receiver
+      // call the sibling method is the correct target even when a same-name free
+      // function coexists in-file (an exact-first order would mis-route
+      // `this.foo()` to that free function).
+      if (isMember) {
+        for (const funcId of byFile[callerFile] || []) {
+          if ((this.functions[funcId].name || "").endsWith("." + name)) return funcId;
+        }
+      }
+      // 1a. Same-file EXACT simple-name match (a free function / top-level unit).
       for (const funcId of byFile[callerFile] || []) {
-        const fname = this.functions[funcId].name || "";
-        if (fname === name || fname.endsWith("." + name)) return funcId;
+        if ((this.functions[funcId].name || "") === name) return funcId;
       }
       // 2. Unique-name match across the repo. Exclude object-literal methods:
       // they are only ever invoked through a receiver (`ctrl.handler()`), so a bare
-      // cross-file same-name call must never resolve to one (no phantom). Same-file
-      // member calls still resolve via step 1's endsWith('.'+name) match.
+      // cross-file same-name call must never resolve to one (no phantom). For a bare
+      // call also exclude qualified/method units (`Class.foo`) — a bare call can only
+      // reach a free function — so a lone free function stays the unique target.
       const candidates = (byName[name] || []).filter(
-        (id) => !this.functions[id].localObjectLiteral,
+        (id) =>
+          !this.functions[id].localObjectLiteral &&
+          (isMember || !(this.functions[id].name || "").includes(".")),
       );
       if (candidates.length === 1) return candidates[0];
       return null;
@@ -1674,7 +1866,7 @@ class TypeScriptAnalyzer {
           if (!indirect.includes(name)) indirect.push(name);
           continue;
         }
-        const target = resolveName(name, callerFile);
+        const target = resolveName(name, callerFile, !!edge.member);
         if (target && target !== callerId) {
           if (!resolvedTargets.includes(target)) resolvedTargets.push(target);
         } else if (!target) {
@@ -1739,9 +1931,15 @@ function extractSingleFunction(filePath, functionRef) {
     // Search for the function
     let foundFunction = null;
 
-    // 1. Try class methods first if className specified
+    // 1. Try class methods first if className specified. Descend namespace/module
+    // bodies so a namespaced class member (e.g. `Shape.render` inside
+    // `namespace Geometry {}`) is findable — the inventory/call-graph builders
+    // enumerate the same descended set, so this must too or a namespace class is
+    // emitted as a unit yet its source can't be re-extracted on demand.
     if (className) {
-      for (const classDecl of sourceFile.getClasses()) {
+      for (const classDecl of statementedContainers(sourceFile).flatMap((c) =>
+        c.getClasses(),
+      )) {
         const classNameMatch = classDecl.getName();
         if (classNameMatch === className) {
           // getMethods() excludes get/set accessors, so search the
@@ -1771,7 +1969,12 @@ function extractSingleFunction(filePath, functionRef) {
     // 2. Try standalone function declarations (incl. module-level block-scoped,
     // so a call TO a function defined inside an if/try/for block resolves).
     if (!foundFunction) {
-      for (const func of this._moduleLevelFunctionNodes(sourceFile)) {
+      // extractSingleFunction is a standalone function (no analyzer `this`), so
+      // borrow the class's module-level enumeration via a throwaway instance —
+      // the method reads only `sourceFile`, never instance state. Calling it as
+      // `this._moduleLevelFunctionNodes` here threw a TypeError.
+      const analyzer = new TypeScriptAnalyzer(path.dirname(normalisedFilePath));
+      for (const func of analyzer._moduleLevelFunctionNodes(sourceFile)) {
         if (func.getName() === functionName) {
           foundFunction = {
             node: func,
@@ -1787,8 +1990,11 @@ function extractSingleFunction(filePath, functionRef) {
     }
 
     // 3. Try arrow functions / function expressions assigned to variables
+    // (including those declared inside a namespace/module body).
     if (!foundFunction) {
-      for (const statement of sourceFile.getVariableStatements()) {
+      for (const statement of statementedContainers(sourceFile).flatMap((c) =>
+        c.getVariableStatements(),
+      )) {
         for (const declaration of statement.getDeclarations()) {
           if (declaration.getName() === functionName) {
             const initializer = declaration.getInitializer();
