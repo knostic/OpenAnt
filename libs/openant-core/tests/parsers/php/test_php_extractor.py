@@ -159,6 +159,54 @@ def test_class_only_file_has_no_module_level_unit(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# A namespaced module-level unit must carry its enclosing namespace
+# ---------------------------------------------------------------------------
+
+NAMESPACED_PROCEDURAL = """<?php
+namespace App;
+
+$config = $_GET['mode'];
+add_action('wp_ajax_x', 'handler');
+"""
+
+BRACED_NAMESPACED_PROCEDURAL = """<?php
+namespace App\\Web {
+    $config = $_GET['mode'];
+    add_action('wp_ajax_x', 'handler');
+}
+"""
+
+
+def test_braceless_namespaced_module_unit_carries_namespace(tmp_path):
+    """A module_level unit under `namespace App;` must be keyed to that namespace,
+    not to a null namespace (which mis-keys it against other App\\ symbols)."""
+    result = _extract(tmp_path, "plugin.php", NAMESPACED_PROCEDURAL)
+    units = result["functions"]
+    module_units = [
+        fd for fd in units.values() if fd.get("unit_type") == "module_level"
+    ]
+    assert module_units, "expected a module_level unit for the namespaced code"
+    assert module_units[0]["namespace_name"] == "App", (
+        "namespaced module_level unit must carry namespace 'App'; got "
+        f"{module_units[0]['namespace_name']!r}"
+    )
+
+
+def test_braced_namespaced_module_unit_carries_namespace(tmp_path):
+    """Same requirement for a braced `namespace App\\Web { ... }` block."""
+    result = _extract(tmp_path, "plugin.php", BRACED_NAMESPACED_PROCEDURAL)
+    units = result["functions"]
+    module_units = [
+        fd for fd in units.values() if fd.get("unit_type") == "module_level"
+    ]
+    assert module_units, "expected a module_level unit for the namespaced code"
+    assert module_units[0]["namespace_name"] == "App\\Web", (
+        "braced-namespaced module_level unit must carry namespace 'App\\\\Web'; got "
+        f"{module_units[0]['namespace_name']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # PHP superglobals must seed entry points
 # ---------------------------------------------------------------------------
 

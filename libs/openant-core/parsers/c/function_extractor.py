@@ -253,7 +253,7 @@ class FunctionExtractor:
         """
         return a.get('parameters', []) == b.get('parameters', [])
 
-    def _store_function(self, func_id: str, func_data: dict) -> None:
+    def _store_function(self, func_id: str, func_data: dict) -> str:
         """Store a function, disambiguating same-(file,name) collisions instead
         of silently overwriting (Bug 1: #ifdef/#else stubs and C++ overloads
         collapsed onto one node — see reachability-bugs.md / bug-3482.md).
@@ -272,19 +272,28 @@ class FunctionExtractor:
             so both overloads stay findable. (Contrast bug [39], which folds the
             template-arg discriminator into the NAME — correct there because a
             template call is written `g<int>`; an overload call is written bare.)
+
+        Returns the func_id the node was actually stored under: the plain
+        `func_id` when there was no collision or a same-signature merge, and the
+        overload-disambiguated `overload_id` when a genuine overload minted a new
+        key. Callers building an enclosing-function scope for GNU nested
+        functions / lambdas MUST use this returned key (not the bare full_name)
+        so nested callables inside two same-named OVERLOADED enclosers stay
+        distinct instead of colliding (PR150-c-nested-fn-collision, FA3).
         """
         existing = self.functions.get(func_id)
         if existing is None:
             self.functions[func_id] = func_data
-            return
+            return func_id
         if self._same_signature(existing, func_data):
             if len(func_data.get('code', '')) > len(existing.get('code', '')):
                 self.functions[func_id] = func_data
-            return
+            return func_id
         overload_id = f"{func_id}({self._signature_discriminator(func_data.get('parameters', []))})"
         prior = self.functions.get(overload_id)
         if prior is None or len(func_data.get('code', '')) > len(prior.get('code', '')):
             self.functions[overload_id] = func_data
+        return overload_id
 
     def _find_function_declarator(self, node):
         """Find the function_declarator within a declarator tree."""
@@ -450,43 +459,51 @@ class FunctionExtractor:
         is_header = os.path.splitext(file_path)[1].lower() in ('.h', '.hpp', '.hxx', '.hh')
 
         # Iterative traversal with explicit stack carrying
-        # (node, namespace_prefix, class_context). namespace_prefix is the
-        # qualified prefix used to build the func_id; class_context is the
-        # enclosing class/struct/union name (or None) used for metadata so a
-        # namespace qualifier is never mistaken for a class qualifier.
-        stack = [(tree.root_node, '', None)]
+        # (node, namespace_prefix, class_context, enclosing_prefix).
+        # namespace_prefix is the qualified prefix used to build the func_id;
+        # class_context is the enclosing class/struct/union name (or None) used
+        # for metadata so a namespace qualifier is never mistaken for a class
+        # qualifier. enclosing_prefix is the dotted chain of enclosing FUNCTION
+        # names (empty at top level) folded into the func_id so two GNU nested
+        # functions of the same name in different enclosers don't collide
+        # (PR150-c-nested-fn-collision).
+        stack = [(tree.root_node, '', None, '')]
 
         # struct/union member functions are C++ methods exactly like class
         # members; only `class_specifier` was special-cased originally.
         record_specifiers = ('class_specifier', 'struct_specifier', 'union_specifier')
 
         while stack:
-            node, namespace_prefix, class_context = stack.pop()
+            node, namespace_prefix, class_context, enclosing_prefix = stack.pop()
 
             if node.type == 'function_definition':
-                self._process_function_node(node, source, relative_path,
-                                            is_cpp, is_header, namespace_prefix,
-                                            class_context)
+                # scope_chain already includes enclosing_prefix AND any overload
+                # discriminator _store_function appended, so it is NOT re-prefixed.
+                scope_chain = self._process_function_node(
+                    node, source, relative_path, is_cpp, is_header,
+                    namespace_prefix, class_context, enclosing_prefix)
                 # Descend into the body: GNU nested functions (a GCC extension) are
                 # `function_definition` nodes inside the compound_statement and would
                 # otherwise never be visited. A nested definition is processed on a
-                # later iteration with the same namespace/class context.
+                # later iteration with the same namespace/class context, but under a
+                # deeper enclosing_prefix so its func_id carries this function's scope.
+                child_prefix = f"{scope_chain}." if scope_chain else enclosing_prefix
                 for child in reversed(node.children):
-                    stack.append((child, namespace_prefix, class_context))
+                    stack.append((child, namespace_prefix, class_context, child_prefix))
 
             elif node.type == 'declaration' and not is_header:
                 # Standalone declarations in .c/.cpp files are prototypes, EXCEPT
                 # a declaration whose initializer is a lambda — a named callable.
                 if is_cpp:
                     self._process_lambda_declaration(node, source, relative_path,
-                                                     namespace_prefix)
+                                                     namespace_prefix, enclosing_prefix)
 
             elif node.type == 'declaration' and is_header:
                 # In headers, track prototypes for call resolution
                 self._process_declaration_node(node, source, relative_path)
                 if is_cpp:
                     self._process_lambda_declaration(node, source, relative_path,
-                                                     namespace_prefix)
+                                                     namespace_prefix, enclosing_prefix)
 
             elif node.type == 'namespace_definition' and is_cpp:
                 ns_name_node = node.child_by_field_name('name')
@@ -496,7 +513,7 @@ class FunctionExtractor:
                 if body_node:
                     for child in reversed(body_node.children):
                         # class_context unchanged: a namespace is NOT a class.
-                        stack.append((child, new_prefix, class_context))
+                        stack.append((child, new_prefix, class_context, enclosing_prefix))
                 continue  # Don't walk children again
 
             elif node.type in record_specifiers and is_cpp:
@@ -524,21 +541,28 @@ class FunctionExtractor:
                             elif child.type == 'access_specifier':
                                 pass
                             else:
-                                stack.append((child, new_prefix, class_name))
+                                stack.append((child, new_prefix, class_name, enclosing_prefix))
                 continue
 
             else:
                 for child in reversed(node.children):
-                    stack.append((child, namespace_prefix, class_context))
+                    stack.append((child, namespace_prefix, class_context, enclosing_prefix))
 
     def _process_function_node(self, node, source: bytes, relative_path: str,
                                 is_cpp: bool, is_header: bool,
                                 namespace_prefix: str = '',
-                                class_context: Optional[str] = None) -> None:
-        """Process a single function_definition node."""
+                                class_context: Optional[str] = None,
+                                enclosing_prefix: str = '') -> Optional[str]:
+        """Process a single function_definition node. Returns the enclosing-function
+        SCOPE CHAIN (or None if the node has no name) so the caller can build the
+        scope for any GNU nested functions/lambdas in its body. The scope is the
+        stored func_id minus the ``relative_path:`` prefix — i.e. it carries the
+        overload disambiguator that ``_store_function`` may have appended, so two
+        same-named OVERLOADED enclosers yield DISTINCT nested scopes
+        (PR150-c-nested-fn-collision, FA3)."""
         name = self._get_function_name(node, source)
         if not name:
-            return
+            return None
 
         full_name = namespace_prefix + name if namespace_prefix and '::' not in name else name
         # class_name comes from the lexical enclosing class/struct/union
@@ -565,7 +589,13 @@ class FunctionExtractor:
             name, relative_path, is_static, code, is_cpp, class_name
         )
 
-        func_id = f"{relative_path}:{full_name}"
+        # enclosing_prefix is empty for top-level/method functions (id stays the
+        # plain `path:name` the suite's hardcoded id literals depend on) and the
+        # dotted enclosing-function chain for a GNU nested function, so two
+        # same-named nested fns in different enclosers stay distinct. The `name`
+        # field is left bare (unscoped) so the call-graph builder still resolves
+        # the bare nested call.
+        func_id = f"{relative_path}:{enclosing_prefix}{full_name}"
 
         func_data = {
             'name': full_name,
@@ -582,7 +612,7 @@ class FunctionExtractor:
             'class_name': class_name,
         }
 
-        self._store_function(func_id, func_data)
+        stored_id = self._store_function(func_id, func_data)
         self.stats['total_functions'] += 1
 
         if is_static:
@@ -592,13 +622,27 @@ class FunctionExtractor:
 
         self.stats['by_type'][unit_type] = self.stats['by_type'].get(unit_type, 0) + 1
 
+        # Return the scope chain (stored id minus the `relative_path:` prefix)
+        # rather than the bare full_name: `_store_function` may have appended an
+        # overload discriminator (e.g. `outer(double x)`), and nested callables
+        # must inherit THAT disambiguated scope so two same-named overloaded
+        # enclosers don't hand their nested fns/lambdas an identical prefix
+        # (PR150-c-nested-fn-collision, FA3).
+        return stored_id[len(relative_path) + 1:]
+
     def _process_lambda_declaration(self, node, source: bytes, relative_path: str,
-                                    namespace_prefix: str = '') -> None:
+                                    namespace_prefix: str = '',
+                                    enclosing_prefix: str = '') -> None:
         """Extract a named lambda from a declaration (auto f = [](){...};).
 
         A lambda is a `lambda_expression` initializer inside an
         `init_declarator`; the declaration node is otherwise skipped by the
         traversal, so the callable would never be recorded as a unit.
+
+        ``enclosing_prefix`` is the dotted enclosing-function scope (empty at
+        top level) folded into the func_id so two same-named lambdas declared in
+        different enclosing functions don't collide/overwrite
+        (PR150-c-nested-fn-collision).
         """
         # A declaration may declare several init_declarators.
         stack = list(node.children)
@@ -620,7 +664,11 @@ class FunctionExtractor:
 
             full_name = (namespace_prefix + name
                          if namespace_prefix and '::' not in name else name)
-            func_id = f"{relative_path}:{full_name}"
+            # enclosing_prefix is empty for top-level lambdas (id stays the plain
+            # `path:name`) and the dotted enclosing-function chain for a lambda
+            # declared inside a function body, so two same-named lambdas in
+            # different enclosers stay distinct (PR150-c-nested-fn-collision).
+            func_id = f"{relative_path}:{enclosing_prefix}{full_name}"
             self._store_function(func_id, {
                 'name': full_name,
                 'file_path': relative_path,
@@ -678,8 +726,6 @@ class FunctionExtractor:
             self.stats['files_with_errors'] += 1
             return
 
-        self.stats['files_processed'] += 1
-
         # Extract includes
         self.includes[relative_path] = self._extract_includes(tree, source)
 
@@ -692,11 +738,27 @@ class FunctionExtractor:
         self._extract_functions_from_tree(tree, source, str(file_path),
                                            relative_path, is_cpp)
 
+        # Count as processed only after extraction fully succeeds, so a file that crashes
+        # mid-extraction (caught by _process_file_guarded) is counted once as an error and
+        # never as processed.
+        self.stats['files_processed'] += 1
+
+    def _process_file_guarded(self, file_path: Path) -> None:
+        """Process one file, isolating any failure so a single pathological file cannot abort the
+        whole repo's extraction (mirrors the Python/Zig/Go per-file loop guard from PR #136).
+        Parse errors are already handled inside process_file; this backstops the rest
+        (RecursionError/MemoryError from deep nesting, extractor bugs)."""
+        try:
+            self.process_file(file_path)
+        except Exception as e:
+            print(f"Warning: failed to process {file_path}: {type(e).__name__}: {e}", file=sys.stderr)
+            self.stats['files_with_errors'] += 1
+
     def extract_from_scan(self, scan_result: Dict) -> Dict:
         """Extract functions from files listed in a scan result."""
         for file_info in scan_result.get('files', []):
             file_path = self.repo_path / file_info['path']
-            self.process_file(file_path)
+            self._process_file_guarded(file_path)
 
         return self.export()
 
@@ -706,7 +768,7 @@ class FunctionExtractor:
             for file_rel_path in files:
                 file_path = self.repo_path / file_rel_path
                 if file_path.exists():
-                    self.process_file(file_path)
+                    self._process_file_guarded(file_path)
         else:
             all_extensions = C_EXTENSIONS | CPP_EXTENSIONS
             for ext in all_extensions:
@@ -717,7 +779,7 @@ class FunctionExtractor:
                     # ancestor of repo_path contains one (a checkout under '/home/tester/' excludes all).
                     if {'.git', 'build', 'test', 'node_modules'} & set(file_path.relative_to(self.repo_path).parts):
                         continue
-                    self.process_file(file_path)
+                    self._process_file_guarded(file_path)
 
         return self.export()
 

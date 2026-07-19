@@ -283,7 +283,22 @@ class FunctionExtractor:
         """True if the call node carries a do..end or { } block."""
         return any(c.type in ('do_block', 'block') for c in node.children)
 
-    def _is_sinatra_class(self, relative_path: str, class_name: Optional[str]) -> bool:
+    @staticmethod
+    def _class_key(relative_path: str, class_name: Optional[str],
+                   module_name: Optional[str]) -> str:
+        """The self.classes key for a class, folding in its enclosing module.
+
+        The module namespace is part of a class's identity: `module A; class Foo`
+        and `module B; class Foo` are DISTINCT classes and must NOT share a key.
+        Every read of self.classes must build the key through here so it agrees
+        with the write site.
+        """
+        if module_name:
+            return f"{relative_path}:{module_name}::{class_name}"
+        return f"{relative_path}:{class_name}"
+
+    def _is_sinatra_class(self, relative_path: str, class_name: Optional[str],
+                          module_name: Optional[str] = None) -> bool:
         """True if `class_name` extends Sinatra::Base/Application (modular Sinatra).
 
         The class was registered in self.classes (with its superclass) before its
@@ -291,7 +306,7 @@ class FunctionExtractor:
         """
         if not class_name:
             return False
-        cls = self.classes.get(f"{relative_path}:{class_name}", {})
+        cls = self.classes.get(self._class_key(relative_path, class_name, module_name), {})
         superclass = cls.get('superclass') or ''
         return 'Sinatra::Base' in superclass or 'Sinatra::Application' in superclass
 
@@ -437,7 +452,7 @@ class FunctionExtractor:
                 elif (method_name in self._SINATRA_VERBS
                       and self._has_block(node) and args
                       and ((class_name is None and module_name is None)
-                           or self._is_sinatra_class(relative_path, class_name))):
+                           or self._is_sinatra_class(relative_path, class_name, module_name))):
                     # `get '/path' do..end` -- a Sinatra route, either classic
                     # top-level style or MODULAR style inside a `< Sinatra::Base`
                     # subclass. The class case is gated on the class actually
@@ -487,20 +502,41 @@ class FunctionExtractor:
                             break
 
                 if new_class_name:
-                    class_id = f"{relative_path}:{new_class_name}"
+                    # Fold the enclosing module into the class_id key. Two
+                    # GENUINELY-DISTINCT same-name classes in DIFFERENT modules
+                    # (`module A; class Foo` vs `module B; class Foo`) must get
+                    # DISTINCT ids -- they are distinct classes -- so the reopen
+                    # MERGE below does not wrongly union their methods and
+                    # superclass. A same-module reopen still collides -> merges.
+                    class_id = self._class_key(relative_path, new_class_name, module_name)
                     body_node = node.child_by_field_name('body')
                     methods = self._collect_class_method_names(body_node, source)
 
-                    self.classes[class_id] = {
-                        'name': new_class_name,
-                        'file_path': relative_path,
-                        'start_line': node.start_point[0] + 1,
-                        'end_line': node.end_point[0] + 1,
-                        'methods': methods,
-                        'superclass': superclass,
-                        'module_name': module_name,
-                    }
-                    self.stats['total_classes'] += 1
+                    # Ruby class reopening is idiomatic: a later `class X` block
+                    # augments the earlier one. MERGE rather than last-write-wins
+                    # so an earlier superclass (often omitted on reopen) and the
+                    # earlier methods are not dropped.
+                    existing = self.classes.get(class_id)
+                    if existing is None:
+                        self.classes[class_id] = {
+                            'name': new_class_name,
+                            'file_path': relative_path,
+                            'start_line': node.start_point[0] + 1,
+                            'end_line': node.end_point[0] + 1,
+                            'methods': methods,
+                            'superclass': superclass,
+                            'module_name': module_name,
+                        }
+                        self.stats['total_classes'] += 1
+                    else:
+                        if not existing.get('superclass') and superclass:
+                            existing['superclass'] = superclass
+                        seen = set(existing['methods'])
+                        existing['methods'].extend(
+                            m for m in methods if not (m in seen or seen.add(m))
+                        )
+                        existing['end_line'] = max(existing['end_line'],
+                                                   node.end_point[0] + 1)
 
                 # Recurse into class body with updated class_name and a FRESH
                 # per-body visibility state (defaults to public).
@@ -741,8 +777,6 @@ class FunctionExtractor:
             self.stats['files_with_errors'] += 1
             return
 
-        self.stats['files_processed'] += 1
-
         # Extract imports
         self.imports[relative_path] = self._extract_imports(tree, source)
 
@@ -751,6 +785,11 @@ class FunctionExtractor:
 
         # Extract file-scope top-level script code
         self._extract_module_level_code(tree, source, relative_path)
+
+        # Count as processed only after extraction fully succeeds, so a file that crashes
+        # mid-extraction (caught by _process_file_guarded) is counted once as an error and
+        # never as processed.
+        self.stats['files_processed'] += 1
 
     # Top-level program children that are NOT file-scope script statements:
     # definitions (their bodies are their own units) and comments.
@@ -817,11 +856,22 @@ class FunctionExtractor:
         self.stats['standalone_functions'] += 1
         self.stats['by_type']['module_level'] = self.stats['by_type'].get('module_level', 0) + 1
 
+    def _process_file_guarded(self, file_path: Path) -> None:
+        """Process one file, isolating any failure so a single pathological file cannot abort the
+        whole repo's extraction (mirrors the Python/Zig/Go per-file loop guard from PR #136).
+        Parse errors are already handled inside process_file; this backstops the rest
+        (RecursionError/MemoryError from deep nesting, extractor bugs)."""
+        try:
+            self.process_file(file_path)
+        except Exception as e:
+            print(f"Warning: failed to process {file_path}: {type(e).__name__}: {e}", file=sys.stderr)
+            self.stats['files_with_errors'] += 1
+
     def extract_from_scan(self, scan_result: Dict) -> Dict:
         """Extract functions from files listed in a scan result."""
         for file_info in scan_result.get('files', []):
             file_path = self.repo_path / file_info['path']
-            self.process_file(file_path)
+            self._process_file_guarded(file_path)
 
         return self.export()
 
@@ -831,15 +881,20 @@ class FunctionExtractor:
             for file_rel_path in files:
                 file_path = self.repo_path / file_rel_path
                 if file_path.exists():
-                    self.process_file(file_path)
+                    self._process_file_guarded(file_path)
         else:
             for ext in ('.rb', '.rake'):
                 for file_path in self.repo_path.rglob(f'*{ext}'):
+                    # Exclude on the REPO-RELATIVE path: should_exclude_directory tests every
+                    # segment, so passing the absolute path would let an ancestor named like an
+                    # excluded token (e.g. a repo under /private/tmp) drop the entire scan. rglob
+                    # yields paths under repo_path, so relative_to never raises.
                     if should_exclude_directory(
-                        file_path, ['.git', 'vendor', '.bundle', 'tmp', 'node_modules']
+                        file_path.relative_to(self.repo_path),
+                        ['.git', 'vendor', '.bundle', 'tmp', 'node_modules'],
                     ):
                         continue
-                    self.process_file(file_path)
+                    self._process_file_guarded(file_path)
 
         return self.export()
 

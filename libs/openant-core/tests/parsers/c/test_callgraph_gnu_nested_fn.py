@@ -26,7 +26,10 @@ def test_gnu_nested_function_extracted():
         "}\n"
         "int main(){ return outer(1); }\n",
     )
-    assert any(k.endswith(":inner") for k in fns), (
+    # The nested func_id is scoped by its enclosing function
+    # (`n.c:outer.inner`), so it ends with `.inner`, not `:inner`
+    # (PR150-c-nested-fn-collision).
+    assert any(k.endswith(":inner") or k.endswith(".inner") for k in fns), (
         f"GNU nested function inner() must be extracted; funcs={list(fns)}"
     )
     # sanity: the outer functions are still present (no regression to normal extraction)
