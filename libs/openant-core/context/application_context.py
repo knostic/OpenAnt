@@ -26,7 +26,7 @@ Usage:
 import json
 import re
 import sys
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, fields
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -166,6 +166,18 @@ class ApplicationContext:
             str(level).lower() == "untrusted"
             for level in (self.trust_boundaries or {}).values()
         )
+
+
+def _context_kwargs_from_dict(data: dict) -> dict:
+    """Allowlist-filter an untrusted dict to ApplicationContext dataclass fields.
+
+    LLM output and hand-edited JSON files can carry unknown/hallucinated keys;
+    passing them straight to ``ApplicationContext(**data)`` raises an uncaught
+    TypeError. Keep only keys that name a real dataclass field so construction
+    is robust to extra keys.
+    """
+    allowed = {f.name for f in fields(ApplicationContext)}
+    return {k: v for k, v in data.items() if k in allowed}
 
 
 # Files to check for manual override (in order of priority)
@@ -373,6 +385,32 @@ def detect_entry_points(repo_path: Path) -> str:
     return "\n".join(findings[:30])  # Limit output
 
 
+def _application_context_from_override(data: Any, filename: str) -> ApplicationContext:
+    """Build an ApplicationContext from operator override data, tolerating unknown keys.
+
+    An unknown/extra key makes ``ApplicationContext(**data)`` raise TypeError, which
+    the caller's broad ``except`` swallows -- silently dropping the whole override.
+    Filter to the dataclass's known fields (allowlist) and warn on the rest so the
+    known keys are still honored.
+
+    Raises ValueError when ``data`` is not a mapping (empty/list/scalar frontmatter),
+    so the caller's existing ``except`` handles it exactly like any other parse
+    failure -- falling through to the next MANUAL_OVERRIDE_FILES entry rather than
+    short-circuiting the precedence loop.
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"manual override is not a mapping (got {type(data).__name__})")
+    data = {**data, "source": "manual"}
+    known = {f.name for f in fields(ApplicationContext)}
+    unknown = [k for k in data if k not in known]
+    if unknown:
+        print(
+            f"Warning: ignoring unknown key(s) in {filename}: {', '.join(sorted(str(k) for k in unknown))}",
+            file=sys.stderr,
+        )
+    return ApplicationContext(**{k: v for k, v in data.items() if k in known})
+
+
 def check_manual_override(repo_path: Path) -> ApplicationContext | None:
     """Check for manual override file in the repository.
 
@@ -395,8 +433,7 @@ def check_manual_override(repo_path: Path) -> ApplicationContext | None:
             if filename.endswith('.json'):
                 # Direct JSON format
                 data = read_json(filepath)
-                data['source'] = 'manual'
-                return ApplicationContext(**data)
+                return _application_context_from_override(data, filename)
 
             # .md files need raw text so regex can extract the embedded JSON block.
             with open_utf8(filepath) as _f:
@@ -407,8 +444,7 @@ def check_manual_override(repo_path: Path) -> ApplicationContext | None:
                 json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
                 if json_match:
                     data = json.loads(json_match.group(1))
-                    data['source'] = 'manual'
-                    return ApplicationContext(**data)
+                    return _application_context_from_override(data, filename)
 
                 # Check for YAML frontmatter
                 yaml_match = re.match(r'^---\s*\n(.*?)\n---', content, re.DOTALL)
@@ -416,8 +452,7 @@ def check_manual_override(repo_path: Path) -> ApplicationContext | None:
                     try:
                         import yaml
                         data = yaml.safe_load(yaml_match.group(1))
-                        data['source'] = 'manual'
-                        return ApplicationContext(**data)
+                        return _application_context_from_override(data, filename)
                     except ImportError:
                         print("Warning: PyYAML not installed, cannot parse YAML frontmatter", file=sys.stderr)
 
@@ -518,7 +553,7 @@ def generate_application_context(
     repo_path: Path,
     binding: PhaseBinding,
     force_regenerate: bool = False,
-) -> ApplicationContext:
+) -> ApplicationContext | None:
     """Generate application context using LLM analysis.
 
     Checks for manual override first, then falls back to LLM generation.
@@ -585,8 +620,29 @@ def generate_application_context(
 
     data['source'] = 'llm'
 
-    # Validate and create context (will raise UnsupportedApplicationTypeError if invalid)
-    return ApplicationContext(**data)
+    # Allowlist-filter to dataclass fields: the LLM can hallucinate unknown/extra
+    # keys, and a raw ApplicationContext(**data) would raise an uncaught TypeError
+    # ("unexpected keyword argument") that crashes context generation. Drop unknown
+    # keys so only recognized fields reach the constructor.
+    data = _context_kwargs_from_dict(data)
+
+    # Validate and create context (will raise UnsupportedApplicationTypeError if invalid).
+    # The allowlist filter above closes the UNKNOWN-key crash, but the LLM can also
+    # OMIT a required field (application_type / purpose); ApplicationContext(**data)
+    # then raises an uncaught TypeError ("missing required positional argument") that
+    # crashes generation — the exact class this hardening set out to kill. Untrusted
+    # LLM output: warn to stderr and fall back gracefully (return None; both callers —
+    # context/generate_context.py and core/scanner.py — wrap this call in a broad
+    # try/except and continue without a context).
+    try:
+        return ApplicationContext(**data)
+    except TypeError as e:
+        print(
+            f"WARNING: LLM returned an incomplete application context "
+            f"(missing required field): {e}. Skipping app context.",
+            file=sys.stderr,
+        )
+        return None
 
 
 def save_context(context: ApplicationContext, output_path: Path) -> None:
@@ -614,10 +670,22 @@ def load_context(input_path: Path) -> ApplicationContext:
         ApplicationContext loaded from file.
     """
     data = read_json(input_path)
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a JSON object in {input_path}, got {type(data).__name__}")
     # Mark as manual to skip validation (already validated when saved)
     original_source = data.get('source', 'llm')
     data['source'] = 'manual'  # Temporarily bypass validation
-    context = ApplicationContext(**data)
+    # Sibling of the LLM path: a hand-edited JSON file may carry unknown keys;
+    # allowlist-filter to dataclass fields so **data cannot raise TypeError.
+    data = _context_kwargs_from_dict(data)
+    # The filter drops unknown keys, but a saved/edited file can also be MISSING a
+    # required field (application_type / purpose); ApplicationContext(**data) then
+    # raises a raw, uninformative TypeError. This is a trusted-ish on-disk file, so
+    # surface a clear, actionable error naming the offending path instead of crashing.
+    try:
+        context = ApplicationContext(**data)
+    except TypeError as e:
+        raise ValueError(f"Invalid context in {input_path}: {e}")
     context.source = original_source  # Restore original source
     return context
 
