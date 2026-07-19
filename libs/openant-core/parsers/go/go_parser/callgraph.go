@@ -219,6 +219,21 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 	// receiver all dispatch to the right type's method.
 	varTypes := c.collectVarTypes(file)
 
+	// A name is filtered as a builtin only when no user function of that name is
+	// visible from THIS caller's scope. A user func shadowing a builtin (e.g. a
+	// local `len`) is a real call target, so its edge must be kept. Go builtin
+	// shadowing is PACKAGE/BLOCK-scoped, NOT repo-global: a user `min` in one
+	// package does not disable the builtin `min` in another. So the bypass is
+	// scoped to the same file / same package (mirroring resolveSimpleCall's
+	// priorities 1 & 2, and the Python/C parsers' same-file scoping) and
+	// deliberately EXCLUDES the repo-global name index — using functionsByName
+	// here would let a genuine builtin call in an unrelated package survive the
+	// filter and then be mis-resolved to a cross-package user func via
+	// resolveSimpleCall's len(candidates)==1 uniqueness gate (a false edge).
+	isBuiltin := func(name string) bool {
+		return c.builtins[name] && !c.userFuncInScope(name, funcInfo.FilePath)
+	}
+
 	// Walk the AST looking for call expressions
 	ast.Inspect(file, func(n ast.Node) bool {
 		// Go 1.23 range-over-func: `for v := range seqFunc` invokes seqFunc as an
@@ -231,7 +246,7 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 				if target, ok := aliases[name]; ok {
 					name = target
 				}
-				if name != "" && !c.builtins[name] {
+				if name != "" && !isBuiltin(name) {
 					calls = append(calls, CallInfo{Name: name})
 				}
 			}
@@ -256,7 +271,7 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 		if callInfo.IsMethod && callInfo.Package == "" && callInfo.Receiver != "" {
 			callInfo.ReceiverTypes = varTypes[callInfo.Receiver]
 		}
-		if callInfo.Name != "" && !c.builtins[callInfo.Name] && !c.builtins[callInfo.Package] {
+		if callInfo.Name != "" && !isBuiltin(callInfo.Name) && !c.builtins[callInfo.Package] {
 			calls = append(calls, callInfo)
 		}
 		return true
@@ -266,13 +281,23 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 }
 
 // exprTypeName returns the simple type name of a type expression: the identifier
-// for `T`, and the pointee's name for `*T`. Anything more complex (qualified,
-// generic, slice, map, ...) is not a receiver type we can key on, so "".
+// for `T`, the pointee's name for `*T`, and the bare base type for a generic
+// instantiation `T[A]` / `T[A, B]`. The base type is the key methodsByType uses
+// (extractor.go's typeToString collapses generics the same way), so a generic
+// receiver `*Stack[T]` must resolve to "Stack" — otherwise the receiver var gets
+// no static type and the self-call edge is dropped. Anything more complex
+// (qualified, slice, map, ...) is not a receiver type we can key on, so "".
 func exprTypeName(expr ast.Expr) string {
 	switch t := expr.(type) {
 	case *ast.Ident:
 		return t.Name
 	case *ast.StarExpr:
+		return exprTypeName(t.X)
+	case *ast.IndexExpr:
+		// Generic type with one type parameter, e.g. Stack[T]: drop the arg, key on the base.
+		return exprTypeName(t.X)
+	case *ast.IndexListExpr:
+		// Generic type with multiple type parameters, e.g. Pair[K, V]: same, key on the base.
 		return exprTypeName(t.X)
 	}
 	return ""
@@ -513,26 +538,41 @@ func (c *CallGraphBuilder) resolveCalls(callerID string, callerInfo FunctionInfo
 }
 
 func (c *CallGraphBuilder) resolveMethodCall(methodName, receiverType, currentFile string) string {
-	// Try to find method on the receiver type
-	if methods, ok := c.methodsByType[receiverType]; ok {
-		for _, funcID := range methods {
-			if strings.HasSuffix(funcID, "."+methodName) {
-				return funcID
-			}
+	// methodsByType is keyed by the BARE receiver type, so two packages that each define a type
+	// with the same name and method collide in one slice. Returning the first matching element made
+	// the winner depend on map-iteration order in buildIndexes -> nondeterministic/unstable edges.
+	// Instead pick deterministically: prefer a method in the caller's own package, then break ties
+	// by the lexicographically smallest funcID.
+	callerPkg := filepath.Dir(currentFile)
+	suffix := "." + methodName
+	best := ""
+	pick := func(funcID string) {
+		if !strings.HasSuffix(funcID, suffix) {
+			return
+		}
+		if best == "" {
+			best = funcID
+			return
+		}
+		candSame := filepath.Dir(funcID) == callerPkg
+		bestSame := filepath.Dir(best) == callerPkg
+		if (candSame && !bestSame) || (candSame == bestSame && funcID < best) {
+			best = funcID
 		}
 	}
 
-	// Also try without pointer
-	receiverType = strings.TrimPrefix(receiverType, "*")
-	if methods, ok := c.methodsByType[receiverType]; ok {
-		for _, funcID := range methods {
-			if strings.HasSuffix(funcID, "."+methodName) {
-				return funcID
-			}
+	// Try the exact receiver type first; only fall back to the pointer-stripped type if it yields
+	// no match (preserving the original exact-before-pointer preference).
+	for _, funcID := range c.methodsByType[receiverType] {
+		pick(funcID)
+	}
+	if best == "" {
+		for _, funcID := range c.methodsByType[strings.TrimPrefix(receiverType, "*")] {
+			pick(funcID)
 		}
 	}
 
-	return ""
+	return best
 }
 
 func (c *CallGraphBuilder) resolvePackageCall(funcName, pkgAlias, currentFile string) string {
@@ -564,6 +604,37 @@ func (c *CallGraphBuilder) resolvePackageCall(funcName, pkgAlias, currentFile st
 	}
 
 	return ""
+}
+
+// userFuncInScope reports whether the repo defines its own function of the given
+// simple name that is visible from currentFile's scope — the same file or the
+// same package (same directory). It intentionally mirrors resolveSimpleCall's
+// same-file + same-package priorities and EXCLUDES the repo-global unique-name
+// fallback: a user func in an unrelated package must not shadow a builtin call
+// here, otherwise a genuine builtin call would be kept and then mis-resolved to
+// that cross-package func. This is the Go analogue of the Python
+// (_resolve_local_function) and C (_resolve_same_file) parsers' same-file scoping.
+func (c *CallGraphBuilder) userFuncInScope(funcName, currentFile string) bool {
+	suffix := ":" + funcName
+	// Priority 1: same file.
+	for _, funcID := range c.functionsByFile[currentFile] {
+		if strings.HasSuffix(funcID, suffix) {
+			return true
+		}
+	}
+	// Priority 2: same package (a different file in the same directory).
+	currentDir := filepath.Dir(currentFile)
+	for file, funcs := range c.functionsByFile {
+		if filepath.Dir(file) != currentDir {
+			continue
+		}
+		for _, funcID := range funcs {
+			if strings.HasSuffix(funcID, suffix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *CallGraphBuilder) resolveSimpleCall(funcName, currentFile, currentPkg string) string {
