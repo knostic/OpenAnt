@@ -7,6 +7,7 @@ explicitly, preventing ``'charmap' codec can't decode byte ...`` errors.
 """
 
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -32,6 +33,48 @@ def read_json(path: PathLike) -> Any:
     """Read and parse a JSON file using UTF-8 encoding."""
     with open_utf8(path, "r") as f:
         return json.load(f)
+
+
+def normalize_results(obj: Any, key: str = "results") -> Any:
+    """Normalize a model-produced results container at the trust boundary.
+
+    OpenAnt reads JSON emitted by an LLM (experiment_results.json,
+    dynamic_test_results.json). A non-Anthropic model can emit a NON-DICT
+    element (bare string/number/None/list) inside the ``results`` array, or a
+    non-list value for ``results`` itself. Downstream code iterates that array
+    doing ``r.get(...)`` in ~20 places; a non-dict element raises
+    ``AttributeError`` and aborts verify/report/CSV.
+
+    Rather than guard every per-loop read (which was tried in fa15/fa16 and
+    missed the upstream verifier and dynamic paths — per-loop guards do not
+    converge), normalize ONCE at each load boundary: mutate ``obj[key]`` in
+    place so it is always a list containing only dicts. Every downstream
+    iterator AND count (e.g. ``len(obj["results"])``) then sees the same
+    filtered list. fa15/fa16 per-loop guards become harmless defense-in-depth.
+
+    Mutates ``obj`` in place and also returns it for convenience.
+    """
+    raw = obj.get(key, []) if isinstance(obj, dict) else []
+    if isinstance(obj, dict):
+        if isinstance(raw, list):
+            kept = [r for r in raw if isinstance(r, dict)]
+            dropped = len(raw) - len(kept)
+        else:
+            kept = []
+            dropped = 0 if raw in (None, [], {}, "") else 1
+        obj[key] = kept
+        if dropped:
+            # QUARANTINE-NOT-DROP (recall safety — a SAST tool must never silently
+            # lose a finding): a dropped non-dict element could be a half-emitted
+            # sink. Surface the count on the object AND log fail-LOUD so malformed
+            # model output is visible, never a silent false-negative.
+            obj[f"_{key}_invalid_dropped"] = obj.get(f"_{key}_invalid_dropped", 0) + dropped
+            logging.getLogger("openant.normalize").warning(
+                "normalize_results: dropped %d non-dict element(s) from %r — "
+                "malformed model output (surfaced as _%s_invalid_dropped)",
+                dropped, key, key,
+            )
+    return obj
 
 
 def write_json(path: PathLike, data: Any, **kwargs) -> None:

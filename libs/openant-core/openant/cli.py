@@ -23,7 +23,7 @@ import sys
 import tempfile
 
 from core.verdict_taxonomy import FINDING_VERDICT_ORDER
-from utilities.file_io import read_json
+from utilities.file_io import normalize_results, read_json
 
 
 def _output_json(data: dict):
@@ -290,6 +290,9 @@ def cmd_analyze(args):
                         repo_path=args.repo_path,
                         workers=args.workers,
                         backoff_seconds=args.backoff,
+                        # Propagate --llm-config so the chained verify stage
+                        # uses the same configured model as analyze, not the default.
+                        llm_config_name=args.llm_config,
                     )
 
                     vctx.summary = {
@@ -630,6 +633,11 @@ def cmd_report_data(args):
         }) as ctx:
             # Load data
             experiment = read_json(results_path)
+            # fa17 TRUST BOUNDARY: normalize model-supplied `results` to dicts-only
+            # once at load. This also fixes the total_units stat below —
+            # `len(experiment.get("results", []))` now counts the filtered list
+            # (matching len(findings)) instead of the raw, poisoned array.
+            normalize_results(experiment)
             dataset = read_json(dataset_path)
 
             # --- Load dynamic test results if available ---
@@ -641,7 +649,16 @@ def cmd_report_data(args):
             po_path = os.path.join(results_dir, "pipeline_output.json")
             if os.path.exists(dt_path) and os.path.exists(po_path):
                 dt_data = read_json(dt_path)
+                # fa17 TRUST BOUNDARY: dynamic_test_results.json is a separate
+                # model-supplied schema; normalize its `results` to dicts-only so
+                # the `for dr in dt_data.get("results", [])` loop below is safe.
+                normalize_results(dt_data)
                 po_data = read_json(po_path)
+                # fa18 TRUST BOUNDARY: normalize model `findings` from
+                # pipeline_output.json to dicts-only at load (presence-guarded)
+                # so the `finding.get("id")` mapping loop below is safe.
+                if "findings" in po_data:
+                    normalize_results(po_data, "findings")
 
                 # Map VULN-ID → route_key from pipeline_output
                 vuln_id_to_route = {}
@@ -679,9 +696,16 @@ def cmd_report_data(args):
             file_verdicts = {}
             findings = []
 
-            for result in experiment.get("results", []):
+            # FAM-ROBUST (fa16): `results` is model-supplied; a non-Anthropic
+            # model can emit a bare string/number where a result dict is
+            # expected. Drop non-dict elements at loop entry so every `.get()`
+            # below is safe (mirrors the fa15 guard in core/reporter.py).
+            for result in [r for r in experiment.get("results", []) if isinstance(r, dict)]:
                 route_key = result.get("route_key", "")
-                verdict = result.get("finding", "")
+                # Fall back to the raw ``verdict`` field when ``finding`` is
+                # absent, else finding-less vulnerable results are dropped from
+                # the count. Mirrors the canonical read in reporter.py.
+                verdict = str(result.get("finding") or result.get("verdict", "")).lower()
                 file_path = route_key.rsplit(":", 1)[0] if ":" in route_key else route_key
                 unit = units_by_id.get(route_key, {})
                 llm_context = unit.get("llm_context") or {}

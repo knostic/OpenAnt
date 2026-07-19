@@ -13,7 +13,7 @@ import sys
 from core.schemas import DynamicTestStepResult, UsageInfo
 from core.verdict_taxonomy import DYNAMIC_TESTABLE
 from core import tracking
-from utilities.file_io import read_json, write_json
+from utilities.file_io import normalize_results, read_json, write_json
 
 
 def run_tests(
@@ -59,6 +59,10 @@ def run_tests(
 
     # Check how many findings to test
     pipeline_data = read_json(pipeline_output_path)
+    # fa18 TRUST BOUNDARY: normalize model `findings` to dicts-only at load
+    # (presence-guarded) so the testability filter's `f.get(...)` is safe.
+    if "findings" in pipeline_data:
+        normalize_results(pipeline_data, "findings")
     findings = pipeline_data.get("findings", [])
     testable = [
         f for f in findings

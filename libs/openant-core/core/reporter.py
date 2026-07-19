@@ -20,7 +20,7 @@ from pathlib import Path
 
 from core.schemas import ReportResult
 from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
-from utilities.file_io import open_utf8, read_json, write_json
+from utilities.file_io import normalize_results, open_utf8, read_json, write_json
 
 # Root of openant-core
 _CORE_ROOT = Path(__file__).parent.parent
@@ -153,6 +153,13 @@ def _dedup_caller_callee(
     because CWE is stable across runs while attack_vector varies.
     CWE-0 (unknown) never matches — two unknowns shouldn't collapse.
     """
+    # FAM-ROBUST: `confirmed` and `all_results` are model-supplied lists. A
+    # non-Anthropic model can emit a bare string/number where a finding dict
+    # is expected; drop non-dict elements up front so every `.get()` below —
+    # and this helper when called standalone — is safe.
+    confirmed = [f for f in confirmed if isinstance(f, dict)]
+    all_results = [r for r in all_results if isinstance(r, dict)]
+
     if not os.path.isfile(call_graph_path):
         return confirmed
 
@@ -241,7 +248,25 @@ def build_pipeline_output(
     print(f"[Report] Building pipeline_output.json...", file=sys.stderr)
 
     experiment = read_json(results_path)
-    all_results = experiment.get("results", [])
+    # fa17 TRUST BOUNDARY: normalize model-supplied `results` to dicts-only once
+    # at load so every downstream count/iterator sees the same filtered list.
+    normalize_results(experiment)
+    # fa18 TRUST BOUNDARY: `confirmed_findings` shares this same
+    # results_verified.json trust boundary and is iterated with `finding.get(...)`
+    # below (and inside _dedup_caller_callee). Normalize it to dicts-only at the
+    # same load point so a non-list value (which fa15's `[c for c in confirmed]`
+    # guard would raise TypeError on) or non-dict elements can't crash the build.
+    # Guard on presence: an ABSENT key must stay absent so the `confirmed is None`
+    # fallback below (manual filter from `results`) still fires -- materializing
+    # it to [] would silently skip that fallback.
+    if "confirmed_findings" in experiment:
+        normalize_results(experiment, "confirmed_findings")
+    # FAM-ROBUST (fa15/fa16, kept as defense-in-depth): `results` is
+    # model-supplied; a non-Anthropic model can emit a bare string/number where a
+    # result dict is expected. Drop non-dict elements once at the entry so the
+    # confirmed filter and the full_result `next(...)` lookup below never call
+    # `.get()` on a non-dict.
+    all_results = [r for r in experiment.get("results", []) if isinstance(r, dict)]
     code_by_route = experiment.get("code_by_route", {})
     metrics = experiment.get("metrics", {})
 
@@ -256,6 +281,11 @@ def build_pipeline_output(
             r for r in all_results
             if str(r.get("finding") or r.get("verdict", "")).lower() in ("vulnerable", "bypassable")
         ]
+
+    # FAM-ROBUST: the `confirmed_findings` (verified-results) path comes straight
+    # from model output and may contain non-dict elements; drop them before the
+    # top-level `for finding in confirmed` loop `.get()`s each element.
+    confirmed = [c for c in confirmed if isinstance(c, dict)]
 
     # ---------------------------------------------------------------
     # Dedup: collapse caller/callee pairs that share the same attack
@@ -281,7 +311,11 @@ def build_pipeline_output(
 
         # Extract vulnerability details from nested structure if present
         vulns = finding.get("vulnerabilities", [])
-        vuln = vulns[0] if vulns else {}
+        # Truthiness only proves the list is non-empty, not that its first
+        # element is a dict. A model can return vulnerabilities=["str"]; guard
+        # the element with isinstance so the vuln.get(...) reads below can't
+        # raise AttributeError. Same defensive-coercion class as _coerce_to_str.
+        vuln = vulns[0] if vulns and isinstance(vulns[0], dict) else {}
 
         description = (
             vuln.get("description")
@@ -308,7 +342,12 @@ def build_pipeline_output(
             parts = []
             if finding.get("attack_vector"):
                 parts.append(_coerce_to_str(finding["attack_vector"]))
-            exploit_path = finding.get("exploit_path") or {}
+            # ``or {}`` only substitutes for FALSY values; a truthy non-dict
+            # exploit_path (a string/list, which non-Anthropic models emit)
+            # would slip through and crash ``.get``. Guard the type too.
+            exploit_path = finding.get("exploit_path")
+            if not isinstance(exploit_path, dict):
+                exploit_path = {}
             data_flow = exploit_path.get("data_flow")
             if data_flow:
                 # ``data_flow`` is meant to be ``list[str]`` (verify
@@ -339,6 +378,12 @@ def build_pipeline_output(
         # Map incomplete → "unverified" so it renders distinctly and stays
         # disclosure-eligible (surfaced for manual review).
         verification = finding.get("verification", {})
+        # A non-Anthropic model can return ``verification`` as a truthy
+        # non-dict (e.g. the string "agreed"); the ``.get`` calls below
+        # would raise AttributeError and crash report generation. Coerce
+        # to an empty dict — same read-side guard as exploit_path / M3.
+        if not isinstance(verification, dict):
+            verification = {}
         if verification.get("agree", False):
             stage2_verdict = "confirmed" if finding.get("exploit_path") else "agreed"
         elif verification.get("incomplete"):
@@ -532,6 +577,14 @@ def generate_summary_report(
     print("[Report] Generating summary report (LLM)...", file=sys.stderr)
 
     pipeline_data = read_json(results_path)
+    # fa18 TRUST BOUNDARY: `findings` is a model array-of-dict read back from
+    # pipeline_output.json; merge_dynamic_results (below) and the summary
+    # compaction iterate it with `finding.get(...)`. Normalize to dicts-only
+    # once at this load, BEFORE the merge, so a non-dict element can't crash.
+    # Guard on presence so an absent `findings` still trips validation's
+    # "missing required field" check rather than silently validating as empty.
+    if "findings" in pipeline_data:
+        normalize_results(pipeline_data, "findings")
     # Merge dynamic test results if available
     pipeline_data = merge_dynamic_results(pipeline_data, results_path)
 
@@ -595,6 +648,12 @@ def generate_disclosure_docs(
     print("[Report] Generating disclosure documents (LLM)...", file=sys.stderr)
 
     pipeline_data = read_json(results_path)
+    # fa18 TRUST BOUNDARY: normalize model `findings` to dicts-only at load,
+    # BEFORE merge_dynamic_results / the disclosure-eligibility enumerate below,
+    # so a non-dict element can't crash `finding.get("stage2_verdict")`.
+    # Presence-guarded (see generate_summary_report for rationale).
+    if "findings" in pipeline_data:
+        normalize_results(pipeline_data, "findings")
     # Merge dynamic test results if available
     pipeline_data = merge_dynamic_results(pipeline_data, results_path)
 
