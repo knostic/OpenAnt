@@ -66,7 +66,22 @@ class RepositoryScanner:
         directories_scanned = 0
         directories_excluded = 0
 
-        for root, dirs, filenames in os.walk(self.repo_path):
+        # followlinks=True so .zig files reachable ONLY through a symlinked
+        # directory are still scanned (matches the iterdir()+is_dir() behaviour
+        # of the other four language scanners). Following symlinks needs a guard
+        # against two hazards, applied by pruning directory symlinks from `dirs`
+        # (os.walk descends whatever remains in `dirs`):
+        #   1. Alias duplication / canonical loss: a symlink pointing back INSIDE
+        #      the repo names a real directory that os.walk already reaches on its
+        #      canonical (non-symlink) path. Descending the alias would emit files
+        #      under the symlink path and, worse, could suppress the real path
+        #      entirely. We always drop the alias and keep the canonical visit.
+        #   2. External symlink loops: a symlink pointing OUTSIDE the repo whose
+        #      real target we have already descended (a self-referential loop)
+        #      would recurse forever; an inode guard prevents re-descending it.
+        seen_real_dirs: set = set()
+        repo_real = os.path.realpath(self.repo_path)
+        for root, dirs, filenames in os.walk(self.repo_path, followlinks=True):
             # Filter out excluded directories
             original_dirs = dirs.copy()
             dirs[:] = [
@@ -77,10 +92,35 @@ class RepositoryScanner:
                 and not (self.skip_tests and self._is_test_directory(d))
             ]
             directories_excluded += len(original_dirs) - len(dirs)
+
+            # Cycle / alias guard on the surviving directory symlinks.
+            kept = []
+            for d in dirs:
+                full = os.path.join(root, d)
+                if os.path.islink(full):
+                    real = os.path.realpath(full)
+                    # In-repo alias: the real directory is walked canonically,
+                    # so never descend the symlink (prefer the canonical path).
+                    if real == repo_real or real.startswith(repo_real + os.sep):
+                        continue
+                    # External target: guard against symlink loops by inode.
+                    try:
+                        st = os.stat(full)
+                        real_key = (st.st_dev, st.st_ino)
+                    except OSError:
+                        continue
+                    if real_key in seen_real_dirs:
+                        continue
+                    seen_real_dirs.add(real_key)
+                kept.append(d)
+            dirs[:] = kept
+
             directories_scanned += 1
 
             for filename in filenames:
-                if not filename.endswith(".zig"):
+                # Case-insensitive: filesystems (macOS/Windows) and users may
+                # spell the extension .ZIG/.Zig; skipping those silently loses files.
+                if not filename.lower().endswith(".zig"):
                     continue
 
                 file_path = Path(root) / filename
