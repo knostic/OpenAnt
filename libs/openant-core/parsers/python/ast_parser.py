@@ -97,7 +97,8 @@ class PythonRouteParser:
             return "", 0, 0
 
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            # async def handlers (aiohttp/FastAPI/Flask 2.x) are AsyncFunctionDef, not FunctionDef.
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
                 lines = content.split('\n')
                 start = node.lineno - 1
                 end = node.end_lineno if hasattr(node, 'end_lineno') else start + 10
@@ -286,7 +287,8 @@ class PythonRouteParser:
 
         # Find route decorators
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
+            # async def route handlers (Flask 2.x) are AsyncFunctionDef, not FunctionDef.
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 route_info = self._extract_flask_route_decorator(node)
                 if route_info:
                     path, methods = route_info
@@ -315,7 +317,7 @@ class PythonRouteParser:
                         )
                         self.routes.append(unit)
 
-    def _extract_flask_route_decorator(self, func_node: ast.FunctionDef) -> Optional[Tuple[str, List[str]]]:
+    def _extract_flask_route_decorator(self, func_node) -> Optional[Tuple[str, List[str]]]:
         """Extract route path and methods from Flask decorators."""
         for decorator in func_node.decorator_list:
             if isinstance(decorator, ast.Call):
@@ -425,8 +427,8 @@ class PythonRouteParser:
         """Extract string value from an AST node."""
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return node.value
-        if isinstance(node, ast.Str):  # Python < 3.8
-            return node.s
+        # ast.Str was removed in CPython 3.12+; ast.Constant already covers str
+        # literals on all supported versions, so no legacy branch is needed.
         return None
 
     def _get_call_name(self, node) -> Optional[str]:
