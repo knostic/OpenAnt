@@ -29,7 +29,7 @@ import csv
 import json
 import os
 import sys
-from utilities.file_io import read_json
+from utilities.file_io import normalize_results, read_json
 
 # Characters that make a spreadsheet treat a cell as a formula on open (CSV / formula
 # injection, CWE-1236 / OWASP). Cells written from scanned source or LLM text must be
@@ -105,13 +105,14 @@ def get_stage1_verdict(result: dict) -> str:
                 return parts[i + 1]
 
     # If Stage 2 agreed, current finding is Stage 1's finding
+    # Fall back to 'verdict' so a verdict-only result exports its verdict, not blank.
     if verification.get('agree', True):
-        return result.get('finding', '')
+        return result.get('finding') or result.get('verdict', '')
 
     # If disagreed but no note, try to infer
     # The verification.correct_finding is Stage 2's, so current finding should be Stage 2's
     # This is a fallback - ideally verification_note should exist
-    return result.get('finding', '')
+    return result.get('finding') or result.get('verdict', '')
 
 
 def export_csv(experiment_path: str, dataset_path: str, output_path: str):
@@ -125,6 +126,10 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
     """
     # Load data
     experiment = load_json(experiment_path)
+    # fa17 TRUST BOUNDARY: normalize model-supplied `results` to dicts-only once
+    # at load so the CSV row loop below is safe (fa15/fa16 per-loop filter kept
+    # as defense-in-depth).
+    normalize_results(experiment)
     dataset = load_json(dataset_path)
 
     # Build unit lookup by ID
@@ -135,7 +140,11 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
 
     # Prepare CSV rows
     rows = []
-    for result in experiment.get('results', []):
+    # FAM-ROBUST (fa16): `results` is model-supplied; a non-Anthropic model can
+    # emit a bare string/number where a result dict is expected. Drop non-dict
+    # elements at loop entry so every `.get()` below is safe (mirrors the fa15
+    # guard in core/reporter.py).
+    for result in [r for r in experiment.get('results', []) if isinstance(r, dict)]:
         route_key = result.get('route_key', '')
 
         # Get unit data from dataset
@@ -158,7 +167,8 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
         stage1_verdict = get_stage1_verdict(result)
 
         # Stage 2 verdict is the final finding
-        stage2_verdict = result.get('finding', '')
+        # Fall back to 'verdict' so a verdict-only result exports its verdict, not blank.
+        stage2_verdict = result.get('finding') or result.get('verdict', '')
 
         # Build row
         row = {

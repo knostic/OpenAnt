@@ -177,6 +177,23 @@ class TestBuildPipelineOutputCoercion:
         steps = out["findings"][0]["steps_to_reproduce"] or ""
         assert "no input validation" in steps
 
+    def test_truthy_nondict_verification_does_not_crash(self, tmp_path):
+        # A non-Anthropic model can return ``verification`` as a bare
+        # string (e.g. "agreed") where the schema expects a dict. The
+        # verdict block did ``verification.get("agree")`` unguarded,
+        # which raised AttributeError on any truthy non-dict and crashed
+        # build_pipeline_output. Same read-side coercion concern as the
+        # exploit_path / M3 fixes in this file.
+        out = _run_build(tmp_path, finding={
+            "attack_vector": "GET /user?id=evil",
+            "verification": "agreed",
+        })
+        assert len(out["findings"]) == 1
+        # A non-dict verification coerces to ``{}`` (falsy), carrying no
+        # ``agree``/``incomplete`` flag, so the verdict falls through to
+        # the Stage-1 default rather than crashing.
+        assert out["findings"][0]["stage2_verdict"] == "vulnerable"
+
     def test_string_fields_unchanged_after_fix(self, tmp_path):
         # Anthropic still returns clean strings; coercion must be
         # a no-op for the common case (no spurious quoting / wrapping).

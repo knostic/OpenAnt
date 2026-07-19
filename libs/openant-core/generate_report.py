@@ -31,7 +31,7 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from core.verdict_taxonomy import FINDING_VERDICT_ORDER
-from utilities.file_io import read_json
+from utilities.file_io import normalize_results, read_json
 from utilities.llm import (
     build_phase_registry,
     load_config_file,
@@ -147,7 +147,11 @@ def prepare_findings_summary(experiment: dict, dataset: dict) -> list:
     units_by_id = {u['id']: u for u in dataset.get('units', [])}
 
     findings = []
-    for result in experiment.get('results', []):
+    # FAM-ROBUST (fa16): `results` is model-supplied; a non-Anthropic model can
+    # emit a bare string/number where a result dict is expected. Drop non-dict
+    # elements at loop entry so every `.get()` below is safe (mirrors the fa15
+    # guard in core/reporter.py).
+    for result in [r for r in experiment.get('results', []) if isinstance(r, dict)]:
         route_key = result.get('route_key', '')
         unit = units_by_id.get(route_key, {})
         llm_context = unit.get('llm_context') or {}
@@ -156,7 +160,9 @@ def prepare_findings_summary(experiment: dict, dataset: dict) -> list:
         findings.append({
             'file': extract_file(route_key),
             'unit_id': route_key,
-            'verdict': result.get('finding', ''),
+            # Fall back to raw ``verdict`` when ``finding`` is absent (see
+            # verdict-count site below); keeps finding-less vulns actionable.
+            'verdict': str(result.get('finding') or result.get('verdict', '')).lower(),
             'attack_vector': result.get('attack_vector', ''),
             'stage1_reasoning': result.get('reasoning', ''),
             'stage2_explanation': verification.get('explanation', ''),
@@ -303,9 +309,16 @@ def generate_html_report(
     file_verdicts = {}  # file -> worst verdict
     findings_data = []
 
-    for result in experiment.get('results', []):
+    # FAM-ROBUST (fa16): `results` is model-supplied; a non-Anthropic model can
+    # emit a bare string/number where a result dict is expected. Drop non-dict
+    # elements at loop entry so every `.get()` below is safe (mirrors the fa15
+    # guard in core/reporter.py).
+    for result in [r for r in experiment.get('results', []) if isinstance(r, dict)]:
         route_key = result.get('route_key', '')
-        verdict = result.get('finding', '')
+        # Fall back to the raw ``verdict`` field when a result has no normalized
+        # ``finding`` key, else finding-less vulnerable results are dropped from
+        # the count. Mirrors the canonical read in reporter.py / verifier.py.
+        verdict = str(result.get('finding') or result.get('verdict', '')).lower()
         file_path = extract_file(route_key)
         unit = units_by_id.get(route_key, {})
         llm_context = unit.get('llm_context') or {}
@@ -822,6 +835,10 @@ def main():
 
     print("Loading data...")
     experiment = load_json(args.experiment)
+    # fa17 TRUST BOUNDARY: normalize model-supplied `results` to dicts-only once
+    # at load. `experiment` is passed by reference into prepare_findings_summary
+    # and generate_html_report, so both iterators see the filtered list.
+    normalize_results(experiment)
     dataset = load_json(args.dataset)
 
     # Load step reports if available

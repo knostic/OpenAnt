@@ -15,7 +15,7 @@ from pathlib import Path
 from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
 from .generator import generate_summary_report, generate_disclosure, generate_all
 from .schema import validate_pipeline_output, ValidationError
-from utilities.file_io import open_utf8, read_json
+from utilities.file_io import normalize_results, open_utf8, read_json
 from utilities.llm import (
     PhaseBinding,
     build_phase_registry,
@@ -44,6 +44,10 @@ def _build_report_binding(llm_config_name: str | None = None) -> PhaseBinding:
 def cmd_summary(args):
     """Generate summary report."""
     pipeline_data = read_json(args.input)
+    # fa18 TRUST BOUNDARY: normalize model `findings` to dicts-only at load
+    # (presence-guarded) before validation / iteration.
+    if "findings" in pipeline_data:
+        normalize_results(pipeline_data, "findings")
 
     try:
         validate_pipeline_output(pipeline_data)
@@ -67,6 +71,10 @@ def cmd_summary(args):
 def cmd_disclosures(args):
     """Generate disclosure documents."""
     pipeline_data = read_json(args.input)
+    # fa18 TRUST BOUNDARY: normalize model `findings` to dicts-only at load
+    # (presence-guarded) before validation / the disclosure enumerate.
+    if "findings" in pipeline_data:
+        normalize_results(pipeline_data, "findings")
 
     try:
         validate_pipeline_output(pipeline_data)

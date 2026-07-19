@@ -26,7 +26,7 @@ from utilities.llm import (
     load_config_file,
     resolve_llm_config,
 )
-from utilities.file_io import read_json, write_json
+from utilities.file_io import normalize_results, read_json, write_json
 from utilities.finding_verifier import FindingVerifier
 from utilities.agentic_enhancer.repository_index import load_index_from_file
 
@@ -90,6 +90,11 @@ def run_verification(
     # Load Stage 1 results
     print(f"[Verify] Loading results: {results_path}", file=sys.stderr)
     experiment = read_json(results_path)
+    # fa17 TRUST BOUNDARY: `results` is model-supplied; drop non-dict elements
+    # once here so the vulnerable_results filter below (and every downstream
+    # r.get()) is safe. Verify runs BEFORE report, so this is the first place a
+    # poisoned result would crash — normalizing per-loop missed it (fa15/fa16).
+    normalize_results(experiment)
     all_results = experiment.get("results", [])
     code_by_route = experiment.get("code_by_route", {})
 
@@ -278,11 +283,26 @@ def _count_verification_outcomes(verified_results: list) -> dict:
             continue
         if verification.get("agree", False):
             counts["agreed"] += 1
-            finding = r.get("finding", "").lower()
+            # Canonical read (matches :99 input filter): fall back to `verdict`
+            # so a verdict-only VULNERABLE result is not silently dropped.
+            finding = str(r.get("finding") or r.get("verdict", "")).lower()
             if finding in ("vulnerable", "bypassable"):
                 counts["confirmed_vulnerabilities"] += 1
         else:
-            counts["disagreed"] += 1
+            # Stage 2 disagreed. finding_verifier has already written the
+            # corrected verdict onto ``r["finding"]`` (= correct_finding). A
+            # disagreement only folds into ``safe`` (``safe += disagreed``) when
+            # that corrected verdict is itself non-vulnerable. If the verifier
+            # disagreed but the finding is STILL vulnerable/bypassable (e.g.
+            # vulnerable -> bypassable), it is a confirmed vulnerability, NOT
+            # safe — counting it as ``disagreed`` would under-report the vuln.
+            # Canonical read (matches :99 input filter): fall back to `verdict`
+            # so a verdict-only VULNERABLE disagreement is not silently dropped.
+            finding = str(r.get("finding") or r.get("verdict", "")).lower()
+            if finding in ("vulnerable", "bypassable"):
+                counts["confirmed_vulnerabilities"] += 1
+            else:
+                counts["disagreed"] += 1
     return counts
 
 
@@ -306,7 +326,9 @@ def _write_verified_results(
         # must not be dropped.
         "confirmed_findings": [
             r for r in verified_only
-            if r.get("finding", "").lower() in ("vulnerable", "bypassable")
+            # Canonical read (matches :99 input filter): fall back to `verdict`.
+            if str(r.get("finding") or r.get("verdict", "")).lower()
+            in ("vulnerable", "bypassable")
         ],
     }
 
@@ -316,7 +338,9 @@ def _write_verified_results(
         "protected": 0, "safe": 0, "errors": 0,
     }
     for r in merged_results:
-        finding = r.get("finding", r.get("verdict", "error").lower())
+        # Canonical read: lowercase a PRESENT finding too (not only the
+        # verdict/default), so a verdict-only result is classified correctly.
+        finding = str(r.get("finding") or r.get("verdict") or "error").lower()
         if finding in counts:
             counts[finding] += 1
         elif r.get("verdict") == "ERROR":

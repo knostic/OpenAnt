@@ -26,7 +26,7 @@ from utilities.llm import (
     load_config_file,
     resolve_llm_config,
 )
-from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import normalize_results, read_json, write_json, open_utf8
 
 
 def run_dynamic_tests(
@@ -66,7 +66,19 @@ def run_dynamic_tests(
 
     # Load pipeline output
     pipeline = read_json(pipeline_output_path)
+    # fa18 TRUST BOUNDARY: normalize model `findings` to dicts-only at load
+    # (presence-guarded) so the DYNAMIC_TESTABLE filter's `f.get(...)` is safe.
+    if "findings" in pipeline:
+        normalize_results(pipeline, "findings")
     findings = pipeline.get("findings", [])
+    # Enforce the dynamic-testability filter at the execution site. Only
+    # findings asserted vulnerable are worth an active Docker reproduction;
+    # core/dynamic_tester.py computes the same filter for reporting, but the
+    # per-finding loop lives here, so without this every finding (regardless
+    # of stage2_verdict) was dynamically tested anyway.
+    from core.verdict_taxonomy import DYNAMIC_TESTABLE
+    findings = [f for f in findings
+                if f.get("stage2_verdict") in DYNAMIC_TESTABLE]
     repo_info = {
         "name": pipeline.get("repository", {}).get("name", "unknown"),
         "language": pipeline.get("repository", {}).get("language", "Python"),

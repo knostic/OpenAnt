@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
 from .schema import validate_pipeline_output, ValidationError
-from utilities.file_io import open_utf8, read_json
+from utilities.file_io import normalize_results, open_utf8, read_json
 from utilities.llm import (
     PhaseBinding,
     PhaseRegistry,
@@ -93,6 +93,10 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
         return pipeline_data
 
     dynamic_data = read_json(dynamic_path)
+    # fa17 TRUST BOUNDARY: dynamic_test_results.json `results` is model-supplied;
+    # normalize to dicts-only once so the `result.get("finding_id")` loop below
+    # never calls `.get()` on a bare string/number.
+    normalize_results(dynamic_data)
     results_by_id = {}
     for result in dynamic_data.get("results", []):
         fid = result.get("finding_id")
@@ -284,6 +288,12 @@ def generate_all(
 ) -> None:
     """Generate all reports from a pipeline output file."""
     pipeline_data = read_json(pipeline_path)
+    # fa18 TRUST BOUNDARY: normalize model `findings` to dicts-only once at load
+    # so the summary compaction and the disclosure enumerate below iterate
+    # dicts-only. Presence-guarded so an absent `findings` still fails
+    # validate_pipeline_output's "missing required field" check.
+    if "findings" in pipeline_data:
+        normalize_results(pipeline_data, "findings")
 
     try:
         validate_pipeline_output(pipeline_data)
