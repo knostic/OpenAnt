@@ -209,6 +209,32 @@ class CallGraphBuilder:
 
         return calls
 
+    # Nodes that open a new lexical scope; their local names are separate bindings.
+    _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+    def _walk_current_scope(self, tree: ast.AST):
+        """Yield nodes in the caller's own scope, NOT descending into nested scopes.
+
+        ``tree`` is the parsed caller source: ``Module([FunctionDef(caller)])`` for a
+        function (enter that def's frame) or bare module statements. We walk the caller's
+        frame but stop at any further nested function/lambda/class, whose locals are
+        distinct variables that must not leak into (or out of) the caller's frame.
+        """
+        stack: List[ast.AST] = []
+        for child in ast.iter_child_nodes(tree):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.extend(child.body)  # enter the top-level caller's own frame
+            elif isinstance(child, ast.ClassDef):
+                continue                  # a class body is its own scope, not the caller's
+            else:
+                stack.append(child)       # module-level statement in the caller's frame
+        while stack:
+            node = stack.pop()
+            yield node
+            if isinstance(node, self._SCOPE_NODES):
+                continue                  # do not cross into a nested scope
+            stack.extend(ast.iter_child_nodes(node))
+
     def _collect_local_types(self, tree: ast.AST) -> Dict[str, str]:
         """Map local variable names to the class name they are constructed from.
 
@@ -216,10 +242,15 @@ class CallGraphBuilder:
         right-hand side is a direct call of a bare Name (the constructor). Used to resolve
         ``var.method()`` against the constructed type. If the same
         name is rebound to different types, it is treated as ambiguous and dropped.
+
+        Collection is scoped to the caller's OWN lexical frame: a same-named variable
+        constructed in a nested function/lambda/class is a DIFFERENT binding, so
+        descending into those scopes (as a flat ast.walk would) leaks an inner type onto
+        the outer same-named var and misdirects its method-call edges.
         """
         types: Dict[str, str] = {}
         ambiguous: Set[str] = set()
-        for node in ast.walk(tree):
+        for node in self._walk_current_scope(tree):
             if not isinstance(node, ast.Assign):
                 continue
             value = node.value
@@ -407,7 +438,24 @@ class CallGraphBuilder:
                 return local
             if self._is_builtin(func_name):
                 return None
-            return self._resolve_simple_call(func_name, caller_file)
+            resolved = self._resolve_simple_call(func_name, caller_file)
+            if resolved:
+                return resolved
+            # Constructor call FALLBACK: `ClassName(...)` is a real call to that
+            # class's __init__. This runs ONLY AFTER _resolve_simple_call (which
+            # consults same-file functions, the import map, and the cross-file
+            # function index) returns None, so a genuine import/function binding
+            # always wins. Ordering matters: an imported FACTORY FUNCTION named
+            # like a class (e.g. `from b import Widget` where b.Widget is a
+            # function, while some other file has `class Widget`) must resolve to
+            # the function, NOT to the class's __init__ -- running ctor first
+            # PREEMPTED import resolution and dropped the true edge (S2:
+            # additive emission that lowers reachability via preemption). An
+            # imported CLASS ctor still resolves here, because _resolve_simple_call
+            # returns None for a name that isn't a function. Without this fallback
+            # the constructor call resolved to no function at all and the
+            # __init__ edge was dropped from reachability entirely.
+            return self._resolve_class_method(func_name, '__init__', caller_file)
 
         # Method call: obj.method(...)
         elif isinstance(func, ast.Attribute):
@@ -464,8 +512,13 @@ class CallGraphBuilder:
 
         # 3. Check by simple name across files (single match only)
         candidates = self.functions_by_name.get(func_name, [])
-        # Filter to non-method functions
-        candidates = [c for c in candidates if not self.functions.get(c, {}).get('class_name')]
+        # Filter to non-method functions. Also exclude module-level lambdas
+        # (`name = lambda ...`): a lambda binding is module-LOCAL, reachable only
+        # same-file (step 1) or via explicit import (step 2), so a bare cross-file
+        # name must not resolve to it here or the uniqueness gate poisons the edge.
+        candidates = [c for c in candidates
+                      if not self.functions.get(c, {}).get('class_name')
+                      and not self.functions.get(c, {}).get('is_lambda')]
         if len(candidates) == 1:
             return candidates[0]
 
