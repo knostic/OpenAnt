@@ -683,7 +683,9 @@ def scan_repository(
             outputs = {}
 
             try:
-                generate_summary_report(pipeline_output_path, summary_path)
+                # Thread the scan's --llm-config through to the report phase
+                # (else it silently falls back to the file's default_llm).
+                generate_summary_report(pipeline_output_path, summary_path, llm_config_name)
                 result.summary_path = summary_path
                 outputs["summary_path"] = summary_path
                 print(f"  Summary: {summary_path}", file=sys.stderr)
@@ -694,7 +696,7 @@ def scan_repository(
             # Only generate disclosures if there are findings
             if has_findings:
                 try:
-                    generate_disclosure_docs(pipeline_output_path, disclosures_dir)
+                    generate_disclosure_docs(pipeline_output_path, disclosures_dir, llm_config_name)
                     outputs["disclosures_dir"] = disclosures_dir
                     print(f"  Disclosures: {disclosures_dir}", file=sys.stderr)
                 except Exception as e:
