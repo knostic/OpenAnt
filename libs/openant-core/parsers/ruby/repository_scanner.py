@@ -101,10 +101,19 @@ class RepositoryScanner:
             'directories_scanned': 0,
             'directories_excluded': 0,
             'test_files_skipped': 0,
+            # Directories whose contents could not be read (permission/OS error);
+            # every file under them is silently dropped, so surface the count in
+            # the structured result — not only on stderr — for consumers.
+            'directories_read_failed': 0,
         }
 
         # Results
         self.files: List[Dict] = []
+
+        # Cycle guard: (st_dev, st_ino) of every directory already descended
+        # into, so a symlink loop back to an ancestor does not cause infinite
+        # recursion / duplicate scanning.
+        self._visited_dirs: Set = set()
 
     def should_exclude_directory(self, dir_name: str) -> bool:
         """Check if a directory should be excluded."""
@@ -140,14 +149,30 @@ class RepositoryScanner:
 
     def scan_directory(self, dir_path: Path, relative_path: str = '') -> None:
         """Recursively scan a directory."""
+        # Cycle guard: identify the directory by (device, inode) and bail if we
+        # have already descended into it. Without this a directory symlink that
+        # points back at an ancestor loops forever (RecursionError / duplicates).
+        try:
+            st = dir_path.stat()
+            dir_key = (st.st_dev, st.st_ino)
+        except OSError:
+            dir_key = None
+        if dir_key is not None:
+            if dir_key in self._visited_dirs:
+                return
+            self._visited_dirs.add(dir_key)
+
         self.stats['directories_scanned'] += 1
 
         try:
             entries = list(dir_path.iterdir())
         except PermissionError:
+            # Record the drop in the structured result, not only on stderr.
+            self.stats['directories_read_failed'] += 1
             print(f"Warning: Cannot read directory {dir_path}: Permission denied", file=sys.stderr)
             return
         except Exception as e:
+            self.stats['directories_read_failed'] += 1
             print(f"Warning: Cannot read directory {dir_path}: {e}", file=sys.stderr)
             return
 
@@ -192,12 +217,14 @@ class RepositoryScanner:
 
         # Reset state
         self.files = []
+        self._visited_dirs = set()
         self.stats = {
             'total_files': 0,
             'total_size_bytes': 0,
             'directories_scanned': 0,
             'directories_excluded': 0,
             'test_files_skipped': 0,
+            'directories_read_failed': 0,
         }
 
         # Run scan
