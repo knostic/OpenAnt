@@ -4,6 +4,7 @@ Stage 3: Call Graph Builder for Zig
 Builds bidirectional call graphs showing function dependencies.
 """
 
+import posixpath
 import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set
@@ -154,7 +155,17 @@ class CallGraphBuilder:
 
         # Build per-file simple const fn-alias bindings (`const f = handler;`)
         # so that a later `f()` resolves to `handler`.
-        alias_to_target = self._build_alias_index(name_to_ids)
+        # Belt-and-suspenders: the alias index is an over-approximation AID, not
+        # essential to producing a call graph. The tree walks it drives are now
+        # iterative (no RecursionError), but any residual failure here must
+        # degrade GRACEFULLY to an empty alias map rather than abort the whole
+        # zig build -- `_resolve_call` reads it via `.get(caller_id, {})`, so an
+        # empty dict simply means no alias-based resolution (edges still form via
+        # every other path).
+        try:
+            alias_to_target = self._build_alias_index(name_to_ids)
+        except Exception:
+            alias_to_target = {}
 
         for func_id, func_info in self.functions.items():
             code = func_info.get("code", "")
@@ -316,41 +327,61 @@ class CallGraphBuilder:
         name_to_ids: Dict[str, List[str]],
         aliases: Dict[str, Set[str]],
     ) -> None:
-        """Collect `const <alias> = <known-fn>;` bindings from a parse tree."""
-        if node.type in ("variable_declaration", "VarDecl"):
-            ident_children = [
-                c for c in node.children if c.type in ("identifier", "IDENTIFIER")
-            ]
-            # A simple alias is exactly: const <alias> = <target-identifier>;
-            if len(ident_children) == 2:
-                alias_name = self._get_node_text(ident_children[0], source)
-                target_name = self._get_node_text(ident_children[1], source)
-                # Only record when the target is a known function name. A Zig
-                # `const` binding is immutable, but the SAME alias name can be
-                # declared on distinct control-flow paths within one function
-                # (`const doit = foo` in one branch, `= bar` in another).
-                # Accumulate every target in a set instead of last-wins
-                # overwriting, so a later `doit()` over-approximates to both.
-                if alias_name and target_name in name_to_ids:
-                    aliases.setdefault(alias_name, set()).add(target_name)
-            # Struct field-init fn pointers: `const h = T{ .cb = knownFn };` binds
-            # `h.cb` -> knownFn so a later `h.cb()` resolves. The first identifier
-            # child is the bound variable; the struct type name is nested inside the
-            # struct_initializer and is ignored.
-            if ident_children:
-                var_name = self._get_node_text(ident_children[0], source)
-                struct_init = next(
-                    (c for c in node.children
-                     if c.type in ("struct_initializer", "StructInit")),
-                    None,
-                )
-                if var_name and struct_init is not None:
-                    self._collect_field_fn_bindings(
-                        struct_init, source, name_to_ids, aliases, var_name
-                    )
+        """Collect `const <alias> = <known-fn>;` bindings from a parse tree.
 
-        for child in node.children:
-            self._collect_aliases_from_node(child, source, name_to_ids, aliases)
+        ITERATIVE walk over an explicit worklist stack -- deliberately NOT
+        self-recursive. A pathologically deep parse tree (deeply nested source)
+        would drive a recursive walker past Python's recursion limit and raise
+        RecursionError; because _build_alias_index invokes this walk OUTSIDE the
+        try/except that guards parsing, that error would propagate up and abort
+        the ENTIRE zig call-graph build. It is also ambient-stack-dependent (the
+        overflow point shifts with however many frames are already on the stack
+        at entry). The worklist form grows zero Python frames regardless of tree
+        depth or ambient stack, so it is robust for any AST and NEVER truncates.
+
+        This is a strict robustness improvement: it visits exactly the same
+        nodes and records exactly the same aliases as the prior recursive
+        version on real (shallow) Zig ASTs -- no behaviour change. (PR#87 marked
+        the sibling `_walk_node` recursion 'by-design'; this rewrite alters no
+        observable behaviour on real shallow ASTs, so it is safe to land
+        regardless of that annotation.)
+        """
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.type in ("variable_declaration", "VarDecl"):
+                ident_children = [
+                    c for c in current.children if c.type in ("identifier", "IDENTIFIER")
+                ]
+                # A simple alias is exactly: const <alias> = <target-identifier>;
+                if len(ident_children) == 2:
+                    alias_name = self._get_node_text(ident_children[0], source)
+                    target_name = self._get_node_text(ident_children[1], source)
+                    # Only record when the target is a known function name. A Zig
+                    # `const` binding is immutable, but the SAME alias name can be
+                    # declared on distinct control-flow paths within one function
+                    # (`const doit = foo` in one branch, `= bar` in another).
+                    # Accumulate every target in a set instead of last-wins
+                    # overwriting, so a later `doit()` over-approximates to both.
+                    if alias_name and target_name in name_to_ids:
+                        aliases.setdefault(alias_name, set()).add(target_name)
+                # Struct field-init fn pointers: `const h = T{ .cb = knownFn };` binds
+                # `h.cb` -> knownFn so a later `h.cb()` resolves. The first identifier
+                # child is the bound variable; the struct type name is nested inside the
+                # struct_initializer and is ignored.
+                if ident_children:
+                    var_name = self._get_node_text(ident_children[0], source)
+                    struct_init = next(
+                        (c for c in current.children
+                         if c.type in ("struct_initializer", "StructInit")),
+                        None,
+                    )
+                    if var_name and struct_init is not None:
+                        self._collect_field_fn_bindings(
+                            struct_init, source, name_to_ids, aliases, var_name
+                        )
+
+            stack.extend(current.children)
 
     def _collect_field_fn_bindings(
         self, struct_init, source, name_to_ids, aliases, var_name
@@ -439,31 +470,41 @@ class CallGraphBuilder:
     def _extract_calls_from_node(
         self, node: Node, source: bytes, calls: Set[str]
     ) -> None:
-        """Recursively extract call sites from AST nodes."""
-        if node.type in ("call_expression", "call_expr", "CallExpr"):
-            # The callee is the first child: an `identifier` for a plain call foo(), or a
-            # `field_expression` for a method/namespaced call obj.method() / mod.func().
-            callee = node.children[0] if node.children else None
-            if callee is not None and callee.type in ("identifier", "IDENTIFIER"):
-                calls.add(self._get_node_text(callee, source))
-            elif callee is not None and callee.type in ("field_expression", "field_access"):
-                # Carry the RECEIVER by keeping only the full dotted form
-                # (`recv.method`); the resolver splits it and dispatches on the
-                # receiver's static TYPE. Adding the bare method name here would
-                # independently over-connect to EVERY same-named method (the
-                # namespace-leak FP), defeating type-based dispatch. An un-typed
-                # receiver still resolves by unique/same-file bare-name fallback
-                # inside _resolve_call, so recall is preserved.
-                text = self._get_node_text(callee, source)
-                calls.add(text)  # full dotted `receiver.method`
-        elif node.type == "builtin_function":
-            # @call(.modifier, realFn, argsTuple): the wrapped function is the real call target;
-            # other @builtins are filtered out downstream.
-            self._extract_builtin_call_target(node, source, calls)
+        """Extract call sites from AST nodes.
 
-        # Recurse into children
-        for child in node.children:
-            self._extract_calls_from_node(child, source, calls)
+        ITERATIVE walk over an explicit worklist stack -- see
+        _collect_aliases_from_node for the full rationale. This is the DIRECT
+        TWIN of that walk and had the identical unbounded self-recursion; a
+        pathologically deep parse tree could overflow the Python stack here too.
+        The worklist form grows zero Python frames and is a strict robustness
+        improvement: same nodes visited, same calls recorded on real ASTs, no
+        behaviour change.
+        """
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.type in ("call_expression", "call_expr", "CallExpr"):
+                # The callee is the first child: an `identifier` for a plain call foo(), or a
+                # `field_expression` for a method/namespaced call obj.method() / mod.func().
+                callee = current.children[0] if current.children else None
+                if callee is not None and callee.type in ("identifier", "IDENTIFIER"):
+                    calls.add(self._get_node_text(callee, source))
+                elif callee is not None and callee.type in ("field_expression", "field_access"):
+                    # Carry the RECEIVER by keeping only the full dotted form
+                    # (`recv.method`); the resolver splits it and dispatches on the
+                    # receiver's static TYPE. Adding the bare method name here would
+                    # independently over-connect to EVERY same-named method (the
+                    # namespace-leak FP), defeating type-based dispatch. An un-typed
+                    # receiver still resolves by unique/same-file bare-name fallback
+                    # inside _resolve_call, so recall is preserved.
+                    text = self._get_node_text(callee, source)
+                    calls.add(text)  # full dotted `receiver.method`
+            elif current.type == "builtin_function":
+                # @call(.modifier, realFn, argsTuple): the wrapped function is the real call target;
+                # other @builtins are filtered out downstream.
+                self._extract_builtin_call_target(current, source, calls)
+
+            stack.extend(current.children)
 
     def _extract_builtin_call_target(
         self, node: Node, source: bytes, calls: Set[str]
@@ -686,12 +727,22 @@ class CallGraphBuilder:
         # and skip non-file stdlib imports (@import("std")/("builtin")/("root")) which would
         # otherwise substring-match unrelated candidate paths.
         file_imports = self.imports.get(caller_file, [])
+        caller_dir = posixpath.dirname(caller_file)
         for candidate in candidates:
             candidate_file = candidate.split(":")[0]
             for imp in file_imports:
                 if not imp.endswith(".zig"):
                     continue  # std / builtin / root are not file imports
-                if candidate_file == imp or candidate_file.endswith("/" + imp):
+                # The @import path is relative to the importing file's directory and
+                # may contain ./ or ../; normalize it against caller_dir to the same
+                # repo-relative form as the stored candidate key, or the cross-file
+                # edge is dropped whenever the import crosses a directory boundary.
+                resolved_imp = posixpath.normpath(posixpath.join(caller_dir, imp))
+                if (
+                    candidate_file == resolved_imp
+                    or candidate_file == imp
+                    or candidate_file.endswith("/" + imp)
+                ):
                     return [candidate]
 
         # 3. If unique match, use it
