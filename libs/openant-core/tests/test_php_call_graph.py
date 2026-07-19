@@ -131,4 +131,6 @@ def test_extract_imports_namespace_use_declaration():
     tree = parser.parse(src)
     imports = FunctionExtractor("/r")._extract_imports(tree, src)
     assert "App\\Service\\Foo" in imports, imports
-    assert "App\\Bar" in imports, imports  # alias stripped to the namespace path
+    assert "App\\Bar" in imports, imports  # namespace path recorded for file-name matching
+    # The alias is recorded as its own entry pointing at the target class's last segment.
+    assert imports.get("B") == "use_alias:Bar", imports  # alias B -> class Bar

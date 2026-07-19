@@ -294,7 +294,13 @@ class CallGraphBuilder:
         if fw_idx is not None and func_name not in self.functions_by_name:
             return self._resolve_callback_arg(node, source, caller_file, caller_class, fw_idx)
 
-        return self._resolve_simple_call(func_name, caller_file, caller_class, caller_namespace)
+        # A bare function call -- `foo()`, incl. a framework-callback dispatcher that is
+        # shadowed by a same-named user function and so lands here -- is resolved by PHP in
+        # the (namespaced/global) FUNCTION namespace, never as a method of the enclosing
+        # class. Pass caller_class=None so _resolve_simple_call's implicit-$this step does
+        # not poison the edge with a coincidentally same-named enclosing method (mirrors the
+        # string-callback fix in _resolve_callback_name). Namespace resolution is preserved.
+        return self._resolve_simple_call(func_name, caller_file, None, caller_namespace)
 
     def _resolve_callback_arg(self, node, source: bytes, caller_file: str,
                               caller_class: Optional[str], idx: int) -> Optional[str]:
@@ -310,8 +316,11 @@ class CallGraphBuilder:
         if idx >= len(arg_nodes) or not arg_nodes[idx].children:
             return None
         value = arg_nodes[idx].children[0]
-        if value.type == 'string':
-            name = source[value.start_byte:value.end_byte].decode('utf-8', errors='replace').strip('\'"')
+        # A callback name may be single-quoted (`string`) or double-quoted (`encapsed_string`);
+        # route both through _string_literal_value so `"cb"` / escaped names aren't dropped
+        # (PR#147 added encapsed_string support there but this resolver only saw `string`).
+        name = self._string_literal_value(value, source)
+        if name is not None:
             return self._resolve_callback_name(name, caller_file, caller_class)
         if value.type == 'array_creation_expression':
             # ['ClassName', 'method'] static callback (instance [$obj,'m'] needs a type we don't track).
@@ -319,11 +328,14 @@ class CallGraphBuilder:
             stack = [value]
             while stack:
                 n = stack.pop()
-                if n.type == 'string':
-                    strings.append(source[n.start_byte:n.end_byte].decode('utf-8', errors='replace').strip('\'"'))
+                lit = self._string_literal_value(n, source)
+                if lit is not None:
+                    strings.append(lit)
                 stack.extend(reversed(n.children))
             if len(strings) >= 2:
-                return self._resolve_class_call(strings[0], strings[1], caller_file)
+                # ['App\\Loader', 'load'] -- reduce the (possibly namespaced) class to its
+                # bare name so the array-form callback resolves like the string form.
+                return self._resolve_class_call(self._strip_namespace(strings[0]), strings[1], caller_file)
         return None
 
     def _resolve_callback_name(self, name: str, caller_file: str,
@@ -331,10 +343,16 @@ class CallGraphBuilder:
         """Resolve a string callback: 'Class::method' (static) or a plain function name."""
         if '::' in name:
             cls, _, method = name.partition('::')
-            return self._resolve_class_call(cls, method, caller_file)
+            # A namespaced callable ('App\\Sanitizer::run', either quote style) names a real
+            # class indexed by its bare name; reduce the qualified class to its last segment
+            # so it resolves like a plain callback instead of leaving an unmatched prefix.
+            return self._resolve_class_call(self._strip_namespace(cls), method, caller_file)
         if self._is_builtin(name):
             return None
-        return self._resolve_simple_call(name, caller_file, caller_class)
+        # A bare string callable ('name') is resolved by PHP as a GLOBAL function, never a
+        # method of the class the registration sits in. Pass caller_class=None so the implicit
+        # $this self-call step does not poison the edge with a same-named enclosing method.
+        return self._resolve_simple_call(name, caller_file, None)
 
     def _resolve_new(self, node, source: bytes, caller_file: str,
                      caller_class: Optional[str]) -> Optional[str]:
@@ -388,36 +406,58 @@ class CallGraphBuilder:
             return None
         return next(iter(literal_names))
 
+    # Double-quoted single-char PHP escapes. Octal (\0..\777), hex (\x..) and
+    # unicode (\u{..}) sequences are left literal: they are irrelevant to callable
+    # names and keeping them raw never drops a namespace segment.
+    _DQ_SIMPLE_ESCAPES = {
+        '\\\\': '\\', '\\"': '"', '\\$': '$', '\\n': '\n', '\\r': '\r',
+        '\\t': '\t', '\\v': '\v', '\\f': '\f', '\\e': '\x1b',
+    }
+
+    @staticmethod
+    def _unescape_php(seq: str, single_quoted: bool) -> str:
+        """Translate one tree-sitter `escape_sequence` to its runtime value.
+
+        PHP single-quoted strings escape ONLY `\\` and `\'`; every other backslash
+        pair is literal. Double-quoted strings recognise the C-style set above.
+        """
+        if single_quoted:
+            if seq == '\\\\':
+                return '\\'
+            if seq == "\\'":
+                return "'"
+            return seq
+        return CallGraphBuilder._DQ_SIMPLE_ESCAPES.get(seq, seq)
+
     @staticmethod
     def _string_literal_value(node, source: bytes) -> Optional[str]:
-        """Return the content of a string-literal node, else None.
+        """Return the runtime value of a string-literal node, else None.
 
         Single-quoted strings parse as `string`; double-quoted as `encapsed_string`.
-        An `encapsed_string` is accepted only when it has NO interpolation (its only
-        meaningful child is a single `string_content`), so `"dang$p"` is not treated
-        as a static literal.
+        tree-sitter splits EITHER into `string_content` + `escape_sequence` chunks when
+        the literal contains an escape (e.g. the `\\` namespace separator in the callable
+        'App\\Sanitizer::run'). We concatenate every chunk and unescape the sequences so the
+        result is the real PHP value -- never the first chunk truncated at the first
+        backslash, and never dropped just because an escape is present. An `encapsed_string`
+        carrying interpolation (a `variable_name` / embedded-expression child) is still
+        declined, so `"dang$p"` is not treated as a static literal.
         """
-        if node.type == 'string':
-            for child in node.children:
-                if child.type == 'string_content':
-                    return source[child.start_byte:child.end_byte].decode(
-                        'utf-8', errors='replace')
-            # Empty string literal ('') has no string_content child.
-            return ''
-        if node.type == 'encapsed_string':
-            content = None
-            for child in node.children:
-                if child.type == '"':
-                    continue
-                if child.type == 'string_content':
-                    if content is not None:
-                        return None  # multiple chunks -> unusual, decline
-                    content = source[child.start_byte:child.end_byte].decode(
-                        'utf-8', errors='replace')
-                else:
-                    return None  # interpolation / embedded expression -> not static
-            return content if content is not None else ''
-        return None
+        if node.type not in ('string', 'encapsed_string'):
+            return None
+        single_quoted = node.type == 'string'
+        parts = []
+        for child in node.children:
+            if child.type in ('"', "'"):
+                continue
+            raw = source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')
+            if child.type == 'string_content':
+                parts.append(raw)
+            elif child.type == 'escape_sequence':
+                parts.append(CallGraphBuilder._unescape_php(raw, single_quoted))
+            else:
+                return None  # interpolation / embedded expression -> not static
+        # Empty literal ('' / "") has no content children -> ''.
+        return ''.join(parts)
 
     def _resolve_member_call(self, node, source: bytes, caller_file: str,
                               caller_class: Optional[str], root=None) -> Optional[str]:
@@ -503,20 +543,19 @@ class CallGraphBuilder:
                              caller_class: Optional[str],
                              caller_namespace: Optional[str] = None) -> Optional[str]:
         """Resolve a simple (unqualified) function call to a function ID."""
-        # 1. Check same class first (implicit $this)
-        if caller_class:
-            result = self._resolve_self_call(func_name, caller_file, caller_class)
-            if result:
-                return result
+        # NB: a bare unqualified call `foo()` has NO implicit `$this->` in PHP -- it
+        # resolves to a FUNCTION (current namespace, then global), never to a same-named
+        # method. Preferring a same-class method here misdirected the edge; a method is
+        # reachable only via $this->/self::/static:: (handled by _resolve_method_call).
 
-        # 2. Check same file
+        # 1. Check same file
         same_file_funcs = self.functions_by_file.get(caller_file, [])
         for func_id in same_file_funcs:
             func_data = self.functions.get(func_id, {})
             if func_data.get('name') == func_name and not func_data.get('class_name'):
                 return func_id
 
-        # 3. Check use/require-resolved files
+        # 2. Check use/require-resolved files
         file_imports = self.imports.get(caller_file, {})
         for import_name, import_type in file_imports.items():
             if import_type in ('require', 'require_once', 'include', 'include_once', 'use'):
@@ -533,7 +572,7 @@ class CallGraphBuilder:
                             if func_data.get('name') == func_name:
                                 return func_id
 
-        # 4. Unqualified call resolution across files. PHP resolves an unqualified
+        # 3. Unqualified call resolution across files. PHP resolves an unqualified
         #    function call within the caller's own namespace FIRST; if there is no such
         #    function it FALLS BACK to the global namespace. A same-named function in an
         #    unrelated namespace is never reachable this way, so it must not leak an edge.
@@ -637,6 +676,19 @@ class CallGraphBuilder:
     def _resolve_class_call(self, class_name: str, method_name: str,
                             caller_file: str) -> Optional[str]:
         """Resolve a ClassName::method() call."""
+        # Translate an import alias to its real class so `Bar::run()` / `new Bar()` resolves to
+        # the aliased target instead of dropping the edge. Every alias sibling form
+        # (`use App\Service\Foo as Bar;` and grouped `use App\{Foo as Bar};`) is recorded by the
+        # extractor as `imports[alias] = 'use_alias:<Target>'`; this is the single chokepoint
+        # through which `new`, `Class::method`, and string-callback resolution all pass.
+        import_entry = self.imports.get(caller_file, {}).get(class_name)
+        if isinstance(import_entry, str) and import_entry.startswith('use_alias:'):
+            class_name = import_entry[len('use_alias:'):]
+        # methods_by_class is keyed by BARE class name, so a namespace-qualified target
+        # ('App\Sanitizer' from a string/array callback) must be reduced to its last segment
+        # or the lookup misses and the handler+sink go unreachable. (No-op after alias
+        # translation, whose stored target is already a bare last segment.)
+        class_name = self._strip_namespace(class_name)
         # Check same file first
         class_key = f"{caller_file}:{class_name}"
         if class_key in self.methods_by_class:

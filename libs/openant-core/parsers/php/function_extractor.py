@@ -208,6 +208,41 @@ class FunctionExtractor:
                 aliases[alias] = [trait_name, method_name]
         return aliases
 
+    def _register_class(self, class_id: str, entry: Dict) -> None:
+        """Register a class/interface/trait/enum entry, MERGING on id collision.
+
+        A PHP name may be (re)declared in mutually-exclusive/guarded branches
+        (`if (...) { class Foo {..} } else { class Foo {..} }`, or a double
+        `!class_exists()` guard). All such branches share id `<file>:<name>`, so
+        a plain `self.classes[id] = entry` was last-write-wins and silently
+        dropped the earlier branch's methods/bases -- a false negative for the
+        call graph. Merge instead: union the list fields and keep the first
+        non-empty base. Only fields already present on the stored entry are
+        touched, so the (name-keyed, hence same-kind) schema is preserved.
+        """
+        existing = self.classes.get(class_id)
+        if existing is None:
+            self.classes[class_id] = entry
+            self.stats['total_classes'] += 1
+            return
+
+        def _union(a, b):
+            out = list(a or [])
+            for x in (b or []):
+                if x not in out:
+                    out.append(x)
+            return out
+
+        for key in ('methods', 'traits', 'interfaces'):
+            if key in existing:
+                existing[key] = _union(existing[key], entry.get(key))
+        if 'superclass' in existing and not existing.get('superclass'):
+            existing['superclass'] = entry.get('superclass')
+        if 'trait_aliases' in existing:
+            merged = dict(existing['trait_aliases'])
+            merged.update(entry.get('trait_aliases') or {})
+            existing['trait_aliases'] = merged
+
     def _get_visibility(self, node, source: bytes) -> Optional[str]:
         """Extract visibility modifier from a method_declaration node."""
         for child in node.children:
@@ -258,7 +293,16 @@ class FunctionExtractor:
         return 'function'
 
     def _extract_imports(self, tree, source: bytes) -> Dict[str, str]:
-        """Extract use declarations, namespace definitions, and include/require from a file."""
+        """Extract use declarations, namespace definitions, and include/require from a file.
+
+        An import alias is recorded as a distinct entry ``imports[alias] = 'use_alias:<Target>'``
+        (``<Target>`` is the target class's last segment), covering every sibling form:
+        ``use App\\Service\\Foo as Bar;`` at namespace scope AND grouped
+        ``use App\\Service\\{Foo as Bar, Baz};``. Downstream call resolution translates the alias
+        so `Bar::run()` / `new Bar()` resolves to the real class instead of dropping the edge. The
+        alias lives in the per-file ``imports`` map (not a separate top-level key) so it needs no
+        change to the process-file / export path. The ``use_alias:`` type is ignored by the
+        file-name import matcher, so it never leaks a spurious function edge."""
         imports = {}
         stack = [tree.root_node]
 
@@ -274,14 +318,22 @@ class FunctionExtractor:
                 if cleaned.startswith('use '):
                     cleaned = cleaned[4:]
                 cleaned = cleaned.rstrip(';').strip()
-                # Handle grouped `use A\B, C\D;` and drop trailing `as Alias` so the stored import is
-                # the namespace path (matched by file name downstream).
-                for part in cleaned.split(','):
-                    entry = part.strip()
-                    if not entry:
-                        continue
-                    path = entry.split(' as ')[0].strip() if ' as ' in entry else entry
-                    imports[path] = 'use'
+                # Expand both a flat `use A\B, C\D;` list and a grouped `use A\B\{C, D as E};`
+                # declaration into individual `path[ as alias]` entries, then record each.
+                for entry in self._expand_use_entries(cleaned):
+                    if ' as ' in entry:
+                        path, _, alias = entry.partition(' as ')
+                        path = path.strip()
+                        alias = alias.strip()
+                        # Map the alias to the target class's last segment so `Bar::run()`
+                        # / `new Bar()` resolves to the aliased class rather than dropping.
+                        if alias:
+                            target = path.replace('\\', '/').rsplit('/', 1)[-1]
+                            imports[alias] = f'use_alias:{target}'
+                    else:
+                        path = entry.strip()
+                    if path:
+                        imports[path] = 'use'
 
             elif node.type == 'namespace_definition':
                 # Extract namespace name
@@ -301,6 +353,25 @@ class FunctionExtractor:
             stack.extend(reversed(node.children))
 
         return imports
+
+    @staticmethod
+    def _expand_use_entries(cleaned: str) -> List[str]:
+        """Expand a cleaned `use` body into individual `path[ as alias]` entries.
+
+        Handles the grouped form `App\\Service\\{Foo as Bar, Baz}` by distributing the prefix
+        over every brace item, and the flat form `A\\B, C\\D` by splitting on commas. Returns
+        one string per imported name so the caller can uniformly detect a trailing `as` alias."""
+        if '{' in cleaned and '}' in cleaned:
+            prefix, _, rest = cleaned.partition('{')
+            prefix = prefix.strip().rstrip('\\')
+            inner = rest.split('}', 1)[0]
+            entries = []
+            for item in inner.split(','):
+                item = item.strip()
+                if item:
+                    entries.append(f'{prefix}\\{item}' if prefix else item)
+            return entries
+        return [p.strip() for p in cleaned.split(',') if p.strip()]
 
     def _extract_functions_from_tree(self, tree, source: bytes, file_path: Path,
                                      relative_path: str) -> None:
@@ -408,7 +479,7 @@ class FunctionExtractor:
                                 trait_aliases.update(
                                     self._extract_trait_aliases(child, source))
 
-                    self.classes[class_id] = {
+                    self._register_class(class_id, {
                         'name': new_class_name,
                         'file_path': relative_path,
                         'start_line': node.start_point[0] + 1,
@@ -419,8 +490,7 @@ class FunctionExtractor:
                         'superclass': superclass,
                         'interfaces': interfaces,
                         'namespace_name': namespace_name,
-                    }
-                    self.stats['total_classes'] += 1
+                    })
 
                 # Recurse into class body with updated class_name
                 if body_node:
@@ -450,7 +520,7 @@ class FunctionExtractor:
                                 if mname:
                                     methods.append(mname)
 
-                    self.classes[class_id] = {
+                    self._register_class(class_id, {
                         'name': new_iface_name,
                         'file_path': relative_path,
                         'start_line': node.start_point[0] + 1,
@@ -459,8 +529,7 @@ class FunctionExtractor:
                         'superclass': None,
                         'interfaces': [],
                         'namespace_name': namespace_name,
-                    }
-                    self.stats['total_classes'] += 1
+                    })
 
                 if body_node:
                     for child in reversed(body_node.children):
@@ -489,7 +558,7 @@ class FunctionExtractor:
                                 if mname:
                                     methods.append(mname)
 
-                    self.classes[class_id] = {
+                    self._register_class(class_id, {
                         'name': new_trait_name,
                         'file_path': relative_path,
                         'start_line': node.start_point[0] + 1,
@@ -498,8 +567,7 @@ class FunctionExtractor:
                         'superclass': None,
                         'interfaces': [],
                         'namespace_name': namespace_name,
-                    }
-                    self.stats['total_classes'] += 1
+                    })
 
                 if body_node:
                     for child in reversed(body_node.children):
@@ -533,7 +601,7 @@ class FunctionExtractor:
                                     else:
                                         methods.append(mname)
 
-                    self.classes[class_id] = {
+                    self._register_class(class_id, {
                         'name': new_enum_name,
                         'file_path': relative_path,
                         'start_line': node.start_point[0] + 1,
@@ -542,8 +610,7 @@ class FunctionExtractor:
                         'superclass': None,
                         'interfaces': [],
                         'namespace_name': namespace_name,
-                    }
-                    self.stats['total_classes'] += 1
+                    })
 
                 if body_node:
                     for child in reversed(body_node.children):
@@ -600,7 +667,7 @@ class FunctionExtractor:
                                 else:
                                     methods.append(mname)
 
-                    self.classes[f"{relative_path}:{anon_name}"] = {
+                    self._register_class(f"{relative_path}:{anon_name}", {
                         'name': anon_name,
                         'file_path': relative_path,
                         'start_line': node.start_point[0] + 1,
@@ -609,8 +676,7 @@ class FunctionExtractor:
                         'superclass': None,
                         'interfaces': [],
                         'namespace_name': namespace_name,
-                    }
-                    self.stats['total_classes'] += 1
+                    })
 
                     for child in reversed(body_node.children):
                         stack.append((child, anon_name, namespace_name))
@@ -795,31 +861,41 @@ class FunctionExtractor:
             'comment', 'declare_statement', '{', '}',
         }
 
-        def program_statements(node):
-            """Yield file-scope statement nodes.
+        def program_statements(node, ns_name=None):
+            """Yield ``(statement_node, enclosing_namespace)`` pairs.
 
             A braceless `namespace App;` is a self-contained node whose following
             statements are program-level SIBLINGS (tree-sitter-php does not nest
-            them), so we simply skip the namespace token-node. A braced
-            `namespace App { ... }` wraps its statements in a body, so we descend
-            into that body.
+            them), so we skip the namespace token-node but carry its name forward
+            to the siblings it governs. A braced `namespace App { ... }` wraps its
+            statements in a body, so we descend into that body with the name.
+            The namespace must ride along so the synthetic module unit is keyed to
+            its namespace rather than to a null one (which mis-keys it against the
+            file's other App\\ symbols).
             """
             for child in node.children:
                 if child.type == 'namespace_definition':
+                    name_node = child.child_by_field_name('name')
+                    child_ns = self._node_text(name_node, source) if name_node else ns_name
                     body = child.child_by_field_name('body')
                     if body is not None:
-                        yield from program_statements(body)
-                    # braceless: its real statements are program-level siblings,
-                    # reached later in this same loop; the namespace node itself
-                    # contributes no executable code.
+                        yield from program_statements(body, child_ns)
+                    else:
+                        # braceless: its real statements are program-level siblings,
+                        # reached later in this same loop; propagate the namespace
+                        # to them. The namespace node itself is not executable code.
+                        ns_name = child_ns
                     continue
                 if child.type in skip_types:
                     continue
-                yield child
+                yield child, ns_name
 
-        statements = list(program_statements(root))
-        if not statements:
+        pairs = list(program_statements(root))
+        if not pairs:
             return
+        statements = [stmt for stmt, _ in pairs]
+        # Key the unit to the namespace governing its statements (first non-null).
+        namespace_name = next((ns for _, ns in pairs if ns), None)
 
         code = '\n'.join(self._node_text(s, source) for s in statements).strip()
         if not code:
@@ -829,15 +905,16 @@ class FunctionExtractor:
         end_line = statements[-1].end_point[0] + 1
 
         func_id = f"{relative_path}:__module__"
+        qualified_name = f"{namespace_name}\\__module__" if namespace_name else '__module__'
         self.functions[func_id] = {
             'name': '__module__',
-            'qualified_name': '__module__',
+            'qualified_name': qualified_name,
             'file_path': relative_path,
             'start_line': start_line,
             'end_line': end_line,
             'code': code,
             'class_name': None,
-            'namespace_name': None,
+            'namespace_name': namespace_name,
             'parameters': [],
             'is_static': False,
             'unit_type': 'module_level',
@@ -864,8 +941,6 @@ class FunctionExtractor:
             self.stats['files_with_errors'] += 1
             return
 
-        self.stats['files_processed'] += 1
-
         # Extract imports
         self.imports[relative_path] = self._extract_imports(tree, source)
 
@@ -875,11 +950,27 @@ class FunctionExtractor:
         # Synthesise a module_level unit for any top-level procedural statements
         self._extract_module_level_unit(tree, source, relative_path)
 
+        # Count as processed only after extraction fully succeeds, so a file that crashes
+        # mid-extraction (caught by _process_file_guarded) is counted once as an error and
+        # never as processed.
+        self.stats['files_processed'] += 1
+
+    def _process_file_guarded(self, file_path: Path) -> None:
+        """Process one file, isolating any failure so a single pathological file cannot abort the
+        whole repo's extraction (mirrors the Python/Zig/Go per-file loop guard from PR #136).
+        Parse errors are already handled inside process_file; this backstops the rest
+        (RecursionError/MemoryError from deep nesting, extractor bugs)."""
+        try:
+            self.process_file(file_path)
+        except Exception as e:
+            print(f"Warning: failed to process {file_path}: {type(e).__name__}: {e}", file=sys.stderr)
+            self.stats['files_with_errors'] += 1
+
     def extract_from_scan(self, scan_result: Dict) -> Dict:
         """Extract functions from files listed in a scan result."""
         for file_info in scan_result.get('files', []):
             file_path = self.repo_path / file_info['path']
-            self.process_file(file_path)
+            self._process_file_guarded(file_path)
 
         return self.export()
 
@@ -889,7 +980,7 @@ class FunctionExtractor:
             for file_rel_path in files:
                 file_path = self.repo_path / file_rel_path
                 if file_path.exists():
-                    self.process_file(file_path)
+                    self._process_file_guarded(file_path)
         else:
             for ext in ('.php', '.phtml'):
                 for file_path in self.repo_path.rglob(f'*{ext}'):
@@ -899,7 +990,7 @@ class FunctionExtractor:
                     rel_parts = file_path.relative_to(self.repo_path).parts
                     if any(excl in rel_parts for excl in ('.git', 'vendor', 'node_modules', 'tmp', '.cache')):
                         continue
-                    self.process_file(file_path)
+                    self._process_file_guarded(file_path)
 
         return self.export()
 
