@@ -153,20 +153,15 @@ func runInit(cmd *cobra.Command, args []string) {
 
 	commitSHA := initCommit
 	if isGit {
-		if commitSHA == "" {
-			out, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
-			if err != nil {
-				output.PrintError(fmt.Sprintf("Failed to get HEAD commit: %s", err))
-				os.Exit(1)
-			}
-			commitSHA = strings.TrimSpace(string(out))
-		} else {
-			// Resolve short SHA to full SHA
-			out, err := exec.Command("git", "-C", repoPath, "rev-parse", commitSHA).Output()
-			if err == nil {
-				commitSHA = strings.TrimSpace(string(out))
-			}
+		sha, warn, err := resolveLocalCommit(repoPath, initCommit)
+		if err != nil {
+			output.PrintError(err.Error())
+			os.Exit(1)
 		}
+		if warn != "" {
+			output.PrintWarning(warn)
+		}
+		commitSHA = sha
 	} else {
 		if commitSHA != "" {
 			output.PrintWarning("--commit ignored: not a git repository")
@@ -367,4 +362,38 @@ func detectLanguage(repoPath string) (string, error) {
 	}
 
 	return bestLang, nil
+}
+
+// resolveLocalCommit determines the commit SHA to record for a LOCAL git repo.
+// openant references local repos in place and never checks them out (unlike the
+// remote path, which runs `git checkout`), so the recorded commit MUST reflect
+// what will actually be scanned: the current working-tree HEAD. A --commit that
+// differs from HEAD, or that cannot be resolved, is warned about and ignored
+// (record HEAD) rather than silently recorded — otherwise the scan would be
+// mislabeled with a commit the working tree is not at
+// (finding gocli-local-commit-no-checkout).
+func resolveLocalCommit(repoPath, requested string) (sha string, warn string, err error) {
+	head, err := gitRevParseLocal(repoPath, "HEAD")
+	if err != nil {
+		return "", "", fmt.Errorf("Failed to get HEAD commit: %s", err)
+	}
+	if requested == "" {
+		return head, "", nil
+	}
+	resolved, rerr := gitRevParseLocal(repoPath, requested)
+	if rerr != nil {
+		return head, fmt.Sprintf("--commit %q could not be resolved in local repo; using working-tree HEAD %s (local repos are referenced in place, not checked out)", requested, config.ShortSHA(head)), nil
+	}
+	if resolved != head {
+		return head, fmt.Sprintf("--commit %s is not checked out (working tree is at %s); local repos are referenced in place and not checked out — scanning HEAD", config.ShortSHA(resolved), config.ShortSHA(head)), nil
+	}
+	return resolved, "", nil
+}
+
+func gitRevParseLocal(repoPath, ref string) (string, error) {
+	out, err := exec.Command("git", "-C", repoPath, "rev-parse", ref).Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
