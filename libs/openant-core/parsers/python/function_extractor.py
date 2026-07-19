@@ -492,7 +492,15 @@ class FunctionExtractor:
         class_id, class_data, method_nodes = self.process_class(
             node, str(file_path), content, outer_qualifier=outer_qualifier
         )
-        self.classes[class_id] = class_data
+        existing = self.classes.get(class_id)
+        if existing is None:
+            self.classes[class_id] = class_data
+        else:
+            # Same-named class re-declared in one file (conditional/platform
+            # branch or a redefinition) collides on the `path:name` key. Merging
+            # rather than overwriting keeps every declaration's bases/methods so
+            # no inheritance edge is silently severed by last-write-wins.
+            self._merge_class_data(existing, class_data)
         self.stats['total_classes'] += 1
 
         qualified_class = f"{outer_qualifier}.{node.name}" if outer_qualifier else node.name
@@ -510,6 +518,23 @@ class FunctionExtractor:
         # class so a block-nested def stays a method of this class.
         self._descend_into_blocks(node.body, file_path, content,
                                   enclosing_class=qualified_class)
+
+    @staticmethod
+    def _merge_class_data(existing: Dict, new: Dict) -> None:
+        """Union a second declaration of a same-keyed class into the first.
+
+        Only additive: bases/methods/decorators are unioned (order-preserving),
+        the line range is widened, and a missing docstring is backfilled. Never
+        drops data the existing declaration already carried.
+        """
+        for key in ('bases', 'methods', 'decorators'):
+            for item in new.get(key, []):
+                if item not in existing[key]:
+                    existing[key].append(item)
+        existing['start_line'] = min(existing['start_line'], new['start_line'])
+        existing['end_line'] = max(existing['end_line'], new['end_line'])
+        if not existing.get('docstring'):
+            existing['docstring'] = new.get('docstring')
 
     def extract_assigned_lambdas(self, tree: ast.AST, file_path: Path, content: str) -> None:
         """Emit a function unit for each module-level `name = lambda ...`.
