@@ -144,7 +144,9 @@ def _group_by_signature_pattern(results: list) -> dict:
     groups = {}
 
     for result in results:
-        route_key = result.get("route_key", "")
+        # `or ""` also coerces a present-but-None route_key (not just a
+        # missing key) so None never reaches the str ops in the pattern helper.
+        route_key = result.get("route_key") or ""
         pattern = _extract_function_signature_pattern(route_key)
 
         if pattern not in groups:
@@ -192,7 +194,10 @@ def run_stage1_consistency_check(
         # Get verdicts (normalize to uppercase)
         verdicts = set()
         for r in group:
-            v = r.get("verdict", "").upper()
+            # Type-guard: verdict may be present-but-non-string (None before a
+            # verdict is assigned, or a stray int/list); treat any non-str as "".
+            raw_verdict = r.get("verdict")
+            v = raw_verdict.upper() if isinstance(raw_verdict, str) else ""
             # Treat VULNERABLE and BYPASSABLE as equivalent for grouping
             if v in ("VULNERABLE", "BYPASSABLE"):
                 verdicts.add("VULNERABLE")
@@ -229,7 +234,8 @@ def run_stage1_consistency_check(
                 # Apply updates
                 for update in consistency_result.findings_updated:
                     route_key = update.get("route_key")
-                    new_verdict = update.get("should_be", "").upper()
+                    raw_should_be = update.get("should_be")
+                    new_verdict = raw_should_be.upper() if isinstance(raw_should_be, str) else ""
 
                     if not new_verdict:
                         continue
@@ -237,7 +243,8 @@ def run_stage1_consistency_check(
                     for result in results:
                         if result.get("route_key") == route_key:
                             old_verdict = result.get("verdict", "UNKNOWN")
-                            if old_verdict.upper() != new_verdict:
+                            old_verdict_norm = old_verdict.upper() if isinstance(old_verdict, str) else ""
+                            if old_verdict_norm != new_verdict:
                                 result["verdict"] = new_verdict
                                 result["stage1_consistency_update"] = {
                                     "from": old_verdict,
