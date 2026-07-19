@@ -202,6 +202,21 @@ func PrintAnalyzeSummary(data map[string]any) {
 	fmt.Println()
 }
 
+// PrintAnalyzeResult renders the summary for the `analyze` command's envelope
+// data. When --verify chained into Stage 2, the Python backend returns a
+// VerifyResult (which has no "metrics" key) instead of the AnalysisResult, so
+// route to the verify summary — otherwise PrintAnalyzeSummary's missing-metrics
+// early-return silently drops the entire Stage-2 outcome. If verification was
+// requested but skipped (e.g. no --analyzer-output), the backend still returns
+// an AnalysisResult with "metrics", so fall back to the analyze summary.
+func PrintAnalyzeResult(data map[string]any, verify bool) {
+	if _, hasMetrics := data["metrics"]; verify && !hasMetrics {
+		PrintVerifySummary(data)
+		return
+	}
+	PrintAnalyzeSummary(data)
+}
+
 // PrintReportSummary outputs a formatted summary of report generation.
 func PrintReportSummary(data map[string]any) {
 	PrintHeader("Report Generated")
