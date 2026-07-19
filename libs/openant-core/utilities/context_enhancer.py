@@ -35,7 +35,12 @@ from .llm import (
     PhaseBinding,
     simple_text,
 )
-from .agentic_enhancer import RepositoryIndex, enhance_unit_with_agent, load_index_from_file
+from .agentic_enhancer import (
+    RepositoryIndex,
+    enhance_unit_with_agent,
+    load_index_from_file,
+    INCOMPLETE_CLASSIFICATION,
+)
 from .rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
 from .file_io import read_json, write_json
 
@@ -62,6 +67,18 @@ CONTEXT_ENHANCEMENT_MODEL_LEGACY = CLAUDE_SONNET_4_20250514
 # re-attempts units still carrying a retryable error; rounds stop early once
 # none remain or a round recovers nothing.
 MAX_RETRY_ROUNDS = 3
+
+# Expected JSON shape of an enhancer response — handed to JSONCorrector so a
+# malformed-but-recoverable enhancer reply is repaired into THIS shape (no
+# verdict) rather than the default vuln schema.
+_ENHANCE_JSON_SCHEMA = """{
+    "missing_dependencies": [{"name": "functionName", "reason": "why missed", "likely_location": "file or module"}],
+    "additional_callers": [{"name": "callerName", "reason": "why it likely calls the target"}],
+    "data_flow": {"inputs": [], "outputs": [], "tainted_variables": [], "security_relevant_flows": []},
+    "imports": [{"module": "name", "used_for": "purpose"}],
+    "reasoning": "Brief explanation of your analysis",
+    "confidence": 0.0
+}"""
 
 
 def _build_error_info(exc: Exception) -> dict:
@@ -336,12 +353,15 @@ class ContextEnhancer:
                     "confidence": analysis.get("confidence", 0.5)
                 }
             else:
-                unit["llm_context"] = self._get_default_context()
+                unit["llm_context"] = self._get_default_context(
+                    error={"type": "parse_error",
+                           "message": "LLM response could not be parsed as JSON"}
+                )
 
         except Exception as e:
             self.stats["errors"] += 1
             self._log("error", f"Error enhancing unit", unit_id=function_id, error=str(e))
-            unit["llm_context"] = self._get_default_context()
+            unit["llm_context"] = self._get_default_context(error=_build_error_info(e))
 
         return unit
 
@@ -377,9 +397,13 @@ class ContextEnhancer:
         """
         units = dataset.get("units", [])
 
-        # Diff filter: honor diff_selected when set by the parse step.
-        # Keep units_by_id scoped to the original so callers lookup still works
-        # for units outside the diff scope.
+        # Preserve the full unit list before diff filtering so units_by_id below
+        # can span ALL units — enhance_unit's same-file cross-unit context lookup
+        # must still resolve unchanged units outside the diff scope.
+        all_units = units
+
+        # Diff filter: honor diff_selected when set by the parse step. Only the
+        # diff-selected subset is *processed*, but context lookup uses all_units.
         if any("diff_selected" in u for u in units):
             _pre = len(units)
             units = [u for u in units if u.get("diff_selected")]
@@ -419,8 +443,9 @@ class ContextEnhancer:
         self._log("info", f"Mode: {mode}")
 
         # Build lookup dict for context gathering (over ALL units, so cross-unit
-        # context lookup still works even when some are restored/skipped).
-        units_by_id = {u.get("id"): u for u in units}
+        # context lookup still works even when some are restored/skipped or
+        # filtered out of the diff scope).
+        units_by_id = {u.get("id"): u for u in all_units}
         units_to_process = [u for u in units if u.get("id") not in processed_ids]
 
         def _process_one(unit):
@@ -683,7 +708,12 @@ class ContextEnhancer:
                           error_type=error_info.get("type", "unknown"))
                 unit["agent_context"] = {
                     "error": error_info,
-                    "security_classification": "neutral",
+                    # An errored unit has NO verdict. Tagging it "neutral" made the
+                    # exploitable-filter / CSV read the failure as a genuine benign
+                    # result (same masquerade as the agent-degenerate exit); "error"
+                    # is a non-verdict marker the filter never keeps and the CSV
+                    # shows honestly.
+                    "security_classification": "error",
                     "confidence": 0.0
                 }
 
@@ -848,6 +878,7 @@ class ContextEnhancer:
                       "exploitable": agentic_stats['exploitable_found'],
                       "vulnerable_internal": agentic_stats['vulnerable_found'],
                       "neutral": agentic_stats['neutral_found'],
+                      "incomplete": agentic_stats['incomplete_found'],
                       "errors": agentic_stats['errors']
                   })
         self._log("info", "Token usage",
@@ -940,6 +971,10 @@ class ContextEnhancer:
             "exploitable_found": 0,
             "vulnerable_found": 0,
             "neutral_found": 0,
+            # Degenerate-exit units (agent never completed a `finish` tool call).
+            # Tracked distinctly so an unanalyzed unit is not bucketed as a
+            # genuine "neutral" (no-security-relevance) verdict.
+            "incomplete_found": 0,
             "errors": 0,
             "error_summary": {},
         }
@@ -969,6 +1004,8 @@ class ContextEnhancer:
                 stats["exploitable_found"] += 1
             elif classification == "vulnerable_internal":
                 stats["vulnerable_found"] += 1
+            elif classification == INCOMPLETE_CLASSIFICATION:
+                stats["incomplete_found"] += 1
             else:
                 stats["neutral_found"] += 1
             stats["total_iterations"] += agent_ctx.get("agent_metadata", {}).get("iterations", 0)
@@ -996,9 +1033,15 @@ class ContextEnhancer:
         calls = summary.get("calls") or []
         return calls[-1] if calls else {}
 
-    def _get_default_context(self) -> dict:
-        """Return default context when LLM call fails."""
-        return {
+    def _get_default_context(self, error: dict | None = None) -> dict:
+        """Return default context when LLM call fails.
+
+        ``error`` carries a structured error dict so the failed context sets an
+        ``error`` key — mirroring the agentic path's ``agent_context["error"]``.
+        Without it, enhancer.py's ``if ctx.get("error")`` never counts single-shot
+        failures and they pass through reported as if successfully enhanced.
+        """
+        ctx = {
             "missing_dependencies": [],
             "additional_callers": [],
             "data_flow": {
@@ -1011,6 +1054,9 @@ class ContextEnhancer:
             "reasoning": "LLM analysis failed, using static analysis only",
             "confidence": 0.3
         }
+        if error is not None:
+            ctx["error"] = error
+        return ctx
 
     def _parse_json_response(self, response: str) -> Optional[dict]:
         """Parse JSON response from LLM, with LLM correction fallback."""
@@ -1039,12 +1085,18 @@ class ContextEnhancer:
                 except json.JSONDecodeError:
                     pass
 
-        # Fallback: use LLM to correct malformed JSON
+        # Fallback: use LLM to correct malformed JSON. Pass THIS phase's schema
+        # so the corrector recovers enhancer shape (no verdict) instead of
+        # rewriting it into the vuln verdict schema and dropping the context.
         if response.strip() and hasattr(self, 'binding') and self.binding:
             try:
                 from utilities.json_corrector import JSONCorrector
                 corrector = JSONCorrector(self.binding)
-                corrected = corrector.attempt_correction(response)
+                corrected = corrector.attempt_correction(
+                    response,
+                    schema=_ENHANCE_JSON_SCHEMA,
+                    required_keys=["missing_dependencies"],
+                )
                 if corrected.get("verdict") != "ERROR":
                     corrected["json_corrected"] = True
                     return corrected

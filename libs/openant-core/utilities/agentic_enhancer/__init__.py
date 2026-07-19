@@ -16,7 +16,8 @@ from .agent import (
     ContextAgent,
     AgentResult,
     enhance_unit_with_agent,
-    create_reachability_context
+    create_reachability_context,
+    INCOMPLETE_CLASSIFICATION,
 )
 from .repository_index import RepositoryIndex, load_index_from_file
 from .tools import TOOL_DEFINITIONS, ToolExecutor
@@ -35,5 +36,6 @@ __all__ = [
     "EntryPointDetector",
     "blackout_warning",
     "library_seed_ids",
-    "ReachabilityAnalyzer"
+    "ReachabilityAnalyzer",
+    "INCOMPLETE_CLASSIFICATION",
 ]

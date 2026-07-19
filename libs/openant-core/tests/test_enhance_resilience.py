@@ -171,6 +171,49 @@ class TestAgenticBoundedRetry:
 
 
 # --------------------------------------------------------------------------
+# an ERRORED unit must NOT masquerade as a genuine `neutral` verdict.
+# --------------------------------------------------------------------------
+class TestErroredUnitNotNeutral:
+    def test_exception_path_does_not_persist_neutral_classification(self, monkeypatch):
+        """When enhance_unit_with_agent raises, the except handler must persist a
+        NON-verdict security_classification (e.g. 'error'/'incomplete'), never
+        'neutral'. Otherwise the exploitable-filter / CSV read the errored unit as
+        a genuine benign result -- the same masquerade as the agent-degenerate exit.
+        """
+        from unittest.mock import MagicMock
+
+        from utilities import context_enhancer as ce
+
+        enh = _make_enhancer()
+        fake_index = MagicMock()
+        fake_index.get_statistics.return_value = {"total_functions": 0, "total_files": 0}
+        monkeypatch.setattr(ce, "load_index_from_file", lambda *a, **k: fake_index)
+
+        # A non-retryable failure so the post-loop retry does not re-run the unit.
+        def boom(unit, index, binding, tracker, verbose):
+            raise ValueError("agent blew up")
+
+        monkeypatch.setattr(ce, "enhance_unit_with_agent", boom)
+
+        result = enh.enhance_dataset_agentic(
+            dataset=_dataset(1), analyzer_output_path=None, repo_path=None, workers=1,
+        )
+
+        u0 = result["units"][0]
+        ctx = u0.get("agent_context", {})
+        # The error itself must be recorded (drives retry / stats tally).
+        assert ctx.get("error"), "errored unit lost its error record"
+        # The masquerade: an errored unit tagged 'neutral' is read as a real verdict.
+        assert ctx.get("security_classification") != "neutral", (
+            "errored unit persisted security_classification='neutral' -- masquerades "
+            "as a genuine benign verdict to the exploitable-filter/CSV"
+        )
+        assert ctx.get("security_classification") in ("error", "incomplete"), (
+            f"expected a non-verdict marker, got {ctx.get('security_classification')!r}"
+        )
+
+
+# --------------------------------------------------------------------------
 # single-shot enhance must support checkpoint/resume.
 # --------------------------------------------------------------------------
 class TestSingleShotCheckpoint:

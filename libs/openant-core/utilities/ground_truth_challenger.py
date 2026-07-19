@@ -21,6 +21,18 @@ from dataclasses import dataclass
 from .llm import PhaseBinding, simple_text
 
 
+# Expected JSON shape of an arbitration response — handed to JSONCorrector so a
+# malformed-but-recoverable arbitration reply is repaired into THIS shape (no
+# verdict) rather than the default vuln schema, and its success is gated on the
+# arbitration's own key instead of a nonexistent ``verdict`` field.
+_ARBITRATION_JSON_SCHEMA = """{
+    "arbitration_verdict": "MODEL_CORRECT | GROUND_TRUTH_CORRECT | UNCERTAIN",
+    "confidence": 0.0,
+    "reasoning": "Detailed explanation of your analysis and conclusion",
+    "recommendation": "VULNERABLE or SAFE"
+}"""
+
+
 @dataclass
 class ChallengeResult:
     """Result of challenging a ground truth."""
@@ -186,12 +198,20 @@ def _parse_json_response(response: str, binding: Optional[PhaseBinding] = None) 
             except json.JSONDecodeError:
                 pass
 
-    # Fallback: use LLM to correct malformed JSON
+    # Fallback: use LLM to correct malformed JSON. Pass the arbitration schema
+    # so the corrector recovers arbitration shape (no verdict) instead of
+    # rewriting it into the vuln verdict schema — otherwise a perfectly-
+    # extractable arbitration is rejected by the verdict-only success gate and
+    # the challenge is silently dropped.
     if response.strip() and binding is not None:
         try:
             from utilities.json_corrector import JSONCorrector
             corrector = JSONCorrector(binding)
-            corrected = corrector.attempt_correction(response)
+            corrected = corrector.attempt_correction(
+                response,
+                schema=_ARBITRATION_JSON_SCHEMA,
+                required_keys=["arbitration_verdict"],
+            )
             if corrected.get("verdict") != "ERROR":
                 corrected["json_corrected"] = True
                 return corrected

@@ -35,6 +35,13 @@ from .reachability_analyzer import ReachabilityAnalyzer
 MAX_ITERATIONS = 20
 MAX_TOKENS_PER_RESPONSE = 4096
 
+# Classification stamped on a degenerate exit (agent ended without a completed
+# `finish` tool call: bare end_turn, no tool calls, or MAX_ITERATIONS reached).
+# Distinct from "neutral" — a genuine "no security relevance" verdict — so
+# downstream (analyzer filter, CSV, reporting) records the no-op/error state
+# instead of silently bucketing an unanalyzed unit as a real neutral finding.
+INCOMPLETE_CLASSIFICATION = "incomplete"
+
 # Input budget.
 # The conversation input had no budget: primary_code was inlined verbatim and
 # raw tool results were appended every iteration, so input grew unbounded until
@@ -285,7 +292,7 @@ class ContextAgent:
                 return AgentResult(
                     include_functions=[],
                     usage_context="Agent did not complete analysis",
-                    security_classification="neutral",
+                    security_classification=INCOMPLETE_CLASSIFICATION,
                     classification_reasoning="Analysis incomplete",
                     confidence=0.3,
                     iterations=iterations,
@@ -381,7 +388,7 @@ class ContextAgent:
                 return AgentResult(
                     include_functions=[],
                     usage_context="Agent response had no tool calls",
-                    security_classification="neutral",
+                    security_classification=INCOMPLETE_CLASSIFICATION,
                     classification_reasoning="Analysis incomplete - no tool calls",
                     confidence=0.3,
                     iterations=iterations,
@@ -406,7 +413,7 @@ class ContextAgent:
         return AgentResult(
             include_functions=[],
             usage_context="Analysis terminated - max iterations reached",
-            security_classification="neutral",
+            security_classification=INCOMPLETE_CLASSIFICATION,
             classification_reasoning="Could not complete analysis within iteration limit",
             confidence=0.2,
             iterations=iterations,
