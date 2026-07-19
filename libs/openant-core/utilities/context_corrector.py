@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from typing import Optional
 
 from .llm_client import TokenTracker, get_global_tracker
@@ -22,6 +23,51 @@ from .llm import PhaseBinding, simple_text
 
 # Maximum characters per batch (leaving room for prompt overhead)
 MAX_BATCH_SIZE = 150000  # ~37k tokens for Sonnet
+
+
+# Canonical non-source directories the parsers skip when walking a repo.
+#
+# The single source of truth for language detection is config/languages.json
+# -> "skip_dirs" (see core/parser_adapter.detect_language). The per-language
+# extractors add a few more (e.g. parsers/ruby/repository_scanner.py excludes
+# .bundle/tmp/log/pkg/.cache/doc). gather_source_files() below must mirror
+# these: its extension list was broadened from JS-only to every parsed
+# language, so the walk now descends into dependency/build/VCS trees that the
+# JS-only default never reached (Python __pycache__/.venv, Ruby .bundle/tmp,
+# a top-level .git, ...). Correcting context against vendored/generated code
+# is wrong, so we exclude the union of the canonical skip sets.
+#
+# This literal is the always-available fallback + extractor-specific extras;
+# _canonical_skip_dirs() unions in config/languages.json at runtime so the
+# two never silently drift.
+_FALLBACK_SKIP_DIRS = frozenset({
+    # config/languages.json -> skip_dirs
+    'node_modules', '__pycache__', 'venv', '.venv', 'dist', 'build',
+    '.git', 'vendor',
+    # extractor-specific skips (parsers/ruby/repository_scanner.py) + JS extras
+    '.bundle', 'tmp', 'log', 'coverage', 'pkg', '.cache', 'doc', 'docs',
+    '.next',
+})
+
+
+def _canonical_skip_dirs() -> set[str]:
+    """Union of the parsers' canonical skip dirs.
+
+    Loads config/languages.json -> "skip_dirs" (the same single source of truth
+    core/parser_adapter.detect_language reads) and unions it with the literal
+    fallback so the corrector's exclusions stay in sync with the parsers even
+    if the config gains new entries. Never raises: on any load failure it
+    degrades to the fallback set.
+    """
+    skip = set(_FALLBACK_SKIP_DIRS)
+    try:
+        # utilities/context_corrector.py -> utilities -> openant-core -> libs -> repo root
+        cfg = Path(__file__).resolve().parent.parent.parent.parent / "config" / "languages.json"
+        with open(cfg, 'r', encoding='utf-8') as fh:
+            skip |= set(json.load(fh).get("skip_dirs", ()))
+    except Exception:
+        pass
+    return skip
 
 
 def get_missing_context_prompt(reasoning: str) -> str:
@@ -120,16 +166,29 @@ def gather_source_files(repo_path: str, extensions: list[str] = None) -> list[di
 
     Args:
         repo_path: Path to the repository root
-        extensions: File extensions to include (default: js, ts, jsx, tsx, ejs, pug, hbs)
+        extensions: File extensions to include (default: source files for every language
+            OpenAnt parses -- js/ts family plus c, go, php, python, ruby, rust, zig)
 
     Returns:
         List of dicts with file_path, relative_path, and content
     """
     if extensions is None:
-        extensions = ['.js', '.ts', '.jsx', '.tsx', '.ejs', '.pug', '.hbs', '.json']
+        # Cover every language the parsers/ directory supports, not just JS/TS: a default
+        # of JS-only extensions silently gathered zero source files for c/go/php/python/
+        # ruby/rust/zig repos, so context correction was skipped for every non-JS project.
+        extensions = [
+            # JS / TS family + templates
+            '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.ejs', '.pug', '.hbs', '.json',
+            # other parsed languages
+            '.go', '.py', '.rb', '.rake', '.php', '.rs', '.zig',
+            '.c', '.h', '.cpp', '.hpp', '.cc', '.cxx', '.hxx', '.hh',
+        ]
 
-    # Directories to exclude
-    exclude_dirs = {'node_modules', '.git', 'dist', 'build', 'coverage', 'vendor', '.next'}
+    # Directories to exclude. Mirror the parsers' canonical skip set (see
+    # _canonical_skip_dirs) so the broadened multi-language extension walk does
+    # not descend into dependency/build/VCS trees and correct context against
+    # vendored or generated code.
+    exclude_dirs = _canonical_skip_dirs()
 
     # File patterns to exclude
     exclude_patterns = {'.min.js', '.min.css', '.bundle.js', '.chunk.js', 'package-lock.json'}
