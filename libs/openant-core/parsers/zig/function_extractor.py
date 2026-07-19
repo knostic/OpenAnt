@@ -138,8 +138,11 @@ class FunctionExtractor:
                 # recurse with current_struct unchanged and be emitted as bare top-level
                 # functions. Thread the function name as the struct context so they
                 # qualify as List.push and distinct containers' methods don't collide.
+                # NEST (not replace) the context: use the already-qualified name so a
+                # container defined inside a struct keeps its outer path (Outer.List),
+                # otherwise two outer scopes' same-named inner methods collide on func_id.
                 if self._returns_type(node, source):
-                    child_struct = func_info["name"]
+                    child_struct = func_info["qualified_name"]
 
         elif node.type == "variable_declaration":
             # `const Foo = struct { ... };` -- a named struct/enum definition.
@@ -151,7 +154,14 @@ class FunctionExtractor:
                 # function_declarations are emitted ONCE, qualified as
                 # Struct.method (a method visited via recursion produces the
                 # same func_id as the eager scan, so there is no bare duplicate).
-                child_struct = struct_info["name"]
+                # NEST (not replace) the parent context so nested structs qualify as
+                # Outer.Inner.method; replacing lost the outer name and made two
+                # different outer structs' same-named inner methods collide on func_id.
+                child_struct = (
+                    f"{current_struct}.{struct_info['name']}"
+                    if current_struct
+                    else struct_info["name"]
+                )
 
         elif node.type == "builtin_function" and self._get_node_text(
             node, source
@@ -191,12 +201,22 @@ class FunctionExtractor:
         if not name:
             return None
 
-        # Determine qualified name and unit type
+        # Determine qualified name and unit type.
+        # `current_struct` is the FULL nested scope path (Outer.Inner) so the func_id
+        # (keyed off qualified_name) is unique across different outer scopes -- this is
+        # what prevents the same-named-inner collision. But `class_name` must stay the
+        # BARE leaf struct name (Inner): the receiver resolver (_resolve_typed_member)
+        # matches class_name against the in-scope receiver TYPE, which is bare
+        # (`var x = Inner{}` -> "Inner"). Storing the dotted path in class_name broke
+        # that match and dropped the `x.method()` edge. Decouple the two: dotted
+        # qualified_name for the storage KEY, bare leaf for class_name resolution.
         if current_struct:
             qualified_name = f"{current_struct}.{name}"
+            class_name = current_struct.rpartition(".")[2]
             unit_type = "method"
         else:
             qualified_name = name
+            class_name = None
             unit_type = self._classify_function(name, file_path)
 
         start_line = node.start_point[0] + 1  # 1-indexed
@@ -209,7 +229,7 @@ class FunctionExtractor:
             "start_line": start_line,
             "end_line": end_line,
             "code": self._get_node_text(node, source),
-            "class_name": current_struct,
+            "class_name": class_name,
             "module_name": None,
             "parameters": parameters,
             "unit_type": unit_type,

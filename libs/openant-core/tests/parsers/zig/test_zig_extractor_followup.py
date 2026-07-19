@@ -156,7 +156,11 @@ def test_nested_struct_and_import_not_dropped():
     class_names = {info["name"] for info in result["classes"].values()}
 
     assert "Outer.outerFn" in qualified, qualified
-    assert "Inner.innerFn" in qualified, qualified
+    # A nested struct's method is qualified by its FULL path (Outer.Inner.innerFn),
+    # not just the immediate struct. Single-level qualification let two different
+    # outer structs' same-named inner methods collide on one func_id (all but the
+    # last dropped); the full path keeps them distinct.
+    assert "Outer.Inner.innerFn" in qualified, qualified
     assert "Outer" in class_names, class_names
     assert "Inner" in class_names, class_names
     assert "builtin" in result["imports"]["main.zig"], result["imports"]
