@@ -249,18 +249,21 @@ class StepCheckpoint:
                 continue
 
             # Check for errors. Each phase stores checkpoint data differently:
-            #   - enhance: agent_context.error is set
+            #   - enhance: error under agent_context (agentic) / llm_context (single-shot)
             #   - analyze: result.verdict == "ERROR" or result.finding == "error"
             #   - verify: verification is empty or verification.correct_finding == "error"
             #   - dynamic-test: top-level status == "ERROR"
             is_error = False
             err_type = None
 
-            # Enhance-style: agent_context.error
-            agent_ctx = data.get("agent_context", {})
-            if agent_ctx.get("error"):
+            # Enhance-style: error under the context named by ``context_key``
+            # (agent_context for agentic, llm_context for single-shot). Legacy
+            # agentic checkpoints omit context_key → default agent_context.
+            ctx_key = data.get("context_key", "agent_context")
+            enhance_ctx = data.get(ctx_key, {})
+            if isinstance(enhance_ctx, dict) and enhance_ctx.get("error"):
                 is_error = True
-                err = agent_ctx["error"]
+                err = enhance_ctx["error"]
                 err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
 
             # Analyze-style: result.verdict or result.finding
