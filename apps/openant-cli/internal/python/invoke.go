@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -104,14 +105,18 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 
 	// Forward SIGINT/SIGTERM to the Python subprocess so Ctrl+C kills it.
 	sigChan := make(chan os.Signal, 1)
-	interrupted := false
+	// interrupted is written by the signal goroutine below and read on the
+	// main goroutine after cmd.Wait; use atomic.Bool so the two accesses are
+	// synchronized (a plain bool is a data race — go test -race flags it and a
+	// stale read would mislabel a user Ctrl+C as a Failed scan instead of 130).
+	var interrupted atomic.Bool
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		sig, ok := <-sigChan
 		if !ok {
 			return // channel closed, normal exit
 		}
-		interrupted = true
+		interrupted.Store(true)
 		// Forward signal to Python subprocess
 		if cmd.Process != nil {
 			_ = cmd.Process.Signal(sig)
@@ -158,7 +163,12 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	// Parse JSON from stdout
 	rawJSON := strings.TrimSpace(stdoutBuf.String())
 	if rawJSON == "" {
-		if interrupted {
+		// The interrupt short-circuit fires ONLY here, where the child produced
+		// no usable success/vuln envelope (empty stdout). A fully-parsed
+		// envelope below MUST win over a late/spurious SIGINT — reporting 130
+		// then would discard a real scan result. Empty stdout + interrupted is
+		// the only case where 130 is the correct answer.
+		if interrupted.Load() {
 			// User interrupted with Ctrl+C — not an error
 			return &InvokeResult{
 				Envelope: types.Envelope{
@@ -173,7 +183,7 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 				Status: "error",
 				Errors: []string{"Python process produced no output on stdout"},
 			},
-			ExitCode: exitCode,
+			ExitCode: normalizeExit(exitCode, true),
 		}, nil
 	}
 
@@ -187,23 +197,52 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 					fmt.Sprintf("Raw output: %s", truncate(rawJSON, 500)),
 				},
 			},
-			ExitCode: exitCode,
+			ExitCode: normalizeExit(exitCode, true),
 		}, nil
 	}
 
+	// Normalize the parsed-envelope exit code against the documented 0/1/2
+	// contract: an error envelope must not surface as clean/vulns-found, and a
+	// non-interrupt signal kill (negative code) is an error. A legitimate
+	// success + code 1 (vulns found) is preserved.
 	return &InvokeResult{
 		Envelope: envelope,
-		ExitCode: exitCode,
+		ExitCode: normalizeExit(exitCode, envelope.Status == "error"),
 	}, nil
+}
+
+// normalizeExit maps a child exit code onto the tool's documented contract
+// (openant/cli.py:16 — 0 = clean, 1 = vulnerabilities found, 2 = error) before
+// scan.go does os.Exit(result.ExitCode). User interrupts (SIGINT -> 130) are
+// handled earlier and never reach here.
+//   - A negative code (Go reports -1 for a signal-killed child: OOM/SIGKILL/
+//     segfault) is abnormal termination -> 2, regardless of any flushed envelope.
+//   - When the result is an error envelope, clean (0)/vulns-found (1) -> 2.
+//   - Otherwise the code is preserved (a legitimate success + 1 = vulns found).
+func normalizeExit(code int, isError bool) int {
+	if code < 0 {
+		return 2
+	}
+	if isError && code < 2 {
+		return 2
+	}
+	return code
 }
 
 // streamStderr reads stderr line by line and writes to os.Stderr.
 // If quiet is true, stderr output is suppressed.
 func streamStderr(r io.Reader, quiet bool) {
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		if !quiet {
-			fmt.Fprintln(os.Stderr, scanner.Text())
+	// bufio.Reader (not bufio.Scanner) so a stderr line larger than the
+	// scanner's default 64k token buffer is not truncated/dropped — a long
+	// Python traceback on one line can exceed that and would lose diagnostics.
+	br := bufio.NewReader(r)
+	for {
+		line, err := br.ReadString('\n')
+		if len(line) > 0 && !quiet {
+			fmt.Fprint(os.Stderr, line)
+		}
+		if err != nil {
+			return
 		}
 	}
 }
