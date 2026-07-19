@@ -349,7 +349,12 @@ class CallGraphBuilder:
             return None
 
         if node.type == 'qualified_identifier':
-            return text
+            # A qualified TEMPLATE call (ns::foo<int>()) parses as a
+            # qualified_identifier whose leaf `name` is a template_function, so the
+            # raw text carries the `<...>` argument list (ns::foo<int>) and never
+            # matches the ns::foo definition -> the specialized function is
+            # unreachable. Rebuild the name with template argument lists dropped.
+            return self._qualified_name_without_template_args(node, source) or text
 
         if node.type == 'template_function':
             name_node = node.child_by_field_name('name')
@@ -361,6 +366,54 @@ class CallGraphBuilder:
             return None
 
         return text if text.isidentifier() else None
+
+    def _qualified_name_without_template_args(self, node, source: bytes) -> Optional[str]:
+        """Reconstruct a (possibly nested) qualified call name, dropping any
+        template argument list so ns::foo<int> normalises to ns::foo.
+
+        Handles the shapes tree-sitter-cpp produces for a qualified name:
+        namespace/identifier leaves, a template_function leaf (returns just its
+        `name`, i.e. no `<...>`), and a nested qualified_identifier (recurses on
+        the scope and name fields).
+
+        CONSERVATIVE by design: this returns None whenever ANY present segment is
+        a node shape it does not cleanly model (e.g. a decltype scope, or a
+        destructor_name / operator_name / conversion name leaf). It must NEVER
+        drop an unmodelled segment and emit a bare/partial name — doing so would
+        fabricate a name (``ns::~Widget`` -> ``ns``, ``decltype(x)::foo`` ->
+        ``foo``) that resolves to an unrelated function, creating a FALSE
+        call-graph edge HEAD never emitted. On None the caller falls back to the
+        raw node text (which resolves to nothing, exactly like prior behaviour).
+        Only ``ns::foo<int>`` -> ``ns::foo`` (every segment modelled) normalises.
+        """
+        if node.type in ('identifier', 'namespace_identifier', 'type_identifier'):
+            return source[node.start_byte:node.end_byte].decode('utf-8', errors='replace')
+        if node.type == 'template_function':
+            name_node = node.child_by_field_name('name')
+            if name_node is not None:
+                return source[name_node.start_byte:name_node.end_byte].decode('utf-8', errors='replace')
+            return None
+        if node.type == 'qualified_identifier':
+            scope = node.child_by_field_name('scope')
+            name = node.child_by_field_name('name')
+            # The name segment is required and must be cleanly modelled; an exotic
+            # leaf (destructor_name / operator_name / ...) -> None -> fallback.
+            if name is None:
+                return None
+            name_txt = self._qualified_name_without_template_args(name, source)
+            if name_txt is None:
+                return None
+            # Scope absent (global-scope ``::foo``): the only present segment is
+            # the modelled name, so normalise to it.
+            if scope is None:
+                return name_txt
+            # Scope present: it too must be cleanly modelled, else fall back so we
+            # never emit a partial name with an unmodelled scope silently dropped.
+            scope_txt = self._qualified_name_without_template_args(scope, source)
+            if scope_txt is None:
+                return None
+            return f"{scope_txt}::{name_txt}"
+        return None
 
     def _is_visible_from(self, func_id: str, caller_file: str) -> bool:
         """Whether a candidate definition is linkable from caller_file.
