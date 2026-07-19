@@ -107,7 +107,8 @@ class PythonDependencyResolver:
             return "", 0, 0
 
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            # async def handlers (aiohttp/FastAPI/Flask 2.x) are AsyncFunctionDef, not FunctionDef.
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
                 lines = content.split('\n')
                 start = node.lineno - 1
                 end = node.end_lineno if hasattr(node, 'end_lineno') else start + 10
@@ -123,7 +124,8 @@ class PythonDependencyResolver:
             # Also check class methods
             if isinstance(node, ast.ClassDef):
                 for item in node.body:
-                    if isinstance(item, ast.FunctionDef) and item.name == func_name:
+                    # async def methods are AsyncFunctionDef, not FunctionDef.
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == func_name:
                         lines = content.split('\n')
                         start = item.lineno - 1
                         end = item.end_lineno if hasattr(item, 'end_lineno') else start + 10
