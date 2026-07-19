@@ -133,6 +133,20 @@ func (e *Extractor) extractVarFuncLit(lit *ast.FuncLit, name, filePath, pkgName 
 		}
 	}
 
+	var returns []string
+	if lit.Type.Results != nil {
+		for _, field := range lit.Type.Results.List {
+			returnType := e.typeToString(field.Type)
+			if len(field.Names) > 0 {
+				for _, n := range field.Names {
+					returns = append(returns, fmt.Sprintf("%s %s", n.Name, returnType))
+				}
+			} else {
+				returns = append(returns, returnType)
+			}
+		}
+	}
+
 	litSrc := ""
 	if so, eo := startPos.Offset, endPos.Offset; so >= 0 && eo <= len(content) && so < eo {
 		litSrc = string(content[so:eo])
@@ -140,15 +154,19 @@ func (e *Extractor) extractVarFuncLit(lit *ast.FuncLit, name, filePath, pkgName 
 	code := "var " + name + " = " + litSrc
 
 	return FunctionInfo{
-		Name:       name,
-		Code:       code,
-		StartLine:  startPos.Line,
-		EndLine:    endPos.Line,
-		UnitType:   UnitTypeFunction,
+		Name:      name,
+		Code:      code,
+		StartLine: startPos.Line,
+		EndLine:   endPos.Line,
+		// A func-valued var is still a function unit: classify it like any other
+		// (http_handler/cli_handler/middleware/…) instead of hardcoding "function",
+		// so handlers assigned to package-level vars are seeded as entry points.
+		UnitType:   e.classifyUnitType(name, "", params, returns, code, filePath),
 		IsExported: len(name) > 0 && unicode.IsUpper(rune(name[0])),
 		Package:    pkgName,
 		FilePath:   filePath,
 		Parameters: params,
+		Returns:    returns,
 	}
 }
 
@@ -446,6 +464,13 @@ func duplicateIDWarning(fns map[string]FunctionInfo, funcID string, incoming Fun
 func (e *Extractor) makeFunctionID(filePath string, info FunctionInfo) string {
 	if info.ClassName != "" {
 		return fmt.Sprintf("%s:%s.%s", filePath, info.ClassName, info.Name)
+	}
+	// Go permits several `init` (and blank `_`) functions per file/package, so the name
+	// alone is not a unique id: without disambiguation they collapse onto one key and all
+	// but the last are silently overwritten in output.Functions (data loss). Neither is a
+	// callable target, so suffixing the start line cannot break call-edge resolution.
+	if info.Name == "init" || info.Name == "_" {
+		return fmt.Sprintf("%s:%s#L%d", filePath, info.Name, info.StartLine)
 	}
 	return fmt.Sprintf("%s:%s", filePath, info.Name)
 }
