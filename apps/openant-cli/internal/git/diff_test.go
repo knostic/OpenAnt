@@ -143,6 +143,51 @@ func TestChangedFilesDetectsRenames(t *testing.T) {
 	}
 }
 
+func TestChangedFilesNonASCII(t *testing.T) {
+	dir := t.TempDir()
+	initTestRepo(t, dir)
+
+	// Commit 1: initial state.
+	writeFile(t, dir, "a.txt", "hello\n")
+	runCmd(t, dir, "git", "add", ".")
+	runCmd(t, dir, "git", "commit", "-q", "-m", "init")
+
+	base, err := gitRevParse(dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit 2: add two files whose names git does not emit verbatim on the
+	// default line-oriented output:
+	//   1. a non-ASCII name — octal-escaped and double-quoted under the
+	//      default core.quotepath=true (e.g. "caf\303\251.py").
+	//   2. a name with an embedded newline — ALWAYS escaped and double-quoted
+	//      regardless of core.quotepath, and, if a line scanner is used, split
+	//      across two "files" so the real path is never recovered.
+	// Both must be returned verbatim. Only `-z` + NUL-split is exact here:
+	// core.quotepath=false alone still mangles (2).
+	const nonASCII = "café_wörld.py"
+	const embeddedNewline = "we\nird.py"
+	writeFile(t, dir, nonASCII, "x = 1\n")
+	writeFile(t, dir, embeddedNewline, "y = 2\n")
+	runCmd(t, dir, "git", "add", "-A")
+	runCmd(t, dir, "git", "commit", "-q", "-m", "add tricky filenames")
+
+	files, err := ChangedFiles(dir, base)
+	if err != nil {
+		t.Fatalf("ChangedFiles: %v", err)
+	}
+	got := make(map[string]bool, len(files))
+	for _, f := range files {
+		got[f] = true
+	}
+	for _, want := range []string{nonASCII, embeddedNewline} {
+		if !got[want] {
+			t.Errorf("ChangedFiles = %v, want to contain verbatim %q", files, want)
+		}
+	}
+}
+
 func TestBuildManifestChangedFilesScope(t *testing.T) {
 	dir := t.TempDir()
 	initTestRepo(t, dir)
