@@ -166,7 +166,9 @@ func runAnalyze(cmd *cobra.Command, args []string) {
 		output.PrintJSON(result.Envelope)
 	} else if result.Envelope.Status == "success" {
 		if data, ok := result.Envelope.Data.(map[string]any); ok {
-			output.PrintAnalyzeSummary(data)
+			// With --verify the backend returns a Stage-2 verify result, not the
+			// analyze result; route accordingly so the verify outcome isn't dropped.
+			output.PrintAnalyzeResult(data, analyzeVerify)
 		}
 	} else {
 		output.PrintErrors(result.Envelope.Errors)
