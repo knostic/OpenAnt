@@ -19,29 +19,19 @@ configurations where a "Sonnet" model may not even exist.
 
 import json
 import sys
-from typing import Optional
+from typing import List, Optional
 
 from .llm import PhaseBinding, simple_text
 
 
-def get_json_extraction_prompt(raw_response: str) -> str:
-    """
-    Generate a prompt to extract JSON from a malformed response.
-    """
-    # Truncate very long responses
-    if len(raw_response) > 8000:
-        raw_response = raw_response[:8000] + "\n... [truncated]"
-
-    return f"""The following is a response from a security analysis that should have been JSON but wasn't properly formatted.
-
-Your task is to extract the security analysis data and return it as valid JSON.
-
-The expected JSON schema is:
-{{
+# Default (analyze/verify) schema. The corrector is also called by the enhance
+# and review phases whose output shapes have NO verdict — those callers pass
+# their own ``schema`` so the extraction prompt asks for the correct shape.
+_VULN_SCHEMA = """{
     "verdict": "VULNERABLE" | "SAFE" | "INSUFFICIENT_CONTEXT",
     "confidence": 0.0-1.0,
     "vulnerabilities": [
-        {{
+        {
             "type": "SQL Injection | XSS | Command Injection | Path Traversal | Open Redirect | XXE | Insecure Deserialization | Broken Access Control | Other",
             "severity": "CRITICAL | HIGH | MEDIUM | LOW",
             "source": "description of where tainted data enters",
@@ -49,26 +39,86 @@ The expected JSON schema is:
             "flow": "data flow description",
             "evidence": "code snippet",
             "why_vulnerable": "explanation"
-        }}
+        }
     ],
     "reasoning": "analysis summary"
-}}
+}"""
+
+
+def get_json_extraction_prompt(raw_response: str, schema: Optional[str] = None) -> str:
+    """
+    Generate a prompt to extract JSON from a malformed response.
+
+    Args:
+        raw_response: The malformed response to recover structured data from.
+        schema: Expected JSON schema for the calling phase. Defaults to the
+            analyze/verify vuln schema; enhance/review callers pass their own
+            so a valid enhance/review response isn't rewritten into a verdict.
+    """
+    # Truncate very long responses
+    if len(raw_response) > 8000:
+        raw_response = raw_response[:8000] + "\n... [truncated]"
+
+    schema = schema or _VULN_SCHEMA
+
+    return f"""The following is a response from a security analysis pipeline that should have been JSON but wasn't properly formatted.
+
+Your task is to extract the structured data and return it as valid JSON.
+
+The expected JSON schema is:
+{schema}
 
 Raw response to extract from:
 ---
 {raw_response}
 ---
 
-Return ONLY valid JSON matching the schema above. If you cannot determine the verdict, use "INSUFFICIENT_CONTEXT".
-If the response indicates vulnerabilities were found, set verdict to "VULNERABLE" and populate the vulnerabilities array.
-If the response indicates the code is safe, set verdict to "SAFE" with an empty vulnerabilities array.
+Return ONLY valid JSON matching the schema above. Preserve every field that is present in the raw response; do not invent values. If a required field cannot be determined, use the most conservative default for that field.
 
 Respond with the JSON only, no markdown, no explanation:"""
+
+
+# Verify-stage (finding_verifier Stage 2) finish schema — agree/correct_finding/
+# explanation (+ optional exploit_path/security_weakness), NOT the Stage-1 vuln
+# schema. Exposed both as ``get_verify_extraction_prompt`` (used by verify-stage
+# callers that want a ready-made prompt) and reachable via ``schema=`` on the
+# generic corrector.
+_VERIFY_SCHEMA = """{
+    "agree": true | false,
+    "correct_finding": "safe" | "protected" | "bypassable" | "vulnerable" | "inconclusive",
+    "explanation": "detailed explanation of the analysis",
+    "exploit_path": {
+        "entry_point": "where attacker input enters (or null)",
+        "data_flow": ["step 1", "step 2"],
+        "sink_reached": true | false,
+        "attacker_control_at_sink": "full" | "partial" | "none",
+        "path_broken_at": "where/why the path breaks (or null)"
+    },
+    "security_weakness": "dangerous patterns that exist but aren't currently exploitable (or null)"
+}"""
+
+
+def get_verify_extraction_prompt(raw_response: str) -> str:
+    """
+    Generate a prompt to extract JSON from a malformed *verify-stage*
+    (finding_verifier Stage 2) response.
+
+    The verify stage's finish schema is agree/correct_finding/explanation
+    (+ optional exploit_path/security_weakness) — NOT the Stage-1 analyze
+    schema (verdict/vulnerabilities/reasoning). Using the analyze prompt here
+    would ask the model for the wrong shape and drop a valid verification.
+
+    This is a thin convenience wrapper over :func:`get_json_extraction_prompt`
+    with the verify schema pre-filled; the reconciled corrector reaches the
+    same shape when a caller passes ``schema=`` directly.
+    """
+    return get_json_extraction_prompt(raw_response, schema=_VERIFY_SCHEMA)
 
 
 def extract_json_with_llm(
     binding: PhaseBinding,
     raw_response: str,
+    schema: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Use LLM to extract JSON from a malformed response.
@@ -78,6 +128,8 @@ def extract_json_with_llm(
             the binding of whatever phase received the malformed
             response in the first place (analyze, verify, etc.).
         raw_response: The raw response that failed to parse
+        schema: Expected JSON schema for the calling phase (see
+            ``get_json_extraction_prompt``). None => default vuln schema.
 
     Returns:
         Parsed JSON dict if successful, None otherwise
@@ -85,10 +137,16 @@ def extract_json_with_llm(
     if not raw_response or len(raw_response.strip()) < 10:
         return None
 
-    prompt = get_json_extraction_prompt(raw_response)
+    prompt = get_json_extraction_prompt(raw_response, schema=schema)
 
     try:
-        llm_response = simple_text(binding, prompt, max_tokens=2048)
+        # The correction must reproduce the FULL verdict JSON (verdict + an array
+        # of vulnerabilities + reasoning), which routinely exceeds 2048 tokens for
+        # a multi-finding response. A 2048-token cap truncated valid corrections
+        # mid-structure, so _parse_json_response rejected them. Match the schema's
+        # own producer (finding_verifier MAX_TOKENS_PER_RESPONSE) and simple_text's
+        # 8192 default so a large valid correction is never cut off.
+        llm_response = simple_text(binding, prompt, max_tokens=8192)
         return _parse_json_response(llm_response)
     except Exception as e:
         print(f"      JSON extraction failed: {e}", file=sys.stderr)
@@ -140,45 +198,82 @@ class JSONCorrector:
         """
         self.binding = binding
 
-    def attempt_correction(self, raw_response: str) -> dict:
+    def attempt_correction(
+        self,
+        raw_response: str,
+        schema: Optional[str] = None,
+        required_keys: Optional[List[str]] = None,
+    ) -> dict:
         """
         Attempt to correct a malformed JSON response.
 
         Args:
             raw_response: The raw response that failed to parse
+            schema: Expected JSON schema for the calling phase. None => the
+                default analyze/verify vuln schema. Enhance/review phases pass
+                their own shape so a valid non-verdict response is recovered
+                as-is instead of being rewritten into a vuln verdict.
+            required_keys: Keys that must be present for the correction to count
+                as successful. Defaults to ``["verdict"]`` (vuln shape). Callers
+                with a non-verdict shape pass their own required keys.
 
         Returns:
             Corrected result dict
         """
+        # Non-verdict schemas skip the vuln-specific finding->verdict
+        # normalization; their success gate is their own required_keys.
+        vuln_mode = schema is None
+        if required_keys is None:
+            required_keys = ["verdict"]
+
         print(f"      Attempting JSON correction with LLM...", file=sys.stderr)
 
-        extracted = extract_json_with_llm(self.binding, raw_response)
+        # Only forward ``schema`` when a caller supplied one, so pre-existing
+        # 2-arg stubs of extract_json_with_llm keep working on the default path.
+        if schema is None:
+            extracted = extract_json_with_llm(self.binding, raw_response)
+        else:
+            extracted = extract_json_with_llm(self.binding, raw_response, schema=schema)
 
         if extracted:
-            # Normalize the extracted finding casing so downstream lowercase
-            # gates (verifier/reporter) don't silently drop a capitalized
-            # "Vulnerable". Recover-only: lowercase, never invent a verdict.
-            if "finding" in extracted and isinstance(extracted["finding"], str):
-                extracted["finding"] = extracted["finding"].lower()
+            if vuln_mode:
+                # Normalize the extracted finding casing so downstream lowercase
+                # gates (verifier/reporter) don't silently drop a capitalized
+                # "Vulnerable". Recover-only: lowercase, never invent a verdict.
+                if "finding" in extracted and isinstance(extracted["finding"], str):
+                    extracted["finding"] = extracted["finding"].lower()
 
-            # Normalize finding -> verdict
-            if "verdict" not in extracted and "finding" in extracted:
-                finding = extracted["finding"]
-                mapping = {
-                    "vulnerable": "VULNERABLE", "safe": "SAFE",
-                    "protected": "PROTECTED", "bypassable": "BYPASSABLE",
-                    "inconclusive": "INCONCLUSIVE",
-                    "insufficient_context": "INSUFFICIENT_CONTEXT",
-                }
-                extracted["verdict"] = mapping.get(finding.lower(), finding.upper())
+                # Verify-stage shape recovery on the DEFAULT path: a verify finish
+                # dict carries the enum in ``correct_finding`` (lowercase) with no
+                # ``verdict`` key. Lowercase-normalize it and derive a ``verdict``
+                # so a default-args correction of a verify response passes the
+                # verdict-only success gate instead of being rejected as ERROR.
+                # (Verify callers that pass schema=/required_keys= skip this block
+                # entirely and are gated on their own keys.) Recover-only.
+                if "correct_finding" in extracted and isinstance(extracted["correct_finding"], str):
+                    extracted["correct_finding"] = extracted["correct_finding"].lower()
+                    if "verdict" not in extracted:
+                        extracted["verdict"] = extracted["correct_finding"].upper()
 
-            # Validate the extracted data has required fields
-            if "verdict" in extracted:
+                # Normalize finding -> verdict
+                if "verdict" not in extracted and "finding" in extracted:
+                    finding = extracted["finding"]
+                    mapping = {
+                        "vulnerable": "VULNERABLE", "safe": "SAFE",
+                        "protected": "PROTECTED", "bypassable": "BYPASSABLE",
+                        "inconclusive": "INCONCLUSIVE",
+                        "insufficient_context": "INSUFFICIENT_CONTEXT",
+                    }
+                    extracted["verdict"] = mapping.get(finding.lower(), finding.upper())
+
+            # Validate the extracted data has the caller's required fields
+            if all(k in extracted for k in required_keys):
                 extracted["json_corrected"] = True
-                print(f"      JSON correction successful! Verdict: {extracted.get('verdict')}", file=sys.stderr)
+                print(f"      JSON correction successful! keys={list(extracted.keys())}", file=sys.stderr)
                 return extracted
             else:
-                print(f"      JSON correction failed: missing verdict field", file=sys.stderr)
+                missing = [k for k in required_keys if k not in extracted]
+                print(f"      JSON correction failed: missing required fields {missing}", file=sys.stderr)
         else:
             print(f"      JSON correction failed: could not extract JSON", file=sys.stderr)
 

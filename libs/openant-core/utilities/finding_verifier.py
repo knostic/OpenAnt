@@ -73,6 +73,19 @@ MAX_ITERATIONS = 20
 MAX_TOKENS_PER_RESPONSE = 4096
 
 
+# Expected JSON shape of a verifier `finish` response — handed to JSONCorrector
+# so a malformed-but-recoverable verifier reply is repaired into THIS shape (no
+# verdict) rather than the default vuln schema, and its success is gated on the
+# verifier's own required keys instead of a nonexistent ``verdict`` field.
+_VERIFY_JSON_SCHEMA = """{
+    "agree": true,
+    "correct_finding": "safe | protected | bypassable | vulnerable | inconclusive",
+    "exploit_path": {"entry_point": null, "data_flow": [], "sink_reached": false, "attacker_control_at_sink": "none", "path_broken_at": null},
+    "explanation": "Detailed explanation of your analysis",
+    "security_weakness": null
+}"""
+
+
 # Enhanced finish tool with exploit_path structure
 VERIFICATION_TOOLS = [
     {
@@ -187,6 +200,17 @@ VERIFICATION_TOOLS = [
         }
     }
 ]
+
+
+def _resolve_stage1_finding(result: dict) -> str:
+    """Resolve a Stage-1 result's classification for verification.
+
+    A verdict-only result (``{"verdict": "vulnerable"}`` with no ``finding``
+    key) must fall back to its raw ``verdict`` before the ``inconclusive``
+    default — otherwise a real VULNERABLE is silently downgraded to
+    ``inconclusive`` and dropped from the report.
+    """
+    return str(result.get("finding") or result.get("verdict") or "inconclusive").lower()
 
 
 @dataclass
@@ -651,7 +675,7 @@ class FindingVerifier:
         Mutates the result dict in-place (each result is unique, no contention).
         """
         route_key = result.get("route_key", "unknown")
-        stage1_finding = result.get("finding", "inconclusive")
+        stage1_finding = _resolve_stage1_finding(result)
         worker = threading.current_thread().name
 
         self.tracker.start_unit_tracking()
@@ -710,7 +734,7 @@ class FindingVerifier:
         try:
             for i, result in enumerate(results):
                 route_key = result.get("route_key", "unknown")
-                stage1_finding = result.get("finding", "inconclusive")
+                stage1_finding = _resolve_stage1_finding(result)
                 self._log("info", f"Verifying finding {i+1}/{len(results)}",
                           unit_id=route_key, classification=stage1_finding)
 
@@ -858,9 +882,12 @@ class FindingVerifier:
         if verification.get("explanation") == "Max iterations reached":
             return False
 
-        # Check for exploit path analysis
+        # Check for exploit path analysis. A model may emit ``exploit_path``
+        # as a truthy non-dict (e.g. the bare string "reached"); the ``.get``
+        # calls below would then raise AttributeError. Treat any non-dict as
+        # not-conclusive, matching a missing exploit_path.
         exploit_path = verification.get("exploit_path")
-        if not exploit_path:
+        if not isinstance(exploit_path, dict):
             return False
 
         # Check if the exploit path analysis shows the path is broken
@@ -953,8 +980,12 @@ class FindingVerifier:
         """Parse the finish tool result into VerificationResult."""
         # Parse exploit path if present
         exploit_path = None
-        if "exploit_path" in finish_result and finish_result["exploit_path"]:
-            ep = finish_result["exploit_path"]
+        # FAM-ROBUST: finish_result is raw model tool-args; only treat
+        # exploit_path as structured when it is actually a dict. A non-dict
+        # (str/list/int from a non-Anthropic model) has no path fields — skip
+        # it (normalized to None) instead of crashing on ep.get(...).
+        ep = finish_result.get("exploit_path")
+        if isinstance(ep, dict) and ep:
             exploit_path = ExploitPath(
                 entry_point=ep.get("entry_point"),
                 data_flow=ep.get("data_flow", []),
@@ -1022,12 +1053,20 @@ class FindingVerifier:
         except json.JSONDecodeError:
             pass
 
-        # Fallback: use LLM to correct malformed JSON
+        # Fallback: use LLM to correct malformed JSON. Pass the verifier's
+        # `finish` schema so the corrector recovers verifier shape (no verdict)
+        # instead of rewriting it into the vuln verdict schema — otherwise a
+        # perfectly-extractable verification is rejected by the verdict-only
+        # success gate and the finding is silently dropped.
         if text.strip():
             try:
                 from utilities.json_corrector import JSONCorrector
                 corrector = JSONCorrector(self.binding)
-                corrected = corrector.attempt_correction(text)
+                corrected = corrector.attempt_correction(
+                    text,
+                    schema=_VERIFY_JSON_SCHEMA,
+                    required_keys=["agree", "correct_finding", "explanation"],
+                )
                 if corrected.get("verdict") != "ERROR":
                     corrected["json_corrected"] = True
                     return corrected

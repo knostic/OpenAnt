@@ -16,6 +16,17 @@ from .llm import PhaseBinding, simple_text
 from .context_corrector import gather_source_files, search_files_for_context
 
 
+# Expected JSON shape of a reviewer response — handed to JSONCorrector so a
+# malformed-but-recoverable reviewer reply is repaired into THIS shape (no
+# verdict) rather than the default vuln schema.
+_REVIEW_JSON_SCHEMA = """{
+    "context_complete": true,
+    "missing_items": [{"type": "utility", "description": "what is missing", "why_needed": "why", "hints": "clues"}],
+    "confidence": 0.0,
+    "reasoning": "Brief explanation of your assessment"
+}"""
+
+
 def get_context_review_prompt(code: str, route: str, handler: str, files_included: list[str]) -> str:
     """
     Generate a prompt for the LLM to review the assembled context
@@ -317,12 +328,18 @@ class ContextReviewer:
                 except json.JSONDecodeError:
                     pass
 
-        # Fallback: use LLM to correct malformed JSON
+        # Fallback: use LLM to correct malformed JSON. Pass THIS phase's schema
+        # so the corrector recovers reviewer shape (no verdict) instead of
+        # rewriting it into the vuln verdict schema and dropping the review.
         if response.strip() and hasattr(self, 'binding') and self.binding:
             try:
                 from utilities.json_corrector import JSONCorrector
                 corrector = JSONCorrector(self.binding)
-                corrected = corrector.attempt_correction(response)
+                corrected = corrector.attempt_correction(
+                    response,
+                    schema=_REVIEW_JSON_SCHEMA,
+                    required_keys=["context_complete"],
+                )
                 if corrected.get("verdict") != "ERROR":
                     corrected["json_corrected"] = True
                     return corrected
