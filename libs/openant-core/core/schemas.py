@@ -48,6 +48,32 @@ class ParseResult:
     units_count: int = 0
     language: str = "unknown"
     processing_level: str = "all"
+    # --- multi-language (additive) -------------------------------------
+    # `language` above stays scalar and means THE PRIMARY language: it is
+    # serialized into JSON the Go CLI unmarshals, so widening its type would be
+    # a cross-language breaking change. These fields sit beside it, following
+    # the same convention as skipped_steps / skipped_step_reasons.
+    languages: list = field(default_factory=list)
+    language_stats: dict = field(default_factory=dict)
+    per_language: dict = field(default_factory=dict)
+    parse_errors: list = field(default_factory=list)
+    # Languages detected but deliberately not scanned, with the reason.
+    # Carried on the result so a coverage gap is inspectable after the fact,
+    # not only visible in a stderr line that CI discards.
+    excluded_languages: dict = field(default_factory=dict)
+    # Which path supplied the application context: "threat_model" (a file in
+    # the scanned repo), "generated" (the built-in LLM generator), or "none".
+    # Recorded because a scan run under the WRONG security model looks
+    # identical to a correct one unless the source is stated.
+    context_source: str = "none"
+
+    @property
+    def degraded(self) -> bool:
+        """Whether any requested language failed to parse.
+
+        Derived rather than stored so it cannot disagree with parse_errors.
+        """
+        return bool(self.parse_errors)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -146,6 +172,33 @@ class ScanResult:
     # 'no_candidates' for an auto-skip vs 'not_requested' for an opt-out).
     skipped_step_reasons: dict = field(default_factory=dict)
 
+    # --- multi-language (additive) -------------------------------------
+    # `language` above stays scalar and means THE PRIMARY language: it is
+    # serialized into JSON the Go CLI unmarshals, so widening its type would be
+    # a cross-language breaking change. These fields sit beside it, following
+    # the same convention as skipped_steps / skipped_step_reasons.
+    languages: list = field(default_factory=list)
+    language_stats: dict = field(default_factory=dict)
+    per_language: dict = field(default_factory=dict)
+    parse_errors: list = field(default_factory=list)
+    # Languages detected but deliberately not scanned, with the reason.
+    # Carried on the result so a coverage gap is inspectable after the fact,
+    # not only visible in a stderr line that CI discards.
+    excluded_languages: dict = field(default_factory=dict)
+    # Which path supplied the application context: "threat_model" (a file in
+    # the scanned repo), "generated" (the built-in LLM generator), or "none".
+    # Recorded because a scan run under the WRONG security model looks
+    # identical to a correct one unless the source is stated.
+    context_source: str = "none"
+
+    @property
+    def degraded(self) -> bool:
+        """Whether any requested language failed to parse.
+
+        Derived rather than stored so it cannot disagree with parse_errors.
+        """
+        return bool(self.parse_errors)
+
     def to_dict(self) -> dict:
         return {
             "output_dir": self.output_dir,
@@ -166,6 +219,13 @@ class ScanResult:
             "step_reports": self.step_reports,
             "skipped_steps": self.skipped_steps,
             "skipped_step_reasons": self.skipped_step_reasons,
+            "languages": self.languages,
+            "language_stats": self.language_stats,
+            "per_language": self.per_language,
+            "parse_errors": self.parse_errors,
+            "excluded_languages": self.excluded_languages,
+            "context_source": self.context_source,
+            "degraded": self.degraded,
         }
 
 

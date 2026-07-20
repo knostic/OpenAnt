@@ -14,6 +14,7 @@ Supports reachability-aware classification to distinguish:
 import json
 from typing import Optional, Set, List
 
+from core.file_boundary import boundary_for_language
 from ..llm_client import TokenTracker, get_global_tracker
 from ..llm import (
     Message,
@@ -499,7 +500,10 @@ def enhance_unit_with_agent(
 
         # Append to primary_code with file boundaries
         if additional_code:
-            FILE_BOUNDARY = "\n\n// ========== File Boundary ==========\n\n"
+            # Emit the marker in the UNIT'S comment syntax. A `//` line injected
+            # into Python or Ruby source is a syntax error, and the downstream
+            # split would not find it in the form those parsers emit.
+            FILE_BOUNDARY = boundary_for_language(unit.get("language"))
             current_code = unit["code"]["primary_code"]
             assembled = current_code + FILE_BOUNDARY + FILE_BOUNDARY.join(additional_code)
             unit["code"]["primary_code"] = assembled

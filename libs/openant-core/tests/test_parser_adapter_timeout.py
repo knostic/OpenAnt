@@ -5,6 +5,7 @@ C/Ruby/PHP/Zig already pass timeout=1800; JS and Go did not, so a direct-Python 
 parse_repository / _parse_javascript / _parse_go had no bound. These tests fail on master
 (no timeout) and pass with the fix.
 """
+import functools
 import inspect
 import tempfile
 
@@ -57,8 +58,20 @@ def test_go_parse_subprocess_has_timeout(monkeypatch):
 def test_all_subprocess_parsers_are_uniformly_timed():
     """Every language whose *parse step* runs as a subprocess must carry a timeout — not just
     4 of them. (Python parses in-process, so it is intentionally excluded; the npm-install
-    dependency bootstrap in _ensure_js_parser_dependencies is a separate concern, not a parse.)"""
-    for lang in ("_parse_javascript", "_parse_go", "_parse_c",
-                 "_parse_ruby", "_parse_php", "_parse_zig"):
-        src = inspect.getsource(getattr(parser_adapter, lang))
-        assert "timeout=" in src, f"{lang} subprocess.run is missing a timeout"
+    dependency bootstrap in _ensure_js_parser_dependencies is a separate concern, not a parse.)
+
+    The six per-language bodies this originally scanned have been collapsed into the single
+    shared ``_parse_via_subprocess``, so uniformity is now structural rather than something
+    six copies have to independently get right. The assertion is correspondingly stronger:
+    the one implementation carries a timeout, AND every subprocess language routes to it —
+    which is what "uniformly timed" actually means.
+    """
+    src = inspect.getsource(parser_adapter._parse_via_subprocess)
+    assert "timeout=" in src, "_parse_via_subprocess subprocess.run is missing a timeout"
+
+    for lang in ("javascript", "go", "c", "ruby", "php", "zig"):
+        parser = parser_adapter._parser_for(lang)
+        assert isinstance(parser, functools.partial), f"{lang} no longer routes via a partial"
+        assert parser.func is parser_adapter._parse_via_subprocess, (
+            f"{lang} does not route through the shared timed subprocess parser"
+        )

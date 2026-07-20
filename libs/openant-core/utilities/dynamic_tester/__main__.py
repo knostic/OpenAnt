@@ -41,7 +41,7 @@ def main():
     print("\n" + "=" * 50)
     print("DYNAMIC TEST SUMMARY")
     print("=" * 50)
-    for status in ["CONFIRMED", "NOT_REPRODUCED", "BLOCKED", "INCONCLUSIVE", "ERROR"]:
+    for status in ["CONFIRMED", "NOT_REPRODUCED", "BLOCKED", "INCONCLUSIVE", "ERROR", "SKIPPED"]:
         if status in counts:
             print(f"  {status}: {counts[status]}")
     print(f"  TOTAL: {len(results)}")

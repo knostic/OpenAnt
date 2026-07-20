@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.schemas import ReportResult
+from core.language_registry import fence_for_path
 from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
 from utilities.file_io import normalize_results, open_utf8, read_json, write_json
 
@@ -66,26 +67,11 @@ def _load_diff_metadata(scan_dir: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 # Map language hints to the code-fence language tag used in Markdown.
-_FENCE_LANG = {
-    "python": "python",
-    "py": "python",
-    "javascript": "javascript",
-    "js": "javascript",
-    "typescript": "typescript",
-    "ts": "typescript",
-    "go": "go",
-    "golang": "go",
-    "java": "java",
-    "ruby": "ruby",
-    "rb": "ruby",
-    "php": "php",
-    "rust": "rust",
-    "c": "c",
-    "cpp": "cpp",
-    "c++": "cpp",
-    "csharp": "csharp",
-    "c#": "csharp",
-}
+# Fence tags come from the language registry, resolved per FILE. The old
+# module-level map was keyed by the SCAN-WIDE language, which mislabelled every
+# file whose extension implied a different tag than the scan's primary
+# language — a `.ts` file in a "javascript" scan was fenced as ```javascript
+# even before multi-language scanning existed.
 
 
 def _coerce_to_str(value) -> str:
@@ -125,7 +111,9 @@ def _build_vulnerable_code_section(file_path: str, code: str, language: str | No
     """
     if not code:
         return ""
-    fence_lang = _FENCE_LANG.get((language or "").lower(), "")
+    # Resolve by the finding's own file; fall back to the scan language only
+    # when the path carries no recognizable extension.
+    fence_lang = fence_for_path(file_path, fallback=language)
     return (
         "## Vulnerable Code\n\n"
         f"`{file_path}`:\n\n"

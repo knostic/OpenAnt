@@ -129,7 +129,26 @@ class ApplicationContext:
     # Metadata
     confidence: float = 0.0
     evidence: list[str] = field(default_factory=list)
-    source: str = "llm"  # "llm", "manual", or "merged"
+    source: str = "llm"  # "llm", "manual", "merged", or "threat_model"
+
+    # --- Custom threat-model extension (schema v1, see context/threat_model.py) ---
+    #
+    # These are ALL optional with defaults, deliberately. The two deserialization
+    # sites in the codebase (core/analyzer.py, core/verifier.py) both go through
+    # ``load_context``, which is ``ApplicationContext(**data)``; ``save_context`` is
+    # a plain ``asdict``. Because every new field is defaulted, a pre-existing
+    # ``application_context.json`` written before this extension existed still loads
+    # unchanged, and the richer schema round-trips through save/load with no changes
+    # to either function. That is what lets the built-in "app type" arm and the
+    # custom threat-model arm be the *same* dataclass differing only in which JSON
+    # file is handed to the pipeline — the precondition for comparing them.
+    threat_model_version: int | None = None
+    classification: str | None = None
+    components: list = field(default_factory=list)
+    attacker_profiles: list = field(default_factory=list)
+    input_sources: dict = field(default_factory=dict)
+    vulnerability_criteria: list = field(default_factory=list)
+    impact_statement: str | None = None
 
     def __post_init__(self):
         """Validate application_type after initialization."""
@@ -137,11 +156,40 @@ class ApplicationContext:
         if self.source == "manual":
             return
 
+        # Skip validation for threat-model contexts. This is an EXPLICIT second
+        # branch rather than a widening of the ``source == "manual"`` bypass above,
+        # and the duplication is intentional. The two bypasses exist for unrelated
+        # reasons and must be able to change independently:
+        #
+        #   * the manual bypass exists because an operator hand-writing OPENANT.md
+        #     is trusted to name any type they like;
+        #   * this bypass exists because a threat model's ``application_type`` is
+        #     *derived*, not chosen — ``threat_model_to_context`` synthesizes
+        #     ``"custom:" + slug(classification)`` from a free-form classification,
+        #     which by construction can never be one of the four enum values.
+        #
+        # Folding them together would mean a future tightening of one silently
+        # loosens the other, and would also make a threat-model context
+        # indistinguishable from an operator override at the ``source`` field.
+        if self.threat_model_version is not None:
+            return
+
         if not ApplicationType.is_supported(self.application_type):
             raise UnsupportedApplicationTypeError(
                 self.application_type,
                 self.evidence
             )
+
+    def has_threat_model(self) -> bool:
+        """Whether this context was built from a custom threat model (schema v1+).
+
+        The single branch predicate at every consumption site: prompt renderers,
+        the scanner's context step, and the A/B arm labelling. ``threat_model_version``
+        is the marker because it is the one field that is meaningless to set by hand
+        on a legacy context and is written by exactly one producer
+        (``context.threat_model.threat_model_to_context``).
+        """
+        return self.threat_model_version is not None
 
     def get_type_info(self) -> dict:
         """Get detailed information about this application type."""

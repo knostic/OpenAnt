@@ -31,6 +31,7 @@ To submit your repo for scanning:
 - C/C++ (beta)
 - PHP (beta)
 - Ruby (beta)
+- Zig (beta)
 
 ## Credits
 

@@ -10,13 +10,24 @@ sys.path hacks in the original code.
 """
 
 import contextlib
+import functools
 import json
 import os
 import shutil
 import subprocess
 import sys
+import time
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from core.language_registry import (
+    extension_map,
+    load_registry,
+    parser_script_path,
+    skip_dirs,
+    supported_languages,
+)
 from core.schemas import ParseResult
 from utilities.file_io import open_utf8, read_json, write_json
 
@@ -26,41 +37,48 @@ _CORE_ROOT = Path(__file__).parent.parent
 # JS parser directory (holds its own package.json / node_modules)
 _JS_PARSER_DIR = _CORE_ROOT / "parsers" / "javascript"
 
-# Shared language detection config (single source of truth: config/languages.json)
-_LANGUAGES_CONFIG = Path(__file__).parent.parent.parent.parent / "config" / "languages.json"
+def detect_languages(repo_path: str) -> dict[str, int]:
+    """Count source files per language.
 
+    This is the multi-language primitive. ``detect_language`` wraps it for the
+    single-language callers, which previously threw the count map away — a repo
+    that is 60% Go and 40% TypeScript was scanned as a Go repo, and the absence
+    of the TypeScript was never reported anywhere.
 
-def _load_language_config() -> dict:
-    return read_json(_LANGUAGES_CONFIG)
+    Directories named in ``skip_dirs`` are PRUNED rather than filtered
+    per-file. This matches the Go detector's ``filepath.SkipDir`` semantics
+    exactly (the two implementations previously disagreed on what "skip"
+    meant), and it stops the walk descending into ``node_modules`` at all,
+    which is a substantial speedup on JS monorepos.
 
-
-def detect_language(repo_path: str) -> str:
-    """Auto-detect the primary language of a repository.
-
-    Counts source files by extension and returns the dominant language.
-    Extension mappings and skip directories are loaded from config/languages.json.
+    Args:
+        repo_path: Repository root to walk.
 
     Returns:
-        One of: "python", "javascript", "go", "c", "ruby", "php", "zig"
-    """
-    config = _load_language_config()
-    skip_dirs = set(config["skip_dirs"])
-    extensions = config["extensions"]
+        Mapping of language name → source-file count, ordered by descending
+        count with ties broken alphabetically. The ordering is deterministic:
+        the previous ``max(counts, key=counts.get)`` returned whichever key
+        happened to be first in dict order, and the Go side's randomized map
+        iteration meant the two could disagree on a tie for the same repo.
 
-    repo = Path(repo_path)
+    Raises:
+        ValueError: If no supported source files were found. The message is
+            preserved verbatim so ``detect_language``'s contract is unchanged.
+    """
+    extensions = extension_map()
+    skipped = skip_dirs()
+
     counts: dict[str, int] = {}
 
-    for f in repo.rglob("*"):
-        if not f.is_file():
-            continue
-        # Skip configured non-source dirs
-        if any(p in skip_dirs for p in f.parts):
-            continue
+    for dirpath, dirnames, filenames in os.walk(repo_path):
+        # Prune in place so os.walk does not descend into skipped trees.
+        dirnames[:] = [d for d in dirnames if d not in skipped]
 
-        suffix = f.suffix.lower()
-        if suffix in extensions:
-            lang = extensions[suffix]
-            counts[lang] = counts.get(lang, 0) + 1
+        for filename in filenames:
+            suffix = os.path.splitext(filename)[1].lower()
+            lang = extensions.get(suffix)
+            if lang is not None:
+                counts[lang] = counts.get(lang, 0) + 1
 
     if not counts:
         raise ValueError(
@@ -68,7 +86,19 @@ def detect_language(repo_path: str) -> str:
             "Supported languages: Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Zig."
         )
 
-    return max(counts, key=counts.get)
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def detect_language(repo_path: str) -> str:
+    """Auto-detect the primary (dominant) language of a repository.
+
+    Preserved verbatim in signature and in the ``ValueError`` contract so every
+    existing caller and test is unaffected by the multi-language work.
+
+    Returns:
+        One of: "python", "javascript", "go", "c", "ruby", "php", "zig"
+    """
+    return next(iter(detect_languages(repo_path)))
 
 
 def parse_repository(
@@ -128,26 +158,183 @@ def parse_repository(
         language = detect_language(repo_path)
         print(f"  Auto-detected language: {language}", file=sys.stderr)
 
-    # Dispatch to the right parser
-    if language == "python":
-        result = _parse_python(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
-    elif language == "javascript":
-        result = _parse_javascript(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
-    elif language == "go":
-        result = _parse_go(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
-    elif language == "c":
-        result = _parse_c(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
-    elif language == "ruby":
-        result = _parse_ruby(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
-    elif language == "php":
-        result = _parse_php(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
-    elif language == "zig":
-        result = _parse_zig(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
-    else:
-        raise ValueError(f"Unsupported language: {language}")
+    # Dispatch to the right parser via the registry.
+    try:
+        parser = _parser_for(language)
+    except KeyError:
+        raise ValueError(
+            f"Unsupported language: {language}. "
+            f"Supported: {', '.join(supported_languages())}"
+        ) from None
+
+    result = parser(repo_path, output_dir, processing_level, skip_tests, name, library_mode)
 
     _maybe_apply_diff_filter(result, output_dir, diff_manifest)
     return result
+
+
+@dataclass
+class LanguageParseOutcome:
+    """Result of parsing ONE language during a multi-language fan-out.
+
+    Failures are data, not exceptions, because one broken toolchain must not
+    cost the user every other language in the repo.
+
+    Attributes:
+        language: Registry language name.
+        ok: Whether the parse succeeded.
+        output_dir: The per-language directory written to.
+        dataset_path: Path to this language's dataset.json, if produced.
+        analyzer_output_path: Path to analyzer_output.json, if produced.
+        units_count: Units parsed.
+        duration_seconds: Wall-clock time for this language.
+        error: Failure message, when ``ok`` is False.
+        error_type: Coarse failure class, for reporting and triage.
+    """
+
+    language: str
+    ok: bool
+    output_dir: str
+    dataset_path: str | None = None
+    analyzer_output_path: str | None = None
+    units_count: int = 0
+    duration_seconds: float = 0.0
+    error: str | None = None
+    error_type: str | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _classify_parse_error(exc: BaseException) -> str:
+    """Coarse failure class for a per-language parse error."""
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "timeout"
+    if isinstance(exc, FileNotFoundError):
+        return "missing_dependency"
+    if isinstance(exc, OSError):
+        return "os_error"
+    if isinstance(exc, ValueError):
+        return "unsupported_language"
+    return "parser_failed"
+
+
+def parse_repository_multi(
+    repo_path: str,
+    run_dir: str,
+    languages: list[str],
+    processing_level: str = "reachable",
+    skip_tests: bool = True,
+    name: str = None,
+    fresh: bool = False,
+    library_mode: bool = False,
+    strict: bool = False,
+) -> list[LanguageParseOutcome]:
+    """Parse a repository once per language into per-language directories.
+
+    Every parser writes the SAME flat filenames — ``dataset.json``,
+    ``analyzer_output.json``, ``call_graph.json``, ``scan_result(s).json``,
+    ``functions.json``, ``pipeline_results.json`` — into whatever output
+    directory it is handed. Running two languages into one directory therefore
+    means the second silently overwrites the first. Giving each language its own
+    ``<run_dir>/<language>/`` is the whole reason this function exists, and it
+    matches the layout the Go CLI already assumes via
+    ``config.ScanDir(project, sha, language)``.
+
+    **Sequential by design.** This loop must not be parallelised without first
+    moving cost tracking off the process-global tracker: ``step_context``
+    computes usage deltas against it, and concurrent languages would interleave
+    those deltas and silently corrupt every per-step ``cost_usd``. Two further
+    reasons: the Python parser runs in-process and mutates ``sys.path``, and
+    running six tree-sitter/Node/Go parsers at once on a monorepo is a
+    realistic OOM — which would lose every language, the exact outcome the
+    partial-success handling below exists to prevent.
+
+    Args:
+        repo_path: Repository to parse.
+        run_dir: Run root. Per-language output goes in ``<run_dir>/<language>/``.
+        languages: Languages to parse, in order.
+        processing_level: "all", "reachable", "codeql" or "exploitable".
+        skip_tests: Exclude test files.
+        name: Dataset name override.
+        fresh: Delete each language's existing dataset.json first.
+        library_mode: Seed the public API surface as entry points.
+        strict: Re-raise the first per-language failure instead of continuing.
+
+    Returns:
+        One :class:`LanguageParseOutcome` per requested language, in order.
+
+    Raises:
+        ValueError: If ``languages`` is empty.
+        RuntimeError: If EVERY language failed, aggregating each error.
+    """
+    if not languages:
+        raise ValueError("parse_repository_multi requires at least one language")
+
+    repo_path = os.path.abspath(repo_path)
+    run_dir = os.path.abspath(run_dir)
+
+    outcomes: list[LanguageParseOutcome] = []
+
+    for language in languages:
+        output_dir = os.path.join(run_dir, language)
+        started = time.monotonic()
+
+        try:
+            result = parse_repository(
+                repo_path=repo_path,
+                output_dir=output_dir,
+                language=language,
+                processing_level=processing_level,
+                skip_tests=skip_tests,
+                name=name,
+                fresh=fresh,
+                library_mode=library_mode,
+            )
+        except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
+            # Deliberately NOT a bare `except Exception`: a KeyboardInterrupt or
+            # MemoryError mid-fan-out must abort the run, not be logged as
+            # "this language failed" and then repeated for five more languages.
+            outcomes.append(LanguageParseOutcome(
+                language=language,
+                ok=False,
+                output_dir=output_dir,
+                duration_seconds=time.monotonic() - started,
+                error=str(exc),
+                error_type=_classify_parse_error(exc),
+            ))
+            print(
+                f"  [ERROR] {language} parser failed: {exc} — "
+                "continuing with remaining languages",
+                file=sys.stderr,
+            )
+            if strict:
+                raise
+            continue
+
+        outcomes.append(LanguageParseOutcome(
+            language=language,
+            ok=True,
+            output_dir=output_dir,
+            dataset_path=result.dataset_path,
+            analyzer_output_path=result.analyzer_output_path,
+            units_count=result.units_count,
+            duration_seconds=time.monotonic() - started,
+        ))
+
+    if not any(o.ok for o in outcomes):
+        detail = "; ".join(f"{o.language}: {o.error}" for o in outcomes)
+        raise RuntimeError(f"All {len(outcomes)} language parser(s) failed. {detail}")
+
+    failed = [o for o in outcomes if not o.ok]
+    if failed:
+        print(
+            f"[Parser] DEGRADED: {len(failed)} of {len(outcomes)} language(s) failed "
+            f"({', '.join(o.language for o in failed)}). Results are incomplete.",
+            file=sys.stderr,
+        )
+
+    return outcomes
 
 
 def _maybe_apply_diff_filter(
@@ -547,138 +734,60 @@ def _file_lock(lock_path: Path):
         f.close()
 
 
-def _parse_javascript(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
-    """Invoke the JavaScript/TypeScript parser.
+def _parse_via_subprocess(
+    language: str,
+    repo_path: str,
+    output_dir: str,
+    processing_level: str,
+    skip_tests: bool = True,
+    name: str = None,
+    library_mode: bool = False,
+) -> ParseResult:
+    """Invoke a language's parser as a subprocess.
 
-    The JS parser is a PipelineTest class that runs Node.js subprocesses.
-    We invoke it via subprocess to avoid the sys.path hacks.
+    Every non-Python parser shares one argv contract::
+
+        <script> <repo_path> --output <dir> --processing-level <level>
+                 [--name N] [--skip-tests] [--library-mode]
+
+    and writes the same artifact set into *output_dir*. This used to be six
+    near-identical function bodies (javascript, go, c, ruby, php, zig) that
+    differed only in a log string, a script path, a language literal, and — for
+    JavaScript alone — an npm bootstrap. Collapsing them means adding a
+    language is a `config/languages.json` edit plus a `parsers/<lang>/`
+    directory, rather than another copy of this function.
+
+    The script path and the bootstrap hook both come from the registry, so the
+    dispatch table and the detection table can no longer disagree.
+
+    Args:
+        language: Registry language name.
+        repo_path: Absolute path to the repository to parse.
+        output_dir: Directory to write dataset.json / analyzer_output.json into.
+        processing_level: "all", "reachable", "codeql" or "exploitable".
+        skip_tests: Exclude test files from parsing.
+        name: Dataset name override.
+        library_mode: Seed the public API surface as reachability entry points.
+
+    Returns:
+        ParseResult for this language.
+
+    Raises:
+        RuntimeError: If the parser subprocess exits non-zero.
+        ValueError: If the language has no registered subprocess parser.
     """
-    _ensure_js_parser_dependencies()
+    spec = load_registry().get(language)
+    if spec is None or spec.parser_mode != "subprocess":
+        raise ValueError(f"No subprocess parser registered for language: {language}")
 
-    print("[Parser] Running JavaScript parser...", file=sys.stderr)
+    # Per-language pre-hook. Only JavaScript has one: its parser carries its
+    # own package.json and needs node_modules present before it can run.
+    if spec.bootstrap == "npm":
+        _ensure_js_parser_dependencies()
 
-    parser_script = _CORE_ROOT / "parsers" / "javascript" / "test_pipeline.py"
+    print(f"[Parser] Running {language} parser...", file=sys.stderr)
 
-    # Build command — analyzer-path now defaults to co-located file in the parser
-    cmd = [
-        sys.executable, str(parser_script),
-        repo_path,
-        "--output", output_dir,
-        "--processing-level", processing_level,
-    ]
-
-    if name:
-        cmd.extend(["--name", name])
-    if skip_tests:
-        cmd.append("--skip-tests")
-    if library_mode:
-        cmd.append("--library-mode")
-
-    result = subprocess.run(
-        cmd,
-        stdout=sys.stderr,
-        stderr=sys.stderr,
-        cwd=str(_CORE_ROOT),
-        timeout=1800,  # 30 min — parity with the C/Ruby/PHP/Zig parse subprocesses
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(f"JavaScript parser failed with exit code {result.returncode}")
-
-    dataset_path = os.path.join(output_dir, "dataset.json")
-    analyzer_output_path = os.path.join(output_dir, "analyzer_output.json")
-
-    # Count units
-    units_count = 0
-    if os.path.exists(dataset_path):
-        data = read_json(dataset_path)
-        units_count = len(data.get("units", []))
-
-    print(f"  JavaScript parser complete: {units_count} units", file=sys.stderr)
-
-    return ParseResult(
-        dataset_path=dataset_path,
-        analyzer_output_path=analyzer_output_path if os.path.exists(analyzer_output_path) else None,
-        units_count=units_count,
-        language="javascript",
-        processing_level=processing_level,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Go parser
-# ---------------------------------------------------------------------------
-
-def _parse_go(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
-    """Invoke the Go parser.
-
-    The Go parser is a PipelineTest class that calls a compiled Go binary.
-    We invoke it via subprocess.
-    """
-    print("[Parser] Running Go parser...", file=sys.stderr)
-
-    parser_script = _CORE_ROOT / "parsers" / "go" / "test_pipeline.py"
-
-    cmd = [
-        sys.executable, str(parser_script),
-        repo_path,
-        "--output", output_dir,
-        "--processing-level", processing_level,
-    ]
-
-    if name:
-        cmd.extend(["--name", name])
-    if skip_tests:
-        cmd.append("--skip-tests")
-    if library_mode:
-        cmd.append("--library-mode")
-
-    result = subprocess.run(
-        cmd,
-        stdout=sys.stderr,
-        stderr=sys.stderr,
-        cwd=str(_CORE_ROOT),
-        timeout=1800,  # 30 min — parity with the C/Ruby/PHP/Zig parse subprocesses
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(f"Go parser failed with exit code {result.returncode}")
-
-    dataset_path = os.path.join(output_dir, "dataset.json")
-    analyzer_output_path = os.path.join(output_dir, "analyzer_output.json")
-
-    # Count units
-    units_count = 0
-    if os.path.exists(dataset_path):
-        data = read_json(dataset_path)
-        units_count = len(data.get("units", []))
-
-    print(f"  Go parser complete: {units_count} units", file=sys.stderr)
-
-    return ParseResult(
-        dataset_path=dataset_path,
-        analyzer_output_path=analyzer_output_path if os.path.exists(analyzer_output_path) else None,
-        units_count=units_count,
-        language="go",
-        processing_level=processing_level,
-    )
-
-
-# ---------------------------------------------------------------------------
-# C/C++ parser
-# ---------------------------------------------------------------------------
-
-def _parse_c(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
-    """Invoke the C/C++ parser.
-
-    The C parser uses tree-sitter for function extraction and call graph
-    building.  Invoked via subprocess (same pattern as Go/JS parsers).
-
-    Requires: tree-sitter, tree-sitter-c, tree-sitter-cpp
-    """
-    print("[Parser] Running C/C++ parser...", file=sys.stderr)
-
-    parser_script = _CORE_ROOT / "parsers" / "c" / "test_pipeline.py"
+    parser_script = parser_script_path(language)
 
     cmd = [
         sys.executable, str(parser_script),
@@ -699,11 +808,11 @@ def _parse_c(repo_path: str, output_dir: str, processing_level: str, skip_tests:
         stdout=sys.stderr,
         stderr=sys.stderr,
         cwd=str(_CORE_ROOT),
-        timeout=1800,  # 30 min timeout (C repos can be large)
+        timeout=1800,  # 30 min — large repos, tree-sitter/Node/Go toolchains
     )
 
     if result.returncode != 0:
-        raise RuntimeError(f"C/C++ parser failed with exit code {result.returncode}")
+        raise RuntimeError(f"{language} parser failed with exit code {result.returncode}")
 
     dataset_path = os.path.join(output_dir, "dataset.json")
     analyzer_output_path = os.path.join(output_dir, "analyzer_output.json")
@@ -714,195 +823,58 @@ def _parse_c(repo_path: str, output_dir: str, processing_level: str, skip_tests:
         data = read_json(dataset_path)
         units_count = len(data.get("units", []))
 
-    print(f"  C/C++ parser complete: {units_count} units", file=sys.stderr)
+    print(f"  {language} parser complete: {units_count} units", file=sys.stderr)
 
     return ParseResult(
         dataset_path=dataset_path,
         analyzer_output_path=analyzer_output_path if os.path.exists(analyzer_output_path) else None,
         units_count=units_count,
-        language="c",
+        language=language,
         processing_level=processing_level,
     )
 
 
-# ---------------------------------------------------------------------------
-# Ruby parser
-# ---------------------------------------------------------------------------
+# Named aliases, preserved so any test or downstream import that references a
+# parser by its original symbol keeps working.
+_parse_javascript = functools.partial(_parse_via_subprocess, "javascript")
+_parse_go = functools.partial(_parse_via_subprocess, "go")
+_parse_c = functools.partial(_parse_via_subprocess, "c")
+_parse_ruby = functools.partial(_parse_via_subprocess, "ruby")
+_parse_php = functools.partial(_parse_via_subprocess, "php")
+_parse_zig = functools.partial(_parse_via_subprocess, "zig")
 
-def _parse_ruby(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
-    """Invoke the Ruby parser.
+ParserFn = Callable[..., ParseResult]
 
-    The Ruby parser uses tree-sitter for function extraction and call graph
-    building.  Invoked via subprocess (same pattern as other parsers).
 
-    Requires: tree-sitter, tree-sitter-ruby
+def _parser_for(language: str) -> ParserFn:
+    """Resolve the parser callable for a language.
+
+    Resolution order matters:
+
+    1. A module-level ``_parse_<language>`` attribute, looked up DYNAMICALLY.
+       This is what preserves the long-standing monkeypatch seam — tests swap
+       ``parser_adapter._parse_python`` to stub out parsing (see
+       tests/test_parse_fresh.py). Capturing the function object once at import
+       time would silently ignore those patches, turning a stubbed test into a
+       real parse.
+    2. Otherwise, build the subprocess parser straight from the registry, so a
+       language added to ``config/languages.json`` works without also needing a
+       hand-written alias here.
+
+    Raises:
+        KeyError: If the language is not in the registry.
+        ValueError: If the registry marks it in-process but no implementation
+            is bound — a config error, not a user error.
     """
-    print("[Parser] Running Ruby parser...", file=sys.stderr)
+    spec = load_registry()[language]
 
-    parser_script = _CORE_ROOT / "parsers" / "ruby" / "test_pipeline.py"
+    override = globals().get(f"_parse_{language}")
+    if override is not None:
+        return override
 
-    cmd = [
-        sys.executable, str(parser_script),
-        repo_path,
-        "--output", output_dir,
-        "--processing-level", processing_level,
-    ]
-
-    if name:
-        cmd.extend(["--name", name])
-    if skip_tests:
-        cmd.append("--skip-tests")
-    if library_mode:
-        cmd.append("--library-mode")
-
-    result = subprocess.run(
-        cmd,
-        stdout=sys.stderr,
-        stderr=sys.stderr,
-        cwd=str(_CORE_ROOT),
-        timeout=1800,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(f"Ruby parser failed with exit code {result.returncode}")
-
-    dataset_path = os.path.join(output_dir, "dataset.json")
-    analyzer_output_path = os.path.join(output_dir, "analyzer_output.json")
-
-    # Count units
-    units_count = 0
-    if os.path.exists(dataset_path):
-        data = read_json(dataset_path)
-        units_count = len(data.get("units", []))
-
-    print(f"  Ruby parser complete: {units_count} units", file=sys.stderr)
-
-    return ParseResult(
-        dataset_path=dataset_path,
-        analyzer_output_path=analyzer_output_path if os.path.exists(analyzer_output_path) else None,
-        units_count=units_count,
-        language="ruby",
-        processing_level=processing_level,
-    )
-
-
-# ---------------------------------------------------------------------------
-# PHP parser
-# ---------------------------------------------------------------------------
-
-def _parse_php(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
-    """Invoke the PHP parser.
-
-    The PHP parser uses tree-sitter for function extraction and call graph
-    building.  Invoked via subprocess (same pattern as other parsers).
-
-    Requires: tree-sitter, tree-sitter-php
-    """
-    print("[Parser] Running PHP parser...", file=sys.stderr)
-
-    parser_script = _CORE_ROOT / "parsers" / "php" / "test_pipeline.py"
-
-    cmd = [
-        sys.executable, str(parser_script),
-        repo_path,
-        "--output", output_dir,
-        "--processing-level", processing_level,
-    ]
-
-    if name:
-        cmd.extend(["--name", name])
-    if skip_tests:
-        cmd.append("--skip-tests")
-    if library_mode:
-        cmd.append("--library-mode")
-
-    result = subprocess.run(
-        cmd,
-        stdout=sys.stderr,
-        stderr=sys.stderr,
-        cwd=str(_CORE_ROOT),
-        timeout=1800,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(f"PHP parser failed with exit code {result.returncode}")
-
-    dataset_path = os.path.join(output_dir, "dataset.json")
-    analyzer_output_path = os.path.join(output_dir, "analyzer_output.json")
-
-    # Count units
-    units_count = 0
-    if os.path.exists(dataset_path):
-        data = read_json(dataset_path)
-        units_count = len(data.get("units", []))
-
-    print(f"  PHP parser complete: {units_count} units", file=sys.stderr)
-
-    return ParseResult(
-        dataset_path=dataset_path,
-        analyzer_output_path=analyzer_output_path if os.path.exists(analyzer_output_path) else None,
-        units_count=units_count,
-        language="php",
-        processing_level=processing_level,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Zig parser
-# ---------------------------------------------------------------------------
-
-def _parse_zig(repo_path: str, output_dir: str, processing_level: str, skip_tests: bool = True, name: str = None, library_mode: bool = False) -> ParseResult:
-    """Invoke the Zig parser.
-
-    The Zig parser uses tree-sitter for function extraction and call graph
-    building.  Invoked via subprocess (same pattern as other parsers).
-
-    Requires: tree-sitter, tree-sitter-zig
-    """
-    print("[Parser] Running Zig parser...", file=sys.stderr)
-
-    parser_script = _CORE_ROOT / "parsers" / "zig" / "test_pipeline.py"
-
-    cmd = [
-        sys.executable, str(parser_script),
-        repo_path,
-        "--output", output_dir,
-        "--processing-level", processing_level,
-    ]
-
-    if name:
-        cmd.extend(["--name", name])
-    if skip_tests:
-        cmd.append("--skip-tests")
-    if library_mode:
-        cmd.append("--library-mode")
-
-    result = subprocess.run(
-        cmd,
-        stdout=sys.stderr,
-        stderr=sys.stderr,
-        cwd=str(_CORE_ROOT),
-        timeout=1800,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(f"Zig parser failed with exit code {result.returncode}")
-
-    dataset_path = os.path.join(output_dir, "dataset.json")
-    analyzer_output_path = os.path.join(output_dir, "analyzer_output.json")
-
-    # Count units
-    units_count = 0
-    if os.path.exists(dataset_path):
-        data = read_json(dataset_path)
-        units_count = len(data.get("units", []))
-
-    print(f"  Zig parser complete: {units_count} units", file=sys.stderr)
-
-    return ParseResult(
-        dataset_path=dataset_path,
-        analyzer_output_path=analyzer_output_path if os.path.exists(analyzer_output_path) else None,
-        units_count=units_count,
-        language="zig",
-        processing_level=processing_level,
-    )
+    if spec.parser_mode == "inprocess":
+        raise ValueError(
+            f"Language {language!r} is registered as in-process but has no "
+            f"_parse_{language} implementation."
+        )
+    return functools.partial(_parse_via_subprocess, language)

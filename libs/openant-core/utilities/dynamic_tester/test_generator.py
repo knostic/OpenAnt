@@ -8,6 +8,8 @@ For each finding, generates:
 
 import json
 import os
+
+from core.language_registry import docker_template_for, language_for_path
 import re
 import sys
 import threading
@@ -18,15 +20,28 @@ from utilities.llm_client import TokenTracker
 from utilities.llm import PhaseBinding, simple_text
 
 # Map language strings to Dockerfile template names
-LANGUAGE_MAP = {
-    "python": "python",
-    "javascript": "node",
-    "typescript": "node",
-    "js": "node",
-    "ts": "node",
-    "go": "go",
-    "golang": "go",
-}
+def resolve_docker_template(file_path: str, scan_language: str | None = None) -> str | None:
+    """Docker template for a finding, chosen by the FINDING's own file.
+
+    Args:
+        file_path: Path of the file the finding is in.
+        scan_language: Scan-wide language, used only when *file_path* has no
+            recognizable extension.
+
+    Returns:
+        The template name, or ``None`` when the language has no template.
+
+    ``None`` means SKIP, and callers must honour it. The previous code mapped
+    only python/js/ts/go and defaulted everything else to ``"python"``, so a C
+    or Zig finding produced a Python Dockerfile — an LLM call that could only
+    ever fail. Skipping with a recorded reason is both cheaper and honest.
+    """
+    language = language_for_path(file_path)
+    if language is None and scan_language:
+        language = scan_language.lower()
+    if language is None:
+        return None
+    return docker_template_for(language)
 
 SYSTEM_PROMPT = """\
 You are an expert security researcher generating dynamic exploit tests.
@@ -109,7 +124,16 @@ Return ONLY the JSON object, no markdown fences or explanations."""
 
 def _build_finding_prompt(finding: dict, repo_info: dict) -> str:
     """Build the prompt for generating a test for a single finding."""
-    language = repo_info.get("language", "Python")
+    # Resolve per finding, not per scan — a Go finding in a Python-primary
+    # scan must be described as Go.
+    #
+    # This is the LANGUAGE, not the Docker template. They are different
+    # vocabularies ("javascript" vs the "node" base image) and conflating them
+    # tells the model the wrong language for the code it is writing a test
+    # against. Template selection is resolve_docker_template's job.
+    loc_for_lang = finding.get("location", {})
+    finding_file = loc_for_lang.get("file", "") if isinstance(loc_for_lang, dict) else ""
+    language = language_for_path(finding_file) or repo_info.get("language") or "unknown"
 
     # Derive the staged source filename so the LLM can reference it in COPY.
     source_basename = ""
