@@ -175,16 +175,47 @@ def supported_languages() -> list[str]:
     return [name for name, spec in load_registry().items() if spec.enabled]
 
 
+def require_registry() -> dict[str, LanguageSpec]:
+    """The registry, or a loud failure explaining that the install is broken.
+
+    ``load_registry()`` degrades to ``{}`` when the config is missing, which is
+    right for callers that merely DESCRIBE the language set — ``--help`` must not
+    die because a data file moved. It is wrong for callers that need to actually
+    do work: with an empty registry, detection finds zero source files and reports
+    "repository has no supported source files", which sends the operator to look at
+    their repository when the fault is in the installation.
+
+    That misattribution is worse than the original crash it replaced. Go already
+    fails loudly on the identical condition (``registry.go`` returns an error), so
+    the two runtimes disagreed about the same missing file. This restores the loud
+    contract for the paths that need it, without putting ``--help`` back at risk.
+    """
+    registry = load_registry()
+    if not registry:
+        searched = os.environ.get("OPENANT_LANGUAGES_CONFIG") or "$OPENANT_LANGUAGES_CONFIG (unset)"
+        raise RuntimeError(
+            "config/languages.json could not be found, so no languages are known. "
+            "This is an installation problem, not a problem with the repository "
+            "being scanned. Searched: "
+            f"{searched}, then upward from {Path(__file__).parent} and {Path.cwd()}."
+        )
+    return registry
+
+
 def extension_map() -> dict[str, str]:
     """Extension → language name, derived from the per-language lists.
 
     This is the same content as the legacy top-level ``extensions`` map; a
     consistency test asserts they match so the Go reader and the Python reader
     cannot drift.
+
+    Raises:
+        RuntimeError: If no config could be located. Detection cannot do anything
+            useful with an empty map, and failing here names the real cause.
     """
     return {
         ext: spec.name
-        for spec in load_registry().values()
+        for spec in require_registry().values()
         if spec.enabled
         for ext in spec.extensions
     }

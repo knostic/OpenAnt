@@ -53,6 +53,7 @@ import json
 import os
 import re
 import stat
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -228,9 +229,14 @@ def parse_threat_model_md(text: str) -> dict:
 def missing_headings(text: str) -> list[str]:
     """Headings from ``REQUIRED_HEADINGS`` that do not appear in the document.
 
-    Advisory only — callers surface these as warnings. The json block is the
-    machine truth, so a document with perfect json and no prose still scans; it is
-    just useless to the humans who have to review it.
+    Advisory: ``load_threat_model`` surfaces these as a stderr warning rather than
+    refusing the file. The json block is machine truth, so a document with perfect
+    json and no prose still scans — it is just useless to the humans who have to
+    review it, which is the actual failure this catches.
+
+    Until recently this function had *no callers at all* while its docstring claimed
+    otherwise, so the documented "the md must follow a specific structure"
+    requirement was enforced nowhere on the load path.
     """
     return [h for h in REQUIRED_HEADINGS if h.lower() not in (text or "").lower()]
 
@@ -302,7 +308,14 @@ def validate_threat_model(data: Any) -> None:
 
     if "schema_version" in data:
         version = data["schema_version"]
-        if version not in SUPPORTED_SCHEMA_VERSIONS:
+        # `isinstance(True, int)` is True and `True == 1`, so a bare membership
+        # test accepts `"schema_version": true` as version 1. The same guard is
+        # already applied to `confidence`; it was missing here.
+        if isinstance(version, bool) or not isinstance(version, int):
+            violations.append(
+                f"schema_version must be an integer (got {_describe(version)})"
+            )
+        elif version not in SUPPORTED_SCHEMA_VERSIONS:
             supported = ", ".join(str(v) for v in SUPPORTED_SCHEMA_VERSIONS)
             violations.append(
                 f"unsupported schema_version {version!r}; supported versions: {supported}"
@@ -382,6 +395,14 @@ def _validate_components(components: Any, violations: list[str]) -> set[str]:
         else:
             _require_enum(comp["exposure"], EXPOSURE_LEVELS, f"{label}.exposure", violations)
         if isinstance(comp.get("name"), str) and comp["name"].strip():
+            # Duplicate names collapse silently into this set, which then weakens
+            # the handled_by cross-check: two different components sharing a name
+            # make "handled_by names a real component" true for the wrong one.
+            if comp["name"] in names:
+                violations.append(
+                    f"{label}.name duplicates an earlier component: {comp['name']!r}. "
+                    "Component names are referenced by handled_by, so they must be unique."
+                )
             names.add(comp["name"])
     return names
 
@@ -403,6 +424,15 @@ def _validate_input_sources(input_sources: Any, violations: list[str],
         violations.append("input_sources must not be empty")
     for name, spec in input_sources.items():
         label = f"input_sources[{name!r}]"
+        # Keys are referenced by entry_via, so a blank or non-string key produces a
+        # source no profile can name. A non-string key also makes the error path
+        # itself unstable: the dangling-reference message sorts these names, and
+        # sorted() raises on mixed str/int.
+        if not isinstance(name, str) or not name.strip():
+            violations.append(
+                f"input_sources key must be a non-empty string (got {_describe(name)})"
+            )
+            continue
         names.add(name)
         if not isinstance(spec, dict):
             violations.append(f"{label} must be an object (got {_describe(spec)})")
@@ -445,11 +475,42 @@ def _validate_attacker_profiles(profiles: Any, violations: list[str],
         return
     if not profiles:
         violations.append("attacker_profiles must not be empty")
+    seen_ids: set[str] = set()
     for i, profile in enumerate(profiles):
         label = f"attacker_profiles[{i}]"
         if not isinstance(profile, dict):
             violations.append(f"{label} must be an object (got {_describe(profile)})")
             continue
+
+        profile_id = profile.get("id")
+        if isinstance(profile_id, str) and profile_id.strip():
+            if profile_id in seen_ids:
+                violations.append(
+                    f"{label}.id duplicates an earlier profile: {profile_id!r}. "
+                    "Profile ids identify personas in the Stage 2 prompt and in "
+                    "findings, so two personas sharing one id are indistinguishable "
+                    "in the output."
+                )
+            seen_ids.add(profile_id)
+
+        # A capability asserted in both CAN and CANNOT is rendered verbatim to the
+        # verifier, which is then told the attacker both can and cannot do the same
+        # thing. Disambiguating the attacker is this schema's entire purpose, and
+        # `cannot` is load-bearing: it is what makes a NOT-EXPLOITABLE verdict
+        # falsifiable. A contradiction silently decides that verdict either way.
+        caps = profile.get("capabilities")
+        cannots = profile.get("cannot")
+        if isinstance(caps, list) and isinstance(cannots, list):
+            overlap = sorted(
+                {c.strip().lower() for c in caps if isinstance(c, str)}
+                & {c.strip().lower() for c in cannots if isinstance(c, str)}
+            )
+            if overlap:
+                violations.append(
+                    f"{label} lists the same capability in both capabilities and "
+                    f"cannot: {', '.join(repr(o) for o in overlap)}"
+                )
+
         for key in ("id", "description", "impact"):
             if key not in profile:
                 violations.append(f"{label} missing required field: {key}")
@@ -658,6 +719,75 @@ def threat_model_path(repo_path: Path | str) -> Path:
     return Path(repo_path) / THREAT_MODEL_FILENAME
 
 
+def warn_permissive_threat_model(data: dict, path: Path | str | None = None) -> list[str]:
+    """Warn when a threat model disables most of the scan, and say so out loud.
+
+    This is §2.4 of ``THREAT_MODEL_AUTHORITY_DESIGN.md``. The file is authored by
+    the *scanned* repository, and a schema-valid one can legitimately suppress
+    findings — that is the feature. But the same mechanism lets a repository
+    whitelist itself: declare every input trusted, describe no reachable attacker,
+    and blanket-exclude the vulnerability classes a scanner would report. Validation
+    cannot catch this, because nothing here is malformed. It is a *semantic* attack
+    that needs no prompt injection.
+
+    A scanner that reports clean because the audited code said so is worse than no
+    scanner, since it manufactures assurance. This does not refuse the model — the
+    operator may have written it, and refusing would break the legitimate case — but
+    it makes the suppression visible instead of silent, which is the difference
+    between an informed decision and an invisible one.
+
+    Returns:
+        The warnings emitted, so callers can record them in scan artifacts rather
+        than relying on stderr, which CI discards.
+    """
+    warnings: list[str] = []
+
+    sources = data.get("input_sources")
+    if isinstance(sources, dict) and sources:
+        trusts = [
+            s.get("trust") for s in sources.values() if isinstance(s, dict)
+        ]
+        if trusts and all(t == "trusted" for t in trusts):
+            warnings.append(
+                f"every one of {len(trusts)} input source(s) is declared 'trusted' — "
+                "no untrusted input means essentially nothing is reachable by an "
+                "attacker, and the scan will report almost nothing"
+            )
+
+    profiles = data.get("attacker_profiles")
+    if isinstance(profiles, list) and profiles:
+        positions = {p.get("position") for p in profiles if isinstance(p, dict)}
+        if not positions & {"remote", "adjacent", "supply_chain"}:
+            warnings.append(
+                "no attacker profile is positioned remote/adjacent/supply_chain — "
+                "only locally-positioned attackers are modelled, which suppresses "
+                "every remotely-triggered finding"
+            )
+
+    criteria = data.get("vulnerability_criteria")
+    excluded = data.get("not_a_vulnerability")
+    if isinstance(criteria, list) and isinstance(excluded, list):
+        if len(excluded) > 3 * max(len(criteria), 1):
+            warnings.append(
+                f"not_a_vulnerability ({len(excluded)} entries) greatly outweighs "
+                f"vulnerability_criteria ({len(criteria)}) — the model is mostly "
+                "describing what NOT to report"
+            )
+
+    if warnings:
+        where = f" in {Path(path).name}" if path is not None else ""
+        print(
+            f"  [ThreatModel] WARNING: permissive threat model{where}. "
+            "The scanned repository supplied this file, and it substantially "
+            "narrows what will be reported:",
+            file=sys.stderr,
+        )
+        for w in warnings:
+            print(f"    - {w}", file=sys.stderr)
+
+    return warnings
+
+
 def load_threat_model(repo_path: Path | str) -> ApplicationContext | None:
     """Load ``OPENANT.THREATMODEL.md`` from a repository root, if present.
 
@@ -722,4 +852,14 @@ def load_threat_model(repo_path: Path | str) -> ApplicationContext | None:
         # Re-raise with the path attached so the operator is told *which* file.
         raise ThreatModelValidationError(exc.violations, path) from None
 
+    absent = missing_headings(text)
+    if absent:
+        print(
+            f"  [ThreatModel] WARNING: {path.name} is missing required section(s): "
+            f"{', '.join(absent)}. The JSON block is authoritative so the scan "
+            "continues, but a threat model no human can review is not reviewable.",
+            file=sys.stderr,
+        )
+
+    warn_permissive_threat_model(data, path)
     return threat_model_to_context(data)

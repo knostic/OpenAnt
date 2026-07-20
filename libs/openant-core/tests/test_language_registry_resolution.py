@@ -53,9 +53,20 @@ class TestDegradeRatherThanDie:
         monkeypatch.setattr(lr, "find_languages_config", lambda: None)
         assert lr.supported_languages() == []
 
-    def test_extension_map_degrades(self, monkeypatch):
+    def test_extension_map_refuses_rather_than_degrading(self, monkeypatch):
+        """Contract change: describing degrades, working does not.
+
+        This previously asserted ``extension_map() == {}``. Returning an empty map
+        is fine for anything that merely lists languages, but detection built on it
+        finds zero files and reports "repository has no supported source files" —
+        which sends the operator to inspect their repository when the fault is a
+        broken installation. Raising here names the real cause; ``--help`` is
+        unaffected because it goes through ``supported_languages()``, which still
+        degrades (asserted directly above and by test_cli_still_builds_without_a_config).
+        """
         monkeypatch.setattr(lr, "find_languages_config", lambda: None)
-        assert lr.extension_map() == {}
+        with pytest.raises(RuntimeError, match="installation problem"):
+            lr.extension_map()
 
     def test_skip_dirs_degrades(self, monkeypatch):
         monkeypatch.setattr(lr, "find_languages_config", lambda: None)
@@ -70,10 +81,21 @@ class TestDegradeRatherThanDie:
         assert parser is not None
 
     def test_parsing_a_language_without_config_fails_loudly(self, monkeypatch, tmp_path):
-        """Degrading help text is fine; silently parsing nothing is not."""
+        """Degrading help text is fine; silently parsing nothing is not.
+
+        Accepts RuntimeError as well as ValueError. Both are loud, which is what
+        this test is really about — but RuntimeError now arrives from
+        ``require_registry`` with a message naming the installation, instead of
+        ValueError's "no supported source files", which blamed the repository. The
+        distinction matters: a repository with a real .py file in it, as here, is
+        exactly the case where the old message was actively misleading.
+        """
         monkeypatch.setattr(lr, "find_languages_config", lambda: None)
         from core.parser_adapter import detect_languages
 
         (tmp_path / "a.py").write_text("x = 1")
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, RuntimeError)) as exc:
             detect_languages(str(tmp_path))
+        assert "installation problem" in str(exc.value), (
+            "the failure must name the install, not the scanned repository"
+        )

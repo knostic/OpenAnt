@@ -56,3 +56,14 @@ packages = [
     "context",
     "report",
 ]
+
+# config/languages.json is the single source of truth for the language set, read
+# by BOTH the Python engine and the Go CLI. It lives at the monorepo root, two
+# levels above this project root, so `packages` above cannot reach it and the
+# wheel shipped without it: the registry then resolved to {} and every language
+# silently disappeared (`-l python` became "invalid choice", detection found zero
+# files in any repository). force-include is what makes an installed layout work,
+# and it must land at `config/` so the upward search from the installed package
+# finds it the same way it does in a checkout.
+[tool.hatch.build.targets.wheel.force-include]
+"../../config/languages.json" = "config/languages.json"
