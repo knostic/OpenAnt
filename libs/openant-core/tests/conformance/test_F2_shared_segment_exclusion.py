@@ -41,7 +41,7 @@ import pytest
 
 _CORE_ROOT = os.environ.get(
     "OPENANT_CORE_ROOT",
-    "/Users/gadievron/Documents/ClaudeNew/OpenAnt/new-bugs-2/OpenAnt/libs/openant-core",
+    str(Path(__file__).resolve().parent.parent.parent),
 )
 if _CORE_ROOT not in sys.path:
     sys.path.insert(0, _CORE_ROOT)

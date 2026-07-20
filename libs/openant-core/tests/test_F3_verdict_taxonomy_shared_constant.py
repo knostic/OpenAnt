@@ -16,13 +16,14 @@ RED on the ORIGINAL tree: core.verdict_taxonomy does not exist -> ImportError.
 GREEN on the PATCHED tree: the module exists and the invariant holds, and the
 behavior change (bypassable/error now disclosure-eligible) is asserted.
 
-The target tree is chosen via the OPENANT_ROOT env var (falls back to the
-scratchpad impl-core copy). Run:
+The target tree is chosen via the OPENANT_ROOT env var (defaults to this
+repo's own openant-core). Run:
 
     OPENANT_ROOT=/path/to/patched/tree pytest F3-...test.py
 """
 
 import importlib
+from contextlib import contextmanager
 import os
 import re
 import sys
@@ -30,23 +31,55 @@ from pathlib import Path
 
 import pytest
 
-_DEFAULT_ROOT = (
-    "/private/tmp/claude-501/"
-    "-Users-gadievron-Documents-ClaudeNew-OpenAnt-new-bugs-2/"
-    "e77a0496-1f59-4f65-80e9-fa508d40fa3c/scratchpad/impl-core"
-)
+# Default to THIS repo's core. The previous default was an absolute path into
+# another machine-session's scratchpad; where that directory still happened to
+# exist, the whole suite silently asserted against a stale, different tree
+# (its core/ had no verdict_taxonomy at all, so the consumer check reported
+# reporter.py as missing DISCLOSURE_ELIGIBLE when in fact it imports it).
+_DEFAULT_ROOT = str(Path(__file__).resolve().parent.parent)
 ROOT = Path(os.environ.get("OPENANT_ROOT", _DEFAULT_ROOT)).resolve()
+
+
+@contextmanager
+def _isolated_core_namespace():
+    """Import ``core.*`` from ROOT without leaking the eviction into the session.
+
+    The eviction itself is necessary: pointing OPENANT_ROOT at a different tree
+    must re-import rather than reuse a cached copy. What was missing is putting
+    ``sys.modules`` and ``sys.path`` BACK afterwards.
+
+    Leaking them is not a tidiness issue. Any test collected after this one that
+    bound ``import core.X as m`` at collection time and then monkeypatched
+    ``m.attr`` was silently defeated: the code under test re-imported ``core.X``
+    and got a DIFFERENT module object, so the patch applied to an orphan. That
+    is what made ``test_enhance_limit`` bypass its stub and issue a live
+    Anthropic API call during an offline test run.
+    """
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "core" or name.startswith("core.")
+    }
+    saved_path = list(sys.path)
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        for name in list(sys.modules):
+            if name == "core" or name.startswith("core."):
+                del sys.modules[name]
+        yield
+    finally:
+        for name in list(sys.modules):
+            if name == "core" or name.startswith("core."):
+                del sys.modules[name]
+        sys.modules.update(saved_modules)
+        sys.path[:] = saved_path
 
 
 def _load_taxonomy():
     """Import core.verdict_taxonomy from the target tree in a clean namespace."""
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
-    # Drop any previously-imported copy so a different OPENANT_ROOT re-imports.
-    for name in list(sys.modules):
-        if name == "core" or name.startswith("core."):
-            del sys.modules[name]
-    return importlib.import_module("core.verdict_taxonomy")
+    with _isolated_core_namespace():
+        return importlib.import_module("core.verdict_taxonomy")
 
 
 # ---------------------------------------------------------------------------
@@ -157,3 +190,22 @@ def test_disclosure_consumers_reference_the_constant():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_loading_taxonomy_does_not_leak_module_eviction():
+    """The eviction must not outlive the helper.
+
+    Regression lock for a cross-test hazard: leaking it silently defeated
+    monkeypatches in every test collected afterwards, which made
+    test_enhance_limit bypass its stub and issue a live API call.
+    """
+    import core.parser_adapter as before
+
+    _load_taxonomy()
+
+    import core.parser_adapter as after
+    assert after is before, (
+        "core.parser_adapter was re-imported as a different object after "
+        "_load_taxonomy() — the sys.modules eviction leaked"
+    )
+    assert "core.parser_adapter" in sys.modules

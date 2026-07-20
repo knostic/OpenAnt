@@ -28,8 +28,7 @@ from pathlib import Path
 
 IMPL_CORE = os.environ.get(
     "IMPL_CORE",
-    "/private/tmp/claude-501/-Users-gadievron-Documents-ClaudeNew-OpenAnt-new-bugs-2/"
-    "e77a0496-1f59-4f65-80e9-fa508d40fa3c/scratchpad/impl-core",
+    str(Path(__file__).resolve().parent.parent.parent),
 )
 
 
