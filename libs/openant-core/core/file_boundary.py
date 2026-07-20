@@ -53,6 +53,39 @@ _BOUNDARY_LINE = re.compile(
 )
 
 
+def neutralize_boundaries(source: str) -> str:
+    """Defang boundary-shaped lines in untrusted source before concatenation.
+
+    This is the security half of the boundary contract, and it belongs to the
+    *producer*. A consumer cannot defend itself: once several files are joined into
+    one blob, a marker the attacker wrote and a marker the parser wrote are the same
+    bytes, and no amount of pattern-tightening distinguishes them.
+
+    The attack it prevents: scanned source contains a line that looks like a
+    boundary. ``split_on_boundary`` then cuts the unit there, and everything after
+    the forged line is relabelled "Context (do NOT analyze these)" in the prompt —
+    so a repository hides a vulnerability from both analysis stages with one comment.
+
+    This was not exploitable before multi-language support, by accident rather than
+    design: the matcher required ``//``, which is a syntax error in Python, so the
+    marker could not appear in real Python source. Teaching the matcher to accept
+    ``#`` fixed a genuine bug (Python and Ruby units never split at all, so
+    dependency code was analysed as the target) and simultaneously made the marker
+    forgeable in exactly the languages that had just been fixed. Hence a
+    neutralizer rather than a tighter pattern: the previous attempt to fix this by
+    adjusting the regex is what created the hole.
+
+    The replacement is deliberately visible rather than silent. The model still sees
+    that a suspicious line was present, which is itself signal, and a reviewer
+    reading the prompt can tell defanging happened.
+    """
+    if not source:
+        return source
+    return _BOUNDARY_LINE.sub(
+        "# [openant] boundary-shaped line from scanned source, neutralized", source
+    )
+
+
 def has_boundary(code: str) -> bool:
     """Whether *code* contains at least one file-boundary marker."""
     if not code:

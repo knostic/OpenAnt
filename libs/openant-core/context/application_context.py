@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from utilities.file_io import open_utf8, read_json, write_json
+from utilities.file_io import open_utf8, read_json, read_repo_file, write_json
 from utilities.llm import PhaseBinding, simple_text
 
 # Load environment variables
@@ -289,16 +289,19 @@ def gather_context_sources(repo_path: Path) -> dict[str, str]:
     # Read priority files
     for filename in CONTEXT_FILES:
         filepath = repo_path / filename
-        if filepath.exists():
-            try:
-                with open_utf8(filepath, errors="ignore") as _f:
-                    content = _f.read()
-                # Limit size to avoid token overflow
-                if len(content) > 10000:
-                    content = content[:10000] + "\n\n[... truncated ...]"
-                sources[filename] = content
-            except Exception as e:
-                print(f"Warning: Could not read {filename}: {e}", file=sys.stderr)
+        try:
+            # Guarded, and bounded at the syscall rather than after the fact: the
+            # old form read the whole file and *then* truncated to 10 000 chars, so
+            # a README symlinked to /dev/zero or a multi-GB file was fully resident
+            # before the cap ever applied.
+            content = read_repo_file(filepath, max_bytes=10_000)
+            if content is None:
+                continue
+            if len(content) >= 10_000:
+                content = content + "\n\n[... truncated ...]"
+            sources[filename] = content
+        except Exception as e:  # noqa: BLE001 - context gathering is best-effort
+            print(f"Warning: Could not read {filename}: {e}", file=sys.stderr)
 
     # Get directory structure (top 2 levels)
     dir_structure = get_directory_structure(repo_path, max_depth=2)
@@ -474,24 +477,28 @@ def check_manual_override(repo_path: Path) -> ApplicationContext | None:
     """
     for filename in MANUAL_OVERRIDE_FILES:
         filepath = repo_path / filename
-        if not filepath.exists():
-            continue
 
         try:
+            # Guarded read: this path is authored by the scanned repository, so it
+            # may be a symlink out of the tree, a FIFO that blocks forever, or
+            # unbounded. read_repo_file lstats before opening and returns None for
+            # genuine absence. Previously this was `exists()` + bare `open()`, which
+            # hung the scanner on a FIFO named OPENANT.md.
+            content = read_repo_file(filepath)
+            if content is None:
+                continue
+
             if filename.endswith('.json'):
-                # Direct JSON format
-                data = read_json(filepath)
+                data = json.loads(content)
                 return _application_context_from_override(data, filename)
 
-            # .md files need raw text so regex can extract the embedded JSON block.
-            with open_utf8(filepath) as _f:
-                content = _f.read()
-
             if filename.endswith('.md'):
-                # Markdown format - check for JSON code block
-                json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
+                # Markdown format - check for JSON code block. No `\s*` around the
+                # lazy group: that form backtracks cubically on an unclosed fence,
+                # which is an unbounded hang on eight bytes of repo-authored input.
+                json_match = re.search(r'```json(.*?)```', content, re.DOTALL)
                 if json_match:
-                    data = json.loads(json_match.group(1))
+                    data = json.loads(json_match.group(1).strip())
                     return _application_context_from_override(data, filename)
 
                 # Check for YAML frontmatter

@@ -29,6 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from utilities.file_io import read_json, write_json, open_utf8
+from core.file_boundary import neutralize_boundaries
 
 
 # File boundary marker for enhanced code (PHP uses // comments)
@@ -135,7 +136,9 @@ class UnitGenerator:
                 parts.append(caller_code)
                 included_code.add(caller_code)
 
-        return FILE_BOUNDARY.join(parts)
+        # See parsers/python/unit_generator.py: each part is scanned-repository
+        # source and may forge the separator. Neutralize before joining.
+        return FILE_BOUNDARY.join(neutralize_boundaries(p) for p in parts)
 
     def collect_files_included(self, primary_file: str,
                                 upstream_deps: List[Dict],

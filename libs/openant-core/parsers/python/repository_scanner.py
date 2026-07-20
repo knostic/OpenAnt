@@ -26,6 +26,7 @@ Output (JSON):
 
 import json
 import os
+import stat
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -159,29 +160,129 @@ class RepositoryScanner:
             return True
         return False
 
+    def _safe_to_descend(self, entry: Path, repo_real: str, seen_dirs: Set) -> bool:
+        """Whether a directory entry may be walked, given symlink hazards.
+
+        The scanned repository is untrusted, and a directory symlink hands it two
+        primitives. ``vendor -> /`` walks the host filesystem into ``dataset.json``
+        and from there to the model provider — verified: a repo containing
+        ``escape -> /tmp/outside`` produced a unit from outside the repo. And
+        ``loop -> ..`` recurses until ELOOP; three sibling loops made the scan
+        non-terminating on a one-file repository.
+
+        The guard keys on **directory** inodes only. Guarding file inodes as well
+        would silently drop legitimately hardlinked source — trading one
+        false-negative primitive for another, which is the wrong direction for a
+        tool whose failure mode is missing code.
+
+        Ported from ``parsers/zig/repository_scanner.py``, which had it while the
+        other five did not.
+        """
+        full = str(entry)
+        if not os.path.islink(full):
+            return True
+        real = os.path.realpath(full)
+        # In-repo alias: the real directory is reached by its canonical path
+        # anyway, so descending the link only duplicates work (or loops).
+        if real == repo_real or real.startswith(repo_real + os.sep):
+            return False
+        # Points outside the repository. Refuse: following it is how host files
+        # end up in the dataset.
+        return False
+
     def scan_directory(self, dir_path: Path, relative_path: str = '') -> None:
-        """Recursively scan a directory."""
-        self.stats['directories_scanned'] += 1
+        """Scan a directory tree.
 
-        try:
-            entries = list(dir_path.iterdir())
-        except PermissionError:
-            print(f"Warning: Cannot read directory {dir_path}: Permission denied", file=sys.stderr)
-            return
-        except Exception as e:
-            print(f"Warning: Cannot read directory {dir_path}: {e}", file=sys.stderr)
-            return
+        Iterative rather than recursive. The recursive form died at ~445 levels
+        with a ``RecursionError`` that the bare ``except`` below swallowed — so a
+        file planted deep enough was simply absent from a scan that reported
+        success, with no warning. For a SAST tool that is a false-negative
+        injection primitive, and worse than a crash: it manufactures assurance.
 
-        for entry in sorted(entries, key=lambda e: e.name):
+        An explicit stack of iterators (rather than a stack of paths) preserves the
+        original depth-first, name-sorted traversal order exactly, so output
+        ordering is unchanged.
+        """
+        repo_real = os.path.realpath(self.repo_path)
+        seen_dirs: Set = set()
+
+        def _record_unreadable(path, reason: str) -> None:
+            """Count an entry we could not classify or read as a coverage gap.
+
+            This is the load-bearing half of the deep-nesting fix, and the reason
+            the naive version did not work: ``Path.is_dir()`` swallows OSError and
+            returns **False**, so a path the OS refuses to stat is silently
+            classified as "neither a directory nor a file" and skipped. There is no
+            exception to catch and nothing in the output to notice — which is
+            exactly how a planted file at depth 600 disappeared from a scan that
+            reported success. Anything we cannot classify is code we did not
+            analyse, and it has to be counted as such.
+            """
+            self.stats['directories_unreadable'] = (
+                self.stats.get('directories_unreadable', 0) + 1
+            )
+            self.stats.setdefault('unreadable_examples', [])
+            if len(self.stats['unreadable_examples']) < 5:
+                self.stats['unreadable_examples'].append(f"{path}: {reason}")
+            print(f"Warning: Cannot read {path}: {reason} (coverage gap recorded)",
+                  file=sys.stderr)
+
+        def _open_dir(path: Path):
+            self.stats['directories_scanned'] += 1
+            try:
+                return iter(sorted(path.iterdir(), key=lambda e: e.name))
+            except PermissionError:
+                reason = "permission denied"
+            except OSError as e:
+                # ENAMETOOLONG lands here on a deeply nested tree: every path is
+                # absolute, and past ~1024 bytes the OS refuses to stat it at all.
+                # That is a real platform limit rather than a bug we can fix by
+                # walking harder — so the only correct response is to make the
+                # resulting blind spot visible.
+                reason = str(e)
+            # A directory we could not read is code we did not analyse. Counting it
+            # into the result (not just stderr, which CI discards) is the whole
+            # point: the previous version swallowed the failure and returned a
+            # scan that looked complete, which is how a planted file at depth 600
+            # went missing with no signal anywhere.
+            _record_unreadable(path, reason)
+            return None
+
+        root_entries = _open_dir(dir_path)
+        if root_entries is None:
+            return
+        stack = [(root_entries, relative_path)]
+
+        while stack:
+            entries, relative_path = stack[-1]
+            entry = next(entries, None)
+            if entry is None:
+                stack.pop()
+                continue
+
             entry_relative = os.path.join(relative_path, entry.name) if relative_path else entry.name
 
-            if entry.is_dir():
+            # Classify with an explicit stat rather than is_dir()/is_file(), both
+            # of which convert an OSError into a silent False. A path we cannot
+            # stat must be recorded, not skipped.
+            try:
+                mode = entry.stat().st_mode
+            except OSError as e:
+                _record_unreadable(entry, str(e))
+                continue
+
+            if stat.S_ISDIR(mode):
                 if self.should_exclude_directory(entry.name):
                     self.stats['directories_excluded'] += 1
                     continue
-                self.scan_directory(entry, entry_relative)
+                if not self._safe_to_descend(entry, repo_real, seen_dirs):
+                    self.stats['directories_excluded'] += 1
+                    continue
+                child = _open_dir(entry)
+                if child is not None:
+                    stack.append((child, entry_relative))
 
-            elif entry.is_file():
+            elif stat.S_ISREG(mode):
                 if not self.is_source_file(entry.name):
                     continue
 

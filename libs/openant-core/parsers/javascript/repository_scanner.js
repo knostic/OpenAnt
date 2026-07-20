@@ -139,6 +139,23 @@ class RepositoryScanner {
             const fullPath = path.join(dirPath, entry.name);
             const entryRelativePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
 
+            // Refuse symlinked directories. The scanned repository is untrusted:
+            // `vendor -> /` would walk the host filesystem into the dataset (and
+            // from there to the model provider), and `loop -> ..` never terminates.
+            //
+            // This check is currently redundant — readdirSync({withFileTypes:true})
+            // returns Dirents with lstat semantics, so a symlink reports
+            // isSymbolicLink() and isDirectory() is already false. It is written out
+            // anyway because that safety is an undocumented property of the API
+            // choice, not of this code: switching to statSync, or to a readdir
+            // without withFileTypes, would silently restore the vulnerability with
+            // no visible diff at this line. The sibling Python scanners had exactly
+            // this bug.
+            if (entry.isSymbolicLink()) {
+                this.stats.directoriesExcluded++;
+                continue;
+            }
+
             if (entry.isDirectory()) {
                 if (this.shouldExcludeDirectory(entry.name)) {
                     this.stats.directoriesExcluded++;

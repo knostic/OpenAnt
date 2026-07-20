@@ -136,7 +136,20 @@ OPTIONAL_TOP_LEVEL = (
     "generated_by",
 )
 
-_JSON_BLOCK_RE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
+# No `\s*` around the lazy group. The obvious-looking ```` ```json\s*(.*?)\s*``` ````
+# is ambiguous — the two `\s*` runs and the lazy `.*?` can divide the same whitespace
+# between them in exponentially many ways — so an *unclosed* fence backtracks
+# cubically: 4 KB of trailing spaces took 32.9s, and MAX_THREAT_MODEL_BYTES does not
+# bound it (1 MiB extrapolates past 10^11 seconds). The scanned repository authors
+# this file, so that is eight bytes of attacker input for an unbounded hang. Strip in
+# Python instead, where it is linear.
+_JSON_BLOCK_RE = re.compile(r"```json(.*?)```", re.DOTALL)
+
+# Markdown renderers hide HTML comments, so a block inside one is invisible in every
+# review surface a human uses — the PR diff, the rendered file — while remaining
+# perfectly visible to a regex. Stripping comments before scanning keeps "what the
+# reviewer approved" and "what the scanner obeys" the same document.
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
 class ThreatModelValidationError(Exception):
@@ -170,6 +183,11 @@ def parse_threat_model_md(text: str) -> dict:
     document is expected to contain prose examples, and a template's own decoy
     blocks must not shadow the real one.
 
+    HTML comments are stripped first. Markdown hides them, so a block inside
+    ``<!-- -->`` is invisible to every human review surface while still being found
+    here — which let a repository show a reviewer one threat model and hand the
+    scanner another.
+
     Args:
         text: Full markdown source of an ``OPENANT.THREATMODEL.md``.
 
@@ -182,7 +200,8 @@ def parse_threat_model_md(text: str) -> dict:
             Any json decode errors seen along the way are reported too, since a
             typo inside the *real* block is by far the likeliest cause.
     """
-    blocks = _JSON_BLOCK_RE.findall(text or "")
+    visible = _HTML_COMMENT_RE.sub("", text or "")
+    blocks = _JSON_BLOCK_RE.findall(visible)
     if not blocks:
         raise ThreatModelValidationError(
             ["no ```json block found; the machine-readable threat model is required"]
@@ -191,7 +210,7 @@ def parse_threat_model_md(text: str) -> dict:
     decode_errors: list[str] = []
     for index, block in enumerate(blocks):
         try:
-            parsed = json.loads(block)
+            parsed = json.loads(block.strip())
         except json.JSONDecodeError as exc:
             decode_errors.append(f"json block #{index + 1} is not valid JSON: {exc}")
             continue
@@ -665,14 +684,21 @@ def load_threat_model(repo_path: Path | str) -> ApplicationContext | None:
         ``context/OPENANT_THREATMODEL_TEMPLATE.md``. Accepted, documented risk.
     """
     path = threat_model_path(repo_path)
-    if not path.exists():
-        return None
 
-    # Guard BEFORE opening. The scanned repository authors this path, so it can
-    # ship a symlink to a host file, or a FIFO/device that blocks the scanner
-    # forever. `exists()` and `open()` both follow symlinks, so the check must
-    # use lstat and must precede the open, not follow it.
-    link_stat = os.lstat(path)
+    # Guard BEFORE opening, and probe with lstat rather than exists(). The scanned
+    # repository authors this path, so it can ship a symlink to a host file, or a
+    # FIFO/device that blocks the scanner forever.
+    #
+    # `exists()` follows symlinks, so a *dangling* link answered False and was read
+    # as "no threat model" — the scan then silently proceeded under the built-in
+    # app-type heuristics, and the guards below were never reached. That inverts
+    # this function's whole contract (absence falls back, malformed aborts) and
+    # handed the repository a one-symlink downgrade switch. lstat sees the link
+    # itself, so a broken link now lands on the S_ISLNK branch and raises.
+    try:
+        link_stat = os.lstat(path)
+    except FileNotFoundError:
+        return None  # genuinely absent: the only case that may fall back
     if stat.S_ISLNK(link_stat.st_mode):
         raise ThreatModelValidationError(
             [f"{path.name} is a symlink; refusing to follow it out of the "

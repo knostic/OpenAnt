@@ -54,6 +54,31 @@ const { DependencyResolver } = require('./dependency_resolver');
 // marker instead of re-defining it and risking silent drift).
 const FILE_BOUNDARY = '\n\n// ========== File Boundary ==========\n\n';
 
+// A whole boundary line, either comment style, anchored to line starts. Mirrors
+// core/file_boundary.py's _BOUNDARY_LINE — the two must stay in step, which
+// tests/test_hostile_repo.py enforces by requiring every producer to neutralize.
+const BOUNDARY_LINE_RE = /^[ \t]*(?:#|\/\/)?[ \t]*={10} File Boundary ={10}[ \t]*$/gm;
+
+/**
+ * Defang boundary-shaped lines in untrusted source before concatenation.
+ *
+ * Scanned source can contain a line that mimics the separator. Once files are
+ * joined, a forged marker is byte-identical to ours, so the split cuts the unit
+ * there and everything after it is relabelled "do NOT analyze" in the prompt —
+ * one comment line hides a vulnerability from both analysis stages. The consumer
+ * cannot distinguish them after the fact, so this has to happen here.
+ *
+ * @param {string} source Untrusted source from the scanned repository.
+ * @returns {string} Source with boundary-shaped lines replaced.
+ */
+function neutralizeBoundaries(source) {
+    if (!source) return source;
+    return source.replace(
+        BOUNDARY_LINE_RE,
+        '// [openant] boundary-shaped line from scanned source, neutralized'
+    );
+}
+
 class UnitGenerator {
     constructor(repoPath, datasetName = null, options = {}) {
         this.repoPath = repoPath;
@@ -190,7 +215,9 @@ class UnitGenerator {
             }
         }
 
-        return parts.join(FILE_BOUNDARY);
+        // Neutralize each part before joining — every one is scanned-repository
+        // source and may forge the separator.
+        return parts.map(neutralizeBoundaries).join(FILE_BOUNDARY);
     }
 
     /**
@@ -492,4 +519,4 @@ if (require.main === module) {
     }
 }
 
-module.exports = { UnitGenerator, FILE_BOUNDARY };
+module.exports = { UnitGenerator, FILE_BOUNDARY, neutralizeBoundaries };

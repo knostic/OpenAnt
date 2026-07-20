@@ -13,6 +13,7 @@ and ``run_dynamic_tests()``.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -604,6 +605,29 @@ def generate_summary_report(
     return ReportResult(output_path=output_path, format="summary", usage=_usage_to_info(usage))
 
 
+def safe_disclosure_filename(short_name: str) -> str:
+    """Reduce a model-supplied name to a single safe path component.
+
+    ``short_name`` is LLM output (``vuln.get("short_name")``), and it used to reach
+    ``os.path.join`` through only ``.replace(" ", "_").upper()``. That is not
+    sanitisation: ``/`` and ``..`` pass through untouched, so a name like
+    ``../../../etc/pwned`` escaped the output directory and turned report generation
+    into an arbitrary-write primitive.
+
+    This matters more than a typical output-escaping bug because the threat model
+    file is repository-authored and unfenced — the accepted prompt-injection gap is
+    precisely a channel for steering model output, so treating that output as
+    trusted compounds one accepted risk into an unaccepted one.
+
+    Allowlist rather than blocklist: enumerate what may appear, so novel separators,
+    unicode lookalikes and encoding tricks are excluded by construction instead of
+    by remembering to ban them.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", (short_name or "").strip())
+    cleaned = cleaned.strip("._-")[:64]
+    return cleaned.upper() or "UNNAMED"
+
+
 def generate_disclosure_docs(
     results_path: str,
     output_dir: str,
@@ -687,8 +711,7 @@ def generate_disclosure_docs(
         def _one(args):
             i, finding = args
             disclosure_text, usage = _generate_disclosure(finding, product_name, report_binding)
-            safe_name = finding["short_name"].replace(" ", "_").upper()
-            filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
+            filename = f"DISCLOSURE_{i:02d}_{safe_disclosure_filename(finding['short_name'])}.md"
             filepath = os.path.join(output_dir, filename)
             with open_utf8(filepath, "w") as f:
                 f.write(disclosure_text)

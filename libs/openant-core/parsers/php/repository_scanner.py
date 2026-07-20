@@ -31,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import safe_to_descend
 
 
 class RepositoryScanner:
@@ -159,6 +160,12 @@ class RepositoryScanner:
 
             if entry.is_dir():
                 if self.should_exclude_directory(entry.name):
+                    self.stats['directories_excluded'] += 1
+                    continue
+                # Refuse symlinked directories: the scanned repo is untrusted, and
+                # `vendor -> /` walks the host filesystem into the dataset (and on
+                # to the model provider), while `loop -> ..` never terminates.
+                if not safe_to_descend(entry, str(self.repo_path)):
                     self.stats['directories_excluded'] += 1
                     continue
                 self.scan_directory(entry, entry_relative)

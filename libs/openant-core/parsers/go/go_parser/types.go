@@ -1,5 +1,7 @@
 package main
 
+import "regexp"
+
 // ScanResult represents the output of the repository scanner (Stage 1)
 type ScanResult struct {
 	Repository string         `json:"repository"`
@@ -167,3 +169,23 @@ const (
 
 // File boundary marker for enhanced code
 const FileBoundary = "\n\n// ========== File Boundary ==========\n\n"
+
+// boundaryLineRe matches a whole boundary line in either comment style, anchored
+// to line starts. Mirrors _BOUNDARY_LINE in core/file_boundary.py.
+var boundaryLineRe = regexp.MustCompile(`(?m)^[ \t]*(?:#|//)?[ \t]*={10} File Boundary ={10}[ \t]*$`)
+
+// NeutralizeBoundaries defangs boundary-shaped lines in untrusted source before
+// concatenation.
+//
+// Scanned source can contain a line that mimics the separator. Once files are
+// joined, a forged marker is byte-identical to the parser's own, so the split cuts
+// the unit there and everything after it is relabelled "do NOT analyze" in the
+// prompt — one comment line hides a vulnerability from both analysis stages. The
+// consumer cannot tell them apart afterwards, so this must happen at composition.
+func NeutralizeBoundaries(source string) string {
+	if source == "" {
+		return source
+	}
+	return boundaryLineRe.ReplaceAllString(
+		source, "// [openant] boundary-shaped line from scanned source, neutralized")
+}

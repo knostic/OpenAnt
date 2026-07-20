@@ -10,6 +10,7 @@
 const ts = require('typescript');
 const fs = require('fs');
 const path = require('path');
+const { neutralizeBoundaries } = require('./unit_generator');
 
 class ContextAssembler {
     constructor(projectRoot, options = {}) {
@@ -152,10 +153,13 @@ class ContextAssembler {
             this.resolveFunctionInFile(sourceFile, functionName);
         }
 
-        // Combine code files and templates
+        // Combine code files and templates. Each piece is neutralized first: it is
+        // scanned-repository source, and a boundary-shaped line inside it would
+        // split the unit and relabel the payload after it as do-not-analyze
+        // context. See neutralizeBoundaries in ./unit_generator.js.
         const allCode = [
-            ...this.collectedCode.map(c => c.code),
-            ...this.collectedTemplates.map(t => `// ========== Template: ${t.relativePath} ==========\n${t.code}`)
+            ...this.collectedCode.map(c => neutralizeBoundaries(c.code)),
+            ...this.collectedTemplates.map(t => `// ========== Template: ${t.relativePath} ==========\n${neutralizeBoundaries(t.code)}`)
         ].join('\n\n// ========== File Boundary ==========\n\n');
 
         const allFiles = [

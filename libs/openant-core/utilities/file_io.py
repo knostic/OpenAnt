@@ -9,12 +9,105 @@ explicitly, preventing ``'charmap' codec can't decode byte ...`` errors.
 import json
 import logging
 import os
+import stat
 import subprocess
 import tempfile
 from typing import Any, Union
 
 # Accept str, Path, or any os.PathLike
 PathLike = Union[str, os.PathLike]
+
+
+class UnsafeRepoFile(Exception):
+    """A path inside a scanned repository is not safe to read."""
+
+
+def safe_to_descend(dir_path: PathLike, repo_real: str) -> bool:
+    """Whether a directory inside a scanned repository may be walked.
+
+    A directory symlink in an untrusted repository is two attack primitives:
+
+    * ``vendor -> /`` walks the host filesystem into ``dataset.json``, which is then
+      sent to the model provider. Verified: a repo containing ``escape -> /tmp/x``
+      produced a unit for a file outside the repository.
+    * ``loop -> ..`` recurses until ELOOP. Three sibling loops made a scan of a
+      one-file repository run for minutes at full CPU with memory climbing.
+
+    Refusing every symlinked directory is the right call rather than merely
+    deduplicating them: an in-repo alias is reached by its canonical path anyway, so
+    following it only duplicates work, and an out-of-repo target is precisely what
+    must not be read. Callers that need the target's contents should have it
+    committed to the repository.
+
+    This lived in ``parsers/zig/repository_scanner.py`` and nowhere else — its own
+    comment noted it was deviating from "the other four language scanners", so the
+    divergence was known and simply never propagated. Shared here so a sixth parser
+    inherits it instead of re-deriving it.
+
+    Note this keys on the *directory* only. A file-inode guard would silently drop
+    legitimately hardlinked source, trading one false-negative primitive for another.
+
+    Args:
+        dir_path: The directory entry being considered.
+        repo_real: ``realpath`` of the repository root. Currently unused — every
+            symlinked directory is refused regardless of target — but kept in the
+            signature because the in-repo/out-of-repo distinction is the first thing
+            anyone will want if this is ever relaxed to allow in-repo aliases.
+    """
+    return not os.path.islink(os.fspath(dir_path))
+
+
+def read_repo_file(path: PathLike, max_bytes: int = 1024 * 1024) -> str | None:
+    """Read a file authored by the *scanned* repository, or refuse to.
+
+    Every path under a scanned repository is attacker-controlled: OpenAnt's whole
+    job is analysing code it does not trust. A plain ``open()`` on such a path hands
+    the repository three primitives:
+
+    * a **symlink** to a host file, which lands outside the repo in ``dataset.json``
+      and is then shipped to the model provider;
+    * a **FIFO or device**, which blocks the scan forever on ``open()`` — no
+      timeout, no error, just a wedged run;
+    * an **unbounded file**, read fully into memory before any caller-side cap.
+
+    This existed correctly in exactly one place (``load_threat_model``) while three
+    sibling loaders opened repo-authored paths bare — the same "fixed it at the one
+    site the report named" pattern that recurs throughout this codebase. Centralising
+    it means the next loader gets the guard by construction rather than by review.
+
+    Order matters: ``lstat`` before ``open``, because both ``exists()`` and
+    ``open()`` follow symlinks, and a check that follows the link is not a check.
+
+    Returns:
+        File contents, or ``None`` if the path does not exist.
+
+    Raises:
+        UnsafeRepoFile: If the path is a symlink, is not a regular file, or exceeds
+            ``max_bytes``. Refusing loudly is the point — a silent skip would let a
+            repository hide a file from analysis just by making it weird.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+    name = os.path.basename(os.fspath(path))
+    if stat.S_ISLNK(info.st_mode):
+        raise UnsafeRepoFile(
+            f"{name} is a symlink; refusing to follow it out of the scanned repository"
+        )
+    if not stat.S_ISREG(info.st_mode):
+        raise UnsafeRepoFile(
+            f"{name} is not a regular file (mode {info.st_mode:o}); a FIFO or device "
+            "would block the scan indefinitely"
+        )
+    if info.st_size > max_bytes:
+        raise UnsafeRepoFile(
+            f"{name} is too large ({info.st_size} bytes > {max_bytes}); refusing to read"
+        )
+
+    with open_utf8(path) as handle:
+        return handle.read(max_bytes + 1)[:max_bytes]
 
 
 def open_utf8(path: PathLike, mode: str = "r", **kwargs):

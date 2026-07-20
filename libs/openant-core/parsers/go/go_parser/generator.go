@@ -234,7 +234,7 @@ func (g *Generator) assembleEnhancedCode(funcInfo FunctionInfo, upstream []strin
 	seenFiles := map[string]bool{funcInfo.FilePath: true}
 
 	// Start with primary code
-	parts = append(parts, funcInfo.Code)
+	parts = append(parts, NeutralizeBoundaries(funcInfo.Code))
 
 	// Add upstream dependencies
 	for _, depID := range upstream {
@@ -249,8 +249,9 @@ func (g *Generator) assembleEnhancedCode(funcInfo FunctionInfo, upstream []strin
 			filesIncluded = append(filesIncluded, depInfo.FilePath)
 		}
 
-		// Add dependency code with file boundary
-		parts = append(parts, FileBoundary+depInfo.Code)
+		// Add dependency code with file boundary. Neutralize first: the code is
+		// scanned-repository source and may forge the separator.
+		parts = append(parts, FileBoundary+NeutralizeBoundaries(depInfo.Code))
 	}
 
 	return strings.Join(parts, ""), filesIncluded

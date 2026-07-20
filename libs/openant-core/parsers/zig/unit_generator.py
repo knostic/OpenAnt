@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Set
 
 from utilities.file_io import write_json
+from core.file_boundary import neutralize_boundaries
 
 
 class UnitGenerator:
@@ -208,8 +209,12 @@ class UnitGenerator:
                     deps_by_file[file_path] = []
                 deps_by_file[file_path].append(dep_id)
 
-        # Build enhanced code
-        code_parts = [primary_code]
+        # Build enhanced code. Every string appended below is source from the
+        # scanned repository, so each is neutralized before it enters the blob: a
+        # file containing a boundary-shaped line would otherwise split the unit and
+        # push everything after it into the prompt's do-not-analyze section. See
+        # core/file_boundary.neutralize_boundaries.
+        code_parts = [neutralize_boundaries(primary_code)]
 
         for file_path, dep_ids in deps_by_file.items():
             if file_path == func_info["file_path"]:
@@ -217,7 +222,7 @@ class UnitGenerator:
                 for dep_id in dep_ids:
                     dep_info = self.functions.get(dep_id)
                     if dep_info:
-                        code_parts.append(dep_info.get("code", ""))
+                        code_parts.append(neutralize_boundaries(dep_info.get("code", "")))
             else:
                 # Different file - add file boundary
                 if file_path not in files_included:
@@ -226,7 +231,7 @@ class UnitGenerator:
                 for dep_id in dep_ids:
                     dep_info = self.functions.get(dep_id)
                     if dep_info:
-                        file_code.append(dep_info.get("code", ""))
+                        file_code.append(neutralize_boundaries(dep_info.get("code", "")))
                 if file_code:
                     code_parts.append(self.FILE_BOUNDARY + "\n".join(file_code))
 
