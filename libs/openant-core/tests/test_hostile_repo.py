@@ -172,9 +172,10 @@ def hostile_repo(tmp_path: Path) -> Path:
     (beyond / "host_secret.py").write_text('KEY = "sk-ant-SECRET-DO-NOT-LEAK"\n')
     os.symlink(beyond / "host_secret.py", repo / "src" / "leak.py")
     os.symlink("/etc/hosts", repo / "src" / "abs.py")
-    # Negative control: a parent-scoped link IS allowed by policy. If this stops
-    # being scanned, the fix has become "refuse every symlink" and has silently
-    # reintroduced the false-negative the zig regression fixture exists to prevent.
+    # A parent-scoped link. Under the earlier policy this was ALLOWED and served
+    # as the negative control against over-refusing; policy is now refuse-all, so
+    # it serves instead as the case proving the refusal is counted rather than
+    # silent.
     (outside / "vendored.py").write_text("def vendored():\n    return 1\n")
     os.symlink(outside / "vendored.py", repo / "src" / "sibling.py")
 
@@ -428,12 +429,18 @@ def test_traversal_does_not_ingest_files_outside_the_repository(hostile_repo: Pa
         "scanner ingested files resolving BEYOND the repository parent; whatever "
         f"it returns is sent to the model provider: {escaped}"
     )
-    # Negative control: the parent-scoped link must STILL be scanned. A fix that
-    # refuses every symlink passes the assertion above and silently drops
-    # legitimately vendored source — for a SAST tool the worse failure direction.
-    assert any(f.endswith("sibling.py") for f in files), (
-        "parent-scoped symlink was dropped; the guard has become refuse-everything "
-        f"and now loses legitimate source. scanned={files}"
+    # Policy is now refuse-every-symlink, so the parent-scoped link is dropped
+    # too. That is a real coverage loss, accepted deliberately — and the control
+    # is therefore no longer "it must still be scanned" but "it must be COUNTED".
+    # An unscanned path that leaves no trace is a silent false negative, which is
+    # the failure mode a SAST tool can least afford.
+    assert not any(f.endswith("sibling.py") for f in files), (
+        f"a symlink was followed; policy is to refuse all of them. scanned={files}"
+    )
+    stats = result.get("statistics", {}) if isinstance(result, dict) else {}
+    assert stats.get("symlinks_skipped"), (
+        "symlinks were refused but not counted; the coverage gap is invisible. "
+        f"statistics={stats}"
     )
 
 

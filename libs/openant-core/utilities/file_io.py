@@ -86,125 +86,63 @@ def write_repo_file(path: PathLike, text: str, *, overwrite: bool = False) -> No
 def safe_to_descend(dir_path: PathLike, repo_real: str, seen: set | None = None) -> bool:
     """Whether a directory inside a scanned repository may be walked.
 
-    A directory symlink in an untrusted repository is two attack primitives:
+    **Policy: symlinked directories are never followed.**
 
-    * ``vendor -> /`` walks the host filesystem into ``dataset.json``, which is then
-      sent to the model provider. Verified: a repo containing ``escape -> /tmp/x``
-      produced a unit for a file outside the repository.
-    * ``loop -> ..`` recurses until ELOOP. Three sibling loops made a scan of a
-      one-file repository run for minutes at full CPU with memory climbing.
+    A directory symlink in an untrusted repository is an exfiltration primitive:
+    ``vendor -> /`` walks the host filesystem into ``dataset.json``, which is sent
+    to the model provider.
 
-    Refusing every symlinked directory is the right call rather than merely
-    deduplicating them: an in-repo alias is reached by its canonical path anyway, so
-    following it only duplicates work, and an out-of-repo target is precisely what
-    must not be read. Callers that need the target's contents should have it
-    committed to the repository.
+    An earlier policy followed links resolving inside the repository or its
+    immediate parent, to admit monorepo sibling-vendoring. The operator chose the
+    stricter rule. It is also the simpler property to reason about: "never follow
+    a link" needs no containment arithmetic and cannot be defeated by a target
+    that resolves somewhere unexpected.
 
-    This lived in ``parsers/zig/repository_scanner.py`` and nowhere else — its own
-    comment noted it was deviating from "the other four language scanners", so the
-    divergence was known and simply never propagated. Shared here so a sixth parser
-    inherits it instead of re-deriving it.
-
-    Note this keys on the *directory* only. A file-inode guard would silently drop
-    legitimately hardlinked source, trading one false-negative primitive for another.
-
-    **Policy: follow a symlink only if it resolves inside the repository or its
-    immediate parent; refuse anything further out.**
-
-    This is a deliberate compromise between two real and opposing requirements,
-    and it is worth stating why neither extreme was chosen.
-
-    Refusing every symlink loses code: ``parsers/zig`` carries a regression test
-    whose fixture is a ``.zig`` file reachable only through a symlinked directory,
-    written because such files were once silently dropped. For a SAST tool a
-    false negative is the worse failure direction, so blanket refusal is not free.
-
-    Following every symlink leaks the host: the security audit demonstrated a repo
-    containing ``escape -> /tmp/outside`` putting a file from outside the tree into
-    ``dataset.json``, which is then sent to the model provider. In an untrusted
-    repository "vendored dependency" and ``vendor -> /`` are indistinguishable.
-
-    Allowing the parent admits the common monorepo case — a package symlinking a
-    sibling directory — while still refusing arbitrary absolute paths.
-
-    **Accepted residual risk:** anything under the parent directory is reachable.
-    Scanning a repo checked out directly into a directory that also holds unrelated
-    sensitive material will ingest it. Clone into a dedicated parent.
+    **Accepted cost:** source reachable ONLY through a symlink is not scanned.
+    That is unscanned code, so callers MUST count the refusal rather than skip in
+    silence — a scanner quietly analysing less than it claims is precisely the
+    failure mode this codebase keeps designing against. ``core/repo_walk.py``
+    records these under ``symlinks_skipped``.
 
     Args:
         dir_path: The directory entry being considered.
-        repo_real: ``realpath`` of the repository root.
-        seen: Optional ``(st_dev, st_ino)`` set, mutated here, bounding cycles.
-            Without it an internal ``loop -> ..`` alias would recurse forever.
+        repo_real: ``realpath`` of the repository root. Unused under the current
+            policy; retained because the containment arithmetic is the first
+            thing needed if this is ever relaxed again.
+        seen: Unused. Previously bounded cycles among followed in-repo aliases;
+            with nothing followed, no cycle is reachable.
 
     Returns:
-        True if the walker may descend.
+        True if the walker may descend — i.e. the entry is not a symlink.
     """
-    full = os.fspath(dir_path)
-    if not os.path.islink(full):
-        return True
-
-    real = os.path.realpath(full)
-
-    def _under(root: str) -> bool:
-        return bool(root) and (real == root or real.startswith(root + os.sep))
-
-    # 1. Resolves back inside the repository: an internal alias. SKIP it — the
-    #    real directory is walked by its canonical path anyway, so descending the
-    #    alias emits every file a second time under the alias path (and `loop ->
-    #    ..` recurses). Skipping loses nothing and keeps output canonical.
-    if _under(repo_real):
-        return False
-
-    # 2. Resolves within the repository's parent: the sibling-vendoring case a
-    #    monorepo package needs. FOLLOW, bounded by inode so a cycle terminates.
-    if _under(os.path.dirname(repo_real)):
-        if seen is None:
-            return True
-        try:
-            info = os.stat(full)
-        except OSError:
-            return False
-        key = (info.st_dev, info.st_ino)
-        if key in seen:
-            return False
-        seen.add(key)
-        return True
-
-    # 3. Anything further out. REFUSE — this is the exfiltration path.
-    return False
+    return not os.path.islink(os.fspath(dir_path))
 
 
 def safe_to_read(file_path: PathLike, repo_real: str) -> bool:
     """Whether a FILE inside a scanned repository may be read.
 
-    The file-side counterpart of ``safe_to_descend``, and it did not exist — which
-    was an exfiltration hole. Traversal stats entries with a call that follows
-    symlinks, so ``leak.py -> /etc/passwd`` reported as a regular file and was
-    read and shipped. Directory symlinks were contained; file symlinks were not.
+    **Policy: symlinked files are never read.** Symmetrical with
+    ``safe_to_descend``, deliberately — an asymmetry between the two is exactly
+    what produced the original hole.
 
-    Applies the SAME policy the directory case uses (and that the operator chose
-    deliberately): resolve, then allow only if the target lands inside the
-    repository or its immediate parent. Parent scope admits the monorepo case
-    where a package symlinks a sibling; anything beyond is refused.
+    This guard did not exist, and its absence was an exfiltration primitive:
+    traversal takes an entry's mode from a call that FOLLOWS symlinks, so
+    ``leak.py -> /etc/passwd`` reported as a regular file, was read, and its
+    contents reached ``dataset.json`` and the model provider. Directory symlinks
+    were contained; file symlinks were not.
 
-    Deliberately not "refuse every file symlink". `parsers/zig` carries a
-    regression test whose fixture is source reachable only through a symlink,
-    written because such files were once silently dropped — and for a SAST tool
-    a false negative is the worse failure direction. The security property is
-    "never leave the repository", not "never follow a link".
+    **Accepted cost:** identical to the directory case — symlinked source is not
+    scanned, and the refusal is counted, never silent.
 
-    **Accepted residual risk, same as the directory case:** anything under the
-    parent directory is reachable. Clone into a dedicated parent.
+    Args:
+        file_path: The file entry being considered.
+        repo_real: ``realpath`` of the repository root. Unused under the current
+            policy; kept symmetrical with ``safe_to_descend``.
+
+    Returns:
+        True if the file may be read — i.e. it is not a symlink.
     """
-    full = os.fspath(file_path)
-    if not os.path.islink(full):
-        return True
-    real = os.path.realpath(full)
-    for root in (repo_real, os.path.dirname(repo_real)):
-        if root and (real == root or real.startswith(root + os.sep)):
-            return True
-    return False
+    return not os.path.islink(os.fspath(file_path))
 
 
 def read_repo_file(path: PathLike, max_bytes: int = 1024 * 1024,

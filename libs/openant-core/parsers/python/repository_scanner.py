@@ -117,6 +117,7 @@ class RepositoryScanner:
             'directories_scanned': 0,
             'directories_excluded': 0,
             'test_files_skipped': 0,
+            'symlinks_skipped': 0,
         }
 
         # Results
@@ -159,6 +160,21 @@ class RepositoryScanner:
         if name_lower.endswith(self.test_file_suffixes):
             return True
         return False
+
+    def _note_symlink(self, path) -> None:
+        """Count a refused symlink so the coverage gap stays visible.
+
+        Symlinks are refused by policy, which means code reachable only that way
+        is not scanned. Folding the count into `directories_excluded` (as this
+        did) hid it among ordinary prunes like node_modules — an unscanned path
+        that leaves no distinguishable trace is a silent false negative. Mirrors
+        `symlinks_skipped` in core/repo_walk.py so all five scanners report the
+        same key.
+        """
+        self.stats['symlinks_skipped'] = self.stats.get('symlinks_skipped', 0) + 1
+        self.stats.setdefault('symlink_examples', [])
+        if len(self.stats['symlink_examples']) < 5:
+            self.stats['symlink_examples'].append(str(path))
 
     def _safe_to_descend(self, entry: Path, repo_real: str, seen_dirs: Set) -> bool:
         """Whether a directory entry may be walked, given symlink hazards.
@@ -276,7 +292,7 @@ class RepositoryScanner:
                     self.stats['directories_excluded'] += 1
                     continue
                 if not self._safe_to_descend(entry, repo_real, seen_dirs):
-                    self.stats['directories_excluded'] += 1
+                    self._note_symlink(entry)
                     continue
                 child = _open_dir(entry)
                 if child is not None:
@@ -288,7 +304,7 @@ class RepositoryScanner:
                 # read and shipped — the exfiltration hole every guard in the
                 # tree missed by being directory-only.
                 if not safe_to_read(entry, repo_real):
-                    self.stats['directories_excluded'] += 1
+                    self._note_symlink(entry)
                     continue
                 if not self.is_source_file(entry.name):
                     continue

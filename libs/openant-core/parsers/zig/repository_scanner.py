@@ -135,6 +135,10 @@ class RepositoryScanner:
                 # gap nobody sees.
                 "directories_unreadable": stats.get("directories_unreadable", 0),
                 "unreadable_examples": stats.get("unreadable_examples", []),
+                # Symlinks are refused by policy; surfacing the count keeps that
+                # a visible coverage gap rather than a silent false negative.
+                "symlinks_skipped": stats.get("symlinks_skipped", 0),
+                "symlink_examples": stats.get("symlink_examples", []),
             },
         }
 

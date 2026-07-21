@@ -52,6 +52,10 @@ STAT_KEYS = (
     "directories_scanned",
     "directories_excluded",
     "directories_unreadable",
+    # Symlinks are refused outright (see utilities.file_io.safe_to_descend). That
+    # is unscanned code, so it is COUNTED. A scanner that silently analyses less
+    # than it claims manufactures assurance, which is worse than a visible gap.
+    "symlinks_skipped",
 )
 
 
@@ -91,6 +95,18 @@ def walk_repository(
     seen_dirs: set = set()
     for key in STAT_KEYS:
         stats.setdefault(key, 0)
+
+    def _note_symlink(path) -> None:
+        """Record a refused symlink so the coverage gap is inspectable.
+
+        Policy is to refuse every symlink, which means code reachable only that
+        way is not scanned. Recording it in the structured result — not just on
+        stderr, which CI discards — is what keeps that a visible gap rather than
+        a silent false negative.
+        """
+        stats.setdefault("symlink_examples", [])
+        if len(stats["symlink_examples"]) < unreadable_examples_limit:
+            stats["symlink_examples"].append(str(path))
 
     def _record_unreadable(path, reason: str) -> None:
         stats["directories_unreadable"] = stats.get("directories_unreadable", 0) + 1
@@ -142,7 +158,8 @@ def walk_repository(
                 stats["directories_excluded"] = stats.get("directories_excluded", 0) + 1
                 continue
             if not safe_to_descend(entry, repo_real, seen_dirs):
-                stats["directories_excluded"] = stats.get("directories_excluded", 0) + 1
+                stats["symlinks_skipped"] = stats.get("symlinks_skipped", 0) + 1
+                _note_symlink(entry)
                 continue
             child = _open_dir(entry)
             if child is not None:
@@ -161,6 +178,7 @@ def walk_repository(
             # DIRECTORY symlink, so it certified one shape of the attack while
             # the other was wide open.
             if not safe_to_read(entry, repo_real):
-                stats["files_excluded"] = stats.get("files_excluded", 0) + 1
+                stats["symlinks_skipped"] = stats.get("symlinks_skipped", 0) + 1
+                _note_symlink(entry)
                 continue
             on_file(entry, entry_relative)
