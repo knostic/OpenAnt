@@ -47,7 +47,12 @@ var (
 )
 
 func init() {
-	initCmd.Flags().StringVarP(&initLanguage, "language", "l", "", languages.FlagHelp())
+	// Defaults to "auto" = scan every detected language. Previously this flag was
+	// REQUIRED, which meant there was no default at all: every user had to name a
+	// language, the help examples all show `-l go`, and the natural choice pinned
+	// the project to one language forever. "All languages should be scanned, not
+	// just the main one" cannot be true of a tool that makes you pick one up front.
+	initCmd.Flags().StringVarP(&initLanguage, "language", "l", "auto", languages.FlagHelp())
 	initCmd.Flags().StringVar(&initCommit, "commit", "", "Specific commit SHA (default: HEAD)")
 	initCmd.Flags().StringVar(&initName, "name", "", "Override project name (default: derived from URL/path)")
 	initCmd.Flags().BoolVar(&initFull, "full", false, "Force full scan (rejects --incremental/--diff-base/--pr)")
@@ -55,7 +60,8 @@ func init() {
 	initCmd.Flags().StringVar(&initDiffBase, "diff-base", "", "Incremental against this ref (e.g. origin/main, HEAD~5)")
 	initCmd.Flags().IntVar(&initPR, "pr", 0, "Incremental against a GitHub PR number (requires gh; mutex with --diff-base)")
 	initCmd.Flags().StringVar(&initDiffScope, "diff-scope", "", "Diff scope: changed_files, changed_functions, callers (default changed_functions)")
-	_ = initCmd.MarkFlagRequired("language")
+	// Deliberately NOT MarkFlagRequired: "auto" is the default, and requiring the
+	// flag is what forced every project into a single language.
 }
 
 func runInit(cmd *cobra.Command, args []string) {

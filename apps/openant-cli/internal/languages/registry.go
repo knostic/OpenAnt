@@ -138,7 +138,7 @@ func FlagHelp() string {
 		return "Language to analyze (see config/languages.json), or auto to detect"
 	}
 	return fmt.Sprintf(
-		"Language: %s, auto (auto = experimental dominance heuristic; see #61)",
+		"Language: %s, auto (default; auto = detect and scan every language present)",
 		strings.Join(names, ", "),
 	)
 }
