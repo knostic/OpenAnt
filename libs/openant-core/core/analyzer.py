@@ -38,8 +38,10 @@ from utilities.file_io import read_json, write_json
 from utilities.json_corrector import JSONCorrector
 from utilities.rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
 
-# Reuse the core analysis functions from experiment.py
-from experiment import (
+# These live in core/ because core is shipped and experiment.py is not: importing
+# them from the research harness made `import core.analyzer` fail in any installed
+# environment (ModuleNotFoundError: no module named 'experiment').
+from core.analysis_core import (
     analyze_unit,
     parse_response,
     _normalize_result,

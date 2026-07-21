@@ -27,8 +27,8 @@ from pathlib import Path
 
 import pytest
 
-import generate_report
-import export_csv
+import report.html_report as generate_report
+import report.csv_export as export_csv
 from openant import cli
 
 

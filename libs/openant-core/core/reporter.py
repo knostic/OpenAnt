@@ -2,8 +2,8 @@
 Report generation wrapper.
 
 Wraps the existing report generators:
-- generate_report.py   — HTML report with Chart.js
-- export_csv.py        — CSV export
+- report/html_report.py — HTML report with Chart.js
+- report/csv_export.py  — CSV export
 - report/generator.py  — LLM-based summary and disclosure documents
 
 Also provides ``build_pipeline_output()`` which assembles analysis results
@@ -488,13 +488,15 @@ def generate_html_report(
     # Pass step reports dir so the HTML report can include cost/time breakdown
     step_reports_dir = os.path.dirname(os.path.abspath(results_path))
 
-    script = _CORE_ROOT / "generate_report.py"
     cmd = [
-        sys.executable, str(script), results_path, dataset_path, output_path,
+        sys.executable, "-m", "report.html_report", results_path, dataset_path, output_path,
         "--step-reports-dir", step_reports_dir,
     ]
 
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, cwd=str(_CORE_ROOT))
+    # No cwd=_CORE_ROOT: these are now `-m` package invocations resolved through
+    # the installed distribution, not source-tree-relative scripts. Depending on
+    # cwd is what made them unrunnable from an installed wheel.
+    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
 
     if result.returncode != 0:
         raise RuntimeError(f"HTML report generation failed (exit code {result.returncode})")
@@ -522,10 +524,12 @@ def generate_csv_report(
     """
     print("[Report] Generating CSV report...", file=sys.stderr)
 
-    script = _CORE_ROOT / "export_csv.py"
-    cmd = [sys.executable, str(script), results_path, dataset_path, output_path]
+    cmd = [sys.executable, "-m", "report.csv_export", results_path, dataset_path, output_path]
 
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, cwd=str(_CORE_ROOT))
+    # No cwd=_CORE_ROOT: these are now `-m` package invocations resolved through
+    # the installed distribution, not source-tree-relative scripts. Depending on
+    # cwd is what made them unrunnable from an installed wheel.
+    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
 
     if result.returncode != 0:
         raise RuntimeError(f"CSV export failed (exit code {result.returncode})")
