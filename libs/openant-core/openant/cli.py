@@ -122,15 +122,35 @@ def cmd_scan(args):
 
 
 def _select_languages_for(args):
-    """LanguageSelection for this invocation, or None to use the legacy path.
+    """LanguageSelection for this invocation, or None only for an explicit ``-l``.
 
-    Returns None when no multi-language flag was given, so the single-language
-    code path stays byte-identical for every pre-existing invocation — the
-    detection walk is not even performed.
+    **`auto` now means every detected language, not the dominant one.** This is a
+    deliberate behaviour change and it is the point of the feature: the request was
+    "all languages we currently support should be detected in the repo and it
+    should scan all of them, not just the main one" — a statement about what the
+    tool does by default, which an opt-in flag does not satisfy.
+
+    The machinery this needs already existed and was already reviewed:
+    ``select_languages`` applies the file-count and share thresholds, always keeps
+    the dominant language so a selection can never be empty, and
+    ``report_exclusions`` prints any language it dropped. Only the early return
+    here forced the legacy single-language path, so removing it is the whole
+    inversion.
+
+    Returns None only when the caller named a single language explicitly with
+    ``-l <lang>``, which remains the escape hatch and the way to get the old
+    behaviour.
+
+    What changes for existing users: multi-language repositories now cost more to
+    scan and produce more findings. That is the intended effect; the loud
+    selection/exclusion banner is the mitigation, so the coverage change is never
+    silent.
     """
-    if not (getattr(args, "languages", None)
-            or getattr(args, "all_languages", False)
-            or getattr(args, "multi_language", False)):
+    explicit = getattr(args, "language", "auto") not in (None, "auto")
+    multi = (getattr(args, "languages", None)
+             or getattr(args, "all_languages", False)
+             or getattr(args, "multi_language", False))
+    if explicit and not multi:
         return None
     from core.parser_adapter import detect_languages
 
@@ -1092,13 +1112,18 @@ def resolve_language_selection(args, counts: dict[str, int]):
             silently preferring either would surprise someone.
     """
     explicit = getattr(args, "language", "auto") not in (None, "auto")
-    multi = getattr(args, "languages", None) or getattr(args, "all_languages", False)
+    # `multi_language` was missing here while `_select_languages_for` did treat it
+    # as a trigger, so `-l go --multi-language` silently dropped the multi flag and
+    # then blamed the exclusion on `--languages`, which the user never passed.
+    multi = (getattr(args, "languages", None)
+             or getattr(args, "all_languages", False)
+             or getattr(args, "multi_language", False))
 
     if explicit and multi:
         raise ValueError(
-            "-l/--language is mutually exclusive with --languages/--all-languages: "
-            f"got -l {args.language} alongside a multi-language flag. Use one or "
-            "the other."
+            "-l/--language is mutually exclusive with --languages/--all-languages/"
+            f"--multi-language: got -l {args.language} alongside a multi-language "
+            "flag. Use one or the other."
         )
 
     if explicit:

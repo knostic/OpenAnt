@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/knostic/open-ant-cli/internal/config"
@@ -132,16 +133,37 @@ func runInit(cmd *cobra.Command, args []string) {
 		repoPath = absPath
 	}
 
-	// Auto-detect language if not specified
-	if initLanguage == "" || initLanguage == "auto" {
-		fmt.Fprintf(os.Stderr, "Auto-detecting language...\n")
-		detected, err := languages.DetectLanguage(repoPath)
-		if err != nil {
-			output.PrintError(fmt.Sprintf("Language auto-detection failed: %s\nSpecify manually with -l/--language", err))
+	// Language resolution. When the user did not name one, STORE "auto" rather
+	// than collapsing to a single detected language.
+	//
+	// This used to resolve auto -> one concrete language and persist that. Because
+	// `scan` then passes the stored value as an explicit -l (see cmd/scan.go), and
+	// explicit beats auto, an `init`-created project was pinned to one language
+	// permanently — so a 6-language monorepo was scanned as one language forever,
+	// and no amount of fixing the engine's default could reach it. That made the
+	// product's primary flow (`init` then `scan`) the one place the "scan all
+	// languages, not just the main one" requirement could never take effect.
+	//
+	// Detection still runs, but only to TELL the user what is there. The set is
+	// resolved per-scan now, so adding a language to the repo later is picked up
+	// without re-running init.
+	if initLanguage == "" {
+		initLanguage = "auto"
+	}
+	if initLanguage == "auto" {
+		fmt.Fprintf(os.Stderr, "Detecting languages...\n")
+		counts, err := languages.DetectLanguages(repoPath)
+		if err != nil || len(counts) == 0 {
+			output.PrintError(fmt.Sprintf("Language detection failed: %v\nSpecify manually with -l/--language", err))
 			os.Exit(1)
 		}
-		initLanguage = detected
-		fmt.Fprintf(os.Stderr, "Detected language: %s\n", initLanguage)
+		names := make([]string, 0, len(counts))
+		for name := range counts {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		fmt.Fprintf(os.Stderr, "Detected: %s (all will be scanned; use -l to pin one)\n",
+			strings.Join(names, ", "))
 	}
 
 	// Get commit SHA (best-effort — not all local paths are git repos)
