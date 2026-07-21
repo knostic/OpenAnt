@@ -57,6 +57,17 @@ packages = [
     "report",
 ]
 
+# Keep test scaffolding and generated outputs out of the distribution. These are
+# regenerable artifacts, not product: report/test_output shipped a third-party
+# exploit writeup (paperless-ngx, CWE-639) and a stale sample report, and
+# report/test_data shipped a captured pipeline. None is referenced by production.
+exclude = [
+    "**/test_output",
+    "**/test_data",
+    "**/test_output/**",
+    "**/test_data/**",
+]
+
 # config/languages.json is the single source of truth for the language set, read
 # by BOTH the Python engine and the Go CLI. It lives at the monorepo root, two
 # levels above this project root, so `packages` above cannot reach it and the

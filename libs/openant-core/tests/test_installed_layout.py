@@ -119,3 +119,43 @@ def test_a_built_wheel_carries_the_config(tmp_path: Path):
         f"wheel ships no language config; installed users get zero languages. "
         f"Entries: {[n for n in names if 'config' in n]}"
     )
+
+
+@pytest.mark.slow
+def test_wheel_omits_test_artifacts_and_carries_runtime_modules(tmp_path: Path):
+    """The distribution must contain product and NOTHING but product.
+
+    report/test_output shipped a third-party exploit writeup (paperless-ngx,
+    CWE-639, with reproduction steps) and a stale sample report; report/test_data
+    shipped a captured pipeline. None is referenced by production, and shipping an
+    exploit disclosure to PyPI is a disclosure problem, not just clutter.
+
+    Two-sided on purpose: an over-broad exclude that also dropped a runtime
+    module would pass a "junk absent" check while breaking the install, so this
+    asserts BOTH — the junk is gone and the things the product needs are present.
+    """
+    import subprocess, zipfile
+
+    result = subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path),
+         str(CORE_ROOT)],
+        capture_output=True, text=True, timeout=900,
+        env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"})
+    if result.returncode != 0:
+        pytest.skip(f"wheel build unavailable: {result.stderr[-300:]}")
+
+    wheels = list(tmp_path.glob("*.whl"))
+    assert wheels, "no wheel produced"
+    names = zipfile.ZipFile(wheels[0]).namelist()
+
+    banned = [n for n in names
+              if "/test_output/" in n or "/test_data/" in n
+              or n.endswith("/test_output") or n.endswith("/test_data")
+              or "DISCLOSURE_" in n or "paperless" in n.lower()]
+    assert not banned, f"wheel ships test artifacts / an exploit writeup: {banned}"
+
+    required = ["core/analyzer.py", "report/generator.py",
+                "report/prompts/disclosure.txt", "config/languages.json"]
+    for r in required:
+        assert any(n.endswith(r) or n == r for n in names), (
+            f"wheel is missing a runtime file the product needs: {r}")

@@ -360,7 +360,9 @@ def test_reviewer():
     cf = load_config_file()
     registry = build_phase_registry(cf, resolve_llm_config(cf, None))
     binding = registry.get("analyze")
-    repo_path = "/Users/nahumkorda/code/dvna"
+    # Demo block (guarded by os.path.exists below). Env var, not a
+    # hardcoded personal path shipped in the wheel.
+    repo_path = os.environ.get("OPENANT_DEMO_REPO", "")
 
     if not os.path.exists(repo_path):
         print(f"Repository not found: {repo_path}", file=sys.stderr)

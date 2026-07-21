@@ -92,3 +92,44 @@ def test_the_guard_actually_matches_the_bad_pattern():
     assert _MACHINE_PATH.search('X = "/private/tmp/claude-501/scratch/impl-core"')
     assert not _MACHINE_PATH.search('ROOT = Path(__file__).parent.parent')
     assert not _MACHINE_PATH.search('p = tmp_path / "dataset.json"')
+
+
+
+# --- Shipped production source (the gap that let a personal path into the wheel) -
+
+_SHIPPED_PKGS = ("core", "utilities", "parsers", "prompts", "context", "report", "openant")
+_SRC_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _shipped_sources():
+    out = []
+    for pkg in _SHIPPED_PKGS:
+        out.extend((_SRC_ROOT / pkg).rglob("*.py"))
+    return [p for p in out if "__pycache__" not in p.parts]
+
+
+_SHIPPED = _shipped_sources()
+
+
+def test_the_source_sweep_is_not_vacuous():
+    """A sweep that scanned nothing would pass while proving nothing.
+
+    The original sweep only covered tests/, which is exactly why a personal path
+    in utilities/ shipped in the wheel unnoticed. This floor guards the extension.
+    """
+    assert len(_SHIPPED) > 100, (
+        f"only {len(_SHIPPED)} shipped sources found; the glob has stopped matching"
+    )
+
+
+@pytest.mark.parametrize("src", _SHIPPED, ids=lambda p: str(p.relative_to(_SRC_ROOT)))
+def test_no_machine_specific_absolute_paths_in_shipped_source(src):
+    """No /Users/<name> or /home/<name> literal in code that ships in the wheel.
+
+    A comment giving an example path is fine; a string literal is not — that is
+    what embeds someone's home directory in the distribution.
+    """
+    for i, line in enumerate(src.read_text(errors="replace").splitlines(), 1):
+        code = line.split("#", 1)[0]
+        m = _MACHINE_PATH.search(code)
+        assert not m, f"{src.relative_to(_SRC_ROOT)}:{i}: machine path {m.group(0)}"
