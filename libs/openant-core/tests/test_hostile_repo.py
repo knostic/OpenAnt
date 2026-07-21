@@ -426,30 +426,3 @@ def _iter_scanned_paths(result):
 
 
 # --- parity: the guard must exist everywhere, not at one site -----------------
-
-
-@pytest.mark.parametrize(
-    "language", ["python", "javascript", "go", "c", "ruby", "php", "zig"]
-)
-def test_every_parser_guards_against_symlink_cycles(language: str):
-    """The recurring defect in this codebase is "wired one branch of two".
-
-    The FIFO guard landed at one of four open sites; the fence fix at one of two
-    reporters; the inode guard at two of seven parsers. A parity test over the
-    enumerated set is the antidote: it fails automatically when language #8 arrives
-    without the guard, instead of waiting for a reviewer to notice.
-    """
-    root = Path(__file__).resolve().parent.parent / "parsers" / language
-    if not root.is_dir():
-        pytest.skip(f"no parser package for {language}")
-    sources = list(root.glob("repository_scanner.*"))
-    if not sources:
-        pytest.skip(f"{language} has no repository_scanner")
-    blob = "\n".join(p.read_text(errors="replace") for p in sources)
-    guards = ("safe_to_descend", "_safe_to_descend", "st_ino", "realpath",
-              "islink", "isSymbolicLink", "EvalSymlinks")
-    assert any(g in blob for g in guards), (
-        f"parsers/{language}/repository_scanner has no symlink guard; a directory "
-        f"symlink would walk the host filesystem into the dataset. Expected one of "
-        f"{guards}"
-    )

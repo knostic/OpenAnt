@@ -661,9 +661,15 @@ def generate_application_context(
     )
 
     # Extract JSON from response
-    json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
+    # No `\s*` around the lazy group: that form is ambiguous and backtracks
+    # cubically on an unclosed fence. Third copy of this pattern to be fixed — the
+    # other two were context/threat_model.py and check_manual_override above. This
+    # one parses *model* output rather than repo files, so it is bounded by
+    # max_tokens and was a multi-minute hang rather than an unbounded one, but the
+    # input is still attacker-influenceable via the accepted prompt-injection gap.
+    json_match = re.search(r'```json(.*?)```', response_text, re.DOTALL)
     if json_match:
-        json_str = json_match.group(1)
+        json_str = json_match.group(1).strip()
     else:
         # Try to parse the whole response as JSON
         json_str = response_text.strip()

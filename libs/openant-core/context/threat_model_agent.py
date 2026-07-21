@@ -22,6 +22,9 @@ every later scan, and the loader is deliberately strict about malformed input.
 import json
 from pathlib import Path
 
+from utilities.file_io import read_repo_file, repo_path_state, write_repo_file
+from utilities.llm import PhaseBinding, simple_text
+
 from context.threat_model import (
     THREAT_MODEL_FILENAME,
     ThreatModelValidationError,
@@ -83,8 +86,18 @@ REPOSITORY: {name}
 
 
 def threat_model_exists(repo_path: Path) -> bool:
-    """Whether the repository already ships a threat model."""
-    return (Path(repo_path) / THREAT_MODEL_FILENAME).exists()
+    """Whether the repository already ships a threat model file.
+
+    True for anything present at that path, including a symlink or a non-regular
+    file — deliberately NOT ``exists()``, which follows links and so reports False
+    for a dangling one. Callers use this to decide whether to generate; answering
+    "absent" for a path that is occupied by a hostile link is what let the writer
+    treat it as a free filename and follow it out of the repository.
+
+    Safety is decided by ``repo_path_state`` at the point of use; this only answers
+    "is something there".
+    """
+    return repo_path_state(Path(repo_path) / THREAT_MODEL_FILENAME) != "absent"
 
 
 def _build_prompt(repo_path: Path) -> str:
@@ -155,7 +168,18 @@ def generate_threat_model(
     repo_path = Path(repo_path)
     target = Path(output_path) if output_path else repo_path / THREAT_MODEL_FILENAME
 
-    if target.exists() and not force:
+    # lstat, not exists(): the target lives in the *scanned* repository, so it can
+    # be a symlink pointing anywhere. exists() follows links, so a dangling one
+    # answers False, reads as "no model here", and the write below then follows it
+    # out of the tree. Classify before deciding anything.
+    state = repo_path_state(target)
+    if state == "unsafe":
+        raise ThreatModelGenerationError(
+            f"{target} is a symlink or not a regular file; refusing to write "
+            "through it. A scanned repository must not be able to redirect where "
+            "OpenAnt writes."
+        )
+    if state == "regular" and not force:
         raise ThreatModelGenerationError(
             f"{target} already exists. It may be hand-curated; pass force=True "
             "to regenerate (the existing file is backed up first)."
@@ -164,11 +188,29 @@ def generate_threat_model(
     prompt = _build_prompt(repo_path)
 
     try:
-        # Single-shot rather than a tool loop. The survey inputs (README,
-        # manifests, entry points) are already assembled above, so the agentic
-        # exploration the enhancer needs per-unit buys little here — and it
-        # keeps the generator usable on adapters without tool support.
-        response = binding.adapter.complete(prompt=prompt, max_tokens=MAX_TOKENS)
+        # Go through simple_text, not adapter.complete directly.
+        #
+        # This call was `binding.adapter.complete(prompt=..., max_tokens=...)`,
+        # which does not exist: the protocol is keyword-only
+        # `complete(*, model, system, messages, max_tokens, tools=None)` returning a
+        # CompletionResult. Every real adapter raised TypeError, the except below
+        # wrapped it in a polite ThreatModelGenerationError, and this feature had
+        # therefore NEVER executed successfully — behind a green suite, because the
+        # test fake accepted `*a, **k` and returned a str.
+        #
+        # simple_text is the existing helper for exactly this (application_context
+        # uses it for the same job). It owns model selection from the binding,
+        # system/messages construction, text extraction from the content blocks,
+        # and — importantly — records the call against the token tracker, so
+        # generation now appears in cost accounting instead of being invisible.
+        #
+        # Still single-shot. That is a real limitation, not a design win: the
+        # survey inputs are a truncated README plus a shallow directory listing, so
+        # this can produce a schema-valid model of a repository it has largely not
+        # read. Making it an actual repository-exploring agent is tracked separately;
+        # "the generator runs" and "the generator understands the repo" are
+        # different claims and only the first is true here.
+        response = simple_text(binding, prompt, max_tokens=MAX_TOKENS)
     except ThreatModelGenerationError:
         raise
     except Exception as exc:  # noqa: BLE001 - adapter errors vary by provider
@@ -176,7 +218,7 @@ def generate_threat_model(
             f"threat-model generation call failed: {exc}"
         ) from exc
 
-    data = _extract_json(response if isinstance(response, str) else str(response))
+    data = _extract_json(response)
 
     data.setdefault("generated_by", {}).update({
         "model": getattr(binding, "model", "unknown"),
@@ -193,10 +235,15 @@ def generate_threat_model(
             + "; ".join(getattr(exc, "violations", [str(exc)]))
         ) from exc
 
-    if target.exists() and force:
+    if state == "regular" and force:
+        # The backup is written into the same attacker-controlled directory, so it
+        # gets the same no-follow treatment: overwriting a .bak symlink would be
+        # the identical escape one filename over.
         backup = target.with_suffix(target.suffix + ".bak")
-        backup.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+        existing = read_repo_file(target)
+        if existing is not None:
+            write_repo_file(backup, existing, overwrite=True)
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(render_threat_model_md(data), encoding="utf-8")
+    write_repo_file(target, render_threat_model_md(data), overwrite=(state == "regular"))
     return target

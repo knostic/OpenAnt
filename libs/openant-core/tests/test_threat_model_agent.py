@@ -9,6 +9,8 @@ Every test here runs against a fake adapter — zero API calls, zero cost.
 import json
 from pathlib import Path
 
+from utilities.llm.adapter import CompletionResult, TextBlock
+
 import pytest
 
 from context.threat_model_agent import (
@@ -52,10 +54,26 @@ class FakeBinding:
             def __init__(self):
                 self.supports_tools = supports_tools
 
-            def complete(self, *a, **k):
+            # Signature matches utilities.llm.adapter.LLMAdapter.complete EXACTLY:
+            # keyword-only, and returning a CompletionResult rather than a str.
+            #
+            # It used to be `complete(self, *a, **k) -> str`, and that is the single
+            # reason a threat-model generator which had never once executed sat
+            # behind a green suite: production called `complete(prompt=...)`, which
+            # is not a parameter of the real protocol, and a fake looser than the
+            # interface it stands in for absorbed the difference. A fake must be at
+            # least as strict as the thing it replaces, or it tests the caller's
+            # imagination instead of the caller.
+            def complete(self, *, model, system, messages, max_tokens, tools=None):
                 if outer._raises:
                     raise outer._raises
-                return json.dumps(outer._payload)
+                return CompletionResult(
+                    content=(TextBlock(text=json.dumps(outer._payload)),),
+                    input_tokens=0,
+                    output_tokens=0,
+                    stop_reason="end_turn",
+                    raw=None,
+                )
 
         self.adapter = _Adapter()
 

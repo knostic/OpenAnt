@@ -6,6 +6,7 @@ wrappers ensure that every file open and subprocess call uses UTF-8
 explicitly, preventing ``'charmap' codec can't decode byte ...`` errors.
 """
 
+import errno
 import json
 import logging
 import os
@@ -22,7 +23,67 @@ class UnsafeRepoFile(Exception):
     """A path inside a scanned repository is not safe to read."""
 
 
-def safe_to_descend(dir_path: PathLike, repo_real: str) -> bool:
+def repo_path_state(path: PathLike) -> str:
+    """Classify a path inside a scanned repository: absent / regular / unsafe.
+
+    Use instead of ``Path.exists()`` anywhere the answer decides security
+    behaviour. ``exists()`` follows symlinks, so a **dangling** link answers False
+    and reads as "absent" — which is how a repository gets a silent downgrade (the
+    loader treating a broken link as "no threat model") or a write-escape (the
+    writer treating it as a free filename and then following it).
+
+    Returns:
+        ``"absent"``, ``"regular"``, or ``"unsafe"`` (symlink, FIFO, device,
+        directory — anything that must not be read or written as a plain file).
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unsafe"
+    if stat.S_ISLNK(info.st_mode):
+        return "unsafe"
+    return "regular" if stat.S_ISREG(info.st_mode) else "unsafe"
+
+
+def write_repo_file(path: PathLike, text: str, *, overwrite: bool = False) -> None:
+    """Write a file into a scanned repository without following symlinks.
+
+    ``Path.write_text`` follows symlinks, so writing to an attacker-chosen path in
+    an untrusted checkout is a write-escape primitive: the repository ships
+    ``OPENANT.THREATMODEL.md -> /etc/cron.d/x`` (or anything outside the tree), the
+    caller's ``exists()`` check reads the dangling link as absent, and the write
+    lands wherever the link points.
+
+    ``O_NOFOLLOW`` refuses at the final component, which is the component the
+    repository controls. Combined with ``O_EXCL`` (create-only) or ``O_TRUNC``
+    (explicit overwrite) the caller states its intent and cannot be redirected.
+
+    Raises:
+        UnsafeRepoFile: If the target is a symlink, or exists when the caller asked
+            to create. Refusing loudly is correct — silently writing elsewhere is
+            the whole failure being prevented.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags |= os.O_TRUNC if overwrite else os.O_EXCL
+    name = os.path.basename(os.fspath(path))
+    try:
+        fd = os.open(path, flags, 0o644)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise UnsafeRepoFile(
+                f"{name} is a symlink; refusing to write through it and out of the "
+                "scanned repository"
+            ) from None
+        if exc.errno == errno.EEXIST:
+            raise UnsafeRepoFile(f"{name} already exists") from None
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def safe_to_descend(dir_path: PathLike, repo_real: str, seen: set | None = None) -> bool:
     """Whether a directory inside a scanned repository may be walked.
 
     A directory symlink in an untrusted repository is two attack primitives:
@@ -47,14 +108,71 @@ def safe_to_descend(dir_path: PathLike, repo_real: str) -> bool:
     Note this keys on the *directory* only. A file-inode guard would silently drop
     legitimately hardlinked source, trading one false-negative primitive for another.
 
+    **Policy: follow a symlink only if it resolves inside the repository or its
+    immediate parent; refuse anything further out.**
+
+    This is a deliberate compromise between two real and opposing requirements,
+    and it is worth stating why neither extreme was chosen.
+
+    Refusing every symlink loses code: ``parsers/zig`` carries a regression test
+    whose fixture is a ``.zig`` file reachable only through a symlinked directory,
+    written because such files were once silently dropped. For a SAST tool a
+    false negative is the worse failure direction, so blanket refusal is not free.
+
+    Following every symlink leaks the host: the security audit demonstrated a repo
+    containing ``escape -> /tmp/outside`` putting a file from outside the tree into
+    ``dataset.json``, which is then sent to the model provider. In an untrusted
+    repository "vendored dependency" and ``vendor -> /`` are indistinguishable.
+
+    Allowing the parent admits the common monorepo case — a package symlinking a
+    sibling directory — while still refusing arbitrary absolute paths.
+
+    **Accepted residual risk:** anything under the parent directory is reachable.
+    Scanning a repo checked out directly into a directory that also holds unrelated
+    sensitive material will ingest it. Clone into a dedicated parent.
+
     Args:
         dir_path: The directory entry being considered.
-        repo_real: ``realpath`` of the repository root. Currently unused — every
-            symlinked directory is refused regardless of target — but kept in the
-            signature because the in-repo/out-of-repo distinction is the first thing
-            anyone will want if this is ever relaxed to allow in-repo aliases.
+        repo_real: ``realpath`` of the repository root.
+        seen: Optional ``(st_dev, st_ino)`` set, mutated here, bounding cycles.
+            Without it an internal ``loop -> ..`` alias would recurse forever.
+
+    Returns:
+        True if the walker may descend.
     """
-    return not os.path.islink(os.fspath(dir_path))
+    full = os.fspath(dir_path)
+    if not os.path.islink(full):
+        return True
+
+    real = os.path.realpath(full)
+
+    def _under(root: str) -> bool:
+        return bool(root) and (real == root or real.startswith(root + os.sep))
+
+    # 1. Resolves back inside the repository: an internal alias. SKIP it — the
+    #    real directory is walked by its canonical path anyway, so descending the
+    #    alias emits every file a second time under the alias path (and `loop ->
+    #    ..` recurses). Skipping loses nothing and keeps output canonical.
+    if _under(repo_real):
+        return False
+
+    # 2. Resolves within the repository's parent: the sibling-vendoring case a
+    #    monorepo package needs. FOLLOW, bounded by inode so a cycle terminates.
+    if _under(os.path.dirname(repo_real)):
+        if seen is None:
+            return True
+        try:
+            info = os.stat(full)
+        except OSError:
+            return False
+        key = (info.st_dev, info.st_ino)
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    # 3. Anything further out. REFUSE — this is the exfiltration path.
+    return False
 
 
 def read_repo_file(path: PathLike, max_bytes: int = 1024 * 1024) -> str | None:
