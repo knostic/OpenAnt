@@ -9,7 +9,7 @@ Every test here runs against a fake adapter — zero API calls, zero cost.
 import json
 from pathlib import Path
 
-from utilities.llm.adapter import CompletionResult, TextBlock
+from utilities.llm.adapter import CompletionResult, TextBlock, ToolUseBlock
 
 import pytest
 
@@ -67,6 +67,18 @@ class FakeBinding:
             def complete(self, *, model, system, messages, max_tokens, tools=None):
                 if outer._raises:
                     raise outer._raises
+                # Model BOTH protocol shapes, because production now has two paths
+                # and a fake that only knows one would leave the other untested —
+                # which is the exact hole that let a never-executing generator sit
+                # behind a green suite.
+                if tools:
+                    # Tool-capable: answer by calling `finish`, as a real model does.
+                    return CompletionResult(
+                        content=(ToolUseBlock(
+                            id="call_1", name="finish", input=dict(outer._payload)),),
+                        input_tokens=0, output_tokens=0,
+                        stop_reason="tool_use", raw=None,
+                    )
                 return CompletionResult(
                     content=(TextBlock(text=json.dumps(outer._payload)),),
                     input_tokens=0,

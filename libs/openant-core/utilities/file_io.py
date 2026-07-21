@@ -175,7 +175,8 @@ def safe_to_descend(dir_path: PathLike, repo_real: str, seen: set | None = None)
     return False
 
 
-def read_repo_file(path: PathLike, max_bytes: int = 1024 * 1024) -> str | None:
+def read_repo_file(path: PathLike, max_bytes: int = 1024 * 1024,
+                   *, oversize: str = "raise") -> str | None:
     """Read a file authored by the *scanned* repository, or refuse to.
 
     Every path under a scanned repository is attacker-controlled: OpenAnt's whole
@@ -196,13 +197,25 @@ def read_repo_file(path: PathLike, max_bytes: int = 1024 * 1024) -> str | None:
     Order matters: ``lstat`` before ``open``, because both ``exists()`` and
     ``open()`` follow symlinks, and a check that follows the link is not a check.
 
+    Args:
+        path: File to read.
+        max_bytes: Size ceiling.
+        oversize: What to do when the file exceeds it. ``"raise"`` (default) refuses
+            — right for a config or override file, where reading half a document is
+            worse than reading none. ``"truncate"`` returns the first ``max_bytes``
+            — right for source files during exploration, where refusing outright
+            would hide every large file from the survey and the caller reports the
+            truncation. The choice is a parameter rather than a guess because both
+            behaviours are correct for different callers.
+
     Returns:
         File contents, or ``None`` if the path does not exist.
 
     Raises:
         UnsafeRepoFile: If the path is a symlink, is not a regular file, or exceeds
-            ``max_bytes``. Refusing loudly is the point — a silent skip would let a
-            repository hide a file from analysis just by making it weird.
+            ``max_bytes`` under ``oversize="raise"``. Refusing loudly is the point —
+            a silent skip would let a repository hide a file from analysis just by
+            making it weird.
     """
     try:
         info = os.lstat(path)
@@ -219,7 +232,7 @@ def read_repo_file(path: PathLike, max_bytes: int = 1024 * 1024) -> str | None:
             f"{name} is not a regular file (mode {info.st_mode:o}); a FIFO or device "
             "would block the scan indefinitely"
         )
-    if info.st_size > max_bytes:
+    if info.st_size > max_bytes and oversize != "truncate":
         raise UnsafeRepoFile(
             f"{name} is too large ({info.st_size} bytes > {max_bytes}); refusing to read"
         )
