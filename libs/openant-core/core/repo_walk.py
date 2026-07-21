@@ -44,7 +44,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from utilities.file_io import safe_to_descend
+from utilities.file_io import safe_to_descend, safe_to_read
 
 # Keys this walker maintains on the caller's stats dict. Callers should seed them,
 # but the walker tolerates absence so an existing scanner can adopt it incrementally.
@@ -148,4 +148,19 @@ def walk_repository(
             if child is not None:
                 stack.append((child, entry_relative))
         elif stat.S_ISREG(mode):
+            # Files get the SAME containment check as directories. They did not,
+            # and that was an exfiltration hole: `mode` above comes from
+            # `entry.stat()`, which FOLLOWS symlinks, so `leak.py -> /etc/passwd`
+            # reports S_ISREG and was handed straight to `on_file`. The scanner
+            # then read through the link and put host-file contents into
+            # dataset.json, which is sent to the model provider — reachable with
+            # one committed symlink in an untrusted repository.
+            #
+            # Every guard in the tree was directory-only, and the test asserting
+            # "does not ingest files outside the repository" built only a
+            # DIRECTORY symlink, so it certified one shape of the attack while
+            # the other was wide open.
+            if not safe_to_read(entry, repo_real):
+                stats["files_excluded"] = stats.get("files_excluded", 0) + 1
+                continue
             on_file(entry, entry_relative)

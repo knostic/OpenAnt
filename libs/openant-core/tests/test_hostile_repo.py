@@ -25,6 +25,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -155,6 +156,27 @@ def hostile_repo(tmp_path: Path) -> Path:
     (outside / "host_secret.py").write_text("SECRET = 'do not ingest me'\n")
     os.symlink(outside, repo / "escape")
     assert (repo / "escape" / "host_secret.py").exists(), "escape symlink not built"
+
+    # 1b. FILE symlinks, absolute and relative. The directory case above was the
+    #     only one this fixture built for a long time, so the test asserting
+    #     "does not ingest files outside the repository" passed while every guard
+    #     in the tree was directory-only: repo_walk checks containment inside the
+    #     S_ISDIR branch, and the file branch stats through the link, sees
+    #     S_ISREG, and hands it straight to the caller. A fixture that only
+    #     builds one shape of the attack certifies one shape of the defence.
+    #     The target must lie BEYOND the repository's parent. Policy allows
+    #     parent-scoped links so a monorepo package can symlink a sibling, so a
+    #     fixture under tmp_path would be permitted and assert nothing. mkdtemp
+    #     gives an unrelated root. `sibling.py` below is the negative control.
+    beyond = Path(tempfile.mkdtemp(prefix="openant-beyond-"))
+    (beyond / "host_secret.py").write_text('KEY = "sk-ant-SECRET-DO-NOT-LEAK"\n')
+    os.symlink(beyond / "host_secret.py", repo / "src" / "leak.py")
+    os.symlink("/etc/hosts", repo / "src" / "abs.py")
+    # Negative control: a parent-scoped link IS allowed by policy. If this stops
+    # being scanned, the fix has become "refuse every symlink" and has silently
+    # reintroduced the false-negative the zig regression fixture exists to prevent.
+    (outside / "vendored.py").write_text("def vendored():\n    return 1\n")
+    os.symlink(outside / "vendored.py", repo / "src" / "sibling.py")
 
     # 2. Deep nest with a planted file at the bottom. Past the recursion limit the
     #    scanner used to return success having simply not seen it.
@@ -382,9 +404,37 @@ def test_traversal_does_not_ingest_files_outside_the_repository(hostile_repo: Pa
     """
     mod = _load_parser_module("python", "repository_scanner")
     result = mod.RepositoryScanner(str(hostile_repo)).scan()
-    files = [str(f) for f in _iter_scanned_paths(result)]
-    escaped = [f for f in files if "host_secret" in f or "outside" in f]
-    assert not escaped, f"ingested files from outside the repo: {escaped}"
+    files = _iter_scanned_paths(result)
+
+    # RESOLVE each reported path before judging it. The previous version matched
+    # on the path STRING ("host_secret" in f), which can never fire for a file
+    # symlink: the scanner reports the in-repo name it walked (src/leak.py), and
+    # the target's name appears nowhere in it. So the assertion was blind in the
+    # same direction the fixture was — it could only ever catch an escape that
+    # announced itself by filename.
+    # The boundary asserted here is the boundary the POLICY implements: inside the
+    # repository OR its immediate parent is allowed (so a monorepo package may
+    # symlink a sibling); beyond that is refused. An earlier version of this check
+    # tested "outside the repo", which is stricter than the implemented invariant
+    # and flagged the deliberate parent-scoped control as an escape.
+    repo_real = os.path.realpath(hostile_repo)
+    allowed_roots = [r for r in (repo_real, os.path.dirname(repo_real)) if r]
+    escaped = []
+    for rel in files:
+        target = os.path.realpath(os.path.join(hostile_repo, rel))
+        if not any(target == r or target.startswith(r + os.sep) for r in allowed_roots):
+            escaped.append(f"{rel} -> {target}")
+    assert not escaped, (
+        "scanner ingested files resolving BEYOND the repository parent; whatever "
+        f"it returns is sent to the model provider: {escaped}"
+    )
+    # Negative control: the parent-scoped link must STILL be scanned. A fix that
+    # refuses every symlink passes the assertion above and silently drops
+    # legitimately vendored source — for a SAST tool the worse failure direction.
+    assert any(f.endswith("sibling.py") for f in files), (
+        "parent-scoped symlink was dropped; the guard has become refuse-everything "
+        f"and now loses legitimate source. scanned={files}"
+    )
 
 
 def test_deeply_nested_code_is_scanned_or_the_failure_is_loud(hostile_repo: Path):
@@ -405,7 +455,7 @@ def test_deeply_nested_code_is_scanned_or_the_failure_is_loud(hostile_repo: Path
         result = mod.RepositoryScanner(str(hostile_repo)).scan()
     except Exception:  # noqa: BLE001 - a loud failure is an acceptable outcome
         return
-    files = [str(f) for f in _iter_scanned_paths(result)]
+    files = _iter_scanned_paths(result)
     if any("planted_backdoor" in f for f in files):
         return
     stats = result.get("statistics", {}) if isinstance(result, dict) else {}
@@ -416,13 +466,32 @@ def test_deeply_nested_code_is_scanned_or_the_failure_is_loud(hostile_repo: Path
 
 
 def _iter_scanned_paths(result):
-    """Normalize scanner return shapes into an iterable of paths."""
+    """Normalize scanner return shapes into an iterable of path STRINGS.
+
+    Scanners return ``{"files": [{"path": ..., "size": ...}, ...]}``. An earlier
+    version of this helper returned those dicts, and callers did ``str(f)`` — so
+    every comparison ran against ``"{'path': 'src/leak.py', 'size': 20}"``. That
+    string matches no filename, and joined to the repo root it resolves *inside*
+    the repo, so the containment check could not fail no matter what the scanner
+    did. Extract the field.
+    """
+    rows = result
     if isinstance(result, dict):
         for key in ("files", "source_files", "scanned_files"):
             if key in result:
-                return result[key]
-        return [v for v in result.values() if isinstance(v, str)]
-    return result or []
+                rows = result[key]
+                break
+        else:
+            rows = [v for v in result.values() if isinstance(v, str)]
+    out = []
+    for row in (rows or []):
+        if isinstance(row, dict):
+            value = row.get("path") or row.get("file_path") or row.get("relative_path")
+            if value:
+                out.append(str(value))
+        else:
+            out.append(str(row))
+    return out
 
 
 # --- parity: the guard must exist everywhere, not at one site -----------------

@@ -31,7 +31,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
-from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import read_json, write_json, open_utf8, safe_to_read
 
 
 class RepositoryScanner:
@@ -283,6 +283,13 @@ class RepositoryScanner:
                     stack.append((child, entry_relative))
 
             elif stat.S_ISREG(mode):
+                # Same containment check as directories. `entry.stat()` above
+                # follows symlinks, so a file symlink reports S_ISREG and was
+                # read and shipped — the exfiltration hole every guard in the
+                # tree missed by being directory-only.
+                if not safe_to_read(entry, repo_real):
+                    self.stats['directories_excluded'] += 1
+                    continue
                 if not self.is_source_file(entry.name):
                     continue
 

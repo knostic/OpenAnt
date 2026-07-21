@@ -175,6 +175,38 @@ def safe_to_descend(dir_path: PathLike, repo_real: str, seen: set | None = None)
     return False
 
 
+def safe_to_read(file_path: PathLike, repo_real: str) -> bool:
+    """Whether a FILE inside a scanned repository may be read.
+
+    The file-side counterpart of ``safe_to_descend``, and it did not exist — which
+    was an exfiltration hole. Traversal stats entries with a call that follows
+    symlinks, so ``leak.py -> /etc/passwd`` reported as a regular file and was
+    read and shipped. Directory symlinks were contained; file symlinks were not.
+
+    Applies the SAME policy the directory case uses (and that the operator chose
+    deliberately): resolve, then allow only if the target lands inside the
+    repository or its immediate parent. Parent scope admits the monorepo case
+    where a package symlinks a sibling; anything beyond is refused.
+
+    Deliberately not "refuse every file symlink". `parsers/zig` carries a
+    regression test whose fixture is source reachable only through a symlink,
+    written because such files were once silently dropped — and for a SAST tool
+    a false negative is the worse failure direction. The security property is
+    "never leave the repository", not "never follow a link".
+
+    **Accepted residual risk, same as the directory case:** anything under the
+    parent directory is reachable. Clone into a dedicated parent.
+    """
+    full = os.fspath(file_path)
+    if not os.path.islink(full):
+        return True
+    real = os.path.realpath(full)
+    for root in (repo_real, os.path.dirname(repo_real)):
+        if root and (real == root or real.startswith(root + os.sep)):
+            return True
+    return False
+
+
 def read_repo_file(path: PathLike, max_bytes: int = 1024 * 1024,
                    *, oversize: str = "raise") -> str | None:
     """Read a file authored by the *scanned* repository, or refuse to.
