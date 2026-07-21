@@ -30,13 +30,35 @@ VALID = """# TM
 """
 
 
+def _threat_model_context():
+    """Load the shared fixture without mutating ``sys.path``.
+
+    This was ``sys.path.insert(0, "tests")`` followed by a bare import — twice.
+    Two defects in one line. The path is RELATIVE, so the import only resolves
+    when pytest is invoked from ``libs/openant-core``; run it from the repository
+    root and these tests fail with ModuleNotFoundError while the rest pass, which
+    reads as a product regression rather than a harness bug. And the entry is
+    never removed, so ``tests/parsers/`` then shadows the real top-level
+    ``parsers`` package for the remainder of the process — the suite stayed green
+    only because alphabetical collection happened to run the victim first.
+
+    importlib resolves the file directly, relative to THIS file, with no global
+    side effect and no ordering dependency.
+    """
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "test_threat_model_prompts.py"
+    spec = importlib.util.spec_from_file_location("_tm_prompts_fixture", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.threat_model_context
+
+
 class TestStage1SeesTheAttackerProfiles:
     """The system prompt instructs Stage 1 to check profiles; it must see them."""
 
     def test_profiles_are_rendered_into_the_stage1_context(self):
-        import sys
-        sys.path.insert(0, "tests")
-        from test_threat_model_prompts import threat_model_context
+        threat_model_context = _threat_model_context()
         from prompts.vulnerability_analysis import format_app_context_for_prompt
 
         out = format_app_context_for_prompt(threat_model_context())
@@ -46,9 +68,7 @@ class TestStage1SeesTheAttackerProfiles:
         )
 
     def test_capabilities_and_limits_reach_stage1(self):
-        import sys
-        sys.path.insert(0, "tests")
-        from test_threat_model_prompts import threat_model_context
+        threat_model_context = _threat_model_context()
         from prompts.vulnerability_analysis import format_app_context_for_prompt
 
         out = format_app_context_for_prompt(threat_model_context())
