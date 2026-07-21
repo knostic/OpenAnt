@@ -288,19 +288,24 @@ def explore_repository(
                 content=json.dumps(outcome)[:MAX_FILE_BYTES],
             ))
 
-        if not results:
-            # No tool calls and no finish: the model is talking rather than
-            # working. Nudge once with the remaining budget rather than burning
-            # the rest of the turns on conversation.
-            results.append(ToolResultBlock(
-                tool_use_id="nudge", name="list_dir",
-                content=json.dumps({
-                    "note": f"{MAX_TURNS - budget.turns} turns left; call finish "
-                            "with your best current answer before they run out"}),
-            ))
-
         messages.append(Message(role="assistant", content=assistant_content))
-        messages.append(Message(role="user", content=tuple(results)))
+        if results:
+            messages.append(Message(role="user", content=tuple(results)))
+        else:
+            # The model replied with prose and called nothing. Answer in kind: a
+            # plain user turn, NOT a ToolResultBlock.
+            #
+            # This previously sent ToolResultBlock(tool_use_id="nudge"). The
+            # Messages API requires every tool_result's id to match a tool_use in
+            # the immediately preceding assistant turn — and this branch exists
+            # precisely because there was no tool_use — so the adapter, which
+            # serializes the id verbatim, would have produced a guaranteed 400 and
+            # killed the survey on the first chatty response. It never fired only
+            # because this whole loop path had no test.
+            messages.append(Message(role="user", content=(TextBlock(
+                text=f"You called no tool. {MAX_TURNS - budget.turns} turns remain "
+                     "— use list_dir/read_file/search, or call finish with your "
+                     "best current answer."),)))
 
     budget.exhausted = True
     raise RuntimeError(
