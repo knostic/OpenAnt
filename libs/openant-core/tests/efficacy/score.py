@@ -1,38 +1,49 @@
-"""Measure whether OpenAnt actually detects vulnerabilities.
+"""Pipeline smoke test: does a real scan flag the planted vulns and clear the traps?
 
-Every other test in this repository checks that the plumbing works. None of them
-check the product's central claim. A SAST scanner can be well packaged,
-deterministic, observable, correctly exit-coded — and still be a poor scanner. The
-test count says nothing about recall.
+This is NOT an efficacy benchmark and produces NO recall/precision number. Six
+textbook units on one blinded fixture cannot support a recall, precision, or
+external-validity claim, and an earlier version of this file did exactly that —
+it reported ``recall=1.0`` against a fixture whose docstrings literally captioned
+each unit ``VULN`` / ``NOT A VULN``, so the "measurement" only proved a model can
+read an English label. Those captions are gone (the fixture is blinded; the
+expected outcomes live only in the sidecar ``ground_truth.json``, which the
+scanner never sees because it analyses only ``src/*.py``).
 
-This is the smallest harness that produces real numbers, and it is deliberately
-NOT a pytest test: it costs money, needs a provider, and its output is a
-measurement to be tracked over time rather than a pass/fail gate. Wire it into a
-scheduled canary, not a merge gate.
+What remains is a SMOKE TEST with a binary contract:
 
-## What it measures, and why the split matters
+    the pipeline must FLAG the three planted vulnerabilities, and
+    the pipeline must CLEAR the three false-positive traps.
 
-Stage 1 (detection) and Stage 2 (attacker simulation) are scored **separately**.
-That separation is the whole point. The product's thesis is that Stage 2 raises
-precision by discarding findings an attacker could not actually reach. If you only
-score the final output you cannot distinguish:
+Pass/fail, per unit. Nothing is averaged into a headline number, because a number
+from six hand-written units would invite exactly the over-claim this rewrite
+removes.
 
-* Stage 2 working — it removed Stage 1 false positives;  from
-* Stage 2 failing — it removed Stage 1 TRUE positives.
+It is deliberately NOT a pytest test: it costs money and needs a provider. Wire
+it into a scheduled canary, not a merge gate. The PURE checking functions
+(``read_results``, ``index_results``, ``evaluate``) take no provider and are unit
+tested offline in ``tests/test_efficacy_score.py``.
 
-Both look like "fewer findings". Only the first is the feature. So the harness
-reports, for each stage, what it did to the true positives and to the traps.
+## Why Stage 1 and Stage 2 are checked separately
 
-## The fixture design
+Stage 1 (detection) and Stage 2 (attacker simulation) are evaluated separately so
+a Stage-2 regression that suppresses a TRUE positive is distinguishable from
+Stage 2 correctly removing a false positive — both look like "fewer findings",
+only the first is the feature.
 
-Six units: three remotely-reachable vulnerabilities, and three that are shaped to
-LOOK alarming — a subprocess call, a sqlite call, an f-string — but are not
-attacker-reachable. Clean code that trivially looks clean measures nothing; the
-traps are where a scanner earns its precision claim.
+## Failure modes that are ERRORS, never a silent pass
+
+* a missing ``results.json`` (the scan/pipeline failed) — NOT "zero recall";
+* an expected unit absent from the results (the scan never analysed it —
+  ``--level all`` is required so the unreachable traps are offered to Stage 1);
+* the scanner flagging a unit the oracle does not cover (cannot be judged);
+* a duplicate unit id in the results.
+
+Each raises and exits non-zero, so a broken harness cannot masquerade as a
+passing scan.
 
 Usage:
-    python tests/efficacy/score.py --fixture webapp
-    python tests/efficacy/score.py --fixture webapp --stage1-only   # cheaper
+    python tests/efficacy/score.py --fixture webapp                 # detection only
+    python tests/efficacy/score.py --fixture webapp --verify        # + Stage 2
 """
 
 from __future__ import annotations
@@ -48,185 +59,224 @@ HERE = Path(__file__).resolve().parent
 CORE = HERE.parent.parent
 
 
-def load_ground_truth(fixture: str) -> dict:
+class SmokeError(RuntimeError):
+    """A harness/scan failure that must stop the smoke test, not score as 0."""
+
+
+# --------------------------------------------------------------------------
+# Pure functions — no provider, unit tested offline.
+# --------------------------------------------------------------------------
+
+def load_oracle(fixture: str) -> dict:
+    """Load the sidecar oracle. It is never shown to the scanner."""
     return json.loads((HERE / "fixtures" / fixture / "ground_truth.json").read_text())
 
 
 def unit_key(unit_id: str) -> str:
-    """Normalise a scanner unit id to the ground-truth key form.
+    """Normalise a scanner unit id to the oracle key form.
 
     Ids are ``relative/path.ext:function``. Merged multi-language datasets may
-    namespace a colliding id as ``lang::path:func`` — strip that, or a namespaced
-    unit would silently score as "not found" and be counted a false negative
-    against the scanner unfairly.
+    namespace a colliding id as ``lang::path:func`` — strip that so a namespaced
+    unit is not mistaken for an absent one.
     """
     return unit_id.split("::", 1)[-1]
 
 
-def run_scan(fixture_dir: Path, out_dir: Path, stage1_only: bool) -> dict:
+def read_results(path: Path) -> list[dict]:
+    """Read a results artifact's ``results`` list, or raise.
+
+    A missing file is a scan/pipeline FAILURE, not an empty result set. The
+    earlier harness returned ``{}`` here and let the confusion matrix report
+    ``recall=0.0`` — a harness failure disguised as a product failure. This
+    refuses instead.
+    """
+    if not path.is_file():
+        raise SmokeError(
+            f"results file missing: {path}. A missing results file means the scan "
+            "or pipeline failed; that is an error, not zero recall."
+        )
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise SmokeError(f"results file unreadable: {path}: {exc}") from exc
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise SmokeError(f"results file has no 'results' list: {path}")
+    return results
+
+
+def index_results(
+    results: list[dict], field: str, positive: set[str]
+) -> tuple[set[str], set[str]]:
+    """Return ``(flagged_ids, all_ids)``; raise on a duplicate id.
+
+    ``flagged_ids`` are the units whose ``field`` (``finding`` for Stage 1,
+    ``verdict`` for Stage 2) is one of ``positive`` (compared by VALUE, upper-
+    cased — never truthiness, because the string ``"safe"`` is truthy and once
+    scored every cleared trap as a false alarm).
+    """
+    all_ids: set[str] = set()
+    flagged: set[str] = set()
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        uid = unit_key(str(entry.get("unit_id") or entry.get("id") or ""))
+        if not uid:
+            continue
+        if uid in all_ids:
+            raise SmokeError(f"duplicate unit id in results: {uid}")
+        all_ids.add(uid)
+        if str(entry.get(field, "")).strip().upper() in positive:
+            flagged.add(uid)
+    return flagged, all_ids
+
+
+def evaluate(oracle: dict, flagged: set[str], all_ids: set[str], stage: str) -> dict:
+    """Binary smoke outcome for one stage against the sidecar oracle.
+
+    Raises SmokeError if an expected unit is absent from the results, or the
+    scanner flagged a unit the oracle does not cover — either makes the run
+    unjudgeable and must not be silently smoothed into a pass.
+    """
+    units = oracle["units"]
+    expected_vuln = {unit_key(k) for k, v in units.items() if v["vulnerable"]}
+    expected_clean = {unit_key(k) for k, v in units.items() if not v["vulnerable"]}
+    expected = expected_vuln | expected_clean
+
+    absent = sorted(expected - all_ids)
+    if absent:
+        raise SmokeError(
+            f"[{stage}] expected units absent from the results — the scan did not "
+            f"analyse them (is --level all set, so the unreachable traps are "
+            f"offered to Stage 1?): {absent}"
+        )
+    unknown = sorted(flagged - expected)
+    if unknown:
+        raise SmokeError(
+            f"[{stage}] scanner flagged units the oracle does not cover, so the "
+            f"result cannot be judged: {unknown}"
+        )
+
+    missed = sorted(expected_vuln - flagged)          # should flag, did not
+    false_alarms = sorted(expected_clean & flagged)   # flagged a trap
+    return {
+        "stage": stage,
+        "passed": not missed and not false_alarms,
+        "flagged_vulns": sorted(expected_vuln & flagged),
+        "missed_vulns": missed,
+        "cleared_traps": sorted(expected_clean - flagged),
+        "false_alarms": false_alarms,
+    }
+
+
+def verification_effect(stage1_flagged: set[str], stage2_flagged: set[str],
+                        oracle: dict) -> dict:
+    """What Stage 2 did to Stage 1's findings — the product thesis, as a check."""
+    units = oracle["units"]
+    expected_vuln = {unit_key(k) for k, v in units.items() if v["vulnerable"]}
+    tp_suppressed = sorted((stage1_flagged & expected_vuln) - stage2_flagged)
+    fp_removed = sorted((stage1_flagged - expected_vuln) - stage2_flagged)
+    return {
+        "true_positives_suppressed": tp_suppressed,
+        "false_positives_removed": fp_removed,
+        "verdict": (
+            "HARMFUL: suppressed true positives" if tp_suppressed
+            else "improves precision" if fp_removed
+            else "no measurable effect on this fixture"
+        ),
+    }
+
+
+# --------------------------------------------------------------------------
+# The billed part.
+# --------------------------------------------------------------------------
+
+def run_scan(fixture_dir: Path, out_dir: Path, verify: bool) -> dict:
     """Run a real scan. This spends money."""
-    # --level all is REQUIRED, not an optimisation. The default (reachable)
-    # filters unreachable units out before analysis, and the trap units in this
-    # fixture are deliberately unreachable — they would never be offered to Stage
-    # 1, then score as free true negatives. That would report a precision the
-    # scanner never earned.
-    #
-    # Verification is opt-IN (--verify), so the default run IS stage-1-only.
-    # Dynamic testing is likewise opt-in and stays off; it needs Docker and adds
-    # cost without bearing on detection quality.
+    # --level all is REQUIRED: the default (reachable) filters the unreachable
+    # trap units out before analysis, so they would never be offered to Stage 1
+    # and would score as free true negatives — a precision the scanner never
+    # earned. --no-enhance/--no-report keep cost and noise down.
     cmd = [
         sys.executable, "-m", "openant.cli", "scan", str(fixture_dir),
         "--output", str(out_dir), "--level", "all", "--no-enhance", "--no-report",
     ]
-    if not stage1_only:
+    if verify:
         cmd.append("--verify")
     proc = subprocess.run(cmd, cwd=CORE, capture_output=True, text=True, timeout=3600)
     if proc.returncode not in (0, 1):  # 1 == vulnerabilities found
-        raise SystemExit(f"scan failed ({proc.returncode}):\n{proc.stderr[-3000:]}")
-    return {"returncode": proc.returncode, "stderr_tail": proc.stderr[-2000:]}
-
-
-def collect_findings(out_dir: Path) -> tuple[dict, dict]:
-    """Return (stage1_by_unit, stage2_by_unit).
-
-    Stage 1 = what detection flagged. Stage 2 = what verification kept. A unit
-    present in stage1 and absent from stage2 was SUPPRESSED by verification —
-    which is the measurement that matters most and the one a final-output-only
-    score cannot see.
-    """
-    def flagged_in(filename: str, field: str, positive: set[str]) -> dict[str, dict]:
-        """Units the named artifact marks positive.
-
-        Two bugs are being deliberately avoided here, both of which this harness
-        originally had and both of which produced a confidently wrong number:
-
-        1. **Read the specific artifact, not rglob("*.json").** Stage 1 writes
-           results.json and Stage 2 writes results_verified.json, and BOTH carry
-           `finding` and `verdict` keys. Globbing merged them, so the two stages
-           were mathematically guaranteed to score identically and the
-           verification-effect measurement — the entire reason to separate them —
-           could never show anything.
-
-        2. **Compare the VALUE, never the truthiness.** `finding` is the string
-           "vulnerable" or "safe". `if entry.get("finding")` is true for BOTH,
-           because "safe" is a non-empty string. That scored every correctly-
-           cleared trap as a false alarm and reported precision 0.5 for a run that
-           actually scored 1.0 — a harness bug masquerading as a product defect,
-           in the direction that looks like diligence.
-        """
-        path = out_dir / filename
-        if not path.is_file():
-            return {}
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {}
-        out: dict[str, dict] = {}
-        for entry in (data.get("results") or []):
-            if not isinstance(entry, dict):
-                continue
-            uid = unit_key(str(entry.get("unit_id") or entry.get("id") or ""))
-            value = str(entry.get(field, "")).strip().upper()
-            if uid and value in positive:
-                out[uid] = entry
-        return out
-
-    stage1 = flagged_in("results.json", "finding", {"VULNERABLE"})
-    stage2 = flagged_in("results_verified.json", "verdict", {"VULNERABLE", "EXPLOITABLE"})
-    return stage1, stage2
-
-
-def score(truth: dict, flagged: set[str], label: str) -> dict:
-    """Confusion matrix for one stage against ground truth."""
-    units = truth["units"]
-    expected_vuln = {k for k, v in units.items() if v["vulnerable"]}
-    expected_safe = {k for k, v in units.items() if not v["vulnerable"]}
-
-    tp = sorted(expected_vuln & flagged)
-    fn = sorted(expected_vuln - flagged)
-    fp = sorted(expected_safe & flagged)
-    tn = sorted(expected_safe - flagged)
-
-    recall = len(tp) / len(expected_vuln) if expected_vuln else None
-    precision = len(tp) / (len(tp) + len(fp)) if (tp or fp) else None
-    return {
-        "stage": label,
-        "recall": recall, "precision": precision,
-        "true_positives": tp, "false_negatives": fn,
-        "false_positives": fp, "true_negatives": tn,
-    }
+        raise SmokeError(f"scan failed ({proc.returncode}):\n{proc.stderr[-3000:]}")
+    return {"returncode": proc.returncode}
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description="Pipeline smoke test (not a benchmark).")
     ap.add_argument("--fixture", default="webapp")
     ap.add_argument("--output", default=None)
-    ap.add_argument("--stage1-only", action="store_true",
-                    help="skip verification (cheaper; halves the LLM spend)")
+    ap.add_argument("--verify", action="store_true",
+                    help="also run Stage 2 attacker simulation")
     args = ap.parse_args()
 
-    truth = load_ground_truth(args.fixture)
+    oracle = load_oracle(args.fixture)
     fixture_dir = HERE / "fixtures" / args.fixture
     out_dir = Path(args.output) if args.output else HERE / "_runs" / args.fixture
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    meta = run_scan(fixture_dir, out_dir, args.stage1_only)
-    stage1, stage2 = collect_findings(out_dir)
+    meta = run_scan(fixture_dir, out_dir, args.verify)
+
+    s1_flagged, s1_all = index_results(
+        read_results(out_dir / "results.json"), "finding", {"VULNERABLE"})
+    stage1 = evaluate(oracle, s1_flagged, s1_all, "stage1_detection")
 
     report = {
-        # A run manifest, not just a score. A number without the model, prompts and
-        # code revision that produced it cannot be compared to next month's number,
-        # and comparability is the entire reason to measure.
         "manifest": {
             "fixture": args.fixture,
-            "fixture_version": truth.get("version"),
+            "fixture_version": oracle.get("version"),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "code_revision": subprocess.run(
                 ["git", "rev-parse", "HEAD"], cwd=CORE, capture_output=True, text=True
             ).stdout.strip(),
             "scan_returncode": meta["returncode"],
-            "stage1_only": args.stage1_only,
+            "verify": args.verify,
         },
-        "stage1_detection": score(truth, set(stage1), "stage1_detection"),
+        "stage1_detection": stage1,
     }
+    all_passed = stage1["passed"]
 
-    if not args.stage1_only:
-        report["stage2_verification"] = score(truth, set(stage2), "stage2_verification")
-        # The product thesis, stated as a measurement: verification should remove
-        # false positives and keep true positives. Anything it removed from the TP
-        # set is the scanner losing a real vulnerability it had already found —
-        # strictly worse than never finding it, because the cost was paid.
-        s1, s2 = set(stage1), set(stage2)
-        expected_vuln = {k for k, v in truth["units"].items() if v["vulnerable"]}
-        report["verification_effect"] = {
-            "true_positives_suppressed": sorted((s1 & expected_vuln) - s2),
-            "false_positives_removed": sorted((s1 - expected_vuln) - s2),
-            "verdict": None,  # filled below
-        }
-        eff = report["verification_effect"]
-        eff["verdict"] = (
-            "improves precision" if eff["false_positives_removed"] and not eff["true_positives_suppressed"]
-            else "HARMFUL: suppressed true positives" if eff["true_positives_suppressed"]
-            else "no measurable effect"
-        )
+    if args.verify:
+        s2_flagged, s2_all = index_results(
+            read_results(out_dir / "results_verified.json"),
+            "verdict", {"VULNERABLE", "EXPLOITABLE"})
+        stage2 = evaluate(oracle, s2_flagged, s2_all, "stage2_verification")
+        report["stage2_verification"] = stage2
+        report["verification_effect"] = verification_effect(
+            s1_flagged, s2_flagged, oracle)
+        all_passed = all_passed and stage2["passed"]
 
-    out = out_dir / "efficacy_report.json"
+    report["smoke_passed"] = all_passed
+    out = out_dir / "smoke_report.json"
     out.write_text(json.dumps(report, indent=2))
 
-    s1 = report["stage1_detection"]
-    print(f"\n=== {args.fixture} (fixture v{truth.get('version')}) ===")
-    print(f"Stage 1 detection : recall={s1['recall']} precision={s1['precision']}")
-    if s1["false_negatives"]:
-        print(f"  MISSED          : {', '.join(s1['false_negatives'])}")
-    if s1["false_positives"]:
-        print(f"  false alarms    : {', '.join(s1['false_positives'])}")
-    if "stage2_verification" in report:
-        s2r = report["stage2_verification"]
-        print(f"Stage 2 verified  : recall={s2r['recall']} precision={s2r['precision']}")
-        print(f"  effect          : {report['verification_effect']['verdict']}")
-    print(f"\nreport: {out}")
-    return 0
+    def line(r: dict) -> str:
+        bits = [f"{r['stage']}: {'PASS' if r['passed'] else 'FAIL'}"]
+        if r["missed_vulns"]:
+            bits.append(f"MISSED {', '.join(r['missed_vulns'])}")
+        if r["false_alarms"]:
+            bits.append(f"FALSE ALARM {', '.join(r['false_alarms'])}")
+        return " | ".join(bits)
+
+    print(f"\n=== {args.fixture} smoke (fixture v{oracle.get('version')}) ===")
+    print(line(stage1))
+    if args.verify:
+        print(line(report["stage2_verification"]))
+        print(f"  verification effect: {report['verification_effect']['verdict']}")
+    print(f"\nsmoke: {'PASS' if all_passed else 'FAIL'}   report: {out}")
+    return 0 if all_passed else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SmokeError as exc:
+        print(f"SMOKE ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc

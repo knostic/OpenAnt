@@ -3,6 +3,35 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-07-22] — Efficacy harness rescoped to a smoke test
+
+### Changed
+
+- **The "efficacy" harness no longer produces a recall/precision number.** It was
+  reporting `recall=1.0 precision=1.0` against a fixture whose docstrings captioned
+  each unit `VULN` / `NOT A VULN` — text that reaches the analysis prompt (via the
+  unit's `code.primary_code` and `metadata.docstring`), so the measurement only
+  proved a model can read an English label. `tests/efficacy/score.py` is now a
+  strict pipeline **smoke test** with a binary per-unit contract (flag the three
+  planted vulns, clear the three traps) and no averaged headline number.
+
+### Fixed
+
+- **Blinded the fixture.** Removed the answer-bearing verdict docstrings; the two
+  files (formerly an all-vulnerable `handlers.py` and an all-clean
+  `maintenance.py`, a file-split that itself signalled the answer) are replaced by
+  two neutrally-named modules with vulnerable and clean units interleaved. Expected
+  outcomes live only in the sidecar `ground_truth.json`, which the scanner never
+  sees (it analyses only `src/*.py`). Verified: no verdict marker remains in the
+  parsed dataset.
+- **Deleted the fabricated baseline** `tests/efficacy/baselines/webapp.json`, whose
+  `code_revision` named a tree where `score.py` did not yet exist.
+- **Fixed the scorer's silent-failure modes.** A missing `results.json` (scan
+  failure), an expected unit absent from the results, an unknown flagged id, and a
+  duplicate id each now raise and exit non-zero instead of scoring a confident
+  `recall=0.0`. The pure checking functions are unit-tested offline in
+  `tests/test_efficacy_score.py`.
+
 ## [2026-07-22] — Go parser symlink containment (security)
 
 ### Fixed
