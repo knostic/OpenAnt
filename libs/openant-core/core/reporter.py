@@ -489,7 +489,14 @@ def generate_html_report(
     step_reports_dir = os.path.dirname(os.path.abspath(results_path))
 
     cmd = [
-        sys.executable, "-m", "report.html_report", results_path, dataset_path, output_path,
+        # -P: no CWD on sys.path. `-m` prepends the process CWD to sys.path[0],
+        # and the engine inherits the user's shell CWD — which, in the standard
+        # `git clone X && cd X && openant report` flow, is INSIDE the scanned
+        # untrusted repo. Without -P, a hostile ``report/`` package in that repo
+        # shadows this one and its __init__ executes. This dropped when cwd=
+        # _CORE_ROOT was removed to fix the wheel; -P restores the containment
+        # the cwd pin held by accident.
+        sys.executable, "-P", "-m", "report.html_report", results_path, dataset_path, output_path,
         "--step-reports-dir", step_reports_dir,
     ]
 
@@ -524,7 +531,9 @@ def generate_csv_report(
     """
     print("[Report] Generating CSV report...", file=sys.stderr)
 
-    cmd = [sys.executable, "-m", "report.csv_export", results_path, dataset_path, output_path]
+    # -P: keep the untrusted CWD off sys.path so a hostile report/ package in the
+    # scanned repo cannot shadow this one. See the html path above for the full note.
+    cmd = [sys.executable, "-P", "-m", "report.csv_export", results_path, dataset_path, output_path]
 
     # No cwd=_CORE_ROOT: these are now `-m` package invocations resolved through
     # the installed distribution, not source-tree-relative scripts. Depending on
