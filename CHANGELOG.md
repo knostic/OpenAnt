@@ -21,9 +21,12 @@ All notable changes to OpenAnt are documented in this file.
   files (formerly an all-vulnerable `handlers.py` and an all-clean
   `maintenance.py`, a file-split that itself signalled the answer) are replaced by
   two neutrally-named modules with vulnerable and clean units interleaved. Expected
-  outcomes live only in the sidecar `ground_truth.json`, which the scanner never
-  sees (it analyses only `src/*.py`). Verified: no verdict marker remains in the
-  parsed dataset.
+  outcomes live only in the sidecar oracle `tests/efficacy/oracles/<fixture>.json`,
+  kept OUTSIDE the scanned fixture directory so the app-context survey agent (which
+  can `list_dir`/`read_repo_file` anything under the scanned tree) cannot reach the
+  answer key — a stronger guarantee than relying on the parser skipping non-`.py`
+  files. Verified: no verdict marker remains in the parsed dataset, and no
+  answer-key file remains under the scanned tree.
 - **Deleted the fabricated baseline** `tests/efficacy/baselines/webapp.json`, whose
   `code_revision` named a tree where `score.py` did not yet exist.
 - **Fixed the scorer's silent-failure modes.** A missing `results.json` (scan

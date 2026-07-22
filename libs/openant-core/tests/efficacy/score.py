@@ -6,8 +6,10 @@ external-validity claim, and an earlier version of this file did exactly that �
 it reported ``recall=1.0`` against a fixture whose docstrings literally captioned
 each unit ``VULN`` / ``NOT A VULN``, so the "measurement" only proved a model can
 read an English label. Those captions are gone (the fixture is blinded; the
-expected outcomes live only in the sidecar ``ground_truth.json``, which the
-scanner never sees because it analyses only ``src/*.py``).
+expected outcomes live only in the sidecar oracle ``oracles/<fixture>.json``,
+which is kept OUTSIDE the scanned fixture directory so the app-context survey
+agent — which can list_dir and read_repo_file anything under the scanned tree —
+cannot reach it. See ``oracle_path``.)
 
 What remains is a SMOKE TEST with a binary contract:
 
@@ -67,9 +69,23 @@ class SmokeError(RuntimeError):
 # Pure functions — no provider, unit tested offline.
 # --------------------------------------------------------------------------
 
+def oracle_path(fixture: str) -> Path:
+    """Location of the sidecar oracle — DELIBERATELY OUTSIDE the scanned tree.
+
+    The oracle holds the answer key (``vulnerable: true`` per unit). It must not
+    live under ``fixtures/<name>/`` (the directory the scanner walks): the
+    app-context step's ``repo_explorer`` agent can ``list_dir`` and
+    ``read_repo_file`` anything in the scanned tree, so an oracle placed there is
+    reachable by the model even though it is not ``.py`` source. Keeping it in a
+    sibling ``oracles/`` directory makes "never shown to the scanner" structural
+    rather than a property of which file extensions the parser happens to skip.
+    """
+    return HERE / "oracles" / f"{fixture}.json"
+
+
 def load_oracle(fixture: str) -> dict:
     """Load the sidecar oracle. It is never shown to the scanner."""
-    return json.loads((HERE / "fixtures" / fixture / "ground_truth.json").read_text())
+    return json.loads(oracle_path(fixture).read_text())
 
 
 def unit_key(unit_id: str) -> str:

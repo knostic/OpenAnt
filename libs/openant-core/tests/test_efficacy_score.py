@@ -28,6 +28,40 @@ def _load():
 score = _load()
 
 
+_EFF = _SCORE.parent  # tests/efficacy
+
+
+def test_oracle_lives_outside_the_scanned_fixture_tree():
+    """The answer key must NOT be readable by the app-context survey agent.
+
+    score.py's scan runs app-context generation, whose repo_explorer agent can
+    list_dir / read_repo_file anything under the scanned fixture directory. An
+    oracle placed there leaks `vulnerable: true` per unit into the model even
+    though it is not .py source. This pins the oracle OUTSIDE the scanned tree.
+    """
+    fixture_dir = _EFF / "fixtures" / "webapp"
+    oracle = score.oracle_path("webapp")
+    assert oracle.is_file(), oracle
+    # The oracle path must not be inside the directory the scanner walks.
+    assert fixture_dir not in oracle.parents, (
+        f"oracle {oracle} is inside the scanned fixture tree {fixture_dir}")
+    # And no answer key of any name may sit in the scanned tree.
+    for leftover in fixture_dir.rglob("*"):
+        if leftover.is_file() and leftover.suffix == ".json":
+            raise AssertionError(f"answer-key-shaped file in scanned tree: {leftover}")
+
+
+def test_scanned_fixture_source_carries_no_verdict_text():
+    """Belt-and-braces on the blinding: src/*.py has no answer-bearing markers."""
+    src = (_EFF / "fixtures" / "webapp" / "src").rglob("*.py")
+    markers = ("VULN", "NOT A VULN", "injection", "traversal", "no sink",
+               "parameteri", "attacker-controlled", "trap")
+    for f in src:
+        text = f.read_text()
+        hit = [m for m in markers if m in text]
+        assert not hit, f"{f} leaks verdict markers {hit}"
+
+
 ORACLE = {
     "units": {
         "src/app_a.py:render_snippet": {"vulnerable": True},
