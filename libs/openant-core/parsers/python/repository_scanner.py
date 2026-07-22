@@ -370,6 +370,15 @@ class RepositoryScanner:
             'directories_scanned': 0,
             'directories_excluded': 0,
             'test_files_skipped': 0,
+            # Seed the coverage counters at 0 so a clean scan emits them PRESENT
+            # (== "instrumented, skipped nothing"), distinguishable from a parser
+            # that does not instrument coverage at all (key absent). Without this
+            # seed, scan() reset dropped __init__'s symlinks_skipped and never
+            # seeded directories_unreadable, so a clean Python scan looked
+            # byte-identical to an uninstrumented one — the false-0 ambiguity the
+            # coverage aggregator must avoid.
+            'symlinks_skipped': 0,
+            'directories_unreadable': 0,
         }
 
         # Run scan

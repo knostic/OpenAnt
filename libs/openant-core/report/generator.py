@@ -148,6 +148,31 @@ def _compact_for_summary(pipeline_data: dict) -> dict:
     return compact
 
 
+def _context_provenance_header(pipeline_data: dict) -> str:
+    """R5: a deterministic banner when context came from a repo-controlled file.
+
+    Rendered from ``pipeline_output.json`` fields WITHOUT the LLM, on purpose: a
+    threat model is attacker-influenceable (it ships in the scanned repo), so the
+    notice that the security model came from that file must not be something a
+    hostile file can suppress by steering the report prompt. Returns "" for the
+    built-in/generated path so the banner never fires on a trusted context.
+    """
+    if pipeline_data.get("context_source") != "threat_model":
+        return ""
+    lines = [
+        "> **⚠ Security model supplied by a repo-controlled file.**",
+        "> This scan's attacker model came from `OPENANT.THREATMODEL.md` inside "
+        "the scanned repository, which is attacker-influenceable. Treat the "
+        "findings' scope as only as trustworthy as that file.",
+    ]
+    sha = pipeline_data.get("threat_model_sha256")
+    if sha:
+        lines.append(f"> Threat-model sha256: `{sha}`")
+    for warning in pipeline_data.get("threat_model_warnings") or []:
+        lines.append(f"> - {warning}")
+    return "\n".join(lines) + "\n\n"
+
+
 def generate_summary_report(
     pipeline_data: dict,
     binding: PhaseBinding,
@@ -178,6 +203,8 @@ def generate_summary_report(
     )
 
     text = "\n".join(b.text for b in result.content if isinstance(b, TextBlock))
+    # Prepend the R5 provenance banner deterministically (see helper docstring).
+    text = _context_provenance_header(pipeline_data) + text
     return text, _extract_usage(
         result.input_tokens,
         result.output_tokens,

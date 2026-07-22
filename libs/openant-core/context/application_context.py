@@ -142,6 +142,12 @@ class ApplicationContext:
     # to either function. That is what lets the built-in "app type" arm and the
     # custom threat-model arm be the *same* dataclass differing only in which JSON
     # file is handed to the pipeline — the precondition for comparing them.
+    # Provenance of a repo-supplied threat model, for R5 artifact visibility.
+    # Both are additive/defaulted so save_context(asdict)/load_context(**data)
+    # round-trip unchanged. sha256 is over the raw file bytes; permissive_warnings
+    # is warn_permissive_threat_model's output, which was previously discarded.
+    source_sha256: str | None = None
+    permissive_warnings: list = None
     threat_model_version: int | None = None
     classification: str | None = None
     components: list = field(default_factory=list)
@@ -151,6 +157,8 @@ class ApplicationContext:
     impact_statement: str | None = None
 
     def __post_init__(self):
+        if self.permissive_warnings is None:
+            self.permissive_warnings = []
         """Validate application_type after initialization."""
         # Skip validation for manual overrides (they may use custom types intentionally)
         if self.source == "manual":

@@ -212,6 +212,9 @@ def build_pipeline_output(
     application_type: str = "web_app",
     processing_level: str | None = None,
     step_reports: list[dict] | None = None,
+    context_source: str = "none",
+    threat_model_sha256: str | None = None,
+    threat_model_warnings: list | None = None,
 ) -> tuple[str, int]:
     """Build ``pipeline_output.json`` from analysis results.
 
@@ -229,6 +232,15 @@ def build_pipeline_output(
         application_type: App type for context (default ``"web_app"``).
         processing_level: Processing level used (``"reachable"``, etc.).
         step_reports: Optional list of step report dicts for duration/cost info.
+        context_source: Which path supplied the security model —
+            ``"threat_model"`` (a file in the scanned repo), ``"generated"``
+            (built-in generator), or ``"none"``. Recorded so a scan run under
+            the wrong model is distinguishable from a correct one.
+        threat_model_sha256: sha256 over the raw threat-model file bytes when
+            one was loaded; ``None`` (key omitted) otherwise — never the empty
+            hash.
+        threat_model_warnings: over-permissive-model warnings to surface in the
+            artifact + report header; ``None``/empty when there are none.
 
     Returns:
         A ``(output_path, findings_count)`` tuple: the *output_path* written
@@ -425,6 +437,17 @@ def build_pipeline_output(
         },
         "analysis_date": datetime.now(timezone.utc).isoformat(),
         "application_type": application_type,
+        # Which path supplied the security model (Plan DoD #9). Additive key;
+        # Go consumers use comma-ok access so it is safe to add.
+        "context_source": context_source,
+        **(
+            {"threat_model_sha256": threat_model_sha256}
+            if threat_model_sha256
+            else {}
+        ),
+        # Over-permissive-model warnings (previously stderr-only). Emitted as a
+        # list so the report header can render them; empty list when none.
+        "threat_model_warnings": list(threat_model_warnings or []),
         "pipeline_stats": {
             "total_units": total_units,
             "reachable_units": total_units,

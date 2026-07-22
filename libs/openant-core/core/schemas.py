@@ -190,6 +190,14 @@ class ScanResult:
     # Recorded because a scan run under the WRONG security model looks
     # identical to a correct one unless the source is stated.
     context_source: str = "none"
+    # R5 provenance for a repo-supplied threat model (context_source ==
+    # "threat_model"). sha256 is over the raw file bytes so a scan can be tied
+    # to the exact file that shaped it; None (never the empty-string hash) when
+    # no threat model was loaded. permissive_warnings carries the previously
+    # discarded warn_permissive_threat_model output so an over-permissive model
+    # is visible in the artifact, not only on stderr.
+    threat_model_sha256: str | None = None
+    threat_model_warnings: list = field(default_factory=list)
 
     @property
     def degraded(self) -> bool:
@@ -225,6 +233,8 @@ class ScanResult:
             "parse_errors": self.parse_errors,
             "excluded_languages": self.excluded_languages,
             "context_source": self.context_source,
+            "threat_model_sha256": self.threat_model_sha256,
+            "threat_model_warnings": self.threat_model_warnings,
             "degraded": self.degraded,
         }
 

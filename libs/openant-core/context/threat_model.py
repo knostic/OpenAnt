@@ -49,6 +49,7 @@ via ``prompts/_fence.py``). See the KNOWN GAP section of
 ``context/OPENANT_THREATMODEL_TEMPLATE.md``. Accepted, documented risk.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -842,8 +843,12 @@ def load_threat_model(repo_path: Path | str) -> ApplicationContext | None:
             [f"{path.name} is too large ({link_stat.st_size} bytes > "
              f"{MAX_THREAT_MODEL_BYTES}); refusing to load"], path)
 
-    with open_utf8(path) as handle:
-        text = handle.read()
+    # Read raw bytes for the provenance hash, then decode for parsing. The sha is
+    # tamper-evidence recorded in the scan artifact (R5): a scan can be tied to the
+    # exact threat-model file that shaped it.
+    raw = path.read_bytes()
+    source_sha256 = hashlib.sha256(raw).hexdigest()
+    text = raw.decode("utf-8", errors="replace")
 
     try:
         data = parse_threat_model_md(text)
@@ -861,5 +866,11 @@ def load_threat_model(repo_path: Path | str) -> ApplicationContext | None:
             file=sys.stderr,
         )
 
-    warn_permissive_threat_model(data, path)
-    return threat_model_to_context(data)
+    warnings = warn_permissive_threat_model(data, path)
+    ctx = threat_model_to_context(data)
+    # Previously discarded: carry provenance onto the context so the scanner can
+    # persist it into scan.report.json / pipeline_output.json instead of it
+    # reaching only stderr (which CI discards).
+    ctx.source_sha256 = source_sha256
+    ctx.permissive_warnings = warnings
+    return ctx

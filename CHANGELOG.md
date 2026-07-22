@@ -3,6 +3,39 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-07-22] — Artifact provenance + coverage; threat-model known risk
+
+### Added
+
+- **Context provenance in artifacts.** `scan.report.json` and
+  `pipeline_output.json` now carry `context_source` (`"threat_model"` |
+  `"generated"` | `"none"`) so a scan run under a repo-supplied security model
+  is distinguishable from one under the built-in generator. Both artifacts also
+  gained the multi-language coverage fields (`per_language`, `parse_errors`,
+  `excluded_languages`, `degraded`) that `scan.report.json` previously omitted,
+  and an aggregate `coverage` block reporting symlinks refused and directories
+  that could not be read. All keys are additive; Go consumers use comma-ok
+  access, so nothing breaks.
+- **Threat-model provenance (R5 controls).** When a repository supplies
+  `OPENANT.THREATMODEL.md`, the scan records `threat_model_sha256` (over the raw
+  file bytes) in both artifacts, persists the previously-discarded
+  over-permissive-model warnings (`threat_model_warnings`), and prepends a
+  deterministic, non-LLM banner to the summary report stating that the security
+  model came from a repo-controlled file. The sha key is **absent** — never the
+  empty-string hash — when no threat model is present.
+
+### Known risk (accepted, documented)
+
+- **Prompt injection via a repo-supplied threat model is NOT prevented.**
+  `OPENANT.THREATMODEL.md` ships inside the scanned (untrusted) repository and
+  shapes the attacker model applied to every finding; a hostile repo can declare
+  that nothing is a vulnerability. Per the project decision this is an accepted
+  gap. The controls above are *visibility*, not prevention: the sha, the
+  persisted permissive-model warnings, and the report banner let an operator see
+  that a repo-controlled file supplied the security model, and detect the
+  most-permissive case. See Risk R5 in the plan and the `load_threat_model`
+  call site.
+
 ## [2026-05-24] — Pluggable LLM providers (per-phase llm-configs)
 
 ### Added

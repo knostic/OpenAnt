@@ -368,6 +368,14 @@ def scan_repository(
                 save_context(threat_model_ctx, Path(app_context_path))
                 result.app_context_path = app_context_path
                 result.context_source = "threat_model"
+                # R5: carry the file's provenance (sha over raw bytes) and the
+                # previously discarded permissive-model warnings onto the result
+                # so both land in scan.report.json / pipeline_output.json rather
+                # than reaching only stderr (which CI discards).
+                result.threat_model_sha256 = threat_model_ctx.source_sha256
+                result.threat_model_warnings = list(
+                    threat_model_ctx.permissive_warnings
+                )
                 ctx.summary = {
                     "application_type": threat_model_ctx.application_type,
                     "context_source": "threat_model",
@@ -825,6 +833,9 @@ def scan_repository(
             ) or "web_app",
             processing_level=processing_level,
             step_reports=collected_step_reports,
+            context_source=result.context_source,
+            threat_model_sha256=result.threat_model_sha256,
+            threat_model_warnings=result.threat_model_warnings,
         )
 
         ctx.outputs = {"pipeline_output_path": pipeline_output_path}
@@ -1014,6 +1025,98 @@ def _read_app_type(app_context_path: str) -> str | None:
         return None
 
 
+# Coverage fields the shared walker (core/repo_walk.py STAT_KEYS) records when it
+# refuses a symlink or cannot read a directory. Parsers persist them into their
+# per-language scan-result file's ``statistics`` block, NOT into dataset.json —
+# so the merge into ``per_language`` never carries them. They are the only signal
+# that a scan skipped part of the tree; without them a partially-covered scan of
+# a hostile repo looks identical to a clean one. Aggregated here, at report time.
+_COVERAGE_COUNT_KEYS = ("symlinks_skipped", "directories_unreadable")
+_COVERAGE_EXAMPLE_KEYS = ("symlink_examples", "unreadable_examples")
+# Parsers disagree on the filename: the in-process Python parser writes
+# scan_result.json (singular); the subprocess parsers write scan_results.json.
+_SCAN_RESULT_FILENAMES = ("scan_result.json", "scan_results.json")
+
+
+def _read_coverage_stats(dir_path: str) -> dict:
+    """Return the coverage keys present in a directory's scan-result file, or {}.
+
+    Reads OUR output artifact, not anything from the scanned repo, so a plain
+    read is safe. Only keys that are actually present are returned — absence is
+    NOT coerced to zero here, because the caller must distinguish "the parser
+    instruments coverage and skipped nothing" (a count key present at 0) from
+    "the parser does not instrument coverage at all" (the key absent). Coercing
+    absence to 0 is exactly the false-``symlinks_skipped: 0`` assurance this
+    aggregation exists to avoid.
+    """
+    for name in _SCAN_RESULT_FILENAMES:
+        candidate = os.path.join(dir_path, name)
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            stats = read_json(candidate).get("statistics", {}) or {}
+        except Exception:
+            return {}
+        return {
+            k: stats[k]
+            for k in (*_COVERAGE_COUNT_KEYS, *_COVERAGE_EXAMPLE_KEYS)
+            if k in stats
+        }
+    return {}
+
+
+def _language_scan_dirs(result: ScanResult) -> list[tuple[str, str]]:
+    """``(language, scan-output-dir)`` pairs to probe for coverage.
+
+    Multi-language runs carry a per-language ``output_dir`` in ``per_language``;
+    the single-language passthrough writes straight into ``result.output_dir``
+    with an empty ``per_language``. Both are normalised to the same pair list so
+    coverage is attributable to a named language either way.
+    """
+    pairs: list[tuple[str, str]] = []
+    for lang, spec in (result.per_language or {}).items():
+        out = spec.get("output_dir") if isinstance(spec, dict) else None
+        pairs.append((lang, out or result.output_dir))
+    if not pairs:
+        pairs.append((result.language, result.output_dir))
+    return pairs
+
+
+def _collect_coverage(result: ScanResult) -> dict:
+    """Aggregate skipped-symlink / unreadable-dir figures across languages.
+
+    A language is "instrumented" iff its scan-result ``statistics`` carries at
+    least one coverage COUNT key. This is a presence PROBE, deliberately not a
+    hardcoded per-language allowlist: the parser set gains and loses coverage
+    instrumentation over time, and a stale allowlist would fail dangerously —
+    silently summing a de-instrumented language's absent keys as 0, i.e. a false
+    "nothing skipped". The probe fails safe instead: an uninstrumented language
+    is disclosed in ``languages_without_coverage_data`` rather than counted as 0,
+    so a ``symlinks_skipped: 0`` aggregate is trustworthy ONLY when that list is
+    empty. (JavaScript and Go do not yet instrument coverage; they appear in the
+    list until their parsers emit the snake_case keys.)
+    """
+    counts = {k: 0 for k in _COVERAGE_COUNT_KEYS}
+    examples: dict[str, list] = {k: [] for k in _COVERAGE_EXAMPLE_KEYS}
+    without_data: list[str] = []
+    for lang, d in _language_scan_dirs(result):
+        stats = _read_coverage_stats(d)
+        if not any(k in stats for k in _COVERAGE_COUNT_KEYS):
+            without_data.append(lang or "unknown")
+            continue
+        for k in _COVERAGE_COUNT_KEYS:
+            counts[k] += int(stats.get(k, 0) or 0)
+        for k in _COVERAGE_EXAMPLE_KEYS:
+            for ex in stats.get(k, []) or []:
+                if len(examples[k]) < 5 and ex not in examples[k]:
+                    examples[k].append(ex)
+    return {
+        **counts,
+        **examples,
+        "languages_without_coverage_data": sorted(set(without_data)),
+    }
+
+
 def _write_scan_report(
     output_dir: str,
     result: ScanResult,
@@ -1040,6 +1143,27 @@ def _write_scan_report(
             # ADDITIVE / non-breaking: disambiguated skip cause per step.
             # `steps_skipped` above stays a flat bare list (consumers read it).
             "steps_skipped_reasons": result.skipped_step_reasons,
+            # Multi-language coverage + which path supplied the security model.
+            # Previously omitted here, so a merged/degraded scan and a
+            # single-language clean one produced indistinguishable reports.
+            "languages": result.languages,
+            "language_stats": result.language_stats,
+            "per_language": result.per_language,
+            "parse_errors": result.parse_errors,
+            "excluded_languages": result.excluded_languages,
+            "degraded": result.degraded,
+            "context_source": result.context_source,
+            # R5: provenance of a repo-supplied threat model. sha is absent (key
+            # omitted) when no threat model was loaded — never the empty hash.
+            **(
+                {"threat_model_sha256": result.threat_model_sha256}
+                if result.threat_model_sha256
+                else {}
+            ),
+            "threat_model_warnings": result.threat_model_warnings,
+            # Aggregate of what the walker refused (symlinks) or could not read
+            # (directories), summed across languages from each scan-result file.
+            "coverage": _collect_coverage(result),
         },
         inputs={"repo_path": result.output_dir.replace(os.path.abspath("."), ".")},
         outputs={
