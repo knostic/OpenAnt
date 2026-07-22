@@ -206,3 +206,54 @@ class TestFullPipeline:
             processing_level="all",
         )
         assert result.language == "javascript"
+
+
+class TestSymlinkContainment:
+    """The JS scanner must refuse every symlink in an untrusted repo.
+
+    The scanner already refused symlinks (isSymbolicLink() before is{Directory,File}),
+    but folded the refusal into the camelCase `directoriesExcluded` counter, so it
+    was invisible to the coverage aggregator (which reads snake_case
+    `symlinks_skipped`). No executable containment test existed for the JS runtime
+    — the same gap that let the Go file-symlink hole ship. These lock both the
+    containment and the snake_case reporting.
+    """
+
+    def test_symlinked_file_and_dir_are_refused_and_counted(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "secret.txt"
+        secret.write_text("SECRET-CANARY\n")
+
+        repo = tmp_path / "repo"
+        (repo / "sub").mkdir(parents=True)
+        (repo / "real.js").write_text("function real(){ return 1; }\n")
+        # leak.js -> outside secret (the exfiltration vector); plus a dir symlink.
+        (repo / "leak.js").symlink_to(secret)
+        (repo / "sub" / "vendordir").symlink_to(outside, target_is_directory=True)
+
+        output = tmp_path / "scan_results.json"
+        result = run_node("repository_scanner.js", str(repo), "--output", str(output))
+        assert result.returncode == 0, result.stderr
+        data = json.loads(output.read_text())
+
+        paths = [f["path"] for f in data["files"]]
+        assert "leak.js" not in paths, f"symlinked file was scanned: {paths}"
+        assert paths == ["real.js"]
+        stats = data["statistics"]
+        assert stats["symlinks_skipped"] == 2, stats
+        assert stats["symlink_examples"]
+        # Refusals must NOT be double-counted into directoriesExcluded.
+        assert stats["directoriesExcluded"] == 0, stats
+
+    def test_clean_repo_reports_zero_skipped_present(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "a.js").write_text("function a(){ return 1; }\n")
+
+        output = tmp_path / "scan_results.json"
+        run_node("repository_scanner.js", str(repo), "--output", str(output))
+        stats = json.loads(output.read_text())["statistics"]
+        # Present at 0 == coverage-instrumented (distinguishable from absent).
+        assert stats["symlinks_skipped"] == 0
+        assert stats["directories_unreadable"] == 0

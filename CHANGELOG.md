@@ -3,6 +3,37 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-07-22] — Go parser symlink containment (security)
+
+### Fixed
+
+- **The Go parser followed file symlinks out of the scanned repo (containment
+  hole).** `filepath.Walk` lstat's each entry, so a symlinked file
+  `leak.go -> /outside/secret` had `IsDir()==false` and a `.go` extension and was
+  added to the file list and read *through* the link — the same host-file→
+  `dataset.json`→model-provider exfiltration the Python engine's refuse-all
+  policy already closed, never applied to the Go binary. The scanner now refuses
+  every symlink (file and directory) inside the repo (the repo root itself is
+  exempt), and an unreadable directory is a counted `directories_unreadable`
+  coverage gap rather than a silently swallowed error. Proven by an executable
+  containment test (`scanner_symlink_test.go`) with a leak canary + negative
+  control; a mutation disabling the guard re-scans the symlinked file.
+- **The `test_pipeline.py` Go build now rebuilds on staleness, not just
+  absence.** Rebuild-only-if-absent left this security fix inert on any machine
+  with a cached (gitignored) binary. The build now triggers when any `.go`
+  source is newer than the binary.
+
+### Changed
+
+- **JavaScript parser reports symlink refusals as `symlinks_skipped`** (snake_case,
+  matching the other parsers) instead of folding them into `directoriesExcluded`,
+  and counts unreadable directories. Containment was already correct; this makes
+  the coverage aggregator see the gap. Added the missing JS symlink-containment
+  test (`TestSymlinkContainment`). With Go and JS now instrumented, they drop off
+  `languages_without_coverage_data` automatically. Corrected the false claim in
+  `test_scanner_contract.py` that Go/Node containment was covered by their own
+  suites — those suites did not exist, which is how the Go hole shipped.
+
 ## [2026-07-22] — Artifact provenance + coverage; threat-model known risk
 
 ### Added

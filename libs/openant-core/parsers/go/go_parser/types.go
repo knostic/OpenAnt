@@ -22,6 +22,15 @@ type ScanStatistics struct {
 	TotalSizeBytes      int64          `json:"totalSizeBytes"`
 	DirectoriesScanned  int            `json:"directoriesScanned"`
 	DirectoriesExcluded int            `json:"directoriesExcluded"`
+	// Coverage gap fields, snake_case to match the Python-family parsers so the
+	// aggregator's presence probe reads them (core/scanner.py). Counts are NOT
+	// omitempty: emitting them at 0 marks this parser as coverage-instrumented,
+	// distinguishing "skipped nothing" from "does not report coverage". Examples
+	// are omitempty, mirroring the Python walker.
+	SymlinksSkipped       int      `json:"symlinks_skipped"`
+	SymlinkExamples       []string `json:"symlink_examples,omitempty"`
+	DirectoriesUnreadable int      `json:"directories_unreadable"`
+	UnreadableExamples    []string `json:"unreadable_examples,omitempty"`
 }
 
 // AnalyzerOutput represents the output of the function extractor (Stage 2)

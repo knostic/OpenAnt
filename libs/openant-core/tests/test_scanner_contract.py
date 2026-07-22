@@ -47,9 +47,14 @@ def _python_scanner_languages() -> list[str]:
     """Registry languages whose scanner is a Python module we can drive in-process.
 
     Derived from the registry rather than hardcoded, so language #8 is covered the
-    day it is registered. Non-Python scanners (Node, Go) are excluded here and
-    covered by their own runtime's suite — the contract is the same, the harness
-    differs.
+    day it is registered. Non-Python scanners (Node, Go) are excluded here because
+    this harness drives Python modules in-process; their equivalents live in their
+    own runtime's suite — the JS containment test in ``tests/test_js_parser.py``
+    (``TestSymlinkContainment``) and the Go test in
+    ``parsers/go/go_parser/scanner_symlink_test.go``. NOTE: this claim was once
+    false — no such Go/Node containment suite existed, and that false comfort is
+    how the Go file-symlink exfiltration hole shipped. Both suites now exist; do
+    not remove them without moving the coverage here.
     """
     languages = []
     for name in sorted(load_registry()):

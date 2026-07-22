@@ -71,7 +71,15 @@ class RepositoryScanner {
             totalSizeBytes: 0,
             directoriesScanned: 0,
             directoriesExcluded: 0,
-            testFilesSkipped: 0
+            testFilesSkipped: 0,
+            // snake_case coverage keys, matching the Python-family parsers so the
+            // aggregator's presence probe (core/scanner.py) reads them. Present
+            // at 0 marks this parser as coverage-instrumented (vs. a parser that
+            // reports no coverage at all, where the key is absent).
+            symlinks_skipped: 0,
+            symlink_examples: [],
+            directories_unreadable: 0,
+            unreadable_examples: []
         };
 
         // Results
@@ -130,7 +138,13 @@ class RepositoryScanner {
         try {
             entries = fs.readdirSync(dirPath, { withFileTypes: true });
         } catch (error) {
-            // Permission denied or other error
+            // Unreadable directory: record it as a counted coverage gap rather
+            // than a silent skip (a silent skip is a false negative, the worst
+            // direction for a SAST tool), then stop descending this one.
+            this.stats.directories_unreadable++;
+            if (this.stats.unreadable_examples.length < 5) {
+                this.stats.unreadable_examples.push(`${relativePath || '.'}: ${error.message}`);
+            }
             console.error(`Warning: Cannot read directory ${dirPath}: ${error.message}`);
             return;
         }
@@ -152,7 +166,14 @@ class RepositoryScanner {
             // no visible diff at this line. The sibling Python scanners had exactly
             // this bug.
             if (entry.isSymbolicLink()) {
-                this.stats.directoriesExcluded++;
+                // Count as a symlink skip, NOT directoriesExcluded — that field
+                // is for excluded real directories, and folding refusals into it
+                // both mislabels the gap and hides it from the coverage probe,
+                // which reads snake_case symlinks_skipped.
+                this.stats.symlinks_skipped++;
+                if (this.stats.symlink_examples.length < 5) {
+                    this.stats.symlink_examples.push(entryRelativePath);
+                }
                 continue;
             }
 
@@ -218,7 +239,15 @@ class RepositoryScanner {
             totalSizeBytes: 0,
             directoriesScanned: 0,
             directoriesExcluded: 0,
-            testFilesSkipped: 0
+            testFilesSkipped: 0,
+            // snake_case coverage keys, matching the Python-family parsers so the
+            // aggregator's presence probe (core/scanner.py) reads them. Present
+            // at 0 marks this parser as coverage-instrumented (vs. a parser that
+            // reports no coverage at all, where the key is absent).
+            symlinks_skipped: 0,
+            symlink_examples: [],
+            directories_unreadable: 0,
+            unreadable_examples: []
         };
 
         // Run scan
