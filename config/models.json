@@ -1,0 +1,138 @@
+{
+  "_comment": "Provider-model registry: the single source of truth for model IDs and pricing, read by BOTH the Python engine (core/model_registry.py) and the Go CLI (internal/models). status is OpenAnt's shipped claim; source+retrieved are its provenance. price is null for any model that must not be auto-dispatched (retired/unknown) so it never resolves to a silent $0 in cost accounting. Prices are OpenAnt's shipped rates and are NOT verified against live provider pricing in the build environment — see each record's source. Recency of `retrieved` is an operational/CI concern, not asserted in the unit tests.",
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "claude-opus-4-8", "provider": "anthropic", "status": "current",
+      "price": {"input": 15.00, "output": 75.00},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Anthropic pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "claude-sonnet-4-6", "provider": "anthropic", "status": "current",
+      "price": {"input": 3.00, "output": 15.00},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Anthropic pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "claude-haiku-4-5-20251001", "provider": "anthropic", "status": "current",
+      "price": {"input": 1.00, "output": 5.00},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Anthropic pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "claude-opus-4-20250514", "provider": "anthropic", "status": "retired",
+      "price": null,
+      "source": "labeled retired in openant source (model_config.py); no live verification in build env",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "claude-sonnet-4-20250514", "provider": "anthropic", "status": "retired",
+      "price": null,
+      "source": "labeled retired in openant source (model_config.py, cmd/setup.go); no live verification in build env",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "claude-opus-4-6", "provider": "anthropic", "status": "unknown",
+      "price": null,
+      "source": "liveness contested and not verifiable in build env; asserted neither alive nor dead",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gpt-4o", "provider": "openai", "status": "current",
+      "price": {"input": 2.50, "output": 10.00},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gpt-4o-mini", "provider": "openai", "status": "current",
+      "price": {"input": 0.15, "output": 0.60},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gpt-4.1", "provider": "openai", "status": "current",
+      "price": {"input": 2.00, "output": 8.00},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gpt-4.1-mini", "provider": "openai", "status": "current",
+      "price": {"input": 0.40, "output": 1.60},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gpt-4.1-nano", "provider": "openai", "status": "current",
+      "price": {"input": 0.10, "output": 0.40},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "o1", "provider": "openai", "status": "current",
+      "price": {"input": 15.00, "output": 60.00},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "o3", "provider": "openai", "status": "current",
+      "price": {"input": 2.00, "output": 8.00},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "o3-mini", "provider": "openai", "status": "current",
+      "price": {"input": 1.10, "output": 4.40},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "o4-mini", "provider": "openai", "status": "current",
+      "price": {"input": 1.10, "output": 4.40},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gemini-2.5-pro", "provider": "google", "status": "current",
+      "price": {"input": 1.25, "output": 10.00},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gemini-2.5-flash", "provider": "google", "status": "current",
+      "price": {"input": 0.30, "output": 2.50},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gemini-2.5-flash-lite", "provider": "google", "status": "current",
+      "price": {"input": 0.10, "output": 0.40},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gemini-2.0-flash", "provider": "google", "status": "current",
+      "price": {"input": 0.10, "output": 0.40},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gemini-2.0-flash-lite", "provider": "google", "status": "current",
+      "price": {"input": 0.075, "output": 0.30},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gemini-1.5-pro", "provider": "google", "status": "current",
+      "price": {"input": 1.25, "output": 5.00},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
+      "retrieved": "2026-07-23"
+    },
+    {
+      "id": "gemini-1.5-flash", "provider": "google", "status": "current",
+      "price": {"input": 0.075, "output": 0.30},
+      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
+      "retrieved": "2026-07-23"
+    }
+  ]
+}

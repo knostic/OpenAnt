@@ -78,3 +78,8 @@ exclude = [
 # finds it the same way it does in a checkout.
 [tool.hatch.build.targets.wheel.force-include]
 "../../config/languages.json" = "config/languages.json"
+# config/models.json is the shared provider-model registry (IDs, status,
+# pricing), read by both runtimes exactly like languages.json. Without this
+# stanza it would not ship in the wheel and core/model_registry.require_models()
+# would fail loud — the same defect class that made every language vanish.
+"../../config/models.json" = "config/models.json"

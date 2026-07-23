@@ -36,6 +36,9 @@ def test_wheel_declares_the_config_as_force_include():
         "above the package root and cannot ship without one"
     )
     assert "config/languages.json" in pyproject
+    # models.json is the shared provider-model registry; without its force-include
+    # it would not ship and core/model_registry.require_models() would fail loud.
+    assert "config/models.json" in pyproject
 
 
 def test_the_monorepo_config_exists_where_packaging_expects_it():
@@ -155,7 +158,8 @@ def test_wheel_omits_test_artifacts_and_carries_runtime_modules(tmp_path: Path):
     assert not banned, f"wheel ships test artifacts / an exploit writeup: {banned}"
 
     required = ["core/analyzer.py", "report/generator.py",
-                "report/prompts/disclosure.txt", "config/languages.json"]
+                "report/prompts/disclosure.txt", "config/languages.json",
+                "config/models.json"]
     for r in required:
         assert any(n.endswith(r) or n == r for n in names), (
             f"wheel is missing a runtime file the product needs: {r}")
