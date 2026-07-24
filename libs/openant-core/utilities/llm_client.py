@@ -23,18 +23,29 @@ import importlib
 import sys
 import threading
 
-from .model_config import ANTHROPIC_PRICING
+from core.model_registry import pricing_map
 
 
-# Pricing per million tokens. LEGACY fallback: issue #65 moved pricing
-# onto each adapter (``AnthropicAdapter.pricing`` is the source of truth),
-# so this global only backstops call sites that don't yet pass an
-# adapter-provided ``pricing`` (record_call's fallback, report/generator).
-# It MUST mirror ``AnthropicAdapter.pricing`` — ``tests/test_pricing_drift_guard.py``
-# fails if the two drift. Both are independent, value-equal copies of the
-# same canonical table in ``utilities/model_config.py`` — they can neither
-# drift nor bleed mutations into each other. Unknown models: $0 + one warn.
-MODEL_PRICING = {m: dict(p) for m, p in ANTHROPIC_PRICING.items()}
+# Pricing per million tokens. LEGACY fallback: issue #65 moved pricing onto
+# each adapter, and ``config/models.json`` (read by core.model_registry) is now
+# the source of truth for BOTH the adapters and this global. ``MODEL_PRICING``
+# still backstops call sites that don't pass an adapter-provided ``pricing``
+# (record_call's fallback, report/generator) and the drift guard, but it is
+# served LAZILY from the registry via module ``__getattr__`` below — never a
+# frozen import-time snapshot — so it can neither drift from the adapter table
+# nor price from a stale copy, and a missing config fails LOUD at first use
+# instead of pricing every model at $0. Retired/unknown ids are omitted
+# (lookup miss -> warn + $0).
+
+
+def __getattr__(name: str):
+    # PEP 562 hook: resolve MODEL_PRICING on demand. Fires for attribute access
+    # and ``from utilities.llm_client import MODEL_PRICING`` — but NOT for a bare
+    # ``MODEL_PRICING`` reference inside this module, which is why record_call
+    # calls ``pricing_map("anthropic")`` directly.
+    if name == "MODEL_PRICING":
+        return pricing_map("anthropic")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _unknown_pricing_warned: set[str] = set()
 _unknown_pricing_lock = threading.Lock()
@@ -48,7 +59,7 @@ def _warn_unknown_pricing(model: str) -> None:
         _unknown_pricing_warned.add(model)
     sys.stderr.write(
         f"warning: no pricing for model {model!r}; cost will be reported as $0. "
-        f"Add it to MODEL_PRICING in utilities/llm_client.py for accurate totals.\n"
+        f"Add it to config/models.json (the shared model registry) for accurate totals.\n"
     )
 
 
@@ -104,7 +115,7 @@ class TokenTracker:
             Dict with call details including cost.
         """
         if pricing is None:
-            pricing = MODEL_PRICING.get(model)
+            pricing = pricing_map("anthropic").get(model)
         if pricing is None:
             _warn_unknown_pricing(model)
             total_cost = 0.0

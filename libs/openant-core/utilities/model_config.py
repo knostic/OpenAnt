@@ -1,23 +1,23 @@
-"""Canonical model-ID constants and per-provider pricing tables.
+"""Canonical model-ID constants.
 
-Single source of truth for every hard-coded model-ID string that used
-to be duplicated across the product source:
+Single source of truth for the hard-coded model-ID *strings* used across the
+product source — e.g. ``utilities/llm/builtins.py``'s ``OPENANT_DEFAULT``
+per-phase models and ``utilities/context_enhancer.py``'s
+``CONTEXT_ENHANCEMENT_MODEL_LEGACY``.
 
-* ``utilities/llm_client.py`` (``MODEL_PRICING``)
-* ``utilities/context_enhancer.py`` (``CONTEXT_ENHANCEMENT_MODEL_LEGACY``)
-* ``utilities/llm/builtins.py`` (``OPENANT_DEFAULT`` per-phase models)
-* ``utilities/llm/providers/anthropic.py`` (``AnthropicAdapter.pricing``)
-* ``utilities/llm/providers/google.py`` (``GoogleAdapter.pricing``)
-* ``utilities/llm/providers/openai.py`` (``OpenAIAdapter.pricing``)
+**Pricing no longer lives here.** Per-provider pricing moved to the shared
+``config/models.json`` registry, read by ``core/model_registry.py`` (Python) and
+``apps/openant-cli/internal/models`` (Go). The adapters' ``pricing``,
+``utilities/llm_client.MODEL_PRICING`` and the report generator now resolve rates
+lazily from ``core.model_registry.pricing_map(<provider>)`` — retired/unknown ids
+are omitted there so they can never price at a silent \\$0. The model-ID constants
+remain here as the irreducible compile-time defaults, VALIDATED against the
+registry (``tests/test_model_registry.py``) rather than being unchecked assertions.
 
-Those modules now import the constants and pricing maps below instead of
-re-typing the literals. If a provider deprecates a model ID, or a price
-changes, this file is the single place to edit.
-
-This module is intentionally dependency-free (pure literals, no imports
-from the rest of the package) so any module — including
-``utilities/llm_client.py``, which the ``utilities.llm`` package imports
-transitively — can import it without risking a circular import.
+This module is intentionally dependency-free (pure literals, no imports from the
+rest of the package) so any module — including ``utilities/llm_client.py``, which
+the ``utilities.llm`` package imports transitively — can import it without risking
+a circular import.
 """
 
 from __future__ import annotations
@@ -51,42 +51,3 @@ GEMINI_2_0_FLASH = "gemini-2.0-flash"
 GEMINI_2_0_FLASH_LITE = "gemini-2.0-flash-lite"
 GEMINI_1_5_PRO = "gemini-1.5-pro"
 GEMINI_1_5_FLASH = "gemini-1.5-flash"
-
-
-# --- Per-provider pricing (USD per 1M tokens) ------------------------
-# Authoritative rates each adapter ships with. Consumers reference these
-# maps directly so the legacy ``MODEL_PRICING`` global in
-# ``utilities/llm_client.py`` can never drift from the adapter table
-# (see tests/test_pricing_drift_guard.py).
-ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
-    # Current model IDs (must match utilities/llm/builtins.py OPENANT_DEFAULT).
-    CLAUDE_OPUS: {"input": 15.00, "output": 75.00},
-    CLAUDE_SONNET: {"input": 3.00, "output": 15.00},
-    CLAUDE_HAIKU: {"input": 1.00, "output": 5.00},
-    # Retired IDs kept for historical reports / back-compat.
-    CLAUDE_OPUS_4_20250514: {"input": 15.00, "output": 75.00},
-    CLAUDE_OPUS_4_6: {"input": 15.00, "output": 75.00},
-    CLAUDE_SONNET_4_20250514: {"input": 3.00, "output": 15.00},
-}
-
-OPENAI_PRICING: dict[str, dict[str, float]] = {
-    GPT_4O: {"input": 2.50, "output": 10.00},
-    GPT_4O_MINI: {"input": 0.15, "output": 0.60},
-    GPT_4_1: {"input": 2.00, "output": 8.00},
-    GPT_4_1_MINI: {"input": 0.40, "output": 1.60},
-    GPT_4_1_NANO: {"input": 0.10, "output": 0.40},
-    O1: {"input": 15.00, "output": 60.00},
-    O3: {"input": 2.00, "output": 8.00},
-    O3_MINI: {"input": 1.10, "output": 4.40},
-    O4_MINI: {"input": 1.10, "output": 4.40},
-}
-
-GOOGLE_PRICING: dict[str, dict[str, float]] = {
-    GEMINI_2_5_PRO: {"input": 1.25, "output": 10.00},
-    GEMINI_2_5_FLASH: {"input": 0.30, "output": 2.50},
-    GEMINI_2_5_FLASH_LITE: {"input": 0.10, "output": 0.40},
-    GEMINI_2_0_FLASH: {"input": 0.10, "output": 0.40},
-    GEMINI_2_0_FLASH_LITE: {"input": 0.075, "output": 0.30},
-    GEMINI_1_5_PRO: {"input": 1.25, "output": 5.00},
-    GEMINI_1_5_FLASH: {"input": 0.075, "output": 0.30},
-}

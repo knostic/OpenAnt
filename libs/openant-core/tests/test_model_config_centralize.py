@@ -4,11 +4,13 @@ Asserts the three properties the fix must satisfy:
 
 (a) No hard-coded model-ID *literal* remains in product source outside
     ``utilities/model_config.py`` (grep-based scan over every product .py).
-(b) The new module imports resolve, and every consumer imports its IDs /
-    pricing from it (the modules load without a circular import).
-(c) The centralized values match what was hard-coded before the refactor
-    (behavior-preserving) — pinned against a snapshot of the pre-refactor
-    literals, and cross-checked against each live consumer.
+(b) The new module imports resolve, and every consumer imports its IDs from it —
+    pricing now comes from the config/models.json registry (core.model_registry),
+    NOT from model_config — with no circular import.
+(c) The values match what was hard-coded before the refactor (behavior-preserving)
+    for CURRENT models; retired/unknown ids are omitted from pricing now (null in
+    the registry) so they can never price at $0. Cross-checked against each live
+    consumer.
 
 Run against the refactored tree (GREEN):
     OPENANT_CORE_ROOT=/path/to/openant-core \
@@ -112,8 +114,13 @@ def test_b_model_config_module_imports():
     mc = importlib.import_module("utilities.model_config")
     for const in ("CLAUDE_OPUS", "CLAUDE_SONNET", "CLAUDE_HAIKU"):
         assert isinstance(getattr(mc, const), str)
+    # Pricing moved OUT of model_config to the config/models.json registry
+    # (read by core.model_registry). Lock that removal so a stray dict cannot
+    # silently reintroduce a second, driftable source of truth.
     for table in ("ANTHROPIC_PRICING", "OPENAI_PRICING", "GOOGLE_PRICING"):
-        assert isinstance(getattr(mc, table), dict) and getattr(mc, table)
+        assert not hasattr(mc, table), (
+            f"{table} must no longer live in model_config; pricing is registry-owned"
+        )
 
 
 def test_b_consumers_import_without_cycle():
@@ -132,13 +139,19 @@ def test_b_consumers_import_without_cycle():
 
 # --- (c) values are behavior-preserving ------------------------------
 # Snapshot of the exact literals present BEFORE the refactor.
-_EXPECTED_ANTHROPIC = {
+# Post-cutover, pricing_map("anthropic") OMITS retired/unknown ids (null-priced
+# in config/models.json), so the adapter table and MODEL_PRICING expose only the
+# CURRENT models. The retired ids were priced in the old dict but must never
+# price now (they resolve to warn + $0).
+_EXPECTED_ANTHROPIC_CURRENT = {
     "claude-opus-4-8": {"input": 15.00, "output": 75.00},
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
     "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
-    "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
-    "claude-opus-4-6": {"input": 15.00, "output": 75.00},
-    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+}
+_RETIRED_OR_UNKNOWN_ANTHROPIC = {
+    "claude-opus-4-20250514",
+    "claude-opus-4-6",
+    "claude-sonnet-4-20250514",
 }
 _EXPECTED_OPENAI = {
     "gpt-4o": {"input": 2.50, "output": 10.00},
@@ -173,10 +186,16 @@ _EXPECTED_LEGACY_ENHANCE = "claude-sonnet-4-20250514"
 
 
 def test_c_pricing_maps_match_pre_refactor_snapshot():
-    mc = importlib.import_module("utilities.model_config")
-    assert mc.ANTHROPIC_PRICING == _EXPECTED_ANTHROPIC
-    assert mc.OPENAI_PRICING == _EXPECTED_OPENAI
-    assert mc.GOOGLE_PRICING == _EXPECTED_GOOGLE
+    # Values are now sourced from config/models.json via core.model_registry.
+    # Behavior-preserving for CURRENT models; retired/unknown ids are omitted.
+    from core.model_registry import pricing_map
+
+    anthropic = pricing_map("anthropic")
+    assert anthropic == _EXPECTED_ANTHROPIC_CURRENT
+    for retired in _RETIRED_OR_UNKNOWN_ANTHROPIC:
+        assert retired not in anthropic, f"{retired} must be omitted, not priced"
+    assert pricing_map("openai") == _EXPECTED_OPENAI
+    assert pricing_map("google") == _EXPECTED_GOOGLE
 
 
 def test_c_consumers_resolve_to_pre_refactor_values():
@@ -187,8 +206,8 @@ def test_c_consumers_resolve_to_pre_refactor_values():
     from utilities.llm.builtins import OPENANT_DEFAULT
     from utilities.context_enhancer import CONTEXT_ENHANCEMENT_MODEL_LEGACY
 
-    assert MODEL_PRICING == _EXPECTED_ANTHROPIC
-    assert AnthropicAdapter.pricing == _EXPECTED_ANTHROPIC
+    assert MODEL_PRICING == _EXPECTED_ANTHROPIC_CURRENT
+    assert AnthropicAdapter.pricing == _EXPECTED_ANTHROPIC_CURRENT
     assert OpenAIAdapter.pricing == _EXPECTED_OPENAI
     assert GoogleAdapter.pricing == _EXPECTED_GOOGLE
     assert CONTEXT_ENHANCEMENT_MODEL_LEGACY == _EXPECTED_LEGACY_ENHANCE

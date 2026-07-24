@@ -80,7 +80,7 @@ from ..adapter import (
     ToolUseBlock,
 )
 from ._ratelimit import report_rate_limit, wait_for_rate_limit
-from ...model_config import GOOGLE_PRICING
+from .._pricing import LazyProviderPricing
 from .._redact import redact_secrets, redacted_cause_from
 
 
@@ -154,7 +154,9 @@ class GoogleAdapter:
     # 200K context vs over); we ship the more common <200K rates.
     # Users with long-context scans may need to override locally.
     # Models absent here report $0 + warning per issue #65 §9.
-    pricing: dict[str, dict[str, float]] = {m: dict(p) for m, p in GOOGLE_PRICING.items()}
+    # Resolved lazily from config/models.json (the shared registry) on
+    # first access; see utilities/llm/_pricing.py.
+    pricing = LazyProviderPricing("google")
 
     def __init__(
         self,

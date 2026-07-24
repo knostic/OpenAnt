@@ -99,3 +99,18 @@ def test_configured_default_phase_models_resolve_to_non_retired():
         assert rec is not None, f"phase {phase!r} model {ref.model!r} not in registry"
         assert rec["status"] != "retired", (
             f"phase {phase!r} default {ref.model!r} resolves to a RETIRED model")
+
+
+def test_configured_default_phase_models_are_current():
+    """Defaults must be CURRENT, not merely non-retired.
+
+    Preserves the intent of the deleted ``test_default_registry_uses_current_ids``
+    (a fresh install's default phases use live, priced models) WITHOUT naming
+    which ids are blessed — a default resolving to an 'unknown'-status model would
+    price at $0 with a warning, which is not a state a shipped default should be in.
+    """
+    from utilities.llm.builtins import OPENANT_DEFAULT
+
+    for phase, ref in OPENANT_DEFAULT.phases.items():
+        assert mr.model_status(ref.model) == "current", (
+            f"phase {phase!r} default {ref.model!r} is not a 'current' model")
