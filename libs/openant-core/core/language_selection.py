@@ -45,11 +45,13 @@ class LanguageSelection:
     Attributes:
         selected: Languages to parse, ordered by descending file count.
         counts: The full detection result, including excluded languages.
-        excluded: Language → human-readable reason it was dropped.
-            NOT currently surfaced anywhere: callers flatten this object to
-            ``selected`` before it reaches the scanner, so exclusion reasons are
-            computed and discarded. The coverage gap this field exists to make
-            visible is therefore still silent.
+        excluded: Language → human-readable reason it was dropped. This IS
+            surfaced (docstring corrected 2026-07-25): ``openant/cli.py`` passes
+            ``dict(selection.excluded)`` into ``scan_repository`` as the sidecar
+            ``excluded_languages`` argument, which ``core/scanner.py`` stores on
+            the result and emits in the scan report; ``report_exclusions`` also
+            prints it to stderr. The coverage gap this field exists to make
+            visible is therefore NO LONGER silent.
         primary: The dominant language. Populates every scalar ``language``
             field downstream, preserving back-compat.
     """

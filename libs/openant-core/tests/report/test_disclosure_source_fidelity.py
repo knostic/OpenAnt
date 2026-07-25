@@ -143,7 +143,7 @@ def test_ping_section_contains_verbatim_source(pipeline_output: dict):
     """Real ping() has @app.route, check_output, and -c 4 — must appear verbatim."""
     ping = next(
         f for f in pipeline_output["findings"]
-        if f["location"]["function"].endswith(":ping")
+        if f["location"]["function"] == "ping"
     )
     section = ping["vulnerable_code_section"]
 
@@ -160,7 +160,7 @@ def test_run_query_section_contains_verbatim_source(pipeline_output: dict):
     """Real run_query() is 3 lines, not a Flask-route hybrid — must appear verbatim."""
     run_query = next(
         f for f in pipeline_output["findings"]
-        if f["location"]["function"].endswith(":run_query")
+        if f["location"]["function"] == "run_query"
     )
     section = run_query["vulnerable_code_section"]
 
@@ -323,7 +323,7 @@ def test_generate_disclosure_output_has_real_code(fake_report_binding, pipeline_
     generate_disclosure() must contain the real source."""
     ping = next(
         f for f in pipeline_output["findings"]
-        if f["location"]["function"].endswith(":ping")
+        if f["location"]["function"] == "ping"
     )
 
     text, _usage = generator.generate_disclosure(
@@ -346,7 +346,7 @@ def test_generate_disclosure_prompt_has_no_source_code(fake_report_binding, pipe
     rewritten version."""
     ping = next(
         f for f in pipeline_output["findings"]
-        if f["location"]["function"].endswith(":ping")
+        if f["location"]["function"] == "ping"
     )
 
     generator.generate_disclosure(

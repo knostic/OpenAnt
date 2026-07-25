@@ -399,8 +399,13 @@ def build_pipeline_output(
             "name": vuln.get("name", finding.get("finding", "Unknown Vulnerability")),
             "short_name": vuln.get("short_name", finding.get("verdict", "vuln")),
             "location": {
+                # function is the exact complement of file so that
+                # file + ":" + function == route_key round-trips (the cli.py
+                # dynamic-test bridge reconstructs route_key from these two).
+                # This drops the redundant file prefix that used to duplicate
+                # ``file`` inside ``function`` (D3b).
                 "file": route_key.split(":")[0] if ":" in route_key else "unknown",
-                "function": route_key,
+                "function": route_key.split(":", 1)[1] if ":" in route_key else route_key,
             },
             "cwe_id": vuln.get("cwe_id") or finding.get("cwe_id") or full_result.get("cwe_id", 0),
             "cwe_name": vuln.get("cwe_name") or finding.get("cwe_name") or full_result.get("cwe_name", "Unknown"),

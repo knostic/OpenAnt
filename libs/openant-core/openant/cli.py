@@ -762,7 +762,8 @@ def cmd_report_data(args):
             # --- Load dynamic test results if available ---
             # Dynamic tests use VULN-XXX IDs from pipeline_output.json,
             # but report-data works with route_keys from results_verified.json.
-            # Bridge via pipeline_output's location.function (== route_key).
+            # Bridge by reconstructing route_key = location.file + ":" + location.function
+            # (location.function is the bare name; file+":"+function == route_key, D3b).
             dt_by_route_key = {}
             dt_path = os.path.join(results_dir, "dynamic_test_results.json")
             po_path = os.path.join(results_dir, "pipeline_output.json")
@@ -783,7 +784,11 @@ def cmd_report_data(args):
                 vuln_id_to_route = {}
                 for finding in po_data.get("findings", []):
                     fid = finding.get("id")
-                    route = finding.get("location", {}).get("function", "")
+                    loc = finding.get("location", {})
+                    route = (
+                        f"{loc.get('file', '')}:{loc.get('function', '')}"
+                        if loc.get("file") else loc.get("function", "")
+                    )
                     if fid and route:
                         vuln_id_to_route[fid] = route
 
