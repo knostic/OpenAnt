@@ -244,6 +244,20 @@ def run_stage1_consistency_check(
                         if result.get("route_key") == route_key:
                             old_verdict = result.get("verdict", "UNKNOWN")
                             old_verdict_norm = old_verdict.upper() if isinstance(old_verdict, str) else ""
+                            # F-KB-1a: pattern-consistency must not silently downgrade a
+                            # surfaced Stage-1 finding to safe. At Stage 1 there is no
+                            # per-finding exploit evidence, only pattern similarity (the
+                            # weakest signal); block the downgrade and record it for audit.
+                            if old_verdict_norm in ("VULNERABLE", "BYPASSABLE") and new_verdict in ("SAFE", "PROTECTED"):
+                                result["stage1_consistency_downgrade_blocked"] = {
+                                    "from": old_verdict,
+                                    "proposed": new_verdict,
+                                    "reason": update.get("reason"),
+                                    "pattern": consistency_result.pattern_identified,
+                                }
+                                log("warning", f"Blocked Stage-1 consistency downgrade: {old_verdict} -> {new_verdict}",
+                                    step="detect", unit_id=route_key)
+                                continue
                             if old_verdict_norm != new_verdict:
                                 result["verdict"] = new_verdict
                                 result["stage1_consistency_update"] = {
