@@ -53,3 +53,28 @@ def test_legitimate_upgrade_still_applies():
         {"route_key": SAFE_RK, "verdict": "SAFE", "confidence": 0.8}])
     upgraded = next(r for r in out if r["route_key"] == SAFE_RK)
     assert upgraded["verdict"] == "VULNERABLE"                  # upgrades flow freely
+
+
+def test_same_basename_cross_directory_findings_group_and_downgrade_is_blocked():
+    """Regression for the cross-file / cross-language grouping coupling.
+
+    Stage-1 groups by BASENAME, so two findings in different directories that share a
+    filename (common in Swift: View.swift/Extensions.swift per module) land in ONE group.
+    If a resolver proposes downgrading the surfaced one to SAFE, the guard must block it and
+    leave an audit breadcrumb rather than silently drop it. (Documents the interaction a
+    concurrent Swift-parser PR would exercise; the mechanism is language-agnostic.)
+    """
+    VULN = "ModuleA/View.swift:Iterator.next"
+    SAFE = "ModuleB/View.swift:Iterator.next"
+    assert s1._extract_function_signature_pattern(VULN) == s1._extract_function_signature_pattern(SAFE)
+
+    def resolver(binding, group, code_by_route, tracker):
+        return s1.Stage1ConsistencyResult(
+            "iterator next", "SAFE",
+            [{"route_key": VULN, "should_be": "SAFE", "reason": "resembles the safe sibling"}], "grouped")
+    out = _run(resolver, [
+        {"route_key": VULN, "verdict": "VULNERABLE", "confidence": 0.9},
+        {"route_key": SAFE, "verdict": "SAFE", "confidence": 0.8}])
+    vuln = next(r for r in out if r["route_key"] == VULN)
+    assert vuln["verdict"] == "VULNERABLE"                        # not silently dropped
+    assert "stage1_consistency_downgrade_blocked" in vuln         # breadcrumb, triageable
