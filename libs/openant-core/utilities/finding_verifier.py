@@ -845,6 +845,21 @@ class FindingVerifier:
                                           unit_id=route_key)
                                 continue
 
+                            # F-KB-1b: a conclusively-exploitable finding must not be
+                            # silently downgraded to safe by pattern matching (mirror of
+                            # the conclusive-broken guard above).
+                            if (self._has_conclusive_exploitable_path(result)
+                                    and str(new_verdict or "").strip().lower() in ("safe", "protected")):
+                                self._log("warning",
+                                          f"Blocked consistency downgrade of conclusively-exploitable {route_key} -> {new_verdict}",
+                                          unit_id=route_key)
+                                result["consistency_downgrade_blocked"] = {
+                                    "proposed": new_verdict,
+                                    "reason": finding_update.get("reason"),
+                                    "pattern": consistency_result.pattern_identified,
+                                }
+                                continue
+
                             old_verdict = result.get("verification", {}).get("correct_finding") or result.get("finding")
                             if old_verdict != new_verdict:
                                 result["finding"] = new_verdict
@@ -904,6 +919,21 @@ class FindingVerifier:
             return True
 
         return False
+
+    def _has_conclusive_exploitable_path(self, result: dict) -> bool:
+        """Mirror of _has_conclusive_exploit_path: True when analysis conclusively
+        shows the path IS reachable, attacker-controlled, and unbroken. Defaults
+        require proof — a missing field must NOT read as exploitable."""
+        verification = result.get("verification", {})
+        if verification.get("explanation") == "Max iterations reached":
+            return False
+        exploit_path = verification.get("exploit_path")
+        if not isinstance(exploit_path, dict):
+            return False
+        sink_reached = exploit_path.get("sink_reached", False)
+        attacker_control = exploit_path.get("attacker_control_at_sink", "none")
+        path_broken_at = exploit_path.get("path_broken_at")
+        return bool(sink_reached) and attacker_control in ("full", "partial") and not path_broken_at
 
     def _group_by_pattern(self, results: list) -> dict:
         """Group results by code pattern for consistency checking."""
