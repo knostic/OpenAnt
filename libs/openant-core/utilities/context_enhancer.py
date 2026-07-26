@@ -353,6 +353,10 @@ class ContextEnhancer:
                     "confidence": analysis.get("confidence", 0.5)
                 }
             else:
+                # enhancer-failed-context: a parse failure is an error, not a
+                # silent non-event. Count it like the exception branch below so the
+                # [Enhance] Errors telemetry does not under-report parse failures.
+                self.stats["errors"] += 1
                 unit["llm_context"] = self._get_default_context(
                     error={"type": "parse_error",
                            "message": "LLM response could not be parsed as JSON"}
