@@ -1,0 +1,100 @@
+"""The explore_repository multi-turn loop had NO test (HANDOFF §4 #5), so its
+'model called no tool' branch — which previously sent ToolResultBlock(tool_use_id="nudge"),
+a guaranteed Messages-API 400 — never fired in a test. These pin that branch and the
+loop's finish / exhaustion paths, with a fake adapter (no network, free).
+
+RED on the pre-fix code: the nudge branch sent a ToolResultBlock with an id matching no
+tool_use in the preceding turn -> test_chatty_turn_is_answered_with_plain_text would fail
+(it asserts the fed-back turn carries NO ToolResultBlock).
+"""
+from __future__ import annotations
+
+import pytest
+
+from context.repo_explorer import explore_repository, MAX_TURNS
+from utilities.llm.adapter import Message, TextBlock, ToolDef, ToolResultBlock, ToolUseBlock
+
+
+class _Resp:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeAdapter:
+    supports_tools = True
+
+    def __init__(self, scripted):
+        self._scripted = list(scripted)
+        self.seen_messages = []  # messages passed on each complete() call
+
+    def complete(self, *, model, system, messages, max_tokens, tools):
+        self.seen_messages.append(list(messages))
+        return self._scripted.pop(0)
+
+
+class _FakeBinding:
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self.model = "fake-model"
+        self.provider_name = "fake"
+
+
+_FINISH = ToolDef(name="finish", description="deliver result",
+                  input_schema={"type": "object", "properties": {}})
+
+
+def _repo(tmp_path):
+    r = tmp_path / "repo"
+    (r / "src").mkdir(parents=True)
+    (r / "src" / "app.py").write_text("def handler(req):\n    return req\n")
+    return r
+
+
+def test_finish_returns_payload_and_counts_turns(tmp_path):
+    adapter = _FakeAdapter([
+        _Resp((ToolUseBlock(id="tu1", name="finish", input={"ok": True}),)),
+    ])
+    payload, budget = explore_repository(_repo(tmp_path), _FakeBinding(adapter),
+                                         "sys", "task", _FINISH)
+    assert payload == {"ok": True}
+    assert budget.turns == 1
+
+
+def test_chatty_turn_is_answered_with_plain_text_not_toolresult(tmp_path):
+    # Turn 1: model returns prose, calls no tool -> the nudge branch.
+    # Turn 2: model calls finish.
+    adapter = _FakeAdapter([
+        _Resp((TextBlock(text="let me think about this repo..."),)),
+        _Resp((ToolUseBlock(id="tu2", name="finish", input={"done": 1}),)),
+    ])
+    payload, budget = explore_repository(_repo(tmp_path), _FakeBinding(adapter),
+                                         "sys", "task", _FINISH)
+    assert payload == {"done": 1}
+    assert budget.turns == 2
+    # THE FIX: the turn fed back after the chatty response must be a plain user
+    # TextBlock, never a ToolResultBlock (whose id would match no tool_use -> 400).
+    fed_back = adapter.seen_messages[1][-1]  # last message the model saw on turn 2
+    assert all(not isinstance(b, ToolResultBlock) for b in fed_back.content), \
+        "nudge must be plain text, not a ToolResultBlock"
+    assert any(isinstance(b, TextBlock) for b in fed_back.content)
+
+
+def test_tool_call_result_is_fed_back_as_toolresult(tmp_path):
+    # A real tool call (list_dir) must come back as a ToolResultBlock with the
+    # matching tool_use id, then finish.
+    adapter = _FakeAdapter([
+        _Resp((ToolUseBlock(id="tu-ld", name="list_dir", input={"path": "."}),)),
+        _Resp((ToolUseBlock(id="tu-fin", name="finish", input={"ok": 1}),)),
+    ])
+    payload, _ = explore_repository(_repo(tmp_path), _FakeBinding(adapter),
+                                    "sys", "task", _FINISH)
+    assert payload == {"ok": 1}
+    fed_back = adapter.seen_messages[1][-1]
+    trs = [b for b in fed_back.content if isinstance(b, ToolResultBlock)]
+    assert len(trs) == 1 and trs[0].tool_use_id == "tu-ld"
+
+
+def test_never_finishing_raises_after_max_turns(tmp_path):
+    adapter = _FakeAdapter([_Resp((TextBlock(text="thinking"),)) for _ in range(MAX_TURNS)])
+    with pytest.raises(RuntimeError):
+        explore_repository(_repo(tmp_path), _FakeBinding(adapter), "sys", "task", _FINISH)
