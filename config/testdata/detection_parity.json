@@ -1,0 +1,54 @@
+{
+  "_comment": "A7 Go<->Python language-DETECTION parity golden. One source of truth for expected outcomes, consumed by BOTH runtimes (libs/openant-core/tests/test_detection_parity.py and apps/openant-cli/internal/languages/detection_parity_test.go). Each harness materializes the tree as empty files, runs its detect_languages/DetectLanguages+Ranked, and compares the RANKED ordered language list (or asserts an error outcome). Pins behavior only: ranking + empty->error. Does NOT re-test the extension map / skip-dirs set (single-sourced in languages.json, already guarded). Scope = detection primitive only; NOT selection thresholds (language_selection.py 2% is Python-pipeline-only), parsing, or reachability. The dotfile divergence (a file literally named '.py': Go counts it via filepath.Ext, Python ignores it via splitext) is a KNOWN unresolved Go<->Python divergence and is deliberately NOT pinned here — see THREAT_MODEL notes / item-4 report.",
+  "fixtures": [
+    {
+      "name": "F1_rank_collapse_ignore",
+      "why": "ranked order by count; .ts collapses to javascript; README/Makefile ignored",
+      "tree": ["a.py", "b.py", "c.py", "x.js", "y.ts", "README.md", "Makefile"],
+      "expect": ["python", "javascript"]
+    },
+    {
+      "name": "F2_tie_break_alphabetical",
+      "why": "equal counts -> alphabetical tie-break (javascript before python)",
+      "tree": ["a.py", "b.py", "x.js", "y.js"],
+      "expect": ["javascript", "python"]
+    },
+    {
+      "name": "F3_three_plus_langs",
+      "why": "full ranked ordering across 5 languages, with a 2-2 tie (ruby<zig)",
+      "tree": ["a.py","b.py","c.py","d.py","e.py","f.py","g.py","h.py","i.py",
+               "a.c","b.c","c.c","d.c","e.c",
+               "a.rb","b.rb",
+               "a.zig","b.zig",
+               "a.go"],
+      "expect": ["python", "c", "ruby", "zig", "go"]
+    },
+    {
+      "name": "F4_skip_dir_pruning",
+      "why": "skip-dirs pruned by directory (node_modules/.git/vendor); a FILE named vendor.go still counts",
+      "tree": ["app.py", "build.py", "vendor.go",
+               "node_modules/deep/x.js", "vendor/lib.go", ".git/h.py"],
+      "expect": ["python", "go"]
+    },
+    {
+      "name": "F5_case_insensitive_extension",
+      "why": "uppercase extensions fold to lowercase; A.PY/B.GO tie -> alphabetical",
+      "tree": ["A.PY", "B.GO"],
+      "expect": ["go", "python"]
+    },
+    {
+      "name": "F6_detection_has_no_threshold",
+      "why": "DETECTION counts every language with >=1 file; the 2% min-share is a SELECTION-stage concern (language_selection.py), NOT detection",
+      "tree": ["01.go","02.go","03.go","04.go","05.go","06.go","07.go","08.go","09.go","10.go",
+               "11.go","12.go","13.go","14.go","15.go","16.go","17.go","18.go","19.go","20.go",
+               "one.py"],
+      "expect": ["go", "python"]
+    },
+    {
+      "name": "F7_no_supported_files_is_error",
+      "why": "a repo with no supported source files is an ERROR outcome, not a silent empty result",
+      "tree": ["README.md", "Makefile", "notes.txt"],
+      "expect": {"error": true}
+    }
+  ]
+}
