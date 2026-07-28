@@ -758,7 +758,6 @@ class TestUrllib3ContextGrounding:
     def test_default_remove_headers_in_context(self):
         """After grounding improvement, the urllib3 context must include
         DEFAULT_REMOVE_HEADERS_ON_REDIRECT so the LLM can produce the real fix."""
-        import sys
         sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
         from advisory_fetcher import fetch_ghsa
         from advisory_converter import ghsa_to_vuln_text
@@ -774,7 +773,6 @@ class TestUrllib3ContextGrounding:
 
     def test_context_header_uses_full_relative_path(self):
         """Context header must show src/urllib3/util/retry.py, not just retry.py."""
-        import sys
         sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
         from advisory_fetcher import fetch_ghsa
         from advisory_converter import ghsa_to_vuln_text

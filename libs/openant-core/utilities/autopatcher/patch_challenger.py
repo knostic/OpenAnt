@@ -12,8 +12,6 @@ import re
 from pathlib import Path
 from typing import List, Dict
 
-from typing import Dict
-
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "patch_challenger.md"
 
 

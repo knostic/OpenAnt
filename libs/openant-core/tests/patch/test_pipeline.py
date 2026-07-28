@@ -100,7 +100,7 @@ class TestPipelineLLMModeLog:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
 
         # Stub out the actual Anthropic call so the test stays offline.
-        import types, sys
+        import types
         class FakeAnthropic:
             def __init__(self, api_key=None): pass
             class messages:
