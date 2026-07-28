@@ -335,6 +335,19 @@ func PrintDynamicTestSummary(data map[string]any) {
 	fmt.Println()
 }
 
+// PrintPatchSummary outputs a formatted summary of a patch-trust run.
+func PrintPatchSummary(data map[string]any) {
+	PrintHeader("Patch Trust Report")
+
+	if id, ok := data["finding_id"].(string); ok {
+		PrintKeyValue("Finding", id)
+	}
+	if path, ok := data["trust_report_path"].(string); ok {
+		PrintKeyValue("Report", path)
+	}
+	fmt.Println()
+}
+
 // PrintBuildOutputSummary outputs a formatted summary of pipeline output generation.
 func PrintBuildOutputSummary(data map[string]any) {
 	PrintHeader("Pipeline Output")

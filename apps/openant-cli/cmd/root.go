@@ -146,6 +146,7 @@ func init() {
 	rootCmd.AddCommand(buildOutputCmd)
 	rootCmd.AddCommand(dynamicTestCmd)
 	rootCmd.AddCommand(reportCmd)
+	rootCmd.AddCommand(patchCmd)
 	rootCmd.AddCommand(projectCmd)
 	rootCmd.AddCommand(configCmd)
 	rootCmd.AddCommand(setAPIKeyCmd)

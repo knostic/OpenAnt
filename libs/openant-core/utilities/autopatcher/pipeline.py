@@ -1,0 +1,2538 @@
+"""
+Pipeline orchestrator.
+
+Ties together the patch_generator, patch_reviewer, patch_challenger, and
+confidence_scorer stages and produces a formatted Markdown report.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from .confidence_scorer import score_confidence
+from .finding_calibration import calibrate_findings
+from .llm_client import LLMClient
+from .patch_challenger import challenge_patch
+from .patch_generator import generate_patch
+from .patch_reviewer import review_patch
+from .testing_support import discover_tests, tests_for_file, score_test_support
+from .test_suggester import extract_findings, suggest_tests
+from .impact_surface import LightweightImpactAnalyzer
+from .behavior_summary import BehaviorAnalyzer
+from .language_support import detect_language
+from pathlib import Path as _Path
+from .repository_grounding_models import RepositoryCandidate, RepositoryGroundingResult
+
+# Static patch signals
+try:
+    from scripts.constraint_signals import run_constraint_signals as _run_constraint_signals
+    from scripts.remediation_signals import run_remediation_signals as _run_remediation_signals
+    _STATIC_SIGNALS_AVAILABLE = True
+except ImportError:
+    _STATIC_SIGNALS_AVAILABLE = False
+    def _run_constraint_signals(*a, **k): return []  # type: ignore
+    def _run_remediation_signals(*a, **k): return []  # type: ignore
+
+
+# Minimal TargetRepoContext for routing repo-relative file reads.
+# Keep this intentionally small: resolve, read_file, exists only.
+class TargetRepoContext:
+    def __init__(self, repo_root: _Path):
+        self.repo_root = _Path(repo_root).resolve()
+
+    def resolve(self, relative_path: str) -> _Path:
+        rel = str(relative_path).lstrip("/")
+        candidate = (self.repo_root / rel).resolve(strict=False)
+        # Use is_relative_to when available, fallback to string containment
+        if hasattr(candidate, "is_relative_to"):
+            if not candidate.is_relative_to(self.repo_root):
+                raise ValueError("path outside repo root")
+        else:
+            if str(self.repo_root) not in str(candidate):
+                raise ValueError("path outside repo root")
+        return candidate
+
+    def read_file(self, relative_path: str) -> str:
+        p = self.resolve(relative_path)
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+
+    def exists(self, relative_path: str) -> bool:
+        try:
+            return self.resolve(relative_path).exists()
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Data container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PipelineResult:
+    vulnerability_text: str
+    patch: str
+    review: str
+    score_text: str
+    challenger: dict
+    impact: dict | None = None
+    final_score: float | None = None
+    behavior: dict | None = None
+    repo_root: _Path | None = None
+    hygiene: list | None = None
+    applicability: dict | None = None
+    orig_score: float | None = None
+    original_patch: str = ""
+    retry_patch: str | None = None
+    retry_attempted: bool = False
+    retry_succeeded: bool = False
+    retry_failed_file: str | None = None
+    retry_error_before: str | None = None
+    # Challenger-driven repair (Phase C)
+    repair_attempted: bool = False
+    repair_succeeded: bool = False
+    repair_patch: str | None = None
+    repair_challenger: dict | None = None
+    repair_defect_count: int = 0
+    repair_rechallenged: bool = False
+    original_challenger_defect_count: int = 0
+    # Deterministic static signals (Phase I)
+    constraint_signals: list[dict] | None = None
+    remediation_signals: list[dict] | None = None
+    # Language guardrail: dominant detected language of repo_root, used to
+    # gate Python-only signals (Test Support, Impact Surface, sink scanning).
+    detected_language: str = "python"
+    # Finding calibration (evidence-quality pass): one entry per
+    # plausible_risk/generic classified finding — {"original", "group",
+    # "reworded"}. None when calibration wasn't run at all (e.g. no
+    # findings to calibrate); _build_known_findings falls back to the
+    # uncalibrated classifier text when this is None or empty, so a
+    # calibration failure never loses a finding.
+    finding_calibration: list[dict] | None = None
+    # Repository Grounding (surfaced in the report as "Repository Context").
+    grounding: RepositoryGroundingResult | None = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_score(score_text: str) -> str:
+    """Pull the numeric score out of the scorer's response."""
+    match = re.search(r"confidence score[^0-9]*([0-9]+(?:\.[0-9]+)?)", score_text, re.IGNORECASE)
+    return match.group(1) if match else "N/A"
+
+
+def _extract_summary(vulnerability_text: str) -> str:
+    """Return the first non-empty line of the vulnerability file as a summary."""
+    for line in vulnerability_text.splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line:
+            return line
+    return "No summary available."
+
+
+def _split_review(review: str) -> dict[str, str]:
+    """
+    Split the review text into its three expected sections.
+
+    Returns a dict with keys: explanation, affected_areas, validation_notes.
+    Falls back to the full review text for each key if parsing fails.
+    """
+    sections: dict[str, str] = {
+        "explanation": "",
+        "affected_areas": "",
+        "validation_notes": "",
+    }
+
+    # Match section headers (### Explanation, **Explanation**, etc.)
+    pattern = re.compile(
+        r"(?:#{1,3}\s*|\*\*)(Explanation|Affected areas|Validation notes)(?:\*\*)?[:\s]*",
+        re.IGNORECASE,
+    )
+    parts = pattern.split(review)
+
+    # parts = [pre_text, header1, body1, header2, body2, ...]
+    i = 1
+    while i < len(parts) - 1:
+        header = parts[i].lower().replace(" ", "_")
+        body = re.sub(r"^\*{1,2}\s*", "", parts[i + 1]).strip()
+        if "explanation" in header:
+            sections["explanation"] = body
+        elif "affected" in header:
+            sections["affected_areas"] = body
+        elif "validation" in header:
+            sections["validation_notes"] = body
+        i += 2
+
+    # If parsing failed, populate all sections with the full review
+    if not any(sections.values()):
+        full = review.strip()
+        sections = {k: full for k in sections}
+
+    return sections
+
+
+def enhance_findings_with_impact(challenger: dict, impact_report: dict | None) -> None:
+    """Apply deterministic textual augmentation to adversarial challenger notes
+
+    This helper does not alter impact analysis results — it only appends
+    human-readable sentences into the challenger dict under
+    'impact_annotations' so the report can surface them.
+
+    Rules (deterministic):
+      - high -> append propagation sentence
+      - medium -> append validation sentence
+      - low -> append nothing
+    """
+    if not impact_report:
+        return
+    level = (impact_report.get("impact_level") or "").lower()
+    ann = challenger.get("impact_annotations") or []
+    if level == "high":
+        ann.append("This issue may propagate across multiple flows due to widespread usage of the affected function.")
+    elif level == "medium":
+        ann.append("This issue affects multiple components and should be validated across flows.")
+    # low -> do nothing
+    if ann:
+        challenger["impact_annotations"] = ann
+
+
+def build_recommendation(challenger: dict, final_score: float | None, rating: str, impact: dict | None) -> dict:
+    """Deterministic recommendation builder.
+
+    Returns a dict: {"decision": str, "reason": str}
+    Decision is one of: "Safe to deploy", "Deploy with caution", "Do not deploy yet".
+    The reason is a single human-readable sentence (<=120 chars) that focuses on
+    adversarial findings, impact, and test support. It must NOT mention numeric
+    confidence or raw labels like "impact: MEDIUM".
+    """
+    # Normalize inputs
+    impact_level = (impact.get("impact_level") if impact else "low") or "low"
+    impact_level = impact_level.lower()
+    rating_norm = (rating or "None").strip()
+
+    still = bool(challenger and challenger.get("still_vulnerable"))
+    edge_cases = (challenger.get("edge_cases") or []) if challenger else []
+    potential = (challenger.get("potential_issues") or []) if challenger else []
+    adv_exist = bool(edge_cases or potential)
+
+    # Rule: Do not deploy yet (evaluate first)
+    if still:
+        decision = "Do not deploy yet"
+    elif final_score is not None and isinstance(final_score, (int, float)) and final_score < 0.5:
+        decision = "Do not deploy yet"
+    elif impact_level == "high" and rating_norm.lower() == "none":
+        # Explicit override: high impact + no tests -> do not mark safe
+        decision = "Do not deploy yet"
+    else:
+        # Deploy with caution conditions
+        if adv_exist or impact_level in ("medium", "high") or rating_norm == "None" or (
+            final_score is not None and final_score < 0.75
+        ):
+            decision = "Deploy with caution"
+        else:
+            # Safe to deploy only when clear of adversarial findings, good tests, high score, and low impact
+            if (not adv_exist) and final_score is not None and final_score >= 0.75 and rating_norm in ("Some", "Good") and impact_level == "low":
+                decision = "Safe to deploy"
+            else:
+                decision = "Deploy with caution"
+
+    # Build reason fragments (do NOT mention numeric score)
+    phrases: list[str] = []
+    if adv_exist:
+        phrases.append("adversarial findings remain")
+    if impact_level == "high":
+        phrases.append("impact is high")
+    elif impact_level == "medium":
+        phrases.append("impact is medium")
+    # Test support phrasing
+    if rating_norm == "None":
+        phrases.append("direct test coverage is missing")
+    elif rating_norm == "Some":
+        phrases.append("direct test coverage is limited")
+
+    # If no focused phrase, provide a minimal neutral reason
+    if not phrases:
+        if decision == "Safe to deploy":
+            reason = "No adversarial findings, impact is low, and direct tests provide reasonable coverage."
+        else:
+            reason = "No adversarial findings, but please verify impact and test coverage before deploying."
+    else:
+        # Compose a single natural sentence
+        # Join with commas and a final conjunction if appropriate
+        if len(phrases) == 1:
+            reason_core = phrases[0]
+        elif len(phrases) == 2:
+            reason_core = f"{phrases[0]} and {phrases[1]}"
+        else:
+            reason_core = ", ".join(phrases[:-1]) + ", and " + phrases[-1]
+        reason = reason_core[0].upper() + reason_core[1:] + "."
+
+    # Enforce single sentence, <=120 chars, no bullets
+    reason = re.sub(r"\s+", " ", reason).strip()
+    if len(reason) > 120:
+        # Truncate safely at word boundary
+        cut = reason[:120]
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        reason = cut.rstrip("., ") + "."
+
+    # Ensure no bullet characters
+    reason = reason.replace("-", "").replace("*", "")
+
+    return {"decision": decision, "reason": reason}
+
+
+# ---------------------------------------------------------------------------
+# Trust Package V1 helpers
+# ---------------------------------------------------------------------------
+
+# Explicit exploitability patterns — always Confirmed Defect regardless of context.
+# These assert the CURRENT STATE of exploitability of the primary vulnerability and
+# are unambiguous: no scope qualifier can make "still vulnerable" a limitation.
+_EXPLICIT_DEFECT_RE = re.compile(
+    r"\b(still\s+(vulnerable|exploitable)"
+    r"|attack\s+(still|remains|continues)"
+    r"|(can|could)\s+(be\s+)?bypass\w*"  # active exploit: can bypass, can be bypassed
+    r"|allow\w*\s+(be\s+)?bypass\w*"     # active exploit: allows bypass
+    r"|can\s+still\s+be\s+(exploited|attacked)"
+    r"|attack\s+vector\s+remains"
+    r"|remain[s]?\s+exploitable)\b",
+    re.IGNORECASE,
+)
+
+# "does not fix/address/prevent/close" — CONTEXTUAL pattern.
+# Primary fix failure if no scope marker is present; scope limitation otherwise.
+_DOES_NOT_RE = re.compile(
+    r"\bdoes\s+not\s+(fix|address|prevent|close)\b",
+    re.IGNORECASE,
+)
+
+# Version markers — version numbers, legacy/older release references.
+# Presence alongside _DOES_NOT_RE indicates a scope limitation, not a primary failure.
+_VERSION_MARKER_RE = re.compile(
+    r"v?\d+\.\d+[\.\d]*\b"                  # v1.26.x, 2.0.6, v1.x (numeric major.minor)
+    r"|\d+\.x\b"                             # 1.x, 26.x (wildcard minor)
+    r"|\bversion\s+\d"                       # version 1, version 2
+    r"|\bolder\s+(versions?|releases?)\b"
+    r"|\blegacy\s+(versions?|branch|releases?)\b"
+    r"|\bprevious\s+(versions?|releases?)\b"
+    r"|\bv\d+\s+(branch|releases?)\b",        # v1 branch
+    re.IGNORECASE,
+)
+
+# User/configuration/scope markers — conditional, optional, or orthogonal scope.
+# Presence alongside _DOES_NOT_RE indicates a scope limitation, not a primary failure.
+_SCOPE_MARKER_RE = re.compile(
+    r"\bif\s+users?\b"
+    r"|\busers?\s+who\b"                                         # "users who configure/override"
+    r"|\bfor\s+users?\s+(who|running|using|with|on)\b"          # "for users running 1.26.x"
+    r"|\bwhen\s+(configured|enabled|disabled|set|using)\b"
+    r"|\bunless\b"
+    r"|\bonly\s+(when|if|for|with)\b"
+    r"|\ba\s+separate\s+(fix|patch|commit)\b"
+    r"|\b(in\s+addition|additionally)\s+(needs?|requires?|should)\b"
+    r"|\bout(\s*-?\s*)of\s+scope\b"
+    r"|\bnot\s+in\s+scope\b",
+    re.IGNORECASE,
+)
+
+_VALIDATION_GAP_RE = re.compile(
+    r"\b(cannot\s+(verify|confirm|test|validate)|without\s+(running|testing|executing)"
+    r"|can'?t\s+(verify|confirm|test)|needs?\s+(test|verif|validat)"
+    r"|no\s+tests?\s+(run|executed)|should\s+be\s+tested|unverified|untested"
+    r"|requires?\s+(testing|validation)|unable\s+to\s+(verify|confirm))\b",
+    re.IGNORECASE,
+)
+_GENERIC_RE = re.compile(
+    r"\b(tests?\s+should|consider\s+(adding|using)|recommend|performance\s+impact"
+    r"|documentation|changelog|code\s+style|best\s+practice)\b",
+    re.IGNORECASE,
+)
+
+_BENEFIT_VERB_RE = re.compile(
+    r"\b(fix(es)?|prevent(s)?|add(s)?|block(s)?|strip(s)?|remov(es)?|"
+    r"resolve(s)?|ensure(s)?|protect(s)?|mitigat(es)?|eliminat(es)?|"
+    r"address(es)?|patch(es)?|close(s)?)\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_finding(text: str) -> str:
+    """Classify a single challenger finding into one of four categories.
+
+    Returns: 'confirmed_defect' | 'plausible_risk' | 'validation_gap' | 'generic'
+
+    Priority order:
+    1. Explicit exploitability patterns (still vulnerable, bypass, attack vector remains…)
+       → always confirmed_defect; scope markers do not override these.
+    2. "does not fix/address/prevent/close" WITH a version or scope marker
+       → plausible_risk (scope limitation, not a primary fix failure).
+    3. "does not fix/address/prevent/close" WITHOUT any scope marker
+       → confirmed_defect (the primary fix is being claimed as non-functional).
+    4. Validation gap patterns → validation_gap.
+    5. Generic observation patterns → generic.
+    6. Default → plausible_risk (conservative).
+    """
+    if not text:
+        return "generic"
+    # Step 1: explicit current-exploitability language — unambiguous confirmed defect.
+    if _EXPLICIT_DEFECT_RE.search(text):
+        return "confirmed_defect"
+    # Step 2: "does not fix/address/prevent/close" — contextual two-step check.
+    if _DOES_NOT_RE.search(text):
+        if _VERSION_MARKER_RE.search(text) or _SCOPE_MARKER_RE.search(text):
+            return "plausible_risk"   # finding describes a scope / version limitation
+        return "confirmed_defect"     # no scope qualifier → primary fix failure
+    # Step 3: validation gap.
+    if _VALIDATION_GAP_RE.search(text):
+        return "validation_gap"
+    # Step 4: generic observation.
+    if _GENERIC_RE.search(text):
+        return "generic"
+    return "plausible_risk"
+
+
+def _classify_challenger(challenger: dict) -> dict:
+    """Return an augmented challenger dict with per-finding classifications and counts."""
+    result = dict(challenger) if challenger else {}
+
+    classified_edge: list[dict] = []
+    for finding in (challenger or {}).get("edge_cases") or []:
+        classified_edge.append({"text": finding, "category": _classify_finding(finding)})
+    result["classified_edge_cases"] = classified_edge
+
+    classified_issues: list[dict] = []
+    for finding in (challenger or {}).get("potential_issues") or []:
+        classified_issues.append({"text": finding, "category": _classify_finding(finding)})
+    result["classified_potential_issues"] = classified_issues
+
+    all_classified = classified_edge + classified_issues
+    result["confirmed_defect_count"] = sum(1 for f in all_classified if f["category"] == "confirmed_defect")
+    result["plausible_risk_count"] = sum(1 for f in all_classified if f["category"] == "plausible_risk")
+    result["validation_gap_count"] = sum(1 for f in all_classified if f["category"] == "validation_gap")
+    return result
+
+
+def _extract_security_gain(explanation: str) -> str:
+    """Extract the concrete security benefit statement from the reviewer explanation.
+
+    Looks for the first sentence containing a security action verb (fix, prevent,
+    add, strip, etc.) that is long enough to be meaningful.  Falls back to the
+    first 250 characters of the explanation.
+    """
+    if not explanation:
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", explanation.strip())
+    for sentence in sentences:
+        if _BENEFIT_VERB_RE.search(sentence) and len(sentence.strip()) >= 40:
+            return sentence.strip()
+    # Fallback: first paragraph, truncated
+    first_para = explanation.split("\n\n", 1)[0].strip()
+    first_para = re.sub(r"\s+", " ", first_para)
+    if len(first_para) > 250:
+        first_para = first_para[:250].rsplit(" ", 1)[0] + "…"
+    return first_para
+
+
+# ---------------------------------------------------------------------------
+# Primary Vulnerability References
+#
+# Presentation-only text extraction, not a new data source: ghsa_to_vuln_text
+# / cve_to_vuln_text (advisory_converter.py / cve_converter.py) already
+# render a "**Advisory:** <id>" line and a "## References" URL list into
+# vulnerability_text for both --ghsa and --cve input modes. This parses that
+# already-present text the same way _extract_summary parses other blocks —
+# no network call, no new fetch, no semantic classifier.
+# ---------------------------------------------------------------------------
+
+_ADVISORY_LINE_RE = re.compile(r"^\*\*Advisory:\*\*\s*(.+)$", re.MULTILINE)
+_GHSA_ID_RE = re.compile(r"GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}")
+_CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,}")
+
+
+def _extract_primary_references(vulnerability_text: str) -> dict:
+    """Extract GHSA/CVE identifiers already embedded in vulnerability_text.
+    Returns None for any field not found — file-mode input (a hand-written
+    vulnerability.md) has no guaranteed structure, so every field degrades
+    gracefully rather than assuming GHSA/CVE input.
+
+    'advisory_url' is constructed from the identifier using GitHub's/NVD's
+    well-known, stable URL convention — not fetched or independently
+    verified, and labeled as such by the caller.
+
+    Deliberately does not extract upstream fix/remediation references (e.g.
+    a "referenced commit" from the advisory's References list): those imply
+    the generated patch was informed by an existing upstream fix, which the
+    reviewer report must not suggest. That data has no place here at all —
+    not even computed-but-hidden — since nothing in this pipeline persists
+    it elsewhere; it belongs only in benchmark/evaluation artifacts, which
+    are produced and reviewed separately from this report.
+    """
+    text = vulnerability_text or ""
+
+    ghsa_id = None
+    cve_id = None
+    advisory_match = _ADVISORY_LINE_RE.search(text)
+    if advisory_match:
+        line = advisory_match.group(1)
+        m = _GHSA_ID_RE.search(line)
+        if m:
+            ghsa_id = m.group(0)
+        m = _CVE_ID_RE.search(line)
+        if m:
+            cve_id = m.group(0)
+    if not ghsa_id:
+        m = _GHSA_ID_RE.search(text)
+        if m:
+            ghsa_id = m.group(0)
+    if not cve_id:
+        m = _CVE_ID_RE.search(text)
+        if m:
+            cve_id = m.group(0)
+
+    advisory_url = None
+    if ghsa_id:
+        advisory_url = f"https://github.com/advisories/{ghsa_id}"
+    elif cve_id:
+        advisory_url = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+
+    return {
+        "ghsa_id": ghsa_id,
+        "cve_id": cve_id,
+        "advisory_url": advisory_url,
+    }
+
+
+def _render_primary_references(refs: dict) -> str:
+    """Render the Vulnerability Sources section as a compact table (own
+    leading rule) — easier to scan than a bullet list.
+
+    Keeps only GHSA / CVE / Advisory URL, each linked where a URL is known.
+    Deliberately excludes any upstream fix/remediation reference — those
+    belong only in benchmark/evaluation artifacts, never in a reviewer
+    report, since showing them here could imply the generated patch was
+    copied from an existing upstream fix.
+
+    Degrades to a single line for file-mode input, where neither a GHSA nor
+    a CVE identifier is present in the vulnerability text at all.
+    """
+    ghsa_id = refs.get("ghsa_id")
+    cve_id = refs.get("cve_id")
+    advisory_url = refs.get("advisory_url")
+
+    lines: list[str] = ["---\n", "## Vulnerability Sources\n"]
+
+    if not ghsa_id and not cve_id:
+        lines.append("User-provided vulnerability description.\n")
+        return "\n".join(lines) + "\n"
+
+    ghsa_cell = f"[{ghsa_id}]({advisory_url})" if ghsa_id and advisory_url else (ghsa_id or "*(not applicable)*")
+    cve_url = advisory_url if (cve_id and not ghsa_id) else (f"https://nvd.nist.gov/vuln/detail/{cve_id}" if cve_id else None)
+    cve_cell = f"[{cve_id}]({cve_url})" if cve_id and cve_url else (cve_id or "*(not applicable / no associated CVE)*")
+    advisory_cell = f"[{advisory_url}]({advisory_url})" if advisory_url else "*(not stated in the advisory text)*"
+
+    lines.append("| Type | Value |")
+    lines.append("|---|---|")
+    lines.append(f"| GHSA | {ghsa_cell} |")
+    lines.append(f"| CVE | {cve_cell} |")
+    lines.append(f"| Advisory URL | {advisory_cell} |")
+    lines.append("")
+
+    if advisory_url:
+        lines.append("*Advisory URL is constructed from the identifier above, not independently fetched.*")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Repository Context (Repository Grounding, surfaced in the report)
+#
+# "Selected because" — one phrase per semantic reason kind. Literal lookup
+# only: does not change which reason kind a candidate carries.
+# ---------------------------------------------------------------------------
+_GROUNDING_REASON_PHRASES = {
+    "explicit_path": "Explicitly referenced in the security advisory",
+    "symbol_search": "References a symbol named in the advisory",
+    "cwe_keywords": "Contains terminology associated with this vulnerability type",
+    "class_definition_supplement": "Defines a class named in the advisory",
+}
+
+# "Used for" — one phrase per GroundingDecision.outcome. Literal lookup only:
+# does not change which outcome find_code_context() selects.
+_GROUNDING_USED_FOR_PHRASES = {
+    "primary_full_file": "Primary reference (full file)",
+    "primary_snippet": "Primary reference (excerpt)",
+    "secondary_snippet": "Supporting reference (excerpt)",
+}
+
+
+# ---------------------------------------------------------------------------
+# Adapter: the only place that understands Repository Grounding internals
+# (DiscoveryEvidence, best_tier, evidence ordering, tier matching, selection
+# mechanics). Everything downstream — the renderer included — sees only a
+# semantic reason kind (a key into _GROUNDING_REASON_PHRASES), never a
+# RepositoryCandidate's evidence list directly.
+# ---------------------------------------------------------------------------
+def _selected_reason_kind(candidate: "RepositoryCandidate | None") -> "str | None":
+    """Return the semantic reason kind that best explains why `candidate`
+    was selected: the DiscoveryEvidence.pass_name whose tier produced the
+    candidate's best_tier (the tier that actually drove ranking/selection).
+    Falls back to the first evidence entry's pass_name for class-definition-
+    supplement-only candidates, where best_tier is None by construction."""
+    if not candidate or not candidate.evidence:
+        return None
+    if candidate.best_tier is not None:
+        for e in candidate.evidence:
+            if e.tier == candidate.best_tier:
+                return e.pass_name
+    return candidate.evidence[0].pass_name
+
+
+def _render_repository_context_section(grounding: "RepositoryGroundingResult | None") -> str:
+    """Render the Repository Context section (own leading rule).
+
+    Shows only the repository locations find_code_context() actually
+    selected (decision.outcome != "rejected") — no candidate counts, no
+    rejected locations. None-safe: renders the zero-selection sentence when
+    grounding is None or nothing was selected. Preserves the order
+    grounding.decisions already comes in — no additional sorting.
+    """
+    lines: list[str] = ["---\n", "## Repository Context\n"]
+
+    selected = [d for d in (grounding.decisions if grounding else []) if d.outcome != "rejected"]
+    if not selected:
+        lines.append(
+            "No repository locations were identified to provide context for "
+            "this vulnerability.\n"
+        )
+        return "\n".join(lines) + "\n"
+
+    lines.append(
+        "The following repository locations were selected to provide context "
+        "for patch generation and review.\n"
+    )
+
+    candidates_by_path = {c.path: c for c in grounding.candidates}
+
+    entries = []
+    for dec in selected:
+        candidate = candidates_by_path.get(dec.path)
+        kind = _selected_reason_kind(candidate)
+        reason = _GROUNDING_REASON_PHRASES.get(kind, "Identified during repository grounding")
+        used_for = _GROUNDING_USED_FOR_PHRASES.get(dec.outcome, dec.outcome)
+        entries.append(
+            f"**`{dec.path}`**\n\nSelected because\n- {reason}\n\nUsed for\n- {used_for}"
+        )
+
+    lines.append("\n\n---\n\n".join(entries))
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _build_known_findings(classified_challenger: dict, finding_calibration: list[dict] | None = None) -> dict:
+    """Group already-classified challenger findings into report-facing
+    epistemic categories for the Known Findings section.
+
+    This reuses the four categories _classify_challenger already computes
+    (confirmed_defect / plausible_risk / validation_gap / generic) — no new
+    classification, no change to the counts _compute_trust_signals and
+    _build_recommendation_v1 read.
+
+      confirmed_defect  -> potential_remaining_risks   (presented as heuristic
+                           adversarial-review concerns, not confirmed facts,
+                           since the challenger is LLM analysis, not
+                           deterministic verification)
+      validation_gap    -> validation_gaps             ("things we did not verify")
+      plausible_risk,
+      generic           -> split three ways by the finding_calibration stage
+                           (evidence-quality pass): observed_implementation_notes,
+                           validation_hypotheses, future_hardening_ideas.
+
+    finding_calibration is the (optional) output of
+    finding_calibration.calibrate_findings — a list of {"original", "group",
+    "reworded"} dicts covering the plausible_risk/generic findings. When a
+    finding has no matching calibration entry (calibration wasn't run, or
+    failed, or omitted this specific finding), it falls back to a
+    conservative default rather than being dropped: plausible_risk ->
+    Validation Hypotheses (already a hedge), generic -> Future Hardening
+    Ideas (already a suggestion) — the same mapping this project used before
+    calibration existed, so a calibration failure degrades to prior behavior
+    rather than losing information.
+
+    Returns a plain dict of five lists so the renderer (and tests) can
+    address each category directly. Rendering/suppression decisions (e.g.
+    whether an empty category renders at all) belong to the caller, not here.
+    """
+    all_findings = (
+        list(classified_challenger.get("classified_edge_cases") or [])
+        + list(classified_challenger.get("classified_potential_issues") or [])
+    )
+
+    potential_remaining_risks = [f["text"] for f in all_findings if f["category"] == "confirmed_defect"]
+
+    validation_gaps: list[str] = []
+    for f in all_findings:
+        if f["category"] == "validation_gap" and len(validation_gaps) < 3:
+            validation_gaps.append(f["text"])
+
+    calibration_by_original = {
+        entry.get("original"): entry for entry in (finding_calibration or [])
+    }
+
+    observed_implementation_notes: list[str] = []
+    validation_hypotheses: list[str] = []
+    future_hardening_ideas: list[str] = []
+
+    for f in all_findings:
+        if f["category"] not in ("plausible_risk", "generic"):
+            continue
+        entry = calibration_by_original.get(f["text"])
+        if entry and entry.get("reworded"):
+            group = entry.get("group")
+            text = entry["reworded"]
+        else:
+            group = "hypothesis" if f["category"] == "plausible_risk" else "hardening"
+            text = f["text"]
+
+        if group == "observed":
+            observed_implementation_notes.append(text)
+        elif group == "hardening":
+            future_hardening_ideas.append(text)
+        else:
+            validation_hypotheses.append(text)
+
+    return {
+        "potential_remaining_risks": potential_remaining_risks,
+        "validation_gaps": validation_gaps,
+        "observed_implementation_notes": observed_implementation_notes,
+        "validation_hypotheses": validation_hypotheses,
+        "future_hardening_ideas": future_hardening_ideas,
+    }
+
+
+def _compute_trust_signals(
+    hygiene: list | None,
+    applicability: dict | None,
+    classified_challenger: dict,
+    testing_rating: str,
+    impact_level: str,
+) -> dict:
+    """Compute the six Trust Package signals from existing deterministic pipeline outputs.
+
+    Returns a dict mapping signal keys to {value, label, notes} dicts.
+    All logic is deterministic — no LLM score is used.
+    """
+    hygiene = hygiene or []
+    applicability = applicability or {}
+    impact_level = (impact_level or "low").lower()
+
+    high_hygiene = [h for h in hygiene if h.get("severity") == "HIGH"]
+    med_hygiene = [h for h in hygiene if h.get("severity") == "MEDIUM"]
+
+    defect_count = classified_challenger.get("confirmed_defect_count", 0)
+    risk_count = classified_challenger.get("plausible_risk_count", 0)
+    gap_count = classified_challenger.get("validation_gap_count", 0)
+    still_vulnerable = bool((classified_challenger or {}).get("still_vulnerable"))
+
+    # --- Patch Integrity ---
+    if high_hygiene:
+        int_val = "Critical Issues"
+        int_notes = f"HIGH: {high_hygiene[0].get('detail', '')[:80]}"
+    elif applicability.get("applicable") is False:
+        int_val = "Does Not Apply"
+        stderr = (applicability.get("stderr") or "").replace("\n", " ")[:60]
+        int_notes = stderr if stderr else "rejected by git apply"
+    elif applicability.get("skipped"):
+        int_val = "Not Verified"
+        int_notes = applicability.get("skipped_reason") or "no .git repo to check against"
+    elif med_hygiene:
+        int_val = "Minor Issues"
+        int_notes = f"MEDIUM: {med_hygiene[0].get('detail', '')[:80]}"
+    else:
+        int_val = "Clean"
+        int_notes = "Applies cleanly · no hygiene issues"
+
+    # --- Security Improvement (fully deterministic, no LLM score) ---
+    if applicability.get("applicable") is False:
+        imp_val = "None"
+        imp_notes = "Patch does not apply to repository"
+    elif applicability.get("skipped") and not applicability.get("applicable"):
+        imp_val = "Unknown"
+        imp_notes = "No repository available for applicability check"
+    elif high_hygiene:
+        imp_val = "Low"
+        imp_notes = "Critical hygiene issue — patch may be a no-op"
+    elif defect_count > 0:
+        imp_val = "Low"
+        imp_notes = f"{defect_count} review finding(s) flagged as high-confidence heuristic risk"
+    elif not still_vulnerable:
+        imp_val = "High"
+        imp_notes = "Adversarial review found no remaining exploit path"
+    elif still_vulnerable and risk_count == 0:
+        # still_vulnerable=True but only due to validation gaps, not high-confidence findings
+        imp_val = "High"
+        imp_notes = f"No high-confidence heuristic risk identified · {gap_count} verification gap(s)"
+    else:
+        imp_val = "Medium"
+        total = risk_count + gap_count
+        imp_notes = f"No high-confidence heuristic risk identified · {total} review finding(s) remain open"
+
+    # --- Remediation Alignment ---
+    if defect_count > 0:
+        aln_val = "Misaligned"
+        aln_notes = "Confirmed alternate exploit path identified"
+    elif not still_vulnerable:
+        aln_val = "Aligned"
+        aln_notes = "Adversarial review confirms fix approach"
+    elif still_vulnerable and risk_count == 0:
+        aln_val = "Likely Aligned"
+        aln_notes = "Correct mechanism · runtime verification pending"
+    else:
+        aln_val = "Partial"
+        aln_notes = f"still_vulnerable flag set · {risk_count} plausible risk(s)"
+
+    # --- Coverage Confidence ---
+    if defect_count > 0:
+        cov_val = "Low"
+        cov_notes = f"{defect_count} review finding(s) flagged as high-confidence heuristic risk"
+    elif risk_count > 0 or gap_count > 0:
+        total = risk_count + gap_count
+        cov_val = "Medium"
+        cov_notes = (
+            f"{total} review finding(s) · no deterministic blocker identified — "
+            "none rose to a confirmed, high-confidence defect during adversarial review"
+        )
+    else:
+        cov_val = "High"
+        cov_notes = "No gaps identified by adversarial analysis"
+
+    # --- Test Availability (replaces Validation Evidence) ---
+    if testing_rating in ("Good", "Some"):
+        tst_val = "Tests Available"
+        tst_notes = f"{testing_rating} — test files cover this module"
+    elif testing_rating == "Not Applicable":
+        tst_val = "Not Verified"
+        tst_notes = "Test discovery is not supported for this language yet"
+    else:
+        tst_val = "No Tests Found"
+        tst_notes = "No test files cover this module"
+
+    # --- Deployment Safety ---
+    # impact_level == "not_applicable" means the language guardrail skipped
+    # symbol/usage analysis (unsupported language) — it must render as
+    # "Not Verified", not fall through to the reassuring "Low Risk" default
+    # that an empty Python-only impact scan would otherwise produce.
+    if impact_level == "high" or high_hygiene:
+        saf_val = "High Risk"
+        saf_notes = f"{impact_level.upper()} impact surface"
+    elif impact_level == "medium":
+        saf_val = "Medium Risk"
+        saf_notes = "Moderate impact surface"
+    elif impact_level == "not_applicable":
+        saf_val = "Not Verified"
+        saf_notes = "Impact analysis is not supported for this language yet"
+    else:
+        saf_val = "Low Risk"
+        saf_notes = "Localized change · low regression risk"
+
+    # Icon mapping
+    _icons = {
+        "Clean": "✓", "High": "✓", "Aligned": "✓", "Low Risk": "✓",
+        "Likely Aligned": "◑", "Medium": "◑", "Partial": "◑",
+        "Medium Risk": "◑", "Tests Available": "◑", "Minor Issues": "⚠",
+        "Low": "⚠", "No Tests Found": "○",
+        "Critical Issues": "✗", "Does Not Apply": "✗", "Misaligned": "✗",
+        "High Risk": "✗", "None": "✗", "Unknown": "?", "Not Verified": "?",
+    }
+
+    def _label(val: str) -> str:
+        return f"{_icons.get(val, '')} {val}".strip()
+
+    return {
+        "patch_integrity":       {"value": int_val, "label": _label(int_val), "notes": int_notes},
+        "security_improvement":  {"value": imp_val, "label": _label(imp_val), "notes": imp_notes},
+        "remediation_alignment": {"value": aln_val, "label": _label(aln_val), "notes": aln_notes},
+        "coverage_confidence":   {"value": cov_val, "label": _label(cov_val), "notes": cov_notes},
+        "test_availability":     {"value": tst_val, "label": _label(tst_val), "notes": tst_notes},
+        "deployment_safety":     {"value": saf_val, "label": _label(saf_val), "notes": saf_notes},
+    }
+
+
+def _build_recommendation_v1(
+    signals: dict,
+    still_vulnerable: bool = False,
+    defect_count: int = 0,
+) -> dict:
+    """Produce a Trust Package recommendation from the six trust signals.
+
+    Returns {decision: str, reason: str}.  Decisions use the new V1 vocabulary:
+    'Deploy After Validation' | 'Deploy With Caution' | 'Manual Review Required'
+    | 'Do Not Apply'
+
+    Blocking policy (Recommendation Policy v2 — see docs/recommendation-policy-v2.md):
+      Hard-block  → integrity failure only (deterministic evidence: git-apply / hygiene).
+                    Pure heuristic evidence (challenger findings, incl. alignment=Misaligned)
+                    must never produce Do Not Apply on its own.
+      Escalation  → still_vulnerable=True with defect_count == 0, OR alignment=Misaligned
+                    (confirmed_defect_count > 0) — both are heuristic-only signals and land
+                    at Manual Review Required, never Do Not Apply.
+      Forward     → still_vulnerable=False with defect_count == 0
+    """
+    integrity = signals["patch_integrity"]["value"]
+    improvement = signals["security_improvement"]["value"]
+    alignment = signals["remediation_alignment"]["value"]
+    safety = signals["deployment_safety"]["value"]
+
+    if integrity in ("Does Not Apply", "Critical Issues"):
+        return {
+            "decision": "Do Not Apply",
+            "reason": "Patch has critical issues or does not apply to the target repository.",
+        }
+    if alignment == "Misaligned":
+        return {
+            "decision": "Manual Review Required",
+            "reason": (
+                "Adversarial review flagged findings classified as high-confidence risk "
+                "indicators; this is unresolved heuristic evidence, not a verified exploit — "
+                "manual review is required before deployment."
+            ),
+        }
+    if still_vulnerable and defect_count == 0:
+        return {
+            "decision": "Manual Review Required",
+            "reason": (
+                "Challenger flagged unverified risks but found no confirmed exploit path; "
+                "review the Known Findings before deploying."
+            ),
+        }
+    if improvement in ("High", "Medium") and safety != "High Risk":
+        return {
+            "decision": "Deploy After Validation",
+            "reason": (
+                "Patch addresses the attack vector described by the advisory and applies cleanly. "
+                "Run the listed validation actions before deployment."
+            ),
+        }
+    if improvement == "Low" and safety == "Low Risk":
+        return {
+            "decision": "Deploy With Caution",
+            "reason": "Patch provides limited or uncertain security improvement. Manual security review recommended.",
+        }
+    if safety == "High Risk":
+        return {
+            "decision": "Manual Review Required",
+            "reason": "Change has high deployment risk; regression testing across affected callers required.",
+        }
+    return {
+        "decision": "Manual Review Required",
+        "reason": "Patch requires manual security review before deployment.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Slice 1 — Decision Consistency
+#
+# Goal: a confident-sounding recommendation must never sit beside evidence,
+# already displayed elsewhere in the same report, that undercuts it without
+# saying so. This function only reads signals that are already computed and
+# already rendered in the Trust Signals table — it adds no new evidence and
+# never changes `decision`.
+# ---------------------------------------------------------------------------
+
+# Decisions that read as confident enough to require this check. The other
+# two decisions (Manual Review Required, Do Not Apply) already read as
+# cautious and do not need further hedging here.
+_TOP_TIER_DECISIONS = frozenset({"Deploy After Validation", "Deploy With Caution"})
+
+
+def _build_consistency_caveat(lead: str, notes: str) -> str:
+    """Compose one caveat sentence from a lead-in and an existing signal's notes.
+
+    Reuses the notes text already shown in the Trust Signals table rather
+    than inventing new wording, so the caveat is traceable to evidence the
+    reader has already seen.
+    """
+    notes = (notes or "").strip()
+    if not notes:
+        return f"{lead}."
+    if notes[-1] not in ".!?":
+        notes += "."
+    return f"{lead} — {notes}"
+
+
+def _decision_relevant_finding_count(known_findings: dict) -> int:
+    """Count Known Findings entries that bear on deployment confidence.
+
+    Coverage Confidence answers "how thoroughly did we explore the solution
+    space?" — Future Hardening Ideas are genuine evidence of that and must
+    keep counting there (see _compute_trust_signals, unchanged). This
+    function answers a different, narrower question — "should this
+    recommendation itself be discounted?" — so it deliberately excludes
+    future_hardening_ideas: those are explicitly out of the current
+    advisory's scope and are not reasons to distrust this deployment
+    recommendation, even though they're real findings worth knowing about.
+    """
+    return len(
+        known_findings.get("potential_remaining_risks", [])
+        + known_findings.get("validation_gaps", [])
+        + known_findings.get("observed_implementation_notes", [])
+        + known_findings.get("validation_hypotheses", [])
+    )
+
+
+def _check_recommendation_consistency(signals: dict, decision: str, known_findings: dict) -> list[str]:
+    """Surface already-displayed evidence that a top-tier recommendation does
+    not acknowledge on its own.
+
+    Deterministic; no LLM calls beyond what finding_calibration already ran.
+    Never alters `decision`. Returns an empty list when the decision is not
+    top-tier, or when neither weak-evidence condition applies.
+
+    "Not Verified" (the language-guardrail state for `test_availability`) is
+    intentionally excluded from the "No Tests Found" check — it means the
+    check could not run for this repository's language, not that tests are
+    confirmed absent. Treating the two as equivalent would recreate, inside
+    this fix, the exact kind of misleading conflation this fix exists to
+    remove.
+
+    The second caveat is intentionally NOT driven by coverage_confidence's
+    own value/notes (unlike before) — Coverage Confidence answers "how much
+    did we look" and legitimately includes Future Hardening Ideas; this
+    caveat answers "should this recommendation be discounted" and must not,
+    so it computes its own decision-relevant count from `known_findings`
+    instead of reusing the Trust Signal's broader one.
+    """
+    if decision not in _TOP_TIER_DECISIONS:
+        return []
+
+    caveats: list[str] = []
+
+    test_sig = signals.get("test_availability") or {}
+    if test_sig.get("value") == "No Tests Found":
+        caveats.append(
+            _build_consistency_caveat(
+                "This recommendation currently has no automated test coverage",
+                test_sig.get("notes", ""),
+            )
+        )
+
+    decision_relevant_count = _decision_relevant_finding_count(known_findings)
+    if decision_relevant_count > 0:
+        caveats.append(
+            _build_consistency_caveat(
+                "This recommendation's adversarial coverage is heuristic, not deterministically "
+                "confirmed — see Known Findings below for the validation questions and remaining "
+                "uncertainties",
+                f"{decision_relevant_count} decision-relevant finding(s) remain open",
+            )
+        )
+
+    return caveats
+
+
+def _render_recommendation_block(recommendation: dict, caveats: list[str] | None = None) -> str:
+    """Render just the Recommendation section (no leading rule — the caller's
+    preceding block is expected to end with one, matching prior layout)."""
+    lines: list[str] = []
+    lines.append("## Recommendation\n")
+    lines.append(f"**{recommendation['decision']}**\n")
+    lines.append(f"{recommendation['reason']}\n")
+
+    if caveats:
+        for c in caveats:
+            lines.append(f"> **Evidence check:** {c}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def _render_known_findings(findings: dict) -> str:
+    """Render the Review Results section (includes its own leading rule).
+
+    Five subsections, one per epistemic category from _build_known_findings.
+    Only populated categories render; the whole section is omitted when all
+    five are empty. Each subsection carries a one-line disclaimer stating its
+    certainty level explicitly, so a reviewer never has to guess whether a
+    bullet is a confirmed fact, a repository-backed observation, an unvalidated
+    hypothesis, or an out-of-scope suggestion.
+    """
+    risks = findings.get("potential_remaining_risks") or []
+    gaps = findings.get("validation_gaps") or []
+    observed = findings.get("observed_implementation_notes") or []
+    hypotheses = findings.get("validation_hypotheses") or []
+    hardening = findings.get("future_hardening_ideas") or []
+
+    if not (risks or gaps or observed or hypotheses or hardening):
+        return ""
+
+    lines: list[str] = ["---\n", "## Review Results\n"]
+    lines.append(
+        "*The bullet count below is not a count of confirmed defects — it "
+        "reflects how many observations the review produced. Confirmed "
+        "Observations, Validation Questions, and Future Improvements below "
+        "carry different confidence levels; see each subsection's own note.*\n"
+    )
+
+    if risks:
+        lines.append("### Potential Remaining Risks\n")
+        lines.append(
+            "*Flagged by heuristic adversarial review — not independently "
+            "reproduced or deterministically confirmed.*\n"
+        )
+        for r in risks:
+            lines.append(f"- {r}")
+        lines.append("")
+
+    if gaps:
+        lines.append("### Validation Gaps\n")
+        lines.append(
+            "*Behaviors the challenger flagged as not yet verified — independent "
+            "of whether the repository already has pre-existing tests for this "
+            "module (see Trust Signals above; both can be true at once).*\n"
+        )
+        for g in gaps:
+            lines.append(f"- {g}")
+        lines.append("")
+
+    if observed:
+        lines.append("### Confirmed Observations\n")
+        lines.append(
+            "*Directly backed by the repository evidence or patch diff shown "
+            "to the reviewer — not merely inferred.*\n"
+        )
+        for o in observed:
+            lines.append(f"- {o}")
+        lines.append("")
+
+    if hypotheses:
+        lines.append("### Validation Questions\n")
+        lines.append(
+            "*Plausible behaviors inferred from analysis, not directly observed "
+            "in the evidence shown to the reviewer — these describe conditions "
+            "under which something could happen, not confirmed outcomes, and "
+            "should be validated.*\n"
+        )
+        for h in hypotheses:
+            lines.append(f"- {h}")
+        lines.append("")
+
+    if hardening:
+        lines.append("### Future Improvements\n")
+        lines.append(
+            "*Unrelated to the current advisory — these do not reduce confidence "
+            "in the recommendation above.*\n"
+        )
+        for h in hardening:
+            lines.append(f"- {h}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# Trust Signals v2 — question-style rows with one consistent status
+# vocabulary (✅/⚠️/❌/?), replacing the old six-row table where "good"
+# pointed in different directions per row (High vs. Low Risk) and three
+# rows (security_improvement, remediation_alignment, coverage_confidence)
+# were peer-displayed duplicates of the same underlying challenger counts.
+#
+# Display only: _compute_trust_signals still computes all six keys exactly
+# as before (including security_improvement, which _build_recommendation_v1
+# still reads directly) — this only changes which keys get their own row
+# and how each value's status is worded.
+# Fourth element per row: the section that holds this row's detail, or
+# None when there isn't one. Only referenced when status isn't good — a row
+# that's already fine has nothing further to send the reader to.
+_TRUST_SIGNALS_V2_ROWS = [
+    ("Does the patch apply?", "patch_integrity", {
+        "Clean": "✅ Good",
+        "Minor Issues": "⚠️ Needs review",
+        "Critical Issues": "❌ Blocked",
+        "Does Not Apply": "❌ Blocked",
+        "Not Verified": "? Not verified",
+    }, "Patch Applicability"),
+    ("Does it address the vulnerability?", "remediation_alignment", {
+        "Aligned": "✅ Good",
+        "Likely Aligned": "⚠️ Needs review",
+        "Partial": "⚠️ Needs review",
+        "Misaligned": "❌ Blocked",
+    }, "Review Results"),
+    ("Are there unresolved concerns?", "coverage_confidence", {
+        "High": "✅ Good",
+        "Medium": "⚠️ Needs review",
+        "Low": "❌ Blocked",
+    }, "Review Results"),
+    ("Do relevant tests already exist?", "test_availability", {
+        "Tests Available": "✅ Good",
+        "No Tests Found": "⚠️ Needs review",
+        "Not Verified": "? Not verified",
+    }, "Test Support"),
+    ("Is deployment risk low?", "deployment_safety", {
+        "Low Risk": "✅ Good",
+        "Medium Risk": "⚠️ Needs review",
+        "High Risk": "❌ Blocked",
+        "Not Verified": "? Not verified",
+    }, "Impact Surface"),
+]
+
+def _render_trust_signals_table(signals: dict, known_findings_rendered: bool = True) -> str:
+    """Render the Trust Signals table (includes its own leading rule).
+
+    Every row whose status is not "✅ Good" gets an explicit pointer to the
+    existing section heading that holds its detail, so "see below" always
+    names a real destination. A row that's already good gets no pointer —
+    there's nothing further to send the reader to.
+
+    known_findings_rendered must reflect whether the Review Results section
+    will actually render (see _build_known_findings) — remediation_alignment
+    can still be non-good even when no finding list is populated (e.g.
+    "Likely Aligned"), so the pointer to Review Results is suppressed for
+    that row rather than risk a reference to a section that isn't there.
+
+    The "Do relevant tests already exist?" row always carries a fixed bridge
+    note, regardless of status: it answers only whether the repository
+    already has related tests (Existing Test Coverage) — a separate question
+    from whether the new patched behavior itself is validated (see Review
+    Results -> Validation Gaps). Without this, "✅ Good" here can visually
+    contradict a "no test validates this behavior" finding elsewhere, even
+    though both are true and answer different questions.
+    """
+    lines: list[str] = []
+    lines.append("---\n")
+    lines.append("## Trust Signals\n")
+    lines.append(
+        "*Patch Integrity, Test Availability, and Deployment Risk are deterministic "
+        "checks. Remediation Alignment and Coverage Confidence are derived from "
+        "heuristic adversarial review, not independent verification.*\n"
+    )
+    lines.append("| Question | Status | Notes |")
+    lines.append("|---|---|---|")
+    for question, key, status_map, target_section in _TRUST_SIGNALS_V2_ROWS:
+        sig = signals[key]
+        value = sig["value"]
+        status = status_map.get(value, "? Not verified")
+        notes = sig["notes"].rstrip()
+        effective_target = target_section
+        if target_section == "Review Results" and not known_findings_rendered:
+            effective_target = None
+        if key == "test_availability":
+            # Points at "Review Results" as a whole, not specifically its
+            # Validation Gaps subsection: the challenger's own phrasing
+            # determines which Review Results category a given "this isn't
+            # validated" observation lands in (e.g. "no test appears to be
+            # added validating X" classifies as a Behavior Note today, not a
+            # Validation Gap) — verified against a real live challenger run,
+            # not assumed. Naming a specific subsection here would risk
+            # pointing at one that's empty while the relevant content sits
+            # in another.
+            bridge = "existing repository coverage only — new-behavior validation is tracked separately, see Review Results below"
+            if status != "✅ Good" and effective_target:
+                bridge += f"; see {effective_target} section below for existing coverage detail"
+            notes = f"{notes} ({bridge})" if notes else bridge.capitalize()
+        elif status != "✅ Good" and effective_target:
+            notes = f"{notes} — see {effective_target} section below" if notes else \
+                f"See {effective_target} section below"
+        lines.append(f"| {question} | {status} | {notes} |")
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def _render_validation_actions_section(validation_actions: list[dict], decision: str = "") -> str:
+    """Render Validation Actions (includes its own leading rule). Empty string
+    when there are no actions, same as before the split.
+
+    This is now the single, canonical checklist section — it includes each
+    action's Reason as well as its Next step. A separate "Validation Plan"
+    section used to repeat these same (already-capped-at-3) items lower in
+    the report with Reason added; verified there was no other unique data
+    in it, so it was removed rather than kept as a second name for the same
+    checklist.
+
+    `decision` only changes a leading note's wording (added when "Do Not
+    Apply") — it does not change which actions are computed, their order,
+    priority, or count.
+    """
+    if not validation_actions:
+        return ""
+
+    lines: list[str] = []
+    lines.append("---\n")
+    lines.append("## Validation Actions\n")
+    if decision == "Do Not Apply":
+        lines.append(
+            "*This patch is not recommended for deployment. The items below "
+            "apply only if a corrected patch is produced — not to this one.*\n"
+        )
+    for i, action in enumerate(validation_actions[:3], start=1):
+        priority = action.get("priority", "")
+        title = action.get("title", "")
+        reason = action.get("reason", "")
+        next_step = action.get("next_step", "")
+        lines.append(f"{i}. **[{priority}]** {title}  ")
+        if reason:
+            lines.append(f"   Reason: {reason}  ")
+        if next_step:
+            lines.append(f"   Next step: {next_step}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Decision Card (Report Structure v2, Phase 1) — first-screen summary
+#
+# Renders only values already computed elsewhere (trust_rec, patch_integrity
+# signal, validation_actions count, files_changed count). Adds no new
+# analysis, no new signals, and does not alter recommendation policy,
+# trust signal computation, or classification.
+# ---------------------------------------------------------------------------
+
+_DECISION_CARD_EMOJI = {
+    "Deploy After Validation": "🟢",
+    "Deploy With Caution": "🟡",
+    "Manual Review Required": "🟠",
+    "Do Not Apply": "🔴",
+}
+
+# Composed as "Patch {label}." — lowercase, verb-first, so it reads as a
+# grammatical sentence in the Hero Banner (this is the "existing patch
+# applicability label", reused, not a new signal).
+_DECISION_CARD_PATCH_LABEL = {
+    "Clean": "applies cleanly",
+    "Minor Issues": "applies, with minor hygiene issues",
+    "Critical Issues": "has critical issues",
+    "Does Not Apply": "does not apply",
+    "Not Verified": "was not verified",
+}
+
+
+def _render_decision_card(
+    recommendation: dict,
+    signals: dict,
+    validation_actions: list[dict],
+    files_changed: list[str],
+) -> str:
+    """Render the Decision Card as a first-screen Hero Banner.
+
+    The large decision line (emoji + decision, as a heading) is the first
+    visible content after the report title — it doubles as the anchor for
+    tests/tooling, so no separate "## Decision Card" label is needed. Every
+    field below it is read from a value the pipeline already computed
+    elsewhere in this module — no new evidence gathering, no new signal
+    derivation, no independent "confidence" judgment.
+    """
+    decision = recommendation["decision"]
+    emoji = _DECISION_CARD_EMOJI.get(decision, "⚪")
+
+    patch_value = signals["patch_integrity"]["value"]
+    patch_label = _DECISION_CARD_PATCH_LABEL.get(patch_value, patch_value.lower())
+
+    # Wording deliberately does not name a section — the Hero Banner must
+    # stay valid even if section names or positions change elsewhere in the
+    # report (they already have, more than once).
+    action_count = len(validation_actions or [])
+    if decision == "Do Not Apply":
+        # "Before deployment" is actively misleading here — there is no
+        # deployment to validate toward. These are the same already-computed
+        # validation_actions, just described as applying to a future,
+        # corrected patch rather than this one.
+        if action_count == 0:
+            validation_line = "This patch should not be deployed."
+        elif action_count == 1:
+            validation_line = (
+                "This patch should not be deployed. "
+                "The item below applies only to a corrected patch, not this one."
+            )
+        else:
+            validation_line = (
+                "This patch should not be deployed. "
+                "The items below apply only to a corrected patch, not this one."
+            )
+    elif action_count == 0:
+        validation_line = "No additional validation actions identified."
+    elif action_count == 1:
+        validation_line = "Complete the recommended validation check before deployment."
+    else:
+        validation_line = "Complete the recommended validation checks before deployment."
+
+    lines = [
+        f"## {emoji} {decision.upper()}\n",
+        f"Patch {patch_label}.  ",
+        f"{validation_line}  ",
+        f"Files changed: {len(files_changed)}",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _render_deterministic_signals(
+    constraint_signals: list[dict] | None,
+    remediation_signals: list[dict] | None,
+) -> str:
+    """Render Deterministic Signals section as a Markdown string.
+
+    Returns empty string when both signal lists are absent or empty.
+    """
+    all_signals = list(constraint_signals or []) + list(remediation_signals or [])
+    if not all_signals:
+        return ""
+
+    _STATUS_ICON = {
+        "green": "✓",
+        "red": "✗",
+        "n/a": "—",
+        "yellow": "⚠",
+        "violations": "⚠",
+        "see evidence": "◑",
+        "unknown": "◑",
+    }
+
+    def _icon(status: str) -> str:
+        return _STATUS_ICON.get(status.lower().split()[0], "◑")
+
+    lines: list[str] = ["---\n", "## Deterministic Signals\n"]
+    lines.append("| Signal | Status |")
+    lines.append("|--------|--------|")
+    evidence_blocks: list[tuple[str, list[str]]] = []
+    for sig in all_signals:
+        name = sig.get("name", "")
+        status = sig.get("status", "")
+        icon = _icon(status)
+        lines.append(f"| {name} | {icon} {status} |")
+        # Collect evidence for RED / violation signals
+        if status.lower().startswith("red") or "violation" in status.lower():
+            ev = sig.get("evidence") or []
+            if ev:
+                evidence_blocks.append((name, ev))
+    lines.append("")
+
+    for name, ev in evidence_blocks:
+        lines.append(f"**{name} — Evidence**\n")
+        for item in ev[:5]:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Report builder
+# ---------------------------------------------------------------------------
+
+
+def _render_repair_notice(result: PipelineResult) -> str:
+    """Return a short Markdown blockquote about the repair attempt, or empty string.
+
+    Renders only what was actually observed. `repair_defect_count` is only a
+    real, re-challenge-derived number when `repair_rechallenged` is True — it
+    is otherwise an untouched default and must never be printed as if it were
+    a finding.
+    """
+    if not result.repair_attempted:
+        return ""
+    if result.repair_succeeded:
+        return (
+            f"\n> **Auto-repaired:** Original patch had "
+            f"{result.original_challenger_defect_count} confirmed defect(s). "
+            f"A repair was generated and accepted — re-challenge found 0 confirmed defect(s).\n"
+        )
+    if result.repair_rechallenged:
+        return (
+            f"\n> **Repair attempted:** Challenger found "
+            f"{result.original_challenger_defect_count} confirmed defect(s). "
+            f"Repair patch still had {result.repair_defect_count} confirmed defect(s); "
+            f"original recommendation stands.\n"
+        )
+    return (
+        f"\n> **Repair attempted:** Challenger found "
+        f"{result.original_challenger_defect_count} confirmed defect(s). "
+        f"The repair patch did not reach re-challenge (it failed to apply, or the "
+        f"repair loop encountered an unexpected error) — no repair defect count is "
+        f"available; original recommendation stands.\n"
+    )
+
+
+def _render_retry_notice(result: PipelineResult) -> str:
+    """Return a short Markdown blockquote about the applicability-aware retry
+    attempt, or empty string when no retry occurred.
+
+    Renders only the already-computed retry_attempted/retry_succeeded fields —
+    does not re-derive, trigger, or otherwise affect retry behavior.
+    """
+    if not result.retry_attempted:
+        return ""
+    if result.retry_succeeded:
+        outcome = "Retry succeeded — patch now applies cleanly."
+    else:
+        outcome = "Retry failed to produce an applicable patch."
+    return (
+        "\n\n> **Applicability-aware retry**\n"
+        "> - Initial patch did not apply.\n"
+        "> - Applicability-aware retry was attempted.\n"
+        f"> - Outcome: {outcome}"
+    )
+
+
+def _build_report(result: PipelineResult) -> str:
+    # === [A] Extract and prepare data ===
+    summary = _extract_summary(result.vulnerability_text)
+    review_sections = _split_review(result.review)
+    challenger = result.challenger or {}
+    behavior = result.behavior
+
+    # Files touched by the unified diff — used by the Hero Banner's "Files
+    # changed" count. "Impact Summary" and "Testing Notes" (which used to be
+    # built here as restatements of Explanation/Known Findings/Reviewer
+    # Notes) were removed as duplicated storytelling — each of their three-
+    # to-four subsections repeated content already shown elsewhere verbatim
+    # or near-verbatim.
+    files_changed = []
+    for line in (result.patch or "").splitlines():
+        if line.startswith("+++ b/"):
+            files_changed.append(line[6:].strip())
+
+    # Build Patch Hygiene section
+    hygiene_findings = result.hygiene or []
+    if hygiene_findings:
+        hygiene_lines = []
+        for f in hygiene_findings:
+            sev = f.get("severity", "?")
+            detail = f.get("detail", "")
+            hygiene_lines.append(f"- [{sev}] {detail}")
+        hygiene_section = "\n".join(hygiene_lines)
+    else:
+        hygiene_section = "No obvious hygiene issues detected."
+
+    # Build Patch Applicability section
+    app = result.applicability or {}
+    if not app or app.get("skipped"):
+        reason = (app.get("skipped_reason") or "applicability check did not run")
+        applicability_section = f"*(Skipped — {reason}.)*"
+    elif app.get("error"):
+        applicability_section = f"**Result:** ⚠ Error — {app['error']}"
+    elif app.get("applicable") is True:
+        applicability_section = "**Result:** ✓ Patch applies cleanly to the target repository."
+    elif app.get("applicable") is False:
+        stderr = (app.get("stderr") or "").strip()
+        applicability_section = "**Result:** ✗ Patch does not apply cleanly."
+        if stderr:
+            applicability_section += f"\n\n```\n{stderr}\n```"
+    else:
+        applicability_section = "*(Applicability unknown.)*"
+
+    # -----------------------
+    # Hoist: Suggested Tests + Test Support + Validation Actions
+    # (needed before Trust Package computation)
+    # -----------------------
+    adv_parts_early = []
+    if challenger:
+        for e in (challenger.get("edge_cases") or []):
+            adv_parts_early.append(f"- {e}")
+        for p in (challenger.get("potential_issues") or []):
+            adv_parts_early.append(f"- {p}")
+    adv_text_early = "\n".join(adv_parts_early).strip()
+    findings_early = extract_findings(adv_text_early) if adv_text_early else []
+    suggestions = suggest_tests(findings_early, behavior=behavior) if (findings_early or behavior) else []
+
+    ts_root = result.repo_root if result.repo_root else Path.cwd()
+    target_file_display = "unknown"
+    target_path_obj = None
+    m = re.search(r"^\+\+\+ b/(.+)$", result.patch or "", re.MULTILINE)
+    if m:
+        target_rel = m.group(1).strip()
+        target_file_display = target_rel
+        target_path_obj = ts_root / target_rel
+    all_tests = discover_tests(ts_root)
+    total_tests_found = len(all_tests)
+    _report_language = result.detected_language or "python"
+    matches: list = []
+    rating = "None"
+    delta = -0.15
+    metadata: dict = {}
+    if target_path_obj is not None:
+        matches = tests_for_file(ts_root, target_path_obj)
+        rating, delta, metadata = score_test_support(matches, language=_report_language)
+    else:
+        matches = []
+        rating, delta, metadata = score_test_support(matches, language=_report_language)
+
+    # -----------------------
+    # Validation Actions (definition hoisted here)
+    # -----------------------
+    def build_validation_plan(challenger: dict, suggestions: list[dict], matches: list[dict], rating: str, impact: dict | None, behavior: dict | None = None) -> list[dict]:
+        """Build up to 3 deterministic validation actions.
+
+        Returns list of action dicts: {priority,title,reason,next_step}
+        """
+        actions: list[dict] = []
+
+        def short_reason(text: str) -> str:
+            if not text:
+                return ""
+            s = text.split(".", 1)[0].strip()
+            s = re.sub(r"\s+", " ", s)
+            return s[:120].rstrip("., ")
+
+        def normalize_title_from_text(t: str) -> str:
+            lt = (t or "").lower()
+            if any(k in lt for k in ("db", "driver", "placeholder")):
+                return "Verify database driver compatibility"
+            if any(k in lt for k in ("unicode", "encoding", "binary")):
+                return "Validate input handling edge cases"
+            if any(k in lt for k in ("auth", "authenticate", "login", "token", "access", "permission")):
+                return "Review authentication flow"
+            parts = (t or "").split()
+            return "Add targeted tests for " + " ".join(parts[:3])
+
+        impact_level = (impact.get("impact_level") if impact else "low")
+        impact_level = (impact_level or "low").lower()
+
+        def compute_priority(base_medium=False) -> str:
+            if impact_level == "high":
+                return "HIGH"
+            if impact_level == "medium" or base_medium:
+                return "MEDIUM"
+            return "LOW"
+
+        # Suggested tests -> up to 2
+        for s in (suggestions or [])[:2]:
+            topic = s.get("name") or s.get("reason", "")
+            title = normalize_title_from_text(topic)
+            reason = short_reason(s.get("reason", "Suggested test")) or "Add targeted tests."
+            base_medium = False
+            if challenger and (challenger.get("edge_cases") or challenger.get("potential_issues")):
+                base_medium = True
+            if rating == "None":
+                base_medium = True
+            actions.append({"priority": compute_priority(base_medium), "title": title, "reason": reason, "next_step": "Add targeted tests for the identified behavior."})
+
+        # Adversarial items -> up to 2
+        adv_items = []
+        if challenger:
+            adv_items.extend(challenger.get("edge_cases", []) or [])
+            adv_items.extend(challenger.get("potential_issues", []) or [])
+        for item in adv_items[:2]:
+            title = normalize_title_from_text(item)
+            reason = short_reason(item) or "Adversarial finding requires validation."
+            actions.append({"priority": compute_priority(True), "title": title, "reason": reason, "next_step": "Validate the finding via focused unit tests or manual review."})
+
+        # Test support candidate -> max 1
+        if rating != "Good":
+            if rating == "None":
+                reason = "No directly matching unit tests found for the patched module."
+            else:
+                reason = f"Test support rating: {rating}."
+            actions.append({"priority": compute_priority(True if rating == "None" else False), "title": ("Improve validation coverage" if rating == "None" else "Increase targeted test coverage"), "reason": short_reason(reason), "next_step": "Add targeted tests exercising the patched behavior."})
+
+        # Ensure a HIGH action exists for high impact
+        if impact_level == "high" and not any(a["priority"] == "HIGH" for a in actions):
+            imp_sum = short_reason(impact.get("impact_summary", "")) if impact else "High-impact change."
+            title = "Review impacted flows"
+            reason = ("High-impact: " + imp_sum)[:120]
+            actions.append({"priority": "HIGH", "title": title, "reason": reason, "next_step": "Perform a targeted code review of affected flows."})
+
+        rank_map = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+        actions_sorted = sorted(actions, key=lambda a: (-rank_map.get(a["priority"], 1)))
+
+        final: list[dict] = []
+        type_counts = {"test": 0, "verify": 0, "review": 0, "other": 0}
+
+        def action_type_from_title(t: str) -> str:
+            lt = (t or "").lower()
+            if "test" in lt:
+                return "test"
+            if any(k in lt for k in ("verify", "validate")):
+                return "verify"
+            if any(k in lt for k in ("review", "investigate")):
+                return "review"
+            return "other"
+
+        for a in actions_sorted:
+            if len(final) >= 3:
+                break
+            atype = action_type_from_title(a["title"])
+            if type_counts.get(atype, 0) >= 2:
+                continue
+            final.append(a)
+            type_counts[atype] = type_counts.get(atype, 0) + 1
+
+        # Fallback only when no anchors
+        if not final:
+            no_suggestions = not (suggestions or [])
+            no_adversarial = not (challenger and (challenger.get("edge_cases") or challenger.get("potential_issues")))
+            if no_suggestions and no_adversarial and rating == "Good":
+                final = [{"priority": "LOW", "title": "Perform quick manual review", "reason": "No automated anchors available; brief manual inspection advised.", "next_step": "Manually review the changed logic and adjacent call sites."}]
+
+        for a in final:
+            a["reason"] = short_reason(a.get("reason", ""))
+
+        # Map next_step to more specific actions for known titles
+        def specific_next_step(title: str, default: str) -> str:
+            lt = (title or "").lower()
+            if "database" in lt or "driver" in lt or "placeholder" in lt:
+                return "Confirm the database driver placeholder style and add a focused compatibility test if needed."
+            if "unicode" in lt or "encoding" in lt or "binary" in lt:
+                return "Add targeted tests for unicode and binary username inputs."
+            if title == "Improve validation coverage" or "validation coverage" in lt:
+                return "Add focused tests that exercise the patched function/module."
+            return default
+
+        for a in final:
+            a["next_step"] = specific_next_step(a.get("title"), a.get("next_step"))
+
+        # If a behavior summary is provided, ensure a single behavior-driven
+        # validation action is prepended. Keep this minimal and deterministic.
+        if behavior:
+            try:
+                pbs = behavior.get("primary_behaviors") or []
+                # comma-separated first 4 primary behaviors
+                next_step = "Verify: " + ", ".join(pbs[:4]) if pbs else "Verify: (behavior validation)"
+                beh_reason = short_reason(behavior.get("summary", ""))
+                beh_action = {"priority": "MEDIUM", "title": "Validate behavior", "reason": beh_reason, "next_step": next_step}
+                # Prepend but keep final limited to 3 actions by trimming the end
+                final = [beh_action] + final
+                if len(final) > 3:
+                    final = final[:3]
+            except Exception:
+                # Non-fatal: ignore behavior-driven action on errors
+                pass
+
+        return final
+
+    validation_actions = build_validation_plan(
+        challenger, suggestions, matches, rating, result.impact, behavior
+    )
+
+    # -----------------------
+    # Trust Package computation (uses hoisted data above)
+    # -----------------------
+    classified_challenger = _classify_challenger(challenger)
+    impact_level_str = ((result.impact or {}).get("impact_level") or "low")
+    signals = _compute_trust_signals(
+        result.hygiene, result.applicability, classified_challenger, rating, impact_level_str
+    )
+    trust_rec = _build_recommendation_v1(
+        signals,
+        still_vulnerable=classified_challenger.get("still_vulnerable", False),
+        defect_count=classified_challenger.get("confirmed_defect_count", 0),
+    )
+    # Demo polish: surface the already-computed decision on stdout the moment
+    # it's known. Reuses the existing decision->emoji mapping (Hero Banner) —
+    # no new value, no new classification.
+    print(f"[pipeline] Recommendation:\n{_DECISION_CARD_EMOJI.get(trust_rec['decision'], '⚪')} {trust_rec['decision']}", file=sys.stderr)
+    security_gain = _extract_security_gain(review_sections.get("explanation", ""))
+    known_findings = _build_known_findings(classified_challenger, result.finding_calibration)
+    # Gate the Trust Signals table's forward pointer on the same finding
+    # categories that back remediation_alignment/coverage_confidence
+    # (risks/hypotheses/observed/gaps) — Future Hardening Ideas isn't
+    # relevant to either signal, so it doesn't justify pointing a reader there.
+    known_findings_relevant = bool(
+        known_findings["potential_remaining_risks"]
+        or known_findings["observed_implementation_notes"]
+        or known_findings["validation_hypotheses"]
+        or known_findings["validation_gaps"]
+    )
+    consistency_caveats = _check_recommendation_consistency(signals, trust_rec["decision"], known_findings)
+    decision_card = _render_decision_card(trust_rec, signals, validation_actions, files_changed)
+    recommendation_block = _render_recommendation_block(trust_rec, caveats=consistency_caveats)
+    trust_signals_block = _render_trust_signals_table(signals, known_findings_rendered=known_findings_relevant)
+    known_findings_block = _render_known_findings(known_findings)
+    validation_actions_block = _render_validation_actions_section(validation_actions, trust_rec["decision"])
+    primary_refs_block = _render_primary_references(_extract_primary_references(result.vulnerability_text))
+
+    # -----------------------
+    # Assemble report
+    #
+    # Order (reviewer-experience redesign): Hero Banner, Vulnerability
+    # Summary, Primary Vulnerability References, Proposed Patch, Patch
+    # Hygiene, Patch Applicability, Trust Signals, Recommendation,
+    # Explanation, Validation Actions, Review Results, Repository Context,
+    # Impact Surface, Appendices. Run Metadata / Stage Stop Reasons are
+    # appended by main.py after this function returns — not rendered here.
+    #
+    # Repository Context answers "which repository locations informed this
+    # work, and why?" — deliberately independent of Trust Signals ("how much
+    # evidence supports trusting this patch?"). Placed immediately before
+    # Impact Surface, sourced from ground_repository(), not from the
+    # find_code_context() call already feeding LLM prompts.
+    #
+    # Rationale: a reviewer first wants to know what is broken and what
+    # patch is proposed — only then do Trust Signals become meaningful.
+    # Trust Signals moved after the patch instead of leading, reversing the
+    # previous redesign's placement. Patch Hygiene and Patch Applicability
+    # (the report's only two fully deterministic checks) were promoted from
+    # Appendices to sit directly beside the diff they describe — a reviewer
+    # who trusts deterministic evidence over LLM narrative should not have to
+    # scroll past Explanation/Validation Actions/Review Results to reach the
+    # actual git-apply result.
+    #
+    # "Impact Summary" and "Testing Notes" are gone entirely — both were
+    # restatements of Explanation / Review Results / Reviewer Notes, not
+    # unique content (verified against a real generated report: "Why it
+    # matters" was byte-identical to Explanation's own text). Reviewer Notes
+    # moved into Appendices — it is supplementary reviewer advice, not part
+    # of the core "understand this in 30 seconds" flow.
+    #
+    # This reorders, relabels, and removes duplicated content only: no
+    # change to how `patch`, `challenger`, `signals`, `trust_rec`,
+    # `classified_challenger`, or `validation_actions` are computed.
+    # -----------------------
+
+    # §1: Header + Hero Banner
+    report = f"""\
+# Auto Patcher MVP — Security Patch Report
+
+{decision_card}
+"""
+
+    # §2: Vulnerability Summary
+    report += f"""## Vulnerability summary
+
+{summary}
+
+"""
+
+    # §3: Primary Vulnerability References
+    report += primary_refs_block
+
+    # §4: Proposed Patch
+    report += f"""## Proposed patch
+
+{result.patch.strip()}
+
+"""
+
+    # §4b: Promoted deterministic evidence — Patch Hygiene and Patch
+    # Applicability (plus the retry/repair notices that describe attempts to
+    # fix applicability) are the only two fully deterministic checks in this
+    # report. Promoted here from Appendices so they sit next to the diff they
+    # describe, rather than after ~200 lines of heuristic narrative (Trust
+    # Signals' own "Does the patch apply?" row already points here).
+    report += f"""## Patch Hygiene
+
+{hygiene_section}
+
+## Patch Applicability
+
+{applicability_section}"""
+
+    # Applicability-aware retry notice — rendered only when a retry actually
+    # occurred; resolves to "" otherwise.
+    report += _render_retry_notice(result)
+    report += "\n"
+
+    # Repair notice (Phase C)
+    repair_notice = _render_repair_notice(result)
+    if repair_notice:
+        report += repair_notice
+    report += "\n"
+
+    # §5: Trust Signals
+    report += trust_signals_block
+
+    # §6: Recommendation
+    report += recommendation_block
+
+    # §7: Explanation — absorbs Known Security Gain as a lead-in. security_gain
+    # is itself an extracted sentence from this same explanation text (or, on
+    # the fallback path, a truncated first paragraph of it) — kept as a
+    # callout rather than dropped. When it's a verbatim match (the common
+    # case), that one copy is stripped from the body below so the sentence
+    # isn't shown twice; the fallback (truncated, non-verbatim) copy is left
+    # in place since it isn't a duplicate of the full text. A standing
+    # disclaimer states the epistemic status of this whole section once,
+    # rather than requiring per-sentence hedging of LLM-generated prose this
+    # pipeline cannot rewrite without a new semantic classifier.
+    report += "---\n\n## Explanation\n\n"
+    report += (
+        "*This explanation reflects the reviewer LLM's analysis of the advisory, "
+        "diff, and any injected code context — not independent execution or "
+        "testing against the target repository.*\n\n"
+    )
+    explanation_text = review_sections["explanation"]
+    if security_gain:
+        report += f"**Security gain:** {security_gain}\n\n"
+        # security_gain is extracted verbatim from this same explanation
+        # text (see _extract_security_gain) — drop that one copy from the
+        # body so the sentence isn't shown twice.
+        if security_gain in explanation_text:
+            explanation_text = explanation_text.replace(security_gain, "", 1)
+            explanation_text = re.sub(r"^[ \t]+", "", explanation_text, flags=re.MULTILINE)
+            # Rendering-only fix: when the stripped sentence was the entire
+            # body of a numbered/bulleted list item, removing it leaves a
+            # bare marker behind (e.g. a dangling "1." with nothing after
+            # it). Drop such now-empty marker lines — a list marker with no
+            # body is never meaningful output, regardless of why it emptied.
+            explanation_text = re.sub(r"^[ \t]*(?:\d+\.|[-*])[ \t]*\n", "", explanation_text, flags=re.MULTILINE)
+            explanation_text = re.sub(r"\n{3,}", "\n\n", explanation_text).strip()
+    report += f"""{explanation_text}
+
+"""
+
+    # §8: Validation Actions
+    report += validation_actions_block
+
+    # §9: Review Results
+    report += known_findings_block
+
+    # §9b: Repository Context (Repository Grounding)
+    report += _render_repository_context_section(result.grounding)
+
+    # §10: Impact Surface
+    if result.impact:
+        try:
+            imp = result.impact
+            report += "---\n\n## Impact Surface\n\n"
+            report += f"**Summary:** {imp.get('impact_summary', '')}\n\n"
+            report += f"- Changed files: {len(imp.get('changed_files', []))}\n"
+            report += f"- Affected files: {len(imp.get('affected_files', []))}\n"
+            report += f"- Impact level: {imp.get('impact_level', 'unknown').upper()}\n"
+            recs = imp.get('recommendations', [])
+            if recs:
+                report += f"- Recommendations: {', '.join(recs)}\n"
+            ums = imp.get('usage_matches', []) or []
+            if ums:
+                report += "\n**Top evidence:**\n"
+                for u in ums[:3]:
+                    report += f"- {u.get('symbol')} — {u.get('file')}:{u.get('line')} — {u.get('snippet')}\n"
+            report += "\n"
+        except Exception:
+            pass
+
+    # §11: Appendices — diagnostics, supplementary reviewer notes, and legacy
+    # sections, consolidated. Patch Hygiene and Patch Applicability (plus
+    # their retry/repair notices) moved out of here to sit next to the diff
+    # (§4b above) — they are deterministic evidence, not supplementary.
+    report += "---\n\n## Appendices\n\n"
+
+    # Deterministic signals section (Phase I)
+    det_section = _render_deterministic_signals(result.constraint_signals, result.remediation_signals)
+    if det_section:
+        report += "\n" + det_section
+
+    # Language Coverage — only rendered when a Python-only signal was skipped.
+    if _report_language != "python":
+        try:
+            from .vulnerability_patterns import classify_vuln_class, sink_scanning_supported
+
+            _gaps = [
+                "Test Support (test-file discovery only recognizes `test_*.py` / `*_test.py`)",
+                "Impact Surface (changed-symbol and usage-impact analysis only supports Python source)",
+            ]
+            if classify_vuln_class(result.vulnerability_text) and not sink_scanning_supported(_report_language):
+                _gaps.append(
+                    "Vulnerability-pattern sink-checklist scanning "
+                    "(only recognizes Python `def` syntax and `*.py` files)"
+                )
+            report += "\n### Language Coverage\n\n"
+            report += f"**Detected repository language:** {_report_language}\n\n"
+            report += (
+                "The following deterministic signals are Python-only and do not "
+                "yet support this language. They are marked Not Applicable in the "
+                "Test Support and Impact Surface sections below, and must not be "
+                "read as a clean or verified result:\n\n"
+            )
+            for _gap in _gaps:
+                report += f"- {_gap}\n"
+            report += "\n"
+        except Exception:
+            pass
+
+    # Test Support
+    test_support_md = (
+        "\n### Test Support\n\n"
+        "*This section reports existing repository tests, not behavioral "
+        "validation of the proposed patch.*\n\n"
+        f"- Target file: {target_file_display}\n"
+        f"- Total test files found: {total_tests_found}\n"
+        f"- Rating: {rating}\n"
+        "\n#### Matching tests\n"
+    )
+    if matches:
+        has_direct = any(m.get("proximity") in ("same-file", "same-module") for m in matches)
+        if not has_direct:
+            test_support_md += "- No tests directly matched the patched file/module.\n"
+        for m in matches:
+            prox_label = m['proximity'] if m['proximity'] != 'repo' else 'repo (context)'
+            test_support_md += f"- {m['path']} — {prox_label} — {m['reason']}\n"
+    else:
+        test_support_md += "- No matching tests found.\n"
+    report += test_support_md
+
+    # Behavior Summary
+    if behavior:
+        try:
+            report += "\n### Behavior Summary\n\n"
+            # behavior["function"] is a regex-based `def` scan over the diff
+            # and is empty for non-function edits (e.g. a class-level
+            # constant). Fall back to the AST-resolved changed_symbols from
+            # Impact Surface — the same data already shown in that section —
+            # before omitting the sentence entirely.
+            func = behavior.get("function") or ""
+            if not func:
+                changed_symbols = (result.impact or {}).get("changed_symbols") or []
+                if changed_symbols:
+                    func = changed_symbols[0]
+            bfile = behavior.get("file") or ""
+            if func and bfile:
+                report += f"This patch appears to modify `{func}` in `{bfile}`.\n\n"
+            report += behavior.get("summary", "") + "\n\n"
+            pbs = behavior.get("primary_behaviors") or []
+            if pbs:
+                report += "Primary behaviors to validate:\n"
+                for p in pbs:
+                    report += f"- {p}\n"
+            report += "\n"
+        except Exception:
+            pass
+
+    # Affected areas — a distinct reviewer-LLM output field, not duplicated
+    # elsewhere in the report.
+    report += f"""
+### Affected areas
+
+{review_sections["affected_areas"]}
+"""
+
+    # Reviewer Notes — reviewer-specific advice not captured by Explanation,
+    # Validation Actions, or Known Findings. Moved into Appendices: it is
+    # supplementary, not part of the core "understand this in 30 seconds" flow.
+    report += f"""
+### Reviewer Notes
+
+{review_sections["validation_notes"]}
+"""
+
+    # ("Validation Plan" stays removed — it repeated the same ≤3 items
+    # already shown in full, with Reason included, in the Validation
+    # Actions section near the top of the report.)
+
+    # Suggested Tests
+    adv_parts: list[str] = []
+    if challenger:
+        if challenger.get("edge_cases"):
+            adv_parts.append("Edge cases:")
+            for e in challenger.get("edge_cases", []):
+                adv_parts.append(f"- {e}")
+        if challenger.get("potential_issues"):
+            adv_parts.append("Potential issues:")
+            for p in challenger.get("potential_issues", []):
+                adv_parts.append(f"- {p}")
+
+    # Presentation-only: name, reason, and suggested filename only — the
+    # generated pytest skeleton bodies are not rendered here (still the same
+    # `suggestions` list; nothing about what's suggested or how many changed,
+    # only how much of each one is printed).
+    suggested_md = "\n### Suggested Tests\n\n"
+    suggested_md += "Generated from adversarial findings. Not automatically written to the repo.\n\n"
+    if not suggestions:
+        suggested_md += "- No actionable adversarial findings found.\n"
+    else:
+        for s in suggestions:
+            test_name = s.get("name")
+            s_reason = s.get("reason")
+            suggested_file = f"tests/suggested/{test_name}.py"
+            suggested_md += f"- **{test_name}** — {suggested_file}\n"
+            suggested_md += f"  Based on finding: \"{s_reason}\"\n"
+    report += suggested_md
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Applicability-aware retry helpers
+# ---------------------------------------------------------------------------
+
+_PATCH_FAILED_RE = re.compile(r"^error: patch failed: (.+?):\d+", re.MULTILINE)
+_DOES_NOT_APPLY_RE = re.compile(r"^error: (.+?): patch does not apply", re.MULTILINE)
+_PLUS_PLUS_RE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
+_RETRY_CONTENT_LIMIT = 50_000
+_RETRY_STDERR_LINES = 6
+
+
+def _extract_failed_file(stderr: str) -> str | None:
+    m = _PATCH_FAILED_RE.search(stderr or "")
+    if m:
+        return m.group(1).strip()
+    m = _DOES_NOT_APPLY_RE.search(stderr or "")
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _extract_patch_target(patch: str) -> str | None:
+    lines = (patch or "").splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    m = _PLUS_PLUS_RE.search("\n".join(lines))
+    return m.group(1).strip() if m else None
+
+
+def _build_repair_hint(confirmed_texts: list[str]) -> str:
+    """Build a repair instruction for the patch generator from confirmed defect texts."""
+    items = "\n".join(f"- {t}" for t in confirmed_texts)
+    return (
+        "The previous patch has the following confirmed security gap(s) identified "
+        "by adversarial review:\n\n"
+        f"{items}\n\n"
+        "Regenerate the patch to address these specific gaps.\n"
+        "Do not use a perimeter validation check (such as startswith or a normpath guard) "
+        "if the correct fix requires changing the dangerous operation itself.\n"
+        "If the vulnerability requires a helper function, the same patch must call that "
+        "helper from every vulnerable code path — not a subset of them.\n"
+        "Use the repository code context shown above as the ground truth for the code.\n"
+        "Keep the same minimal-diff approach: change only what is necessary."
+    )
+
+
+def _build_retry_hint(stderr: str, failed_file: str) -> str:
+    excerpt_lines = (stderr or "").splitlines()[:_RETRY_STDERR_LINES]
+    excerpt = "\n".join(excerpt_lines)
+    return (
+        f"The previous patch attempt failed to apply to `{failed_file}`.\n\n"
+        f"Git error:\n```\n{excerpt}\n```\n\n"
+        "The patch context lines did not match the actual file content.\n"
+        "Regenerate the patch using **only** the code shown in the "
+        "\"Repository code context\" section above.\n"
+        "Do not use your training-data memory of this file — "
+        "the code above is the ground truth.\n"
+        "Keep the same fix logic; only update the surrounding context lines "
+        "to match the actual code exactly."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase E experiment — hand-written plan loader
+# ---------------------------------------------------------------------------
+
+_PHASE_E_PLANS_DIR = Path(__file__).parent.parent / "evaluation" / "phase_e"
+_GHSA_RE = re.compile(r"GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}")
+
+
+def _load_experiment_plan(vulnerability_text: str) -> str:
+    """Phase E experiment: return hand-written plan markdown for a known GHSA, or ''.
+
+    Appended as the final context block before generate_patch(). Never raises.
+    Has no effect when no plan file exists for the matched GHSA.
+    """
+    m = _GHSA_RE.search(vulnerability_text)
+    if not m:
+        return ""
+    plan_path = _PHASE_E_PLANS_DIR / f"{m.group(0)}.md"
+    if not plan_path.exists():
+        return ""
+    try:
+        text = plan_path.read_text(encoding="utf-8")
+        print(f"[pipeline] Phase E plan loaded for {m.group(0)} ({len(text)} chars).", file=sys.stderr)
+        return text
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline entry point
+# ---------------------------------------------------------------------------
+
+
+def run(vulnerability_text: str, api_key: str = "", repo_root: str | Path | None = None) -> str:
+    """
+    Execute the full patching pipeline.
+
+    Parameters
+    ----------
+    vulnerability_text:
+        The vulnerability description as a string (Markdown).  The caller is
+        responsible for reading a file or fetching an advisory before calling
+        this function.
+    api_key:
+        Optional OpenAI API key.  When empty the pipeline uses mock responses.
+
+    Returns
+    -------
+    str
+        The formatted Markdown report.
+    """
+
+    # Ensure downstream challenger reads the same API key if provided.
+    os.environ.setdefault("OPENAI_API_KEY", api_key or os.environ.get("OPENAI_API_KEY", ""))
+
+    llm = LLMClient(api_key=api_key)
+    mode = "MOCK" if llm.is_mock else "LIVE"
+    print(f"[pipeline] LLM mode: {mode}", file=sys.stderr)
+
+    # Experiment H1: plan first, then repo code, then vulnerability pattern guidance.
+    # Previously: repo code → vuln patterns → plan.
+    # H1 hypothesis: placing plan constraints before repo code reduces prior-override failures.
+    _plan_text = _load_experiment_plan(vulnerability_text)
+
+    # Locate relevant code from the target repository (best-effort).
+    _repo_code = ""
+    _grounding: RepositoryGroundingResult | None = None
+    if repo_root:
+        from .repo_locator import ground_repository
+        _grounding = ground_repository(vulnerability_text, Path(repo_root))
+        _repo_code = _grounding.rendered_context
+        if _repo_code:
+            print(f"[pipeline] Code context found ({len(_repo_code)} chars); injecting into patch prompt.", file=sys.stderr)
+        else:
+            print("[pipeline] No code context found in repo; patch will be best-effort.", file=sys.stderr)
+
+    # Phase C.5: inject vulnerability class guidance (canonical patterns + sink coverage).
+    # Pass _repo_code (not the accumulated context) so sink detection scans only source code.
+    _pattern_ctx = ""
+    try:
+        from .vulnerability_patterns import build_vulnerability_pattern_context
+        _pattern_ctx = build_vulnerability_pattern_context(
+            vulnerability_text, _repo_code, Path(repo_root) if repo_root else None
+        )
+        if _pattern_ctx:
+            print(f"[pipeline] Vulnerability class guidance injected ({len(_pattern_ctx)} chars).", file=sys.stderr)
+    except Exception:
+        pass
+
+    # Assemble final context: plan → repo code → vuln patterns.
+    _ctx_parts = [p for p in [_plan_text, _repo_code, _pattern_ctx] if p and p.strip()]
+    code_context = "\n\n".join(_ctx_parts)
+
+    print("[pipeline] Step 1/4 – Generating patch …", file=sys.stderr)
+    patch = generate_patch(vulnerability_text, llm, code_context=code_context)
+
+    # Hunk header repair — recompute @@ counts from body; never blocks the pipeline
+    try:
+        from .diff_hunk_repair import repair_hunk_headers
+        patch, _repair_meta = repair_hunk_headers(patch)
+        if _repair_meta.normalization_applied:
+            print(
+                f"[pipeline] Hunk headers repaired: "
+                f"{_repair_meta.hunks_rewritten} hunk(s) in "
+                f"{_repair_meta.files_rewritten} file(s)"
+            , file=sys.stderr)
+    except Exception:
+        pass
+
+    # Patch hygiene — deterministic, best-effort, never blocks the pipeline
+    try:
+        from .patch_hygiene import check_patch
+        hygiene_findings = check_patch(patch)
+    except Exception:
+        hygiene_findings = []
+
+    # Patch applicability — git apply --check, read-only, best-effort
+    try:
+        from .patch_applicability import check_applicability
+        applicability_result = check_applicability(patch, repo_root)
+    except Exception:
+        applicability_result = {
+            "applicable": None, "skipped": False, "skipped_reason": None,
+            "error": "applicability check failed unexpectedly",
+            "exit_code": None, "stderr": "",
+        }
+
+    # Applicability-aware retry — triggered only on applicable=False with a known repo_root
+    original_patch = patch
+    retry_patch = None
+    retry_attempted = False
+    retry_succeeded = False
+    retry_failed_file = None
+    retry_error_before = None
+
+    if applicability_result.get("applicable") is False and repo_root:
+        stderr = applicability_result.get("stderr", "")
+        failed_file = _extract_failed_file(stderr)
+        if not failed_file:
+            failed_file = _extract_patch_target(patch)
+
+        if failed_file:
+            print(f"[pipeline] Applicability failed — `{failed_file}` did not apply; attempting retry …", file=sys.stderr)
+            retry_failed_file = failed_file
+            retry_error_before = stderr
+            try:
+                repo_ctx = TargetRepoContext(Path(repo_root))
+                actual_content = repo_ctx.read_file(failed_file)
+                if len(actual_content) > _RETRY_CONTENT_LIMIT:
+                    print(
+                        f"[pipeline] Retry skipped — `{failed_file}` is "
+                        f"{len(actual_content)} chars (limit {_RETRY_CONTENT_LIMIT})."
+                    , file=sys.stderr)
+                else:
+                    retry_attempted = True
+                    hint = _build_retry_hint(stderr, failed_file)
+                    r_patch_raw = generate_patch(
+                        vulnerability_text, llm,
+                        code_context=actual_content,
+                        retry_hint=hint,
+                    )
+                    if not r_patch_raw or not r_patch_raw.strip():
+                        print("[pipeline] Retry produced an empty patch; keeping original.", file=sys.stderr)
+                    else:
+                        try:
+                            from .diff_hunk_repair import repair_hunk_headers
+                            r_patch_raw, _r_repair = repair_hunk_headers(r_patch_raw)
+                        except Exception:
+                            pass
+                        r_hygiene: list = []
+                        try:
+                            from .patch_hygiene import check_patch
+                            r_hygiene = check_patch(r_patch_raw)
+                        except Exception:
+                            pass
+                        from .patch_applicability import check_applicability
+                        r_app = check_applicability(r_patch_raw, repo_root)
+                        retry_patch = r_patch_raw
+                        if r_app.get("applicable") is True:
+                            retry_succeeded = True
+                            patch = r_patch_raw
+                            hygiene_findings = r_hygiene
+                            applicability_result = r_app
+                            print("[pipeline] Retry succeeded — patch applies cleanly.", file=sys.stderr)
+                        else:
+                            print("[pipeline] Retry did not apply; keeping original patch.", file=sys.stderr)
+            except Exception as exc:
+                print(f"[pipeline] Retry failed unexpectedly: {exc}", file=sys.stderr)
+        else:
+            print("[pipeline] Applicability failed — target file not identified; retry skipped.", file=sys.stderr)
+
+    print("[pipeline] Step 2/4 – Challenging patch …", file=sys.stderr)
+    challenger = challenge_patch(vulnerability_text, patch, llm, code_context=code_context)
+
+    # Phase C: Challenger-driven repair loop.
+    # Fires once when the patch applies cleanly but has confirmed security defects.
+    _repair_classified = _classify_challenger(challenger)
+    _orig_defect_count = _repair_classified["confirmed_defect_count"]
+
+    repair_attempted = False
+    repair_succeeded = False
+    repair_patch_content: str | None = None
+    repair_challenger_result: dict | None = None
+    repair_defect_count = 0
+    repair_rechallenged = False
+
+    if (
+        applicability_result.get("applicable") is True
+        and _orig_defect_count > 0
+    ):
+        try:
+            repair_attempted = True
+            _confirmed_texts = [
+                f["text"]
+                for f in (
+                    _repair_classified["classified_edge_cases"]
+                    + _repair_classified["classified_potential_issues"]
+                )
+                if f["category"] == "confirmed_defect"
+            ]
+            print(
+                f"[pipeline] Repair loop – {_orig_defect_count} confirmed defect(s) found; "
+                "attempting one repair …"
+            , file=sys.stderr)
+            _r_hint = _build_repair_hint(_confirmed_texts)
+            _r_raw = generate_patch(
+                vulnerability_text, llm,
+                code_context=code_context,
+                retry_hint=_r_hint,
+            )
+            try:
+                from .diff_hunk_repair import repair_hunk_headers
+                _r_raw, _ = repair_hunk_headers(_r_raw)
+            except Exception:
+                pass
+            _r_hygiene: list = []
+            try:
+                from .patch_hygiene import check_patch
+                _r_hygiene = check_patch(_r_raw)
+            except Exception:
+                pass
+            from .patch_applicability import check_applicability as _check_app
+            _r_app = _check_app(_r_raw, repo_root)
+            repair_patch_content = _r_raw
+            if _r_app.get("applicable") is True:
+                _r_challenger = challenge_patch(vulnerability_text, _r_raw, llm, code_context=code_context)
+                _r_classified = _classify_challenger(_r_challenger)
+                repair_defect_count = _r_classified["confirmed_defect_count"]
+                repair_rechallenged = True
+                repair_challenger_result = _r_challenger
+                if repair_defect_count == 0:
+                    repair_succeeded = True
+                    patch = _r_raw
+                    challenger = _r_challenger
+                    hygiene_findings = _r_hygiene
+                    applicability_result = _r_app
+                    print("[pipeline] Repair succeeded – 0 confirmed defects after re-challenge.", file=sys.stderr)
+                else:
+                    print(
+                        f"[pipeline] Repair rejected – {repair_defect_count} confirmed defect(s) "
+                        "remain; keeping original."
+                    , file=sys.stderr)
+            else:
+                print("[pipeline] Repair patch does not apply; keeping original.", file=sys.stderr)
+        except Exception as exc:
+            print(f"[pipeline] Repair loop failed unexpectedly: {exc}", file=sys.stderr)
+
+    # Deterministic patch signals — run on final patch after any repair loop changes
+    _c_signals: list[dict] | None = None
+    _r_signals: list[dict] | None = None
+    if _STATIC_SIGNALS_AVAILABLE and repo_root:
+        try:
+            _c_signals = _run_constraint_signals(patch, _Path(repo_root))
+        except Exception as _exc:
+            print(f"[pipeline] Constraint signals failed (non-fatal): {_exc}", file=sys.stderr)
+        try:
+            _r_signals = _run_remediation_signals(patch, _Path(repo_root))
+        except Exception as _exc:
+            print(f"[pipeline] Remediation signals failed (non-fatal): {_exc}", file=sys.stderr)
+
+    # Finding calibration (evidence-quality pass) — classifies and rewords
+    # the plausible_risk/generic findings from the FINAL challenger result
+    # (post-repair, if a repair was accepted) so calibration reasons about
+    # the patch that will actually be reported. confirmed_defect and
+    # validation_gap findings are not sent here — those already have
+    # unambiguous framing from earlier report-presentation work. Best-effort:
+    # any failure leaves finding_calibration as None, and report rendering
+    # falls back to the uncalibrated classifier text rather than losing
+    # findings or crashing the run.
+    _final_classified = _classify_challenger(challenger)
+    _calibration_inputs = [
+        f["text"]
+        for f in (
+            _final_classified["classified_edge_cases"]
+            + _final_classified["classified_potential_issues"]
+        )
+        if f["category"] in ("plausible_risk", "generic")
+    ]
+    finding_calibration: list[dict] | None = None
+    if _calibration_inputs:
+        try:
+            finding_calibration = calibrate_findings(
+                vulnerability_text, patch, _calibration_inputs, llm, code_context=code_context
+            )
+        except Exception as _exc:
+            print(f"[pipeline] Finding calibration failed (non-fatal): {_exc}", file=sys.stderr)
+
+    print("[pipeline] Step 3/4 – Reviewing patch …", file=sys.stderr)
+    review = review_patch(vulnerability_text, patch, llm)
+
+    print("[pipeline] Step 4/4 – Evaluating Trust Signals…", file=sys.stderr)
+    score_text = score_confidence(vulnerability_text, patch, review, llm, code_context=code_context)
+
+    # Adjust the numeric score based on adversarial challenger results
+    orig_score_str = _extract_score(score_text)
+    try:
+        orig_score = float(orig_score_str)
+    except Exception:
+        orig_score = None
+
+    adjusted_score = orig_score
+    try:
+        still = bool(challenger.get("still_vulnerable"))
+        edge_cases = challenger.get("edge_cases", []) or []
+        potential_issues = challenger.get("potential_issues", []) or []
+    except Exception:
+        still = False
+        edge_cases = []
+        potential_issues = []
+
+    if orig_score is not None:
+        if still:
+            adjusted_score = orig_score * 0.4
+            reason_lines = [
+                "Challenger indicates the vulnerability may still exist; applied strong reduction (0.4x).",
+            ]
+        elif edge_cases or potential_issues:
+            adjusted_score = orig_score * 0.7
+            reason_lines = [
+                "Challenger found edge cases or potential issues; applied moderate reduction (0.7x).",
+            ]
+        else:
+            adjusted_score = orig_score
+            reason_lines = ["No adversarial issues found; score unchanged."]
+
+        adjusted_score_str = f"{adjusted_score:.2f}"
+        orig_score_display = f"{orig_score:.2f}"
+
+        # Build a new score_text that places the adjusted score first so
+        # _extract_score() picks it up when building the report.
+        adjustment_text = (
+            f"**Confidence score:** {adjusted_score_str}\n\n"
+            f"**Original score:** {orig_score_display}\n\n"
+            "**Adjustment reasoning:**\n"
+            + "\n".join(f"- {l}" for l in reason_lines)
+            + "\n\n"
+        )
+
+        # Prepend adjustment summary to the original scorer output for context
+        score_text = adjustment_text + score_text
+    # Run Impact Surface analysis (lightweight, deterministic)
+    impact_dict = None
+    behavior = None
+    _detected_language = "python"
+    try:
+        # Create a minimal TargetRepoContext here; prefer explicit repo_root
+        # passed into pipeline.run(), otherwise default to cwd for
+        # backward-compatibility.
+        repo_root_for_context = Path(repo_root) if repo_root else Path.cwd()
+        repo_context = TargetRepoContext(repo_root_for_context)
+        _detected_language = detect_language(repo_root_for_context)
+
+        analyzer = LightweightImpactAnalyzer()
+        impact = analyzer.analyze(
+            patch,
+            adversarial_findings=challenger,
+            repo_context=repo_context,
+            repo_language=_detected_language,
+        )
+        # attach deterministic annotations to challenger for reporting
+        enhance_findings_with_impact(challenger, impact.to_dict())
+        impact_dict = impact.to_dict()
+
+        # Behavior summary (minimal deterministic analyzer)
+        try:
+            behavior = BehaviorAnalyzer().analyze(patch, repo_context=repo_context)
+        except Exception:
+            behavior = None
+    except Exception:
+        pass
+
+    result = PipelineResult(
+        vulnerability_text=vulnerability_text,
+        patch=patch,
+        review=review,
+        score_text=score_text,
+        challenger=challenger,
+        impact=impact_dict,
+        final_score=adjusted_score,
+        orig_score=orig_score,
+        behavior=behavior,
+        repo_root=_Path(repo_root) if repo_root else None,
+        hygiene=hygiene_findings,
+        applicability=applicability_result,
+        original_patch=original_patch,
+        retry_patch=retry_patch,
+        retry_attempted=retry_attempted,
+        retry_succeeded=retry_succeeded,
+        retry_failed_file=retry_failed_file,
+        retry_error_before=retry_error_before,
+        repair_attempted=repair_attempted,
+        repair_succeeded=repair_succeeded,
+        repair_patch=repair_patch_content,
+        repair_challenger=repair_challenger_result,
+        repair_defect_count=repair_defect_count,
+        repair_rechallenged=repair_rechallenged,
+        original_challenger_defect_count=_orig_defect_count,
+        constraint_signals=_c_signals,
+        remediation_signals=_r_signals,
+        detected_language=_detected_language,
+        finding_calibration=finding_calibration,
+        grounding=_grounding,
+    )
+    return _build_report(result)

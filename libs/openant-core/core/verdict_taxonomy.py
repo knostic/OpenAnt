@@ -100,3 +100,17 @@ DYNAMIC_TESTABLE = frozenset({
     "agreed",
     "vulnerable",
 })
+
+# --- Patch-eligibility filter -------------------------------------------------
+# Findings eligible to be sent to the patch-trust pipeline (``core/patch.py``).
+# Deliberately its OWN set, not an alias of DISCLOSURE_ELIGIBLE or
+# DYNAMIC_TESTABLE: sending a finding to an external-generation patch pipeline
+# is a stricter bar than including it in a report, and "bypassable" (a real,
+# exploitable-if-bypassed finding) is worth patching even though it isn't
+# worth an active dynamic-test reproduction attempt.
+PATCH_ELIGIBLE = frozenset({
+    "confirmed",
+    "agreed",
+    "vulnerable",
+    "bypassable",
+})

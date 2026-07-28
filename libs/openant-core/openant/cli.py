@@ -581,6 +581,39 @@ def cmd_dynamic_test(args):
         return 2
 
 
+def cmd_patch(args):
+    """Generate and evaluate a candidate remediation for one finding."""
+    from core.patch import run_patch
+    from core.schemas import success, error
+    from core.step_report import step_context
+
+    output_dir = args.output or tempfile.mkdtemp(prefix="openant_patch_")
+
+    try:
+        with step_context("patch", output_dir, inputs={
+            "pipeline_output_path": os.path.abspath(args.pipeline_output),
+            "finding_id": args.finding_id,
+        }) as ctx:
+            result = run_patch(
+                pipeline_output_path=args.pipeline_output,
+                finding_id=args.finding_id,
+                output_dir=output_dir,
+                repo_root=args.repo_root,
+            )
+
+            ctx.outputs = {
+                "vulnerability_path": result.vulnerability_path,
+                "trust_report_path": result.trust_report_path,
+            }
+
+        _output_json(success(result.to_dict()))
+        return 0
+
+    except Exception as e:
+        _output_json(error(str(e)))
+        return 2
+
+
 def _default_report_output(results_path: str, fmt: str) -> str:
     """Derive a sensible default output path based on format."""
     reports_dir = os.path.join(os.path.dirname(os.path.abspath(results_path)), "final-reports")
@@ -1542,6 +1575,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     dt_p.set_defaults(func=cmd_dynamic_test)
+
+    # ---------------------------------------------------------------
+    # patch — generate and evaluate a candidate remediation for a finding
+    # ---------------------------------------------------------------
+    patch_p = subparsers.add_parser(
+        "patch", help="Generate and evaluate a candidate remediation for a finding"
+    )
+    patch_p.add_argument("pipeline_output", help="Path to pipeline_output.json")
+    patch_p.add_argument("--finding-id", required=True, help="ID of the finding to remediate")
+    patch_p.add_argument("--repo-root", help="Path to the target repository root")
+    patch_p.add_argument("--output", "-o", help="Output directory (default: temp dir)")
+    patch_p.set_defaults(func=cmd_patch)
 
     # ---------------------------------------------------------------
     # report — generate reports from results
