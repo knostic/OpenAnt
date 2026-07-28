@@ -189,6 +189,16 @@ Or run the full pipeline in one command:
 openant scan --verify
 ```
 
+### 3. Remediate a finding
+
+Generate a candidate fix and an independent Trust Report for a specific finding in `pipeline_output.json`:
+
+```bash
+LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... openant patch --finding-id VULN-001
+```
+
+This writes the candidate patch and a Trust Report — a recommendation on whether to trust it — to a `patch/` folder in the project's scan directory. The target repository itself is never modified; the patch is generated for review, not applied.
+
 ### Working with multiple projects
 
 The pipeline operates on one project at a time. Running `openant init` sets the newly initialized project as the active one, so all subsequent commands target it by default.
