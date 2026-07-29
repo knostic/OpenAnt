@@ -42,6 +42,20 @@ def test_go3_error_verdict_surfaced():
     assert '"error"' in html                        # AND the charts (not just the card)
 
 
+def test_go3_chart_does_not_reintroduce_injection():
+    """GO-3's chart inclusion must add ONLY the known 'error' sentinel, never an
+    arbitrary model-supplied verdict — else it re-opens GO-1 via json.dumps labels."""
+    exp = {"results": [
+        {"route_key": "a.py:f", "finding": "error"},
+        {"route_key": "b.py:g", "finding": "<svg onload=alert(1)>"},
+    ]}
+    out = os.path.join(tempfile.mkdtemp(), "r.html")
+    H.generate_html_report(exp, {"units": []}, "", out)
+    html = open(out).read()
+    assert '"error"' in html                        # sentinel charted
+    assert "<svg onload=alert(1)>" not in html      # arbitrary verdict NOT injected
+
+
 # --- TM-1: a capitalized "Trusted" must still trigger the self-whitelisting warning ---
 @pytest.mark.parametrize("trust", ["trusted", "Trusted", "TRUSTED"])
 def test_tm1_trust_warning_case_insensitive(trust):

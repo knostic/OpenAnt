@@ -30,7 +30,7 @@ import os
 from datetime import datetime
 
 from dotenv import load_dotenv
-from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+from core.verdict_taxonomy import FINDING_VERDICT_ORDER, ERROR_VERDICT
 from utilities.file_io import normalize_results, read_json
 from utilities.llm import (
     build_phase_registry,
@@ -357,11 +357,13 @@ def generate_html_report(
 
     # Prepare chart data
     verdict_order = list(FINDING_VERDICT_ORDER)
-    # Append any producer verdict not in the canonical display order (e.g. 'error',
-    # the errored/unanalyzed sentinel) so such units aren't silently dropped from the
-    # charts — the GO-3 silent-false-negative surface (verdict_taxonomy drift).
-    verdict_order += [v for v in verdict_counts if v not in verdict_order]
-    verdict_order += [v for v in file_verdict_counts if v not in verdict_order]
+    # Surface the errored/unanalyzed sentinel in the charts too (GO-3 silent-FN) —
+    # but ONLY the known ERROR_VERDICT literal, never arbitrary model-supplied verdict
+    # strings: those are attacker-controlled and would inject unescaped into the
+    # json.dumps chart labels (re-opening GO-1). Unknown verdicts still appear in the
+    # findings table with an html.escape'd badge.
+    if ERROR_VERDICT in verdict_counts or ERROR_VERDICT in file_verdict_counts:
+        verdict_order.append(ERROR_VERDICT)
     unit_chart_labels = json.dumps([v for v in verdict_order if v in verdict_counts])
     unit_chart_data = json.dumps([verdict_counts.get(v, 0) for v in verdict_order if v in verdict_counts])
     unit_chart_colors = json.dumps([get_verdict_color(v) for v in verdict_order if v in verdict_counts])
