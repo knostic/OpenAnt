@@ -197,9 +197,5 @@ Extending those exemplars per language is a known, unclosed gap.
 
 ## See also
 
-- [`AFFECTED_PLACES.md`](AFFECTED_PLACES.md) — every site the threat-model work
-  touched, and what still assumes the old app-type model
-- [`knowledge-graph.json`](knowledge-graph.json) — the module graph as queryable
-  edges rather than a picture
 - `libs/openant-core/context/THREAT_MODEL_AUTHORITY_DESIGN.md` — the unimplemented
   authority model for repository-supplied threat models

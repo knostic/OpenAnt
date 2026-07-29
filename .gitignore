@@ -63,3 +63,8 @@ bughunt-repros/red_fkb1a.py
 bughunt-repros/red_fkb1b.py
 bughunt-repros/regress_patched.py
 bughunt-repros/tripwire_agree_branch.py
+
+# P3: generated/internal artifacts (kept locally, excluded from push)
+knowledge-graph.json
+knowledge-graph.md
+pilot-knowledge-graph.md
