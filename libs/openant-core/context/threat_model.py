@@ -145,7 +145,7 @@ OPTIONAL_TOP_LEVEL = (
 # bound it (1 MiB extrapolates past 10^11 seconds). The scanned repository authors
 # this file, so that is eight bytes of attacker input for an unbounded hang. Strip in
 # Python instead, where it is linear.
-_JSON_BLOCK_RE = re.compile(r"(`{3,})json\b(.*?)\1", re.DOTALL)
+_JSON_BLOCK_RE = re.compile(r"(`{3,})json\b(.*?)^\1[ \t]*$", re.DOTALL | re.MULTILINE)
 
 # Markdown renderers hide HTML comments, so a block inside one is invisible in every
 # review surface a human uses — the PR diff, the rendered file — while remaining

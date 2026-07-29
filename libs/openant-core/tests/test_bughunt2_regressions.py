@@ -73,8 +73,21 @@ def test_tm2_backtick_field_round_trips():
     assert back.get("purpose") == data["purpose"]
 
 
-# --- ML-1: a non-string `finding` must not crash parse_response ---
-@pytest.mark.parametrize("literal", ["123", "null", '["x"]'])
-def test_ml1_non_string_finding_no_crash(literal):
-    r = A.parse_response('{"finding": %s}' % literal)       # was AttributeError
-    assert "verdict" in r
+# --- ML-1 / R2D-5: a non-string `finding` -> countable ERROR, not a garbage verdict ---
+@pytest.mark.parametrize("literal", ["123", "null", '["x"]', "true"])
+def test_ml1_non_string_finding_maps_to_error(literal):
+    r = A.parse_response('{"finding": %s}' % literal)       # was AttributeError, then garbage
+    assert r.get("verdict") == "ERROR"                      # not "['X']"/"123"/"NONE" etc.
+
+
+def test_ml1_string_finding_still_maps():
+    assert A.parse_response('{"finding": "vulnerable"}')["verdict"] == "VULNERABLE"
+
+
+# --- TM-2 / R2D-3: mixed-length fences (3-tick decoy + real 4-tick) must not desync ---
+def test_tm2_mixed_length_fences_extract_real_block():
+    data = {"schema": "openant-threat-model", "schema_version": 1,
+            "application_type": "custom:x",
+            "purpose": "runs ```bash``` deploy", "impact_statement": "y"}
+    mixed = "```json\nDECOY not closed with 3 ticks\n\n" + T.render_threat_model_md(data)
+    assert T.parse_threat_model_md(mixed).get("purpose") == data["purpose"]

@@ -39,16 +39,22 @@ def _normalize_result(result: dict) -> dict:
     # Normalize finding -> verdict
     if "verdict" not in result and "finding" in result:
         finding = result["finding"]
-        finding_to_verdict = {
-            "vulnerable": "VULNERABLE",
-            "safe": "SAFE",
-            "protected": "PROTECTED",
-            "bypassable": "BYPASSABLE",
-            "inconclusive": "INCONCLUSIVE",
-            "insufficient_context": "INSUFFICIENT_CONTEXT",
-        }
-        finding_str = str(finding)
-        result["verdict"] = finding_to_verdict.get(finding_str.lower(), finding_str.upper())
+        if not isinstance(finding, str):
+            # A non-string finding (list/dict/null/number) is a malformed model reply,
+            # not a verdict — map it to ERROR so the error / manual-review accounting
+            # counts it, instead of a garbage verdict (e.g. "['VULNERABLE']" from
+            # str(finding).upper()) that silently escapes that accounting (R2D-5).
+            result["verdict"] = "ERROR"
+        else:
+            finding_to_verdict = {
+                "vulnerable": "VULNERABLE",
+                "safe": "SAFE",
+                "protected": "PROTECTED",
+                "bypassable": "BYPASSABLE",
+                "inconclusive": "INCONCLUSIVE",
+                "insufficient_context": "INSUFFICIENT_CONTEXT",
+            }
+            result["verdict"] = finding_to_verdict.get(finding.lower(), finding.upper())
 
     # Ensure verdict is uppercase
     if "verdict" in result and isinstance(result["verdict"], str):
