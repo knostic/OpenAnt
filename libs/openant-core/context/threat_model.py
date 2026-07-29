@@ -145,7 +145,7 @@ OPTIONAL_TOP_LEVEL = (
 # bound it (1 MiB extrapolates past 10^11 seconds). The scanned repository authors
 # this file, so that is eight bytes of attacker input for an unbounded hang. Strip in
 # Python instead, where it is linear.
-_JSON_BLOCK_RE = re.compile(r"```json(.*?)```", re.DOTALL)
+_JSON_BLOCK_RE = re.compile(r"(`{3,})json\b(.*?)\1", re.DOTALL)
 
 # Markdown renderers hide HTML comments, so a block inside one is invisible in every
 # review surface a human uses — the PR diff, the rendered file — while remaining
@@ -203,7 +203,7 @@ def parse_threat_model_md(text: str) -> dict:
             typo inside the *real* block is by far the likeliest cause.
     """
     visible = _HTML_COMMENT_RE.sub("", text or "")
-    blocks = _JSON_BLOCK_RE.findall(visible)
+    blocks = [m.group(2) for m in _JSON_BLOCK_RE.finditer(visible)]
     if not blocks:
         raise ThreatModelValidationError(
             ["no ```json block found; the machine-readable threat model is required"]
@@ -234,10 +234,6 @@ def missing_headings(text: str) -> list[str]:
     refusing the file. The json block is machine truth, so a document with perfect
     json and no prose still scans — it is just useless to the humans who have to
     review it, which is the actual failure this catches.
-
-    Until recently this function had *no callers at all* while its docstring claimed
-    otherwise, so the documented "the md must follow a specific structure"
-    requirement was enforced nowhere on the load path.
     """
     return [h for h in REQUIRED_HEADINGS if h.lower() not in (text or "").lower()]
 
@@ -624,6 +620,22 @@ def _bullets(items: Any, empty: str = "_(none)_") -> str:
     return "\n".join(f"- {i}" for i in items) if items else empty
 
 
+def _fenced_json(data: dict) -> str:
+    """Render ``data`` as a json-fenced block with an ADAPTIVE fence length.
+
+    The fence uses one more backtick than the longest backtick run inside the JSON,
+    so a ``` sequence in a string value (e.g. an ``impact_statement`` that quotes a
+    code fence) cannot close the block early. This keeps render → parse round-trip
+    safe; ``_JSON_BLOCK_RE`` matches ``` `{3,} ``` fences and back-references the
+    opening length. Without this, a backtick in any string field made the written
+    file un-parseable (TM-2).
+    """
+    body = json.dumps(data, indent=2, ensure_ascii=False)
+    longest = max((len(m) for m in re.findall(r"`+", body)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}json\n{body}\n{fence}"
+
+
 def render_threat_model_md(data: dict) -> str:
     """Render a threat model back to ``OPENANT.THREATMODEL.md`` markdown.
 
@@ -704,9 +716,7 @@ def render_threat_model_md(data: dict) -> str:
         "",
         "## Machine-Readable Threat Model",
         "",
-        "```json",
-        json.dumps(data, indent=2, ensure_ascii=False),
-        "```",
+        _fenced_json(data),
         "",
     ]
     return "\n".join(lines)
@@ -748,7 +758,7 @@ def warn_permissive_threat_model(data: dict, path: Path | str | None = None) -> 
         trusts = [
             s.get("trust") for s in sources.values() if isinstance(s, dict)
         ]
-        if trusts and all(t == "trusted" for t in trusts):
+        if trusts and all(str(t).lower() == "trusted" for t in trusts):
             warnings.append(
                 f"every one of {len(trusts)} input source(s) is declared 'trusted' — "
                 "no untrusted input means essentially nothing is reachable by an "

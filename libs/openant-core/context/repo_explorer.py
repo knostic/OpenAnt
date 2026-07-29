@@ -173,7 +173,9 @@ class RepoExplorer:
         if not target.is_dir():
             return {"error": f"not a directory: {rel!r}"}
         entries = []
-        for child in sorted(target.iterdir(), key=lambda p: p.name)[:MAX_LIST_ENTRIES]:
+        all_children = sorted(target.iterdir(), key=lambda p: p.name)
+        truncated = len(all_children) > MAX_LIST_ENTRIES
+        for child in all_children[:MAX_LIST_ENTRIES]:
             if child.name in _SKIP_DIRS:
                 continue
             if child.is_symlink():
@@ -185,7 +187,7 @@ class RepoExplorer:
                     entries.append(f"[file] {child.name} ({child.stat().st_size}B)")
                 except OSError:
                     entries.append(f"[file] {child.name} (size unknown)")
-        return {"path": rel or ".", "entries": entries}
+        return {"path": rel or ".", "entries": entries, "truncated": truncated}
 
     def _read_file(self, rel: str) -> dict:
         if self.budget.bytes_read >= MAX_TOTAL_BYTES:
@@ -281,7 +283,7 @@ def explore_repository(
             if not isinstance(block, ToolUseBlock):
                 continue
             if block.name == finish_tool.name:
-                return dict(block.input), budget
+                return dict(block.input or {}), budget
             outcome = explorer.execute(block.name, block.input or {})
             results.append(ToolResultBlock(
                 tool_use_id=block.id, name=block.name,

@@ -39,7 +39,6 @@ def _normalize_result(result: dict) -> dict:
     # Normalize finding -> verdict
     if "verdict" not in result and "finding" in result:
         finding = result["finding"]
-        # Map finding values to verdict values
         finding_to_verdict = {
             "vulnerable": "VULNERABLE",
             "safe": "SAFE",
@@ -48,7 +47,8 @@ def _normalize_result(result: dict) -> dict:
             "inconclusive": "INCONCLUSIVE",
             "insufficient_context": "INSUFFICIENT_CONTEXT",
         }
-        result["verdict"] = finding_to_verdict.get(finding.lower(), finding.upper())
+        finding_str = str(finding)
+        result["verdict"] = finding_to_verdict.get(finding_str.lower(), finding_str.upper())
 
     # Ensure verdict is uppercase
     if "verdict" in result and isinstance(result["verdict"], str):
