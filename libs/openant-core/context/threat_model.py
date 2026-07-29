@@ -202,7 +202,10 @@ def parse_threat_model_md(text: str) -> dict:
             Any json decode errors seen along the way are reported too, since a
             typo inside the *real* block is by far the likeliest cause.
     """
-    visible = _HTML_COMMENT_RE.sub("", text or "")
+    # Normalize line endings first: the closing-fence anchor ``^\1[ \t]*$`` (MULTILINE)
+    # matches ``$`` before ``\n`` but not before ``\r``, so a CRLF / autocrlf checkout of
+    # a valid threat model would otherwise never close the fence and abort the scan (R3A-1).
+    visible = _HTML_COMMENT_RE.sub("", (text or "").replace("\r\n", "\n").replace("\r", "\n"))
     blocks = [m.group(2) for m in _JSON_BLOCK_RE.finditer(visible)]
     if not blocks:
         raise ThreatModelValidationError(

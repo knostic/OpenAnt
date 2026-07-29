@@ -14,7 +14,7 @@ import json
 import os
 import sys
 
-from utilities.dynamic_tester.models import DynamicTestResult
+from utilities.dynamic_tester.models import DynamicTestResult, TestEvidence
 from utilities.dynamic_tester.test_generator import generate_test, regenerate_test
 from utilities.dynamic_tester.docker_executor import run_single_container
 from utilities.dynamic_tester.result_collector import collect_result
@@ -201,6 +201,13 @@ def run_dynamic_tests(
                 test_code=cp_data.get("test_code", ""),
                 dockerfile=cp_data.get("dockerfile", ""),
                 docker_compose=cp_data.get("docker_compose", ""),
+                # Reconstruct the exploit-proof evidence too — it's serialized in the
+                # checkpoint but was dropped on resume, so a restored CONFIRMED finding
+                # silently lost its command_output/file_read/http_response proof (R3B-1).
+                evidence=[
+                    TestEvidence(type=e.get("type", ""), content=e.get("content", ""))
+                    for e in cp_data.get("evidence", []) if isinstance(e, dict)
+                ],
             )
             results.append(result)
             continue

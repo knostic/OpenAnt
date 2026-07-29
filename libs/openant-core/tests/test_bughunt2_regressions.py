@@ -91,6 +91,25 @@ def test_r2b1_parse_envelope_includes_degraded():
     assert ParseResult(dataset_path="x", parse_errors=[]).to_dict()["degraded"] is False
 
 
+# --- R3A-1: a CRLF / autocrlf threat-model file must still parse (MULTILINE $ vs \r) ---
+def test_r3a1_crlf_threat_model_parses():
+    data = {"schema": "openant-threat-model", "schema_version": 1,
+            "application_type": "custom:x", "purpose": "p", "impact_statement": "y"}
+    crlf = T.render_threat_model_md(data).replace("\n", "\r\n")
+    assert T.parse_threat_model_md(crlf).get("purpose") == "p"
+
+
+# --- R3B-1: dynamic-test evidence must survive a checkpoint resume round-trip ---
+def test_r3b1_dynamic_test_evidence_survives_resume():
+    from utilities.dynamic_tester.models import DynamicTestResult, TestEvidence
+    r = DynamicTestResult(finding_id="f", status="CONFIRMED", details="d",
+                          evidence=[TestEvidence("command_output", "uid=0(root)")])
+    cp = r.to_dict()
+    restored = [TestEvidence(type=e.get("type", ""), content=e.get("content", ""))
+                for e in cp.get("evidence", []) if isinstance(e, dict)]
+    assert len(restored) == 1 and restored[0].content == "uid=0(root)"
+
+
 # --- TM-2 / R2D-3: mixed-length fences (3-tick decoy + real 4-tick) must not desync ---
 def test_tm2_mixed_length_fences_extract_real_block():
     data = {"schema": "openant-threat-model", "schema_version": 1,
