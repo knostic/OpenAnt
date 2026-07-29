@@ -35,7 +35,6 @@ from dotenv import load_dotenv
 from utilities.file_io import open_utf8, read_json, read_repo_file, write_json
 from utilities.llm import PhaseBinding, simple_text
 
-# Load environment variables
 load_dotenv()
 
 
@@ -160,6 +159,12 @@ class ApplicationContext:
         if self.permissive_warnings is None:
             self.permissive_warnings = []
         """Validate application_type after initialization."""
+        # A hallucinated non-dict ``trust_boundaries`` (e.g. an LLM emitting a list)
+        # would crash suppress_local_only() / format_app_context_for_prompt's ``.items()``
+        # at analyze-phase prompt build, which is not wrapped in try/except (R4B-3).
+        # Coerce to a dict for every construction path (manual, LLM, threat-model).
+        if not isinstance(self.trust_boundaries, dict):
+            self.trust_boundaries = {}
         # Skip validation for manual overrides (they may use custom types intentionally)
         if self.source == "manual":
             return
@@ -216,11 +221,16 @@ class ApplicationContext:
         """
         if self.requires_remote_trigger:
             return False
-        # Case-insensitive: trust_boundaries values are LLM-generated and may
-        # deviate from the schema's lowercase 'untrusted' (e.g. 'Untrusted').
+        # A boundary counts as untrusted if its (LLM-generated, free-form) level
+        # CONTAINS the 'untrusted' token — tolerating case AND qualifiers such as
+        # 'untrusted (attacker-controlled)' / 'untrusted - HTTP body'. An exact
+        # '== untrusted' match let a qualified level slip past and re-enable suppression
+        # of the untrusted-input bug class the gate exists to protect (R4B-1).
+        # 'trusted'/'semi-trusted' do not contain the substring 'untrusted'.
+        boundaries = self.trust_boundaries if isinstance(self.trust_boundaries, dict) else {}
         return not any(
-            str(level).lower() == "untrusted"
-            for level in (self.trust_boundaries or {}).values()
+            "untrusted" in str(level).lower()
+            for level in boundaries.values()
         )
 
 
@@ -525,7 +535,6 @@ def check_manual_override(repo_path: Path) -> ApplicationContext | None:
     return None
 
 
-# Build the type descriptions for the prompt
 def _build_type_descriptions() -> str:
     """Build formatted type descriptions for the prompt."""
     lines = []

@@ -110,6 +110,27 @@ def test_r3b1_dynamic_test_evidence_survives_resume():
     assert len(restored) == 1 and restored[0].content == "uid=0(root)"
 
 
+# --- R4B-1: a qualified 'untrusted (...)' boundary must NOT re-enable local-only suppression ---
+def test_r4b1_qualified_untrusted_not_suppressed():
+    from context.application_context import ApplicationContext as AC
+
+    def mk(tb):
+        return AC(application_type="library", purpose="x",
+                  requires_remote_trigger=False, trust_boundaries=tb)
+    assert mk({"n": "untrusted (attacker-controlled)"}).suppress_local_only() is False
+    assert mk({"n": "Untrusted"}).suppress_local_only() is False
+    assert mk({"n": "trusted"}).suppress_local_only() is True          # control unchanged
+
+
+# --- R4B-3: a non-dict trust_boundaries (LLM hallucination) must not crash ---
+def test_r4b3_non_dict_trust_boundaries_coerced():
+    from context.application_context import ApplicationContext as AC
+    ac = AC(application_type="library", purpose="x",
+            requires_remote_trigger=False, trust_boundaries=["network: untrusted"])
+    ac.suppress_local_only()                                            # must not raise
+    assert isinstance(ac.trust_boundaries, dict)
+
+
 # --- TM-2 / R2D-3: mixed-length fences (3-tick decoy + real 4-tick) must not desync ---
 def test_tm2_mixed_length_fences_extract_real_block():
     data = {"schema": "openant-threat-model", "schema_version": 1,
