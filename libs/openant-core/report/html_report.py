@@ -357,6 +357,11 @@ def generate_html_report(
 
     # Prepare chart data
     verdict_order = list(FINDING_VERDICT_ORDER)
+    # Append any producer verdict not in the canonical display order (e.g. 'error',
+    # the errored/unanalyzed sentinel) so such units aren't silently dropped from the
+    # charts — the GO-3 silent-false-negative surface (verdict_taxonomy drift).
+    verdict_order += [v for v in verdict_counts if v not in verdict_order]
+    verdict_order += [v for v in file_verdict_counts if v not in verdict_order]
     unit_chart_labels = json.dumps([v for v in verdict_order if v in verdict_counts])
     unit_chart_data = json.dumps([verdict_counts.get(v, 0) for v in verdict_order if v in verdict_counts])
     unit_chart_colors = json.dumps([get_verdict_color(v) for v in verdict_order if v in verdict_counts])

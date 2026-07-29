@@ -37,7 +37,9 @@ def test_go3_error_verdict_surfaced():
     exp = {"results": [{"route_key": "a.py:f", "finding": "error"}]}
     out = os.path.join(tempfile.mkdtemp(), "r.html")
     H.generate_html_report(exp, {"units": []}, "", out)
-    assert "Errored (unanalyzed)" in open(out).read()
+    html = open(out).read()
+    assert "Errored (unanalyzed)" in html          # stat card
+    assert '"error"' in html                        # AND the charts (not just the card)
 
 
 # --- TM-1: a capitalized "Trusted" must still trigger the self-whitelisting warning ---
