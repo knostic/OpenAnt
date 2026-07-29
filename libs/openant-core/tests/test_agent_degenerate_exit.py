@@ -90,6 +90,29 @@ def test_end_turn_without_finish_is_not_a_neutral_verdict():
     assert result.security_classification == "incomplete"
 
 
+def test_degenerate_exit_records_spend():
+    """R2A-1: a degenerate exit must still record token spend on the tracker and
+    carry input/output tokens on the result — not silently undercount (total_tokens>0
+    but input/output/cost=0)."""
+    class _CountingTracker:
+        def __init__(self):
+            self.calls = 0
+
+        def record_call(self, **kw):
+            self.calls += 1
+            return {"cost_usd": 0.0}
+
+    tracker = _CountingTracker()
+    binding = _FakeBinding(_FakeAdapter([
+        CompletionResult(content=[TextBlock("done")], input_tokens=5000,
+                         output_tokens=200, stop_reason="end_turn"),
+    ]))
+    agent = ContextAgent(index=_StubIndex(), binding=binding, tracker=tracker)
+    result = _run(agent)
+    assert tracker.calls == 1, "degenerate exit did not record_call — spend undercounted"
+    assert result.input_tokens == 5000 and result.output_tokens == 200
+
+
 def test_no_tool_calls_is_not_a_neutral_verdict():
     """Sibling path: model responded but made no tool calls."""
     result = _run(_agent([

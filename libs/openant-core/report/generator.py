@@ -361,7 +361,9 @@ def generate_all(
         print(f"Generating disclosure for {finding['short_name']}...")
         disclosure, _usage = generate_disclosure(finding, product_name, report_binding)
 
-        safe_name = finding["short_name"].replace(" ", "_").upper()
+        # short_name passes validation on presence only, so it may be null/empty;
+        # fall back to id so a null short_name can't crash disclosure generation (R2B-2).
+        safe_name = (finding.get("short_name") or finding.get("id") or "finding").replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
         with open_utf8(disclosures_dir / filename, "w") as f:
             f.write(disclosure)

@@ -205,7 +205,6 @@ class ContextAgent:
         Returns:
             AgentResult with gathered context
         """
-        # Compute reachability info
         is_entry_point = unit_id in self.entry_points
         reachable_from_entry: Optional[bool] = None
         entry_point_path: Optional[List[str]] = None
@@ -230,7 +229,6 @@ class ContextAgent:
             reaching_entry_point=reaching_entry_point
         )
 
-        # Initialize conversation
         messages: list[Message] = [
             Message(role="user", content=[TextBlock(user_prompt)])
         ]
@@ -269,11 +267,9 @@ class ContextAgent:
                 }
                 raise
 
-            # Track tokens
             total_input_tokens += result.input_tokens
             total_output_tokens += result.output_tokens
 
-            # Process response
             assistant_content = result.content
             stop_reason = result.stop_reason
 
@@ -290,6 +286,14 @@ class ContextAgent:
                 if self.verbose:
                     print("  Agent ended without calling finish tool")
 
+                # Record spend even on this degenerate exit, so the tracker and the
+                # per-unit metadata don't undercount tokens/cost (R2A-1).
+                call_record = self.tracker.record_call(
+                    model=self.binding.model,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
+                )
                 return AgentResult(
                     include_functions=[],
                     usage_context="Agent did not complete analysis",
@@ -300,10 +304,12 @@ class ContextAgent:
                     total_tokens=total_input_tokens + total_output_tokens,
                     is_entry_point=is_entry_point,
                     reachable_from_entry=reachable_from_entry,
-                    entry_point_path=entry_point_path
+                    entry_point_path=entry_point_path,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    cost_usd=call_record.get("cost_usd", 0.0),
                 )
 
-            # Process tool calls
             tool_results: list[ToolResultBlock] = []
             finish_result = None
 
@@ -316,7 +322,6 @@ class ContextAgent:
                     if self.verbose:
                         print(f"    Tool: {tool_name}({json.dumps(tool_input)[:100]}...)")
 
-                    # Execute tool
                     tool_outcome = self.tool_executor.execute(tool_name, tool_input)
 
                     if self.verbose:
@@ -386,6 +391,13 @@ class ContextAgent:
                 # No tool calls but model didn't end — treat as incomplete
                 if self.verbose:
                     print("  No tool calls in response, treating as incomplete")
+                # Record spend even on this degenerate exit (R2A-1).
+                call_record = self.tracker.record_call(
+                    model=self.binding.model,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
+                )
                 return AgentResult(
                     include_functions=[],
                     usage_context="Agent response had no tool calls",
@@ -396,7 +408,10 @@ class ContextAgent:
                     total_tokens=total_input_tokens + total_output_tokens,
                     is_entry_point=is_entry_point,
                     reachable_from_entry=reachable_from_entry,
-                    entry_point_path=entry_point_path
+                    entry_point_path=entry_point_path,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    cost_usd=call_record.get("cost_usd", 0.0),
                 )
 
         # Max iterations reached

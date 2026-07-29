@@ -84,6 +84,13 @@ def test_ml1_string_finding_still_maps():
     assert A.parse_response('{"finding": "vulnerable"}')["verdict"] == "VULNERABLE"
 
 
+# --- R2B-1: ParseResult.to_dict must include the derived `degraded` flag ---
+def test_r2b1_parse_envelope_includes_degraded():
+    from core.schemas import ParseResult
+    assert ParseResult(dataset_path="x", parse_errors=["boom"]).to_dict()["degraded"] is True
+    assert ParseResult(dataset_path="x", parse_errors=[]).to_dict()["degraded"] is False
+
+
 # --- TM-2 / R2D-3: mixed-length fences (3-tick decoy + real 4-tick) must not desync ---
 def test_tm2_mixed_length_fences_extract_real_block():
     data = {"schema": "openant-threat-model", "schema_version": 1,

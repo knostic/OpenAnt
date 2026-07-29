@@ -76,7 +76,11 @@ class ParseResult:
         return bool(self.parse_errors)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # ``degraded`` is a @property, which asdict() omits — include it explicitly so
+        # the parse envelope carries it like ScanResult.to_dict does (R2B-1).
+        d["degraded"] = self.degraded
+        return d
 
 
 @dataclass
