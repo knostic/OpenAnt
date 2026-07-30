@@ -6,18 +6,25 @@ import (
 	"testing"
 
 	"github.com/knostic/open-ant-cli/internal/config"
+	"github.com/knostic/open-ant-cli/internal/models"
 )
 
 // ---------------------------------------------------------------------------
 // H3-Go — wizard must not offer o1-mini (the Python adapter drops it because
 // it rejects the `system` role and lacks tool support). o1 / o3-mini /
-// gpt-4o / gpt-4o-mini stay.
+// gpt-4o / gpt-4o-mini stay. The wizard's hint list now comes from the shared
+// config/models.json registry (models.KnownModels) rather than a hardcoded map,
+// so this asserts the same invariant against the registry-derived list.
 // ---------------------------------------------------------------------------
 
 func TestKnownModels_OpenAIDropsO1Mini(t *testing.T) {
-	openai, ok := knownModels["openai"]
-	if !ok {
-		t.Fatal("knownModels missing openai entry")
+	cfg, err := models.Load()
+	if err != nil {
+		t.Fatalf("models.Load(): %v", err)
+	}
+	openai := cfg.KnownModels("openai")
+	if len(openai) == 0 {
+		t.Fatal("KnownModels(openai) returned nothing")
 	}
 	for _, m := range openai {
 		if m == "o1-mini" {
@@ -27,7 +34,7 @@ func TestKnownModels_OpenAIDropsO1Mini(t *testing.T) {
 	// The keepers must still be present.
 	for _, want := range []string{"o1", "o3-mini", "gpt-4o", "gpt-4o-mini"} {
 		if !stringSliceContains(openai, want) {
-			t.Errorf("knownModels[openai] dropped %q; only o1-mini should be removed", want)
+			t.Errorf("KnownModels(openai) dropped %q; only o1-mini should be removed", want)
 		}
 	}
 }

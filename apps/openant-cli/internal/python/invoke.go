@@ -39,7 +39,13 @@ type InvokeResult struct {
 // - Working directory is set to the openant-core lib directory if provided
 // - If apiKey is non-empty, it is injected as ANTHROPIC_API_KEY in the subprocess
 func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey string) (*InvokeResult, error) {
-	cmdArgs := append([]string{"-m", "openant"}, args...)
+	// -P keeps the process working directory off sys.path. `-m openant` otherwise
+	// prepends the CWD, and this engine inherits the user's shell CWD — which in the
+	// standard `git clone X && cd X && openant ...` flow is inside the scanned,
+	// untrusted repository. A hostile `openant/` package there would shadow the real
+	// one and execute on import. -P closes that; it also propagates via the
+	// environment to the report subprocesses the engine spawns.
+	cmdArgs := append([]string{"-P", "-m", "openant"}, args...)
 
 	// Bound the subprocess with an automatic deadline so a hung parser
 	// cannot wedge the CLI forever on cmd.Wait(). When the context expires
@@ -143,6 +149,7 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	// Read all stdout
 	var stdoutBuf strings.Builder
 	if _, err := io.Copy(&stdoutBuf, stdout); err != nil {
+		_ = cmd.Wait() // reap the child even on read error so it isn't leaked
 		return nil, fmt.Errorf("failed to read stdout: %w", err)
 	}
 

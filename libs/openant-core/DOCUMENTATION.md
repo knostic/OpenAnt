@@ -58,9 +58,9 @@ OpenAnt documentation is organized into three tiers based on audience and purpos
 ### Key Facts About the Codebase
 
 - **8-Step Pipeline:** Parse → Generate Units → Entry-Point Filter → Application Context → Context Enhancement → Stage 1 Detection → Stage 2 Verification → Dynamic Testing
-- **Language-Agnostic Prompts:** The same prompts are used for Python, JavaScript, and Go
+- **Language-Agnostic Prompts:** The same prompts are used for every supported language
 - **Two-Stage Analysis:** Stage 1 detects vulnerabilities, Stage 2 uses attacker simulation to verify exploitability
-- **Supported Languages:** Python, JavaScript/TypeScript, Go
+- **Supported Languages:** Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, and Zig
 
 ### File Naming Conventions
 

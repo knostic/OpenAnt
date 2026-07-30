@@ -22,6 +22,13 @@ import os
 import sys
 import tempfile
 
+from core.language_registry import supported_languages
+from core.language_selection import (
+    DEFAULT_MIN_FILES,
+    DEFAULT_MIN_SHARE,
+    report_exclusions,
+    select_languages,
+)
 from core.verdict_taxonomy import FINDING_VERDICT_ORDER
 from utilities.file_io import normalize_results, read_json
 
@@ -56,10 +63,17 @@ def cmd_scan(args):
     output_dir = args.output or tempfile.mkdtemp(prefix="open_ant_")
 
     try:
+        # Resolve multi-language selection BEFORE scanning so an invalid flag
+        # combination fails fast rather than after a full parse.
+        _selection = _select_languages_for(args)
+
         result = scan_repository(
             repo_path=args.repo,
             output_dir=output_dir,
             language=args.language or "auto",
+            languages=_selection.selected if _selection else None,
+            excluded_languages=dict(_selection.excluded) if _selection else None,
+            strict_languages=getattr(args, "strict_languages", False),
             processing_level=args.level,
             verify=args.verify,
             generate_context=not args.no_context,
@@ -107,9 +121,46 @@ def cmd_scan(args):
         return 2
 
 
+def _select_languages_for(args):
+    """LanguageSelection for this invocation, or None only for an explicit ``-l``.
+
+    **`auto` now means every detected language, not the dominant one.** This is a
+    deliberate behaviour change and it is the point of the feature: the request was
+    "all languages we currently support should be detected in the repo and it
+    should scan all of them, not just the main one" — a statement about what the
+    tool does by default, which an opt-in flag does not satisfy.
+
+    The machinery this needs already existed and was already reviewed:
+    ``select_languages`` applies the file-count and share thresholds, always keeps
+    the dominant language so a selection can never be empty, and
+    ``report_exclusions`` prints any language it dropped. Only the early return
+    here forced the legacy single-language path, so removing it is the whole
+    inversion.
+
+    Returns None only when the caller named a single language explicitly with
+    ``-l <lang>``, which remains the escape hatch and the way to get the old
+    behaviour.
+
+    What changes for existing users: multi-language repositories now cost more to
+    scan and produce more findings. That is the intended effect; the loud
+    selection/exclusion banner is the mitigation, so the coverage change is never
+    silent.
+    """
+    explicit = getattr(args, "language", "auto") not in (None, "auto")
+    multi = (getattr(args, "languages", None)
+             or getattr(args, "all_languages", False)
+             or getattr(args, "multi_language", False))
+    if explicit and not multi:
+        return None
+    from core.parser_adapter import detect_languages
+
+    return resolve_language_selection(args, detect_languages(args.repo))
+
+
 def cmd_parse(args):
     """Parse a repository into a dataset."""
-    from core.parser_adapter import parse_repository
+    from core.parser_adapter import _maybe_apply_diff_filter, parse_repository
+    from core.schemas import ParseResult
     from core.schemas import success, error
     from core.step_report import step_context
 
@@ -122,22 +173,90 @@ def cmd_parse(args):
             "processing_level": args.level,
             "skip_tests": not args.no_skip_tests,
         }) as ctx:
-            result = parse_repository(
-                repo_path=args.repo,
-                output_dir=output_dir,
-                language=args.language or "auto",
-                processing_level=args.level,
-                skip_tests=not args.no_skip_tests,
-                name=getattr(args, "name", None),
-                diff_manifest=getattr(args, "diff_manifest", None),
-                fresh=getattr(args, "fresh", False),
-                library_mode=getattr(args, "library_mode", False),
-            )
+            selection = _select_languages_for(args)
+
+            if selection is not None and selection.is_multi:
+                # Multi-language: fan out into <output_dir>/<lang>/, then merge
+                # into the single dataset the rest of the pipeline consumes.
+                from core.dataset_merge import (
+                    merge_analyzer_outputs,
+                    merge_datasets,
+                    write_call_graph_index,
+                )
+                from core.parser_adapter import parse_repository_multi
+
+                outcomes = parse_repository_multi(
+                    repo_path=args.repo,
+                    run_dir=output_dir,
+                    languages=selection.selected,
+                    processing_level=args.level,
+                    skip_tests=not args.no_skip_tests,
+                    name=getattr(args, "name", None),
+                    fresh=getattr(args, "fresh", False),
+                    library_mode=getattr(args, "library_mode", False),
+                    strict=getattr(args, "strict_languages", False),
+                )
+                dataset_path = os.path.join(output_dir, "dataset.json")
+                analyzer_path = os.path.join(output_dir, "analyzer_output.json")
+                merge_stats = merge_datasets(outcomes, dataset_path)
+                merge_analyzer_outputs(outcomes, analyzer_path)
+                write_call_graph_index(
+                    outcomes, os.path.join(output_dir, "call_graphs.json")
+                )
+
+                failed = [o for o in outcomes if not o.ok]
+                result = ParseResult(
+                    dataset_path=dataset_path,
+                    analyzer_output_path=analyzer_path if os.path.exists(analyzer_path) else None,
+                    units_count=merge_stats.total_units,
+                    # Scalar stays the PRIMARY language for back-compat.
+                    language=selection.primary,
+                    processing_level=args.level,
+                    languages=merge_stats.languages,
+                    language_stats=merge_stats.units_per_language,
+                    per_language={o.language: o.to_dict() for o in outcomes},
+                    parse_errors=[o.to_dict() for o in failed],
+                    excluded_languages=dict(selection.excluded),
+                )
+                _maybe_apply_diff_filter(
+                    result, output_dir, getattr(args, "diff_manifest", None)
+                )
+            else:
+                # NOTE: exclusions are attached AFTER this call — see below.
+                # The one-language case is exactly when a coverage gap exists,
+                # so the legacy branch must report it too.
+                result = parse_repository(
+                    repo_path=args.repo,
+                    output_dir=output_dir,
+                    # Honour an explicit single-language selection. `-l` is
+                    # mutually exclusive with --languages, so args.language is
+                    # ALWAYS "auto" here — using it silently re-detected the
+                    # dominant language and parsed something the user did not
+                    # ask for, while reporting success.
+                    language=(
+                        selection.selected[0] if selection and selection.selected
+                        else (args.language or "auto")
+                    ),
+                    processing_level=args.level,
+                    skip_tests=not args.no_skip_tests,
+                    name=getattr(args, "name", None),
+                    diff_manifest=getattr(args, "diff_manifest", None),
+                    fresh=getattr(args, "fresh", False),
+                    library_mode=getattr(args, "library_mode", False),
+                )
+
+            # Attach exclusions on BOTH branches. The multi-language branch
+            # sets them when constructing its ParseResult; the single-language
+            # branch gets them here, because parse_repository knows nothing
+            # about selection policy.
+            if selection is not None and not result.excluded_languages:
+                result.excluded_languages = dict(selection.excluded)
 
             ctx.summary = {
                 "total_units": result.units_count,
                 "language": result.language,
                 "processing_level": result.processing_level,
+                "excluded_languages": result.excluded_languages,
             }
             # Surface diff stats in the parse step report if present.
             diff_report = os.path.join(output_dir, "diff_filter.report.json")
@@ -643,7 +762,8 @@ def cmd_report_data(args):
             # --- Load dynamic test results if available ---
             # Dynamic tests use VULN-XXX IDs from pipeline_output.json,
             # but report-data works with route_keys from results_verified.json.
-            # Bridge via pipeline_output's location.function (== route_key).
+            # Bridge by reconstructing route_key = location.file + ":" + location.function
+            # (location.function is the bare name; file+":"+function == route_key, D3b).
             dt_by_route_key = {}
             dt_path = os.path.join(results_dir, "dynamic_test_results.json")
             po_path = os.path.join(results_dir, "pipeline_output.json")
@@ -664,7 +784,11 @@ def cmd_report_data(args):
                 vuln_id_to_route = {}
                 for finding in po_data.get("findings", []):
                     fid = finding.get("id")
-                    route = finding.get("location", {}).get("function", "")
+                    loc = finding.get("location", {})
+                    route = (
+                        f"{loc.get('file', '')}:{loc.get('function', '')}"
+                        if loc.get("file") else loc.get("function", "")
+                    )
                     if fid and route:
                         vuln_id_to_route[fid] = route
 
@@ -976,7 +1100,133 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
         return 2
 
 
-def main():
+
+def resolve_language_selection(args, counts: dict[str, int]):
+    """Turn parsed CLI flags into a :class:`LanguageSelection`.
+
+    Kept as a standalone function so the flag semantics are testable without
+    running a scan, and so `scan` and `parse` cannot drift apart.
+
+    `-l auto` (the default) deliberately still means "dominant language only".
+    Multi-language is opt-in via --languages / --all-languages, so no existing
+    invocation changes behaviour.
+
+    Raises:
+        ValueError: If an explicit `-l <lang>` is combined with a multi-language
+            flag — one names a single language, the other names a set, and
+            silently preferring either would surprise someone.
+    """
+    explicit = getattr(args, "language", "auto") not in (None, "auto")
+    # `multi_language` was missing here while `_select_languages_for` did treat it
+    # as a trigger, so `-l go --multi-language` silently dropped the multi flag and
+    # then blamed the exclusion on `--languages`, which the user never passed.
+    multi = (getattr(args, "languages", None)
+             or getattr(args, "all_languages", False)
+             or getattr(args, "multi_language", False))
+
+    if explicit and multi:
+        raise ValueError(
+            "-l/--language is mutually exclusive with --languages/--all-languages/"
+            f"--multi-language: got -l {args.language} alongside a multi-language "
+            "flag. Use one or the other."
+        )
+
+    if explicit:
+        include = [args.language]
+    elif getattr(args, "languages", None):
+        include = [p.strip() for p in args.languages.split(",") if p.strip()]
+    else:
+        include = None
+
+    selection = select_languages(
+        counts,
+        include=include,
+        all_languages=getattr(args, "all_languages", False),
+        min_files=getattr(args, "min_language_files", DEFAULT_MIN_FILES),
+        min_share=getattr(args, "min_language_share", DEFAULT_MIN_SHARE),
+    )
+    # Report here rather than at each call site: this is the single point every
+    # command funnels through, so a coverage gap cannot escape by way of a
+    # caller that forgot to print it.
+    report_exclusions(selection.excluded)
+    return selection
+
+
+
+def cmd_threat_model(args):
+    """Generate or validate a repository's OPENANT.THREATMODEL.md."""
+    from pathlib import Path
+
+    from context.threat_model import (
+        THREAT_MODEL_FILENAME,
+        ThreatModelValidationError,
+        load_threat_model,
+    )
+    from core.schemas import error, success
+
+    repo = Path(args.repo)
+
+    if args.validate_only:
+        # CI-friendly: parse and validate a committed model, spend nothing.
+        target = repo / THREAT_MODEL_FILENAME
+        if not target.exists():
+            _output_json(error(f"{THREAT_MODEL_FILENAME} not found in {repo}"))
+            return 2
+        try:
+            context = load_threat_model(repo)
+        except ThreatModelValidationError as exc:
+            _output_json(error(str(exc)))
+            return 2
+        _output_json(success({
+            "path": str(target),
+            "application_type": context.application_type,
+            "attacker_profiles": len(context.attacker_profiles or []),
+            "valid": True,
+        }))
+        return 0
+
+    from context.threat_model_agent import (
+        ThreatModelGenerationError,
+        generate_threat_model,
+    )
+    from utilities.llm import (
+        build_phase_registry,
+        load_config_file,
+        probe_registry_or_raise,
+        resolve_llm_config,
+    )
+
+    try:
+        config = load_config_file()
+        registry = build_phase_registry(
+            config, resolve_llm_config(config, args.llm_config))
+        probe_registry_or_raise(registry)
+        # Reuses the app_context phase — adding a phase would break every
+        # existing user config (see context/threat_model_agent.py).
+        path = generate_threat_model(
+            repo,
+            registry.get("app_context"),
+            force=args.force,
+            output_path=Path(args.output_md) if args.output_md else None,
+        )
+    except ThreatModelGenerationError as exc:
+        _output_json(error(str(exc)))
+        return 2
+    except Exception as exc:  # noqa: BLE001 - surface any provider error cleanly
+        _output_json(error(str(exc)))
+        return 2
+
+    _output_json(success({"path": str(path)}))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the full CLI parser.
+
+    Split out of ``main()`` so tests can introspect the parser — in
+    particular to assert that ``--language`` choices stay in lock-step with
+    ``config/languages.json`` rather than drifting as hardcoded literals.
+    """
     parser = argparse.ArgumentParser(
         prog="openant",
         description="Two-stage SAST tool using Claude for vulnerability analysis",
@@ -999,9 +1249,47 @@ def main():
     scan_p.add_argument("--output", "-o", help="Output directory (default: temp dir)")
     scan_p.add_argument(
         "--language", "-l",
-        choices=["auto", "python", "javascript", "go", "c", "ruby", "php", "zig"],
+        choices=["auto", *supported_languages()],
         default="auto",
         help="Language (default: auto-detect)",
+    )
+    scan_p.add_argument(
+        "--languages",
+        default=None,
+        help=(
+            "Comma-separated languages to parse, e.g. 'python,go'. Bypasses the "
+            "detection thresholds. Mutually exclusive with an explicit -l <lang>."
+        ),
+    )
+    scan_p.add_argument(
+        "--all-languages",
+        action="store_true",
+        help="Parse every detected language, ignoring the size thresholds.",
+    )
+    scan_p.add_argument(
+        "--multi-language",
+        action="store_true",
+        help=(
+            "Scan every detected language that clears the size thresholds. "
+            "Excluded languages are reported as an explicit coverage gap."
+        ),
+    )
+    scan_p.add_argument(
+        "--min-language-files",
+        type=int,
+        default=DEFAULT_MIN_FILES,
+        help=f"Minimum source files for a language to be scanned (default: {DEFAULT_MIN_FILES}).",
+    )
+    scan_p.add_argument(
+        "--min-language-share",
+        type=float,
+        default=DEFAULT_MIN_SHARE,
+        help=f"Minimum share of source files for a language (default: {DEFAULT_MIN_SHARE}).",
+    )
+    scan_p.add_argument(
+        "--strict-languages",
+        action="store_true",
+        help="Abort the run if any selected language fails to parse (default: continue degraded).",
     )
     scan_p.add_argument(
         "--level",
@@ -1076,9 +1364,47 @@ def main():
     parse_p.add_argument("--output", "-o", help="Output directory (default: temp dir)")
     parse_p.add_argument(
         "--language", "-l",
-        choices=["auto", "python", "javascript", "go", "c", "ruby", "php", "zig"],
+        choices=["auto", *supported_languages()],
         default="auto",
         help="Language (default: auto-detect)",
+    )
+    parse_p.add_argument(
+        "--languages",
+        default=None,
+        help=(
+            "Comma-separated languages to parse, e.g. 'python,go'. Bypasses the "
+            "detection thresholds. Mutually exclusive with an explicit -l <lang>."
+        ),
+    )
+    parse_p.add_argument(
+        "--all-languages",
+        action="store_true",
+        help="Parse every detected language, ignoring the size thresholds.",
+    )
+    parse_p.add_argument(
+        "--multi-language",
+        action="store_true",
+        help=(
+            "Scan every detected language that clears the size thresholds. "
+            "Excluded languages are reported as an explicit coverage gap."
+        ),
+    )
+    parse_p.add_argument(
+        "--min-language-files",
+        type=int,
+        default=DEFAULT_MIN_FILES,
+        help=f"Minimum source files for a language to be scanned (default: {DEFAULT_MIN_FILES}).",
+    )
+    parse_p.add_argument(
+        "--min-language-share",
+        type=float,
+        default=DEFAULT_MIN_SHARE,
+        help=f"Minimum share of source files for a language (default: {DEFAULT_MIN_SHARE}).",
+    )
+    parse_p.add_argument(
+        "--strict-languages",
+        action="store_true",
+        help="Abort the run if any selected language fails to parse (default: continue degraded).",
     )
     parse_p.add_argument(
         "--level",
@@ -1268,9 +1594,36 @@ def main():
     cs_p = subparsers.add_parser("checkpoint-status",
         help="(internal) Report checkpoint status for a directory")
     cs_p.add_argument("checkpoint_dir", help="Path to checkpoint directory")
+    # ---------------------------------------------------------------
+    # threat-model — generate or validate OPENANT.THREATMODEL.md
+    # ---------------------------------------------------------------
+    tm_p = subparsers.add_parser(
+        "threat-model",
+        help="Generate or validate a repository's OPENANT.THREATMODEL.md",
+    )
+    tm_p.add_argument("repo", help="Path to repository")
+    tm_p.add_argument(
+        "--force", action="store_true",
+        help="Regenerate even if a threat model exists (backs it up first)",
+    )
+    tm_p.add_argument(
+        "--validate-only", action="store_true",
+        help="Validate an existing threat model and exit. Makes no LLM call.",
+    )
+    tm_p.add_argument("--output-md", help="Write here instead of the repo root")
+    tm_p.add_argument(
+        "--llm-config", default=None,
+        help="Name of the llm-config in ~/.config/openant/config.json",
+    )
+    tm_p.set_defaults(func=cmd_threat_model)
+
     cs_p.set_defaults(func=cmd_checkpoint_status)
 
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     return args.func(args)
 
 

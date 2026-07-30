@@ -76,7 +76,7 @@ from ..adapter import (
     ToolUseBlock,
 )
 from ._ratelimit import report_rate_limit, wait_for_rate_limit
-from ...model_config import OPENAI_PRICING
+from .._pricing import LazyProviderPricing
 from .._redact import redact_secrets, redacted_cause_from
 
 
@@ -164,7 +164,9 @@ class OpenAIAdapter:
     # ``developer`` role and lack tool support, so the adapter does not
     # advertise them (PR #69 H3). ``o1`` / ``o3-mini`` / ``o3`` / ``o4-mini``
     # accept ``developer`` + tools and stay supported.
-    pricing: dict[str, dict[str, float]] = {m: dict(p) for m, p in OPENAI_PRICING.items()}
+    # Resolved lazily from config/models.json (the shared registry) on
+    # first access; see utilities/llm/_pricing.py.
+    pricing = LazyProviderPricing("openai")
 
     def __init__(
         self,

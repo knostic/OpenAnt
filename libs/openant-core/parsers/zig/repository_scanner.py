@@ -5,6 +5,7 @@ Enumerates all Zig source files in a repository.
 """
 
 import os
+from core.repo_walk import walk_repository
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -79,63 +80,43 @@ class RepositoryScanner:
         #   2. External symlink loops: a symlink pointing OUTSIDE the repo whose
         #      real target we have already descended (a self-referential loop)
         #      would recurse forever; an inode guard prevents re-descending it.
-        seen_real_dirs: set = set()
-        repo_real = os.path.realpath(self.repo_path)
-        for root, dirs, filenames in os.walk(self.repo_path, followlinks=True):
-            # Filter out excluded directories
-            original_dirs = dirs.copy()
-            dirs[:] = [
-                d
-                for d in dirs
-                if d not in self.EXCLUDE_DIRS
-                and not self._matches_exclude_pattern(d)
-                and not (self.skip_tests and self._is_test_directory(d))
-            ]
-            directories_excluded += len(original_dirs) - len(dirs)
+        # Traversal delegated to core/repo_walk.py. The previous implementation
+        # used os.walk(followlinks=True) with an inode set that deduped only
+        # REPEAT visits, so an external directory symlink was descended the first
+        # time — `escape -> /` walked the host filesystem into the dataset. Both a
+        # grep-based audit census and a token-matching parity test scored this
+        # scanner "guarded"; only executing it against a hostile fixture found the
+        # hole. It also never recorded unreadable directories, so a subtree it
+        # could not enter vanished from a scan that reported success.
+        stats: dict = {}
 
-            # Cycle / alias guard on the surviving directory symlinks.
-            kept = []
-            for d in dirs:
-                full = os.path.join(root, d)
-                if os.path.islink(full):
-                    real = os.path.realpath(full)
-                    # In-repo alias: the real directory is walked canonically,
-                    # so never descend the symlink (prefer the canonical path).
-                    if real == repo_real or real.startswith(repo_real + os.sep):
-                        continue
-                    # External target: guard against symlink loops by inode.
-                    try:
-                        st = os.stat(full)
-                        real_key = (st.st_dev, st.st_ino)
-                    except OSError:
-                        continue
-                    if real_key in seen_real_dirs:
-                        continue
-                    seen_real_dirs.add(real_key)
-                kept.append(d)
-            dirs[:] = kept
+        def _on_file(entry, relative_path: str) -> None:
+            # Case-insensitive: filesystems (macOS/Windows) and users may spell the
+            # extension .ZIG/.Zig; skipping those silently loses files.
+            if not entry.name.lower().endswith(".zig"):
+                return
+            if self.skip_tests and self._is_test_file(relative_path):
+                return
+            try:
+                size = entry.stat().st_size
+            except OSError:
+                size = 0
+            files.append({"path": relative_path, "size": size})
 
-            directories_scanned += 1
+        def _should_exclude(name: str) -> bool:
+            return (name in self.EXCLUDE_DIRS
+                    or self._matches_exclude_pattern(name)
+                    or (self.skip_tests and self._is_test_directory(name)))
 
-            for filename in filenames:
-                # Case-insensitive: filesystems (macOS/Windows) and users may
-                # spell the extension .ZIG/.Zig; skipping those silently loses files.
-                if not filename.lower().endswith(".zig"):
-                    continue
-
-                file_path = Path(root) / filename
-                relative_path = file_path.relative_to(self.repo_path)
-
-                # Skip test files if requested
-                if self.skip_tests and self._is_test_file(str(relative_path)):
-                    continue
-
-                try:
-                    size = file_path.stat().st_size
-                except OSError:
-                    size = 0
-
-                files.append({"path": str(relative_path), "size": size})
+        walk_repository(
+            self.repo_path,
+            should_exclude_directory=_should_exclude,
+            on_file=_on_file,
+            stats=stats,
+        )
+        directories_scanned = stats.get("directories_scanned", 0)
+        directories_excluded = stats.get("directories_excluded", 0)
+        self.walk_stats = stats
 
         total_size = sum(f["size"] for f in files)
 
@@ -148,6 +129,16 @@ class RepositoryScanner:
                 "total_size_bytes": total_size,
                 "directories_scanned": directories_scanned,
                 "directories_excluded": directories_excluded,
+                # Surfaced into the RESULT, not just stderr. A directory the
+                # scanner could not enter is code it never analysed, and CI
+                # discards stderr — so a gap that lives only in a warning is a
+                # gap nobody sees.
+                "directories_unreadable": stats.get("directories_unreadable", 0),
+                "unreadable_examples": stats.get("unreadable_examples", []),
+                # Symlinks are refused by policy; surfacing the count keeps that
+                # a visible coverage gap rather than a silent false negative.
+                "symlinks_skipped": stats.get("symlinks_skipped", 0),
+                "symlink_examples": stats.get("symlink_examples", []),
             },
         }
 

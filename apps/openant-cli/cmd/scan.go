@@ -7,6 +7,7 @@ import (
 	"github.com/knostic/open-ant-cli/internal/checkpoint"
 	"github.com/knostic/open-ant-cli/internal/config"
 	"github.com/knostic/open-ant-cli/internal/git"
+	"github.com/knostic/open-ant-cli/internal/languages"
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/knostic/open-ant-cli/internal/python"
 	"github.com/spf13/cobra"
@@ -33,24 +34,24 @@ A final scan.report.json aggregates all step reports.`,
 }
 
 var (
-	scanOutput      string
-	scanLanguage    string
-	scanLevel       string
-	scanVerify      bool
-	scanNoContext   bool
-	scanNoEnhance   bool
-	scanEnhanceMode string
-	scanNoReport        bool
-	scanSkipDynamicTest bool
-	scanLimit           int
-	scanLLMConfig   string
-	scanWorkers     int
-	scanBackoff     int
-	scanFull        bool
-	scanIncremental bool
-	scanDiffBase    string
-	scanPR          int
-	scanDiffScope   string
+	scanOutput                      string
+	scanLanguage                    string
+	scanLevel                       string
+	scanVerify                      bool
+	scanNoContext                   bool
+	scanNoEnhance                   bool
+	scanEnhanceMode                 string
+	scanNoReport                    bool
+	scanSkipDynamicTest             bool
+	scanLimit                       int
+	scanLLMConfig                   string
+	scanWorkers                     int
+	scanBackoff                     int
+	scanFull                        bool
+	scanIncremental                 bool
+	scanDiffBase                    string
+	scanPR                          int
+	scanDiffScope                   string
 	scanLLMReachability             bool
 	scanLLMReachabilityMaxCodeBytes int
 )
@@ -64,7 +65,7 @@ func init() {
 // same knobs.
 func registerScanFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVarP(&scanOutput, "output", "o", "", "Output directory (default: project scan dir or temp dir)")
-	cmd.Flags().StringVarP(&scanLanguage, "language", "l", "", "Language: python, javascript, go, c, ruby, php, auto")
+	cmd.Flags().StringVarP(&scanLanguage, "language", "l", "", languages.FlagHelp())
 	cmd.Flags().StringVar(&scanLevel, "level", "reachable", "Processing level: all, reachable, codeql, exploitable")
 	cmd.Flags().BoolVar(&scanVerify, "verify", false, "Enable Stage 2 attacker simulation")
 	cmd.Flags().BoolVar(&scanNoContext, "no-context", false, "Skip application context generation")

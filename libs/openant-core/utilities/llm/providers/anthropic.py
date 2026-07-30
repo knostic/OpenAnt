@@ -36,7 +36,7 @@ from typing import Any, Optional
 import anthropic
 
 from ._ratelimit import report_rate_limit, wait_for_rate_limit
-from ...model_config import ANTHROPIC_PRICING
+from .._pricing import LazyProviderPricing
 from .._redact import redact_secrets, redacted_cause_from
 from ..adapter import (
     CompletionResult,
@@ -122,9 +122,10 @@ class AnthropicAdapter:
     # provider that exposes claude-opus-4-6). When the adapter is
     # pointed at a non-Claude model ID (qwen/qwen-3-coder-480b via
     # OpenRouter), the lookup misses and the tracker reports $0 +
-    # warning — the user can add to this dict locally if they need
-    # accurate cost for a specific non-Claude model.
-    pricing: dict[str, dict[str, float]] = {m: dict(p) for m, p in ANTHROPIC_PRICING.items()}
+    # warning. Resolved lazily from config/models.json (the shared
+    # registry) on first access — retired/unknown ids are OMITTED, so
+    # they route to the tracker's warn+$0 path, never a silent $0 dict.
+    pricing = LazyProviderPricing("anthropic")
 
     def __init__(
         self,

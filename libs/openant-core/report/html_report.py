@@ -30,7 +30,7 @@ import os
 from datetime import datetime
 
 from dotenv import load_dotenv
-from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+from core.verdict_taxonomy import FINDING_VERDICT_ORDER, ERROR_VERDICT
 from utilities.file_io import normalize_results, read_json
 from utilities.llm import (
     build_phase_registry,
@@ -40,7 +40,6 @@ from utilities.llm import (
     simple_text,
 )
 
-# Load environment variables from .env file
 load_dotenv()
 
 
@@ -164,7 +163,7 @@ def prepare_findings_summary(experiment: dict, dataset: dict) -> list:
             # verdict-count site below); keeps finding-less vulns actionable.
             'verdict': str(result.get('finding') or result.get('verdict', '')).lower(),
             'attack_vector': result.get('attack_vector', ''),
-            'stage1_reasoning': result.get('reasoning', ''),
+            'stage1_reasoning': result.get('reasoning') or '',
             'stage2_explanation': verification.get('explanation', ''),
             'description': llm_context.get('reasoning', '')[:300] if llm_context.get('reasoning') else ''
         })
@@ -180,6 +179,10 @@ def generate_remediation_guidance(findings: list) -> str:
     actionable = [f for f in findings if f['verdict'] in ('vulnerable', 'bypassable', 'inconclusive')]
 
     if not actionable:
+        errored = sum(1 for f in findings if f['verdict'] == 'error')
+        if errored:
+            return (f"<p>No confirmed vulnerabilities, but {errored} code unit(s) could not be "
+                    f"analyzed (errored) and need manual review.</p>")
         return "<p>No vulnerabilities or security concerns found. All code units are either safe or properly protected.</p>"
 
     # Build prompt
@@ -324,7 +327,6 @@ def generate_html_report(
         llm_context = unit.get('llm_context') or {}
         verification = result.get('verification') or {}
 
-        # Count verdicts
         verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
 
         # Track worst verdict per file
@@ -342,7 +344,7 @@ def generate_html_report(
             'color': get_verdict_color(verdict),
             'attack_vector': html.escape(result.get('attack_vector', '') or ''),
             'description': html.escape(llm_context.get('reasoning', '')[:200] if llm_context.get('reasoning') else ''),
-            'justification': html.escape(verification.get('explanation', '')[:300] if verification.get('explanation') else result.get('reasoning', '')[:300])
+            'justification': html.escape(verification.get('explanation', '')[:300] if verification.get('explanation') else (result.get('reasoning') or '')[:300])
         })
 
     # Sort findings by priority
@@ -355,6 +357,13 @@ def generate_html_report(
 
     # Prepare chart data
     verdict_order = list(FINDING_VERDICT_ORDER)
+    # Surface the errored/unanalyzed sentinel in the charts too (a silent false-negative) —
+    # but ONLY the known ERROR_VERDICT literal, never arbitrary model-supplied verdict
+    # strings: those are attacker-controlled and would inject unescaped into the
+    # json.dumps chart labels (re-opening the verdict-badge injection). Unknown verdicts still appear in the
+    # findings table with an html.escape'd badge.
+    if ERROR_VERDICT in verdict_counts or ERROR_VERDICT in file_verdict_counts:
+        verdict_order.append(ERROR_VERDICT)
     unit_chart_labels = json.dumps([v for v in verdict_order if v in verdict_counts])
     unit_chart_data = json.dumps([verdict_counts.get(v, 0) for v in verdict_order if v in verdict_counts])
     unit_chart_colors = json.dumps([get_verdict_color(v) for v in verdict_order if v in verdict_counts])
@@ -368,7 +377,7 @@ def generate_html_report(
     for f in findings_data:
         findings_rows += f"""
         <tr>
-            <td><span class="verdict-badge" style="background-color: {f['color']}">{f['verdict']}</span></td>
+            <td><span class="verdict-badge" style="background-color: {f['color']}">{html.escape(f['verdict'])}</span></td>
             <td><code>{html.escape(f['file'])}</code></td>
             <td title="{html.escape(f['unit_id'])}">{html.escape(f['unit_id'].split(':')[-1] if ':' in f['unit_id'] else f['unit_id'])}</td>
             <td>{f['attack_vector'] or '-'}</td>
@@ -665,6 +674,10 @@ def generate_html_report(
             <div class="stat-card">
                 <div class="stat-value" style="color: #28a745">{verdict_counts.get('protected', 0) + verdict_counts.get('safe', 0)}</div>
                 <div class="stat-label">Secure</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" style="color: #6c757d">{verdict_counts.get('error', 0)}</div>
+                <div class="stat-label">Errored (unanalyzed)</div>
             </div>
         </div>
 

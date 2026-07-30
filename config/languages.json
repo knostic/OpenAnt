@@ -30,5 +30,68 @@
     ".rake": "ruby",
     ".php": "php",
     ".zig": "zig"
+  },
+  "languages": {
+    "python": {
+      "extensions": [".py"],
+      "parser": {"mode": "inprocess"},
+      "fence": "python",
+      "docker_template": "python",
+      "enabled": true
+    },
+    "javascript": {
+      "extensions": [".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"],
+      "parser": {
+        "mode": "subprocess",
+        "script": "parsers/javascript/test_pipeline.py",
+        "bootstrap": "npm"
+      },
+      "fence": {".ts": "typescript", ".tsx": "typescript", "*": "javascript"},
+      "docker_template": "node",
+      "enabled": true
+    },
+    "go": {
+      "extensions": [".go"],
+      "parser": {"mode": "subprocess", "script": "parsers/go/test_pipeline.py"},
+      "fence": "go",
+      "docker_template": "go",
+      "enabled": true
+    },
+    "c": {
+      "extensions": [".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hxx", ".hh"],
+      "parser": {"mode": "subprocess", "script": "parsers/c/test_pipeline.py"},
+      "fence": {
+        ".cpp": "cpp",
+        ".hpp": "cpp",
+        ".cc": "cpp",
+        ".cxx": "cpp",
+        ".hxx": "cpp",
+        ".hh": "cpp",
+        "*": "c"
+      },
+      "docker_template": null,
+      "enabled": true
+    },
+    "ruby": {
+      "extensions": [".rb", ".rake"],
+      "parser": {"mode": "subprocess", "script": "parsers/ruby/test_pipeline.py"},
+      "fence": "ruby",
+      "docker_template": "ruby",
+      "enabled": true
+    },
+    "php": {
+      "extensions": [".php"],
+      "parser": {"mode": "subprocess", "script": "parsers/php/test_pipeline.py"},
+      "fence": "php",
+      "docker_template": "php",
+      "enabled": true
+    },
+    "zig": {
+      "extensions": [".zig"],
+      "parser": {"mode": "subprocess", "script": "parsers/zig/test_pipeline.py"},
+      "fence": "zig",
+      "docker_template": null,
+      "enabled": true
+    }
   }
 }

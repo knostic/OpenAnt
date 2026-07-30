@@ -23,8 +23,20 @@ def _repo(files: dict) -> str:
     return str(d)
 
 
-# a deeply-nested attribute chain overflows CPython's stack inside ast.parse -> RecursionError
-_STACK_BLOWER = "x = a" + ".b" * 60000 + "\n"
+# A file whose parse overflows CPython's stack inside ast.parse -> RecursionError.
+#
+# This was `"x = a" + ".b" * 60000`, a deeply-nested attribute chain. CPython 3.14's
+# PEG parser handles left-recursive attribute chains iteratively, so that input now
+# parses cleanly and the fixture stopped being pathological — the two tests below
+# failed, and a third (test_pathological_file_does_not_abort_extract_all) began
+# passing vacuously, isolating an error that no longer occurred.
+#
+# The production guard was never at fault: _process_file_guarded still works, as
+# test_post_parse_extraction_error_is_isolated demonstrates by injecting the error
+# rather than relying on this fixture. So the fix belongs here, not in the parser.
+#
+# A long binary-operator chain still recurses in 3.14.
+_STACK_BLOWER = "x = " + "1+" * 100000 + "1\n"
 
 
 def test_pathological_file_does_not_abort_extract_from_scan():

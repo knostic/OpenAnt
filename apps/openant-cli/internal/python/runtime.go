@@ -397,13 +397,49 @@ func PipUninstall(pythonPath string) *exec.Cmd {
 	return cmd
 }
 
-// findOpenantCore locates the libs/openant-core directory by checking:
-//  1. Relative to the running executable (walk up looking for libs/openant-core/pyproject.toml)
-//  2. Relative to the current working directory
+// OpenantCoreEnv lets a developer point at a checkout explicitly. It is the ONLY
+// way to name a core path that is not derived from the installed executable.
+const OpenantCoreEnv = "OPENANT_CORE_PATH"
+
+// findOpenantCore locates the libs/openant-core directory to install from.
+//
+// Resolution order, deliberately narrow:
+//  1. $OPENANT_CORE_PATH — an explicit, operator-supplied development checkout.
+//  2. Walking up from the running executable — the monorepo/dev layout.
+//
+// It does NOT search the current working directory, and that omission is the
+// whole point of this function.
+//
+// The caller feeds the result to `pip install -e`, and an editable install
+// EXECUTES the target's build backend. Searching upward from CWD therefore meant:
+// run `openant` anywhere at or below a repository that happens to ship
+// `libs/openant-core/pyproject.toml`, with the import probe failing, and the CLI
+// installs and runs code from that repository.
+//
+// For a tool whose entire purpose is being pointed at untrusted third-party
+// repositories, that turns the scan target into an installation source — remote
+// code execution reachable by a repo layout alone. The trigger is conditional
+// (the probe must fail first), which makes it latent rather than acceptable: a
+// broken venv, a partial upgrade, or a Python version bump is enough.
+//
+// An operator who genuinely wants a checkout can say so with the env var. What
+// they cannot do is have one chosen for them by whatever directory they happened
+// to be standing in.
 func findOpenantCore() (string, error) {
 	marker := filepath.Join("libs", "openant-core", "pyproject.toml")
 
-	// Strategy 1: walk up from the executable.
+	// Strategy 1: explicit operator override.
+	if explicit := strings.TrimSpace(os.Getenv(OpenantCoreEnv)); explicit != "" {
+		if fileExists(filepath.Join(explicit, "pyproject.toml")) {
+			return explicit, nil
+		}
+		return "", fmt.Errorf(
+			"%s=%q does not contain pyproject.toml; point it at libs/openant-core",
+			OpenantCoreEnv, explicit)
+	}
+
+	// Strategy 2: walk up from the executable. Trusted because the operator chose
+	// which binary to run; the scan target has no say in where it lives.
 	if exePath, err := os.Executable(); err == nil {
 		exePath, _ = filepath.EvalSymlinks(exePath)
 		dir := filepath.Dir(exePath)
@@ -420,23 +456,17 @@ func findOpenantCore() (string, error) {
 		}
 	}
 
-	// Strategy 2: walk up from CWD.
-	if cwd, err := os.Getwd(); err == nil {
-		dir := cwd
-		for range 6 {
-			candidate := filepath.Join(dir, "libs", "openant-core")
-			if fileExists(filepath.Join(dir, marker)) {
-				return candidate, nil
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
-		}
-	}
-
-	return "", fmt.Errorf("could not find libs/openant-core from executable or working directory")
+	// Fail closed, with the remediation the user needs. Previously this fell
+	// through to a CWD search, which is how a scanned repository could answer the
+	// question "where should I install the engine from?".
+	return "", fmt.Errorf(
+		"could not locate the openant engine relative to the executable.\n"+
+			"The working directory is deliberately NOT searched: it may be an "+
+			"untrusted repository, and installing from it would execute its build "+
+			"code.\n"+
+			"Fix by installing the engine (pip install openant) or, for a "+
+			"development checkout, set %s=/path/to/libs/openant-core",
+		OpenantCoreEnv)
 }
 
 // fileExists is a small helper that returns true if path exists and is not a directory.

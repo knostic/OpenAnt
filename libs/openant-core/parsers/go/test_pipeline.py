@@ -190,15 +190,44 @@ class GoPipelineTest:
             'stages': {}
         }
 
+    def _go_binary_stale(self, go_parser_dir: str) -> bool:
+        """True if the Go parser binary is missing or older than any .go source.
+
+        A build artifact that predates a source edit silently keeps running the
+        old code. For a scanner whose edits include containment guards, that is a
+        security regression, so staleness — not mere absence — must trigger a
+        rebuild.
+        """
+        if not os.path.exists(self.go_parser):
+            return True
+        try:
+            binary_mtime = os.path.getmtime(self.go_parser)
+        except OSError:
+            return True
+        for root, _dirs, files in os.walk(go_parser_dir):
+            for name in files:
+                if name.endswith('.go'):
+                    try:
+                        if os.path.getmtime(os.path.join(root, name)) > binary_mtime:
+                            return True
+                    except OSError:
+                        return True
+        return False
+
     def setup(self):
         """Create output directory and build Go parser if needed."""
         os.makedirs(self.output_dir, exist_ok=True)
         print(f"Output directory: {self.output_dir}")
 
-        # Check if Go parser binary exists, build if not
-        if not os.path.exists(self.go_parser):
+        # Build the Go parser when the binary is missing OR STALE (any .go source
+        # newer than the binary). Rebuild-only-if-absent left a security fix to
+        # the scanner (e.g. the symlink-containment guard) inert on any machine
+        # that already had a cached binary — the source was fixed but the old
+        # binary kept running. The binary is gitignored, so this staleness check
+        # is the only thing that makes a source change take effect.
+        go_parser_dir = os.path.join(self.parser_dir, 'go_parser')
+        if self._go_binary_stale(go_parser_dir):
             print("Building Go parser...")
-            go_parser_dir = os.path.join(self.parser_dir, 'go_parser')
             result = run_utf8(
                 ['go', 'build', '-o', 'go_parser', '.'],
                 cwd=go_parser_dir,

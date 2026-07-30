@@ -15,7 +15,7 @@ ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import generate_report  # noqa: E402
+import report.html_report as generate_report  # noqa: E402
 
 
 def test_findingless_vulnerable_counted_in_html_report(tmp_path):

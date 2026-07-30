@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,19 +18,19 @@ type Scanner struct {
 // NewScanner creates a new scanner for the given repository path
 func NewScanner(repoPath string, skipTests bool) *Scanner {
 	excludeDirs := map[string]bool{
-		"vendor":        true,
-		"testdata":      true,
-		".git":          true,
-		".svn":          true,
-		".hg":           true,
-		"node_modules":  true,
-		"__pycache__":   true,
-		".idea":         true,
-		".vscode":       true,
-		"dist":          true,
-		"build":         true,
-		"bin":           true,
-		".cache":        true,
+		"vendor":       true,
+		"testdata":     true,
+		".git":         true,
+		".svn":         true,
+		".hg":          true,
+		"node_modules": true,
+		"__pycache__":  true,
+		".idea":        true,
+		".vscode":      true,
+		"dist":         true,
+		"build":        true,
+		"bin":          true,
+		".cache":       true,
 	}
 
 	return &Scanner{
@@ -52,16 +53,51 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 
 	dirsScanned := 0
 	dirsExcluded := 0
+	symlinksSkipped := 0
+	dirsUnreadable := 0
+	symlinkExamples := []string{}
+	unreadableExamples := []string{}
 
 	err := filepath.Walk(s.repoPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // Skip files/dirs we can't access
+			// A directory we cannot read is a coverage gap, not a non-event.
+			// Record it (bounded) instead of silently swallowing — a silent
+			// skip is a false negative, the worst failure direction for a SAST
+			// tool. Return nil to keep walking the rest of the tree.
+			dirsUnreadable++
+			if len(unreadableExamples) < 5 {
+				rel, relErr := filepath.Rel(s.repoPath, path)
+				if relErr != nil {
+					rel = path
+				}
+				unreadableExamples = append(unreadableExamples, fmt.Sprintf("%s: %v", rel, err))
+			}
+			return nil
 		}
 
-		// Get relative path from repo root
 		relPath, err := filepath.Rel(s.repoPath, path)
 		if err != nil {
 			relPath = path
+		}
+
+		// Refuse every symlink (file OR directory) inside the repository. The
+		// scanned repo is untrusted: filepath.Walk lstat's each entry, so a
+		// symlinked file `leak.go -> /outside/secret` has IsDir()==false and a
+		// .go extension and would otherwise be added and read THROUGH the link,
+		// exfiltrating host files into dataset.json (and thence to the model
+		// provider) — the same hole core/repo_walk.py closes for the Python
+		// family. The repo root itself is exempt (path != s.repoPath): the
+		// threat is attacker-committed links INSIDE the repo, not an operator
+		// choosing a symlinked path to scan (matching the Python walker, which
+		// applies the guard to entries, never the root). Return nil, never
+		// SkipDir: on a non-directory SkipDir would skip the rest of the parent
+		// directory, dropping sibling real files.
+		if path != s.repoPath && info.Mode()&os.ModeSymlink != 0 {
+			symlinksSkipped++
+			if len(symlinkExamples) < 5 {
+				symlinkExamples = append(symlinkExamples, relPath)
+			}
+			return nil
 		}
 
 		// Skip excluded directories
@@ -101,14 +137,12 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 			return nil
 		}
 
-		// Add file to results
 		result.Files = append(result.Files, FileInfo{
 			Path:      relPath,
 			Size:      info.Size(),
 			Extension: ext,
 		})
 
-		// Update statistics
 		result.Statistics.TotalFiles++
 		result.Statistics.ByExtension[ext]++
 		result.Statistics.TotalSizeBytes += info.Size()
@@ -122,6 +156,10 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 
 	result.Statistics.DirectoriesScanned = dirsScanned
 	result.Statistics.DirectoriesExcluded = dirsExcluded
+	result.Statistics.SymlinksSkipped = symlinksSkipped
+	result.Statistics.SymlinkExamples = symlinkExamples
+	result.Statistics.DirectoriesUnreadable = dirsUnreadable
+	result.Statistics.UnreadableExamples = unreadableExamples
 
 	return result, nil
 }

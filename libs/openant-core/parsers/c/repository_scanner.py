@@ -31,6 +31,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from utilities.file_io import read_json, write_json, open_utf8
+from core.repo_walk import walk_repository
+from utilities.file_io import safe_to_descend
 
 
 class RepositoryScanner:
@@ -132,50 +134,37 @@ class RepositoryScanner:
         return False
 
     def scan_directory(self, dir_path: Path, relative_path: str = '') -> None:
-        """Recursively scan a directory."""
-        self.stats['directories_scanned'] += 1
+        """Walk the tree via the shared walker.
 
-        try:
-            entries = list(dir_path.iterdir())
-        except PermissionError:
-            print(f"Warning: Cannot read directory {dir_path}: Permission denied", file=sys.stderr)
-            return
-        except Exception as e:
-            print(f"Warning: Cannot read directory {dir_path}: {e}", file=sys.stderr)
-            return
+        Traversal used to be implemented here, and independently in three sibling
+        scanners. Each had to be fixed separately for symlink escape, deep nesting
+        and stat-error handling, and each time at least one was missed. The walk now
+        lives in ``core/repo_walk.py``; this method keeps only the parts that are
+        genuinely language-specific: which files count as source, which count as
+        tests, and what a record looks like.
+        """
+        def _on_file(entry: Path, entry_relative: str) -> None:
+            if not self.is_source_file(entry.name):
+                return
+            if self.skip_tests and self.is_test_file(entry_relative):
+                self.stats['test_files_skipped'] += 1
+                return
+            try:
+                file_size = entry.stat().st_size
+            except OSError:
+                file_size = 0
+            record = {'path': entry_relative, 'size': file_size}
+            record['extension'] = os.path.splitext(entry.name)[1].lower()
+            self.files.append(record)
+            self.stats['total_files'] += 1
+            self.stats['total_size_bytes'] += file_size
 
-        for entry in sorted(entries, key=lambda e: e.name):
-            entry_relative = os.path.join(relative_path, entry.name) if relative_path else entry.name
-
-            if entry.is_dir():
-                if self.should_exclude_directory(entry.name):
-                    self.stats['directories_excluded'] += 1
-                    continue
-                self.scan_directory(entry, entry_relative)
-
-            elif entry.is_file():
-                if not self.is_source_file(entry.name):
-                    continue
-
-                if self.skip_tests and self.is_test_file(entry_relative):
-                    self.stats['test_files_skipped'] += 1
-                    continue
-
-                try:
-                    file_size = entry.stat().st_size
-                except Exception:
-                    file_size = 0
-
-                ext = os.path.splitext(entry.name)[1].lower()
-
-                self.files.append({
-                    'path': entry_relative,
-                    'size': file_size,
-                    'extension': ext,
-                })
-
-                self.stats['total_files'] += 1
-                self.stats['total_size_bytes'] += file_size
+        walk_repository(
+            dir_path,
+            should_exclude_directory=self.should_exclude_directory,
+            on_file=_on_file,
+            stats=self.stats,
+        )
 
     def scan(self) -> Dict:
         """Execute the repository scan and return results."""

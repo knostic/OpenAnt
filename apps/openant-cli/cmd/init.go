@@ -1,16 +1,16 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/knostic/open-ant-cli/internal/config"
 	"github.com/knostic/open-ant-cli/internal/git"
+	"github.com/knostic/open-ant-cli/internal/languages"
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -47,7 +47,12 @@ var (
 )
 
 func init() {
-	initCmd.Flags().StringVarP(&initLanguage, "language", "l", "", "Language to analyze: python, javascript, go, c, ruby, php, zig, auto (auto = experimental dominance heuristic; see #61)")
+	// Defaults to "auto" = scan every detected language. Previously this flag was
+	// REQUIRED, which meant there was no default at all: every user had to name a
+	// language, the help examples all show `-l go`, and the natural choice pinned
+	// the project to one language forever. "All languages should be scanned, not
+	// just the main one" cannot be true of a tool that makes you pick one up front.
+	initCmd.Flags().StringVarP(&initLanguage, "language", "l", "auto", languages.FlagHelp())
 	initCmd.Flags().StringVar(&initCommit, "commit", "", "Specific commit SHA (default: HEAD)")
 	initCmd.Flags().StringVar(&initName, "name", "", "Override project name (default: derived from URL/path)")
 	initCmd.Flags().BoolVar(&initFull, "full", false, "Force full scan (rejects --incremental/--diff-base/--pr)")
@@ -55,7 +60,8 @@ func init() {
 	initCmd.Flags().StringVar(&initDiffBase, "diff-base", "", "Incremental against this ref (e.g. origin/main, HEAD~5)")
 	initCmd.Flags().IntVar(&initPR, "pr", 0, "Incremental against a GitHub PR number (requires gh; mutex with --diff-base)")
 	initCmd.Flags().StringVar(&initDiffScope, "diff-scope", "", "Diff scope: changed_files, changed_functions, callers (default changed_functions)")
-	_ = initCmd.MarkFlagRequired("language")
+	// Deliberately NOT MarkFlagRequired: "auto" is the default, and requiring the
+	// flag is what forced every project into a single language.
 }
 
 func runInit(cmd *cobra.Command, args []string) {
@@ -133,16 +139,41 @@ func runInit(cmd *cobra.Command, args []string) {
 		repoPath = absPath
 	}
 
-	// Auto-detect language if not specified
-	if initLanguage == "" || initLanguage == "auto" {
-		fmt.Fprintf(os.Stderr, "Auto-detecting language...\n")
-		detected, err := detectLanguage(repoPath)
+	// Language resolution. When the user did not name one, STORE "auto" rather
+	// than collapsing to a single detected language.
+	//
+	// This used to resolve auto -> one concrete language and persist that. Because
+	// `scan` then passes the stored value as an explicit -l (see cmd/scan.go), and
+	// explicit beats auto, an `init`-created project was pinned to one language
+	// permanently — so a 6-language monorepo was scanned as one language forever,
+	// and no amount of fixing the engine's default could reach it. That made the
+	// product's primary flow (`init` then `scan`) the one place the "scan all
+	// languages, not just the main one" requirement could never take effect.
+	//
+	// Detection still runs, but only to TELL the user what is there. The set is
+	// resolved per-scan now, so adding a language to the repo later is picked up
+	// without re-running init.
+	if initLanguage == "" {
+		initLanguage = "auto"
+	}
+	if initLanguage == "auto" {
+		fmt.Fprintf(os.Stderr, "Detecting languages...\n")
+		counts, err := languages.DetectLanguages(repoPath)
 		if err != nil {
-			output.PrintError(fmt.Sprintf("Language auto-detection failed: %s\nSpecify manually with -l/--language", err))
+			output.PrintError(fmt.Sprintf("Language detection failed: %v\nSpecify manually with -l/--language", err))
 			os.Exit(1)
 		}
-		initLanguage = detected
-		fmt.Fprintf(os.Stderr, "Detected language: %s\n", initLanguage)
+		if len(counts) == 0 {
+			output.PrintError("no supported source files found\nSpecify manually with -l/--language")
+			os.Exit(1)
+		}
+		names := make([]string, 0, len(counts))
+		for name := range counts {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		fmt.Fprintf(os.Stderr, "Detected: %s (all will be scanned; use -l to pin one)\n",
+			strings.Join(names, ", "))
 	}
 
 	// Get commit SHA (best-effort — not all local paths are git repos)
@@ -240,128 +271,6 @@ func runInit(cmd *cobra.Command, args []string) {
 	fmt.Println()
 	output.PrintSuccess("Set as active project")
 	fmt.Println()
-}
-
-// languagesConfig is the structure of config/languages.json.
-type languagesConfig struct {
-	SkipDirs   []string          `json:"skip_dirs"`
-	Extensions map[string]string `json:"extensions"`
-}
-
-// findLanguagesConfig locates config/languages.json by walking up from the
-// executable path and then the current working directory.
-func findLanguagesConfig() (string, error) {
-	rel := filepath.Join("config", "languages.json")
-
-	// Strategy 1: walk up from the executable.
-	if exePath, err := os.Executable(); err == nil {
-		exePath, _ = filepath.EvalSymlinks(exePath)
-		dir := filepath.Dir(exePath)
-		for range 6 {
-			candidate := filepath.Join(dir, rel)
-			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-				return candidate, nil
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
-		}
-	}
-
-	// Strategy 2: walk up from CWD.
-	if cwd, err := os.Getwd(); err == nil {
-		dir := cwd
-		for range 6 {
-			candidate := filepath.Join(dir, rel)
-			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-				return candidate, nil
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
-		}
-	}
-
-	return "", fmt.Errorf("could not find config/languages.json from executable or working directory")
-}
-
-// loadLanguagesConfig loads the shared language detection config.
-func loadLanguagesConfig() (*languagesConfig, error) {
-	path, err := findLanguagesConfig()
-	if err != nil {
-		return nil, err
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", path, err)
-	}
-	var cfg languagesConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse %s: %w", path, err)
-	}
-	return &cfg, nil
-}
-
-// detectLanguage walks a repository and returns the dominant language by file count.
-// Extension mappings and skip directories are loaded from config/languages.json
-// (shared with libs/openant-core/core/parser_adapter.py::detect_language()).
-func detectLanguage(repoPath string) (string, error) {
-	cfg, err := loadLanguagesConfig()
-	if err != nil {
-		return "", fmt.Errorf("failed to load language config: %w", err)
-	}
-
-	skipDirs := make(map[string]bool, len(cfg.SkipDirs))
-	for _, d := range cfg.SkipDirs {
-		skipDirs[d] = true
-	}
-
-	counts := make(map[string]int)
-
-	err = filepath.WalkDir(repoPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil // skip inaccessible paths
-		}
-		if d.IsDir() {
-			if skipDirs[d.Name()] {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		ext := strings.ToLower(filepath.Ext(d.Name()))
-		if lang, ok := cfg.Extensions[ext]; ok {
-			counts[lang]++
-		}
-		return nil
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to walk repository: %w", err)
-	}
-
-	// Find the dominant language
-	bestLang := ""
-	bestCount := 0
-	for lang, count := range counts {
-		if count > bestCount {
-			bestCount = count
-			bestLang = lang
-		}
-	}
-
-	if bestLang == "" {
-		return "", fmt.Errorf(
-			"no supported source files found in %s. "+
-				"Supported languages: Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Zig",
-			repoPath,
-		)
-	}
-
-	return bestLang, nil
 }
 
 // resolveLocalCommit determines the commit SHA to record for a LOCAL git repo.

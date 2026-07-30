@@ -1,4 +1,4 @@
-"""Regression test: the Zig RepositoryScanner must follow symlinked directories.
+"""Symlink policy for the Zig RepositoryScanner: refuse, and record the gap.
 
 The scanner used ``os.walk(repo)`` which defaults to ``followlinks=False``, so a
 ``.zig`` file reachable only through a symlinked directory was silently dropped
@@ -27,8 +27,26 @@ def _load_scanner():
 SCANNER = _load_scanner()
 
 
-def test_symlinked_directory_is_followed(tmp_path):
-    # A .zig file that exists ONLY under a symlinked directory.
+def test_symlinked_directory_is_refused_and_the_gap_is_recorded(tmp_path):
+    """POLICY CHANGE: symlinked directories are no longer followed.
+
+    This test previously asserted the opposite, and it was right to at the time:
+    a ``.zig`` file reachable only through a symlink was being silently dropped,
+    and for a SAST tool a false negative is the worse failure direction.
+
+    It was inverted deliberately, by operator decision, after a demonstrated
+    exfiltration: because traversal takes an entry's mode from a call that
+    FOLLOWS links, an untrusted repository could ship ``leak.py -> /etc/passwd``
+    (or a directory link to anywhere) and have host-file contents read into
+    ``dataset.json``, which is sent to the model provider. An intermediate policy
+    allowed links resolving inside the repository or its parent; the stricter
+    rule was chosen because it needs no containment arithmetic and cannot be
+    defeated by a target resolving somewhere unexpected.
+
+    The original concern is NOT dismissed — it is converted from a silent loss
+    into a counted one. Symlinked source is still unscanned code; the scanner now
+    records it so the gap is visible rather than invisible.
+    """
     external = tmp_path / "external_pkg"
     external.mkdir()
     (external / "util.zig").write_text("pub fn f() void {}\n")
@@ -39,7 +57,14 @@ def test_symlinked_directory_is_followed(tmp_path):
 
     results = SCANNER(str(repo)).scan()
     found = {f["path"] for f in results["files"]}
-    assert "linked_pkg/util.zig" in found, f"symlinked dir not followed; found={found}"
+    assert "linked_pkg/util.zig" not in found, (
+        f"symlinked directory was followed; policy is to refuse. found={found}"
+    )
+    stats = results.get("statistics", {})
+    assert stats.get("symlinks_skipped"), (
+        "the symlink was refused but NOT counted — an unscanned path that leaves "
+        f"no trace is a silent false negative. statistics={stats}"
+    )
 
 
 def test_symlink_cycle_is_bounded_and_emits_target_once(tmp_path):

@@ -464,6 +464,12 @@ class TestCliPlumbing:
 
         # Drive cmd_scan via argparse
         import argparse
+        # `-l auto` now runs language detection by default (it used to defer
+        # to the dominant-language path without walking), so the fixture must
+        # contain real source or detection fails before the plumbing under
+        # test is reached. These tests stub scan_repository and care only
+        # about llm_reachability pass-through.
+        (tmp_path / "app.py").write_text("def handler():\n    return 1\n")
         ns = argparse.Namespace(
             repo=str(tmp_path),
             output=str(tmp_path / "out"),
@@ -505,6 +511,12 @@ class TestCliPlumbing:
         )
 
         import argparse
+        # `-l auto` now runs language detection by default (it used to defer
+        # to the dominant-language path without walking), so the fixture must
+        # contain real source or detection fails before the plumbing under
+        # test is reached. These tests stub scan_repository and care only
+        # about llm_reachability pass-through.
+        (tmp_path / "app.py").write_text("def handler():\n    return 1\n")
         ns = argparse.Namespace(
             repo=str(tmp_path),
             output=str(tmp_path / "out"),

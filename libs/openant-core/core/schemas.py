@@ -48,9 +48,39 @@ class ParseResult:
     units_count: int = 0
     language: str = "unknown"
     processing_level: str = "all"
+    # --- multi-language (additive) -------------------------------------
+    # `language` above stays scalar and means THE PRIMARY language: it is
+    # serialized into JSON the Go CLI unmarshals, so widening its type would be
+    # a cross-language breaking change. These fields sit beside it, following
+    # the same convention as skipped_steps / skipped_step_reasons.
+    languages: list = field(default_factory=list)
+    language_stats: dict = field(default_factory=dict)
+    per_language: dict = field(default_factory=dict)
+    parse_errors: list = field(default_factory=list)
+    # Languages detected but deliberately not scanned, with the reason.
+    # Carried on the result so a coverage gap is inspectable after the fact,
+    # not only visible in a stderr line that CI discards.
+    excluded_languages: dict = field(default_factory=dict)
+    # Which path supplied the application context: "threat_model" (a file in
+    # the scanned repo), "generated" (the built-in LLM generator), or "none".
+    # Recorded because a scan run under the WRONG security model looks
+    # identical to a correct one unless the source is stated.
+    context_source: str = "none"
+
+    @property
+    def degraded(self) -> bool:
+        """Whether any requested language failed to parse.
+
+        Derived rather than stored so it cannot disagree with parse_errors.
+        """
+        return bool(self.parse_errors)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # ``degraded`` is a @property, which asdict() omits — include it explicitly so
+        # the parse envelope carries it like ScanResult.to_dict does.
+        d["degraded"] = self.degraded
+        return d
 
 
 @dataclass
@@ -146,6 +176,41 @@ class ScanResult:
     # 'no_candidates' for an auto-skip vs 'not_requested' for an opt-out).
     skipped_step_reasons: dict = field(default_factory=dict)
 
+    # --- multi-language (additive) -------------------------------------
+    # `language` above stays scalar and means THE PRIMARY language: it is
+    # serialized into JSON the Go CLI unmarshals, so widening its type would be
+    # a cross-language breaking change. These fields sit beside it, following
+    # the same convention as skipped_steps / skipped_step_reasons.
+    languages: list = field(default_factory=list)
+    language_stats: dict = field(default_factory=dict)
+    per_language: dict = field(default_factory=dict)
+    parse_errors: list = field(default_factory=list)
+    # Languages detected but deliberately not scanned, with the reason.
+    # Carried on the result so a coverage gap is inspectable after the fact,
+    # not only visible in a stderr line that CI discards.
+    excluded_languages: dict = field(default_factory=dict)
+    # Which path supplied the application context: "threat_model" (a file in
+    # the scanned repo), "generated" (the built-in LLM generator), or "none".
+    # Recorded because a scan run under the WRONG security model looks
+    # identical to a correct one unless the source is stated.
+    context_source: str = "none"
+    # Provenance for a repo-supplied threat model (context_source ==
+    # "threat_model"). sha256 is over the raw file bytes so a scan can be tied
+    # to the exact file that shaped it; None (never the empty-string hash) when
+    # no threat model was loaded. permissive_warnings carries the previously
+    # discarded warn_permissive_threat_model output so an over-permissive model
+    # is visible in the artifact, not only on stderr.
+    threat_model_sha256: str | None = None
+    threat_model_warnings: list = field(default_factory=list)
+
+    @property
+    def degraded(self) -> bool:
+        """Whether any requested language failed to parse.
+
+        Derived rather than stored so it cannot disagree with parse_errors.
+        """
+        return bool(self.parse_errors)
+
     def to_dict(self) -> dict:
         return {
             "output_dir": self.output_dir,
@@ -166,6 +231,15 @@ class ScanResult:
             "step_reports": self.step_reports,
             "skipped_steps": self.skipped_steps,
             "skipped_step_reasons": self.skipped_step_reasons,
+            "languages": self.languages,
+            "language_stats": self.language_stats,
+            "per_language": self.per_language,
+            "parse_errors": self.parse_errors,
+            "excluded_languages": self.excluded_languages,
+            "context_source": self.context_source,
+            "threat_model_sha256": self.threat_model_sha256,
+            "threat_model_warnings": self.threat_model_warnings,
+            "degraded": self.degraded,
         }
 
 

@@ -26,7 +26,7 @@ func TestInvoke_InterruptedFlagHasNoRace(t *testing.T) {
 		t.Skip("interrupt-race test uses POSIX signals and a shell script")
 	}
 
-	hang := writeHangScript(t)
+	hang, sentinel := writeHangScript(t)
 
 	// Backstop deadline so the test never hangs even if the signal path
 	// somehow fails to terminate the subprocess.
@@ -42,7 +42,7 @@ func TestInvoke_InterruptedFlagHasNoRace(t *testing.T) {
 
 	// Let Invoke start the subprocess and install its signal.Notify handler
 	// before we deliver the interrupt.
-	time.Sleep(300 * time.Millisecond)
+	waitForSentinel(t, sentinel, 5*time.Second)
 
 	p, err := os.FindProcess(os.Getpid())
 	if err != nil {

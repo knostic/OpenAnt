@@ -6,6 +6,7 @@ Validates that a dataset matches the exact schema expected by experiment.py
 Run BEFORE any expensive LLM operations.
 """
 
+from core.file_boundary import has_boundary
 import json
 import sys
 from utilities.file_io import read_json
@@ -55,7 +56,8 @@ def validate_unit(unit, index):
 
     # 8. Check file boundaries in primary_code when deps_inlined with multiple files
     if primary_origin.get(deps_inlined_key) and len(primary_origin.get("files_included", [])) > 1:
-        if "// ========== File Boundary ==========" not in primary_code:
+        # Accept either comment style: producers emit `#` for Python/Ruby.
+        if not has_boundary(primary_code):
             errors.append(f"Unit {index}: enhanced with multiple files but no file boundaries")
 
     return errors

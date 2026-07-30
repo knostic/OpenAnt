@@ -1,5 +1,7 @@
 package main
 
+import "regexp"
+
 // ScanResult represents the output of the repository scanner (Stage 1)
 type ScanResult struct {
 	Repository string         `json:"repository"`
@@ -20,6 +22,15 @@ type ScanStatistics struct {
 	TotalSizeBytes      int64          `json:"totalSizeBytes"`
 	DirectoriesScanned  int            `json:"directoriesScanned"`
 	DirectoriesExcluded int            `json:"directoriesExcluded"`
+	// Coverage gap fields, snake_case to match the Python-family parsers so the
+	// aggregator's presence probe reads them (core/scanner.py). Counts are NOT
+	// omitempty: emitting them at 0 marks this parser as coverage-instrumented,
+	// distinguishing "skipped nothing" from "does not report coverage". Examples
+	// are omitempty, mirroring the Python walker.
+	SymlinksSkipped       int      `json:"symlinks_skipped"`
+	SymlinkExamples       []string `json:"symlink_examples,omitempty"`
+	DirectoriesUnreadable int      `json:"directories_unreadable"`
+	UnreadableExamples    []string `json:"unreadable_examples,omitempty"`
 }
 
 // AnalyzerOutput represents the output of the function extractor (Stage 2)
@@ -167,3 +178,23 @@ const (
 
 // File boundary marker for enhanced code
 const FileBoundary = "\n\n// ========== File Boundary ==========\n\n"
+
+// boundaryLineRe matches a whole boundary line in either comment style, anchored
+// to line starts. Mirrors _BOUNDARY_LINE in core/file_boundary.py.
+var boundaryLineRe = regexp.MustCompile(`(?m)^[ \t]*(?:#|//)?[ \t]*={10} File Boundary ={10}[ \t]*$`)
+
+// NeutralizeBoundaries defangs boundary-shaped lines in untrusted source before
+// concatenation.
+//
+// Scanned source can contain a line that mimics the separator. Once files are
+// joined, a forged marker is byte-identical to the parser's own, so the split cuts
+// the unit there and everything after it is relabelled "do NOT analyze" in the
+// prompt — one comment line hides a vulnerability from both analysis stages. The
+// consumer cannot tell them apart afterwards, so this must happen at composition.
+func NeutralizeBoundaries(source string) string {
+	if source == "" {
+		return source
+	}
+	return boundaryLineRe.ReplaceAllString(
+		source, "// [openant] boundary-shaped line from scanned source, neutralized")
+}

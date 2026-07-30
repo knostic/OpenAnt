@@ -1,0 +1,145 @@
+"""Single source of truth for provider model IDs, status, and pricing.
+
+Before this module, model IDs and prices were hard-coded literals duplicated
+across ``utilities/model_config.py`` and the Go setup wizard, and a passing test
+(``test_builtin_model_ids_current.py``) baked an eternal, un-provenanced list of
+"dead" model IDs. ``config/models.json`` is now authoritative, read by BOTH the
+Python engine (here) and the Go CLI (``internal/models``), mirroring how
+``config/languages.json`` is shared. Each record carries ``status`` (OpenAnt's
+shipped claim) plus ``source`` + ``retrieved`` (its provenance), so nothing
+asserts a provider fact without a receipt.
+
+Two invariants this module exists to hold:
+
+* **A null price is NEVER a zero price.** ``pricing_map`` OMITS any record whose
+  ``price`` is null (retired/unknown models). A null price must fall through to
+  the cost tracker's documented "unknown model → warn, cost reported as \\$0"
+  path, and MUST NOT be materialised as ``{"input": 0, "output": 0}`` — a truthy
+  zero dict would price real tokens at \\$0 with no warning, silently corrupting
+  cost accounting (and any budget ceiling built on it).
+* **A missing config fails LOUD for real work, never silently \\$0.**
+  ``require_models`` raises an "installation problem" error rather than degrading
+  to an empty map, because an empty pricing map would price every model at \\$0.
+  Unlike ``languages.json`` this file feeds no argparse ``choices``, so there is
+  no ``--help`` path to keep alive — pricing is only ever needed for real work.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from functools import lru_cache
+from pathlib import Path
+
+# Deliberately uses the stdlib ``json`` directly (not utilities.file_io) so this
+# module stays a leaf in the import graph — the pricing tables are consumed at
+# import time by adapter class bodies, and a cycle there would deadlock startup.
+
+_CONFIG_REL = Path("config") / "models.json"
+_SEARCH_LEVELS = 6
+_VALID_STATUS = frozenset({"current", "retired", "unknown"})
+_VALID_PROVIDERS = frozenset({"anthropic", "openai", "google"})
+
+
+def _search_upward(start: Path) -> Path | None:
+    current = start.resolve()
+    for _ in range(_SEARCH_LEVELS):
+        candidate = current / _CONFIG_REL
+        if candidate.is_file():
+            return candidate
+        if current.parent == current:
+            break
+        current = current.parent
+    return None
+
+
+def find_models_config() -> Path | None:
+    """Locate ``config/models.json``, or ``None`` if it cannot be found.
+
+    Mirrors ``language_registry.find_languages_config``: an explicit
+    ``OPENANT_MODELS_CONFIG`` override, then upward from this module (checkout
+    and installed layouts), then upward from the CWD.
+    """
+    override = os.environ.get("OPENANT_MODELS_CONFIG")
+    if override:
+        candidate = Path(override)
+        if candidate.is_file():
+            return candidate
+        print(
+            f"[models] OPENANT_MODELS_CONFIG={override!r} not found; "
+            "falling back to search",
+            file=sys.stderr,
+        )
+    found = _search_upward(Path(__file__).parent)
+    if found is not None:
+        return found
+    return _search_upward(Path.cwd())
+
+
+@lru_cache(maxsize=1)
+def _load_config() -> dict:
+    """Read and cache ``config/models.json``. Returns ``{}`` if not found.
+
+    Tests that mutate the config must call ``_load_config.cache_clear()``.
+    """
+    path = find_models_config()
+    if path is None:
+        return {}
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_models() -> list[dict]:
+    """The raw model records (possibly empty if the config is missing)."""
+    return list(_load_config().get("models", []))
+
+
+def require_models() -> list[dict]:
+    """The model records, or a loud failure explaining the install is broken.
+
+    Raises rather than returning ``[]`` because every downstream use is real
+    work (pricing a call): an empty list would price every model at \\$0.
+    """
+    models = load_models()
+    if not models:
+        searched = os.environ.get("OPENANT_MODELS_CONFIG") or "$OPENANT_MODELS_CONFIG (unset)"
+        raise RuntimeError(
+            "config/models.json could not be found, so no model pricing is known. "
+            "This is an installation problem: refusing to price calls at $0. "
+            f"Searched: {searched}, then upward from {Path(__file__).parent} and {Path.cwd()}."
+        )
+    return models
+
+
+def pricing_map(provider: str) -> dict[str, dict[str, float]]:
+    """``{model_id: {"input", "output"}}`` for one provider's PRICED models.
+
+    Records with a null price (retired/unknown models) are OMITTED — never
+    emitted as a zero-valued dict. A caller that looks up an omitted model gets
+    ``None`` and routes to the tracker's unknown-model warn path, exactly as an
+    entirely-absent model does today. Raises loudly if the config is missing.
+    """
+    out: dict[str, dict[str, float]] = {}
+    for rec in require_models():
+        if rec.get("provider") != provider:
+            continue
+        price = rec.get("price")
+        if not price:  # null / missing → NOT a $0 entry
+            continue
+        out[rec["id"]] = {"input": float(price["input"]), "output": float(price["output"])}
+    return out
+
+
+def find_model(model_id: str) -> dict | None:
+    """The record for a model id, or ``None``. Non-raising (for structural use)."""
+    for rec in load_models():
+        if rec.get("id") == model_id:
+            return rec
+    return None
+
+
+def model_status(model_id: str) -> str | None:
+    """A model's ``status``, or ``None`` if it is not in the registry."""
+    rec = find_model(model_id)
+    return rec.get("status") if rec else None

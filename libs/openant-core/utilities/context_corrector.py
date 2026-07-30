@@ -190,7 +190,6 @@ def gather_source_files(repo_path: str, extensions: list[str] = None) -> list[di
     # vendored or generated code.
     exclude_dirs = _canonical_skip_dirs()
 
-    # File patterns to exclude
     exclude_patterns = {'.min.js', '.min.css', '.bundle.js', '.chunk.js', 'package-lock.json'}
 
     files = []
@@ -641,7 +640,9 @@ def test_corrector():
         print(file=sys.stderr)
 
         # Test file gathering
-        repo_path = "/Users/nahumkorda/code/dvna"
+        # Demo block (guarded by os.path.exists below). Was a hardcoded
+        # personal path that shipped in the wheel; now an opt-in env var.
+        repo_path = os.environ.get("OPENANT_DEMO_REPO", "")
         if os.path.exists(repo_path):
             files = gather_source_files(repo_path)
             print(f"Found {len(files)} source files in {repo_path}", file=sys.stderr)

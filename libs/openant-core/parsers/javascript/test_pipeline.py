@@ -1323,8 +1323,10 @@ def main():
     # Set these values to run directly from IDE
     # ========================================
     IDE_MODE = False  # Set to True to use hardcoded values below
-    HARDCODED_REPO_PATH = '/Users/nahumkorda/code/test_repos/Flowise/packages/components'
-    HARDCODED_OUTPUT_DIR = '/Users/nahumkorda/code/openant/datasets/flowise'
+    # IDE-run convenience (dead unless IDE_MODE=True). Env vars replace the
+    # personal paths that shipped in the wheel.
+    HARDCODED_REPO_PATH = os.environ.get('OPENANT_IDE_REPO', '')
+    HARDCODED_OUTPUT_DIR = os.environ.get('OPENANT_IDE_OUTPUT', '')
     HARDCODED_ANALYZER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'typescript_analyzer.js')
     HARDCODED_ENABLE_LLM = True
     HARDCODED_AGENTIC = True

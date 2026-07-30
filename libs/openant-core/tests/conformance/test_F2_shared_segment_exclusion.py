@@ -27,7 +27,7 @@ pristine repo).  The orchestrator runs it once against the pristine core (RED)
 and once against a patched copy (GREEN).
 
     OPENANT_CORE_ROOT=/path/to/openant-core \
-        /Users/gadievron/.openant/venv/bin/python -m pytest F2-shared-segment-exclusion.test.py
+        python -m pytest F2-shared-segment-exclusion.test.py
 """
 
 import importlib.util
@@ -41,7 +41,7 @@ import pytest
 
 _CORE_ROOT = os.environ.get(
     "OPENANT_CORE_ROOT",
-    "/Users/gadievron/Documents/ClaudeNew/OpenAnt/new-bugs-2/OpenAnt/libs/openant-core",
+    str(Path(__file__).resolve().parent.parent.parent),
 )
 if _CORE_ROOT not in sys.path:
     sys.path.insert(0, _CORE_ROOT)

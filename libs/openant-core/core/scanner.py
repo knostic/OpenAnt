@@ -40,10 +40,83 @@ except ImportError:
     HAS_APP_CONTEXT = False
 
 
+
+def resolve_call_graph_dirs(output_dir: str) -> dict[str | None, str]:
+    """Directories holding a usable ``call_graph.json``, keyed by language.
+
+    Multi-language runs write one per language under ``<run>/<lang>/`` and
+    record them in ``call_graphs.json``; single-language runs keep the legacy
+    flat layout. Both are resolved here so the re-filter does not need to know
+    which shape it is looking at.
+
+    Entries are validated against the filesystem rather than trusted from the
+    index — a stale index would otherwise point the filter at a graph that no
+    longer exists.
+
+    Returns:
+        ``{language: dir}``, or ``{None: run_dir}`` for the legacy layout, or
+        ``{}`` when no call graph exists anywhere.
+    """
+    index_path = os.path.join(output_dir, "call_graphs.json")
+    if os.path.exists(index_path):
+        try:
+            index = read_json(index_path)
+        except (json.JSONDecodeError, OSError):
+            index = {}
+        dirs: dict[str | None, str] = {}
+        for language, rel in (index or {}).items():
+            candidate = os.path.join(output_dir, rel)
+            if os.path.isfile(candidate):
+                dirs[language] = os.path.dirname(candidate)
+        return dirs
+
+    if os.path.isfile(os.path.join(output_dir, "call_graph.json")):
+        return {None: output_dir}
+    return {}
+
+
+
+def scope_entry_points_to_units(entry_point_ids, units: list[dict]) -> set:
+    """Restrict promoted entry-point ids to those present in *units*.
+
+    ``apply_reachability_filter`` unions ``extra_entry_points`` into its seed
+    set BEFORE evaluating the empty-seed safety net. Passing the whole run's
+    promoted ids to a single language's filter therefore hands it seeds that do
+    not exist in that language's call graph: the seed set is non-empty, so the
+    "no entry points — pass everything through rather than black out" guard
+    never fires, BFS reaches nothing, and every unit of that language is
+    dropped from the scan while it still reports success.
+
+    Scoping per partition restores the guard: a language with no promoted units
+    of its own gets an EMPTY seed set, which is exactly the condition the
+    safety net is written to detect.
+    """
+    if not entry_point_ids:
+        return set()
+    unit_ids = {u.get("id") for u in units if u.get("id")}
+    return {eid for eid in entry_point_ids if eid in unit_ids}
+
+
+def partition_units_by_language(units: list[dict]) -> dict[str | None, list[dict]]:
+    """Group units by their ``language`` stamp.
+
+    Units from a legacy single-language dataset carry no stamp and group under
+    ``None``. The partition is lossless: every input unit lands in exactly one
+    bucket, so re-filtering per language cannot silently drop units.
+    """
+    parts: dict[str | None, list[dict]] = {}
+    for unit in units:
+        parts.setdefault(unit.get("language"), []).append(unit)
+    return parts
+
+
 def scan_repository(
     repo_path: str,
     output_dir: str,
     language: str = "auto",
+    languages: list[str] | None = None,
+    excluded_languages: dict[str, str] | None = None,
+    strict_languages: bool = False,
     processing_level: str = "reachable",
     verify: bool = False,
     generate_context: bool = True,
@@ -81,6 +154,13 @@ def scan_repository(
         repo_path: Path to the repository to scan.
         output_dir: Directory for all output files.
         language: ``"auto"``, ``"python"``, ``"javascript"``, ``"go"``, or ``"c"``.
+        languages: Optional explicit list of languages to parse. With more than
+            one entry the parse fans out per language into ``<output_dir>/<lang>/``
+            and the datasets are merged; every later stage still runs ONCE over
+            the merged dataset. Omitted or single-element means the unchanged
+            single-language path.
+        strict_languages: If True, abort when any selected language fails to
+            parse instead of continuing with the survivors.
         processing_level: ``"all"``, ``"reachable"``, ``"codeql"``, or ``"exploitable"``.
         verify: If True, run Stage 2 attacker simulation after detection.
         generate_context: If True, generate application context (reduces FP).
@@ -144,6 +224,7 @@ def scan_repository(
     # Step 1: Parse
     # ---------------------------------------------------------------
     from core.parser_adapter import parse_repository
+    from core.schemas import ParseResult
 
     # When LLM reachability is enabled the stage must see ALL units so it can
     # identify entry points the structural pass would miss.  Parse with "all"
@@ -165,15 +246,65 @@ def scan_repository(
         "processing_level": effective_parse_level,
         "skip_tests": skip_tests,
     }) as ctx:
-        parse_result = parse_repository(
-            repo_path=repo_path,
-            output_dir=output_dir,
-            language=language,
-            processing_level=effective_parse_level,
-            skip_tests=skip_tests,
-            diff_manifest=diff_manifest,
-            library_mode=library_mode,
-        )
+        if languages and len(languages) > 1:
+            # Fan out per language, then merge into the single dataset every
+            # later stage consumes. Post-parse stages are unchanged and still
+            # run ONCE — the merge is what makes that possible.
+            from core.dataset_merge import (
+                merge_analyzer_outputs,
+                merge_datasets,
+                write_call_graph_index,
+            )
+            from core.parser_adapter import (
+                _maybe_apply_diff_filter,
+                parse_repository_multi,
+            )
+
+            outcomes = parse_repository_multi(
+                repo_path=repo_path,
+                run_dir=output_dir,
+                languages=languages,
+                processing_level=effective_parse_level,
+                skip_tests=skip_tests,
+                library_mode=library_mode,
+                strict=strict_languages,
+            )
+            _dataset_path = os.path.join(output_dir, "dataset.json")
+            _analyzer_path = os.path.join(output_dir, "analyzer_output.json")
+            _merge_stats = merge_datasets(outcomes, _dataset_path)
+            merge_analyzer_outputs(outcomes, _analyzer_path)
+            write_call_graph_index(
+                outcomes, os.path.join(output_dir, "call_graphs.json")
+            )
+
+            _failed = [o for o in outcomes if not o.ok]
+            parse_result = ParseResult(
+                dataset_path=_dataset_path,
+                analyzer_output_path=(
+                    _analyzer_path if os.path.exists(_analyzer_path) else None
+                ),
+                units_count=_merge_stats.total_units,
+                # Scalar stays the PRIMARY language: it is serialized into JSON
+                # the Go CLI unmarshals.
+                language=_merge_stats.languages[0] if _merge_stats.languages else language,
+                processing_level=effective_parse_level,
+                languages=_merge_stats.languages,
+                language_stats=_merge_stats.units_per_language,
+                per_language={o.language: o.to_dict() for o in outcomes},
+                parse_errors=[o.to_dict() for o in _failed],
+            )
+            # Applied once against the MERGED dataset, not per language.
+            _maybe_apply_diff_filter(parse_result, output_dir, diff_manifest)
+        else:
+            parse_result = parse_repository(
+                repo_path=repo_path,
+                output_dir=output_dir,
+                language=(languages[0] if languages else language),
+                processing_level=effective_parse_level,
+                skip_tests=skip_tests,
+                diff_manifest=diff_manifest,
+                library_mode=library_mode,
+            )
 
         ctx.summary = {
             "total_units": parse_result.units_count,
@@ -196,6 +327,14 @@ def scan_repository(
     result.analyzer_output_path = parse_result.analyzer_output_path
     result.units_count = parse_result.units_count
     result.language = parse_result.language
+    # getattr with defaults: `parse_repository` is duck-typed by callers and
+    # test stubs that predate these fields. Attribute access would turn a
+    # missing optional field into an AttributeError mid-scan.
+    result.languages = getattr(parse_result, "languages", []) or []
+    result.language_stats = getattr(parse_result, "language_stats", {}) or {}
+    result.per_language = getattr(parse_result, "per_language", {}) or {}
+    result.parse_errors = getattr(parse_result, "parse_errors", []) or []
+    result.excluded_languages = dict(excluded_languages or {})
     collected_step_reports.append(_load_step_report(output_dir, "parse"))
 
     print(f"  Parsed: {parse_result.units_count} units ({parse_result.language})",
@@ -215,20 +354,60 @@ def scan_repository(
         with step_context("app-context", output_dir, inputs={
             "repo_path": repo_path,
         }) as ctx:
-            try:
-                context = generate_application_context(
-                    Path(repo_path), registry.get("app_context")
-                )
+            # A threat model committed to the scanned repo is authoritative and
+            # short-circuits generation. Loaded OUTSIDE the try below on
+            # purpose: a malformed one must abort the scan rather than degrade
+            # into a default context, because silently applying the wrong
+            # security model to every finding is worse than failing loudly.
+            from context.threat_model import load_threat_model
+
+            threat_model_ctx = load_threat_model(Path(repo_path))
+
+            if threat_model_ctx is not None:
                 app_context_path = os.path.join(output_dir, "application_context.json")
-                save_context(context, Path(app_context_path))
+                save_context(threat_model_ctx, Path(app_context_path))
                 result.app_context_path = app_context_path
-                ctx.summary = {"application_type": context.application_type}
+                result.context_source = "threat_model"
+                # R5: carry the file's provenance (sha over raw bytes) and the
+                # previously discarded permissive-model warnings onto the result
+                # so both land in scan.report.json / pipeline_output.json rather
+                # than reaching only stderr (which CI discards).
+                result.threat_model_sha256 = threat_model_ctx.source_sha256
+                result.threat_model_warnings = list(
+                    threat_model_ctx.permissive_warnings
+                )
+                ctx.summary = {
+                    "application_type": threat_model_ctx.application_type,
+                    "context_source": "threat_model",
+                }
                 ctx.outputs = {"app_context_path": app_context_path}
-                print(f"  App type: {context.application_type}", file=sys.stderr)
-            except Exception as e:
-                print(f"  WARNING: App context generation failed: {e}", file=sys.stderr)
-                print("  Continuing without app context.", file=sys.stderr)
-                ctx.summary = {"skipped": True, "reason": str(e)}
+                print(
+                    "  Using repo-supplied threat model: "
+                    f"{threat_model_ctx.application_type}",
+                    file=sys.stderr,
+                )
+            else:
+                try:
+                    context = generate_application_context(
+                        Path(repo_path), registry.get("app_context")
+                    )
+                    app_context_path = os.path.join(
+                        output_dir, "application_context.json"
+                    )
+                    save_context(context, Path(app_context_path))
+                    result.app_context_path = app_context_path
+                    result.context_source = "generated"
+                    ctx.summary = {
+                        "application_type": context.application_type,
+                        "context_source": "generated",
+                    }
+                    ctx.outputs = {"app_context_path": app_context_path}
+                    print(f"  App type: {context.application_type}", file=sys.stderr)
+                except Exception as e:
+                    print(f"  WARNING: App context generation failed: {e}",
+                          file=sys.stderr)
+                    print("  Continuing without app context.", file=sys.stderr)
+                    ctx.summary = {"skipped": True, "reason": str(e)}
 
         collected_step_reports.append(_load_step_report(output_dir, "app-context"))
     elif generate_context:
@@ -238,6 +417,16 @@ def scan_repository(
     else:
         print(_step_label("Skipping application context (--no-context)."),
               file=sys.stderr)
+        # Skipping is a legitimate operator choice, but doing it silently while
+        # the repo ships a threat model means the scan runs under a different
+        # security model than the repository declares, invisibly.
+        if (Path(repo_path) / "OPENANT.THREATMODEL.md").exists():
+            print(
+                "  NOTE: this repository ships an OPENANT.THREATMODEL.md, which "
+                "--no-context discards. The scan will NOT use its attacker "
+                "profiles or vulnerability criteria.",
+                file=sys.stderr,
+            )
         _record_skip(result, "app-context", "not_requested")
     print(file=sys.stderr)
 
@@ -303,26 +492,75 @@ def scan_repository(
 
                 # Re-apply the structural reachability filter using
                 # LLM-promoted entry points as additional BFS seeds.
-                # Only possible when call_graph.json was written by the parser
-                # (Python and Zig paths do this; JS/Go/C/Ruby/PHP handle
-                # reachability filtering internally and don't persist it).
+                # Only possible when the parser persisted call_graph.json.
+                # Which parsers do so is determined by PROBING THE FILESYSTEM
+                # below, not by a hardcoded language list — an earlier comment
+                # here claimed only Python and Zig persist it, which is wrong
+                # (JavaScript writes a fully-formed call_graph.json too). Keep
+                # this probe-based: parsers gain and lose the behaviour over
+                # time, and a stale list here would silently skip re-filtering
+                # for a language that actually supports it.
                 if processing_level != "all":
-                    call_graph_path = os.path.join(output_dir, "call_graph.json")
-                    if os.path.exists(call_graph_path):
+                    cg_dirs = resolve_call_graph_dirs(output_dir)
+                    if cg_dirs:
                         from core.parser_adapter import apply_reachability_filter
+
                         llm_promoted_ids = {
                             u["id"] for u in dataset.get("units", [])
                             if u.get("is_entry_point") and u.get("id")
                         }
-                        dataset = apply_reachability_filter(
-                            dataset,
-                            output_dir,
-                            processing_level,
-                            extra_entry_points=llm_promoted_ids,
+                        partitions = partition_units_by_language(
+                            dataset.get("units", [])
                         )
-                        post_filter_count = len(dataset.get("units", []))
+                        kept: list[dict] = []
+                        unfilterable: dict[str, int] = {}
+
+                        for lang, lang_units in partitions.items():
+                            lang_dir = cg_dirs.get(lang)
+                            if lang_dir is None and None in cg_dirs:
+                                # Legacy flat layout: one graph covers everything.
+                                lang_dir = cg_dirs[None]
+                            if lang_dir is None:
+                                # This language's parser persisted no call graph,
+                                # so its units pass through unfiltered — the
+                                # pre-existing behaviour, now scoped per language
+                                # instead of disabling the filter for the whole
+                                # scan just because the primary lacked a graph.
+                                unfilterable[lang or "unknown"] = len(lang_units)
+                                kept.extend(lang_units)
+                                continue
+
+                            # Deep-copy metadata: the shallow {**dataset} copy
+                            # shares the nested metadata dict across every
+                            # per-language call, so each filter's stats
+                            # overwrote the previous language's.
+                            lang_dataset = {
+                                **dataset,
+                                "units": lang_units,
+                                "metadata": dict(dataset.get("metadata") or {}),
+                            }
+                            filtered = apply_reachability_filter(
+                                lang_dataset,
+                                lang_dir,
+                                processing_level,
+                                extra_entry_points=scope_entry_points_to_units(
+                                    llm_promoted_ids, lang_units
+                                ),
+                            )
+                            kept.extend(filtered.get("units", []))
+
+                        dataset = {**dataset, "units": kept}
+                        post_filter_count = len(kept)
                         result.units_count = post_filter_count
                         refilter_supported = True
+
+                        for lang, count in unfilterable.items():
+                            print(
+                                f"\n  WARNING: {lang} persisted no call_graph.json; "
+                                f"{count} unit(s) skip post-LLM re-filtering and "
+                                f"flow to downstream stages unfiltered.",
+                                file=sys.stderr,
+                            )
                     else:
                         # Parser doesn't persist call_graph.json — the full
                         # unfiltered dataset will flow to downstream stages.
@@ -595,6 +833,9 @@ def scan_repository(
             ) or "web_app",
             processing_level=processing_level,
             step_reports=collected_step_reports,
+            context_source=result.context_source,
+            threat_model_sha256=result.threat_model_sha256,
+            threat_model_warnings=result.threat_model_warnings,
         )
 
         ctx.outputs = {"pipeline_output_path": pipeline_output_path}
@@ -784,6 +1025,98 @@ def _read_app_type(app_context_path: str) -> str | None:
         return None
 
 
+# Coverage fields the shared walker (core/repo_walk.py STAT_KEYS) records when it
+# refuses a symlink or cannot read a directory. Parsers persist them into their
+# per-language scan-result file's ``statistics`` block, NOT into dataset.json —
+# so the merge into ``per_language`` never carries them. They are the only signal
+# that a scan skipped part of the tree; without them a partially-covered scan of
+# a hostile repo looks identical to a clean one. Aggregated here, at report time.
+_COVERAGE_COUNT_KEYS = ("symlinks_skipped", "directories_unreadable")
+_COVERAGE_EXAMPLE_KEYS = ("symlink_examples", "unreadable_examples")
+# Parsers disagree on the filename: the in-process Python parser writes
+# scan_result.json (singular); the subprocess parsers write scan_results.json.
+_SCAN_RESULT_FILENAMES = ("scan_result.json", "scan_results.json")
+
+
+def _read_coverage_stats(dir_path: str) -> dict:
+    """Return the coverage keys present in a directory's scan-result file, or {}.
+
+    Reads OUR output artifact, not anything from the scanned repo, so a plain
+    read is safe. Only keys that are actually present are returned — absence is
+    NOT coerced to zero here, because the caller must distinguish "the parser
+    instruments coverage and skipped nothing" (a count key present at 0) from
+    "the parser does not instrument coverage at all" (the key absent). Coercing
+    absence to 0 is exactly the false-``symlinks_skipped: 0`` assurance this
+    aggregation exists to avoid.
+    """
+    for name in _SCAN_RESULT_FILENAMES:
+        candidate = os.path.join(dir_path, name)
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            stats = read_json(candidate).get("statistics", {}) or {}
+        except Exception:
+            return {}
+        return {
+            k: stats[k]
+            for k in (*_COVERAGE_COUNT_KEYS, *_COVERAGE_EXAMPLE_KEYS)
+            if k in stats
+        }
+    return {}
+
+
+def _language_scan_dirs(result: ScanResult) -> list[tuple[str, str]]:
+    """``(language, scan-output-dir)`` pairs to probe for coverage.
+
+    Multi-language runs carry a per-language ``output_dir`` in ``per_language``;
+    the single-language passthrough writes straight into ``result.output_dir``
+    with an empty ``per_language``. Both are normalised to the same pair list so
+    coverage is attributable to a named language either way.
+    """
+    pairs: list[tuple[str, str]] = []
+    for lang, spec in (result.per_language or {}).items():
+        out = spec.get("output_dir") if isinstance(spec, dict) else None
+        pairs.append((lang, out or result.output_dir))
+    if not pairs:
+        pairs.append((result.language, result.output_dir))
+    return pairs
+
+
+def _collect_coverage(result: ScanResult) -> dict:
+    """Aggregate skipped-symlink / unreadable-dir figures across languages.
+
+    A language is "instrumented" iff its scan-result ``statistics`` carries at
+    least one coverage COUNT key. This is a presence PROBE, deliberately not a
+    hardcoded per-language allowlist: the parser set gains and loses coverage
+    instrumentation over time, and a stale allowlist would fail dangerously —
+    silently summing a de-instrumented language's absent keys as 0, i.e. a false
+    "nothing skipped". The probe fails safe instead: an uninstrumented language
+    is disclosed in ``languages_without_coverage_data`` rather than counted as 0,
+    so a ``symlinks_skipped: 0`` aggregate is trustworthy ONLY when that list is
+    empty. (JavaScript and Go do not yet instrument coverage; they appear in the
+    list until their parsers emit the snake_case keys.)
+    """
+    counts = {k: 0 for k in _COVERAGE_COUNT_KEYS}
+    examples: dict[str, list] = {k: [] for k in _COVERAGE_EXAMPLE_KEYS}
+    without_data: list[str] = []
+    for lang, d in _language_scan_dirs(result):
+        stats = _read_coverage_stats(d)
+        if not any(k in stats for k in _COVERAGE_COUNT_KEYS):
+            without_data.append(lang or "unknown")
+            continue
+        for k in _COVERAGE_COUNT_KEYS:
+            counts[k] += int(stats.get(k, 0) or 0)
+        for k in _COVERAGE_EXAMPLE_KEYS:
+            for ex in stats.get(k, []) or []:
+                if len(examples[k]) < 5 and ex not in examples[k]:
+                    examples[k].append(ex)
+    return {
+        **counts,
+        **examples,
+        "languages_without_coverage_data": sorted(set(without_data)),
+    }
+
+
 def _write_scan_report(
     output_dir: str,
     result: ScanResult,
@@ -810,6 +1143,27 @@ def _write_scan_report(
             # ADDITIVE / non-breaking: disambiguated skip cause per step.
             # `steps_skipped` above stays a flat bare list (consumers read it).
             "steps_skipped_reasons": result.skipped_step_reasons,
+            # Multi-language coverage + which path supplied the security model.
+            # Previously omitted here, so a merged/degraded scan and a
+            # single-language clean one produced indistinguishable reports.
+            "languages": result.languages,
+            "language_stats": result.language_stats,
+            "per_language": result.per_language,
+            "parse_errors": result.parse_errors,
+            "excluded_languages": result.excluded_languages,
+            "degraded": result.degraded,
+            "context_source": result.context_source,
+            # R5: provenance of a repo-supplied threat model. sha is absent (key
+            # omitted) when no threat model was loaded — never the empty hash.
+            **(
+                {"threat_model_sha256": result.threat_model_sha256}
+                if result.threat_model_sha256
+                else {}
+            ),
+            "threat_model_warnings": result.threat_model_warnings,
+            # Aggregate of what the walker refused (symlinks) or could not read
+            # (directories), summed across languages from each scan-result file.
+            "coverage": _collect_coverage(result),
         },
         inputs={"repo_path": result.output_dir.replace(os.path.abspath("."), ".")},
         outputs={

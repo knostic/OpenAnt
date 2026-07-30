@@ -121,7 +121,7 @@ prompts/
   prompt_selector.py               - Routes to vulnerability_analysis prompt
 ```
 
-**Note:** Both Stage 1 and Stage 2 prompts are language-agnostic - the same prompt is used for Python, JavaScript, and Go.
+**Note:** Both Stage 1 and Stage 2 prompts are language-agnostic - the same prompt is used for every supported language.
 
 **Stage 1 Prompt Format:**
 ```

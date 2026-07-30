@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # libs/openant-core
 
-import export_csv as ec  # noqa: E402
+import report.csv_export as ec  # noqa: E402
 
 
 def test_get_stage1_verdict_falls_back_to_verdict_agree_branch():

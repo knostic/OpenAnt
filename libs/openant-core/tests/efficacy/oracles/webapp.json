@@ -1,0 +1,14 @@
+{
+  "fixture": "webapp",
+  "version": 2,
+  "language": "python",
+  "notes": "SIDECAR ORACLE — never included in any prompt (the scanner analyses only src/*.py; this JSON is not source). Expected smoke outcomes for the two blinded modules. Vulnerable units are remotely reachable from a Flask route; clean units are deliberately shaped to LOOK alarming (subprocess, sqlite, string building) without being attacker-reachable — the false-positive traps. Vulnerable and clean units are interleaved across both files so neither filename nor file membership signals the verdict, and the source carries no answer-bearing docstrings/comments/names.",
+  "units": {
+    "src/app_a.py:render_snippet": {"vulnerable": true,  "class": "command injection"},
+    "src/app_a.py:migrate":        {"vulnerable": false, "trap": "sqlite call, but parameterised"},
+    "src/app_a.py:download":       {"vulnerable": true,  "class": "path traversal"},
+    "src/app_b.py:rotate_logs":    {"vulnerable": false, "trap": "subprocess with a non-request argument"},
+    "src/app_b.py:get_paste":      {"vulnerable": true,  "class": "sql injection"},
+    "src/app_b.py:build_cache_key": {"vulnerable": false, "trap": "f-string, no sink"}
+  }
+}

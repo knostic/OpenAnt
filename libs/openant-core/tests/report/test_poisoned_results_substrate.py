@@ -176,7 +176,7 @@ def test_reporter_build_pipeline_output_survives_poison(tmp_path: Path):
 # 3. EXPERIMENT boundary: export_csv.export_csv.
 # ---------------------------------------------------------------------------
 def test_export_csv_survives_poison(tmp_path: Path):
-    import export_csv
+    import report.csv_export as export_csv
 
     exp = tmp_path / "results.json"
     ds = tmp_path / "dataset.json"
@@ -194,7 +194,7 @@ def test_export_csv_survives_poison(tmp_path: Path):
 #    Remediation is the only LLM call -> monkeypatched so the test is hermetic.
 # ---------------------------------------------------------------------------
 def test_generate_report_main_survives_poison(tmp_path: Path, monkeypatch, capsys):
-    import generate_report
+    import report.html_report as generate_report
 
     exp = tmp_path / "results.json"
     ds = tmp_path / "dataset.json"

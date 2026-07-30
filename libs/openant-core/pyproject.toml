@@ -56,3 +56,30 @@ packages = [
     "context",
     "report",
 ]
+
+# Keep test scaffolding and generated outputs out of the distribution. These are
+# regenerable artifacts, not product: report/test_output shipped a third-party
+# exploit writeup (paperless-ngx, CWE-639) and a stale sample report, and
+# report/test_data shipped a captured pipeline. None is referenced by production.
+exclude = [
+    "**/test_output",
+    "**/test_data",
+    "**/test_output/**",
+    "**/test_data/**",
+]
+
+# config/languages.json is the single source of truth for the language set, read
+# by BOTH the Python engine and the Go CLI. It lives at the monorepo root, two
+# levels above this project root, so `packages` above cannot reach it and the
+# wheel shipped without it: the registry then resolved to {} and every language
+# silently disappeared (`-l python` became "invalid choice", detection found zero
+# files in any repository). force-include is what makes an installed layout work,
+# and it must land at `config/` so the upward search from the installed package
+# finds it the same way it does in a checkout.
+[tool.hatch.build.targets.wheel.force-include]
+"../../config/languages.json" = "config/languages.json"
+# config/models.json is the shared provider-model registry (IDs, status,
+# pricing), read by both runtimes exactly like languages.json. Without this
+# stanza it would not ship in the wheel and core/model_registry.require_models()
+# would fail loud — the same defect class that made every language vanish.
+"../../config/models.json" = "config/models.json"

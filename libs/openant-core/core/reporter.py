@@ -2,8 +2,8 @@
 Report generation wrapper.
 
 Wraps the existing report generators:
-- generate_report.py   — HTML report with Chart.js
-- export_csv.py        — CSV export
+- report/html_report.py — HTML report with Chart.js
+- report/csv_export.py  — CSV export
 - report/generator.py  — LLM-based summary and disclosure documents
 
 Also provides ``build_pipeline_output()`` which assembles analysis results
@@ -13,12 +13,14 @@ and ``run_dynamic_tests()``.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from core.schemas import ReportResult
+from core.language_registry import fence_for_path
 from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
 from utilities.file_io import normalize_results, open_utf8, read_json, write_json
 
@@ -66,26 +68,11 @@ def _load_diff_metadata(scan_dir: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 # Map language hints to the code-fence language tag used in Markdown.
-_FENCE_LANG = {
-    "python": "python",
-    "py": "python",
-    "javascript": "javascript",
-    "js": "javascript",
-    "typescript": "typescript",
-    "ts": "typescript",
-    "go": "go",
-    "golang": "go",
-    "java": "java",
-    "ruby": "ruby",
-    "rb": "ruby",
-    "php": "php",
-    "rust": "rust",
-    "c": "c",
-    "cpp": "cpp",
-    "c++": "cpp",
-    "csharp": "csharp",
-    "c#": "csharp",
-}
+# Fence tags come from the language registry, resolved per FILE. The old
+# module-level map was keyed by the SCAN-WIDE language, which mislabelled every
+# file whose extension implied a different tag than the scan's primary
+# language — a `.ts` file in a "javascript" scan was fenced as ```javascript
+# even before multi-language scanning existed.
 
 
 def _coerce_to_str(value) -> str:
@@ -125,7 +112,9 @@ def _build_vulnerable_code_section(file_path: str, code: str, language: str | No
     """
     if not code:
         return ""
-    fence_lang = _FENCE_LANG.get((language or "").lower(), "")
+    # Resolve by the finding's own file; fall back to the scan language only
+    # when the path carries no recognizable extension.
+    fence_lang = fence_for_path(file_path, fallback=language)
     return (
         "## Vulnerable Code\n\n"
         f"`{file_path}`:\n\n"
@@ -223,6 +212,9 @@ def build_pipeline_output(
     application_type: str = "web_app",
     processing_level: str | None = None,
     step_reports: list[dict] | None = None,
+    context_source: str = "none",
+    threat_model_sha256: str | None = None,
+    threat_model_warnings: list | None = None,
 ) -> tuple[str, int]:
     """Build ``pipeline_output.json`` from analysis results.
 
@@ -240,6 +232,15 @@ def build_pipeline_output(
         application_type: App type for context (default ``"web_app"``).
         processing_level: Processing level used (``"reachable"``, etc.).
         step_reports: Optional list of step report dicts for duration/cost info.
+        context_source: Which path supplied the security model —
+            ``"threat_model"`` (a file in the scanned repo), ``"generated"``
+            (built-in generator), or ``"none"``. Recorded so a scan run under
+            the wrong model is distinguishable from a correct one.
+        threat_model_sha256: sha256 over the raw threat-model file bytes when
+            one was loaded; ``None`` (key omitted) otherwise — never the empty
+            hash.
+        threat_model_warnings: over-permissive-model warnings to surface in the
+            artifact + report header; ``None``/empty when there are none.
 
     Returns:
         A ``(output_path, findings_count)`` tuple: the *output_path* written
@@ -398,8 +399,13 @@ def build_pipeline_output(
             "name": vuln.get("name", finding.get("finding", "Unknown Vulnerability")),
             "short_name": vuln.get("short_name", finding.get("verdict", "vuln")),
             "location": {
+                # function is the exact complement of file so that
+                # file + ":" + function == route_key round-trips (the cli.py
+                # dynamic-test bridge reconstructs route_key from these two).
+                # This drops the redundant file prefix that used to duplicate
+                # ``file`` inside ``function`` (D3b).
                 "file": route_key.split(":")[0] if ":" in route_key else "unknown",
-                "function": route_key,
+                "function": route_key.split(":", 1)[1] if ":" in route_key else route_key,
             },
             "cwe_id": vuln.get("cwe_id") or finding.get("cwe_id") or full_result.get("cwe_id", 0),
             "cwe_name": vuln.get("cwe_name") or finding.get("cwe_name") or full_result.get("cwe_name", "Unknown"),
@@ -436,6 +442,17 @@ def build_pipeline_output(
         },
         "analysis_date": datetime.now(timezone.utc).isoformat(),
         "application_type": application_type,
+        # Which path supplied the security model (Plan DoD #9). Additive key;
+        # Go consumers use comma-ok access so it is safe to add.
+        "context_source": context_source,
+        **(
+            {"threat_model_sha256": threat_model_sha256}
+            if threat_model_sha256
+            else {}
+        ),
+        # Over-permissive-model warnings (previously stderr-only). Emitted as a
+        # list so the report header can render them; empty list when none.
+        "threat_model_warnings": list(threat_model_warnings or []),
         "pipeline_stats": {
             "total_units": total_units,
             "reachable_units": total_units,
@@ -499,13 +516,22 @@ def generate_html_report(
     # Pass step reports dir so the HTML report can include cost/time breakdown
     step_reports_dir = os.path.dirname(os.path.abspath(results_path))
 
-    script = _CORE_ROOT / "generate_report.py"
     cmd = [
-        sys.executable, str(script), results_path, dataset_path, output_path,
+        # -P: no CWD on sys.path. `-m` prepends the process CWD to sys.path[0],
+        # and the engine inherits the user's shell CWD — which, in the standard
+        # `git clone X && cd X && openant report` flow, is INSIDE the scanned
+        # untrusted repo. Without -P, a hostile ``report/`` package in that repo
+        # shadows this one and its __init__ executes. This dropped when cwd=
+        # _CORE_ROOT was removed to fix the wheel; -P restores the containment
+        # the cwd pin held by accident.
+        sys.executable, "-P", "-m", "report.html_report", results_path, dataset_path, output_path,
         "--step-reports-dir", step_reports_dir,
     ]
 
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, cwd=str(_CORE_ROOT))
+    # No cwd=_CORE_ROOT: these are now `-m` package invocations resolved through
+    # the installed distribution, not source-tree-relative scripts. Depending on
+    # cwd is what made them unrunnable from an installed wheel.
+    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
 
     if result.returncode != 0:
         raise RuntimeError(f"HTML report generation failed (exit code {result.returncode})")
@@ -533,10 +559,14 @@ def generate_csv_report(
     """
     print("[Report] Generating CSV report...", file=sys.stderr)
 
-    script = _CORE_ROOT / "export_csv.py"
-    cmd = [sys.executable, str(script), results_path, dataset_path, output_path]
+    # -P: keep the untrusted CWD off sys.path so a hostile report/ package in the
+    # scanned repo cannot shadow this one. See the html path above for the full note.
+    cmd = [sys.executable, "-P", "-m", "report.csv_export", results_path, dataset_path, output_path]
 
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, cwd=str(_CORE_ROOT))
+    # No cwd=_CORE_ROOT: these are now `-m` package invocations resolved through
+    # the installed distribution, not source-tree-relative scripts. Depending on
+    # cwd is what made them unrunnable from an installed wheel.
+    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
 
     if result.returncode != 0:
         raise RuntimeError(f"CSV export failed (exit code {result.returncode})")
@@ -614,6 +644,29 @@ def generate_summary_report(
     _record_usage_in_tracker(usage, report_binding)
 
     return ReportResult(output_path=output_path, format="summary", usage=_usage_to_info(usage))
+
+
+def safe_disclosure_filename(short_name: str) -> str:
+    """Reduce a model-supplied name to a single safe path component.
+
+    ``short_name`` is LLM output (``vuln.get("short_name")``), and it used to reach
+    ``os.path.join`` through only ``.replace(" ", "_").upper()``. That is not
+    sanitisation: ``/`` and ``..`` pass through untouched, so a name like
+    ``../../../etc/pwned`` escaped the output directory and turned report generation
+    into an arbitrary-write primitive.
+
+    This matters more than a typical output-escaping bug because the threat model
+    file is repository-authored and unfenced — the accepted prompt-injection gap is
+    precisely a channel for steering model output, so treating that output as
+    trusted compounds one accepted risk into an unaccepted one.
+
+    Allowlist rather than blocklist: enumerate what may appear, so novel separators,
+    unicode lookalikes and encoding tricks are excluded by construction instead of
+    by remembering to ban them.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", (short_name or "").strip())
+    cleaned = cleaned.strip("._-")[:64]
+    return cleaned.upper() or "UNNAMED"
 
 
 def generate_disclosure_docs(
@@ -699,8 +752,7 @@ def generate_disclosure_docs(
         def _one(args):
             i, finding = args
             disclosure_text, usage = _generate_disclosure(finding, product_name, report_binding)
-            safe_name = finding["short_name"].replace(" ", "_").upper()
-            filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
+            filename = f"DISCLOSURE_{i:02d}_{safe_disclosure_filename(finding['short_name'])}.md"
             filepath = os.path.join(output_dir, filename)
             with open_utf8(filepath, "w") as f:
                 f.write(disclosure_text)

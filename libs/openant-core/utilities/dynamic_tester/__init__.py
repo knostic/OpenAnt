@@ -14,7 +14,7 @@ import json
 import os
 import sys
 
-from utilities.dynamic_tester.models import DynamicTestResult
+from utilities.dynamic_tester.models import DynamicTestResult, TestEvidence
 from utilities.dynamic_tester.test_generator import generate_test, regenerate_test
 from utilities.dynamic_tester.docker_executor import run_single_container
 from utilities.dynamic_tester.result_collector import collect_result
@@ -28,6 +28,30 @@ from utilities.llm import (
 )
 from utilities.file_io import normalize_results, read_json, write_json, open_utf8
 
+
+
+def should_skip_for_language(file_path: str, scan_language: str | None) -> tuple[bool, str]:
+    """Whether a finding should be skipped for lack of a Docker template.
+
+    Args:
+        file_path: The finding's file, which decides its language.
+        scan_language: Scan-wide language, used when the path has no
+            recognizable extension.
+
+    Returns:
+        ``(skip, reason)``. ``reason`` names the language so a skipped finding
+        leaves an auditable trail rather than an unexplained gap.
+    """
+    from core.language_registry import language_for_path
+    from utilities.dynamic_tester.test_generator import resolve_docker_template
+
+    if resolve_docker_template(file_path, scan_language) is not None:
+        return False, ""
+    language = language_for_path(file_path) or scan_language or "unknown"
+    return True, (
+        f"no dynamic-test Docker template for {language}; "
+        "skipped instead of generating an untemplated test"
+    )
 
 def run_dynamic_tests(
     pipeline_output_path: str,
@@ -81,7 +105,10 @@ def run_dynamic_tests(
                 if f.get("stage2_verdict") in DYNAMIC_TESTABLE]
     repo_info = {
         "name": pipeline.get("repository", {}).get("name", "unknown"),
-        "language": pipeline.get("repository", {}).get("language", "Python"),
+        # No default language. The previous "Python" fallback silently told the
+        # generator that an unknown-language repo was Python; an explicit
+        # "unknown" lets per-finding resolution decide and makes the gap visible.
+        "language": pipeline.get("repository", {}).get("language") or "unknown",
         "application_type": pipeline.get("application_type", "unknown"),
     }
 
@@ -159,6 +186,7 @@ def run_dynamic_tests(
         # Skip already-checkpointed findings, but ONLY if they succeeded.
         # Errored findings fall through to fresh test generation + Docker run,
         # so code/prompt fixes take effect on resume.
+
         cp_data = checkpointed.get(finding_id)
         if cp_data and cp_data.get("status") != "ERROR":
             result = DynamicTestResult(
@@ -173,8 +201,31 @@ def run_dynamic_tests(
                 test_code=cp_data.get("test_code", ""),
                 dockerfile=cp_data.get("dockerfile", ""),
                 docker_compose=cp_data.get("docker_compose", ""),
+                # Reconstruct the exploit-proof evidence too — it's serialized in the
+                # checkpoint but was dropped on resume, so a restored CONFIRMED finding
+                # silently lost its command_output/file_read/http_response proof.
+                evidence=[
+                    TestEvidence(type=e.get("type", ""), content=e.get("content", ""))
+                    for e in cp_data.get("evidence", []) if isinstance(e, dict)
+                ],
             )
             results.append(result)
+            continue
+
+        # Skip findings whose language has no Docker template, BEFORE spending
+        # an LLM call generating a test the harness cannot usefully run.
+        # Placed AFTER the checkpoint hit: a finding CONFIRMED by an
+        # earlier run must keep that verdict on resume, not be downgraded
+        # to SKIPPED and lose its exploit evidence.
+        _loc = finding.get("location", {})
+        _file = _loc.get("file", "") if isinstance(_loc, dict) else ""
+        _skip, _reason = should_skip_for_language(_file, repo_info.get("language"))
+        if _skip:
+            print(f"\n[{i+1}/{total}] SKIPPED {finding_id}: {_reason}", file=sys.stderr)
+            results.append(DynamicTestResult(
+                finding_id=finding_id, status="SKIPPED", details=_reason,
+                elapsed_seconds=0,
+            ))
             continue
 
         print(f"\n[{i+1}/{total}] Testing {finding_id}: "

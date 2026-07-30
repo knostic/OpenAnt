@@ -30,7 +30,7 @@ patch the same seeds are present. If the patch were a no-op this test fails; if
 the patch dropped any pristine seed the superset assertion fails.
 
 Run:
-  PY=/Users/gadievron/.openant/venv/bin/python
+  PY=python
   $PY fixes/F4-entry-root-additive-v3.test.py
 """
 
@@ -39,10 +39,16 @@ import os
 import shutil
 import subprocess
 import sys
+
+import pytest
 import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# This repo's own openant-core — tests/parsers/python/ -> openant-core.
+# Used by the forward-looking tests, which assert against the CURRENT tree and
+# so need no external checkout.
+CORE_ROOT = HERE.parent.parent.parent
 PATCH = HERE / "F4-entry-root-additive-v3.patch"
 # Pristine core: fixes/ and OpenAnt/ are siblings under new-bugs-2/. Allow an
 # explicit override so the test is relocatable.
@@ -213,8 +219,24 @@ def _build_patched_core() -> Path:
 
 
 def test_strict_superset_and_new_seeds():
-    assert PRISTINE_CORE.is_dir(), f"pristine core not found: {PRISTINE_CORE}"
-    assert PATCH.is_file(), f"patch not found: {PATCH}"
+    # This is a development-time RED/GREEN harness: it compares a PRE-#165
+    # checkout against the same tree with the F4 patch applied. Commit 858f5d6
+    # merged that patch, and the .patch file was never committed, so neither
+    # precondition can be satisfied from inside this repo — it has failed on
+    # every run since the day it landed.
+    #
+    # Skipped rather than left red so it stops masquerading as a signal. The
+    # coverage it was meant to provide now lives in
+    # test_f4_seeds_are_produced_by_the_current_core below, which asserts the
+    # same seeds forward against the current tree and needs no external
+    # checkout.
+    if not PRISTINE_CORE.is_dir() or not PATCH.is_file():
+        pytest.skip(
+            "pristine-vs-patched harness needs an out-of-tree pre-#165 checkout "
+            f"({PRISTINE_CORE}) and a patch file ({PATCH}) that is not committed; "
+            "forward-looking coverage lives in "
+            "test_f4_seeds_are_produced_by_the_current_core"
+        )
 
     repo = _write_fixture_repo()
     patched_core = _build_patched_core()
@@ -265,3 +287,37 @@ if __name__ == "__main__":
         sys.exit(2)
     print("PASS test_strict_superset_and_new_seeds")
     print("all tests PASSED")
+
+
+def test_f4_seeds_are_produced_by_the_current_core():
+    """Forward-looking replacement for the pristine-vs-patched comparison.
+
+    Asserts that the CURRENT tree seeds the F4 entry-point patterns —
+    custom ``APIRouter`` instances, aiohttp ``RouteTableDef``, Starlette
+    ``websocket_route``, and Django class-based-view dispatch methods — against
+    the same fixture repo the original harness used.
+
+    This is the only coverage of those patterns in the suite. The original test
+    could not provide it: it aborts on an unsatisfiable precondition before
+    reaching a single assertion.
+    """
+    repo = _write_fixture_repo()
+    seeds = _run_pipeline(CORE_ROOT, repo)
+
+    missing = NEW_EXPECTED - seeds
+    assert not missing, (
+        "current core does not seed the F4 entry points: "
+        f"{sorted(missing)}\nseeded: {sorted(seeds)}"
+    )
+
+
+def test_cbv_helper_is_never_seeded_by_the_current_core():
+    """``get_queryset`` is a CBV helper, not an HTTP dispatch method.
+
+    Seeding it would inflate the reachability root set with non-entry points.
+    """
+    repo = _write_fixture_repo()
+    seeds = _run_pipeline(CORE_ROOT, repo)
+
+    leaked = NEVER_SEEDED & seeds
+    assert not leaked, f"non-entry-point helper(s) seeded: {sorted(leaked)}"

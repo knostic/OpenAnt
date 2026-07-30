@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -144,6 +145,9 @@ func TestChangedFilesDetectsRenames(t *testing.T) {
 }
 
 func TestChangedFilesNonASCII(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("filenames with embedded newlines are not creatable on Windows")
+	}
 	dir := t.TempDir()
 	initTestRepo(t, dir)
 

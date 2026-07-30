@@ -11,6 +11,7 @@ import (
 
 	"github.com/charmbracelet/x/term"
 	"github.com/knostic/open-ant-cli/internal/config"
+	"github.com/knostic/open-ant-cli/internal/models"
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/spf13/cobra"
 )
@@ -29,104 +30,22 @@ var errStdinClosed = errors.New("stdin closed before answer provided")
 // a user setting up their config walks through phases in the same
 // sequence they'll see when they run “openant scan“.
 //
-// “defaultModels“ maps a provider type to the model the wizard
-// pre-fills as the default for THIS phase. Picks reflect the
-// project's recommendation: stronger reasoning models for detection /
-// verification / reachability review, lighter/faster models for
-// generation phases like enhance / report / dynamic_test / app_context.
-// Users can always override at the prompt.
+// The per-phase prefill model is no longer hardcoded here: it is resolved
+// (and validated as a current, non-retired id) from the shared
+// config/models.json registry via internal/models.DefaultModel(provider,
+// phase), and the per-provider "known models" hint list comes from
+// internal/models.KnownModels. See internal/models for the phase→tier
+// mapping that drives the picks (stronger reasoning for detect / verify /
+// reachability, lighter models for the generation phases). Users can always
+// override at the prompt.
 var setupLLMPhases = []phaseSpec{
-	{
-		name:  "app_context",
-		short: "Application-context classification (runs first in scan).",
-		defaultModels: map[string]string{
-			"anthropic": "claude-sonnet-4-20250514",
-			"openai":    "gpt-4o-mini",
-			"google":    "gemini-2.0-flash",
-		},
-	},
-	{
-		name:  "llm_reach",
-		short: "LLM-driven reachability review (opt-in stage).",
-		defaultModels: map[string]string{
-			"anthropic": "claude-opus-4-6",
-			"openai":    "gpt-4o",
-			"google":    "gemini-1.5-pro",
-		},
-	},
-	{
-		name:  "enhance",
-		short: "Context enhancement (single-shot + agentic tool calling).",
-		defaultModels: map[string]string{
-			"anthropic": "claude-sonnet-4-20250514",
-			"openai":    "gpt-4o-mini",
-			"google":    "gemini-2.0-flash",
-		},
-	},
-	{
-		name:  "analyze",
-		short: "Stage 1 vulnerability detection.",
-		defaultModels: map[string]string{
-			"anthropic": "claude-opus-4-6",
-			"openai":    "gpt-4o",
-			"google":    "gemini-1.5-pro",
-		},
-	},
-	{
-		name:  "verify",
-		short: "Stage 2 attacker simulation (tool calling).",
-		defaultModels: map[string]string{
-			"anthropic": "claude-opus-4-6",
-			"openai":    "gpt-4o",
-			"google":    "gemini-1.5-pro",
-		},
-	},
-	{
-		name:  "dynamic_test",
-		short: "Docker exploit-test generation.",
-		defaultModels: map[string]string{
-			"anthropic": "claude-sonnet-4-20250514",
-			"openai":    "gpt-4o-mini",
-			"google":    "gemini-2.0-flash",
-		},
-	},
-	{
-		name:  "report",
-		short: "Disclosure + summary + remediation generation.",
-		defaultModels: map[string]string{
-			"anthropic": "claude-sonnet-4-20250514",
-			"openai":    "gpt-4o-mini",
-			"google":    "gemini-2.0-flash",
-		},
-	},
-}
-
-// knownModels maps a provider type to a list of well-known model IDs
-// shown as a hint to the user when they first configure a provider of
-// that type in the session. NOT exhaustive — providers regularly add
-// new models, and entries here only include IDs known to exist at the
-// provider's main endpoint as of this file's last update. Newer models
-// (gpt-5/o3/gemini-2.5/etc.) may also be available — check the
-// provider's docs and type the exact ID at the prompt.
-var knownModels = map[string][]string{
-	"anthropic": {
-		"claude-opus-4-6",
-		"claude-opus-4-20250514",
-		"claude-sonnet-4-20250514",
-		"claude-haiku-4-5-20251001",
-	},
-	"openai": {
-		"gpt-4o",
-		"gpt-4o-mini",
-		"o1",
-		"o3-mini",
-	},
-	"google": {
-		"gemini-1.5-pro",
-		"gemini-1.5-flash",
-		"gemini-2.0-flash",
-		"gemini-2.0-flash-lite",
-	},
+	{name: "app_context", short: "Application-context classification (runs first in scan)."},
+	{name: "llm_reach", short: "LLM-driven reachability review (opt-in stage)."},
+	{name: "enhance", short: "Context enhancement (single-shot + agentic tool calling)."},
+	{name: "analyze", short: "Stage 1 vulnerability detection."},
+	{name: "verify", short: "Stage 2 attacker simulation (tool calling)."},
+	{name: "dynamic_test", short: "Docker exploit-test generation."},
+	{name: "report", short: "Disclosure + summary + remediation generation."},
 }
 
 // Provider adapter types the wizard offers in the picker. All three
@@ -152,11 +71,6 @@ var apiKeyHints = map[string]string{
 type phaseSpec struct {
 	name  string
 	short string
-	// defaultModels: provider type → suggested model for this phase
-	// when the provider has no base_url override. A custom base_url
-	// short-circuits this map (the user is hitting a proxy, so the
-	// provider's stock model list may not apply).
-	defaultModels map[string]string
 }
 
 var setupCmd = &cobra.Command{
@@ -200,6 +114,16 @@ func runSetupLLM(cmd *cobra.Command, args []string) {
 	cfg, err := config.Load()
 	if err != nil {
 		output.PrintError(err.Error())
+		os.Exit(1)
+	}
+
+	// Load the shared model registry once, up front. Fail loud on a missing
+	// config: the wizard's prefills and hints are derived from it, and a wizard
+	// that silently suggested nothing (or a retired id) is the bug this
+	// replaces. Per-phase lookups below use this snapshot.
+	modelReg, err := models.Load()
+	if err != nil {
+		output.PrintError(fmt.Sprintf("cannot read model registry (config/models.json): %v", err))
 		os.Exit(1)
 	}
 
@@ -257,7 +181,7 @@ func runSetupLLM(cmd *cobra.Command, args []string) {
 		if !shownModelHints[providerName] {
 			shownModelHints[providerName] = true
 			if prov.BaseURL == "" {
-				if opts, ok := knownModels[prov.Type]; ok && len(opts) > 0 {
+				if opts := modelReg.KnownModels(prov.Type); len(opts) > 0 {
 					fmt.Fprintf(os.Stderr, "  Known %s models: %s\n", prov.Type, strings.Join(opts, ", "))
 				}
 			}
@@ -268,7 +192,12 @@ func runSetupLLM(cmd *cobra.Command, args []string) {
 		// the same model IDs).
 		defaultModel := ""
 		if prov.BaseURL == "" {
-			defaultModel = spec.defaultModels[prov.Type]
+			// Resolve the per-phase prefill from the registry. A provider type
+			// with no mapping (or a custom one) simply yields no prefill — the
+			// user types the model — exactly as the old empty-map lookup did.
+			if m, derr := modelReg.DefaultModel(prov.Type, spec.name); derr == nil {
+				defaultModel = m
+			}
 		}
 		model, err := promptRequired(reader, "Model", defaultModel)
 		if err != nil {
@@ -473,14 +402,14 @@ func promptString(reader *bufio.Reader, prompt, defaultVal string) (string, erro
 
 // promptSecret reads a single secret line (e.g. an API key) WITHOUT
 // echoing it to the terminal — closing the shoulder-surf / scrollback
-// leak that the plain ``promptString`` path left open for the API key.
+// leak that the plain “promptString“ path left open for the API key.
 //
 // On an interactive terminal it uses term.ReadPassword (no echo) and
 // prints a trailing newline to stderr (the no-echo read swallows the
 // user's Enter). When stdin is NOT a terminal — piped/scripted input,
 // CI, or the test suite — there is no echo to suppress and ReadPassword
 // would error on the non-TTY fd, so it falls back to the ordinary
-// reader-based ``promptString`` path. This keeps scripted setup and the
+// reader-based “promptString“ path. This keeps scripted setup and the
 // existing tests working while protecting real interactive use.
 //
 // The prompt is written to stderr (like every other wizard prompt) so

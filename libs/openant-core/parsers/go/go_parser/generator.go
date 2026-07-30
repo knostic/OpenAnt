@@ -39,7 +39,6 @@ func (g *Generator) Generate() *Dataset {
 		unit := g.createUnit(funcID, funcInfo)
 		units = append(units, unit)
 
-		// Update statistics
 		byType[unit.UnitType]++
 
 		upstream := unit.Code.DependencyMetadata.TotalUpstream
@@ -63,7 +62,6 @@ func (g *Generator) Generate() *Dataset {
 		return units[i].ID < units[j].ID
 	})
 
-	// Calculate averages
 	avgUpstream := 0.0
 	avgDownstream := 0.0
 	if len(units) > 0 {
@@ -104,7 +102,6 @@ func (g *Generator) createUnit(funcID string, funcInfo FunctionInfo) Unit {
 	// Get all downstream callers (BFS)
 	downstream := g.getDownstream(funcID)
 
-	// Assemble enhanced code
 	primaryCode, filesIncluded := g.assembleEnhancedCode(funcInfo, upstream)
 	originalLength := len(funcInfo.Code)
 	enhancedLength := len(primaryCode)
@@ -233,8 +230,7 @@ func (g *Generator) assembleEnhancedCode(funcInfo FunctionInfo, upstream []strin
 	filesIncluded := []string{funcInfo.FilePath}
 	seenFiles := map[string]bool{funcInfo.FilePath: true}
 
-	// Start with primary code
-	parts = append(parts, funcInfo.Code)
+	parts = append(parts, NeutralizeBoundaries(funcInfo.Code))
 
 	// Add upstream dependencies
 	for _, depID := range upstream {
@@ -249,8 +245,9 @@ func (g *Generator) assembleEnhancedCode(funcInfo FunctionInfo, upstream []strin
 			filesIncluded = append(filesIncluded, depInfo.FilePath)
 		}
 
-		// Add dependency code with file boundary
-		parts = append(parts, FileBoundary+depInfo.Code)
+		// Add dependency code with file boundary. Neutralize first: the code is
+		// scanned-repository source and may forge the separator.
+		parts = append(parts, FileBoundary+NeutralizeBoundaries(depInfo.Code))
 	}
 
 	return strings.Join(parts, ""), filesIncluded

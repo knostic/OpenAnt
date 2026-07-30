@@ -22,7 +22,6 @@ def generate_report(
     """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # Count statuses
     counts = {}
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1
@@ -32,13 +31,15 @@ def generate_report(
     blocked = counts.get("BLOCKED", 0)
     inconclusive = counts.get("INCONCLUSIVE", 0)
     error = counts.get("ERROR", 0)
+    skipped = counts.get("SKIPPED", 0)
     total = len(results)
 
     lines = [
         f"# Dynamic Test Results: {repo_name}",
         "",
         f"**Date:** {now}",
-        f"**Total Findings Tested:** {total}",
+        f"**Total Findings Tested:** {total - skipped}",
+        f"**Skipped (no Docker template for language):** {skipped}",
         f"**Total Cost:** ${total_cost_usd:.4f}",
         "",
         "## Summary",

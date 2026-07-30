@@ -1,6 +1,6 @@
 # OpenAnt Architecture Documentation
 
-OpenAnt is an LLM-powered Static Application Security Testing (SAST) tool that uses a two-stage pipeline for vulnerability analysis with 4-level cost optimization. Supports Python, JavaScript/TypeScript, and Go.
+OpenAnt is an LLM-powered Static Application Security Testing (SAST) tool that uses a two-stage pipeline for vulnerability analysis with 4-level cost optimization. Supports Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, and Zig.
 
 ## Table of Contents
 
@@ -176,7 +176,7 @@ Five categories capture the spectrum of security states:
 | `prompts/verification_prompts.py` | Stage 2 attacker simulation prompt |
 | `prompts/prompt_selector.py` | Routes to vulnerability_analysis prompt |
 
-**Note:** Both Stage 1 and Stage 2 prompts are language-agnostic - the same prompt is used for Python, JavaScript/TypeScript, and Go.
+**Note:** Both Stage 1 and Stage 2 prompts are language-agnostic - the same prompt is used for every supported language.
 
 ### Dynamic Tester
 

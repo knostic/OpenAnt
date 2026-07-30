@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -12,19 +13,45 @@ import (
 // writeHangScript creates an executable script that ignores its arguments,
 // prints nothing on stdout, and sleeps far longer than any test deadline.
 // It stands in for a hung Python parser (infinite loop / I/O deadlock).
-func writeHangScript(t *testing.T) string {
+func writeHangScript(t *testing.T) (string, string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("hang-subprocess test uses a POSIX shell script")
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "hang.sh")
-	// Sleep well past the test's deadline; never produces stdout.
-	script := "#!/bin/sh\nsleep 600\n"
+	sentinel := filepath.Join(dir, "ready")
+	// Touch the sentinel once running, then sleep past the test deadline and
+	// never produce stdout. The sentinel is the readiness barrier: the test
+	// waits for it before signalling, so the SIGINT cannot arrive before the
+	// child (and Invoke's signal.Notify) exists. A fixed sleep was a wall-clock
+	// guess that raced the child under CPU load.
+	script := "#!/bin/sh\ntouch " + shellQuote(sentinel) + "\nsleep 600\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("failed to write hang script: %v", err)
 	}
-	return path
+	return path, sentinel
+}
+
+// shellQuote single-quotes a path for safe embedding in a /bin/sh script.
+func shellQuote(p string) string {
+	return "'" + strings.ReplaceAll(p, "'", "'\\''") + "'"
+}
+
+// waitForSentinel blocks until path exists or the deadline passes, failing the
+// test loudly on timeout. That loud failure is what makes the barrier
+// load-bearing rather than a longer sleep: if the child never signals
+// readiness, the test says so instead of racing.
+func waitForSentinel(t *testing.T, path string, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("child never created readiness sentinel %q within %s", path, within)
 }
 
 // TestInvoke_HangingSubprocessIsBoundedByTimeout asserts that a hung Python
@@ -37,7 +64,7 @@ func writeHangScript(t *testing.T) string {
 // bounded window. Post-fix (exec.CommandContext + a default timeout) the
 // command is killed at the deadline and Invoke returns promptly.
 func TestInvoke_HangingSubprocessIsBoundedByTimeout(t *testing.T) {
-	hang := writeHangScript(t)
+	hang, _ := writeHangScript(t)
 
 	// Shrink the automatic deadline so the test is fast. The default is
 	// far larger; this knob is the wiring the fix must expose.
@@ -132,7 +159,7 @@ func TestInvoke_EmptyStdoutSurfacesErrorCode(t *testing.T) {
 // while sleeping. It models a Python child that fully completed the scan (a
 // real success/vuln envelope, clean exit 0) just before a late/spurious SIGINT
 // reaches the CLI process.
-func writeEnvelopeThenTrapScript(t *testing.T) string {
+func writeEnvelopeThenTrapScript(t *testing.T) (string, string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("late-interrupt test uses POSIX signals and a shell script")
@@ -144,14 +171,20 @@ func writeEnvelopeThenTrapScript(t *testing.T) string {
 	// single long `sleep`) keeps the child alive until the signal arrives yet
 	// lets the trap run promptly — bash defers a trap until the current
 	// foreground command returns, so a lone `sleep 30` would swallow it.
+	sentinel := filepath.Join(dir, "ready")
+	// Touch the sentinel ONLY after the trap is installed and the envelope is
+	// printed — the two preconditions this scenario needs. The test waits on it
+	// before signalling, replacing a 400ms sleep that raced the child under load
+	// (reproduced: 27/30 failures at high CPU).
 	script := "#!/bin/sh\n" +
 		"trap 'exit 0' INT TERM\n" +
 		"printf '%s\\n' '{\"status\":\"success\",\"data\":null,\"errors\":[]}'\n" +
+		"touch " + shellQuote(sentinel) + "\n" +
 		"while true; do sleep 0.1; done\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("failed to write script: %v", err)
 	}
-	return path
+	return path, sentinel
 }
 
 // TestInvoke_LateInterruptDoesNotDiscardEnvelope models the FA2/FA3 precedence
@@ -164,7 +197,7 @@ func TestInvoke_LateInterruptDoesNotDiscardEnvelope(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("late-interrupt test uses POSIX signals")
 	}
-	script := writeEnvelopeThenTrapScript(t)
+	script, sentinel := writeEnvelopeThenTrapScript(t)
 
 	// Backstop deadline so the test never hangs.
 	prev := defaultInvokeTimeout
@@ -181,10 +214,10 @@ func TestInvoke_LateInterruptDoesNotDiscardEnvelope(t *testing.T) {
 		ch <- outcome{r, e}
 	}()
 
-	// Let the child print its envelope (captured by io.Copy) and install the
-	// signal handler, then deliver a late SIGINT to this process. Invoke's
+	// Wait for the child to signal it has installed its trap AND printed the
+	// envelope, then deliver a late SIGINT to this process. Invoke's
 	// signal.Notify intercepts it so the test runner is not killed.
-	time.Sleep(400 * time.Millisecond)
+	waitForSentinel(t, sentinel, 5*time.Second)
 	p, err := os.FindProcess(os.Getpid())
 	if err != nil {
 		t.Fatalf("FindProcess(self): %v", err)
@@ -207,7 +240,7 @@ func TestInvoke_LateInterruptDoesNotDiscardEnvelope(t *testing.T) {
 			got.res.Envelope.Status)
 	}
 	if got.res.ExitCode == 130 {
-		t.Fatalf("late SIGINT masked a fully-parsed envelope as interrupted/130; "+
+		t.Fatalf("late SIGINT masked a fully-parsed envelope as interrupted/130; " +
 			"the real result must win")
 	}
 	if got.res.ExitCode != 0 {

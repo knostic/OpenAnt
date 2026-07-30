@@ -4,7 +4,10 @@ from dataclasses import dataclass, field
 
 
 # Valid test result statuses
-VALID_STATUSES = {"CONFIRMED", "NOT_REPRODUCED", "BLOCKED", "INCONCLUSIVE", "ERROR"}
+# SKIPPED: the finding was never executed — its language has no Docker
+# template. Distinct from ERROR (a test ran and failed) so it does not
+# inflate the error count or trigger retries.
+VALID_STATUSES = {"CONFIRMED", "NOT_REPRODUCED", "BLOCKED", "INCONCLUSIVE", "ERROR", "SKIPPED"}
 
 
 @dataclass
@@ -21,7 +24,7 @@ class TestEvidence:
 class DynamicTestResult:
     """Result from dynamically testing a single finding."""
     finding_id: str
-    status: str         # CONFIRMED, NOT_REPRODUCED, BLOCKED, INCONCLUSIVE, ERROR
+    status: str         # CONFIRMED, NOT_REPRODUCED, BLOCKED, INCONCLUSIVE, ERROR, SKIPPED
     details: str
     evidence: list[TestEvidence] = field(default_factory=list)
     test_code: str = ""       # Generated test script (for reproducibility)

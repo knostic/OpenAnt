@@ -36,12 +36,13 @@ Select the module under test with env CGB_PATH (defaults to the repo file):
 import importlib.util
 import os
 import sys
+from pathlib import Path
 
 # openant-core root must be importable for the module's own imports
 # (`utilities.file_io`, `tree_sitter_zig`).
 _CORE_ROOT = os.environ.get(
     "OPENANT_CORE_ROOT",
-    "/Users/gadievron/Documents/ClaudeNew/OpenAnt/new-bugs-2/OpenAnt/libs/openant-core",
+    str(Path(__file__).resolve().parent.parent.parent.parent),
 )
 if _CORE_ROOT not in sys.path:
     sys.path.insert(0, _CORE_ROOT)

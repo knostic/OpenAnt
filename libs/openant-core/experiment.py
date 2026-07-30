@@ -50,6 +50,10 @@ from utilities.context_corrector import ContextCorrector
 from utilities.json_corrector import JSONCorrector
 from utilities.ground_truth_challenger import GroundTruthChallenger, print_challenge_report
 from utilities.context_reviewer import ContextReviewer
+
+# Moved into core/ so the shipped package no longer depends on this research
+# harness. Re-exported here so existing experiment.py callers keep working.
+from core.analysis_core import analyze_unit, parse_response, _normalize_result
 from utilities.finding_verifier import FindingVerifier
 from utilities.agentic_enhancer.repository_index import RepositoryIndex, load_index_from_file
 
@@ -134,27 +138,30 @@ GROUND_TRUTHS = {
     "github_patches_2": os.path.join(DATASETS_PATH, "github_patches/ground_truth.json"),
 }
 
-# Repository paths for context correction
+# Repository paths for context correction. Local checkouts live under
+# $OPENANT_TEST_REPOS (default ~/code); override to point at your own checkouts.
+_TEST_REPOS = os.environ.get("OPENANT_TEST_REPOS", os.path.expanduser("~/code"))
+_TR = os.path.join(_TEST_REPOS, "test_repos")
 REPO_PATHS = {
-    "dvna": "/Users/nahumkorda/code/dvna",
-    "nodegoat": "/Users/nahumkorda/code/NodeGoat",
-    "juice_shop": "/Users/nahumkorda/code/juice-shop",
-    "flowise": "/Users/nahumkorda/code/test_repos/Flowise",
-    "geospatial": "/Users/nahumkorda/code/test_repos/streamlit-geospatial",
-    "object_browser": "/Users/nahumkorda/code/test_repos/object-browser",
-    "object_browser_vuln25": "/Users/nahumkorda/code/test_repos/object-browser",
-    "uptime_kuma": "/Users/nahumkorda/code/test_repos/uptime-kuma",
-    "code_server": "/Users/nahumkorda/code/test_repos/code-server",
-    "code_server_vuln4": "/Users/nahumkorda/code/test_repos/code-server",
-    "anything_llm": "/Users/nahumkorda/code/test_repos/anything-llm",
-    "flowise_non_codeql": "/Users/nahumkorda/code/test_repos/Flowise",
-    "flowise_stage1_vuln": "/Users/nahumkorda/code/test_repos/Flowise",
-    "langchain": "/Users/nahumkorda/code/test_repos/langchain",
-    "langchain_vuln": "/Users/nahumkorda/code/test_repos/langchain",
-    "flask": "/Users/nahumkorda/code/test_repos/flask",
-    "paperless": "/Users/nahumkorda/code/test_repos/paperless-ngx",
-    "paperless_stage2": "/Users/nahumkorda/code/test_repos/paperless-ngx",
-    "n8n": "/Users/nahumkorda/code/test_repos/n8n",
+    "dvna": os.path.join(_TEST_REPOS, "dvna"),
+    "nodegoat": os.path.join(_TEST_REPOS, "NodeGoat"),
+    "juice_shop": os.path.join(_TEST_REPOS, "juice-shop"),
+    "flowise": os.path.join(_TR, "Flowise"),
+    "geospatial": os.path.join(_TR, "streamlit-geospatial"),
+    "object_browser": os.path.join(_TR, "object-browser"),
+    "object_browser_vuln25": os.path.join(_TR, "object-browser"),
+    "uptime_kuma": os.path.join(_TR, "uptime-kuma"),
+    "code_server": os.path.join(_TR, "code-server"),
+    "code_server_vuln4": os.path.join(_TR, "code-server"),
+    "anything_llm": os.path.join(_TR, "anything-llm"),
+    "flowise_non_codeql": os.path.join(_TR, "Flowise"),
+    "flowise_stage1_vuln": os.path.join(_TR, "Flowise"),
+    "langchain": os.path.join(_TR, "langchain"),
+    "langchain_vuln": os.path.join(_TR, "langchain"),
+    "flask": os.path.join(_TR, "flask"),
+    "paperless": os.path.join(_TR, "paperless-ngx"),
+    "paperless_stage2": os.path.join(_TR, "paperless-ngx"),
+    "n8n": os.path.join(_TR, "n8n"),
 }
 
 # Analyzer output paths for Stage 2 verification (repository index)
@@ -257,199 +264,10 @@ def get_ground_truth_verdict(ground_truth: dict, route_key: str) -> str:
     return "UNKNOWN"
 
 
-def _normalize_result(result: dict) -> dict:
-    """Normalize LLM response fields to canonical names.
-
-    Handles cases where the model returns 'finding' instead of 'verdict',
-    or uses different casing/naming conventions.
-    """
-    # Normalize finding -> verdict
-    if "verdict" not in result and "finding" in result:
-        finding = result["finding"]
-        # Map finding values to verdict values
-        finding_to_verdict = {
-            "vulnerable": "VULNERABLE",
-            "safe": "SAFE",
-            "protected": "PROTECTED",
-            "bypassable": "BYPASSABLE",
-            "inconclusive": "INCONCLUSIVE",
-            "insufficient_context": "INSUFFICIENT_CONTEXT",
-        }
-        result["verdict"] = finding_to_verdict.get(finding.lower(), finding.upper())
-
-    # Ensure verdict is uppercase
-    if "verdict" in result and isinstance(result["verdict"], str):
-        result["verdict"] = result["verdict"].upper()
-
-    # Ensure CWE fields are always present.
-    if "cwe_id" not in result:
-        result["cwe_id"] = 0
-    if "cwe_name" not in result:
-        result["cwe_name"] = None
-
-    return result
 
 
-def parse_response(response: str) -> dict:
-    """Parse JSON response from Claude."""
-    # Try to extract JSON from response
-    response = response.strip()
-
-    # Remove markdown code blocks if present
-    if response.startswith("```json"):
-        response = response[7:]
-    elif response.startswith("```"):
-        response = response[3:]
-
-    if response.endswith("```"):
-        response = response[:-3]
-
-    response = response.strip()
-
-    try:
-        result = json.loads(response)
-        return _normalize_result(result)
-    except json.JSONDecodeError as e:
-        # Try to find JSON object in response
-        start = response.find("{")
-        end = response.rfind("}") + 1
-        if start >= 0 and end > start:
-            try:
-                result = json.loads(response[start:end])
-                return _normalize_result(result)
-            except json.JSONDecodeError:
-                pass
-
-        return {
-            "verdict": "ERROR",
-            "confidence": 0,
-            "vulnerabilities": [],
-            "reasoning": f"Failed to parse response: {str(e)}",
-            "raw_response": response[:500]
-        }
 
 
-def analyze_unit(
-    binding: PhaseBinding,
-    unit: dict,
-    use_multifile: bool = False,
-    json_corrector: JSONCorrector = None,
-    context_reviewer: ContextReviewer = None,
-    app_context: "ApplicationContext" = None
-) -> dict:
-    """
-    Analyze a single code unit.
-
-    Args:
-        binding: Phase binding (provider+model) for the analyze phase.
-        unit: The code unit to analyze
-        use_multifile: If True, use multi-file prompt for enhanced datasets
-        json_corrector: Optional JSON corrector. If not provided, one is created
-                        internally when parsing fails (matching behavior of other
-                        LLM-calling components like finding_verifier and context_enhancer).
-        context_reviewer: Optional context reviewer for proactive context enhancement
-        app_context: Optional ApplicationContext for reducing false positives
-
-    Returns analysis result with timing and token info.
-    """
-    # Extract code from unit
-    code_field = unit.get("code", {})
-    if isinstance(code_field, dict):
-        code = code_field.get("primary_code", "")
-        # Check if dependencies were inlined into this unit's primary_code
-        primary_origin = code_field.get("primary_origin", {})
-        has_deps_inlined = primary_origin.get("deps_inlined", primary_origin.get("enhanced", False))
-        files_included = primary_origin.get("files_included", [])
-    else:
-        code = code_field
-        has_deps_inlined = False
-        files_included = []
-
-    # Extract agent context (security classification from agentic parser)
-    agent_context = unit.get("agent_context", {})
-    security_classification = agent_context.get("security_classification")
-    classification_reasoning = agent_context.get("reasoning")
-
-    # Get route info
-    route = unit.get("route") or {}
-    if route:
-        route_key = f"{route.get('method', 'GET')}:{route.get('path', '/unknown')}"
-        handler = route.get("handler", "main")
-    else:
-        # Non-route unit: use unit ID as identifier
-        route_key = unit.get("id", "unknown")
-        handler = route_key.split(":")[-1] if ":" in route_key else route_key
-
-    # Language defaults to "code" for generic code block formatting
-    language = "code"
-
-    # Proactively enhance context if reviewer is enabled
-    context_enhanced = False
-    additional_files_added = []
-    if context_reviewer and use_multifile:
-        print(f"      Reviewing context for missing files...")
-        enhanced_code, enhanced_files = context_reviewer.enhance_context(
-            code=code,
-            route=route_key,
-            handler=handler,
-            files_included=files_included
-        )
-        if len(enhanced_files) > len(files_included):
-            additional_files_added = [f for f in enhanced_files if f not in files_included]
-            code = enhanced_code
-            files_included = enhanced_files
-            context_enhanced = True
-            print(f"      Added {len(additional_files_added)} files via LLM review")
-
-    # Generate prompt - single unified prompt for all cases
-    prompt = get_analysis_prompt(
-        code=code,
-        language=language,
-        route=route_key,
-        files_included=files_included,
-        security_classification=security_classification,
-        classification_reasoning=classification_reasoning,
-        app_context=app_context
-    )
-
-    # Call the configured analyze-phase model with the threat-model system prompt.
-    start_time = datetime.now()
-    system_prompt = get_stage1_system_prompt(app_context=app_context)
-    response = simple_text(binding, prompt, system=system_prompt)
-    elapsed = (datetime.now() - start_time).total_seconds()
-
-    # Parse response
-    result = parse_response(response)
-
-    # If parsing failed or verdict is missing, try JSON correction
-    if result.get("verdict") in ("ERROR", None):
-        # Create JSONCorrector internally if not provided (same pattern as other components).
-        # JSONCorrector inherits the analyze binding — correction calls
-        # go to the same provider+model as the failing call.
-        if json_corrector is None:
-            json_corrector = JSONCorrector(binding)
-        corrected = json_corrector.attempt_correction(response)
-        corrected = _normalize_result(corrected)
-        if corrected.get("verdict") not in ("ERROR", None):
-            result = corrected
-
-    result["route_key"] = route_key
-    result["elapsed_seconds"] = elapsed
-    result["prompt_length"] = len(prompt)
-    result["response_length"] = len(response)
-    result["code_length"] = len(code)
-    result["files_included"] = files_included
-    result["has_deps_inlined"] = has_deps_inlined
-    result["context_reviewed"] = context_enhanced
-    if additional_files_added:
-        result["files_added_by_review"] = additional_files_added
-
-    # Track security classification from agentic parser
-    if security_classification:
-        result["security_classification"] = security_classification
-        result["classification_reasoning"] = classification_reasoning
-
-    return result
 
 
 def run_experiment(

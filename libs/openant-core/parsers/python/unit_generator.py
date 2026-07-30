@@ -54,6 +54,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from utilities.file_io import read_json, write_json, open_utf8
+from core.file_boundary import neutralize_boundaries
 
 
 # File boundary marker for enhanced code
@@ -217,7 +218,13 @@ class UnitGenerator:
                 parts.append(caller_code)
                 included_code.add(caller_code)
 
-        return FILE_BOUNDARY.join(parts)
+        # Defang boundary-shaped lines in each piece BEFORE joining. Every element
+        # of `parts` is source from the scanned repository, so a file may contain a
+        # line that mimics the separator; once joined, a forged marker and ours are
+        # indistinguishable and the split relabels the attacker's payload as
+        # do-not-analyze context. Neutralizing at composition is the only layer that
+        # can still tell them apart.
+        return FILE_BOUNDARY.join(neutralize_boundaries(p) for p in parts)
 
     def collect_files_included(self, primary_file: str,
                                 upstream_deps: List[Dict],
@@ -274,7 +281,6 @@ class UnitGenerator:
                     'class_name': caller_func.get('class_name'),
                 })
 
-        # Assemble enhanced code
         enhanced_code = self.assemble_enhanced_code(func_data, upstream_deps, downstream_callers)
         files_included = self.collect_files_included(file_path, upstream_deps, downstream_callers)
         has_deps_inlined = len(upstream_deps) > 0 or len(downstream_callers) > 0
@@ -283,7 +289,6 @@ class UnitGenerator:
         direct_calls = self.call_graph.get(func_id, [])
         direct_callers = self.reverse_call_graph.get(func_id, [])
 
-        # Build the unit
         unit = {
             'id': func_id,
             'unit_type': unit_type,

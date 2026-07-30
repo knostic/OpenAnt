@@ -32,10 +32,9 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from utilities.file_io import open_utf8, read_json, write_json
+from utilities.file_io import open_utf8, read_json, read_repo_file, write_json
 from utilities.llm import PhaseBinding, simple_text
 
-# Load environment variables
 load_dotenv()
 
 
@@ -129,12 +128,63 @@ class ApplicationContext:
     # Metadata
     confidence: float = 0.0
     evidence: list[str] = field(default_factory=list)
-    source: str = "llm"  # "llm", "manual", or "merged"
+    source: str = "llm"  # "llm", "manual", "merged", or "threat_model"
+
+    # --- Custom threat-model extension (schema v1, see context/threat_model.py) ---
+    #
+    # These are ALL optional with defaults, deliberately. The two deserialization
+    # sites in the codebase (core/analyzer.py, core/verifier.py) both go through
+    # ``load_context``, which is ``ApplicationContext(**data)``; ``save_context`` is
+    # a plain ``asdict``. Because every new field is defaulted, a pre-existing
+    # ``application_context.json`` written before this extension existed still loads
+    # unchanged, and the richer schema round-trips through save/load with no changes
+    # to either function. That is what lets the built-in "app type" arm and the
+    # custom threat-model arm be the *same* dataclass differing only in which JSON
+    # file is handed to the pipeline — the precondition for comparing them.
+    # Provenance of a repo-supplied threat model, for scan-artifact visibility.
+    # Both are additive/defaulted so save_context(asdict)/load_context(**data)
+    # round-trip unchanged. sha256 is over the raw file bytes; permissive_warnings
+    # is warn_permissive_threat_model's output, which was previously discarded.
+    source_sha256: str | None = None
+    permissive_warnings: list = None
+    threat_model_version: int | None = None
+    classification: str | None = None
+    components: list = field(default_factory=list)
+    attacker_profiles: list = field(default_factory=list)
+    input_sources: dict = field(default_factory=dict)
+    vulnerability_criteria: list = field(default_factory=list)
+    impact_statement: str | None = None
 
     def __post_init__(self):
+        if self.permissive_warnings is None:
+            self.permissive_warnings = []
         """Validate application_type after initialization."""
+        # A hallucinated non-dict ``trust_boundaries`` (e.g. an LLM emitting a list)
+        # would crash suppress_local_only() / format_app_context_for_prompt's ``.items()``
+        # at analyze-phase prompt build, which is not wrapped in try/except.
+        # Coerce to a dict for every construction path (manual, LLM, threat-model).
+        if not isinstance(self.trust_boundaries, dict):
+            self.trust_boundaries = {}
         # Skip validation for manual overrides (they may use custom types intentionally)
         if self.source == "manual":
+            return
+
+        # Skip validation for threat-model contexts. This is an EXPLICIT second
+        # branch rather than a widening of the ``source == "manual"`` bypass above,
+        # and the duplication is intentional. The two bypasses exist for unrelated
+        # reasons and must be able to change independently:
+        #
+        #   * the manual bypass exists because an operator hand-writing OPENANT.md
+        #     is trusted to name any type they like;
+        #   * this bypass exists because a threat model's ``application_type`` is
+        #     *derived*, not chosen — ``threat_model_to_context`` synthesizes
+        #     ``"custom:" + slug(classification)`` from a free-form classification,
+        #     which by construction can never be one of the four enum values.
+        #
+        # Folding them together would mean a future tightening of one silently
+        # loosens the other, and would also make a threat-model context
+        # indistinguishable from an operator override at the ``source`` field.
+        if self.threat_model_version is not None:
             return
 
         if not ApplicationType.is_supported(self.application_type):
@@ -142,6 +192,17 @@ class ApplicationContext:
                 self.application_type,
                 self.evidence
             )
+
+    def has_threat_model(self) -> bool:
+        """Whether this context was built from a custom threat model (schema v1+).
+
+        The single branch predicate at every consumption site: prompt renderers,
+        the scanner's context step, and the A/B arm labelling. ``threat_model_version``
+        is the marker because it is the one field that is meaningless to set by hand
+        on a legacy context and is written by exactly one producer
+        (``context.threat_model.threat_model_to_context``).
+        """
+        return self.threat_model_version is not None
 
     def get_type_info(self) -> dict:
         """Get detailed information about this application type."""
@@ -160,11 +221,16 @@ class ApplicationContext:
         """
         if self.requires_remote_trigger:
             return False
-        # Case-insensitive: trust_boundaries values are LLM-generated and may
-        # deviate from the schema's lowercase 'untrusted' (e.g. 'Untrusted').
+        # A boundary counts as untrusted if its (LLM-generated, free-form) level
+        # CONTAINS the 'untrusted' token — tolerating case AND qualifiers such as
+        # 'untrusted (attacker-controlled)' / 'untrusted - HTTP body'. An exact
+        # '== untrusted' match let a qualified level slip past and re-enable suppression
+        # of the untrusted-input bug class the gate exists to protect.
+        # 'trusted'/'semi-trusted' do not contain the substring 'untrusted'.
+        boundaries = self.trust_boundaries if isinstance(self.trust_boundaries, dict) else {}
         return not any(
-            str(level).lower() == "untrusted"
-            for level in (self.trust_boundaries or {}).values()
+            "untrusted" in str(level).lower()
+            for level in boundaries.values()
         )
 
 
@@ -241,16 +307,19 @@ def gather_context_sources(repo_path: Path) -> dict[str, str]:
     # Read priority files
     for filename in CONTEXT_FILES:
         filepath = repo_path / filename
-        if filepath.exists():
-            try:
-                with open_utf8(filepath, errors="ignore") as _f:
-                    content = _f.read()
-                # Limit size to avoid token overflow
-                if len(content) > 10000:
-                    content = content[:10000] + "\n\n[... truncated ...]"
-                sources[filename] = content
-            except Exception as e:
-                print(f"Warning: Could not read {filename}: {e}", file=sys.stderr)
+        try:
+            # Guarded, and bounded at the syscall rather than after the fact: the
+            # old form read the whole file and *then* truncated to 10 000 chars, so
+            # a README symlinked to /dev/zero or a multi-GB file was fully resident
+            # before the cap ever applied.
+            content = read_repo_file(filepath, max_bytes=10_000)
+            if content is None:
+                continue
+            if len(content) >= 10_000:
+                content = content + "\n\n[... truncated ...]"
+            sources[filename] = content
+        except Exception as e:  # noqa: BLE001 - context gathering is best-effort
+            print(f"Warning: Could not read {filename}: {e}", file=sys.stderr)
 
     # Get directory structure (top 2 levels)
     dir_structure = get_directory_structure(repo_path, max_depth=2)
@@ -426,24 +495,28 @@ def check_manual_override(repo_path: Path) -> ApplicationContext | None:
     """
     for filename in MANUAL_OVERRIDE_FILES:
         filepath = repo_path / filename
-        if not filepath.exists():
-            continue
 
         try:
+            # Guarded read: this path is authored by the scanned repository, so it
+            # may be a symlink out of the tree, a FIFO that blocks forever, or
+            # unbounded. read_repo_file lstats before opening and returns None for
+            # genuine absence. Previously this was `exists()` + bare `open()`, which
+            # hung the scanner on a FIFO named OPENANT.md.
+            content = read_repo_file(filepath)
+            if content is None:
+                continue
+
             if filename.endswith('.json'):
-                # Direct JSON format
-                data = read_json(filepath)
+                data = json.loads(content)
                 return _application_context_from_override(data, filename)
 
-            # .md files need raw text so regex can extract the embedded JSON block.
-            with open_utf8(filepath) as _f:
-                content = _f.read()
-
             if filename.endswith('.md'):
-                # Markdown format - check for JSON code block
-                json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
+                # Markdown format - check for JSON code block. No `\s*` around the
+                # lazy group: that form backtracks cubically on an unclosed fence,
+                # which is an unbounded hang on eight bytes of repo-authored input.
+                json_match = re.search(r'```json(.*?)```', content, re.DOTALL)
                 if json_match:
-                    data = json.loads(json_match.group(1))
+                    data = json.loads(json_match.group(1).strip())
                     return _application_context_from_override(data, filename)
 
                 # Check for YAML frontmatter
@@ -462,7 +535,6 @@ def check_manual_override(repo_path: Path) -> ApplicationContext | None:
     return None
 
 
-# Build the type descriptions for the prompt
 def _build_type_descriptions() -> str:
     """Build formatted type descriptions for the prompt."""
     lines = []
@@ -606,9 +678,15 @@ def generate_application_context(
     )
 
     # Extract JSON from response
-    json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
+    # No `\s*` around the lazy group: that form is ambiguous and backtracks
+    # cubically on an unclosed fence. Third copy of this pattern to be fixed — the
+    # other two were context/threat_model.py and check_manual_override above. This
+    # one parses *model* output rather than repo files, so it is bounded by
+    # max_tokens and was a multi-minute hang rather than an unbounded one, but the
+    # input is still attacker-influenceable via the accepted prompt-injection gap.
+    json_match = re.search(r'```json(.*?)```', response_text, re.DOTALL)
     if json_match:
-        json_str = json_match.group(1)
+        json_str = json_match.group(1).strip()
     else:
         # Try to parse the whole response as JSON
         json_str = response_text.strip()
