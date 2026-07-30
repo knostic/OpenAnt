@@ -13,3 +13,4 @@ docs/
 
 # Local-only scratch and generated artifacts (not part of the codebase)
 *knowledge-graph.*
+/bughunt-repros/
