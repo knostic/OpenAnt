@@ -251,6 +251,32 @@ def test_run_patch_requires_llm_provider(tmp_path, monkeypatch):
         run_patch(po_path, "F-001", str(tmp_path), repo_root=None)
 
 
+def test_run_patch_never_leaves_stale_trust_report_after_failed_rerun(tmp_path, monkeypatch):
+    """F-39: reusing an output directory after a failed run must never leave
+    a stale trust report from an earlier successful run sitting next to a
+    freshly-written vulnerability.md."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    po_path = _write_pipeline_output(tmp_path, [FIXTURE_FINDING_ELIGIBLE])
+
+    first = run_patch(po_path, "F-001", str(tmp_path), repo_root=None)
+    assert os.path.exists(first.trust_report_path)
+
+    import utilities.autopatcher.pipeline as _pipeline_module
+
+    def _boom(**kwargs):
+        raise RuntimeError("simulated pipeline failure")
+
+    monkeypatch.setattr(_pipeline_module, "run", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated pipeline failure"):
+        run_patch(po_path, "F-001", str(tmp_path), repo_root=None)
+
+    assert not os.path.exists(first.trust_report_path), (
+        "a failed rerun must not leave the previous run's trust report behind"
+    )
+    assert os.path.exists(first.vulnerability_path)
+
+
 def test_run_patch_rejects_ineligible_finding(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "mock")
     po_path = _write_pipeline_output(tmp_path, [FIXTURE_FINDING_REJECTED])

@@ -164,6 +164,16 @@ def run_patch(
     patch_dir = os.path.join(output_dir, "patch")
     os.makedirs(patch_dir, exist_ok=True)
 
+    # Remove any trust report left behind by a previous failed run for this
+    # finding_id *before* doing any work that can fail. The trust report is
+    # only written on success, at the very end of this function -- if a stale
+    # one from an earlier run were left in place, a failed run could look
+    # like it succeeded with a report that doesn't match the fresh
+    # vulnerability.md written below.
+    trust_report_path = os.path.join(patch_dir, f"{finding_id}-trust-report.md")
+    if os.path.exists(trust_report_path):
+        os.remove(trust_report_path)
+
     vulnerability_text = render_vulnerability_markdown(finding)
     vulnerability_path = os.path.join(patch_dir, f"{finding_id}-vulnerability.md")
     with open(vulnerability_path, "w", encoding="utf-8") as f:
@@ -210,7 +220,6 @@ def run_patch(
         None,
     )
 
-    trust_report_path = os.path.join(patch_dir, f"{finding_id}-trust-report.md")
     meta = _rm.RunMetadata(
         timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S UTC"),
         input_source=vulnerability_path,
