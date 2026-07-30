@@ -149,7 +149,7 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	// Read all stdout
 	var stdoutBuf strings.Builder
 	if _, err := io.Copy(&stdoutBuf, stdout); err != nil {
-		_ = cmd.Wait() // reap the child even on read error so it isn't leaked (R2C-2)
+		_ = cmd.Wait() // reap the child even on read error so it isn't leaked
 		return nil, fmt.Errorf("failed to read stdout: %w", err)
 	}
 

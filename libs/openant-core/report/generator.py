@@ -203,7 +203,7 @@ def generate_summary_report(
     )
 
     text = "\n".join(b.text for b in result.content if isinstance(b, TextBlock))
-    # Prepend the R5 provenance banner deterministically (see helper docstring).
+    # Prepend the provenance banner deterministically (see helper docstring).
     text = _context_provenance_header(pipeline_data) + text
     return text, _extract_usage(
         result.input_tokens,
@@ -362,7 +362,7 @@ def generate_all(
         disclosure, _usage = generate_disclosure(finding, product_name, report_binding)
 
         # short_name passes validation on presence only, so it may be null/empty;
-        # fall back to id so a null short_name can't crash disclosure generation (R2B-2).
+        # fall back to id so a null short_name can't crash disclosure generation.
         safe_name = (finding.get("short_name") or finding.get("id") or "finding").replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
         with open_utf8(disclosures_dir / filename, "w") as f:

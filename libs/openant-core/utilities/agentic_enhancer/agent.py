@@ -287,7 +287,7 @@ class ContextAgent:
                     print("  Agent ended without calling finish tool")
 
                 # Record spend even on this degenerate exit, so the tracker and the
-                # per-unit metadata don't undercount tokens/cost (R2A-1).
+                # per-unit metadata don't undercount tokens/cost.
                 call_record = self.tracker.record_call(
                     model=self.binding.model,
                     input_tokens=total_input_tokens,
@@ -391,7 +391,7 @@ class ContextAgent:
                 # No tool calls but model didn't end — treat as incomplete
                 if self.verbose:
                     print("  No tool calls in response, treating as incomplete")
-                # Record spend even on this degenerate exit (R2A-1).
+                # Record spend even on this degenerate exit.
                 call_record = self.tracker.record_call(
                     model=self.binding.model,
                     input_tokens=total_input_tokens,

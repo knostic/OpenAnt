@@ -43,7 +43,7 @@ def _normalize_result(result: dict) -> dict:
             # A non-string finding (list/dict/null/number) is a malformed model reply,
             # not a verdict — map it to ERROR so the error / manual-review accounting
             # counts it, instead of a garbage verdict (e.g. "['VULNERABLE']" from
-            # str(finding).upper()) that silently escapes that accounting (R2D-5).
+            # str(finding).upper()) that silently escapes that accounting.
             result["verdict"] = "ERROR"
         else:
             finding_to_verdict = {

@@ -357,10 +357,10 @@ def generate_html_report(
 
     # Prepare chart data
     verdict_order = list(FINDING_VERDICT_ORDER)
-    # Surface the errored/unanalyzed sentinel in the charts too (GO-3 silent-FN) —
+    # Surface the errored/unanalyzed sentinel in the charts too (a silent false-negative) —
     # but ONLY the known ERROR_VERDICT literal, never arbitrary model-supplied verdict
     # strings: those are attacker-controlled and would inject unescaped into the
-    # json.dumps chart labels (re-opening GO-1). Unknown verdicts still appear in the
+    # json.dumps chart labels (re-opening the verdict-badge injection). Unknown verdicts still appear in the
     # findings table with an html.escape'd badge.
     if ERROR_VERDICT in verdict_counts or ERROR_VERDICT in file_verdict_counts:
         verdict_order.append(ERROR_VERDICT)

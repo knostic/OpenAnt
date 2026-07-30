@@ -141,7 +141,7 @@ class ApplicationContext:
     # to either function. That is what lets the built-in "app type" arm and the
     # custom threat-model arm be the *same* dataclass differing only in which JSON
     # file is handed to the pipeline — the precondition for comparing them.
-    # Provenance of a repo-supplied threat model, for R5 artifact visibility.
+    # Provenance of a repo-supplied threat model, for scan-artifact visibility.
     # Both are additive/defaulted so save_context(asdict)/load_context(**data)
     # round-trip unchanged. sha256 is over the raw file bytes; permissive_warnings
     # is warn_permissive_threat_model's output, which was previously discarded.
@@ -161,7 +161,7 @@ class ApplicationContext:
         """Validate application_type after initialization."""
         # A hallucinated non-dict ``trust_boundaries`` (e.g. an LLM emitting a list)
         # would crash suppress_local_only() / format_app_context_for_prompt's ``.items()``
-        # at analyze-phase prompt build, which is not wrapped in try/except (R4B-3).
+        # at analyze-phase prompt build, which is not wrapped in try/except.
         # Coerce to a dict for every construction path (manual, LLM, threat-model).
         if not isinstance(self.trust_boundaries, dict):
             self.trust_boundaries = {}
@@ -225,7 +225,7 @@ class ApplicationContext:
         # CONTAINS the 'untrusted' token — tolerating case AND qualifiers such as
         # 'untrusted (attacker-controlled)' / 'untrusted - HTTP body'. An exact
         # '== untrusted' match let a qualified level slip past and re-enable suppression
-        # of the untrusted-input bug class the gate exists to protect (R4B-1).
+        # of the untrusted-input bug class the gate exists to protect.
         # 'trusted'/'semi-trusted' do not contain the substring 'untrusted'.
         boundaries = self.trust_boundaries if isinstance(self.trust_boundaries, dict) else {}
         return not any(

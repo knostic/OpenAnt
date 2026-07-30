@@ -204,7 +204,7 @@ def parse_threat_model_md(text: str) -> dict:
     """
     # Normalize line endings first: the closing-fence anchor ``^\1[ \t]*$`` (MULTILINE)
     # matches ``$`` before ``\n`` but not before ``\r``, so a CRLF / autocrlf checkout of
-    # a valid threat model would otherwise never close the fence and abort the scan (R3A-1).
+    # a valid threat model would otherwise never close the fence and abort the scan.
     visible = _HTML_COMMENT_RE.sub("", (text or "").replace("\r\n", "\n").replace("\r", "\n"))
     blocks = [m.group(2) for m in _JSON_BLOCK_RE.finditer(visible)]
     if not blocks:
@@ -631,7 +631,7 @@ def _fenced_json(data: dict) -> str:
     code fence) cannot close the block early. This keeps render → parse round-trip
     safe; ``_JSON_BLOCK_RE`` matches ``` `{3,} ``` fences and back-references the
     opening length. Without this, a backtick in any string field made the written
-    file un-parseable (TM-2).
+    file un-parseable.
     """
     body = json.dumps(data, indent=2, ensure_ascii=False)
     longest = max((len(m) for m in re.findall(r"`+", body)), default=0)
@@ -857,7 +857,7 @@ def load_threat_model(repo_path: Path | str) -> ApplicationContext | None:
              f"{MAX_THREAT_MODEL_BYTES}); refusing to load"], path)
 
     # Read raw bytes for the provenance hash, then decode for parsing. The sha is
-    # tamper-evidence recorded in the scan artifact (R5): a scan can be tied to the
+    # tamper-evidence recorded in the scan artifact: a scan can be tied to the
     # exact threat-model file that shaped it.
     raw = path.read_bytes()
     source_sha256 = hashlib.sha256(raw).hexdigest()

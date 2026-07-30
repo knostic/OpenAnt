@@ -78,7 +78,7 @@ class ParseResult:
     def to_dict(self) -> dict:
         d = asdict(self)
         # ``degraded`` is a @property, which asdict() omits — include it explicitly so
-        # the parse envelope carries it like ScanResult.to_dict does (R2B-1).
+        # the parse envelope carries it like ScanResult.to_dict does.
         d["degraded"] = self.degraded
         return d
 
@@ -194,7 +194,7 @@ class ScanResult:
     # Recorded because a scan run under the WRONG security model looks
     # identical to a correct one unless the source is stated.
     context_source: str = "none"
-    # R5 provenance for a repo-supplied threat model (context_source ==
+    # Provenance for a repo-supplied threat model (context_source ==
     # "threat_model"). sha256 is over the raw file bytes so a scan can be tied
     # to the exact file that shaped it; None (never the empty-string hash) when
     # no threat model was loaded. permissive_warnings carries the previously
