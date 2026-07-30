@@ -921,6 +921,9 @@ def _compute_trust_signals(
     elif testing_rating == "Not Applicable":
         tst_val = "Not Verified"
         tst_notes = "Test discovery is not supported for this language yet"
+    elif testing_rating == "Not Verified":
+        tst_val = "Not Verified"
+        tst_notes = "No repository root was provided"
     else:
         tst_val = "No Tests Found"
         tst_notes = "No test files cover this module"
@@ -1679,27 +1682,32 @@ def _build_report(result: PipelineResult) -> str:
     findings_early = extract_findings(adv_text_early) if adv_text_early else []
     suggestions = suggest_tests(findings_early, behavior=behavior) if (findings_early or behavior) else []
 
-    ts_root = result.repo_root if result.repo_root else Path.cwd()
+    # F-01: no Path.cwd() fallback — when no repository root was provided,
+    # this repository-dependent signal is skipped entirely rather than
+    # analyzing whatever directory the process happens to run in.
+    ts_root = result.repo_root
     target_file_display = "unknown"
     target_path_obj = None
     m = re.search(r"^\+\+\+ b/(.+)$", result.patch or "", re.MULTILINE)
     if m:
         target_rel = m.group(1).strip()
         target_file_display = target_rel
-        target_path_obj = ts_root / target_rel
-    all_tests = discover_tests(ts_root)
-    total_tests_found = len(all_tests)
+        if ts_root is not None:
+            target_path_obj = ts_root / target_rel
     _report_language = result.detected_language or "python"
     matches: list = []
     rating = "None"
     delta = -0.15
     metadata: dict = {}
-    if target_path_obj is not None:
-        matches = tests_for_file(ts_root, target_path_obj)
+    total_tests_found = 0
+    if ts_root is not None:
+        all_tests = discover_tests(ts_root)
+        total_tests_found = len(all_tests)
+        if target_path_obj is not None:
+            matches = tests_for_file(ts_root, target_path_obj)
         rating, delta, metadata = score_test_support(matches, language=_report_language)
     else:
-        matches = []
-        rating, delta, metadata = score_test_support(matches, language=_report_language)
+        rating = "Not Verified"
 
     # -----------------------
     # Validation Actions (definition hoisted here)
@@ -2021,7 +2029,18 @@ def _build_report(result: PipelineResult) -> str:
     report += known_findings_block
 
     # §9b: Repository Context (Repository Grounding)
-    report += _render_repository_context_section(result.grounding)
+    if result.repo_root is None:
+        # F-01: grounding was never attempted here (no repo to search) --
+        # distinct from _render_repository_context_section(None)'s
+        # zero-selection sentence, which describes a search that ran and
+        # selected nothing. Reusing that sentence would read as if a
+        # repository search happened and came up empty.
+        report += (
+            "---\n\n## Repository Context\n\n"
+            "*Not evaluated — no repository root was provided.*\n\n"
+        )
+    else:
+        report += _render_repository_context_section(result.grounding)
 
     # §10: Impact Surface
     if result.impact:
@@ -2043,6 +2062,11 @@ def _build_report(result: PipelineResult) -> str:
             report += "\n"
         except Exception:
             pass
+    elif result.repo_root is None:
+        # F-01: state the gap explicitly rather than silently omitting the
+        # section — a reader must not mistake "not shown" for "clean".
+        report += "---\n\n## Impact Surface\n\n"
+        report += "*Not evaluated — no repository root was provided.*\n\n"
 
     # §11: Appendices — diagnostics, supplementary reviewer notes, and legacy
     # sections, consolidated. Patch Hygiene and Patch Applicability (plus
@@ -2084,24 +2108,32 @@ def _build_report(result: PipelineResult) -> str:
             pass
 
     # Test Support
-    test_support_md = (
-        "\n### Test Support\n\n"
-        "*This section reports existing repository tests, not behavioral "
-        "validation of the proposed patch.*\n\n"
-        f"- Target file: {target_file_display}\n"
-        f"- Total test files found: {total_tests_found}\n"
-        f"- Rating: {rating}\n"
-        "\n#### Matching tests\n"
-    )
-    if matches:
-        has_direct = any(m.get("proximity") in ("same-file", "same-module") for m in matches)
-        if not has_direct:
-            test_support_md += "- No tests directly matched the patched file/module.\n"
-        for m in matches:
-            prox_label = m['proximity'] if m['proximity'] != 'repo' else 'repo (context)'
-            test_support_md += f"- {m['path']} — {prox_label} — {m['reason']}\n"
+    if result.repo_root is None:
+        # F-01: state the gap explicitly rather than silently omitting the
+        # section — a reader must not mistake "not shown" for "clean".
+        test_support_md = (
+            "\n### Test Support\n\n"
+            "*Not evaluated — no repository root was provided.*\n\n"
+        )
     else:
-        test_support_md += "- No matching tests found.\n"
+        test_support_md = (
+            "\n### Test Support\n\n"
+            "*This section reports existing repository tests, not behavioral "
+            "validation of the proposed patch.*\n\n"
+            f"- Target file: {target_file_display}\n"
+            f"- Total test files found: {total_tests_found}\n"
+            f"- Rating: {rating}\n"
+            "\n#### Matching tests\n"
+        )
+        if matches:
+            has_direct = any(m.get("proximity") in ("same-file", "same-module") for m in matches)
+            if not has_direct:
+                test_support_md += "- No tests directly matched the patched file/module.\n"
+            for m in matches:
+                prox_label = m['proximity'] if m['proximity'] != 'repo' else 'repo (context)'
+                test_support_md += f"- {m['path']} — {prox_label} — {m['reason']}\n"
+        else:
+            test_support_md += "- No matching tests found.\n"
     report += test_support_md
 
     # Behavior Summary
@@ -2608,36 +2640,42 @@ def run(vulnerability_text: str, api_key: str = "", repo_root: str | Path | None
 
         # Prepend adjustment summary to the original scorer output for context
         score_text = adjustment_text + score_text
-    # Run Impact Surface analysis (lightweight, deterministic)
+    # Run Impact Surface analysis (lightweight, deterministic).
+    # Repository-dependent: skipped entirely when no repo_root is known
+    # (F-01) instead of substituting Path.cwd(). impact_dict stays None,
+    # which _resolve_impact_level() already reads as "unavailable" and the
+    # existing trust policy (F-23/F-24) already renders as Not Verified
+    # rather than a false-positive "low risk".
     impact_dict = None
     behavior = None
     _detected_language = "python"
-    try:
-        # Create a minimal TargetRepoContext here; prefer explicit repo_root
-        # passed into pipeline.run(), otherwise default to cwd for
-        # backward-compatibility.
-        repo_root_for_context = Path(repo_root) if repo_root else Path.cwd()
-        repo_context = TargetRepoContext(repo_root_for_context)
-        _detected_language = detect_language(repo_root_for_context)
-
-        analyzer = LightweightImpactAnalyzer()
-        impact = analyzer.analyze(
-            patch,
-            adversarial_findings=challenger,
-            repo_context=repo_context,
-            repo_language=_detected_language,
-        )
-        # attach deterministic annotations to challenger for reporting
-        enhance_findings_with_impact(challenger, impact.to_dict())
-        impact_dict = impact.to_dict()
-
-        # Behavior summary (minimal deterministic analyzer)
+    if repo_root:
         try:
-            behavior = BehaviorAnalyzer().analyze(patch, repo_context=repo_context)
+            repo_root_for_context = Path(repo_root)
+            repo_context = TargetRepoContext(repo_root_for_context)
+            _detected_language = detect_language(repo_root_for_context)
+
+            analyzer = LightweightImpactAnalyzer()
+            impact = analyzer.analyze(
+                patch,
+                adversarial_findings=challenger,
+                repo_context=repo_context,
+                repo_language=_detected_language,
+            )
+            # attach deterministic annotations to challenger for reporting
+            enhance_findings_with_impact(challenger, impact.to_dict())
+            impact_dict = impact.to_dict()
         except Exception:
-            behavior = None
+            pass
+
+    # Behavior summary (minimal deterministic analyzer) -- operates purely
+    # on the diff text (see behavior_summary.py: it never reads repository
+    # files despite accepting a repo_context parameter), so unlike Impact
+    # Surface above it is not repository-dependent and always runs.
+    try:
+        behavior = BehaviorAnalyzer().analyze(patch)
     except Exception:
-        pass
+        behavior = None
 
     result = PipelineResult(
         vulnerability_text=vulnerability_text,

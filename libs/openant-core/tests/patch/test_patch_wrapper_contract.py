@@ -146,6 +146,24 @@ def test_run_patch_happy_path(tmp_path, monkeypatch):
     assert result.trust_report_path == str(tmp_path / "patch" / "F-001-trust-report.md")
 
 
+def test_run_patch_without_repo_root_never_scans_process_cwd(tmp_path, monkeypatch):
+    """F-01: this module's own docstring calls these tests "hermetic ...
+    no real repo" -- that was only true of the *inputs*. Before the fix,
+    repo_root=None made the engine fall back to Path.cwd() and scan
+    whatever directory pytest happened to be invoked from (this repo's own
+    hundreds of test files), embedding real absolute paths into the
+    on-disk Trust Report artifact. Assert that no longer happens."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    po_path = _write_pipeline_output(tmp_path, [FIXTURE_FINDING_ELIGIBLE])
+
+    result = run_patch(po_path, "F-001", str(tmp_path), repo_root=None)
+
+    report_text = open(result.trust_report_path, encoding="utf-8").read()
+    assert "Not evaluated — no repository root was provided." in report_text
+    openant_core_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    assert openant_core_root not in report_text
+
+
 def test_run_patch_never_leaks_suggested_fix_into_artifact(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "mock")
     po_path = _write_pipeline_output(tmp_path, [FIXTURE_FINDING_ELIGIBLE])
