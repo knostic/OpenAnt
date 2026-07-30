@@ -129,6 +129,60 @@ def test_render_vulnerability_markdown_never_includes_suggested_fix_or_rejection
 
 
 # ---------------------------------------------------------------------------
+# F-31 / F-35: impact/steps_to_reproduce may arrive as a string instead of a
+# list, and description/vulnerable_code may arrive as a non-string value.
+# ---------------------------------------------------------------------------
+
+def test_render_vulnerability_markdown_accepts_string_impact_and_steps():
+    """F-31: a string impact/steps_to_reproduce must render as one bullet,
+    not one bullet per character."""
+    finding = {
+        **FIXTURE_FINDING_ELIGIBLE,
+        "impact": "Full database read access",
+        "steps_to_reproduce": "Send a crafted id",
+    }
+    rendered = render_vulnerability_markdown(finding)
+    assert "- Full database read access" in rendered
+    assert "1. Send a crafted id" in rendered
+    # the character-by-character bullet regression would produce this
+    assert "- F\n- u\n- l\n- l" not in rendered
+
+
+def test_render_vulnerability_markdown_accepts_list_impact_and_steps():
+    """Existing list-shaped inputs keep rendering as before."""
+    finding = {
+        **FIXTURE_FINDING_ELIGIBLE,
+        "impact": ["Full database read access", "Data exfiltration"],
+        "steps_to_reproduce": ["Send a crafted id", "Read the response"],
+    }
+    rendered = render_vulnerability_markdown(finding)
+    assert "- Full database read access" in rendered
+    assert "- Data exfiltration" in rendered
+    assert "1. Send a crafted id" in rendered
+    assert "2. Read the response" in rendered
+
+
+def test_render_vulnerability_markdown_coerces_non_string_description_and_code():
+    """F-35: a non-string description/vulnerable_code must not raise."""
+    finding = {
+        **FIXTURE_FINDING_ELIGIBLE,
+        "description": {"summary": "User input reaches a raw SQL query"},
+        "vulnerable_code": ["cursor.execute(query)", "conn.commit()"],
+    }
+    rendered = render_vulnerability_markdown(finding)  # must not raise
+    assert "User input reaches a raw SQL query" in rendered
+    assert "cursor.execute(query)" in rendered
+
+
+def test_render_vulnerability_markdown_empty_impact_and_steps_omit_sections():
+    """No behavior regression: absent/empty fields still omit their sections."""
+    finding = {**FIXTURE_FINDING_ELIGIBLE, "impact": [], "steps_to_reproduce": []}
+    rendered = render_vulnerability_markdown(finding)
+    assert "## Impact" not in rendered
+    assert "## Attack scenario" not in rendered
+
+
+# ---------------------------------------------------------------------------
 # run_patch end-to-end (mock mode)
 # ---------------------------------------------------------------------------
 

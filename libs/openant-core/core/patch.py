@@ -16,6 +16,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core.reporter import _coerce_to_str
 from core.verdict_taxonomy import PATCH_ELIGIBLE
 from utilities.file_io import read_json, normalize_results
 
@@ -79,21 +80,28 @@ def render_vulnerability_markdown(finding: dict) -> str:
 
     description = finding.get("description")
     if description:
-        lines += ["", description]
+        lines += ["", _coerce_to_str(description)]
 
     vulnerable_code = finding.get("vulnerable_code")
     if vulnerable_code:
-        lines += ["", "## Vulnerable code", "", "```", vulnerable_code, "```"]
+        lines += ["", "## Vulnerable code", "", "```", _coerce_to_str(vulnerable_code), "```"]
 
+    # impact/steps_to_reproduce are documented as lists but some models emit a
+    # single string; iterating a string directly yields one bullet per
+    # character, so a lone string is normalized to a single-item list first.
     impact = finding.get("impact") or []
+    if isinstance(impact, str):
+        impact = [impact]
     if impact:
         lines += ["", "## Impact", ""]
-        lines += [f"- {item}" for item in impact]
+        lines += [f"- {_coerce_to_str(item)}" for item in impact]
 
     steps = finding.get("steps_to_reproduce") or []
+    if isinstance(steps, str):
+        steps = [steps]
     if steps:
         lines += ["", "## Attack scenario", ""]
-        lines += [f"{i + 1}. {step}" for i, step in enumerate(steps)]
+        lines += [f"{i + 1}. {_coerce_to_str(step)}" for i, step in enumerate(steps)]
 
     return "\n".join(lines) + "\n"
 
