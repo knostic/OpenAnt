@@ -7,7 +7,13 @@
     "dist",
     "build",
     ".git",
-    "vendor"
+    "vendor",
+    ".build",
+    ".swiftpm",
+    "DerivedData",
+    "Pods",
+    "Carthage",
+    "xcuserdata"
   ],
   "extensions": {
     ".py": "python",
@@ -29,7 +35,8 @@
     ".rb": "ruby",
     ".rake": "ruby",
     ".php": "php",
-    ".zig": "zig"
+    ".zig": "zig",
+    ".swift": "swift"
   },
   "languages": {
     "python": {
@@ -90,6 +97,13 @@
       "extensions": [".zig"],
       "parser": {"mode": "subprocess", "script": "parsers/zig/test_pipeline.py"},
       "fence": "zig",
+      "docker_template": null,
+      "enabled": true
+    },
+    "swift": {
+      "extensions": [".swift"],
+      "parser": {"mode": "subprocess", "script": "parsers/swift/test_pipeline.py"},
+      "fence": "swift",
       "docker_template": null,
       "enabled": true
     }

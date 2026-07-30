@@ -2,7 +2,7 @@
 
 **LLM-Powered Static Application Security Testing**
 
-OpenAnt uses Claude to analyze code for security vulnerabilities through a two-stage pipeline: detection followed by verification. Features 4-level cost optimization with CodeQL integration. Supports Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, and Zig.
+OpenAnt uses Claude to analyze code for security vulnerabilities through a two-stage pipeline: detection followed by verification. Features 4-level cost optimization with CodeQL integration. Supports Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Zig, and Swift.
 
 ---
 
