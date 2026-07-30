@@ -218,7 +218,7 @@ openant project switch <org/repo> # switch active project
 
 ## Auto Patcher
 
-Auto Patcher exists to answer one question: **does this AI-generated patch deserve to be trusted?**
+Auto Patcher exists to answer one question: **does this AI-generated patch deserve to be trusted?** Generating a candidate patch is only the first step. Auto Patcher focuses on producing the evidence humans need to decide whether that patch should be trusted and deployed.
 
 Given a specific finding from an OpenAnt scan, it generates a candidate patch and then subjects that patch to independent, adversarial scrutiny, producing a Trust Report that states whether the patch is fit to deploy — backed by the evidence behind that call. It does not autofix your repository: the patch and its Trust Report are written to disk for a human to review, and the target repository is never modified.
 
@@ -254,7 +254,15 @@ The adversarial pass is a distinct reasoning step whose only job is to argue the
 
 ### Quick start
 
-Auto Patcher runs against a finding already produced by an OpenAnt scan (`openant scan` / `openant build-output`) that carries an exploitable verdict:
+Auto Patcher runs against a finding already produced by an OpenAnt scan (`openant scan` / `openant build-output`) whose verdict is patch-eligible — `confirmed`, `agreed`, `vulnerable`, or `bypassable`.
+
+To find an eligible finding's id, check the `findings` array in your project's `pipeline_output.json` (written by `openant build-output`):
+
+```bash
+jq -r '.findings[] | "\(.id)\t\(.stage2_verdict // .stage1_verdict)"' pipeline_output.json
+```
+
+Pick an id whose verdict is one of the four above, then pass it to `patch` (`VULN-001` below is a placeholder — use the id you found):
 
 ```bash
 LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... openant patch --finding-id VULN-001
@@ -285,7 +293,7 @@ Things on the list, in no particular order:
 - **More provider adapters.** Ollama (local models), vLLM, Cohere, Mistral, Groq, Amazon Bedrock, Azure OpenAI — each is a small Python adapter recipe (plus a few Go wizard/probe touch-points if you want it offered by `openant setup llm`) per the contributor guide. Lower the barrier to local / on-prem inference.
 - **Subscription-based auth.** ChatGPT / Codex, Claude Pro / Max, and Gemini Advanced subscriptions don't currently grant API quota — users have to maintain a separate API-tier key per provider. OAuth-based adapters that ride the consumer subscription would close that gap.
 - **Cross-provider tool-call quirks.** All three shipped adapters support tool calling, but the long tail (parallel tool calls, strict-mode schema enforcement, retry semantics on partial JSON) behaves differently per provider. Real-world scans surface these — PRs welcome.
-- **More languages.** The supported-languages list above is current coverage. Rust, Java, C#, and Swift come up frequently.
+- **More languages.** The supported-languages list above is current coverage. Rust, Java, and C# come up frequently.
 - **Hosted scan service.** Knostic offers free scans for OSS projects today via the form linked above; a self-serve API for trusted partners is a future possibility.
 
 PRs welcome on any of these — open an issue first if the scope is non-trivial so we can align before you build.
