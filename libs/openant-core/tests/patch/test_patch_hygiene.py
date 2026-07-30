@@ -81,6 +81,21 @@ _NEW_FILE_WITH_CONST = """\
 +def strip_sensitive(headers): pass
 """
 
+# A genuinely new constant added to an existing file — no other line in the
+# diff (added, removed, or unchanged context) mentions this name at all.
+_NEW_CONSTANT_EXISTING_FILE = """\
+--- a/app/config.py
++++ b/app/config.py
+@@ -10,6 +10,7 @@
+ import os
+
+ TIMEOUT = 30
++MAX_REQUEST_BYTES = 1048576
+
+ def load():
+     pass
+"""
+
 # Simulates the dirty urllib3 output we observed in the live run
 _URLLIB3_DIRTY = """\
 --- a/src/urllib3/util/retry.py
@@ -181,7 +196,18 @@ class TestDuplicateAssignmentCheck:
         dups = [f for f in findings if f["check"] == "duplicate_assignment"]
         assert len(dups) == 1
         assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in dups[0]["detail"]
-        assert dups[0]["severity"] == "HIGH"
+        assert dups[0]["severity"] == "MEDIUM"
+
+    def test_duplicate_detail_only_states_what_is_visible(self):
+        # The wording must not claim file-wide duplication, execution order,
+        # runtime shadowing, or that the patch is ineffective — only that
+        # both lines are visible in the diff and warrant a human look.
+        from utilities.autopatcher.patch_hygiene import check_patch
+        findings = check_patch(_DUPLICATE_CONST)
+        dups = [f for f in findings if f["check"] == "duplicate_assignment"]
+        detail = dups[0]["detail"].lower()
+        assert "verify manually" in detail or "verify" in detail
+        assert "likely duplicates it" not in detail
 
     def test_correct_replacement_not_flagged(self):
         from utilities.autopatcher.patch_hygiene import check_patch
@@ -195,11 +221,21 @@ class TestDuplicateAssignmentCheck:
         dups = [f for f in findings if f["check"] == "duplicate_assignment"]
         assert dups == [], "new-file constants should not be flagged as duplicates"
 
+    def test_new_constant_in_existing_file_not_flagged(self):
+        # Regression for F-25: a genuinely new constant added to an existing
+        # file must not be flagged just because the file already has other
+        # constants — the name must co-occur as unchanged context to trigger.
+        from utilities.autopatcher.patch_hygiene import check_patch
+        findings = check_patch(_NEW_CONSTANT_EXISTING_FILE)
+        dups = [f for f in findings if f["check"] == "duplicate_assignment"]
+        assert dups == [], "a genuinely new constant should not be flagged as a duplicate"
+
     def test_dirty_urllib3_flags_duplicate(self):
         from utilities.autopatcher.patch_hygiene import check_patch
         findings = check_patch(_URLLIB3_DIRTY)
         dups = [f for f in findings if f["check"] == "duplicate_assignment"]
         assert any("DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in f["detail"] for f in dups)
+        assert all(f["severity"] == "MEDIUM" for f in dups)
 
 
 # ---------------------------------------------------------------------------

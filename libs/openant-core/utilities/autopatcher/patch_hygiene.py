@@ -28,6 +28,7 @@ class _FilePatch:
     is_new_file: bool        # True when --- /dev/null
     added_lines: list[str]   # raw text of each added line (without leading +)
     removed_lines: list[str] # raw text of each removed line (without leading -)
+    context_lines: list[str] # raw text of each unchanged line shown in the diff
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +42,7 @@ def _parse_file_patches(patch: str) -> list[_FilePatch]:
     to_path: str | None = None
     added: list[str] = []
     removed: list[str] = []
+    context: list[str] = []
 
     def _flush() -> None:
         if to_path is not None:
@@ -52,6 +54,7 @@ def _parse_file_patches(patch: str) -> list[_FilePatch]:
                 is_new_file=is_new,
                 added_lines=added[:],
                 removed_lines=removed[:],
+                context_lines=context[:],
             ))
 
     for line in patch.splitlines():
@@ -64,11 +67,14 @@ def _parse_file_patches(patch: str) -> list[_FilePatch]:
             to_path = raw[2:] if raw.startswith("b/") else raw
             added = []
             removed = []
+            context = []
         elif to_path is not None:
             if line.startswith("+") and not line.startswith("+++"):
                 added.append(line[1:])
             elif line.startswith("-") and not line.startswith("---"):
                 removed.append(line[1:])
+            elif line.startswith(" "):
+                context.append(line[1:])
 
     _flush()
     return patches
@@ -101,12 +107,22 @@ _CONST_RE = re.compile(r"^\s*([A-Z][A-Z0-9_]{2,})\s*=")
 
 
 def _check_duplicate_assignments(fps: list[_FilePatch]) -> list[dict]:
+    """Diff-local co-occurrence heuristic only.
+
+    Flags a name that is both added and visible as an unchanged assignment
+    within the same diff, with no matching removal. This does not infer
+    file-wide duplication, execution order, runtime shadowing, or that the
+    added assignment is ineffective — it only observes that both lines are
+    visible in the diff as shown, which is why a match here is MEDIUM
+    (needs a human look) rather than a confirmed defect.
+    """
     findings = []
     for fp in fps:
         if fp.is_new_file:
             continue  # a new file legitimately defines constants without removing them
         added_names: set[str] = set()
         removed_names: set[str] = set()
+        context_names: set[str] = set()
         for line in fp.added_lines:
             m = _CONST_RE.match(line)
             if m:
@@ -115,13 +131,19 @@ def _check_duplicate_assignments(fps: list[_FilePatch]) -> list[dict]:
             m = _CONST_RE.match(line)
             if m:
                 removed_names.add(m.group(1))
-        for name in sorted(added_names - removed_names):
+        for line in fp.context_lines:
+            m = _CONST_RE.match(line)
+            if m:
+                context_names.add(m.group(1))
+        suspicious = (added_names & context_names) - removed_names
+        for name in sorted(suspicious):
             findings.append({
-                "severity": "HIGH",
+                "severity": "MEDIUM",
                 "check": "duplicate_assignment",
                 "detail": (
-                    f"`{fp.filename}`: `{name}` is added but the existing "
-                    "definition is not removed — likely duplicates it"
+                    f"`{fp.filename}`: `{name}` is added, and an unchanged "
+                    "assignment with the same name is also visible in this "
+                    "diff — both are present as shown; please verify manually"
                 ),
             })
     return findings

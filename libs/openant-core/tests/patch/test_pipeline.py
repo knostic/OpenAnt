@@ -856,6 +856,44 @@ class TestPipelineHelpers:
 
 
 # ---------------------------------------------------------------------------
+# F-25 — a MEDIUM duplicate_assignment hygiene finding must land at
+# "Minor Issues" / "Manual Review Required", never at "Critical Issues" /
+# "Do Not Apply". Exercises _compute_trust_signals + _build_recommendation_v1
+# directly, isolating the hygiene-severity effect from the LLM-driven stages.
+# ---------------------------------------------------------------------------
+
+class TestMediumHygieneRecommendation:
+    def test_medium_duplicate_assignment_yields_minor_issues_not_blocked(self):
+        from utilities.autopatcher.pipeline import _compute_trust_signals, _build_recommendation_v1
+
+        hygiene = [{
+            "severity": "MEDIUM",
+            "check": "duplicate_assignment",
+            "detail": "`app/config.py`: `MAX_REQUEST_BYTES` is added, and an "
+                       "unchanged assignment with the same name is also "
+                       "visible in this diff — verify manually",
+        }]
+        applicability = {"applicable": True}
+        classified_challenger = {
+            "confirmed_defect_count": 0,
+            "plausible_risk_count": 0,
+            "validation_gap_count": 0,
+            "still_vulnerable": False,
+        }
+
+        signals = _compute_trust_signals(
+            hygiene, applicability, classified_challenger, "Good", "low"
+        )
+        assert signals["patch_integrity"]["value"] == "Minor Issues"
+
+        recommendation = _build_recommendation_v1(
+            signals, still_vulnerable=False, defect_count=0
+        )
+        assert recommendation["decision"] == "Manual Review Required"
+        assert recommendation["decision"] != "Do Not Apply"
+
+
+# ---------------------------------------------------------------------------
 # Vulnerability Sources (GHSA/CVE/Advisory URL — no upstream remediation links)
 # ---------------------------------------------------------------------------
 
