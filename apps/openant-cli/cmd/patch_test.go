@@ -70,4 +70,84 @@ func TestPatchCmdIsRegisteredOnRoot(t *testing.T) {
 	if found.Flags().Lookup("finding-id") == nil {
 		t.Error("patch subcommand resolved from root is missing --finding-id flag")
 	}
+	if found.Flags().Lookup("cve") == nil {
+		t.Error("patch subcommand resolved from root is missing --cve flag")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// --cve support: argv construction, format validation, and flag registration.
+// ---------------------------------------------------------------------------
+
+func TestBuildPatchCVEPyArgsBaseline(t *testing.T) {
+	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "")
+	want := []string{"patch", "--cve", "CVE-2022-25883", "--repo-root", "/repo"}
+	if len(args) != len(want) {
+		t.Fatalf("argv = %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q (full=%v)", i, args[i], want[i], args)
+		}
+	}
+}
+
+func TestBuildPatchCVEPyArgsWithOutput(t *testing.T) {
+	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "/scan")
+	want := []string{
+		"patch", "--cve", "CVE-2022-25883",
+		"--repo-root", "/repo",
+		"--output", "/scan",
+	}
+	if len(args) != len(want) {
+		t.Fatalf("argv = %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q (full=%v)", i, args[i], want[i], args)
+		}
+	}
+}
+
+func TestBuildPatchCVEPyArgsOmitsOutputWhenEmpty(t *testing.T) {
+	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "")
+	if found, _ := findFlag(args, "--output"); found {
+		t.Errorf("did not expect --output in pyArgs when unset, got %v", args)
+	}
+}
+
+func TestCveIDPatternAcceptsValidIDs(t *testing.T) {
+	valid := []string{"CVE-2022-25883", "CVE-1999-0001", "CVE-2023-123456"}
+	for _, id := range valid {
+		if !cveIDPattern.MatchString(id) {
+			t.Errorf("expected %q to match cveIDPattern", id)
+		}
+	}
+}
+
+func TestCveIDPatternRejectsInvalidIDs(t *testing.T) {
+	invalid := []string{
+		"CVE-22-25883",    // year not 4 digits
+		"CVE-2022-123",    // sequence too short
+		"cve-2022-25883",  // wrong case
+		"CVE-2022",        // missing sequence
+		"2022-25883",      // missing prefix
+		"CVE-2022-25883x", // trailing garbage
+		"",
+	}
+	for _, id := range invalid {
+		if cveIDPattern.MatchString(id) {
+			t.Errorf("expected %q to NOT match cveIDPattern", id)
+		}
+	}
+}
+
+func TestPatchCmdHasCVEFlag(t *testing.T) {
+	flag := patchCmd.Flags().Lookup("cve")
+	if flag == nil {
+		t.Fatal("patchCmd is missing the --cve flag")
+	}
+	if flag.DefValue != "" {
+		t.Errorf("--cve default should be empty, got %q", flag.DefValue)
+	}
 }

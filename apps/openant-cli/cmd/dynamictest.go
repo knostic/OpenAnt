@@ -91,7 +91,7 @@ func runDynamicTest(cmd *cobra.Command, args []string) {
 		pyArgs = append(pyArgs, "--llm-config", dynamicTestLLMConfig)
 	}
 
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey(), nil)
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)

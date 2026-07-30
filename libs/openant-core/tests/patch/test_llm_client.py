@@ -136,6 +136,99 @@ def test_openai_explicit_provider_raises_on_missing_key(monkeypatch):
         call_llm("prompt with no openai key")
 
 
+class _FakeInteractiveStdin:
+    def isatty(self):
+        return True
+
+
+def _fake_anthropic_ok(captured=None):
+    class FakeContentBlock:
+        text = "ok"
+
+    class FakeResponse:
+        content = [FakeContentBlock()]
+        stop_reason = "end_turn"
+
+    class FakeAnthropic:
+        def __init__(self, api_key=None):
+            if captured is not None:
+                captured["api_key"] = api_key
+
+        class messages:
+            @staticmethod
+            def create(model, max_tokens, messages):
+                if captured is not None:
+                    captured["model"] = model
+                return FakeResponse()
+
+    return types.SimpleNamespace(Anthropic=FakeAnthropic)
+
+
+# ---------------------------------------------------------------------------
+# Interactive prompt text must reach stderr, never stdout -- stdout is
+# reserved for the JSON envelope openant/cli.py writes, and Go's
+# python.Invoke parses it as pure JSON. The selected/typed value must still
+# flow through correctly regardless of which channel displays the prompt.
+# ---------------------------------------------------------------------------
+
+def test_provider_menu_prompt_text_goes_to_stderr_not_stdout(monkeypatch, capsys):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setattr(llm_client, "_cached_provider", None)
+    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
+    monkeypatch.setattr("builtins.input", lambda: "3")  # 3) Mock
+
+    res = call_llm("prompt")
+
+    assert res == _mock_response("prompt")
+    captured = capsys.readouterr()
+    assert "Choose (1/2/3): " in captured.err
+    assert "Choose (1/2/3): " not in captured.out
+
+
+def test_model_menu_prompt_text_goes_to_stderr_not_stdout(monkeypatch, capsys):
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    monkeypatch.setattr(llm_client, "_cached_provider", None)
+    monkeypatch.setattr(llm_client, "_cached_model", {})
+    monkeypatch.setattr(llm_client, "_cached_api_keys", {})
+    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
+    monkeypatch.setattr("builtins.input", lambda: "1")  # first model in the menu
+
+    captured_call: dict = {}
+    monkeypatch.setitem(sys.modules, "anthropic", _fake_anthropic_ok(captured_call))
+
+    call_llm("prompt")
+
+    captured = capsys.readouterr()
+    assert "Select Anthropic model:" in captured.err
+    assert "Choose (1-" in captured.err
+    assert "Select Anthropic model:" not in captured.out
+    assert "Choose (1-" not in captured.out
+    # the typed choice ("1") actually selected a real model, not a fallback default
+    assert captured_call["model"]
+
+
+def test_api_key_prompt_text_goes_to_stderr_not_stdout(monkeypatch, capsys):
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(llm_client, "_cached_provider", "anthropic")
+    monkeypatch.setattr(llm_client, "_cached_model", {"anthropic": "claude-haiku-4-5-20251001"})
+    monkeypatch.setattr(llm_client, "_cached_api_keys", {})
+    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
+    monkeypatch.setattr("builtins.input", lambda: "sk-typed-key")
+
+    captured_call: dict = {}
+    monkeypatch.setitem(sys.modules, "anthropic", _fake_anthropic_ok(captured_call))
+
+    call_llm("prompt")
+
+    captured = capsys.readouterr()
+    assert "Enter ANTHROPIC_API_KEY: " in captured.err
+    assert "Enter ANTHROPIC_API_KEY: " not in captured.out
+    # the typed value actually reached the API client, not just the prompt
+    assert captured_call["api_key"] == "sk-typed-key"
+
+
 def test_non_interactive_defaults_to_mock(monkeypatch):
     # Ensure no provider env var
     monkeypatch.delenv("LLM_PROVIDER", raising=False)

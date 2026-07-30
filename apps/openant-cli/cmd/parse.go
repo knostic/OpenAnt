@@ -120,7 +120,7 @@ func runParse(cmd *cobra.Command, args []string) {
 
 	pyArgs := buildParsePyArgs(repoPath, parseOutput, datasetName, parseLanguage, parseLevel, manifestPath, parseFresh)
 
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, resolvedAPIKey())
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, resolvedAPIKey(), nil)
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)

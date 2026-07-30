@@ -1,0 +1,195 @@
+"""Integration tests for run_patch_cve: CVE id -> fetch -> InvestigationCase ->
+ContextProjection -> the existing (unmodified) Auto Patcher pipeline ->
+artifacts on disk.
+
+Hermetic: LLM_PROVIDER=mock, no network (fetch_cve is mocked at the
+utilities.autopatcher.cve_fetcher module boundary), no real repo beyond a
+tmp_path directory, no Docker. Mirrors test_patch_wrapper_contract.py's style
+for the equivalent run_patch() (Finding-mode) tests.
+"""
+
+from __future__ import annotations
+
+import os
+from unittest import mock
+
+import pytest
+
+from core.patch import PatchStepResult, run_patch_cve
+from utilities.autopatcher.cve_fetcher import CVEFetchError, CVENotFoundError
+
+FIXTURE_CVE = {
+    "id": "CVE-2021-12345",
+    "descriptions": [
+        {"lang": "en", "value": "A SQL injection vulnerability exists in the authenticate() function."}
+    ],
+    "metrics": {
+        "cvssMetricV31": [
+            {"cvssData": {"baseScore": 9.8, "baseSeverity": "CRITICAL"}},
+        ]
+    },
+    "weaknesses": [
+        {"description": [{"lang": "en", "value": "CWE-89"}]}
+    ],
+}
+
+
+# core.patch imports fetch_cve locally inside run_patch_cve's body (from
+# utilities.autopatcher.cve_fetcher import fetch_cve), so the patch target
+# must be the function's home module, not core.patch's namespace.
+def _mock_fetch_cve_at_source(cve=FIXTURE_CVE, side_effect=None):
+    if side_effect is not None:
+        return mock.patch("utilities.autopatcher.cve_fetcher.fetch_cve", side_effect=side_effect)
+    return mock.patch("utilities.autopatcher.cve_fetcher.fetch_cve", return_value=cve)
+
+
+class TestRunPatchCveHappyPath:
+    def test_writes_artifacts_named_after_cve_id(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        with _mock_fetch_cve_at_source():
+            result = run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
+
+        assert isinstance(result, PatchStepResult)
+        assert result.finding_id == "CVE-2021-12345"
+        assert result.input_type == "cve"
+        assert result.input_id == "CVE-2021-12345"
+        assert result.vulnerability_path == str(tmp_path / "patch" / "CVE-2021-12345-vulnerability.md")
+        assert result.trust_report_path == str(tmp_path / "patch" / "CVE-2021-12345-trust-report.md")
+        assert os.path.exists(result.vulnerability_path)
+        assert os.path.exists(result.trust_report_path)
+
+    def test_trust_report_discloses_cve_input_source(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        with _mock_fetch_cve_at_source():
+            result = run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
+
+        report_text = open(result.trust_report_path, encoding="utf-8").read()
+        assert "Input Source: CVE (CVE-2021-12345)" in report_text
+        assert "not been verified against this repository" in report_text
+        assert "| Input type | CVE (CVE-2021-12345, NVD) |" in report_text
+
+    def test_vulnerability_artifact_matches_cve_to_vuln_text(self, tmp_path, monkeypatch):
+        from utilities.autopatcher.cve_converter import cve_to_vuln_text
+
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        with _mock_fetch_cve_at_source():
+            result = run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
+
+        vuln_text = open(result.vulnerability_path, encoding="utf-8").read()
+        assert vuln_text == cve_to_vuln_text(FIXTURE_CVE)
+
+    def test_trust_report_mock_mode_is_self_disclosing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        with _mock_fetch_cve_at_source():
+            result = run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
+
+        report_text = open(result.trust_report_path, encoding="utf-8").read()
+        assert "MOCK MODE" in report_text
+        assert "LLM mode | MOCK" in report_text
+
+    def test_never_leaves_stale_trust_report_after_failed_rerun(self, tmp_path, monkeypatch):
+        """F-39 guarantee, ported to the CVE entry point."""
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        with _mock_fetch_cve_at_source():
+            first = run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
+        assert os.path.exists(first.trust_report_path)
+
+        import utilities.autopatcher.pipeline as _pipeline_module
+
+        def _boom(**kwargs):
+            raise RuntimeError("simulated pipeline failure")
+
+        monkeypatch.setattr(_pipeline_module, "run", _boom)
+
+        with _mock_fetch_cve_at_source():
+            with pytest.raises(RuntimeError, match="simulated pipeline failure"):
+                run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
+
+        assert not os.path.exists(first.trust_report_path)
+        assert os.path.exists(first.vulnerability_path)
+
+
+class TestRunPatchCveRepoRootValidation:
+    def test_missing_repo_root_raises_before_any_fetch(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        nonexistent = str(tmp_path / "does-not-exist")
+
+        with _mock_fetch_cve_at_source() as mocked_fetch:
+            with pytest.raises(ValueError, match="does-not-exist"):
+                run_patch_cve("CVE-2021-12345", nonexistent, str(tmp_path))
+        mocked_fetch.assert_not_called()
+
+    def test_empty_repo_root_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        with pytest.raises(ValueError):
+            run_patch_cve("CVE-2021-12345", "", str(tmp_path))
+
+    def test_repo_root_pointing_at_a_file_not_a_directory_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        a_file = tmp_path / "not-a-dir"
+        a_file.write_text("x")
+        with pytest.raises(ValueError):
+            run_patch_cve("CVE-2021-12345", str(a_file), str(tmp_path))
+
+
+class TestRunPatchCveFetchFailures:
+    def test_cve_not_found_propagates(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        with _mock_fetch_cve_at_source(side_effect=CVENotFoundError("no such CVE")):
+            with pytest.raises(CVENotFoundError):
+                run_patch_cve("CVE-9999-99999", str(repo_root), str(tmp_path))
+
+    def test_network_failure_propagates(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        with _mock_fetch_cve_at_source(side_effect=CVEFetchError("network error")):
+            with pytest.raises(CVEFetchError):
+                run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
+
+    def test_no_artifacts_written_when_fetch_fails(self, tmp_path, monkeypatch):
+        """Fetch failures happen before any artifact is written -- mirrors
+        run_patch()'s existing behavior for an unknown/ineligible finding."""
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        with _mock_fetch_cve_at_source(side_effect=CVENotFoundError("no such CVE")):
+            with pytest.raises(CVENotFoundError):
+                run_patch_cve("CVE-9999-99999", str(repo_root), str(tmp_path))
+
+        assert not os.path.exists(tmp_path / "patch")
+
+
+class TestRunPatchCveRequiresLlmProvider:
+    def test_requires_llm_provider(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        with _mock_fetch_cve_at_source() as mocked_fetch:
+            with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+                run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
+        # repo_root check and fetch both happen before the LLM_PROVIDER
+        # check inside the shared helper -- fetch_cve is still called here,
+        # unlike the repo_root-invalid case above.
+        mocked_fetch.assert_called_once()

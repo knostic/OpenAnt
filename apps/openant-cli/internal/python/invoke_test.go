@@ -79,7 +79,7 @@ func TestInvoke_HangingSubprocessIsBoundedByTimeout(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = Invoke(hang, []string{"parse", "."}, "", true, "")
+		_, _ = Invoke(hang, []string{"parse", "."}, "", true, "", nil)
 	}()
 
 	select {
@@ -142,7 +142,7 @@ func writeEmptyStdoutScript(t *testing.T) string {
 // empty-stdout return path. A revert to `ExitCode: exitCode` would yield 0 here.
 func TestInvoke_EmptyStdoutSurfacesErrorCode(t *testing.T) {
 	script := writeEmptyStdoutScript(t)
-	res, err := Invoke(script, []string{"parse", "."}, "", true, "")
+	res, err := Invoke(script, []string{"parse", "."}, "", true, "", nil)
 	if err != nil {
 		t.Fatalf("Invoke returned error: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestInvoke_LateInterruptDoesNotDiscardEnvelope(t *testing.T) {
 	}
 	ch := make(chan outcome, 1)
 	go func() {
-		r, e := Invoke(script, []string{"scan", "."}, "", true, "")
+		r, e := Invoke(script, []string{"scan", "."}, "", true, "", nil)
 		ch <- outcome{r, e}
 	}()
 

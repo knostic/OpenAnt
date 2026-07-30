@@ -582,29 +582,55 @@ def cmd_dynamic_test(args):
 
 
 def cmd_patch(args):
-    """Generate and evaluate a candidate remediation for one finding."""
-    from core.patch import run_patch
+    """Generate and evaluate a candidate remediation for a Finding or a known CVE."""
+    from core.patch import run_patch, run_patch_cve
     from core.schemas import success, error
     from core.step_report import step_context
+
+    finding_id = getattr(args, "finding_id", None)
+    cve = getattr(args, "cve", None)
+
+    if bool(finding_id) == bool(cve):
+        _output_json(error("exactly one of --finding-id or --cve is required"))
+        return 2
+
+    if cve and not args.repo_root:
+        _output_json(error("--cve requires --repo-root"))
+        return 2
+
+    if finding_id and not args.pipeline_output:
+        _output_json(error("pipeline_output is required when using --finding-id"))
+        return 2
 
     output_dir = args.output or tempfile.mkdtemp(prefix="openant_patch_")
 
     try:
-        with step_context("patch", output_dir, inputs={
-            "pipeline_output_path": os.path.abspath(args.pipeline_output),
-            "finding_id": args.finding_id,
-        }) as ctx:
-            result = run_patch(
-                pipeline_output_path=args.pipeline_output,
-                finding_id=args.finding_id,
-                output_dir=output_dir,
-                repo_root=args.repo_root,
-            )
-
-            ctx.outputs = {
-                "vulnerability_path": result.vulnerability_path,
-                "trust_report_path": result.trust_report_path,
-            }
+        if cve:
+            with step_context("patch", output_dir, inputs={"cve": cve}) as ctx:
+                result = run_patch_cve(
+                    cve_id=cve,
+                    repo_root=args.repo_root,
+                    output_dir=output_dir,
+                )
+                ctx.outputs = {
+                    "vulnerability_path": result.vulnerability_path,
+                    "trust_report_path": result.trust_report_path,
+                }
+        else:
+            with step_context("patch", output_dir, inputs={
+                "pipeline_output_path": os.path.abspath(args.pipeline_output),
+                "finding_id": finding_id,
+            }) as ctx:
+                result = run_patch(
+                    pipeline_output_path=args.pipeline_output,
+                    finding_id=finding_id,
+                    output_dir=output_dir,
+                    repo_root=args.repo_root,
+                )
+                ctx.outputs = {
+                    "vulnerability_path": result.vulnerability_path,
+                    "trust_report_path": result.trust_report_path,
+                }
 
         _output_json(success(result.to_dict()))
         return 0
@@ -1580,11 +1606,21 @@ def build_parser() -> argparse.ArgumentParser:
     # patch — generate and evaluate a candidate remediation for a finding
     # ---------------------------------------------------------------
     patch_p = subparsers.add_parser(
-        "patch", help="Generate and evaluate a candidate remediation for a finding"
+        "patch", help="Generate and evaluate a candidate remediation for a finding or a known CVE"
     )
-    patch_p.add_argument("pipeline_output", help="Path to pipeline_output.json")
-    patch_p.add_argument("--finding-id", required=True, help="ID of the finding to remediate")
-    patch_p.add_argument("--repo-root", help="Path to the target repository root")
+    patch_p.add_argument(
+        "pipeline_output", nargs="?", default=None,
+        help="Path to pipeline_output.json (required unless --cve is given)",
+    )
+    patch_p.add_argument(
+        "--finding-id", help="ID of the finding to remediate (mutually exclusive with --cve)"
+    )
+    patch_p.add_argument(
+        "--cve", help="CVE identifier to fetch from NVD and remediate (mutually exclusive with --finding-id)"
+    )
+    patch_p.add_argument(
+        "--repo-root", help="Path to the target repository root (required when using --cve)"
+    )
     patch_p.add_argument("--output", "-o", help="Output directory (default: temp dir)")
     patch_p.set_defaults(func=cmd_patch)
 

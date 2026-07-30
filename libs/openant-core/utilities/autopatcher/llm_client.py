@@ -273,7 +273,8 @@ def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> s
             print("1) OpenAI", file=sys.stderr)
             print("2) Anthropic", file=sys.stderr)
             print("3) Mock", file=sys.stderr)
-            choice = input("Choose (1/2/3): ").strip()
+            print("Choose (1/2/3): ", file=sys.stderr, end="", flush=True)
+            choice = input().strip()
             provider = {"1": "openai", "2": "anthropic", "3": "mock"}.get(choice, "mock")
             _cached_provider = provider
 
@@ -327,7 +328,8 @@ def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> s
                 for idx, (mname, meta) in enumerate(items, start=1):
                     label = meta.get("label") if isinstance(meta, dict) else ""
                     print(f"{idx}) {mname} ({label})", file=sys.stderr)
-                choice = input(f"Choose (1-{len(items)}): ").strip()
+                print(f"Choose (1-{len(items)}): ", file=sys.stderr, end="", flush=True)
+                choice = input().strip()
                 try:
                     sel = int(choice) - 1
                     chosen_model = items[sel][0]
@@ -358,7 +360,8 @@ def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> s
         key = os.environ.get(env_name, "")
         if not key:
             try:
-                key = input(f"Enter {env_name}: ").strip()
+                print(f"Enter {env_name}: ", file=sys.stderr, end="", flush=True)
+                key = input().strip()
             except Exception:
                 key = ""
         if key:

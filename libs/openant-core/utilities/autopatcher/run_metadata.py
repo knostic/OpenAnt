@@ -23,6 +23,14 @@ class RunMetadata:
     patcher_commit: str # short SHA of auto-patcher project
     max_tokens_configured: Optional[int] = None   # resolved LLM_MAX_TOKENS for this run
     stage_stop_reasons: Optional[dict] = None     # {"patch_generation": "end_turn", ...}
+    # input_type/advisory_id/advisory_source: additive fields distinguishing a
+    # CVE-seeded run from an OpenAnt-Finding-seeded one. Default "finding"
+    # renders no extra content in render_metadata_section -- existing
+    # Finding-mode call sites that don't pass these keep byte-identical
+    # output.
+    input_type: str = "finding"                   # "finding" | "cve"
+    advisory_id: Optional[str] = None             # e.g. "CVE-2022-25883"
+    advisory_source: Optional[str] = None         # e.g. "NVD"
 
 
 def collect_git_info(path: Path) -> str:
@@ -90,7 +98,19 @@ _TRUNCATION_STOP_REASONS = {"max_tokens", "length"}
 
 
 def render_metadata_section(meta: RunMetadata) -> str:
-    """Render the run metadata as a Markdown table with optional warnings."""
+    """Render the run metadata as a Markdown table with optional warnings.
+
+    When meta.input_type == "cve", an additional disclosure block and table
+    row make the report's provenance explicit: the input was a public
+    advisory, not an OpenAnt Finding, and advisory claims (description, CWE,
+    CVSS, affected products) are not equivalent to repository verification.
+    The Recommendation/Trust Signals a caller renders alongside this section
+    are computed upstream from evidence this pipeline run actually collected
+    against the given repository -- this function does not compute or alter
+    them, only states in the report that advisory metadata is not a
+    substitute for that evidence. For meta.input_type == "finding" (the
+    default), nothing here changes: this whole block renders as "".
+    """
     warning = ""
     if meta.llm_mode == "MOCK":
         warning = (
@@ -109,8 +129,29 @@ def render_metadata_section(meta: RunMetadata) -> str:
             "treat completeness-related findings in this report as conclusive.\n\n"
         )
 
+    disclosure = ""
+    if meta.input_type == "cve":
+        advisory_label = meta.advisory_id or "unknown"
+        source_label = meta.advisory_source or "an unspecified source"
+        disclosure = (
+            f"> ℹ️ **Input Source: CVE ({advisory_label})** — this run was seeded from a "
+            f"public advisory ({source_label}), not an OpenAnt-detected Finding. Advisory "
+            "claims (description, CWE, CVSS, affected products) are contextual evidence "
+            "only and have not been verified against this repository's actual code or "
+            "dependency versions. The Recommendation and Trust Signals in this report are "
+            "based only on the evidence this pipeline run actually collected against the "
+            "given repository — not on the advisory's own severity or CVSS score.\n\n"
+        )
+
     max_tokens_display = (
         str(meta.max_tokens_configured) if meta.max_tokens_configured is not None else "—"
+    )
+
+    input_type_row = (
+        f"| Input type | CVE ({meta.advisory_id or 'unknown'}, "
+        f"{meta.advisory_source or 'unknown source'}) |\n"
+        if meta.input_type == "cve"
+        else ""
     )
 
     table = f"""\
@@ -120,7 +161,7 @@ def render_metadata_section(meta: RunMetadata) -> str:
 |---|---|
 | Generated | {meta.timestamp} |
 | Input | {meta.input_source} |
-| Repository | {meta.repo_root or "—"} |
+""" + input_type_row + f"""| Repository | {meta.repo_root or "—"} |
 | Repo commit | {meta.repo_commit} |
 | LLM provider | {meta.llm_provider} |
 | LLM model | {meta.llm_model} |
@@ -143,4 +184,4 @@ def render_metadata_section(meta: RunMetadata) -> str:
             stage_table += f"| {label} | {display} |\n"
         table += stage_table
 
-    return warning + table
+    return warning + disclosure + table

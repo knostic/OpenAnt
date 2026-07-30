@@ -18,11 +18,13 @@ All hermetic: LLM_PROVIDER=mock, no network, no real repo, no Docker.
 
 import json
 import os
+from unittest import mock
 
 import pytest
 
 from core.patch import (
     PatchStepResult,
+    _require_llm_provider,
     check_eligible,
     effective_verdict,
     find_finding_by_id,
@@ -301,6 +303,43 @@ def test_run_patch_missing_pipeline_output(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _require_llm_provider: the Python-side backstop the Go resolver's
+# guarantee relies on. A correctly-resolved interactive run (Go sets
+# LLM_PROVIDER in the subprocess env before Python starts) must not trigger
+# this at all -- these tests confirm that directly rather than only
+# indirectly through run_patch().
+# ---------------------------------------------------------------------------
+
+def test_require_llm_provider_does_not_raise_when_set(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    _require_llm_provider()  # must not raise
+
+
+def test_require_llm_provider_does_not_raise_for_mock(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    _require_llm_provider()  # must not raise
+
+
+def test_require_llm_provider_raises_when_unset(monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+        _require_llm_provider()
+
+
+def test_run_patch_input_type_and_input_id_default_to_finding(tmp_path, monkeypatch):
+    """Regression guard: these fields are additive -- Finding-mode's existing
+    PatchStepResult contract must not regress when they were introduced for
+    CVE mode."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    po_path = _write_pipeline_output(tmp_path, [FIXTURE_FINDING_ELIGIBLE])
+
+    result = run_patch(po_path, "F-001", str(tmp_path), repo_root=None)
+
+    assert result.input_type == "finding"
+    assert result.input_id == "F-001"
+
+
+# ---------------------------------------------------------------------------
 # Full CLI dispatch contract (openant/cli.py's cmd_patch) -- the exact
 # envelope shape internal/python.Invoke() parses on the Go side.
 # ---------------------------------------------------------------------------
@@ -336,6 +375,127 @@ def test_cmd_patch_error_envelope_shape_for_unknown_finding(tmp_path, monkeypatc
     args = _Args(pipeline_output=po_path, finding_id="nope", repo_root=None, output=str(tmp_path / "out"))
 
     exit_code = cmd_patch(args)
+
+    assert exit_code == 2
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["status"] == "error"
+    assert envelope["data"] == {}
+    assert len(envelope["errors"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# cmd_patch: --cve dispatch, mutual exclusion with --finding-id, and the
+# full CVE-mode CLI contract (mocked NVD fetch, no network, no real repo).
+# ---------------------------------------------------------------------------
+
+FIXTURE_CVE_FOR_CLI = {
+    "id": "CVE-2021-12345",
+    "descriptions": [{"lang": "en", "value": "A test vulnerability for CLI-contract coverage."}],
+}
+
+
+def test_cmd_patch_rejects_both_finding_id_and_cve(tmp_path, monkeypatch, capsys):
+    from openant.cli import cmd_patch
+
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    args = _Args(
+        pipeline_output=None, finding_id="F-001", cve="CVE-2021-12345",
+        repo_root=str(tmp_path), output=str(tmp_path / "out"),
+    )
+
+    exit_code = cmd_patch(args)
+
+    assert exit_code == 2
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["status"] == "error"
+    assert envelope["data"] == {}
+    assert "exactly one" in envelope["errors"][0]
+
+
+def test_cmd_patch_rejects_neither_finding_id_nor_cve(tmp_path, monkeypatch, capsys):
+    from openant.cli import cmd_patch
+
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    args = _Args(pipeline_output=None, finding_id=None, cve=None, repo_root=None, output=str(tmp_path / "out"))
+
+    exit_code = cmd_patch(args)
+
+    assert exit_code == 2
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["status"] == "error"
+    assert "exactly one" in envelope["errors"][0]
+
+
+def test_cmd_patch_cve_mode_requires_repo_root(tmp_path, monkeypatch, capsys):
+    from openant.cli import cmd_patch
+
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    args = _Args(pipeline_output=None, finding_id=None, cve="CVE-2021-12345", repo_root=None, output=str(tmp_path / "out"))
+
+    exit_code = cmd_patch(args)
+
+    assert exit_code == 2
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["status"] == "error"
+    assert "--repo-root" in envelope["errors"][0]
+
+
+def test_cmd_patch_finding_id_mode_requires_pipeline_output(tmp_path, monkeypatch, capsys):
+    from openant.cli import cmd_patch
+
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    args = _Args(pipeline_output=None, finding_id="F-001", cve=None, repo_root=None, output=str(tmp_path / "out"))
+
+    exit_code = cmd_patch(args)
+
+    assert exit_code == 2
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["status"] == "error"
+    assert "pipeline_output" in envelope["errors"][0]
+
+
+def test_cmd_patch_success_envelope_shape_cve_mode(tmp_path, monkeypatch, capsys):
+    from openant.cli import cmd_patch
+
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    args = _Args(
+        pipeline_output=None, finding_id=None, cve="CVE-2021-12345",
+        repo_root=str(repo_root), output=str(tmp_path / "out"),
+    )
+
+    with mock.patch("utilities.autopatcher.cve_fetcher.fetch_cve", return_value=FIXTURE_CVE_FOR_CLI):
+        exit_code = cmd_patch(args)
+
+    assert exit_code == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["status"] == "success"
+    assert envelope["errors"] == []
+    assert envelope["data"]["finding_id"] == "CVE-2021-12345"
+    assert envelope["data"]["input_type"] == "cve"
+    assert envelope["data"]["input_id"] == "CVE-2021-12345"
+    assert os.path.exists(envelope["data"]["trust_report_path"])
+    assert os.path.exists(envelope["data"]["vulnerability_path"])
+
+
+def test_cmd_patch_cve_mode_error_envelope_for_unknown_cve(tmp_path, monkeypatch, capsys):
+    from openant.cli import cmd_patch
+    from utilities.autopatcher.cve_fetcher import CVENotFoundError
+
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    args = _Args(
+        pipeline_output=None, finding_id=None, cve="CVE-9999-99999",
+        repo_root=str(repo_root), output=str(tmp_path / "out"),
+    )
+
+    with mock.patch(
+        "utilities.autopatcher.cve_fetcher.fetch_cve",
+        side_effect=CVENotFoundError("no such CVE"),
+    ):
+        exit_code = cmd_patch(args)
 
     assert exit_code == 2
     envelope = json.loads(capsys.readouterr().out)

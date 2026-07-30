@@ -154,7 +154,7 @@ func runAnalyze(cmd *cobra.Command, args []string) {
 		analyzeLLMConfig, analyzeWorkers, analyzeCheckpoint, analyzeBackoff,
 	)
 
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey(), nil)
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)

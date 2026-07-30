@@ -223,3 +223,64 @@ class TestTokenBudgetAndStopReasons:
         ))
         assert "MOCK MODE" in md
         assert "TRUNCATED OUTPUT DETECTED" in md
+
+
+# ---------------------------------------------------------------------------
+# render_metadata_section — CVE input-source disclosure (additive; must not
+# change output for the default "finding" input_type)
+# ---------------------------------------------------------------------------
+
+class TestCveInputSourceDisclosure:
+    def test_default_input_type_renders_no_disclosure_or_row(self):
+        md = render_metadata_section(_meta())
+        assert "Input Source: CVE" not in md
+        assert "Input type" not in md
+
+    def test_finding_input_type_renders_no_disclosure_or_row(self):
+        md = render_metadata_section(_meta(input_type="finding"))
+        assert "Input Source: CVE" not in md
+        assert "Input type" not in md
+
+    def test_cve_input_type_renders_disclosure(self):
+        md = render_metadata_section(_meta(
+            input_type="cve", advisory_id="CVE-2022-25883", advisory_source="NVD",
+        ))
+        assert "Input Source: CVE (CVE-2022-25883)" in md
+        assert "NVD" in md
+
+    def test_cve_disclosure_states_not_repository_verified(self):
+        md = render_metadata_section(_meta(
+            input_type="cve", advisory_id="CVE-2022-25883", advisory_source="NVD",
+        ))
+        assert "not been verified against this repository" in md
+
+    def test_cve_disclosure_states_recommendation_based_on_collected_evidence(self):
+        md = render_metadata_section(_meta(
+            input_type="cve", advisory_id="CVE-2022-25883", advisory_source="NVD",
+        ))
+        assert "based only on the evidence this pipeline run actually collected" in md
+
+    def test_cve_input_type_renders_table_row(self):
+        md = render_metadata_section(_meta(
+            input_type="cve", advisory_id="CVE-2022-25883", advisory_source="NVD",
+        ))
+        assert "| Input type | CVE (CVE-2022-25883, NVD) |" in md
+
+    def test_cve_disclosure_handles_missing_advisory_fields_without_crash(self):
+        md = render_metadata_section(_meta(input_type="cve"))
+        assert "Input Source: CVE (unknown)" in md
+
+    def test_cve_disclosure_coexists_with_mock_warning(self):
+        md = render_metadata_section(_meta(
+            input_type="cve", advisory_id="CVE-2022-25883", advisory_source="NVD",
+            llm_mode="MOCK",
+        ))
+        assert "MOCK MODE" in md
+        assert "Input Source: CVE" in md
+
+    def test_rest_of_table_unaffected_by_cve_disclosure(self):
+        md = render_metadata_section(_meta(
+            input_type="cve", advisory_id="CVE-2022-25883", advisory_source="NVD",
+        ))
+        for field in ["Generated", "Repository", "Repo commit", "LLM provider", "Output", "Auto-patcher"]:
+            assert field in md
