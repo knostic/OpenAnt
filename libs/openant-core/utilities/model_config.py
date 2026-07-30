@@ -31,6 +31,9 @@ CLAUDE_HAIKU = "claude-haiku-4-5-20251001"
 CLAUDE_OPUS_4_20250514 = "claude-opus-4-20250514"
 CLAUDE_OPUS_4_6 = "claude-opus-4-6"
 CLAUDE_SONNET_4_20250514 = "claude-sonnet-4-20250514"
+# Older (pre-4.x) generation names still accepted as legacy CLI/env aliases.
+CLAUDE_3_HAIKU_LEGACY = "claude-3-haiku"
+CLAUDE_3_SONNET_LEGACY = "claude-3-sonnet"
 
 # --- OpenAI model IDs -------------------------------------------------
 GPT_4O = "gpt-4o"

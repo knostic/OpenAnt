@@ -17,7 +17,7 @@ class RunMetadata:
     repo_root: str      # "/tmp/urllib3-eval" or ""
     repo_commit: str    # short SHA or "unknown"
     llm_provider: str   # "anthropic" | "openai" | "mock" | "unknown"
-    llm_model: str      # "claude-sonnet-4-6" | "mock" | "unknown"
+    llm_model: str      # resolved model id (see utilities.model_config) | "mock" | "unknown"
     llm_mode: str       # "LIVE" | "MOCK"
     output_path: str    # final resolved output path
     patcher_commit: str # short SHA of auto-patcher project

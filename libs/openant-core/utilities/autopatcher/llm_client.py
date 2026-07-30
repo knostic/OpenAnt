@@ -13,6 +13,7 @@ import re
 import sys
 from typing import Optional
 
+from ..model_config import GPT_4O_MINI
 from .llm_config import LLM_CONFIG, MODEL_ALIASES, DEFAULT_MAX_TOKENS
 
 # In-memory cached choices for the running session so we don't prompt
@@ -208,7 +209,7 @@ class LLMClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gpt-4o-mini",
+        model: str = GPT_4O_MINI,
     ) -> None:
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.model = model
@@ -242,7 +243,7 @@ class LLMClient:
         return call_llm(combined, model=self.model, stage=stage)
 
 
-def call_llm(prompt: str, model: str = "gpt-4o-mini", stage: str = "unknown") -> str:
+def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> str:
     """Call an LLM and return a single text response.
 
     Provider resolution order:

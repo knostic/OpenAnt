@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -1388,7 +1389,7 @@ class TestClassDefinitionGrounding:
 # Live pygeoapi integration (opt-in)
 # ---------------------------------------------------------------------------
 
-_PYGEOAPI_EVAL = Path("/private/tmp/pygeoapi-eval")
+_PYGEOAPI_EVAL = Path(tempfile.gettempdir()) / "pygeoapi-eval"
 _PYGEOAPI_STAC_PY = _PYGEOAPI_EVAL / "pygeoapi" / "api" / "stac.py"
 _PYGEOAPI_FS_PY = _PYGEOAPI_EVAL / "pygeoapi" / "provider" / "filesystem.py"
 
@@ -1404,7 +1405,7 @@ _run_pygeoapi_live = (
     reason=(
         "Live pygeoapi tests opt-in only — "
         "set RUN_LIVE_REPO_TESTS=1 and ensure "
-        "/private/tmp/pygeoapi-eval contains both "
+        f"{_PYGEOAPI_EVAL} contains both "
         "pygeoapi/api/stac.py and pygeoapi/provider/filesystem.py"
     ),
 )

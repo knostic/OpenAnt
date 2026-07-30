@@ -4,24 +4,34 @@ Keep simple Python structures here so callers can dynamically build menus
 and validate models without hardcoding values in `llm_client.py`.
 """
 
+from ..model_config import (
+    CLAUDE_3_HAIKU_LEGACY,
+    CLAUDE_3_SONNET_LEGACY,
+    CLAUDE_HAIKU,
+    CLAUDE_OPUS_4_6,
+    CLAUDE_SONNET,
+    GPT_4O,
+    GPT_4O_MINI,
+)
+
 # Default max output tokens for LLM completions. Override per-run via the
 # LLM_MAX_TOKENS environment variable (see llm_client._resolve_max_tokens).
 DEFAULT_MAX_TOKENS = 4096
 
 LLM_CONFIG = {
     "openai": {
-        "default_model": "gpt-4o-mini",
+        "default_model": GPT_4O_MINI,
         "models": {
-            "gpt-4o-mini": {"label": "fast"},
-            "gpt-4o": {"label": "strong"},
+            GPT_4O_MINI: {"label": "fast"},
+            GPT_4O: {"label": "strong"},
         },
     },
     "anthropic": {
-        "default_model": "claude-haiku-4-5-20251001",
+        "default_model": CLAUDE_HAIKU,
         "models": {
-            "claude-haiku-4-5-20251001": {"label": "fast"},
-            "claude-sonnet-4-6": {"label": "balanced"},
-            "claude-opus-4-6": {"label": "strong"},
+            CLAUDE_HAIKU: {"label": "fast"},
+            CLAUDE_SONNET: {"label": "balanced"},
+            CLAUDE_OPUS_4_6: {"label": "strong"},
         },
     },
     "mock": {
@@ -32,6 +42,6 @@ LLM_CONFIG = {
 
 # Backwards-compatible aliases for legacy model names
 MODEL_ALIASES = {
-    "claude-3-haiku": "claude-haiku-4-5-20251001",
-    "claude-3-sonnet": "claude-sonnet-4-6",
+    CLAUDE_3_HAIKU_LEGACY: CLAUDE_HAIKU,
+    CLAUDE_3_SONNET_LEGACY: CLAUDE_SONNET,
 }
