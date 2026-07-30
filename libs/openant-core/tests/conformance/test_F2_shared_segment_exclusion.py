@@ -27,7 +27,7 @@ pristine repo).  The orchestrator runs it once against the pristine core (RED)
 and once against a patched copy (GREEN).
 
     OPENANT_CORE_ROOT=/path/to/openant-core \
-        /Users/gadievron/.openant/venv/bin/python -m pytest F2-shared-segment-exclusion.test.py
+        python -m pytest F2-shared-segment-exclusion.test.py
 """
 
 import importlib.util

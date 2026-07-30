@@ -138,27 +138,30 @@ GROUND_TRUTHS = {
     "github_patches_2": os.path.join(DATASETS_PATH, "github_patches/ground_truth.json"),
 }
 
-# Repository paths for context correction
+# Repository paths for context correction. Local checkouts live under
+# $OPENANT_TEST_REPOS (default ~/code); override to point at your own checkouts.
+_TEST_REPOS = os.environ.get("OPENANT_TEST_REPOS", os.path.expanduser("~/code"))
+_TR = os.path.join(_TEST_REPOS, "test_repos")
 REPO_PATHS = {
-    "dvna": "/Users/nahumkorda/code/dvna",
-    "nodegoat": "/Users/nahumkorda/code/NodeGoat",
-    "juice_shop": "/Users/nahumkorda/code/juice-shop",
-    "flowise": "/Users/nahumkorda/code/test_repos/Flowise",
-    "geospatial": "/Users/nahumkorda/code/test_repos/streamlit-geospatial",
-    "object_browser": "/Users/nahumkorda/code/test_repos/object-browser",
-    "object_browser_vuln25": "/Users/nahumkorda/code/test_repos/object-browser",
-    "uptime_kuma": "/Users/nahumkorda/code/test_repos/uptime-kuma",
-    "code_server": "/Users/nahumkorda/code/test_repos/code-server",
-    "code_server_vuln4": "/Users/nahumkorda/code/test_repos/code-server",
-    "anything_llm": "/Users/nahumkorda/code/test_repos/anything-llm",
-    "flowise_non_codeql": "/Users/nahumkorda/code/test_repos/Flowise",
-    "flowise_stage1_vuln": "/Users/nahumkorda/code/test_repos/Flowise",
-    "langchain": "/Users/nahumkorda/code/test_repos/langchain",
-    "langchain_vuln": "/Users/nahumkorda/code/test_repos/langchain",
-    "flask": "/Users/nahumkorda/code/test_repos/flask",
-    "paperless": "/Users/nahumkorda/code/test_repos/paperless-ngx",
-    "paperless_stage2": "/Users/nahumkorda/code/test_repos/paperless-ngx",
-    "n8n": "/Users/nahumkorda/code/test_repos/n8n",
+    "dvna": os.path.join(_TEST_REPOS, "dvna"),
+    "nodegoat": os.path.join(_TEST_REPOS, "NodeGoat"),
+    "juice_shop": os.path.join(_TEST_REPOS, "juice-shop"),
+    "flowise": os.path.join(_TR, "Flowise"),
+    "geospatial": os.path.join(_TR, "streamlit-geospatial"),
+    "object_browser": os.path.join(_TR, "object-browser"),
+    "object_browser_vuln25": os.path.join(_TR, "object-browser"),
+    "uptime_kuma": os.path.join(_TR, "uptime-kuma"),
+    "code_server": os.path.join(_TR, "code-server"),
+    "code_server_vuln4": os.path.join(_TR, "code-server"),
+    "anything_llm": os.path.join(_TR, "anything-llm"),
+    "flowise_non_codeql": os.path.join(_TR, "Flowise"),
+    "flowise_stage1_vuln": os.path.join(_TR, "Flowise"),
+    "langchain": os.path.join(_TR, "langchain"),
+    "langchain_vuln": os.path.join(_TR, "langchain"),
+    "flask": os.path.join(_TR, "flask"),
+    "paperless": os.path.join(_TR, "paperless-ngx"),
+    "paperless_stage2": os.path.join(_TR, "paperless-ngx"),
+    "n8n": os.path.join(_TR, "n8n"),
 }
 
 # Analyzer output paths for Stage 2 verification (repository index)

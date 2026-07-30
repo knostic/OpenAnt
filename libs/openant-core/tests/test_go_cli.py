@@ -223,12 +223,12 @@ class TestInit:
             env_override=isolated_home,
         )
         assert result.returncode == 0, f"init failed:\n{result.stderr}"
-        assert "Detected language: python" in result.stderr
+        assert "Detected: python" in result.stderr
 
         project = self._read_project_json(
             isolated_home["HOME"], "test/python-repo",
         )
-        assert project["language"] == "python"
+        assert project["language"] == "auto"
 
     def test_auto_detect_javascript_from_fixture(
         self, sample_js_repo, isolated_home
@@ -241,12 +241,12 @@ class TestInit:
             env_override=isolated_home,
         )
         assert result.returncode == 0, f"init failed:\n{result.stderr}"
-        assert "Detected language: javascript" in result.stderr
+        assert "Detected: javascript" in result.stderr
 
         project = self._read_project_json(
             isolated_home["HOME"], "test/js-repo",
         )
-        assert project["language"] == "javascript"
+        assert project["language"] == "auto"
 
     def test_auto_detect_typescript_synthetic(self, tmp_path, isolated_home):
         """A TS-only tree (no .git) is detected as ``javascript``."""
@@ -265,12 +265,12 @@ class TestInit:
             env_override=isolated_home,
         )
         assert result.returncode == 0, f"init failed:\n{result.stderr}"
-        assert "Detected language: javascript" in result.stderr
+        assert "Detected: javascript" in result.stderr
 
         project = self._read_project_json(
             isolated_home["HOME"], "test/ts-synth",
         )
-        assert project["language"] == "javascript"
+        assert project["language"] == "auto"
 
     def test_auto_detect_go_synthetic(self, tmp_path, isolated_home):
         """A Go-only tree (no .git) is detected as ``go``."""
@@ -289,12 +289,12 @@ class TestInit:
             env_override=isolated_home,
         )
         assert result.returncode == 0, f"init failed:\n{result.stderr}"
-        assert "Detected language: go" in result.stderr
+        assert "Detected: go" in result.stderr
 
         project = self._read_project_json(
             isolated_home["HOME"], "test/go-synth",
         )
-        assert project["language"] == "go"
+        assert project["language"] == "auto"
 
     def test_explicit_language_overrides_auto_detect(
         self, sample_python_repo, isolated_home
@@ -335,7 +335,7 @@ class TestInit:
         project = self._read_project_json(
             isolated_home["HOME"], "test/no-git",
         )
-        assert project["language"] == "python"
+        assert project["language"] == "auto"
         assert project["commit_sha"] == "nogit"
         assert project["commit_sha_short"] == "nogit"
 

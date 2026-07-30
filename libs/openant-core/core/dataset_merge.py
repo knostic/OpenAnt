@@ -221,7 +221,7 @@ def write_call_graph_index(outcomes, output_path: str) -> dict[str, str]:
             continue
         candidate = os.path.join(outcome.output_dir, "call_graph.json")
         if os.path.isfile(candidate):
-            index[outcome.language] = os.path.relpath(candidate, run_dir)
+            index[outcome.language] = os.path.relpath(candidate, run_dir).replace(os.sep, "/")
 
     os.makedirs(run_dir, exist_ok=True)
     write_json(output_path, index, indent=2)

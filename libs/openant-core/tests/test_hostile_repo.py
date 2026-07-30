@@ -75,6 +75,8 @@ def build_deep_nest(root: Path, depth: int, leaf: str, content: str) -> None:
     no single syscall ever sees a long path. Only one descriptor is held at a time
     — keeping 600 open would blow the default 256-fd limit.
     """
+    if sys.platform == "win32":
+        pytest.skip("deep nesting uses dir_fd + PATH_MAX escape, POSIX-only")
     root.mkdir(parents=True, exist_ok=True)
     cur = os.open(root, os.O_RDONLY)
     try:
@@ -202,6 +204,8 @@ def hostile_repo(tmp_path: Path) -> Path:
 @pytest.fixture
 def fifo_repo(tmp_path: Path) -> Path:
     """A repository whose override file is a FIFO. Reading it blocks forever."""
+    if sys.platform == "win32":
+        pytest.skip("FIFO (os.mkfifo) is POSIX-only")
     repo = tmp_path / "fifo"
     repo.mkdir()
     for name in ("OPENANT.md", "OPENANT.THREATMODEL.md"):

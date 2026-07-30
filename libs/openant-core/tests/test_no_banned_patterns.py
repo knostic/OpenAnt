@@ -52,7 +52,7 @@ def _violations(pattern: re.Pattern, allow: dict[str, str], *suffixes: str):
     """Files matching ``pattern``, minus allowlisted paths (each with a reason)."""
     found = []
     for path in _sources(*suffixes):
-        rel = str(path.relative_to(CORE_ROOT))
+        rel = path.relative_to(CORE_ROOT).as_posix()
         if rel in allow:
             continue
         try:
@@ -115,7 +115,7 @@ def test_language_scanners_do_not_implement_their_own_recursion():
     bad = []
     for path in (CORE_ROOT / "parsers").rglob("repository_scanner.py"):
         text = path.read_text(errors="replace")
-        rel = str(path.relative_to(CORE_ROOT))
+        rel = path.relative_to(CORE_ROOT).as_posix()
         # A self-recursive call inside the scan body — the shape that resists a
         # depth cap and swallows RecursionError in a caller's bare except.
         if re.search(r"self\.scan_directory\([^)]*entry", text):

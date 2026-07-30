@@ -143,7 +143,7 @@ def walk_repository(
             stack.pop()
             continue
 
-        entry_relative = os.path.join(relative, entry.name) if relative else entry.name
+        entry_relative = f"{relative}/{entry.name}" if relative else entry.name
 
         # Explicit stat rather than is_dir()/is_file(): both swallow OSError and
         # answer False, which silently drops anything the OS refuses to stat.

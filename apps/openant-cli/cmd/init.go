@@ -159,8 +159,12 @@ func runInit(cmd *cobra.Command, args []string) {
 	if initLanguage == "auto" {
 		fmt.Fprintf(os.Stderr, "Detecting languages...\n")
 		counts, err := languages.DetectLanguages(repoPath)
-		if err != nil || len(counts) == 0 {
+		if err != nil {
 			output.PrintError(fmt.Sprintf("Language detection failed: %v\nSpecify manually with -l/--language", err))
+			os.Exit(1)
+		}
+		if len(counts) == 0 {
+			output.PrintError("no supported source files found\nSpecify manually with -l/--language")
 			os.Exit(1)
 		}
 		names := make([]string, 0, len(counts))

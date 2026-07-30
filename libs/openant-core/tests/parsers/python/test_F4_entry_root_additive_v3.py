@@ -30,7 +30,7 @@ patch the same seeds are present. If the patch were a no-op this test fails; if
 the patch dropped any pristine seed the superset assertion fails.
 
 Run:
-  PY=/Users/gadievron/.openant/venv/bin/python
+  PY=python
   $PY fixes/F4-entry-root-additive-v3.test.py
 """
 

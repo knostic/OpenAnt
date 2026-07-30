@@ -14,8 +14,8 @@ Asserts the three properties the fix must satisfy:
 
 Run against the refactored tree (GREEN):
     OPENANT_CORE_ROOT=/path/to/openant-core \
-        /Users/gadievron/.openant/venv/bin/python -m pytest \
-        /Users/gadievron/Documents/ClaudeNew/OpenAnt/new-bugs-2/fixes/model-config-centralize.test.py -q
+        python -m pytest \
+        model-config-centralize.test.py -q
 
 Run against the pristine tree (RED — literals still inline, module absent):
     OPENANT_CORE_ROOT=/path/to/pristine/openant-core ... (same command)
@@ -38,7 +38,7 @@ import pytest
 def _default_root() -> Path:
     # This file lives in new-bugs-2/fixes/; core lives in
     # new-bugs-2/OpenAnt/libs/openant-core.
-    return Path(__file__).resolve().parent.parent / "OpenAnt" / "libs" / "openant-core"
+    return Path(__file__).resolve().parent.parent
 
 
 ROOT = Path(os.environ.get("OPENANT_CORE_ROOT", str(_default_root()))).resolve()
