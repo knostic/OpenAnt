@@ -91,6 +91,105 @@ _NO_DIFF_BLOCK = "The vulnerability requires manual intervention. No automated p
 
 _WINDOWS_ENDINGS = "```diff\r\n--- a/foo.py\r\n+++ b/foo.py\r\n@@ -1 +1 @@\r\n-old\r\n+new\r\n```"
 
+# F-29 regression fixtures: a diff body that itself contains a nested
+# Markdown fence must not be truncated at the inner fence.
+
+_NESTED_FENCE_DIFF = """\
+```diff
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -10,4 +10,9 @@ Some intro text
+ ## Usage
+
++```bash
++openant patch --check
++```
++
++See docs for more.
+diff --git a/lib/auth.py b/lib/auth.py
+--- a/lib/auth.py
++++ b/lib/auth.py
+@@ -50,7 +50,7 @@ def verify_token(token):
+-    if token == expected:
++    if hmac.compare_digest(token, expected):
+         return True
+```"""
+
+_QUAD_FENCE_DIFF = """\
+````diff
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,5 @@
+ # Title
++```bash
++echo hello
++```
+````"""
+
+_TILDE_FENCE_DIFF = """\
+~~~diff
+--- a/src/utils.py
++++ b/src/utils.py
+@@ -1,1 +1,1 @@
+-old_line()
++new_line()
+~~~"""
+
+# Context lines (unchanged, single leading space) reproducing a fence from
+# the patched file's own content -- must not be mistaken for the outer
+# fence's closer, since a genuine closer is never diff-prefixed.
+_CONTEXT_LINE_FENCE_DIFF = """\
+```diff
+--- a/README.md
++++ b/README.md
+@@ -10,7 +10,7 @@ Some intro
+ ## Usage
+
+ ```bash
+ echo hi
+ ```
+
+-See docs.
++See documentation.
+```"""
+
+# Recognised opener, real applicable-looking hunk content, but the fence is
+# never closed -- e.g. the model's response was cut off mid-generation.
+_UNCLOSED_FENCE_DIFF = (
+    "```diff\n"
+    "--- a/auth.py\n"
+    "+++ b/auth.py\n"
+    "@@ -1,2 +1,2 @@\n"
+    " def authenticate(u, p):\n"
+    "-    return True\n"
+    "+    return check_credentials(u, p)\n"
+)
+
+# The first ```diff opener is never closed, but a second, independently
+# well-formed ```diff block follows later in the same response. The first
+# block must be treated as malformed on its own -- neither merged with the
+# second block's content nor skipped in favour of it.
+_UNCLOSED_FIRST_THEN_VALID_SECOND_DIFF = (
+    "```diff\n"
+    "--- a/first.py\n"
+    "+++ b/first.py\n"
+    "@@ -1,1 +1,1 @@\n"
+    "-old_first\n"
+    "+new_first\n"
+    "\n"
+    "Some trailing prose, still inside the unclosed first block.\n"
+    "\n"
+    "```diff\n"
+    "--- a/second.py\n"
+    "+++ b/second.py\n"
+    "@@ -1,1 +1,1 @@\n"
+    "-old_second\n"
+    "+new_second\n"
+    "```\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # Tests for _extract_diff_block
@@ -167,6 +266,62 @@ class TestExtractDiffBlock:
 
 
 # ---------------------------------------------------------------------------
+# F-29 regression: nested/embedded fences must not truncate the diff
+# ---------------------------------------------------------------------------
+
+class TestExtractDiffBlockNestedFences:
+    def test_nested_markdown_fence_does_not_truncate_diff(self):
+        from utilities.autopatcher.patch_generator import _extract_diff_block
+        result = _extract_diff_block(_NESTED_FENCE_DIFF)
+        assert result.count("```diff") == 1
+        assert "openant patch --check" in result
+        # The security-relevant change after the inner fenced block must survive.
+        assert "lib/auth.py" in result
+        assert "hmac.compare_digest(token, expected)" in result
+
+    def test_quad_backtick_outer_fence_survives_triple_backtick_content(self):
+        from utilities.autopatcher.patch_generator import _extract_diff_block
+        result = _extract_diff_block(_QUAD_FENCE_DIFF)
+        assert result.startswith("```diff\n")
+        assert "echo hello" in result
+        assert "README.md" in result
+
+    def test_tilde_fenced_diff_normalised_to_diff(self):
+        from utilities.autopatcher.patch_generator import _extract_diff_block
+        result = _extract_diff_block(_TILDE_FENCE_DIFF)
+        assert result.startswith("```diff\n")
+        assert "+new_line()" in result
+        assert "~~~" not in result
+
+    def test_context_line_fence_not_mistaken_for_closer(self):
+        """A single-space-prefixed context line reproducing a bare fence
+        (as unified-diff grammar requires for unchanged content) must not
+        be mistaken for the outer fence's closer."""
+        from utilities.autopatcher.patch_generator import _extract_diff_block
+        result = _extract_diff_block(_CONTEXT_LINE_FENCE_DIFF)
+        assert result.count("```diff") == 1
+        assert "-See docs." in result
+        assert "+See documentation." in result
+
+    def test_unclosed_recognised_fence_returns_empty_string(self):
+        """A recognised opener with no matching closer is malformed
+        structured output -- it must not be returned as partial content or
+        silently repackaged as a complete-looking diff."""
+        from utilities.autopatcher.patch_generator import _extract_diff_block
+        result = _extract_diff_block(_UNCLOSED_FENCE_DIFF)
+        assert result == ""
+
+    def test_unclosed_first_block_not_merged_with_valid_second_block(self):
+        """An unclosed first opener followed by an independently
+        well-formed second block must not be merged or skipped past -- the
+        first block is malformed on its own, so the whole extraction fails
+        closed (""), regardless of the second block's validity."""
+        from utilities.autopatcher.patch_generator import _extract_diff_block
+        result = _extract_diff_block(_UNCLOSED_FIRST_THEN_VALID_SECOND_DIFF)
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
 # Integration: generate_patch extracts clean output from messy LLM response
 # ---------------------------------------------------------------------------
 
@@ -198,6 +353,56 @@ class TestGeneratePatchExtraction:
         llm.complete.return_value = plain
         result = generate_patch("some vuln", llm)
         assert result == plain.strip()
+
+
+# ---------------------------------------------------------------------------
+# F-29 integration regression: an unclosed recognised fence must not become
+# an applicable patch after the real downstream repair/hygiene/applicability
+# chain runs on it -- proven against the actual pipeline code, not asserted
+# as a property of the extractor's output alone.
+# ---------------------------------------------------------------------------
+
+class TestUnclosedFenceCannotBecomeApplicable:
+    def test_unclosed_fence_never_reaches_applicable_true(self, tmp_path):
+        from utilities.autopatcher.patch_generator import _extract_diff_block
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.patch_hygiene import check_patch
+        from utilities.autopatcher.patch_applicability import check_applicability
+
+        (tmp_path / ".git").mkdir()
+
+        # Same fence-open-but-never-closed input as the unit test above, run
+        # through the real downstream chain in the same order pipeline.py
+        # uses: repair -> hygiene -> applicability.
+        patch = _extract_diff_block(_UNCLOSED_FENCE_DIFF)
+        patch, _repair_meta = repair_hunk_headers(patch)
+        check_patch(patch)  # hygiene is best-effort; must not raise
+        result = check_applicability(patch, tmp_path)
+
+        assert result["applicable"] is not True
+        assert result["skipped"] is True
+        assert "empty" in (result["skipped_reason"] or "").lower()
+
+    def test_unclosed_first_block_with_valid_second_block_never_reaches_applicable_true(self, tmp_path):
+        """An unclosed first opener followed by an independently
+        well-formed second block must not, via the real downstream chain,
+        end up applicable=True with either block's content -- and it must
+        not merge the two into some other syntactically-valid patch either."""
+        from utilities.autopatcher.patch_generator import _extract_diff_block
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.patch_hygiene import check_patch
+        from utilities.autopatcher.patch_applicability import check_applicability
+
+        (tmp_path / ".git").mkdir()
+
+        patch = _extract_diff_block(_UNCLOSED_FIRST_THEN_VALID_SECOND_DIFF)
+        patch, _repair_meta = repair_hunk_headers(patch)
+        check_patch(patch)  # hygiene is best-effort; must not raise
+        result = check_applicability(patch, tmp_path)
+
+        assert result["applicable"] is not True
+        assert result["skipped"] is True
+        assert "empty" in (result["skipped_reason"] or "").lower()
 
 
 # ---------------------------------------------------------------------------
