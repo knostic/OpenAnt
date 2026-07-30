@@ -46,7 +46,7 @@ class LanguageSelection:
         selected: Languages to parse, ordered by descending file count.
         counts: The full detection result, including excluded languages.
         excluded: Language → human-readable reason it was dropped. This IS
-            surfaced (docstring corrected 2026-07-25): ``openant/cli.py`` passes
+            surfaced: ``openant/cli.py`` passes
             ``dict(selection.excluded)`` into ``scan_repository`` as the sidecar
             ``excluded_languages`` argument, which ``core/scanner.py`` stores on
             the result and emits in the scan report; ``report_exclusions`` also

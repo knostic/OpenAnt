@@ -75,7 +75,6 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 			return nil
 		}
 
-		// Get relative path from repo root
 		relPath, err := filepath.Rel(s.repoPath, path)
 		if err != nil {
 			relPath = path
@@ -138,14 +137,12 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 			return nil
 		}
 
-		// Add file to results
 		result.Files = append(result.Files, FileInfo{
 			Path:      relPath,
 			Size:      info.Size(),
 			Extension: ext,
 		})
 
-		// Update statistics
 		result.Statistics.TotalFiles++
 		result.Statistics.ByExtension[ext]++
 		result.Statistics.TotalSizeBytes += info.Size()

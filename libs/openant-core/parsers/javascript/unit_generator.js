@@ -332,7 +332,6 @@ class UnitGenerator {
         const hasDepsInlined = upstreamDependencies.length > 0 || downstreamCallers.length > 0;
         const assembledCode = this._assembleEnhancedCode(funcData, upstreamDependencies, downstreamCallers);
 
-        // Build the unit
         const unit = {
             id: functionId,
             unit_type: unitType,

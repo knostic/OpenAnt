@@ -192,7 +192,6 @@ class RepositoryScanner {
                         continue;
                     }
 
-                    // Get file stats
                     let fileStats;
                     try {
                         fileStats = fs.statSync(fullPath);
@@ -203,7 +202,6 @@ class RepositoryScanner {
 
                     const ext = path.extname(entry.name).toLowerCase();
 
-                    // Add to results
                     this.files.push({
                         path: entryRelativePath,
                         size: fileStats.size,
@@ -231,7 +229,6 @@ class RepositoryScanner {
             throw new Error(`Repository path is not a directory: ${this.repoPath}`);
         }
 
-        // Reset state
         this.files = [];
         this.stats = {
             totalFiles: 0,
@@ -250,7 +247,6 @@ class RepositoryScanner {
             unreadable_examples: []
         };
 
-        // Run scan
         this.scanDirectory(this.repoPath);
 
         // Sort files by path for consistent output

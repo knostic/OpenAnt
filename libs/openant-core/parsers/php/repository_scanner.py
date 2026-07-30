@@ -96,7 +96,6 @@ class RepositoryScanner:
         # ``FooTest.php`` is a test while ``Contest.php`` is not.
         self.test_file_pascal_suffix = 'Test.php'
 
-        # Statistics
         self.stats = {
             'total_files': 0,
             'total_size_bytes': 0,
@@ -105,7 +104,6 @@ class RepositoryScanner:
             'test_files_skipped': 0,
         }
 
-        # Results
         self.files: List[Dict] = []
 
     def should_exclude_directory(self, dir_name: str) -> bool:
@@ -183,7 +181,6 @@ class RepositoryScanner:
         if not self.repo_path.is_dir():
             raise NotADirectoryError(f"Repository path is not a directory: {self.repo_path}")
 
-        # Reset state
         self.files = []
         self.stats = {
             'total_files': 0,
@@ -193,7 +190,6 @@ class RepositoryScanner:
             'test_files_skipped': 0,
         }
 
-        # Run scan
         self.scan_directory(self.repo_path)
 
         # Sort files by path for consistent output

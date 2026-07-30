@@ -196,7 +196,6 @@ class UnitGenerator:
                     'class_name': caller_func.get('class_name'),
                 })
 
-        # Assemble enhanced code
         enhanced_code = self.assemble_enhanced_code(func_data, upstream_deps, downstream_callers)
         files_included = self.collect_files_included(file_path, upstream_deps, downstream_callers)
         has_deps_inlined = len(upstream_deps) > 0 or len(downstream_callers) > 0
@@ -205,7 +204,6 @@ class UnitGenerator:
         direct_calls = self.call_graph.get(func_id, [])
         direct_callers = self.reverse_call_graph.get(func_id, [])
 
-        # Build the unit
         unit = {
             'id': func_id,
             'unit_type': unit_type,
@@ -280,7 +278,6 @@ class UnitGenerator:
             total_upstream += dep_meta.get('total_upstream', 0)
             total_downstream += dep_meta.get('total_downstream', 0)
 
-        # Calculate averages
         if self.statistics['total_units'] > 0:
             self.statistics['avg_upstream'] = round(total_upstream / self.statistics['total_units'], 2)
             self.statistics['avg_downstream'] = round(total_downstream / self.statistics['total_units'], 2)

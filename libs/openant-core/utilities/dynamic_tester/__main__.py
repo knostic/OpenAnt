@@ -33,7 +33,6 @@ def main():
         max_retries=args.max_retries,
     )
 
-    # Print summary
     counts = {}
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1

@@ -121,7 +121,6 @@ class UnitGenerator:
         direct_calls = self.call_graph.get(func_id, [])
         direct_callers = self.reverse_call_graph.get(func_id, [])
 
-        # Build enhanced code with dependencies
         primary_code, files_included = self._build_enhanced_code(func_id, func_info, upstream)
 
         original_length = len(func_info.get("code", ""))
@@ -192,7 +191,6 @@ class UnitGenerator:
         self, func_id: str, func_info: Dict[str, Any], upstream: Set[str]
     ) -> tuple[str, List[str]]:
         """Build enhanced code with dependency context."""
-        # Start with the primary function's code
         primary_code = func_info.get("code", "")
         files_included = [func_info["file_path"]]
 

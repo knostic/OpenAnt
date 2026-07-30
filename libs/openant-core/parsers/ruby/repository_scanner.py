@@ -95,7 +95,6 @@ class RepositoryScanner:
         self.test_file_prefixes = ('test_',)
         self.test_file_suffixes = ('_test.rb', '_spec.rb')
 
-        # Statistics
         self.stats = {
             'total_files': 0,
             'total_size_bytes': 0,
@@ -108,7 +107,6 @@ class RepositoryScanner:
             'directories_read_failed': 0,
         }
 
-        # Results
         self.files: List[Dict] = []
 
         # Cycle guard: (st_dev, st_ino) of every directory already descended
@@ -188,7 +186,6 @@ class RepositoryScanner:
         if not self.repo_path.is_dir():
             raise NotADirectoryError(f"Repository path is not a directory: {self.repo_path}")
 
-        # Reset state
         self.files = []
         self._visited_dirs = set()
         self.stats = {
@@ -200,7 +197,6 @@ class RepositoryScanner:
             'directories_read_failed': 0,
         }
 
-        # Run scan
         self.scan_directory(self.repo_path)
 
         # Sort files by path for consistent output

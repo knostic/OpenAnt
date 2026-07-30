@@ -190,7 +190,6 @@ def gather_source_files(repo_path: str, extensions: list[str] = None) -> list[di
     # vendored or generated code.
     exclude_dirs = _canonical_skip_dirs()
 
-    # File patterns to exclude
     exclude_patterns = {'.min.js', '.min.css', '.bundle.js', '.chunk.js', 'package-lock.json'}
 
     files = []

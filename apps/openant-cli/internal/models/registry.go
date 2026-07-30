@@ -57,9 +57,7 @@ var phaseTier = map[string]string{
 // are CURRENT ids; DefaultModel VALIDATES each against config/models.json and
 // refuses to return one that is missing or retired, so a future retirement in
 // the registry surfaces as a failing prefill (and unit test) rather than a
-// silently-404'ing default. The non-anthropic values are unchanged from the
-// pre-registry setup.go; only the anthropic ids moved off the retired
-// claude-opus-4-6 / claude-sonnet-4-20250514 onto the current equivalents.
+// silently-404'ing default.
 var tierModel = map[string]map[string]string{
 	"anthropic": {"strong": "claude-opus-4-8", "light": "claude-sonnet-4-6"},
 	"openai":    {"strong": "gpt-4o", "light": "gpt-4o-mini"},

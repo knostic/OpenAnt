@@ -138,7 +138,6 @@ class ContextAssembler {
             };
         }
 
-        // Add the entry file
         this.addFileContext(sourceFile, 0);
 
         // Parse the handler name to find what we need to resolve
@@ -201,7 +200,6 @@ class ContextAssembler {
         this.visitedFiles.add(filePath);
         this.stats.filesVisited++;
 
-        // Extract function definitions from the file
         const functions = this.extractFunctions(sourceFile);
 
         this.collectedCode.push({

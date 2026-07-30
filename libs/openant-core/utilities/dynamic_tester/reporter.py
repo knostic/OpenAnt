@@ -22,7 +22,6 @@ def generate_report(
     """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # Count statuses
     counts = {}
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1
