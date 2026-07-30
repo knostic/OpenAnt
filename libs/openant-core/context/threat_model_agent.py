@@ -147,21 +147,6 @@ def _finish_tool():
     )
 
 
-def threat_model_exists(repo_path: Path) -> bool:
-    """Whether the repository already ships a threat model file.
-
-    True for anything present at that path, including a symlink or a non-regular
-    file — deliberately NOT ``exists()``, which follows links and so reports False
-    for a dangling one. Callers use this to decide whether to generate; answering
-    "absent" for a path that is occupied by a hostile link is what let the writer
-    treat it as a free filename and follow it out of the repository.
-
-    Safety is decided by ``repo_path_state`` at the point of use; this only answers
-    "is something there".
-    """
-    return repo_path_state(Path(repo_path) / THREAT_MODEL_FILENAME) != "absent"
-
-
 def _build_prompt(repo_path: Path) -> str:
     """Assemble the survey prompt from the repo's own signals."""
     from context.application_context import detect_entry_points, gather_context_sources

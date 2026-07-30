@@ -16,7 +16,6 @@ import pytest
 from context.threat_model_agent import (
     ThreatModelGenerationError,
     generate_threat_model,
-    threat_model_exists,
 )
 
 VALID_PAYLOAD = {
@@ -147,11 +146,6 @@ class TestExistingFileIsNeverClobbered:
         generate_threat_model(repo, FakeBinding(), force=True)
         assert (repo / "OPENANT.THREATMODEL.md.bak").read_text() == "# hand written\n"
         assert "hand written" not in target.read_text()
-
-    def test_threat_model_exists_helper(self, repo):
-        assert not threat_model_exists(repo)
-        (repo / "OPENANT.THREATMODEL.md").write_text("x")
-        assert threat_model_exists(repo)
 
 
 class TestInvalidModelOutputIsRejected:
