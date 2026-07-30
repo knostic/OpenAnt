@@ -191,13 +191,7 @@ openant scan --verify
 
 ### 3. Remediate a finding
 
-Generate a candidate fix and an independent Trust Report for a specific finding in `pipeline_output.json`:
-
-```bash
-LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... openant patch --finding-id VULN-001
-```
-
-This writes the candidate patch and a Trust Report — a recommendation on whether to trust it — to a `patch/` folder in the project's scan directory. The target repository itself is never modified; the patch is generated for review, not applied.
+Generate a candidate patch and an independent Trust Report for a specific finding — see [Auto Patcher](#auto-patcher) below.
 
 ### Working with multiple projects
 
@@ -221,6 +215,68 @@ openant project list              # shows all projects, marks active
 openant project show              # details of active project
 openant project switch <org/repo> # switch active project
 ```
+
+## Auto Patcher
+
+Auto Patcher exists to answer one question: **does this AI-generated patch deserve to be trusted?**
+
+Given a specific finding from an OpenAnt scan, it generates a candidate patch and then subjects that patch to independent, adversarial scrutiny, producing a Trust Report that states whether the patch is fit to deploy — backed by the evidence behind that call. It does not autofix your repository: the patch and its Trust Report are written to disk for a human to review, and the target repository is never modified.
+
+### Why AI-generated patches can't be trusted at face value
+
+A patch produced by an LLM can look correct — it compiles, it touches the right function, it reads like a competent fix — without actually closing the vulnerability. It may narrow the attack surface without eliminating it, fix the described case while missing an adjacent one, or apply cleanly against one version of a file and silently fail against another. Fluent output is not verified output, and asking the same model that wrote a patch whether the patch is good doesn't close that gap — it just repeats the same blind spot.
+
+### What Auto Patcher does differently
+
+Rather than returning a single "here's the fix," every candidate patch goes through a trust-building process:
+
+```
+Generate a candidate patch
+        │
+        ▼
+Challenge it from an adversarial perspective
+        │
+        ▼
+Collect deterministic evidence — does it apply cleanly? does it introduce obvious defects?
+        │
+        ▼
+Produce a recommendation, backed by the evidence collected above
+```
+
+The adversarial pass is a distinct reasoning step whose only job is to argue the patch doesn't hold up — not to confirm that it does. The deterministic checks (applying the patch against the real repository, scanning the diff for hygiene issues) never rely on an LLM's opinion of its own work. The final recommendation is computed from all of this evidence by a fixed decision policy, not read off an LLM's self-reported confidence.
+
+### Philosophy
+
+- **Never communicate more certainty than the evidence supports.** A check that didn't run is reported as unverified, never as a quiet pass.
+- **Recommendations come from deterministic policy, not from an LLM's self-assessment.** Each of the four possible recommendations is computed from evidence gates a human can audit — not a model grading its own patch.
+- **Every recommendation ships with the evidence behind it.** The Trust Report separates what was mechanically verified from what is heuristic, adversarial-review judgment, so a reviewer never has to guess which is which.
+- **The deployment decision stays with a human.** Auto Patcher never applies a patch to the target repository — it produces a recommendation for someone accountable to act on.
+
+### Quick start
+
+Auto Patcher runs against a finding already produced by an OpenAnt scan (`openant scan` / `openant build-output`) that carries an exploitable verdict:
+
+```bash
+LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... openant patch --finding-id VULN-001
+```
+
+`LLM_PROVIDER` (`anthropic` or `openai`) and the matching API key must be set explicitly. This is configured independently of OpenAnt's own `--llm-config` system, and deliberately does not fall back to a mock LLM unless you ask for one.
+
+### The Trust Report
+
+Each run writes two files under `patch/` in the project's scan directory:
+
+- `{finding-id}-vulnerability.md` — the finding as rendered into the input Auto Patcher worked from.
+- `{finding-id}-trust-report.md` — the Trust Report.
+
+The Trust Report leads with a single recommendation — **Deploy After Validation**, **Deploy With Caution**, **Manual Review Required**, or **Do Not Apply** — followed by the evidence behind it: whether the patch applies to the repository, whether adversarial review turned up a remaining exploit path, whether tests already cover the affected code, and what deployment risk the change carries. Each item is marked as either a deterministic check or a heuristic judgment.
+
+### Known limitations
+
+- Auto Patcher is an early-stage capability — its own reports are labeled MVP output today.
+- Some evidence signals (impact analysis, existing-test discovery) currently run meaningfully only on Python codebases; on other languages they report as not applicable rather than being silently skipped.
+- Auto Patcher's LLM access supports Anthropic and OpenAI only; unlike `--llm-config`, it does not support Google.
+- This is a decision aid for a human reviewer, not a replacement for manual security review.
 
 ## Roadmap
 
