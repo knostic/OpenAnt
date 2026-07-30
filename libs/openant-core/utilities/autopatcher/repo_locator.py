@@ -1,11 +1,22 @@
 """Locate relevant source code in a repository given a vulnerability description.
 
-Three ranked signal sources — no AST, no embeddings:
-  1. Explicit file path references in the vulnerability text  (score 3)
-  2. Symbol / backtick-term grep                              (score 2)
-  3. CWE-specific keyword fallback                            (score 1)
+Four ranked signal sources — no AST, no embeddings — highest priority first:
+  1. Explicit file path references in the vulnerability text     (_TIER_EXPLICIT_PATH)
+  2. Exact symbol-definition match (class/def of a named symbol)  (_TIER_SYMBOL_DEFINITION)
+  3. Symbol / backtick-term grep                                 (_TIER_GENERAL_GREP)
+  4. CWE-specific keyword fallback                                (_TIER_CWE_FALLBACK)
 
-Pass 2 combines two extractors:
+Pass 2 (exact symbol-definition match) exists because raw grep occurrence
+counts (Pass 3) are an unreliable relevance signal on their own: a generic
+token repeated many times in an unrelated file can otherwise outscore — and
+evict from the final context — the file that actually *defines* the named
+vulnerable symbol (see F-30). A file that defines a class or function named
+in the advisory is ranked above ordinary grep hits, so it cannot be displaced
+by occurrence count alone. This reuses the same candidate-creation / merge /
+ranking / dedup / rendering pipeline as every other pass — no separate
+rendering path, budget, or injection mechanism.
+
+Pass 3 combines two extractors:
   - Unfiltered backtick terms: ``Cookie``, ``Authorization``, etc. — advisory
     authors use backticks to highlight specific technical terms; these are
     meaningful grep signals even when the raw word looks generic.
@@ -15,14 +26,6 @@ Pass 2 combines two extractors:
 Candidates are collected across all passes, deduped by path, and ranked.
 Returns a code context string (≤ 4 000 chars) ready to inject into the
 patch generator prompt.
-
-Class-definition supplement (full-file mode only):
-  After ranking, files that *define* a PascalCase class named in the advisory
-  are prepended to the secondary context queue.  This ensures implementation
-  files (e.g. a provider or handler class) reach the model even when generic
-  signal words (e.g. "stac") inflate the occurrence counts of routing/API
-  files and push the defining file below the ranked[1:3] window.
-  The supplement does not modify scoring, ranking, or existing pass behaviour.
 """
 
 from __future__ import annotations
@@ -93,14 +96,27 @@ _FULL_FILE_THRESHOLD_CHARS = 20_000
 _SECONDARY_CONTEXT_BUDGET = 4_000  # chars for snippets appended after the full-file primary
 _MIN_CLASS_NAME_LENGTH = 5  # PascalCase names shorter than this are too generic for class-def search
 
+# Pass priority tiers, highest first. A candidate's final rank is the max
+# tier assigned to it by any pass that found it (see the merge step in
+# find_code_context). Explicit path stays strictly highest; Exact Symbol
+# Definition sits directly below it so a file that *defines* the named
+# symbol cannot be outranked by ordinary grep occurrence counts (F-30).
+# Numeric values are an implementation detail — only the relative order
+# matters.
+_TIER_EXPLICIT_PATH = 4
+_TIER_SYMBOL_DEFINITION = 3
+_TIER_GENERAL_GREP = 2
+_TIER_CWE_FALLBACK = 1
+
 # Per-pass candidate limits passed to _grep_repo. Both currently 3 (the
 # value hardcoded before this constant existed) — kept as two separate
 # names, not one shared constant, specifically so either pass's limit can
 # be changed independently in the future without silently changing the
 # other's behavior too (2026-07-16 experiment: a single shared limit was
-# confirmed to widen Pass 2's own candidate return exactly as much as
-# Pass 3's, which cannot help Pass 3 since Pass 2 always outranks Pass 3
-# by tier regardless of candidate count).
+# confirmed to widen the general-grep pass's own candidate return exactly
+# as much as the CWE-fallback pass's, which cannot help the latter since
+# general grep always outranks CWE fallback by tier regardless of
+# candidate count).
 _PASS2_CANDIDATE_LIMIT = 3
 _PASS3_CANDIDATE_LIMIT = 3
 
@@ -372,15 +388,15 @@ def find_code_context(
             p = resolution.path
             try:
                 content = p.read_text(encoding="utf-8", errors="ignore")
-                candidates.append((3, p, content, 0))
+                candidates.append((_TIER_EXPLICIT_PATH, p, content, 0))
                 _evidence_by_path.setdefault(p, []).append(DiscoveryEvidence(
-                    pass_name="explicit_path", tier=3,
+                    pass_name="explicit_path", tier=_TIER_EXPLICIT_PATH,
                     matched_tokens=[rel], total_occurrences=None,
                     hit_line=0, resolution_strategy=resolution.strategy,
                 ))
                 _debug_raw_candidates.append({
                     "file": _rel(p, repo_root), "pass": "explicit_path",
-                    "score": 3, "matched_tokens": [rel],
+                    "score": _TIER_EXPLICIT_PATH, "matched_tokens": [rel],
                     "occurrence_counts": None, "hit_line_0indexed": 0,
                     "resolution_strategy": resolution.strategy,
                 })
@@ -391,7 +407,26 @@ def find_code_context(
         else:
             _debug_unresolved_paths.append(rel)
 
-    # Pass 2: symbol name grep — unfiltered backtick terms merged with filtered symbols
+    # Pass 2: exact symbol-definition match — a file that *defines* a named
+    # class/function/method is ranked above ordinary grep hits (Pass 3), so
+    # it cannot be displaced by a generic token's raw occurrence count
+    # elsewhere (F-30). Reuses the same candidate/merge/rank/dedup/render
+    # pipeline as every other pass — no separate budget or rendering path.
+    for p, content, hit_line in _find_symbol_definitions(vulnerability_text, repo_root):
+        candidates.append((_TIER_SYMBOL_DEFINITION, p, content, hit_line))
+        _evidence_by_path.setdefault(p, []).append(DiscoveryEvidence(
+            pass_name="symbol_definition", tier=_TIER_SYMBOL_DEFINITION,
+            matched_tokens=None, total_occurrences=None,
+            hit_line=hit_line, resolution_strategy=None,
+        ))
+        _debug_raw_candidates.append({
+            "file": _rel(p, repo_root), "pass": "symbol_definition",
+            "score": _TIER_SYMBOL_DEFINITION,
+            "matched_tokens": None, "occurrence_counts": None,
+            "hit_line_0indexed": hit_line,
+        })
+
+    # Pass 3: symbol name grep — unfiltered backtick terms merged with filtered symbols
     backtick_terms = _extract_backtick_terms(vulnerability_text)
     symbols = _extract_symbols(vulnerability_text)
     all_signals = list(dict.fromkeys(backtick_terms + symbols))[:15]
@@ -400,15 +435,15 @@ def find_code_context(
             repo_root, all_signals,
             _debug_sink=_debug_pass2_scanned, limit=_PASS2_CANDIDATE_LIMIT,
         ):
-            candidates.append((2, p, content, hit_line))
+            candidates.append((_TIER_GENERAL_GREP, p, content, hit_line))
             _evidence_by_path.setdefault(p, []).append(DiscoveryEvidence(
-                pass_name="symbol_search", tier=2,
+                pass_name="symbol_search", tier=_TIER_GENERAL_GREP,
                 matched_tokens=None, total_occurrences=None,
                 hit_line=hit_line, resolution_strategy=None,
             ))
             _debug_raw_candidates.append({
                 "file": _rel(p, repo_root), "pass": "symbol_search",
-                "score": 2,
+                "score": _TIER_GENERAL_GREP,
                 "matched_tokens": next(
                     (e["matched_tokens"] for e in _debug_pass2_scanned if e["file"] == p), {}
                 ),
@@ -418,9 +453,9 @@ def find_code_context(
                 "hit_line_0indexed": hit_line,
             })
 
-    # Pass 3: CWE keyword fallback — dict-based keywords unioned with tokens
+    # Pass 4: CWE keyword fallback — dict-based keywords unioned with tokens
     # derived from the advisory's own CWE name (cwe_name_tokens), so a CWE
-    # missing from _CWE_KEYWORDS still contributes Pass-3 signal. Union, not
+    # missing from _CWE_KEYWORDS still contributes signal. Union, not
     # replacement: zero regression risk to the dict's existing coverage.
     kws: list[str] = []
     for cwe in _extract_cwes(vulnerability_text):
@@ -432,15 +467,15 @@ def find_code_context(
             repo_root, kws,
             _debug_sink=_debug_pass3_scanned, limit=_PASS3_CANDIDATE_LIMIT,
         ):
-            candidates.append((1, p, content, hit_line))
+            candidates.append((_TIER_CWE_FALLBACK, p, content, hit_line))
             _evidence_by_path.setdefault(p, []).append(DiscoveryEvidence(
-                pass_name="cwe_keywords", tier=1,
+                pass_name="cwe_keywords", tier=_TIER_CWE_FALLBACK,
                 matched_tokens=None, total_occurrences=None,
                 hit_line=hit_line, resolution_strategy=None,
             ))
             _debug_raw_candidates.append({
                 "file": _rel(p, repo_root), "pass": "cwe_keywords",
-                "score": 1,
+                "score": _TIER_CWE_FALLBACK,
                 "matched_tokens": next(
                     (e["matched_tokens"] for e in _debug_pass3_scanned if e["file"] == p), {}
                 ),
@@ -558,47 +593,14 @@ def find_code_context(
                 _dec.bytes_contributed = len(parts[0])
                 _dec.truncated = False
 
-            # Build the secondary queue.
-            # Class-definition supplements come first: files that define a
-            # PascalCase class named in the advisory are injected before ranked
-            # secondary files so they appear even when occurrence-count ranking
-            # pushes them below the ranked[1:3] window.
-            # The primary file (top_p) is always excluded from supplementation.
+            # Build the secondary queue from the remaining ranked candidates.
+            # Files that *define* a named symbol no longer need a separate
+            # supplement here — Pass 2 (exact symbol-definition match, see
+            # above) already ranks them ahead of ordinary grep hits, so they
+            # are already part of `ranked` (as ranked[0] or within ranked[1:])
+            # by the time this code runs.
             _seen_secondary: set[Path] = {top_p}
             _secondary_queue: list[tuple[Path, str, int]] = []
-            for _sup_p, _sup_content, _sup_hit in _find_class_definitions(
-                vulnerability_text, repo_root
-            ):
-                _sup_rel = _rel(_sup_p, repo_root)
-                if _sup_rel not in _debug_by_file:
-                    _debug_by_file[_sup_rel] = {
-                        "file": _sup_rel,
-                        "passes": [{
-                            "pass": "class_definition_supplement", "score": None,
-                            "matched_tokens": None, "occurrence_counts": None,
-                            "hit_line_0indexed": _sup_hit,
-                        }],
-                        "final_score": None, "selection_outcome": "rejected",
-                        "snippet_range_1indexed": None, "bytes_contributed": 0,
-                        "truncated": False,
-                    }
-                if _sup_rel not in _grounding_candidates:
-                    _grounding_candidates[_sup_rel] = RepositoryCandidate(
-                        path=_sup_rel,
-                        evidence=[DiscoveryEvidence(
-                            pass_name="class_definition_supplement", tier=None,
-                            matched_tokens=None, total_occurrences=None,
-                            hit_line=_sup_hit, resolution_strategy=None,
-                        )],
-                        best_tier=None,
-                    )
-                    _grounding_decisions[_sup_rel] = GroundingDecision(
-                        path=_sup_rel, outcome="rejected", snippet_ranges=None,
-                        bytes_contributed=0, truncated=False,
-                    )
-                if _sup_p not in _seen_secondary:
-                    _secondary_queue.append((_sup_p, _sup_content, _sup_hit))
-                    _seen_secondary.add(_sup_p)
             for _rank_p, (_, _rank_content, _rank_hit) in ranked[1:]:
                 if _rank_p not in _seen_secondary:
                     _secondary_queue.append((_rank_p, _rank_content, _rank_hit))
@@ -917,37 +919,50 @@ def _grep_repo(
 
 
 # ---------------------------------------------------------------------------
-# Class-definition supplement
+# Exact symbol-definition match (Pass 2)
 # ---------------------------------------------------------------------------
 
-def _find_class_definitions(
+def _find_symbol_definitions(
     vulnerability_text: str, repo_root: Path
 ) -> list[tuple[Path, str, int]]:
-    """Return (path, content, hit_line) for Python files that define a class
-    named in the advisory text.
+    """Return (path, content, hit_line) for Python files that define a
+    class, function, or method named in the advisory text.
 
-    Only PascalCase names of length >= _MIN_CLASS_NAME_LENGTH are considered;
-    shorter names are too generic (e.g. "Foo", "Base") and produce false
-    positives.  Results are sorted by definition count descending so the
-    canonical implementation floats above re-export shims.
+    Class names: only PascalCase names of length >= _MIN_CLASS_NAME_LENGTH
+    are considered; shorter names are too generic (e.g. "Foo", "Base") and
+    produce false positives.
+    Function/method names: any symbol _extract_symbols already extracted
+    (backtick-quoted, snake_case, or PascalCase) — that extractor already
+    filters generic tokens and requires length >= 4, so no additional
+    narrowing is needed for a "def" match the way PascalCase needs for a
+    "class" match.
 
-    hit_line is the 0-indexed line of the first class definition match,
-    so that _extract_snippet centres the secondary snippet on the class body
-    rather than the top of the file.
+    Results are sorted by definition count descending so the canonical
+    implementation floats above re-export shims.
 
-    Python-only.  Test files are excluded.  Returns [] when no qualifying
-    class names are present in the advisory.
+    hit_line is the 0-indexed line of the first definition match, so that
+    _extract_snippet centres a snippet on the definition itself rather than
+    the top of the file.
+
+    Python-only. Test files are excluded. Returns [] when no qualifying
+    names are present in the advisory.
     """
+    symbols = _extract_symbols(vulnerability_text)
     class_names = [
-        s for s in _extract_symbols(vulnerability_text)
+        s for s in symbols
         if re.match(r'^[A-Z][a-z]', s) and len(s) >= _MIN_CLASS_NAME_LENGTH
     ]
-    if not class_names:
+    def_names = symbols
+    if not class_names and not def_names:
         return []
 
-    pattern = re.compile(
-        r'(?m)^\s*class\s+(' + '|'.join(re.escape(c) for c in class_names) + r')\b'
-    )
+    pattern_parts = []
+    if class_names:
+        pattern_parts.append(r'class\s+(?:' + '|'.join(re.escape(c) for c in class_names) + r')')
+    if def_names:
+        pattern_parts.append(r'def\s+(?:' + '|'.join(re.escape(d) for d in def_names) + r')')
+    pattern = re.compile(r'(?m)^\s*(?:' + '|'.join(pattern_parts) + r')\b')
+
     hits: list[tuple[int, Path, str, int]] = []
     # Resolved once per call and reused for every candidate below, rather
     # than re-resolving repo_root for each file.

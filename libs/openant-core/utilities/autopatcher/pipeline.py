@@ -559,9 +559,9 @@ def _render_primary_references(refs: dict) -> str:
 # ---------------------------------------------------------------------------
 _GROUNDING_REASON_PHRASES = {
     "explicit_path": "Explicitly referenced in the security advisory",
+    "symbol_definition": "Defines the exact symbol named in the advisory",
     "symbol_search": "References a symbol named in the advisory",
     "cwe_keywords": "Contains terminology associated with this vulnerability type",
-    "class_definition_supplement": "Defines a class named in the advisory",
 }
 
 # "Used for" — one phrase per GroundingDecision.outcome. Literal lookup only:

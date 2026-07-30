@@ -1168,9 +1168,9 @@ class TestRepositoryContextSection:
 
     @pytest.mark.parametrize("pass_name,expected_phrase", [
         ("explicit_path", "Explicitly referenced in the security advisory"),
+        ("symbol_definition", "Defines the exact symbol named in the advisory"),
         ("symbol_search", "References a symbol named in the advisory"),
         ("cwe_keywords", "Contains terminology associated with this vulnerability type"),
-        ("class_definition_supplement", "Defines a class named in the advisory"),
     ])
     def test_semantic_reason_mapping(self, pass_name, expected_phrase):
         from utilities.autopatcher.pipeline import _render_repository_context_section
@@ -1197,14 +1197,15 @@ class TestRepositoryContextSection:
         assert _selected_reason_kind(candidate) == "symbol_search"
 
     def test_selected_reason_kind_falls_back_to_first_evidence_when_best_tier_none(self):
-        """Class-definition-supplement-only candidates have best_tier=None
-        by construction (see repo_locator.py) — must not crash, must use
-        the one evidence entry present."""
+        """Defensive fallback for a hypothetical best_tier=None candidate (no
+        current repo_locator.py pass produces one — every pass now assigns a
+        real tier, including the exact symbol-definition pass) — must not
+        crash, must use the one evidence entry present."""
         from utilities.autopatcher.pipeline import _selected_reason_kind
         candidate = self._candidate(
-            "a_file.py", [self._evidence("class_definition_supplement", tier=None)], best_tier=None,
+            "a_file.py", [self._evidence("some_future_tierless_pass", tier=None)], best_tier=None,
         )
-        assert _selected_reason_kind(candidate) == "class_definition_supplement"
+        assert _selected_reason_kind(candidate) == "some_future_tierless_pass"
 
     def test_selected_reason_kind_none_for_missing_or_empty_candidate(self):
         from utilities.autopatcher.pipeline import _selected_reason_kind

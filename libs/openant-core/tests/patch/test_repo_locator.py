@@ -1163,18 +1163,19 @@ class TestHybridContextBudget:
 
 
 # ---------------------------------------------------------------------------
-# _find_class_definitions unit tests
+# _find_symbol_definitions unit tests
 # ---------------------------------------------------------------------------
 
-class TestFindClassDefinitions:
-    """Unit tests for the class-definition supplement helper."""
+class TestFindSymbolDefinitions:
+    """Unit tests for the exact symbol-definition lookup (Pass 2): finds
+    files that define a class, function, or method named in the advisory."""
 
     def test_finds_defining_file(self, tmp_path):
         """Returns the file that contains 'class FileSystemProvider'."""
-        from utilities.autopatcher.repo_locator import _find_class_definitions
+        from utilities.autopatcher.repo_locator import _find_symbol_definitions
         write(tmp_path / "provider" / "filesystem.py",
               "class FileSystemProvider:\n    def get_data_path(self): pass\n")
-        results = _find_class_definitions("FileSystemProvider path traversal", tmp_path)
+        results = _find_symbol_definitions("FileSystemProvider path traversal", tmp_path)
         assert len(results) == 1
         p, _, hit_line = results[0]
         assert p.name == "filesystem.py"
@@ -1182,50 +1183,54 @@ class TestFindClassDefinitions:
 
     def test_hit_line_points_to_class_not_file_top(self, tmp_path):
         """hit_line is the 0-indexed line of the class definition, not always 0."""
-        from utilities.autopatcher.repo_locator import _find_class_definitions
+        from utilities.autopatcher.repo_locator import _find_symbol_definitions
         preamble = "import os\n" * 20  # 20 lines before the class
         write(tmp_path / "fs.py", preamble + "class FileSystemProvider:\n    pass\n")
-        results = _find_class_definitions("FileSystemProvider path traversal", tmp_path)
+        results = _find_symbol_definitions("FileSystemProvider path traversal", tmp_path)
         assert results, "should find fs.py"
         _, _, hit_line = results[0]
         assert hit_line == 20, f"expected hit_line=20, got {hit_line}"
 
     def test_ignores_names_below_min_length(self, tmp_path):
         """Names shorter than _MIN_CLASS_NAME_LENGTH (5) must not trigger a scan."""
-        from utilities.autopatcher.repo_locator import _find_class_definitions
+        from utilities.autopatcher.repo_locator import _find_symbol_definitions
         write(tmp_path / "foo.py", "class Foo:\n    pass\n")   # len 3
         write(tmp_path / "abcd.py", "class Abcd:\n    pass\n")  # len 4
-        results = _find_class_definitions("Foo and Abcd have vulnerabilities", tmp_path)
+        results = _find_symbol_definitions("Foo and Abcd have vulnerabilities", tmp_path)
         assert results == [], f"short names must be ignored, got {results}"
 
     def test_excludes_test_files(self, tmp_path):
         """Files inside tests/ or named test_*.py must not appear."""
-        from utilities.autopatcher.repo_locator import _find_class_definitions
+        from utilities.autopatcher.repo_locator import _find_symbol_definitions
         write(tmp_path / "tests" / "test_provider.py",
               "class FileSystemProvider:\n    pass\n")
         write(tmp_path / "provider.py",
               "class FileSystemProvider:\n    pass\n")
-        results = _find_class_definitions("FileSystemProvider path traversal", tmp_path)
+        results = _find_symbol_definitions("FileSystemProvider path traversal", tmp_path)
         assert len(results) == 1
         assert results[0][0].name == "provider.py", "test file must be excluded"
 
-    def test_returns_empty_when_no_pascal_case_in_advisory(self, tmp_path):
-        """Advisory with only snake_case and backtick terms produces no class-def scan."""
-        from utilities.autopatcher.repo_locator import _find_class_definitions
+    def test_finds_defining_file_via_def_when_no_pascal_case_in_advisory(self, tmp_path):
+        """An advisory with only a snake_case/backtick symbol (no PascalCase
+        class name) must still find the file that *defines* it, via the
+        "def" branch — this is the generalization from class-only lookup to
+        symbol lookup (functions/methods), the core of F-30's fix."""
+        from utilities.autopatcher.repo_locator import _find_symbol_definitions
         write(tmp_path / "auth.py", "def authenticate_user(): pass\n")
-        results = _find_class_definitions(
+        results = _find_symbol_definitions(
             "SQL injection in `authenticate_user` (CWE-89)", tmp_path
         )
-        assert results == []
+        assert len(results) == 1
+        assert results[0][0].name == "auth.py"
 
     def test_multiple_class_names_matched(self, tmp_path):
         """Multiple PascalCase class names in the advisory each trigger discovery."""
-        from utilities.autopatcher.repo_locator import _find_class_definitions
+        from utilities.autopatcher.repo_locator import _find_symbol_definitions
         write(tmp_path / "stac_handler.py",
               "class StacHandler:\n    pass\n")
         write(tmp_path / "filesystem.py",
               "class FileSystemProvider:\n    pass\n")
-        results = _find_class_definitions(
+        results = _find_symbol_definitions(
             "FileSystemProvider and StacHandler both have path traversal", tmp_path
         )
         names = {r[0].name for r in results}
@@ -1234,24 +1239,25 @@ class TestFindClassDefinitions:
 
     def test_sorted_by_definition_count_descending(self, tmp_path):
         """File with more class definitions appears first."""
-        from utilities.autopatcher.repo_locator import _find_class_definitions
+        from utilities.autopatcher.repo_locator import _find_symbol_definitions
         # two.py defines FileSystemProvider twice (e.g. re-export + real class)
         write(tmp_path / "two.py",
               "class FileSystemProvider:\n    pass\nclass FileSystemProvider:\n    pass\n")
         write(tmp_path / "one.py",
               "class FileSystemProvider:\n    pass\n")
-        results = _find_class_definitions("FileSystemProvider path traversal", tmp_path)
+        results = _find_symbol_definitions("FileSystemProvider path traversal", tmp_path)
         assert results[0][0].name == "two.py", "higher definition count must rank first"
 
 
 # ---------------------------------------------------------------------------
-# Class-definition supplement integration tests (find_code_context)
+# Exact symbol-definition pass integration tests (find_code_context)
 # ---------------------------------------------------------------------------
 
-class TestClassDefinitionGrounding:
-    """Class-definition supplement: advisory-named PascalCase classes appear
-    in secondary context even when occurrence-count ranking pushes them below
-    the ranked[1:3] window."""
+class TestSymbolDefinitionGrounding:
+    """Exact symbol-definition pass (F-30): a file that *defines* an
+    advisory-named class/function outranks ordinary grep hits, so it cannot
+    be displaced by occurrence-count ranking — regardless of how many times
+    an unrelated file repeats some other, more generic token."""
 
     def _write_high_hit_primary(self, tmp_path: Path, signal: str, n: int = 25) -> Path:
         """Write api.py with many occurrences of signal but no class definition."""
@@ -1263,20 +1269,24 @@ class TestClassDefinitionGrounding:
         return write(tmp_path / "api.py", content)
 
     def test_class_def_file_injected_despite_low_occurrence_rank(self, tmp_path):
-        """filesystem.py defines the advisory-named class but is excluded by _grep_repo[:3].
+        """filesystem.py defines the advisory-named class but has the lowest
+        raw \\bstac\\b occurrence count of the four files below.
 
         Hit counts verified against \\bstac\\b (underscore is a word char so
         "handle_stac" does NOT contribute a standalone "stac" hit; only the
         trailing "# stac" comment in _write_high_hit_primary does):
-          api.py     26 hits (1 header + 25 comments)  -> ranked[0], primary
-          urls.py    10 hits (1 header + 9 /stac/ paths) -> ranked[1]
-          flask_app   8 hits (1 header + 7 /stac/ paths) -> ranked[2]
-          filesystem  5 hits (4 standalone + 1 FileSystemProvider) -> 4th, outside [:3]
-        Without the supplement filesystem.py is never in candidates.
-        With it, _find_class_definitions fires and injects it as secondary slot 1.
+          api.py     26 hits (1 header + 25 comments)
+          urls.py    10 hits (1 header + 9 /stac/ paths)
+          flask_app   8 hits (1 header + 7 /stac/ paths)
+          filesystem  5 hits (4 standalone + 1 FileSystemProvider) -- lowest count
+        Under pure occurrence-count ranking filesystem.py would rank 4th and
+        be excluded by _grep_repo[:3] entirely. The exact symbol-definition
+        pass (F-30) instead ranks it above all three occurrence-based hits,
+        since it *defines* FileSystemProvider — so it becomes the full-file
+        primary, not merely a low-priority secondary.
         """
         from utilities.autopatcher.repo_locator import find_code_context
-        # api.py: 26 stac hits (1 header + 25 trailing comments) -> primary
+        # api.py: 26 stac hits (1 header + 25 trailing comments)
         self._write_high_hit_primary(tmp_path, "stac", 25)
         # urls.py: 10 stac hits (1 header + 9 "/stac/" route paths)
         write(tmp_path / "urls.py",
@@ -1284,8 +1294,7 @@ class TestClassDefinitionGrounding:
         # flask_app.py: 8 stac hits (1 header + 7 "/stac/" route paths)
         write(tmp_path / "flask_app.py",
               "# stac routes\n" + "@app.route('/stac/')\n" * 7)
-        # filesystem.py: 5 hits (4 standalone stac + 1 FileSystemProvider) -> 4th
-        # Excluded by _grep_repo[:3]; only the class-def supplement can inject it.
+        # filesystem.py: 5 hits (4 standalone stac + 1 FileSystemProvider) -- lowest count
         write(tmp_path / "provider" / "filesystem.py",
               "class FileSystemProvider:\n"
               "    def get_data_path(self, path): return path\n"
@@ -1293,19 +1302,22 @@ class TestClassDefinitionGrounding:
         ctx = find_code_context(
             "FileSystemProvider path traversal in `stac` collection", tmp_path
         )
-        assert "filesystem.py" in ctx, (
-            "class-def file must be injected via supplement despite being excluded by _grep_repo[:3]"
+        assert "# provider/filesystem.py (full file," in ctx, (
+            "the file defining FileSystemProvider must become the full-file primary "
+            "despite having the lowest raw occurrence count"
         )
 
-    def test_primary_file_not_displaced(self, tmp_path):
-        """api.py (highest `stac` occurrence count) must remain the full-file primary
-        even when the class-def supplement fires for filesystem.py.
-
-        Uses _write_high_hit_primary so api.py gets 26 standalone \\bstac\\b hits
-        (vs filesystem.py's 5), ensuring api.py wins ranked[0].
+    def test_symbol_definition_file_becomes_primary_despite_lower_occurrence_count(
+        self, tmp_path
+    ):
+        """F-30 core regression: a generic token repeated many times in an
+        unrelated file (api.py, 26 raw \\bstac\\b hits) must NOT evict or
+        outrank the file that actually *defines* the advisory-named symbol
+        (filesystem.py, only 5 raw hits) — the defining file must become the
+        full-file primary candidate.
         """
         from utilities.autopatcher.repo_locator import find_code_context
-        # api.py: 26 stac hits -> primary (ranked[0])
+        # api.py: 26 stac hits -- highest raw occurrence count, no definition
         self._write_high_hit_primary(tmp_path, "stac", 25)
         write(tmp_path / "provider" / "filesystem.py",
               "class FileSystemProvider:\n"
@@ -1314,7 +1326,13 @@ class TestClassDefinitionGrounding:
         ctx = find_code_context(
             "FileSystemProvider path traversal in `stac` collection", tmp_path
         )
-        assert "# api.py (full file," in ctx, "api.py must remain the full-file primary"
+        assert "# provider/filesystem.py (full file," in ctx, (
+            "the symbol-defining file must be the primary, not the high-occurrence file"
+        )
+        assert "# api.py (full file," not in ctx, (
+            "a generic token's raw occurrence count must not win primary status "
+            "over the file that defines the named symbol"
+        )
 
     def test_class_def_file_not_duplicated_when_already_primary(self, tmp_path):
         """If the class-defining file IS the primary, it must not appear twice."""
@@ -1332,25 +1350,28 @@ class TestClassDefinitionGrounding:
             f"class-def file as primary must not be duplicated; headers: {headers}"
         )
 
-    def test_no_class_name_in_advisory_behavior_unchanged(self, tmp_path):
-        """Advisory without PascalCase class names: supplement is empty.
-        Output must be consistent with pre-supplement logic (no crash, non-empty)."""
+    def test_function_found_via_def_branch_when_no_class_name_in_advisory(self, tmp_path):
+        """Advisory without a PascalCase class name still finds the file that
+        *defines* the named function, via the generalized def-matching
+        branch — not just supported "by coincidence" through ordinary grep."""
         from utilities.autopatcher.repo_locator import find_code_context
         write(tmp_path / "auth.py",
               "def authenticate_user(u, p):\n    return u == 'admin'\n")
         ctx = find_code_context("SQL injection in `authenticate_user` (CWE-89)", tmp_path)
         assert "authenticate_user" in ctx
 
-    def test_short_class_names_do_not_trigger_supplement(self, tmp_path):
-        """PascalCase names < _MIN_CLASS_NAME_LENGTH must not trigger supplement scan."""
-        from utilities.autopatcher.repo_locator import _find_class_definitions
+    def test_short_names_do_not_trigger_symbol_definition_scan(self, tmp_path):
+        """PascalCase names < _MIN_CLASS_NAME_LENGTH must not trigger a scan."""
+        from utilities.autopatcher.repo_locator import _find_symbol_definitions
         write(tmp_path / "foo.py", "class Foo:\n    pass\n")
         write(tmp_path / "base.py", "class Base:\n    pass\n")
-        assert _find_class_definitions("Foo and Base vulnerability", tmp_path) == []
+        assert _find_symbol_definitions("Foo and Base vulnerability", tmp_path) == []
 
     def test_class_def_snippet_includes_class_body(self, tmp_path):
-        """Snippet for class-def supplement must include the class definition itself,
-        not just the top-of-file preamble (hit_line points to the class line)."""
+        """The symbol-definition file's content must include the class
+        definition itself, not just the top-of-file preamble (hit_line
+        points to the class line) — here as the full-file primary, since
+        the defining file outranks the high-occurrence file."""
         from utilities.autopatcher.repo_locator import find_code_context
         self._write_high_hit_primary(tmp_path, "stac", 25)
         preamble = "import os\nimport sys\n\n"  # 3 lines before class
@@ -1361,27 +1382,125 @@ class TestClassDefinitionGrounding:
         )
         write(tmp_path / "provider.py", preamble + class_body)
         ctx = find_code_context("FileSystemProvider path traversal in stac", tmp_path)
-        assert "class FileSystemProvider" in ctx, (
-            "class definition must appear in the secondary snippet"
+        assert "# provider.py (full file," in ctx, (
+            "the symbol-defining file must be the full-file primary"
         )
+        assert "class FileSystemProvider" in ctx
 
-    def test_secondary_budget_still_respected(self, tmp_path):
-        """Adding a supplement does not blow the secondary budget."""
-        from utilities.autopatcher.repo_locator import find_code_context, _SECONDARY_CONTEXT_BUDGET
+    def test_symbol_definition_file_is_primary_in_snippet_mode_when_large(self, tmp_path):
+        """F-30 regression (snippet mode): when the file that defines the
+        named symbol is itself large enough to exceed the full-file
+        threshold, it must still become the FIRST candidate considered in
+        snippet mode (ranked[0]) — not be displaced by a smaller, unrelated
+        file with a higher raw occurrence count of some generic token."""
+        from utilities.autopatcher.repo_locator import (
+            find_code_context, _FULL_FILE_THRESHOLD_CHARS, _MAX_CONTEXT_CHARS,
+        )
+        # api.py: 26 stac hits, tiny file, no definition of anything named.
         self._write_high_hit_primary(tmp_path, "stac", 25)
-        # Large class-def file that far exceeds the secondary budget
+        # provider.py: defines FileSystemProvider, but is large enough to
+        # exceed the full-file threshold and force snippet mode.
         big_provider = (
             "class FileSystemProvider:\n"
             + "    # implementation line\n" * 2000
         )
-        assert len(big_provider) > _SECONDARY_CONTEXT_BUDGET
+        assert len(big_provider) > _FULL_FILE_THRESHOLD_CHARS
         write(tmp_path / "provider.py", big_provider)
-        ctx = find_code_context("FileSystemProvider path traversal in stac", tmp_path)
-        # Locate the secondary portion (everything after the primary header)
-        primary_end = ctx.index("\n\n") if "\n\n" in ctx else len(ctx)
-        secondary = ctx[primary_end:]
-        assert len(secondary) <= _SECONDARY_CONTEXT_BUDGET + 300, (
-            f"secondary portion ({len(secondary)} chars) exceeds budget allowance"
+
+        ctx = find_code_context("FileSystemProvider path traversal in `stac` collection", tmp_path)
+
+        assert "class FileSystemProvider" in ctx, (
+            "the large defining file must still be included, anchored at its "
+            "class definition, despite exceeding the full-file threshold"
+        )
+        assert "provider.py" in ctx and "api.py" in ctx
+        # provider.py (ranked[0]) must be rendered before api.py (ranked[1]) —
+        # confirms it was not displaced from the first slot.
+        assert ctx.index("provider.py") < ctx.index("api.py"), (
+            "the symbol-defining file must occupy the first (primary) slot "
+            "in snippet mode, not be pushed behind the high-occurrence file"
+        )
+        assert len(ctx) <= _MAX_CONTEXT_CHARS + 500, (
+            f"snippet-mode output ({len(ctx)} chars) exceeds the expected budget allowance"
+        )
+
+
+# ---------------------------------------------------------------------------
+# F-30 regression: a generic token's raw occurrence count must not evict or
+# outrank the file that defines the advisory's actual named symbol. Mirrors
+# the finding's own example ("path" — a plain _GENERIC_TOKENS word, not a
+# repo-specific one like "stac") and its exact failure-mode narrative: three
+# unrelated files each repeating a generic word many times, competing
+# against one real file that defines the named vulnerable symbol.
+# ---------------------------------------------------------------------------
+
+class TestF30GenericTokenCannotEvictDefiningFile:
+    def test_defining_file_survives_full_eviction_scenario(self, tmp_path):
+        """Before the fix, three unrelated files each repeating a generic
+        backtick term ("path") enough times would fill _grep_repo's own
+        top-3 cut, silently evicting the file that defines the named
+        symbol from the candidate list entirely — see the F-30 root-cause
+        investigation. The exact symbol-definition pass finds the defining
+        file independently of _grep_repo's occurrence-based cut, so it must
+        survive regardless of how much generic-token noise exists."""
+        from utilities.autopatcher.repo_locator import find_code_context
+
+        # The real vulnerable file: defines the named symbol, barely
+        # mentions the generic term.
+        write(tmp_path / "auth.py",
+              "def authenticate_user(username, password, path):\n"
+              "    return db.check(username, password)\n")
+
+        # Three unrelated files, each with many occurrences of the generic
+        # term and zero mentions of the actual vulnerable symbol -- enough
+        # to have filled _grep_repo's own top-3 cutoff before the fix.
+        for n, fname in enumerate(["routes.py", "storage.py", "uploads.py"], start=1):
+            write(tmp_path / fname,
+                  "\n".join(f"def helper_{n}_{i}(path):\n    return path" for i in range(20)))
+
+        vuln_text = (
+            "**Type:** CWE-287 Improper Authentication\n\n"
+            "The `authenticate_user` function does not validate the redirect `path` "
+            "parameter, allowing an attacker-controlled `path` to bypass auth checks."
+        )
+
+        ctx = find_code_context(vuln_text, tmp_path)
+
+        assert "def authenticate_user" in ctx, (
+            "the file defining the named vulnerable symbol must not be evicted "
+            "by unrelated files repeating a generic token"
+        )
+        assert "# auth.py (full file," in ctx, (
+            "the defining file must be the primary candidate, not merely present"
+        )
+
+    def test_generic_token_does_not_outrank_defining_file(self, tmp_path):
+        """Two-file version: even without enough noise files to trigger full
+        eviction from _grep_repo's own cut, a single unrelated file with a
+        higher raw occurrence count of a generic token must not become the
+        primary ahead of the file that defines the named symbol."""
+        from utilities.autopatcher.repo_locator import find_code_context
+
+        write(tmp_path / "auth.py",
+              "def authenticate_user(username, password):\n"
+              "    # path traversal via unsanitized redirect path\n"
+              "    return db.check(username, password)\n")
+        write(tmp_path / "unrelated_paths.py",
+              "\n".join(f"def helper_{i}(path):\n    return path + str({i})" for i in range(30)))
+
+        vuln_text = (
+            "**Type:** CWE-287 Improper Authentication\n\n"
+            "The `authenticate_user` function does not validate the redirect `path` "
+            "parameter, allowing an attacker-controlled `path` to bypass auth checks."
+        )
+
+        ctx = find_code_context(vuln_text, tmp_path)
+
+        assert "# auth.py (full file," in ctx, (
+            "the symbol-defining file must be the primary candidate"
+        )
+        assert "# unrelated_paths.py (full file," not in ctx, (
+            "a generic token's raw occurrence count must not win primary status"
         )
 
 
@@ -1606,16 +1725,17 @@ class TestSelectedPassAndSelected:
         assert candidate["selected"] is True
         assert candidate["selection_outcome"] != "rejected"
 
-    # Fixture shared by the next three tests: mirrors
-    # TestClassDefinitionGrounding's api.py/urls.py/flask_app.py/filesystem.py
-    # setup elsewhere in this file — api.py(26 `stac` hits) wins primary;
-    # urls.py(10) and flask_app.py(8) are _grep_repo's ranked[1]/ranked[2];
-    # filesystem.py(5) falls outside _grep_repo's top-3 cut entirely and is
-    # only reachable via the class-definition supplement. Because the
-    # supplement is prepended to the secondary queue ahead of ranked[1:],
-    # and the secondary queue is capped at 2 slots, flask_app.py (ranked[2])
-    # is pushed out and ends up "rejected" — giving a real, non-null
-    # final_score paired with a rejected outcome.
+    # Fixture shared by the next four tests: mirrors
+    # TestSymbolDefinitionGrounding's api.py/urls.py/flask_app.py/filesystem.py
+    # setup elsewhere in this file. filesystem.py defines FileSystemProvider,
+    # so the exact symbol-definition pass (tier 3) ranks it above all three
+    # ordinary grep hits (tier 2) regardless of occurrence count — it becomes
+    # the full-file primary (ranked[0]). api.py(26 `stac` hits) and
+    # urls.py(10) are the two highest-occurrence tier-2 hits and fill the
+    # 2-slot secondary queue (ranked[1], ranked[2]); flask_app.py(8), the
+    # third and lowest tier-2 hit, is pushed out by the 2-slot cap and ends
+    # up "rejected" — giving a real, non-null final_score paired with a
+    # rejected outcome.
     def _write_rejection_fixture(self, tmp_path: Path) -> None:
         write(
             tmp_path / "api.py",
@@ -1662,8 +1782,7 @@ class TestSelectedPassAndSelected:
 
     def test_selected_pass_never_null_for_any_candidate(self, tmp_path, monkeypatch):
         """Every entry that made it into the candidates list arrived via at
-        least one pass, so selected_pass must always resolve to a name —
-        including a final_score=None, supplement-only entry."""
+        least one pass, so selected_pass must always resolve to a name."""
         from utilities.autopatcher.repo_locator import find_code_context
         monkeypatch.setenv("AUTOPATCHER_DEBUG", "1")
         monkeypatch.chdir(tmp_path)
@@ -1675,14 +1794,18 @@ class TestSelectedPassAndSelected:
         for c in record["candidates"]:
             assert c["selected_pass"] is not None, f"selected_pass unexpectedly null for {c['file']}"
 
-    def test_selected_pass_class_definition_supplement_when_final_score_none(
+    def test_selected_pass_symbol_definition_for_promoted_low_occurrence_file(
         self, tmp_path, monkeypatch
     ):
-        """filesystem.py is injected solely via the class-definition
-        supplement (no Pass 1/2/3 hit of its own within the top-3 cut), so
-        final_score=None; selected_pass must still resolve to
-        'class_definition_supplement', not None."""
-        from utilities.autopatcher.repo_locator import find_code_context
+        """filesystem.py has the lowest raw occurrence count of the four
+        files in this fixture, but the exact symbol-definition pass (F-30)
+        ranks it above every ordinary grep hit because it *defines*
+        FileSystemProvider. final_score must be the real symbol-definition
+        tier (not None — there is no more supplement-only, tier-less path),
+        and selected_pass must resolve to 'symbol_definition'."""
+        from utilities.autopatcher.repo_locator import (
+            find_code_context, _TIER_SYMBOL_DEFINITION,
+        )
         monkeypatch.setenv("AUTOPATCHER_DEBUG", "1")
         monkeypatch.chdir(tmp_path)
         self._write_rejection_fixture(tmp_path)
@@ -1693,8 +1816,11 @@ class TestSelectedPassAndSelected:
             c for c in record["candidates"] if c["file"] == "provider/filesystem.py"
         )
 
-        assert candidate["final_score"] is None
-        assert candidate["selected_pass"] == "class_definition_supplement"
+        assert candidate["final_score"] == _TIER_SYMBOL_DEFINITION
+        assert candidate["selected_pass"] == "symbol_definition"
+        assert candidate["selection_outcome"] == "primary_full_file", (
+            "the defining file must be the primary, not merely a rejected-adjacent entry"
+        )
 
 
 class TestGroundRepository:
@@ -1759,10 +1885,10 @@ class TestGroundRepository:
 
     def test_secondary_context_selected_and_rejected(self, tmp_path):
         """Reuses TestSelectedPassAndSelected's rejection fixture: 4
-        candidates, 3 selected (1 primary full-file, 2 secondary snippets —
-        one of them class-definition-supplement-only, final_score=None),
-        1 rejected by the 2-slot secondary cap despite having real,
-        non-null evidence (final_score=2)."""
+        candidates, 3 selected (1 primary full-file — the symbol-definition
+        file, ranked above all ordinary grep hits — plus 2 secondary
+        snippets), 1 rejected by the 2-slot secondary cap despite having
+        real, non-null evidence (final_score=2)."""
         from utilities.autopatcher.repo_locator import find_code_context, ground_repository
         write(tmp_path / "api.py",
               "# stac routing module\n" + "def handle_stac(req): pass  # stac\n" * 25)
@@ -1788,14 +1914,14 @@ class TestGroundRepository:
             assert cand.path == dec.path
 
         outcomes = {d.path: d.outcome for d in result.decisions}
-        assert outcomes["api.py"] == "primary_full_file"
+        assert outcomes["provider/filesystem.py"] == "primary_full_file"
+        assert outcomes["api.py"] == "secondary_snippet"
         assert outcomes["urls.py"] == "secondary_snippet"
-        assert outcomes["provider/filesystem.py"] == "secondary_snippet"
         assert outcomes["flask_app.py"] == "rejected"
 
         selected = {p for p, o in outcomes.items() if o != "rejected"}
         rejected = {p for p, o in outcomes.items() if o == "rejected"}
-        assert selected == {"api.py", "urls.py", "provider/filesystem.py"}
+        assert selected == {"provider/filesystem.py", "api.py", "urls.py"}
         assert rejected == {"flask_app.py"}
 
 
@@ -1806,7 +1932,7 @@ class TestGroundRepository:
 # that *lives* inside the repo but whose target *resolves* outside it must
 # never be enumerated, grepped, class-def-matched, or suffix-resolved. These
 # tests exercise the resolve-and-compare check directly through the three
-# call sites it was added to (_grep_repo, _find_class_definitions,
+# call sites it was added to (_grep_repo, _find_symbol_definitions,
 # RepositoryPathResolver._iter_files), plus find_code_context end-to-end.
 # ---------------------------------------------------------------------------
 
@@ -1834,13 +1960,13 @@ class TestSymlinkContainment:
         assert results == []
 
     def test_external_symlink_rejected_by_class_definitions(self, tmp_path):
-        from utilities.autopatcher.repo_locator import _find_class_definitions
+        from utilities.autopatcher.repo_locator import _find_symbol_definitions
         repo = tmp_path / "repo"
         repo.mkdir()
         write(tmp_path / "secret.py", "class LeakyProvider:\n    pass\n")
         os.symlink(tmp_path / "secret.py", repo / "evil.py")
 
-        results = _find_class_definitions("LeakyProvider vulnerability", repo)
+        results = _find_symbol_definitions("LeakyProvider vulnerability", repo)
         assert results == []
 
     def test_suffix_match_cannot_return_escaping_symlink(self, tmp_path):
@@ -1910,12 +2036,12 @@ class TestSymlinkContainment:
         assert "app.py" in names
 
     def test_broken_symlink_does_not_crash_class_definitions(self, tmp_path):
-        from utilities.autopatcher.repo_locator import _find_class_definitions
+        from utilities.autopatcher.repo_locator import _find_symbol_definitions
         repo = tmp_path / "repo"
         repo.mkdir()
         os.symlink(tmp_path / "does_not_exist.py", repo / "broken.py")
 
-        results = _find_class_definitions("Anything at all", repo)
+        results = _find_symbol_definitions("Anything at all", repo)
         assert results == []
 
     def test_broken_symlink_does_not_crash_suffix_match(self, tmp_path):
@@ -1945,12 +2071,12 @@ class TestSymlinkContainment:
         assert "app.py" in names
 
     def test_symlink_loop_does_not_crash_class_definitions(self, tmp_path):
-        from utilities.autopatcher.repo_locator import _find_class_definitions
+        from utilities.autopatcher.repo_locator import _find_symbol_definitions
         repo = tmp_path / "repo"
         repo.mkdir()
         os.symlink(repo / "loop_a.py", repo / "loop_a.py")
 
-        results = _find_class_definitions("Anything at all", repo)
+        results = _find_symbol_definitions("Anything at all", repo)
         assert results == []
 
     def test_exact_match_symlink_loop_fails_closed(self, tmp_path):
@@ -1976,7 +2102,7 @@ class TestSymlinkContainment:
         location."""
         from utilities.autopatcher.repo_locator import (
             RepositoryPathResolver,
-            _find_class_definitions,
+            _find_symbol_definitions,
             _grep_repo,
         )
         real_root = tmp_path / "real_root"
@@ -1989,7 +2115,7 @@ class TestSymlinkContainment:
         grep_results = _grep_repo(repo_via_link, ["authenticate"])
         assert {p.name for p, _c, _h in grep_results} == {"app.py"}
 
-        class_results = _find_class_definitions("FileSystemProvider vuln", repo_via_link)
+        class_results = _find_symbol_definitions("FileSystemProvider vuln", repo_via_link)
         assert {p.name for p, _c, _h in class_results} == {"provider.py"}
 
         resolver = RepositoryPathResolver(repo_via_link)
