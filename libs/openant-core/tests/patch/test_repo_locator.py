@@ -1797,3 +1797,202 @@ class TestGroundRepository:
         rejected = {p for p, o in outcomes.items() if o == "rejected"}
         assert selected == {"api.py", "urls.py", "provider/filesystem.py"}
         assert rejected == {"flask_app.py"}
+
+
+# ---------------------------------------------------------------------------
+# F-18: symlink / path-containment regression tests
+#
+# _safe_under() is a security boundary, not a convenience filter: a symlink
+# that *lives* inside the repo but whose target *resolves* outside it must
+# never be enumerated, grepped, class-def-matched, or suffix-resolved. These
+# tests exercise the resolve-and-compare check directly through the three
+# call sites it was added to (_grep_repo, _find_class_definitions,
+# RepositoryPathResolver._iter_files), plus find_code_context end-to-end.
+# ---------------------------------------------------------------------------
+
+class TestSymlinkContainment:
+    def test_external_absolute_symlink_rejected_by_grep(self, tmp_path):
+        from utilities.autopatcher.repo_locator import _grep_repo
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        write(tmp_path / "secret.py", "HOST_SECRET = 'hunter2'\n")
+        os.symlink(tmp_path / "secret.py", repo / "evil.py")
+
+        results = _grep_repo(repo, ["HOST_SECRET"])
+        assert results == []
+
+    def test_external_relative_symlink_rejected_by_grep(self, tmp_path):
+        from utilities.autopatcher.repo_locator import _grep_repo
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        write(tmp_path / "secret.py", "HOST_SECRET = 'hunter2'\n")
+        # Target given as a path relative to the symlink's own directory
+        # (repo/), so it escapes without ever mentioning an absolute path.
+        os.symlink(os.path.join("..", "secret.py"), repo / "evil.py")
+
+        results = _grep_repo(repo, ["HOST_SECRET"])
+        assert results == []
+
+    def test_external_symlink_rejected_by_class_definitions(self, tmp_path):
+        from utilities.autopatcher.repo_locator import _find_class_definitions
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        write(tmp_path / "secret.py", "class LeakyProvider:\n    pass\n")
+        os.symlink(tmp_path / "secret.py", repo / "evil.py")
+
+        results = _find_class_definitions("LeakyProvider vulnerability", repo)
+        assert results == []
+
+    def test_suffix_match_cannot_return_escaping_symlink(self, tmp_path):
+        from utilities.autopatcher.repo_locator import RepositoryPathResolver
+        repo = tmp_path / "repo"
+        (repo / "_internal").mkdir(parents=True)
+        write(tmp_path / "secret.py", "HOST_SECRET = 1\n")
+        os.symlink(tmp_path / "secret.py", repo / "_internal" / "download.py")
+
+        resolver = RepositoryPathResolver(repo)
+        result = resolver.resolve("_internal/download.py")
+        assert result.path is None
+        assert result.strategy == "unresolved"
+
+    def test_find_code_context_never_surfaces_external_content(self, tmp_path):
+        from utilities.autopatcher.repo_locator import find_code_context
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        write(tmp_path / "secret.py", "HOST_SECRET_TOKEN = 'do-not-leak'\n")
+        os.symlink(tmp_path / "secret.py", repo / "evil.py")
+        write(repo / "app.py", "def authenticate(): pass\n")
+
+        vuln = "authenticate() is exploitable — see `HOST_SECRET_TOKEN`"
+        result = find_code_context(vuln, repo)
+        assert "do-not-leak" not in result
+        assert "HOST_SECRET_TOKEN" not in result
+
+    def test_in_repo_symlink_still_supported_by_grep(self, tmp_path):
+        """A symlink whose target resolves inside the repo is not an escape
+        and must keep working exactly as before (no regression)."""
+        from utilities.autopatcher.repo_locator import _grep_repo
+        repo = tmp_path / "repo"
+        write(repo / "impl" / "real.py", "def authenticate(): pass\n")
+        os.symlink(repo / "impl" / "real.py", repo / "alias.py")
+
+        results = _grep_repo(repo, ["authenticate"])
+        names = {p.name for p, _content, _hit in results}
+        assert "alias.py" in names
+
+    def test_in_repo_symlink_still_supported_by_suffix_match(self, tmp_path):
+        """Mirrors test_suffix_match_resolves_src_layout: the advisory names
+        `_internal/download.py`, but the real file lives under a src-layout
+        prefix reached only via a symlinked alias — no `_internal/` directory
+        exists at the repo root, so this can only resolve via suffix match."""
+        from utilities.autopatcher.repo_locator import RepositoryPathResolver
+        repo = tmp_path / "repo"
+        write(repo / "real" / "download.py", "def unpack_url(): pass\n")
+        (repo / "src" / "pip" / "_internal").mkdir(parents=True)
+        os.symlink(repo / "real" / "download.py", repo / "src" / "pip" / "_internal" / "download.py")
+
+        resolver = RepositoryPathResolver(repo)
+        result = resolver.resolve("_internal/download.py")
+        assert result.strategy == "suffix"
+        assert result.path is not None
+        assert result.path.resolve() == (repo / "real" / "download.py").resolve()
+
+    def test_broken_symlink_does_not_crash_grep(self, tmp_path):
+        from utilities.autopatcher.repo_locator import _grep_repo
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.symlink(tmp_path / "does_not_exist.py", repo / "broken.py")
+        write(repo / "app.py", "def authenticate(): pass\n")
+
+        results = _grep_repo(repo, ["authenticate"])
+        names = {p.name for p, _content, _hit in results}
+        assert "broken.py" not in names
+        assert "app.py" in names
+
+    def test_broken_symlink_does_not_crash_class_definitions(self, tmp_path):
+        from utilities.autopatcher.repo_locator import _find_class_definitions
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.symlink(tmp_path / "does_not_exist.py", repo / "broken.py")
+
+        results = _find_class_definitions("Anything at all", repo)
+        assert results == []
+
+    def test_broken_symlink_does_not_crash_suffix_match(self, tmp_path):
+        from utilities.autopatcher.repo_locator import RepositoryPathResolver
+        repo = tmp_path / "repo"
+        (repo / "_internal").mkdir(parents=True)
+        os.symlink(tmp_path / "does_not_exist.py", repo / "_internal" / "download.py")
+
+        resolver = RepositoryPathResolver(repo)
+        result = resolver.resolve("_internal/download.py")
+        assert result.path is None
+
+    def test_symlink_loop_does_not_hang_or_crash(self, tmp_path):
+        """A mutual symlink loop must be rejected quickly, not hang the scan
+        or propagate the OS-level 'too many levels of symbolic links' error."""
+        from utilities.autopatcher.repo_locator import _grep_repo
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.symlink(repo / "loop_b.py", repo / "loop_a.py")
+        os.symlink(repo / "loop_a.py", repo / "loop_b.py")
+        write(repo / "app.py", "def authenticate(): pass\n")
+
+        results = _grep_repo(repo, ["authenticate"])
+        names = {p.name for p, _content, _hit in results}
+        assert "loop_a.py" not in names
+        assert "loop_b.py" not in names
+        assert "app.py" in names
+
+    def test_symlink_loop_does_not_crash_class_definitions(self, tmp_path):
+        from utilities.autopatcher.repo_locator import _find_class_definitions
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.symlink(repo / "loop_a.py", repo / "loop_a.py")
+
+        results = _find_class_definitions("Anything at all", repo)
+        assert results == []
+
+    def test_exact_match_symlink_loop_fails_closed(self, tmp_path):
+        """A symlink loop at the exact path an advisory names must not
+        crash resolution — `.resolve()` raises RuntimeError for a loop, and
+        _resolve_exact must catch that and fail closed (unresolved), not
+        propagate it. A single path segment guarantees this exercises only
+        the exact-match branch, never the suffix fallback."""
+        from utilities.autopatcher.repo_locator import RepositoryPathResolver
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.symlink(repo / "loop.py", repo / "loop.py")
+
+        resolver = RepositoryPathResolver(repo)
+        result = resolver.resolve("loop.py")
+        assert result.path is None
+        assert result.strategy == "unresolved"
+
+    def test_repo_root_beneath_symlinked_ancestor_still_works(self, tmp_path):
+        """The repo root itself sitting under a symlinked ancestor directory
+        (e.g. macOS's /tmp -> /private/tmp) must not break containment —
+        both sides of the comparison need to resolve to the same canonical
+        location."""
+        from utilities.autopatcher.repo_locator import (
+            RepositoryPathResolver,
+            _find_class_definitions,
+            _grep_repo,
+        )
+        real_root = tmp_path / "real_root"
+        write(real_root / "repo" / "app.py", "def authenticate(): pass\n")
+        write(real_root / "repo" / "provider.py", "class FileSystemProvider:\n    pass\n")
+        link_root = tmp_path / "link_root"
+        os.symlink(real_root, link_root)
+        repo_via_link = link_root / "repo"
+
+        grep_results = _grep_repo(repo_via_link, ["authenticate"])
+        assert {p.name for p, _c, _h in grep_results} == {"app.py"}
+
+        class_results = _find_class_definitions("FileSystemProvider vuln", repo_via_link)
+        assert {p.name for p, _c, _h in class_results} == {"provider.py"}
+
+        resolver = RepositoryPathResolver(repo_via_link)
+        result = resolver.resolve("app.py")
+        assert result.strategy == "exact"
+        assert result.path is not None

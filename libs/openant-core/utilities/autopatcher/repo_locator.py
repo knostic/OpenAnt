@@ -250,16 +250,26 @@ class RepositoryPathResolver:
         return PathResolution(None, "unresolved")
 
     def _resolve_exact(self, rel: str) -> "Path | None":
-        p = (self._repo_root / rel).resolve()
-        if _safe_under(p, self._repo_root) and p.is_file():
+        try:
+            p = (self._repo_root / rel).resolve()
+        except (OSError, RuntimeError):
+            return None
+        if _safe_under(p, self._repo_root.resolve()) and p.is_file():
             return p
         return None
 
     def _iter_files(self) -> list[Path]:
         if self._files is None:
+            # Resolved once here (this block only runs once per resolver
+            # instance, since self._files is then cached) and reused for
+            # every candidate below, rather than re-resolving repo_root
+            # for each file.
+            resolved_root = self._repo_root.resolve()
             self._files = [
                 p for p in sorted(self._repo_root.rglob("*"))
-                if p.is_file() and not any(part in _IGNORED_DIRS for part in p.parts)
+                if p.is_file()
+                and not any(part in _IGNORED_DIRS for part in p.parts)
+                and _safe_under(p, resolved_root)
             ]
         return self._files
 
@@ -856,6 +866,9 @@ def _grep_repo(
     """
     patterns = [re.compile(rf'\b{re.escape(t)}\b') for t in tokens]
     hits: list[tuple[int, Path, str, int]] = []  # (count, path, content, hit_line)
+    # Resolved once per call and reused for every candidate below, rather
+    # than re-resolving repo_root for each file.
+    resolved_root = repo_root.resolve()
 
     for p in sorted(repo_root.rglob("*")):
         if p.is_dir():
@@ -865,6 +878,8 @@ def _grep_repo(
         if p.suffix not in _SOURCE_EXTENSIONS:
             continue
         if _is_test_file(p):
+            continue
+        if not _safe_under(p, resolved_root):
             continue
         try:
             content = p.read_text(encoding="utf-8", errors="ignore")
@@ -934,10 +949,15 @@ def _find_class_definitions(
         r'(?m)^\s*class\s+(' + '|'.join(re.escape(c) for c in class_names) + r')\b'
     )
     hits: list[tuple[int, Path, str, int]] = []
+    # Resolved once per call and reused for every candidate below, rather
+    # than re-resolving repo_root for each file.
+    resolved_root = repo_root.resolve()
     for p in sorted(repo_root.rglob("*.py")):
         if any(part in _IGNORED_DIRS for part in p.parts):
             continue
         if _is_test_file(p):
+            continue
+        if not _safe_under(p, resolved_root):
             continue
         try:
             content = p.read_text(encoding="utf-8", errors="ignore")
@@ -1109,9 +1129,24 @@ def _extract_snippet(
 # ---------------------------------------------------------------------------
 
 def _safe_under(p: Path, root: Path) -> bool:
-    """Return True if p is under root (no path traversal)."""
+    """Return True only if p resolves to a real location under root.
+
+    `root` must already be resolved by the caller — every call site
+    resolves the repo root once (see e.g. `_grep_repo`) and reuses it
+    across many candidates, so resolving it again here on every call would
+    be redundant work. `p` is resolved here (following symlinks and ``..``
+    segments) so a path whose *textual* location is under root but whose
+    *target* escapes it — e.g. a symlink pointing outside the repository —
+    is rejected. This is a security boundary: any resolution failure
+    (symlink loop, unreadable component) is treated as unsafe rather than
+    propagated, so callers fail closed instead of crashing.
+    """
     try:
-        p.relative_to(root.resolve())
+        resolved_p = p.resolve()
+    except (OSError, RuntimeError):
+        return False
+    try:
+        resolved_p.relative_to(root)
         return True
     except ValueError:
         return False
