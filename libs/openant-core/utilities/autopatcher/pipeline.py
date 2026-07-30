@@ -717,6 +717,104 @@ def _build_known_findings(classified_challenger: dict, finding_calibration: list
     }
 
 
+# ---------------------------------------------------------------------------
+# Recommendation Policy Invariants
+#
+# _compute_trust_signals and _build_recommendation_v1 below implement these
+# invariants. Every branch in both functions must be traceable to one of
+# them by its inline `# In` tag — a branch with no tag, or one that
+# contradicts its tag, is a policy bug. Do not add a fallthrough branch
+# that isn't justified here first.
+#
+# State model
+#   applicability        ∈ {APPLIES, REJECTED, UNAVAILABLE}
+#     UNAVAILABLE = applicable is None. Subsumes pre-flight skip (no repo,
+#     no .git, empty diff, git missing), subprocess timeout, and unexpected
+#     exception — these are policy-equivalent (only their notes/reason text
+#     differs); none may be distinguished from another when deciding a
+#     signal value.
+#   impact_level          ∈ {low, medium, high, not_applicable, unavailable}
+#     unavailable = impact analysis raised and was swallowed (result.impact
+#     is None) — distinct from, and never conflated with, a genuine "low"
+#     result.
+#   patch_integrity        ∈ {Clean, Minor Issues, Not Verified,
+#                              Does Not Apply, Critical Issues}
+#   security_improvement   ∈ {None, Unknown, Low, Medium, High}
+#   deployment_safety       ∈ {Low Risk, Medium Risk, High Risk, Not Verified}
+#
+# I1 — No positive inference from missing applicability evidence.
+#      UNAVAILABLE applicability maps to patch_integrity=Not Verified and
+#      security_improvement=Unknown — never to Clean/Does Not Apply, and
+#      never to Low/Medium/High. Holds identically for skip, timeout, and
+#      exception.
+#
+# I2 — No positive inference from missing impact evidence.
+#      impact_level ∈ {not_applicable, unavailable} maps to
+#      deployment_safety=Not Verified — never to Low Risk.
+#
+# I3 — Deploy After Validation requires positive evidence on every
+#      mandatory gate, expressed as an explicit whitelist, never as a
+#      "not-the-bad-value" blacklist, and never inferred from "didn't hit
+#      the hard-block gate" — absence of a block is not evidence of a
+#      verified-clean state. It requires ALL of:
+#        integrity              == Clean          (exactly — see below)
+#        alignment               != Misaligned
+#        NOT (still_vulnerable AND defect_count == 0)
+#        security_improvement   IN {High, Medium}
+#        deployment_safety       IN {Low Risk, Medium Risk}
+#      "Minor Issues" is deliberately excluded from the integrity allowlist:
+#      it reports an actual observed hygiene defect in the patch (currently
+#      only "unused_import" — a real, if low-severity, code-quality problem,
+#      not a missing-evidence placeholder), and the report itself already
+#      renders it as "⚠️ Needs review", never "✅ Good" — so treating it as
+#      verified-positive here would contradict what the system already tells
+#      the reader. Every condition above must be spelled out as an explicit
+#      membership test against known-good values. A condition shaped as
+#      `x != BAD_VALUE` is a policy bug by construction — it silently admits
+#      Unknown/Not Verified/any future value. New signal values default to
+#      Manual Review Required until explicitly added to a whitelist here.
+#
+# I4 — Do Not Apply requires explicit, deterministic negative evidence only
+#      (git-apply / hygiene via patch_integrity) — never from heuristic
+#      challenger findings alone.
+#
+# I5 — Inconclusive evidence defaults to Manual Review Required. Any state
+#      not explicitly covered by I3 or I4 — including Unknown, Not
+#      Verified, still_vulnerable-with-no-confirmed-defect, and
+#      Misaligned — resolves to Manual Review Required. No silent default
+#      resolves to a stronger decision than the evidence supports.
+#
+# I6 — Never communicate more certainty than the evidence supports.
+#      Not Verified / Unknown / None are always weaker than their positive
+#      counterparts and never appear in a positive whitelist.
+# ---------------------------------------------------------------------------
+
+
+def _applicability_unavailable_reason(applicability: dict) -> str | None:
+    """Returns a human-readable reason when applicability is UNAVAILABLE
+    (applicable is None — covers skip, timeout, and unexpected exception
+    identically per I1), else None.
+    """
+    if applicability.get("applicable") is not None:
+        return None
+    return (
+        applicability.get("skipped_reason")
+        or applicability.get("error")
+        or "applicability check did not complete"
+    )
+
+
+def _resolve_impact_level(impact: dict | None) -> str:
+    """Map a (possibly absent) impact-analysis result to an impact_level
+    string. `impact is None` means the analysis raised and was swallowed
+    (see pipeline.run()'s impact-analysis try/except) — that is distinct
+    from, and must never be read as, a genuine "low" result (I2).
+    """
+    if impact is None:
+        return "unavailable"
+    return impact.get("impact_level") or "low"
+
+
 def _compute_trust_signals(
     hygiene: list | None,
     applicability: dict | None,
@@ -727,7 +825,9 @@ def _compute_trust_signals(
     """Compute the six Trust Package signals from existing deterministic pipeline outputs.
 
     Returns a dict mapping signal keys to {value, label, notes} dicts.
-    All logic is deterministic — no LLM score is used.
+    All logic is deterministic — no LLM score is used. See the Recommendation
+    Policy Invariants block above; each branch below is tagged with the
+    invariant it exists to satisfy.
     """
     hygiene = hygiene or []
     applicability = applicability or {}
@@ -742,16 +842,17 @@ def _compute_trust_signals(
     still_vulnerable = bool((classified_challenger or {}).get("still_vulnerable"))
 
     # --- Patch Integrity ---
+    _unavailable_reason = _applicability_unavailable_reason(applicability)
     if high_hygiene:
-        int_val = "Critical Issues"
+        int_val = "Critical Issues"  # I4: deterministic negative evidence
         int_notes = f"HIGH: {high_hygiene[0].get('detail', '')[:80]}"
     elif applicability.get("applicable") is False:
-        int_val = "Does Not Apply"
+        int_val = "Does Not Apply"  # I4: deterministic negative evidence
         stderr = (applicability.get("stderr") or "").replace("\n", " ")[:60]
         int_notes = stderr if stderr else "rejected by git apply"
-    elif applicability.get("skipped"):
-        int_val = "Not Verified"
-        int_notes = applicability.get("skipped_reason") or "no .git repo to check against"
+    elif _unavailable_reason is not None:
+        int_val = "Not Verified"  # I1: UNAVAILABLE never reads as positive
+        int_notes = _unavailable_reason
     elif med_hygiene:
         int_val = "Minor Issues"
         int_notes = f"MEDIUM: {med_hygiene[0].get('detail', '')[:80]}"
@@ -763,9 +864,9 @@ def _compute_trust_signals(
     if applicability.get("applicable") is False:
         imp_val = "None"
         imp_notes = "Patch does not apply to repository"
-    elif applicability.get("skipped") and not applicability.get("applicable"):
-        imp_val = "Unknown"
-        imp_notes = "No repository available for applicability check"
+    elif _unavailable_reason is not None:
+        imp_val = "Unknown"  # I1: UNAVAILABLE never reads as High/Medium/Low
+        imp_notes = _unavailable_reason
     elif high_hygiene:
         imp_val = "Low"
         imp_notes = "Critical hygiene issue — patch may be a no-op"
@@ -825,22 +926,28 @@ def _compute_trust_signals(
         tst_notes = "No test files cover this module"
 
     # --- Deployment Safety ---
-    # impact_level == "not_applicable" means the language guardrail skipped
-    # symbol/usage analysis (unsupported language) — it must render as
-    # "Not Verified", not fall through to the reassuring "Low Risk" default
-    # that an empty Python-only impact scan would otherwise produce.
+    # I2: "Low Risk" is only reached for the explicit, genuine "low" value.
+    # Every other impact_level — including "not_applicable" (language
+    # guardrail skipped symbol/usage analysis) and "unavailable" (impact
+    # analysis raised and was swallowed), and any unrecognized/malformed
+    # value — falls to the final "Not Verified" branch rather than to a
+    # reassuring default. Whitelist, not blacklist: only genuinely observed
+    # levels earn a Low/Medium/High Risk label.
     if impact_level == "high" or high_hygiene:
         saf_val = "High Risk"
         saf_notes = f"{impact_level.upper()} impact surface"
     elif impact_level == "medium":
         saf_val = "Medium Risk"
         saf_notes = "Moderate impact surface"
-    elif impact_level == "not_applicable":
-        saf_val = "Not Verified"
-        saf_notes = "Impact analysis is not supported for this language yet"
-    else:
+    elif impact_level == "low":
         saf_val = "Low Risk"
         saf_notes = "Localized change · low regression risk"
+    elif impact_level == "not_applicable":
+        saf_val = "Not Verified"  # I2
+        saf_notes = "Impact analysis is not supported for this language yet"
+    else:
+        saf_val = "Not Verified"  # I2: covers "unavailable" and any unrecognized value
+        saf_notes = "Impact analysis did not complete or returned an unrecognized result"
 
     # Icon mapping
     _icons = {
@@ -865,6 +972,22 @@ def _compute_trust_signals(
     }
 
 
+# I3: the only signal values a mandatory gate may treat as positive
+# evidence. Named and centralized so each gate is a membership test against
+# a whitelist, never a `!= BAD_VALUE` blacklist that silently admits
+# Unknown/Not Verified/any future value.
+#
+# _POSITIVE_INTEGRITY is deliberately {"Clean"} only — "Minor Issues" means
+# _compute_trust_signals found a real hygiene defect (currently only
+# "unused_import"), not a verified-clean patch; it is excluded even though
+# it does not hard-block via _BLOCKING_INTEGRITY. Not-blocked is not the
+# same claim as positive-evidence; see I3 above _compute_trust_signals.
+_POSITIVE_INTEGRITY = frozenset({"Clean"})
+_POSITIVE_IMPROVEMENT = frozenset({"High", "Medium"})
+_POSITIVE_SAFETY = frozenset({"Low Risk", "Medium Risk"})
+_BLOCKING_INTEGRITY = frozenset({"Does Not Apply", "Critical Issues"})
+
+
 def _build_recommendation_v1(
     signals: dict,
     still_vulnerable: bool = False,
@@ -876,26 +999,35 @@ def _build_recommendation_v1(
     'Deploy After Validation' | 'Deploy With Caution' | 'Manual Review Required'
     | 'Do Not Apply'
 
-    Blocking policy (Recommendation Policy v2 — see docs/recommendation-policy-v2.md):
-      Hard-block  → integrity failure only (deterministic evidence: git-apply / hygiene).
-                    Pure heuristic evidence (challenger findings, incl. alignment=Misaligned)
-                    must never produce Do Not Apply on its own.
-      Escalation  → still_vulnerable=True with defect_count == 0, OR alignment=Misaligned
-                    (confirmed_defect_count > 0) — both are heuristic-only signals and land
-                    at Manual Review Required, never Do Not Apply.
-      Forward     → still_vulnerable=False with defect_count == 0
+    Implements the Recommendation Policy Invariants (I1-I6) documented above
+    _compute_trust_signals. Each branch below is tagged with the invariant
+    it satisfies:
+      I4 → Do Not Apply requires deterministic integrity failure only; pure
+           heuristic evidence (challenger findings, incl. alignment=
+           Misaligned) must never produce Do Not Apply on its own.
+      I5 → still_vulnerable=True with defect_count==0, OR alignment=
+           Misaligned (confirmed_defect_count > 0) — both heuristic-only —
+           land at Manual Review Required, never Do Not Apply, never higher.
+      I3 → Deploy After Validation only when integrity, improvement, AND
+           safety are each explicitly in their own positive whitelist (not
+           merely "not the one excluded bad value", and not merely "did not
+           hit the Do Not Apply gate above" — integrity=Minor Issues clears
+           that gate but is still excluded here, since it is not the same
+           claim as verified-clean).
+      I5 → everything else (including Unknown/Not Verified on either axis)
+           falls through to Manual Review Required.
     """
     integrity = signals["patch_integrity"]["value"]
     improvement = signals["security_improvement"]["value"]
     alignment = signals["remediation_alignment"]["value"]
     safety = signals["deployment_safety"]["value"]
 
-    if integrity in ("Does Not Apply", "Critical Issues"):
+    if integrity in _BLOCKING_INTEGRITY:  # I4
         return {
             "decision": "Do Not Apply",
             "reason": "Patch has critical issues or does not apply to the target repository.",
         }
-    if alignment == "Misaligned":
+    if alignment == "Misaligned":  # I5
         return {
             "decision": "Manual Review Required",
             "reason": (
@@ -904,7 +1036,7 @@ def _build_recommendation_v1(
                 "manual review is required before deployment."
             ),
         }
-    if still_vulnerable and defect_count == 0:
+    if still_vulnerable and defect_count == 0:  # I5
         return {
             "decision": "Manual Review Required",
             "reason": (
@@ -912,7 +1044,11 @@ def _build_recommendation_v1(
                 "review the Known Findings before deploying."
             ),
         }
-    if improvement in ("High", "Medium") and safety != "High Risk":
+    if (
+        integrity in _POSITIVE_INTEGRITY
+        and improvement in _POSITIVE_IMPROVEMENT
+        and safety in _POSITIVE_SAFETY
+    ):  # I3
         return {
             "decision": "Deploy After Validation",
             "reason": (
@@ -925,12 +1061,12 @@ def _build_recommendation_v1(
             "decision": "Deploy With Caution",
             "reason": "Patch provides limited or uncertain security improvement. Manual security review recommended.",
         }
-    if safety == "High Risk":
+    if safety == "High Risk":  # I5
         return {
             "decision": "Manual Review Required",
             "reason": "Change has high deployment risk; regression testing across affected callers required.",
         }
-    return {
+    return {  # I5 / I6: catch-all for Unknown/Not Verified and any other inconclusive state
         "decision": "Manual Review Required",
         "reason": "Patch requires manual security review before deployment.",
     }
@@ -1716,7 +1852,7 @@ def _build_report(result: PipelineResult) -> str:
     # Trust Package computation (uses hoisted data above)
     # -----------------------
     classified_challenger = _classify_challenger(challenger)
-    impact_level_str = ((result.impact or {}).get("impact_level") or "low")
+    impact_level_str = _resolve_impact_level(result.impact)  # I2
     signals = _compute_trust_signals(
         result.hygiene, result.applicability, classified_challenger, rating, impact_level_str
     )

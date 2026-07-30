@@ -29,6 +29,7 @@ from utilities.autopatcher.pipeline import (
     _build_known_findings,
     _render_known_findings,
     _check_recommendation_consistency,
+    _resolve_impact_level,
 )
 
 
@@ -335,6 +336,12 @@ def _skip_applicability():
 def _fail_applicability(stderr="error: patch does not apply"):
     return {"applicable": False, "skipped": False, "skipped_reason": None, "error": None, "stderr": stderr}
 
+def _error_applicability(error="git apply --check timed out after 10s"):
+    # F-23: timeout and unexpected-exception outcomes share this exact shape
+    # (applicable=None, skipped=False, error=<msg>) — distinct from the
+    # pre-flight skip fixture above, but policy-equivalent per I1.
+    return {"applicable": None, "skipped": False, "skipped_reason": None, "error": error, "stderr": ""}
+
 def _classified(still_vulnerable=False, defects=0, risks=0, gaps=0):
     c = {
         "still_vulnerable": still_vulnerable,
@@ -369,6 +376,14 @@ class TestComputeTrustSignals:
         s = _compute_trust_signals([], _skip_applicability(), _classified(), "None", "low")
         assert s["patch_integrity"]["value"] == "Not Verified"
 
+    def test_integrity_not_verified_when_applicability_errors_or_times_out(self):
+        """F-23: an applicability timeout/exception (applicable=None,
+        skipped=False) must read as Not Verified, never fall through to
+        Clean — it is unavailable evidence, not evidence of a clean apply."""
+        s = _compute_trust_signals([], _error_applicability(), _classified(), "None", "low")
+        assert s["patch_integrity"]["value"] == "Not Verified"
+        assert s["patch_integrity"]["value"] != "Clean"
+
     def test_integrity_critical_when_high_hygiene(self):
         hygiene = [{"severity": "HIGH", "check": "empty_hunk", "detail": "Empty hunk"}]
         s = _compute_trust_signals(hygiene, _clean_applicability(), _classified(), "None", "low")
@@ -387,6 +402,17 @@ class TestComputeTrustSignals:
     def test_improvement_unknown_when_skipped(self):
         s = _compute_trust_signals([], _skip_applicability(), _classified(), "None", "low")
         assert s["security_improvement"]["value"] == "Unknown"
+
+    def test_improvement_unknown_when_applicability_errors_or_times_out(self):
+        """F-23: same timeout/exception state must read as Unknown security
+        improvement, never High/Medium — an unresolved check is not evidence
+        the patch improved security, no matter what the challenger found.
+        (still_vulnerable defaults to False in _classified(), which is
+        exactly the case that previously fell through to "High" — the
+        strongest false-positive of F-23.)"""
+        s = _compute_trust_signals([], _error_applicability(), _classified(), "None", "low")
+        assert s["security_improvement"]["value"] == "Unknown"
+        assert s["security_improvement"]["value"] not in ("High", "Medium", "Low")
 
     def test_improvement_low_when_high_hygiene(self):
         hygiene = [{"severity": "HIGH", "check": "empty_hunk", "detail": "Empty hunk"}]
@@ -510,6 +536,21 @@ class TestComputeTrustSignals:
         assert s["deployment_safety"]["value"] == "Not Verified"
         assert s["deployment_safety"]["value"] != "Low Risk"
 
+    def test_deployment_safety_not_verified_when_impact_unavailable(self):
+        """F-24: impact_level="unavailable" (impact analysis raised and was
+        swallowed — see _resolve_impact_level) must never read as Low Risk.
+        A crashed analysis is not evidence of low regression risk."""
+        s = _compute_trust_signals([], _clean_applicability(), _classified(), "None", "unavailable")
+        assert s["deployment_safety"]["value"] == "Not Verified"
+        assert s["deployment_safety"]["value"] != "Low Risk"
+
+    def test_deployment_safety_not_verified_for_unrecognized_impact_level(self):
+        """Whitelist, not blacklist: any impact_level string that isn't one
+        of the known-good {low, medium, high} must fall to Not Verified,
+        not to the old permissive default."""
+        s = _compute_trust_signals([], _clean_applicability(), _classified(), "None", "totally-malformed")
+        assert s["deployment_safety"]["value"] == "Not Verified"
+
     def test_non_python_repo_signals_never_read_as_clean(self):
         # Simulates the actual values a non-Python (e.g. curl/C) run produces:
         # testing_rating="Not Applicable" from score_test_support, and
@@ -519,6 +560,27 @@ class TestComputeTrustSignals:
         assert s["deployment_safety"]["value"] not in ("Low Risk", "Medium Risk", "High Risk")
         assert s["test_availability"]["value"] == "Not Verified"
         assert s["deployment_safety"]["value"] == "Not Verified"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_impact_level
+# ---------------------------------------------------------------------------
+
+class TestResolveImpactLevel:
+    def test_none_impact_is_unavailable(self):
+        """F-24: result.impact is None only when impact analysis raised and
+        was swallowed by pipeline.run()'s bare except — must resolve to the
+        distinct "unavailable" sentinel, never silently to "low"."""
+        assert _resolve_impact_level(None) == "unavailable"
+
+    def test_present_dict_reads_impact_level(self):
+        assert _resolve_impact_level({"impact_level": "high"}) == "high"
+
+    def test_present_dict_missing_key_defaults_to_low(self):
+        # A real analyzer result always includes impact_level (see
+        # ImpactReport.to_dict()); this only guards a malformed dict, which
+        # is not the same failure mode as impact=None.
+        assert _resolve_impact_level({}) == "low"
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +849,49 @@ class TestRecommendationV1:
         rec = _build_recommendation_v1(_signals_for(improvement="Medium", safety="Medium Risk"))
         assert rec["decision"] == "Deploy After Validation"
 
+    def test_deploy_after_validation_never_fires_with_not_verified_safety(self):
+        """F-37: the gate is a whitelist (I3) — "Not Verified" safety must
+        never satisfy it, regardless of improvement. Prior to the fix the
+        gate was `safety != "High Risk"`, which admitted this exact case."""
+        rec = _build_recommendation_v1(_signals_for(improvement="High", safety="Not Verified"))
+        assert rec["decision"] != "Deploy After Validation"
+        assert rec["decision"] == "Manual Review Required"
+
+    def test_unknown_improvement_never_satisfies_deploy_after_validation(self):
+        """I3 invariant preservation (NOT an F-37 regression case — this
+        already passed before the F-37 fix, since `improvement in ("High",
+        "Medium")` was already whitelist-shaped pre-fix; only the `safety`
+        side was ever blacklist-shaped). Kept as documentation that
+        "Unknown" improvement must never satisfy the gate, even paired with
+        an otherwise-positive safety value."""
+        rec = _build_recommendation_v1(_signals_for(improvement="Unknown", safety="Low Risk"))
+        assert rec["decision"] != "Deploy After Validation"
+        assert rec["decision"] == "Manual Review Required"
+
+    def test_deploy_after_validation_never_fires_with_not_verified_integrity(self):
+        """Boundary found in final review: _build_recommendation_v1 only
+        ever reads `integrity` in the Do Not Apply gate above — nothing
+        re-checked it here before this fix. A signals dict with
+        integrity="Not Verified" (applicability unavailable) but otherwise
+        fully positive improvement/safety must still be blocked; in the
+        live pipeline this combination can't occur (both are derived from
+        the same _unavailable_reason in _compute_trust_signals), but
+        _build_recommendation_v1 takes an arbitrary signals dict and must
+        not rely on that upstream coupling to stay safe."""
+        rec = _build_recommendation_v1(_signals_for(integrity="Not Verified", improvement="High", safety="Low Risk"))
+        assert rec["decision"] != "Deploy After Validation"
+        assert rec["decision"] == "Manual Review Required"
+
+    def test_deploy_after_validation_never_fires_with_minor_issues_integrity(self):
+        """"Minor Issues" reports an actual observed hygiene defect
+        (currently only "unused_import" — see patch_hygiene.py), not a
+        verified-clean patch — it must not satisfy the positive-integrity
+        allowlist even though it doesn't hard-block via _BLOCKING_INTEGRITY.
+        Not being blocked is not the same claim as being positive evidence."""
+        rec = _build_recommendation_v1(_signals_for(integrity="Minor Issues", improvement="High", safety="Low Risk"))
+        assert rec["decision"] != "Deploy After Validation"
+        assert rec["decision"] == "Manual Review Required"
+
     def test_deploy_with_caution_low_improvement_low_risk(self):
         rec = _build_recommendation_v1(_signals_for(improvement="Low", safety="Low Risk"))
         assert rec["decision"] == "Deploy With Caution"
@@ -805,6 +910,66 @@ class TestRecommendationV1:
         signals = _compute_trust_signals([], _clean_applicability(), classified, "None", "low")
         rec = _build_recommendation_v1(signals)
         assert rec["decision"] == "Deploy After Validation"
+
+
+# ---------------------------------------------------------------------------
+# Recommendation Policy boundary table — every row is traceable to one of
+# I1-I6 (see the Recommendation Policy Invariants block in pipeline.py,
+# directly above _compute_trust_signals). still_vulnerable/defect_count are
+# passed straight through to _build_recommendation_v1, independent of the
+# signals dict, matching that function's own signature/contract.
+# ---------------------------------------------------------------------------
+
+_POLICY_TABLE = [
+    # (integrity, alignment, still_vulnerable, defect_count, improvement, safety) -> decision
+    ("Clean", "Aligned", False, 0, "High", "Low Risk", "Deploy After Validation"),
+    ("Clean", "Aligned", False, 0, "Medium", "Medium Risk", "Deploy After Validation"),
+    ("Clean", "Aligned", False, 0, "Low", "Low Risk", "Deploy With Caution"),
+    ("Does Not Apply", "Aligned", False, 0, "None", "Low Risk", "Do Not Apply"),
+    ("Critical Issues", "Aligned", False, 0, "Low", "Low Risk", "Do Not Apply"),
+    ("Clean", "Misaligned", False, 0, "High", "Low Risk", "Manual Review Required"),
+    ("Clean", "Aligned", True, 0, "High", "Low Risk", "Manual Review Required"),
+    ("Clean", "Aligned", False, 0, "High", "High Risk", "Manual Review Required"),
+    # F-23 boundary: applicability UNAVAILABLE (skip or error/timeout) always
+    # yields integrity=Not Verified / improvement=Unknown; neither may reach
+    # Deploy After Validation regardless of safety.
+    ("Not Verified", "Aligned", False, 0, "Unknown", "Low Risk", "Manual Review Required"),
+    ("Not Verified", "Aligned", False, 0, "Unknown", "Medium Risk", "Manual Review Required"),
+    # F-24 boundary: impact analysis UNAVAILABLE always yields
+    # deployment_safety=Not Verified; must never reach Deploy After
+    # Validation even with strong improvement evidence.
+    ("Clean", "Aligned", False, 0, "High", "Not Verified", "Manual Review Required"),
+    ("Clean", "Aligned", False, 0, "Medium", "Not Verified", "Manual Review Required"),
+    # F-37 boundary at the gate itself: Not Verified/Unknown on either axis
+    # never satisfies the whitelist, independent of how they were produced.
+    ("Clean", "Aligned", False, 0, "Unknown", "Not Verified", "Manual Review Required"),
+    # Integrity boundary found in final review: a decoupled signals dict
+    # (integrity=Not Verified paired directly with a positive improvement/
+    # safety, bypassing the coupling _compute_trust_signals normally
+    # guarantees) must still be blocked — integrity is a mandatory gate too.
+    ("Not Verified", "Aligned", False, 0, "High", "Low Risk", "Manual Review Required"),
+    # "Minor Issues" reports a real hygiene defect, not verified-clean —
+    # excluded from the positive-integrity allowlist even though it clears
+    # the Do Not Apply gate.
+    ("Minor Issues", "Aligned", False, 0, "High", "Low Risk", "Manual Review Required"),
+]
+
+
+class TestRecommendationPolicyBoundaries:
+    @pytest.mark.parametrize(
+        "integrity,alignment,still_vulnerable,defect_count,improvement,safety,expected",
+        _POLICY_TABLE,
+    )
+    def test_policy_boundary(
+        self, integrity, alignment, still_vulnerable, defect_count, improvement, safety, expected
+    ):
+        signals = _signals_for(
+            integrity=integrity, improvement=improvement, alignment=alignment, safety=safety
+        )
+        rec = _build_recommendation_v1(
+            signals, still_vulnerable=still_vulnerable, defect_count=defect_count
+        )
+        assert rec["decision"] == expected
 
 
 # ---------------------------------------------------------------------------
