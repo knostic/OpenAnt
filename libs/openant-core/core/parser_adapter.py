@@ -30,6 +30,7 @@ from core.language_registry import (
 )
 from core.schemas import ParseResult
 from utilities.file_io import open_utf8, read_json, write_json
+from utilities.prune_telemetry import compute_prune_telemetry
 
 # Root of openant-core (where parsers/ lives)
 _CORE_ROOT = Path(__file__).parent.parent
@@ -558,6 +559,19 @@ def apply_reachability_filter(
     if _blackout:
         dataset["metadata"]["reachability_filter"]["warning"] = _blackout
         print(f"  [Warning] {_blackout}", file=sys.stderr)
+
+    # Per-unit prune telemetry (ADDITIVE, all-language; advisory — must never crash
+    # the filter). Merges classification keys + the pruned_units.json sidecar; a
+    # forward-asymmetry warning is recorded only if a blackout warning did not
+    # already claim the slot. call_graph/reverse_call_graph are the UN-pruned graphs.
+    _rf = dataset["metadata"]["reachability_filter"]
+    _pruned_ids = [u.get("id", "") for u in units if u.get("id", "") not in reachable_ids]
+    _extra, _asym_warning = compute_prune_telemetry(
+        reachable_ids, sorted(_pruned_ids), call_graph, reverse_call_graph, output_dir)
+    _rf.update(_extra)
+    if _asym_warning and "warning" not in _rf:
+        _rf["warning"] = _asym_warning
+        print(f"  [Warning] {_asym_warning}", file=sys.stderr)
 
     # Warn about unimplemented higher-level filters
     if processing_level == "codeql":

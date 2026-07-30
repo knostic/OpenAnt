@@ -28,7 +28,7 @@ func TestSupportedMatchesConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Supported() error: %v", err)
 	}
-	want := []string{"c", "go", "javascript", "php", "python", "ruby", "zig"}
+	want := []string{"c", "go", "javascript", "php", "python", "ruby", "swift", "zig"}
 	if len(got) != len(want) {
 		t.Fatalf("Supported() = %v, want %v", got, want)
 	}

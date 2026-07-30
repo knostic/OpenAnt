@@ -180,7 +180,7 @@ def gather_source_files(repo_path: str, extensions: list[str] = None) -> list[di
             # JS / TS family + templates
             '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.ejs', '.pug', '.hbs', '.json',
             # other parsed languages
-            '.go', '.py', '.rb', '.rake', '.php', '.rs', '.zig',
+            '.go', '.py', '.rb', '.rake', '.php', '.rs', '.zig', '.swift',
             '.c', '.h', '.cpp', '.hpp', '.cc', '.cxx', '.hxx', '.hh',
         ]
 

@@ -32,6 +32,7 @@ To submit your repo for scanning:
 - PHP (beta)
 - Ruby (beta)
 - Zig (beta)
+- Swift (beta)
 
 ## Credits
 

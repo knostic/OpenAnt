@@ -97,6 +97,14 @@ ENTRY_POINT_DECORATORS = [
     r'@(Get|Post|Put|Delete|Patch)\(',
     r'@Controller\(',
     r'@WebSocketGateway',
+    # Swift: ObjC-exposed / Interface-Builder-invoked methods are externally
+    # callable via the ObjC runtime / UI even when they are not `public`, so a
+    # method carrying one is an entry-point root. The Swift extractor emits these
+    # as `decorators` (base name, e.g. '@objc', '@IBAction'). Over-seeding an
+    # externally-invokable method is reachability-safe.
+    r'@objc\b',
+    r'@IBAction\b',
+    r'@IBSegueAction\b',
 ]
 
 # PHP 8 routing attributes (Symfony / API-Platform): `#[Route(...)]`, `#[Get]`,
@@ -172,6 +180,19 @@ USER_INPUT_PATTERNS = [
     #                    ->toArray() / ->input(...) / ->all()
     r'(\$(request|req)\b|\$this\s*->\s*request\b)\s*->\s*(query|request|cookies|attributes|headers|files)\s*->\s*(get|all)\s*\(',
     r'(\$(request|req)\b|\$this\s*->\s*request\b)\s*->\s*(get|getPayload|getContent|toArray|input|all)\s*\(',
+    # Swift daemon / CLI / stdin / XPC / network input surfaces. Apple's
+    # security-pcc and similar frameworks expose their attack surface through
+    # daemon request handling (XPC listeners, network listeners) and CLI/stdin —
+    # not a web `main`. A method that reads one of these IS a user-input entry
+    # point even when it is `internal` (so public-API seeding alone would miss it).
+    r'CommandLine\.arguments',
+    r'ProcessInfo\.processInfo\.(arguments|environment)',
+    r'\breadLine\s*\(',
+    r'FileHandle\.standardInput',
+    r'\bNSXPCListener\b',
+    r'\bshouldAcceptNewConnection\b',
+    r'\bxpc_connection_',
+    r'\bNWListener\b',
 ]
 
 # Patterns that indicate module-level scripts with user input

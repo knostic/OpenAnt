@@ -109,7 +109,7 @@ class TestRegistryShape:
 class TestSupportedLanguages:
     def test_matches_the_known_set(self):
         assert supported_languages() == [
-            "c", "go", "javascript", "php", "python", "ruby", "zig",
+            "c", "go", "javascript", "php", "python", "ruby", "swift", "zig",
         ]
 
     def test_is_sorted_and_deterministic(self):

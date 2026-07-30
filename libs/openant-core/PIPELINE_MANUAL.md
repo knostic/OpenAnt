@@ -36,7 +36,7 @@ OpenAnt is a vulnerability analysis tool using Claude. The name "two-stage" refe
 | 7 | **Stage 2: Verification** | No | Attacker simulation to confirm exploitability |
 | 8 | **Dynamic Testing** | No | Docker-isolated exploit testing (requires Docker) |
 
-**Supported Languages:** Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, and Zig
+**Supported Languages:** Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Zig, and Swift
 
 **Two-Stage Analysis:**
 - **Stage 1** asks: "Is this code vulnerable?"

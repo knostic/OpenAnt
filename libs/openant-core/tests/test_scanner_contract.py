@@ -164,7 +164,8 @@ def test_deeply_nested_code_is_scanned_or_recorded_as_a_gap(language, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     ext = {"python": ".py", "c": ".c", "php": ".php", "ruby": ".rb",
-           "zig": ".zig", "javascript": ".js", "go": ".go"}.get(language, ".py")
+           "zig": ".zig", "javascript": ".js", "go": ".go",
+           "swift": ".swift"}.get(language, ".py")
     build_deep_nest(repo / "deep", 600, f"planted{ext}", "x = 1\n")
 
     try:

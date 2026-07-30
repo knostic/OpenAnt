@@ -25,3 +25,4 @@ tree-sitter-cpp>=0.21.0
 tree-sitter-ruby>=0.21.0
 tree-sitter-php>=0.22.0
 tree-sitter-zig>=1.1.2
+tree-sitter-swift>=0.7.3
