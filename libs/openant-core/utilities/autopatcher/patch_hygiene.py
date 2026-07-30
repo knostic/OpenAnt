@@ -57,24 +57,52 @@ def _parse_file_patches(patch: str) -> list[_FilePatch]:
                 context_lines=context[:],
             ))
 
-    for line in patch.splitlines():
-        if line.startswith("--- "):
-            raw = line[4:].split("\t")[0].strip()
-            from_path = raw[2:] if raw.startswith("a/") else raw
-        elif line.startswith("+++ "):
+    lines = patch.splitlines()
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+
+        # A real file header is a "--- "/"+++ " PAIR on adjacent lines, not
+        # merely a line that starts with one of those prefixes — a
+        # removed/added hunk-body line whose text is "-- foo" or "++ foo"
+        # produces the raw line "--- foo" / "+++ foo" too. Requiring the
+        # very next line to complete the pair tells apart a genuine file
+        # boundary from coincidental body content. Resolving the pair in one
+        # step also flushes the PREVIOUS file using its own from_path/to_path
+        # before either is overwritten, instead of leaking the next file's
+        # from_path into the previous file's is_new_file computation.
+        if (
+            line.startswith("--- ")
+            and i + 1 < n
+            and lines[i + 1].startswith("+++ ")
+        ):
             _flush()
             raw = line[4:].split("\t")[0].strip()
-            to_path = raw[2:] if raw.startswith("b/") else raw
+            from_path = raw[2:] if raw.startswith("a/") else raw
+            raw2 = lines[i + 1][4:].split("\t")[0].strip()
+            to_path = raw2[2:] if raw2.startswith("b/") else raw2
             added = []
             removed = []
             context = []
-        elif to_path is not None:
-            if line.startswith("+") and not line.startswith("+++"):
+            i += 2
+            continue
+
+        if to_path is not None:
+            # A genuine "+++ "/"--- " header line would already have been
+            # consumed by the pair check above (and skipped via `continue`),
+            # so any "+"/"-"-prefixed line reaching this point is body
+            # content — even one whose text itself starts with "++ "/"-- "
+            # (raw "+++ .../--- ..."). Excluding those here would silently
+            # drop legitimate added/removed content.
+            if line.startswith("+"):
                 added.append(line[1:])
-            elif line.startswith("-") and not line.startswith("---"):
+            elif line.startswith("-"):
                 removed.append(line[1:])
             elif line.startswith(" "):
                 context.append(line[1:])
+
+        i += 1
 
     _flush()
     return patches

@@ -128,6 +128,65 @@ _MOCK_PATCH_INNER = """\
      return cursor.fetchone() is not None
 """
 
+# An added line whose own text starts with "++ " — the raw diff line is
+# "+++ ...", indistinguishable from a real "+++ " file header by a naive
+# startswith check.
+_PLUS_PLUS_PLUS_BODY_CONTENT = (
+    "--- a/example.py\n"
+    "+++ b/example.py\n"
+    "@@ -1,3 +1,4 @@\n"
+    " def f():\n"
+    "-    old = 1\n"
+    "+++ this added line of code starts with plus plus plus\n"
+    "+    new = 2\n"
+)
+
+# A removed line whose own text starts with "-- " — the raw diff line is
+# "--- ...", indistinguishable from a real "--- " file header.
+_DASH_DASH_DASH_BODY_CONTENT = (
+    "--- a/example.py\n"
+    "+++ b/example.py\n"
+    "@@ -1,3 +1,3 @@\n"
+    " def f():\n"
+    "--- this removed line of code starts with dash dash dash\n"
+    "+    return new\n"
+)
+
+# A body-content header lookalike in file1's hunk, followed by a genuinely
+# new file2 (--- /dev/null). Exercises whether is_new_file for file1 gets
+# contaminated by file2's /dev/null header.
+_IS_NEW_FILE_SHIFT = (
+    "--- a/existing.py\n"
+    "+++ b/existing.py\n"
+    "@@ -1,2 +1,2 @@\n"
+    " def f():\n"
+    "--- this removed line of code starts with dash dash dash\n"
+    "--- /dev/null\n"
+    "+++ b/new_module.py\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+def g():\n"
+    "+    pass\n"
+)
+
+# Two files where file1's hunk contains a body-content header lookalike.
+# The false match must not split file1 into a phantom extra "file" or
+# corrupt the file1/file2 boundary.
+_MULTI_FILE_HEADER_LOOKALIKE = (
+    "--- a/file1.py\n"
+    "+++ b/file1.py\n"
+    "@@ -1,3 +1,4 @@\n"
+    " def f():\n"
+    "-    old = 1\n"
+    "+++ marker line inside file1's hunk\n"
+    "+    new = 2\n"
+    "--- a/file2.py\n"
+    "+++ b/file2.py\n"
+    "@@ -10,3 +10,3 @@\n"
+    " a\n"
+    " b\n"
+    " c\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # check_patch — public API
@@ -155,6 +214,71 @@ class TestCheckPatchSafety:
     def test_mock_patch_no_findings(self):
         from utilities.autopatcher.patch_hygiene import check_patch
         assert check_patch(_MOCK_PATCH_INNER) == []
+
+
+# ---------------------------------------------------------------------------
+# _parse_file_patches — hunk-body content resembling a file header must not
+# be misparsed as one (F-36, F-41, F-44, F-45)
+# ---------------------------------------------------------------------------
+
+class TestParseFilePatches:
+    def test_plus_plus_plus_body_content_kept_in_single_file(self):
+        """F-41 regression."""
+        from utilities.autopatcher.patch_hygiene import _parse_file_patches
+        fps = _parse_file_patches(_PLUS_PLUS_PLUS_BODY_CONTENT)
+        assert len(fps) == 1, (
+            f"Expected exactly one file section, got {len(fps)}: "
+            f"{[fp.filename for fp in fps]}"
+        )
+        assert fps[0].filename == "example.py"
+        # line[1:] strips only the single leading '+' marker, so the
+        # line's own "++ " content prefix is legitimately retained.
+        assert "++ this added line of code starts with plus plus plus" in fps[0].added_lines
+
+    def test_dash_dash_dash_body_content_kept_in_single_file(self):
+        """F-45 regression."""
+        from utilities.autopatcher.patch_hygiene import _parse_file_patches
+        fps = _parse_file_patches(_DASH_DASH_DASH_BODY_CONTENT)
+        assert len(fps) == 1, (
+            f"Expected exactly one file section, got {len(fps)}: "
+            f"{[fp.filename for fp in fps]}"
+        )
+        assert fps[0].filename == "example.py"
+        # line[1:] strips only the single leading '-' marker, so the
+        # line's own "-- " content prefix is legitimately retained.
+        assert (
+            "-- this removed line of code starts with dash dash dash"
+            in fps[0].removed_lines
+        )
+
+    def test_is_new_file_not_shifted_across_files(self):
+        """F-44 regression: is_new_file must reflect each file's own from_path,
+        not whatever from_path a later file's header happened to leave behind
+        by the time this file's data is flushed."""
+        from utilities.autopatcher.patch_hygiene import _parse_file_patches
+        fps = _parse_file_patches(_IS_NEW_FILE_SHIFT)
+        by_name = {fp.filename: fp for fp in fps}
+        assert "existing.py" in by_name, (
+            f"existing.py missing from parsed files: {[fp.filename for fp in fps]}"
+        )
+        assert "new_module.py" in by_name, (
+            f"new_module.py missing from parsed files: {[fp.filename for fp in fps]}"
+        )
+        assert by_name["existing.py"].is_new_file is False, (
+            "existing.py's is_new_file was contaminated by the /dev/null "
+            "header belonging to the next file"
+        )
+        assert by_name["new_module.py"].is_new_file is True
+
+    def test_multi_file_boundary_not_corrupted_by_header_lookalike(self):
+        """F-36 regression: a header lookalike inside file1's hunk must not
+        split file1 into a phantom extra "file" or corrupt the file1/file2
+        boundary."""
+        from utilities.autopatcher.patch_hygiene import _parse_file_patches
+        fps = _parse_file_patches(_MULTI_FILE_HEADER_LOOKALIKE)
+        assert [fp.filename for fp in fps] == ["file1.py", "file2.py"], (
+            f"Multi-file boundary corrupted: {[fp.filename for fp in fps]}"
+        )
 
 
 # ---------------------------------------------------------------------------

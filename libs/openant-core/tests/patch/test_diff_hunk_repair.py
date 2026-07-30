@@ -9,6 +9,8 @@ Covers:
   - No-newline marker excluded from counts
   - Count-omitted single-line form normalized to explicit count
   - Multi-file: file_delta resets between files
+  - Multi-file: hunk-body content resembling a "--- "/"+++ " header must not
+    be misparsed as one (F-36, F-41, F-45)
   - Non-diff / empty input passthrough
   - New-file hunk (--- /dev/null) handled
   - RepairResult metadata reflects actual changes
@@ -294,6 +296,87 @@ class TestMultiFileDeltaReset:
         assert meta.hunks_rewritten == 1
         assert meta.files_rewritten == 1
 
+    def test_body_content_resembling_header_does_not_corrupt_second_file(self):
+        """F-36 regression: an added line whose own text starts with "++ "
+        (raw line "+++ ...") must not be mistaken for a real "+++ " file
+        header — doing so would corrupt file_delta/current_file bookkeeping
+        and cascade into file2's header being rewritten incorrectly."""
+        patch = (
+            "--- a/file1.py\n"
+            "+++ b/file1.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            " def f():\n"
+            "-    old = 1\n"
+            "+++ marker line inside file1's hunk\n"
+            "+    new = 2\n"
+            "--- a/file2.py\n"
+            "+++ b/file2.py\n"
+            "@@ -10,3 +10,3 @@\n"
+            " a\n"
+            " b\n"
+            " c\n"
+        )
+        repaired, meta = repair_hunk_headers(patch)
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        assert len(hunk_lines) == 2, f"Expected 2 hunk headers, got: {hunk_lines}"
+        assert hunk_lines[1].startswith("@@ -10,3 +10,3 @@"), (
+            f"file2's correct header was corrupted: {hunk_lines[1]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Hunk-body content that resembles a file header ("--- "/"+++ " prefix)
+# ---------------------------------------------------------------------------
+
+class TestHunkBodyContentResemblingFileHeader:
+    def test_plus_plus_plus_body_content_not_treated_as_header(self):
+        """F-41 regression: a removed/added line whose own text starts with
+        "++ " produces the raw line "+++ ...", indistinguishable from a real
+        file header by a naive startswith check. It must stay inside the
+        hunk body, not be hoisted in front of the (possibly rewritten) hunk
+        header."""
+        patch = (
+            "--- a/example.py\n"
+            "+++ b/example.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            " def f():\n"
+            "-    old = 1\n"
+            "+++ this added line of code starts with plus plus plus\n"
+            "+    new = 2\n"
+        )
+        repaired, meta = repair_hunk_headers(patch)
+        lines = repaired.splitlines(keepends=True)
+        idx_marker = next(
+            i for i, l in enumerate(lines) if l.startswith("+++ this added line")
+        )
+        idx_header = next(i for i, l in enumerate(lines) if l.startswith("@@ "))
+        assert idx_marker > idx_header, (
+            "The '+++ ' body line was hoisted before the hunk header"
+        )
+        assert meta.files_rewritten <= 1
+
+    def test_dash_dash_dash_body_content_not_treated_as_header(self):
+        """F-45 regression: same as above, for a removed line whose own text
+        starts with "-- " (raw line "--- ...")."""
+        patch = (
+            "--- a/example.py\n"
+            "+++ b/example.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " def f():\n"
+            "--- this removed line of code starts with dash dash dash\n"
+            "+    return new\n"
+        )
+        repaired, meta = repair_hunk_headers(patch)
+        lines = repaired.splitlines(keepends=True)
+        idx_marker = next(
+            i for i, l in enumerate(lines) if l.startswith("--- this removed line")
+        )
+        idx_header = next(i for i, l in enumerate(lines) if l.startswith("@@ "))
+        assert idx_marker > idx_header, (
+            "The '--- ' body line was hoisted before the hunk header"
+        )
+        assert meta.files_rewritten <= 1
+
 
 # ---------------------------------------------------------------------------
 # Non-diff / empty input passthrough
@@ -444,6 +527,26 @@ class TestFencedPatch:
         lines = repaired.splitlines()
         assert lines[0].startswith("```"), "Opening fence should be preserved"
         assert lines[-1].strip() == "```", "Closing fence should be preserved"
+
+    def test_context_line_of_triple_backticks_survives_unfenced_patch(self):
+        """F-38 regression: a legitimate context line whose content is ```
+        (e.g. an unchanged closing Markdown code fence) must not be mistaken
+        for the LLM's own wrapper fence and stripped, even when the patch
+        has no surrounding ``` wrapper at all."""
+        patch = (
+            "--- a/README.md\n"
+            "+++ b/README.md\n"
+            "@@ -1,3 +1,3 @@\n"
+            " intro\n"
+            "-old code\n"
+            "+new code\n"
+            " ```\n"
+        )
+        repaired, meta = repair_hunk_headers(patch)
+        assert repaired.splitlines(keepends=True)[-1] == " ```\n", (
+            "Legitimate context line of ``` was stripped as a fake wrapper fence"
+        )
+        assert meta.normalization_applied is False
 
     def test_correct_fenced_patch_is_noop(self):
         """A fenced patch with already-correct headers must not be modified."""

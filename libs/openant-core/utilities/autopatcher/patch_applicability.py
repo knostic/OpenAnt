@@ -34,7 +34,7 @@ def _strip_fences(patch: str) -> str:
     lines = patch.splitlines(keepends=True)
     if lines and re.match(r"^```", lines[0]):
         lines = lines[1:]
-    if lines and lines[-1].strip() in ("```", "~~~"):
+    if lines and lines[-1].rstrip() in ("```", "~~~"):
         lines = lines[:-1]
     return "".join(lines)
 

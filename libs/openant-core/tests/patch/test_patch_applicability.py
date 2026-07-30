@@ -336,6 +336,22 @@ class TestFenceStrippingPreservesTrailingBlankContext:
         assert "```" not in stripped
         assert stripped == "--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-a\n+b\n"
 
+    def test_strip_fences_preserves_trailing_backtick_context_line(self):
+        """F-38 regression: a legitimate context line whose content is ```
+        must not be mistaken for the LLM's own wrapper fence and stripped,
+        even when the patch has no surrounding ``` wrapper at all."""
+        from utilities.autopatcher.patch_applicability import _strip_fences
+        patch = (
+            "--- a/x\n"
+            "+++ b/x\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-a\n"
+            "+b\n"
+            " ```\n"
+        )
+        stripped = _strip_fences(patch)
+        assert stripped.splitlines(keepends=True)[-1] == " ```\n"
+
     def test_strip_fences_preserves_single_space_last_line(self):
         from utilities.autopatcher.patch_applicability import _strip_fences
         patch = self._fenced_patch_with_trailing_blank_context()

@@ -66,7 +66,7 @@ def _strip_md_fences(patch: str) -> tuple[str, str, str]:
     close_fence = ""
     if lines and _FENCE_OPEN_RE.match(lines[0]):
         open_fence = lines.pop(0)
-    if lines and lines[-1].strip() in ("```", "~~~"):
+    if lines and lines[-1].rstrip() in ("```", "~~~"):
         close_fence = lines.pop()
     return open_fence, "".join(lines), close_fence
 
@@ -123,25 +123,18 @@ def _repair(patch: str, meta: RepairResult) -> tuple[str, RepairResult]:
         hunk_orig_header = None
         hunk_body = []
 
-    for line in lines:
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
         stripped = line.rstrip("\n")
 
-        if stripped.startswith("--- "):
-            flush_hunk()
-            file_delta = 0
-            # Track filename for metadata (strip a/ prefix when present)
-            raw = stripped[4:].split("\t")[0].strip()
-            current_file = raw[2:] if raw.startswith("a/") else raw
-            output.append(line)
-
-        elif stripped.startswith("+++ "):
-            output.append(line)
-
-        elif stripped.startswith("@@ "):
+        if stripped.startswith("@@ "):
             flush_hunk()
             m = _HUNK_RE.match(stripped)
             if not m:
                 output.append(line)  # malformed — pass through unchanged
+                i += 1
                 continue
             hunk_old_start = int(m.group(1))
             hunk_claimed_new_start = int(m.group(3))
@@ -149,12 +142,38 @@ def _repair(patch: str, meta: RepairResult) -> tuple[str, RepairResult]:
             hunk_orig_header = line
             hunk_body = []
             in_hunk = True
+            i += 1
+            continue
 
-        elif in_hunk:
+        # A real file header is a "--- "/"+++ " PAIR on adjacent lines, not
+        # merely a line that starts with one of those prefixes — a
+        # removed/added hunk-body line whose text is "-- foo" or "++ foo"
+        # produces the raw line "--- foo" / "+++ foo" too. Requiring the
+        # very next line to complete the pair is what tells apart a genuine
+        # file boundary from coincidental body content: two unrelated body
+        # lines almost never line up to form both halves of the pair.
+        if (
+            stripped.startswith("--- ")
+            and i + 1 < n
+            and lines[i + 1].rstrip("\n").startswith("+++ ")
+        ):
+            flush_hunk()
+            file_delta = 0
+            # Track filename for metadata (strip a/ prefix when present)
+            raw = stripped[4:].split("\t")[0].strip()
+            current_file = raw[2:] if raw.startswith("a/") else raw
+            output.append(line)
+            output.append(lines[i + 1])
+            i += 2
+            continue
+
+        if in_hunk:
             hunk_body.append(line)
+            i += 1
+            continue
 
-        else:
-            output.append(line)  # preamble, diff --git lines, etc.
+        output.append(line)  # preamble, diff --git lines, stray +++, etc.
+        i += 1
 
     flush_hunk()
     meta.files_rewritten = len(files_touched)
