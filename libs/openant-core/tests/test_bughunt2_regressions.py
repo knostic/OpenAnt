@@ -30,6 +30,10 @@ def test_go2_null_reasoning_no_crash():
     H.prepare_findings_summary(exp, {"units": []})          # was None[:300] TypeError
     out = os.path.join(tempfile.mkdtemp(), "r.html")
     H.generate_html_report(exp, {"units": []}, "", out)     # end-to-end
+    html = open(out).read()
+    # not just no-crash: the finding must actually render (else a refactor that skips
+    # the row for a non-fix reason would keep the test green)
+    assert "a.py:f" in html and "vulnerable" in html
 
 
 # --- GO-3: an 'error' (unanalyzed) unit must be surfaced, not invisible ---
@@ -82,6 +86,36 @@ def test_ml1_non_string_finding_maps_to_error(literal):
 
 def test_ml1_string_finding_still_maps():
     assert A.parse_response('{"finding": "vulnerable"}')["verdict"] == "VULNERABLE"
+
+
+# --- R2B-2: a null short_name on a disclosure-eligible finding must not crash generate_all ---
+def test_r2b2_null_short_name_disclosure_no_crash(tmp_path, monkeypatch):
+    import json
+    import report.generator as G
+    monkeypatch.setattr(G, "generate_summary_report", lambda *a, **k: ("summary", {}))
+    monkeypatch.setattr(G, "generate_disclosure", lambda *a, **k: ("disclosure body", {}))
+    pipeline = {
+        "repository": {"name": "acme/app"},
+        "analysis_date": "2026-07-30", "application_type": "web_app",
+        "pipeline_stats": {}, "results": [],
+        "findings": [{
+            "id": "F1", "name": "n", "short_name": None,      # null short_name (passes presence-only validation)
+            "stage2_verdict": "confirmed",                     # disclosure-eligible
+            "stage1_verdict": "vulnerable",
+            "location": {"file": "a.py", "function": "f"},
+            "cwe_id": 89, "cwe_name": "SQLi",
+        }],
+    }
+    p = tmp_path / "pipeline_output.json"; p.write_text(json.dumps(pipeline))
+    out = tmp_path / "out"; out.mkdir()
+
+    class _StubRegistry:
+        def get(self, key): return object()
+
+    G.generate_all(str(p), str(out), registry=_StubRegistry())   # pre-fix: None.replace -> AttributeError
+    discs = list((out / "disclosures").glob("*.md"))
+    assert discs, "no disclosure written"
+    assert "F1" in discs[0].name, "id fallback not used for null short_name"
 
 
 # --- R2B-1: ParseResult.to_dict must include the derived `degraded` flag ---
