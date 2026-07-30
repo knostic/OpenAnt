@@ -132,7 +132,7 @@ Providers accept a custom `base_url` for OpenAI-compatible / Anthropic-compatibl
 
 #### Adding a new provider adapter
 
-OpenAnt's adapter layer is a small Python recipe — one Python file implementing the `LLMAdapter` Protocol, one factory for the contract-test harness, plus a registry entry — and that alone is enough to run the adapter from a hand-authored config. To also have it offered by the `openant setup llm` wizard and pass its pre-save probe, add a few Go touch-points in `apps/openant-cli/cmd/setup.go` (the supported-provider list, a probe `case`, the per-phase default-model maps) plus a Go probe function. The 12 contract tests run automatically against your adapter once it's wired in. See [`docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md`](docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md) for the full recipe.
+OpenAnt's adapter layer is a small Python recipe — one Python file implementing the `LLMAdapter` Protocol, one factory for the contract-test harness, plus a registry entry — and that alone is enough to run the adapter from a hand-authored config. To also have it offered by the `openant setup llm` wizard and pass its pre-save probe, add a few Go touch-points in `apps/openant-cli/cmd/setup.go` (the supported-provider list, a probe `case`, the per-phase default-model maps) plus a Go probe function. The 12 contract tests run automatically against your adapter once it's wired in.
 
 ### Python runtime
 
@@ -256,7 +256,7 @@ The adversarial pass is a distinct reasoning step whose only job is to argue the
 
 Auto Patcher runs against a finding already produced by an OpenAnt scan (`openant scan` / `openant build-output`) whose verdict is patch-eligible — `confirmed`, `agreed`, `vulnerable`, or `bypassable`.
 
-To find an eligible finding's id, check the `findings` array in your project's `pipeline_output.json` (written by `openant build-output`):
+To find an eligible finding's id, check the `findings` array in your project's `pipeline_output.json` (written by `openant build-output`) — the snippet below requires [`jq`](https://jqlang.org/):
 
 ```bash
 jq -r '.findings[] | "\(.id)\t\(.stage2_verdict // .stage1_verdict)"' pipeline_output.json

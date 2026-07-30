@@ -16,7 +16,7 @@ var parseCmd = &cobra.Command{
 	Long: `Parse extracts analyzable code units from a repository.
 
 The output is a JSON dataset that can be fed into the analyze command.
-Supports Python, JavaScript/TypeScript, Go, C/C++, Ruby, and PHP repositories.
+Supports Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Zig, and Swift repositories.
 
 If no repository path is given, the active project is used (see: openant init).`,
 	Args: cobra.MaximumNArgs(1),

@@ -328,7 +328,7 @@ func promptNewProvider(reader *bufio.Reader, name string) (config.ProviderEntry,
 		}
 		if !stringSliceContains(supportedProviderTypes, provType) {
 			fmt.Fprintf(os.Stderr, "Unknown provider type %q. The wizard offers: %v.\n", provType, supportedProviderTypes)
-			fmt.Fprintln(os.Stderr, "To use a provider not listed here, contribute an adapter — see docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md.")
+			fmt.Fprintln(os.Stderr, "To use a provider not listed here, contribute an adapter — see the OpenAnt documentation for adding new provider adapters.")
 			continue
 		}
 		// Per-provider subscription-vs-API reminder — the wizard needs

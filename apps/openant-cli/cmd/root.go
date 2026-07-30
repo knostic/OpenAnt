@@ -123,7 +123,7 @@ func requireAPIKey() string {
 	fmt.Fprintln(os.Stderr, "Run:  openant set-api-key <your-anthropic-api-key>")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Or author an `llm_providers` section in ~/.config/openant/config.json")
-	fmt.Fprintln(os.Stderr, "  (see docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md)")
+	fmt.Fprintln(os.Stderr, "  (see the OpenAnt documentation for adding new provider adapters)")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "You can get an Anthropic API key at https://console.anthropic.com/settings/keys")
 	os.Exit(2)
