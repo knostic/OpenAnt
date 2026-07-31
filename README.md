@@ -88,8 +88,9 @@ Wizard defaults reflect the project's per-phase recommendations (stronger reason
 | `anthropic` | [console.anthropic.com](https://console.anthropic.com/settings/keys) | Reference adapter. NOT included in Claude Pro / Max subscriptions — separate billing. |
 | `openai` | [platform.openai.com](https://platform.openai.com/api-keys) | NOT included in ChatGPT / Codex subscriptions — separate billing. |
 | `google` | [aistudio.google.com](https://aistudio.google.com/apikey) | NOT included in Gemini Advanced — separate billing. |
+| `bedrock` | — (AWS credential chain) | Claude on AWS Bedrock. No `api_key`: credentials come from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars or a `~/.aws` profile, region from `AWS_REGION`. Model IDs are inference profiles (`us.anthropic.claude-sonnet-4-6`, `global.anthropic.claude-haiku-4-5-20251001-v1:0`, ...) — enable them under "Model access" in the Bedrock console and list them with `aws bedrock list-inference-profiles`. Not offered by the setup wizard yet; configure by hand (see below). |
 
-All three support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop.
+All four support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop.
 
 #### Quick path for Anthropic-only setups
 
@@ -217,7 +218,7 @@ openant project switch <org/repo> # switch active project
 
 Things on the list, in no particular order:
 
-- **More provider adapters.** Ollama (local models), vLLM, Cohere, Mistral, Groq, Amazon Bedrock, Azure OpenAI — each is a small Python adapter recipe (plus a few Go wizard/probe touch-points if you want it offered by `openant setup llm`) per the contributor guide. Lower the barrier to local / on-prem inference.
+- **More provider adapters.** Ollama (local models), vLLM, Cohere, Mistral, Groq, Azure OpenAI — each is a small Python adapter recipe (plus a few Go wizard/probe touch-points if you want it offered by `openant setup llm`) per the contributor guide. Lower the barrier to local / on-prem inference.
 - **Subscription-based auth.** ChatGPT / Codex, Claude Pro / Max, and Gemini Advanced subscriptions don't currently grant API quota — users have to maintain a separate API-tier key per provider. OAuth-based adapters that ride the consumer subscription would close that gap.
 - **Cross-provider tool-call quirks.** All three shipped adapters support tool calling, but the long tail (parallel tool calls, strict-mode schema enforcement, retry semantics on partial JSON) behaves differently per provider. Real-world scans surface these — PRs welcome.
 - **More languages.** The supported-languages list above is current coverage. Java and C# come up frequently.
