@@ -85,7 +85,7 @@ _warned_block_kinds: set[str] = set()
 _warned_block_kinds_lock = threading.Lock()
 
 
-def _warn_unknown_block_kind(kind: str) -> None:
+def _warn_unknown_block_kind(kind: str, *, adapter: str = "AnthropicAdapter") -> None:
     """One-time stderr warning when the response carries a content-block
     kind the adapter doesn't translate, so a dropped block isn't silent."""
     should_warn = False
@@ -95,7 +95,7 @@ def _warn_unknown_block_kind(kind: str) -> None:
             should_warn = True
     if should_warn:
         sys.stderr.write(
-            f"warning: AnthropicAdapter received unknown content block "
+            f"warning: {adapter} received unknown content block "
             f"kind {kind!r}; dropping it. If the pipeline should consume "
             f"this, add a ContentBlock kind in utilities/llm/adapter.py "
             f"and translate it here.\n"
@@ -308,8 +308,13 @@ def _tool_to_anthropic(tool: ToolDef) -> dict[str, Any]:
     }
 
 
-def _response_to_unified(response: Any) -> CompletionResult:
-    """Translate an anthropic SDK ``Message`` object into our types."""
+def _response_to_unified(response: Any, *, adapter: str = "AnthropicAdapter") -> CompletionResult:
+    """Translate an anthropic SDK ``Message`` object into our types.
+
+    ``adapter`` names the calling adapter in one-time warnings — the
+    Bedrock adapter reuses this translation layer (same SDK, same wire
+    types) and its warnings should not blame AnthropicAdapter.
+    """
     content_blocks: list[ContentBlock] = []
     for block in response.content:
         kind = getattr(block, "type", None)
@@ -330,7 +335,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
             # symptom isn't silent. For a security tool, a silently
             # dropped "refusal" paired with a benign stop_reason could
             # read as an empty success.
-            _warn_unknown_block_kind(str(kind))
+            _warn_unknown_block_kind(str(kind), adapter=adapter)
 
     # R4-5: a usage-less response (rare, but seen on some proxies and on
     # error-shaped 200s) must not AttributeError here — the downstream
@@ -376,7 +381,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
                 should_warn = True
         if should_warn:
             sys.stderr.write(
-                f"warning: AnthropicAdapter received unknown stop_reason "
+                f"warning: {adapter} received unknown stop_reason "
                 f"{raw_stop!r}; normalising to 'end_turn'. Add this value "
                 f"to StopReason in utilities/llm/adapter.py and the "
                 f"_ANTHROPIC_STOP_REASONS table if it's a new SDK addition.\n"

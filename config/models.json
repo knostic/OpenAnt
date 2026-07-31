@@ -39,6 +39,42 @@
       "retrieved": "2026-07-23"
     },
     {
+      "id": "us.anthropic.claude-opus-4-8", "provider": "bedrock", "status": "current",
+      "price": {"input": 15.00, "output": 75.00},
+      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-opus-4-8 record (Bedrock Claude token rates match the direct Anthropic API)",
+      "retrieved": "2026-07-31"
+    },
+    {
+      "id": "global.anthropic.claude-opus-4-8", "provider": "bedrock", "status": "current",
+      "price": {"input": 15.00, "output": 75.00},
+      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-opus-4-8 record (Bedrock Claude token rates match the direct Anthropic API)",
+      "retrieved": "2026-07-31"
+    },
+    {
+      "id": "us.anthropic.claude-sonnet-4-6", "provider": "bedrock", "status": "current",
+      "price": {"input": 3.00, "output": 15.00},
+      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-sonnet-4-6 record (Bedrock Claude token rates match the direct Anthropic API)",
+      "retrieved": "2026-07-31"
+    },
+    {
+      "id": "global.anthropic.claude-sonnet-4-6", "provider": "bedrock", "status": "current",
+      "price": {"input": 3.00, "output": 15.00},
+      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-sonnet-4-6 record (Bedrock Claude token rates match the direct Anthropic API)",
+      "retrieved": "2026-07-31"
+    },
+    {
+      "id": "us.anthropic.claude-haiku-4-5-20251001-v1:0", "provider": "bedrock", "status": "current",
+      "price": {"input": 1.00, "output": 5.00},
+      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-haiku-4-5-20251001 record (Bedrock Claude token rates match the direct Anthropic API)",
+      "retrieved": "2026-07-31"
+    },
+    {
+      "id": "global.anthropic.claude-haiku-4-5-20251001-v1:0", "provider": "bedrock", "status": "current",
+      "price": {"input": 1.00, "output": 5.00},
+      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-haiku-4-5-20251001 record (Bedrock Claude token rates match the direct Anthropic API)",
+      "retrieved": "2026-07-31"
+    },
+    {
       "id": "gpt-4o", "provider": "openai", "status": "current",
       "price": {"input": 2.50, "output": 10.00},
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
