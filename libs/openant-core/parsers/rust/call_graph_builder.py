@@ -264,8 +264,20 @@ class CallGraphBuilder:
         source = code.encode("utf-8")
 
         stack = [tree.root_node]
+        entered_fn = False
         while stack:
             node = stack.pop()
+            if node.type == "function_item":
+                # The outermost function_item IS this unit; a NESTED `fn` is its own
+                # extracted unit (`outer::inner`) that collects its own call sites
+                # under its own generic bounds. Do not descend into a nested fn body
+                # here — attributing its calls to the outer unit resolves them under
+                # the outer fn's (wrong) bounds and fabricates phantom edges. Closures
+                # (closure_expression) are NOT function_items, so they still belong to
+                # this unit, which is correct (they capture the outer bounds).
+                if entered_fn:
+                    continue
+                entered_fn = True
             if node.type == "call_expression":
                 callee = node.children[0] if node.children else None
                 site = self._describe_callee(callee, source)
