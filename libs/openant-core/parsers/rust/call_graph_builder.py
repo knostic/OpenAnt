@@ -145,7 +145,7 @@ class CallGraphBuilder:
             file_path = func_info.get("file_path", "")
             caller_class = func_info.get("class_name")
 
-            var_types = self._collect_var_types(code)
+            var_types = self._collect_var_types(code, name_to_ids)
             fn_aliases = self._collect_fn_aliases(code, name_to_ids, file_path)
             # Merge the enclosing impl's generic bounds (`impl<T: Shape> Foo<T>`,
             # recorded by the extractor) with the fn's OWN generics; the fn's own
@@ -455,7 +455,9 @@ class CallGraphBuilder:
 
     # -- receiver static-type inference ----------------------------------------
 
-    def _collect_var_types(self, code: str) -> Dict[str, str]:
+    def _collect_var_types(
+        self, code: str, name_to_ids: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, str]:
         """Map local variable/parameter name -> its declared/inferred type.
 
         Sources, in order of confidence: parameter type annotations
@@ -514,11 +516,33 @@ class CallGraphBuilder:
                         name = self._text(c, source)
                         break
                 if name:
-                    _set(name, self._infer_let_type(node, source))
+                    _set(name, self._infer_let_type(node, source, name_to_ids))
             stack.extend(node.children)
         return var_types
 
-    def _infer_let_type(self, node: Node, source: bytes) -> Optional[str]:
+    def _assoc_return_type(
+        self, qualifier: str, leaf: Optional[str],
+        name_to_ids: Optional[Dict[str, List[str]]],
+    ) -> Optional[str]:
+        """Return the recorded return type of associated fn `qualifier::leaf`, if
+        known and not `Self`. Lets `let w = Factory::make()` type `w` as make()'s
+        real return type (Widget) instead of the constructor-idiom guess (Factory).
+        `Self` returns fall through to the qualifier (the `Type::new() -> Self` case).
+        """
+        if not leaf or not name_to_ids:
+            return None
+        for cand in name_to_ids.get(leaf, []):
+            info = self.functions.get(cand, {})
+            if info.get("class_name") == qualifier:
+                rt = info.get("return_type")
+                if rt and rt != "Self":
+                    return rt
+        return None
+
+    def _infer_let_type(
+        self, node: Node, source: bytes,
+        name_to_ids: Optional[Dict[str, List[str]]] = None,
+    ) -> Optional[str]:
         from .function_extractor import _bare_type_name
 
         # `let x: Type = ...;` -- explicit annotation wins.
@@ -553,7 +577,11 @@ class CallGraphBuilder:
                 if callee is not None and callee.type == "scoped_identifier":
                     qualifier, _leaf = self._split_scoped(callee, source)
                     if qualifier and qualifier not in ("Self",):
-                        return qualifier
+                        # Prefer the assoc fn's ACTUAL return type (`make() -> Widget`)
+                        # over the constructor-idiom assumption that it returns the
+                        # qualifier (`Factory`). Falls back to the qualifier when the
+                        # return type is unknown or `Self` (the `Type::new()` case).
+                        return self._assoc_return_type(qualifier, _leaf, name_to_ids) or qualifier
         return None
 
     def _collect_fn_aliases(

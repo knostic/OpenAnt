@@ -582,6 +582,12 @@ class FunctionExtractor:
 
         module_name = "::".join(ctx["module_path"]) if ctx["module_path"] else None
 
+        # Bare return-type name (`-> Widget` -> "Widget"), so a binding
+        # `let w = Type::assoc()` can be typed by the assoc fn's ACTUAL return type
+        # rather than the constructor-idiom assumption that it returns `Type` (bug F).
+        rt_node = node.child_by_field_name("return_type")
+        return_type = _bare_type_name(rt_node, source) if rt_node is not None else None
+
         func_id = f"{file_path}:{qualified_name}"
         if func_id in functions:
             # Same qualified_name already taken -- e.g. `impl Display for P` and
@@ -617,6 +623,7 @@ class FunctionExtractor:
             # so a receiver typed as `T` in this method dispatches to the trait's
             # conformers (bug D). Empty for free functions / inherent-non-generic impls.
             "impl_type_param_bounds": ctx.get("impl_type_param_bounds", {}),
+            "return_type": return_type,
         }
 
         block = None
