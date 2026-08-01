@@ -75,6 +75,17 @@ _ROUTE_ATTR_NAMES = {"get", "post", "put", "delete", "patch", "head", "options",
 # `impl` block, or as the RHS of a `let x: <type> = ...` annotation.
 _TYPE_NODE_KINDS = ("type_identifier", "generic_type", "scoped_type_identifier")
 
+# Non-nominal Self-type node kinds that are absent from _TYPE_NODE_KINDS but CAN be
+# an impl target: `impl Trait for u32 / [u8;4] / (i32,i32) / () / &T / *const T /
+# dyn X`. Collected in _handle_impl so their methods are extracted (bug I); for the
+# genuinely non-nominal ones _bare_type_name returns None and _handle_impl falls
+# back to the raw type text, while reference/dynamic types unwrap to their nominal
+# base as usual.
+_IMPL_SELF_EXTRA_KINDS = (
+    "primitive_type", "array_type", "tuple_type", "unit_type",
+    "reference_type", "pointer_type", "dynamic_type",
+)
+
 
 def _bare_type_name(node: Optional[Node], source: bytes) -> Optional[str]:
     """Reduce a type node to its bare (unqualified, non-generic) name.
@@ -403,7 +414,7 @@ class FunctionExtractor:
                             if cc.type == "type_identifier":
                                 impl_generics.add(_text(cc, source))
                                 break
-            if child.type in _TYPE_NODE_KINDS:
+            if child.type in _TYPE_NODE_KINDS or child.type in _IMPL_SELF_EXTRA_KINDS:
                 type_nodes.append((child, seen_for))
             elif child.type == "declaration_list":
                 body = child
@@ -418,6 +429,14 @@ class FunctionExtractor:
             self_node = type_nodes[0][0] if type_nodes else None
 
         self_type = _bare_type_name(self_node, source)
+        if not self_type and self_node is not None:
+            # Non-nominal Self type (primitive `u32`, array `[u8; 4]`, tuple
+            # `(i32, i32)`, unit `()`): `_bare_type_name` only names nominal types,
+            # so `impl Serialize for u32` would be dropped ENTIRELY -- every method
+            # in the block lost from extraction, the graph, and reachability. Fall
+            # back to the raw type text so the methods are still extracted (keyed by
+            # that type spelling).
+            self_type = _text(self_node, source).strip()
         trait_name = _bare_type_name(trait_node, source)
 
         if not self_type or body is None:
