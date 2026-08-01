@@ -36,7 +36,8 @@
     ".rake": "ruby",
     ".php": "php",
     ".zig": "zig",
-    ".swift": "swift"
+    ".swift": "swift",
+    ".rs": "rust"
   },
   "languages": {
     "python": {
@@ -104,6 +105,13 @@
       "extensions": [".swift"],
       "parser": {"mode": "subprocess", "script": "parsers/swift/test_pipeline.py"},
       "fence": "swift",
+      "docker_template": null,
+      "enabled": true
+    },
+    "rust": {
+      "extensions": [".rs"],
+      "parser": {"mode": "subprocess", "script": "parsers/rust/test_pipeline.py"},
+      "fence": "rust",
       "docker_template": null,
       "enabled": true
     }
