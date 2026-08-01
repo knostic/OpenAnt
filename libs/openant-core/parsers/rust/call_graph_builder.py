@@ -147,7 +147,15 @@ class CallGraphBuilder:
 
             var_types = self._collect_var_types(code)
             fn_aliases = self._collect_fn_aliases(code, name_to_ids, file_path)
-            type_param_bounds = self._collect_type_param_bounds(code)
+            # Merge the enclosing impl's generic bounds (`impl<T: Shape> Foo<T>`,
+            # recorded by the extractor) with the fn's OWN generics; the fn's own
+            # bound wins on a letter collision (inner shadows outer). Without the
+            # impl-level bounds a receiver typed as the impl's `T` would fall to a
+            # bare lookup on the letter and be hijacked by a blanket pseudo-type (D).
+            type_param_bounds = {
+                **func_info.get("impl_type_param_bounds", {}),
+                **self._collect_type_param_bounds(code),
+            }
             calls = self._find_calls_in_code(code, file_path, name_to_ids)
 
             for call in calls:

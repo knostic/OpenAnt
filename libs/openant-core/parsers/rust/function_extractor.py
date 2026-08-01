@@ -140,6 +140,53 @@ def _bare_type_name(node: Optional[Node], source: bytes) -> Optional[str]:
     return None
 
 
+def _impl_generic_bounds(impl_node: Node, source: bytes) -> Dict[str, List[str]]:
+    """Map an impl block's OWN generic param letter -> its bound trait(s).
+
+    `impl<T: Shape + Draw> Foo<T>` and `impl<T> Foo<T> where T: Shape` both yield
+    `{"T": ["Shape", ...]}`. Only the impl header's own generics (the `<...>` before
+    the self type, plus the where-clause) are read. Threaded onto each method so a
+    receiver typed as the impl's generic param (`x: &T`) dispatches to the bound
+    trait's conformers -- the SAME reachability-safe closure fn-level bounds use --
+    instead of falling to a bare lookup on the letter `T` (which a blanket impl's
+    pseudo-type `T` would poison). Mirrors CallGraphBuilder._collect_type_param_bounds.
+    """
+    bounds: Dict[str, List[str]] = {}
+
+    def _traits(tb: Node) -> List[str]:
+        return [_text(c, source) for c in tb.children if c.type == "type_identifier"]
+
+    def _add(param: Optional[str], tb: Node) -> None:
+        if not param:
+            return
+        bounds.setdefault(param, [])
+        for t in _traits(tb):
+            if t not in bounds[param]:
+                bounds[param].append(t)
+
+    def _param(node: Node) -> None:
+        pid = None
+        for cc in node.children:
+            if cc.type == "type_identifier" and pid is None:
+                pid = _text(cc, source)
+            elif cc.type == "trait_bounds":
+                _add(pid, cc)
+
+    seen_for = False
+    for child in impl_node.children:
+        if child.type == "for":
+            seen_for = True
+        elif child.type == "type_parameters" and not seen_for:
+            for tp in child.children:
+                if tp.type in ("type_parameter", "constrained_type_parameter"):
+                    _param(tp)
+        elif child.type == "where_clause":
+            for wp in child.children:
+                if wp.type == "where_predicate":
+                    _param(wp)
+    return bounds
+
+
 def _text(node: Optional[Node], source: bytes) -> str:
     if node is None:
         return ""
@@ -459,6 +506,7 @@ class FunctionExtractor:
             "in_test_scope": ctx["in_test_scope"],
             "in_trait_impl": trait_name is not None,
             "impl_trait": trait_name,
+            "impl_type_param_bounds": _impl_generic_bounds(node, source),
         }
         worklist.append((body, new_ctx))
 
@@ -565,6 +613,10 @@ class FunctionExtractor:
             "is_exported": is_exported,
             "has_self": has_self,
             "decorators": attrs,
+            # Bounds of the enclosing impl's own generics (`impl<T: Shape> Foo<T>`),
+            # so a receiver typed as `T` in this method dispatches to the trait's
+            # conformers (bug D). Empty for free functions / inherent-non-generic impls.
+            "impl_type_param_bounds": ctx.get("impl_type_param_bounds", {}),
         }
 
         block = None
