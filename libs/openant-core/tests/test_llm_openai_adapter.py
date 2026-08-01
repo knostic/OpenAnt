@@ -491,8 +491,27 @@ def test_validate_gpt5_uses_responses_endpoint():
     adapter.validate(G5)
     client.responses.create.assert_called_once()
     client.chat.completions.create.assert_not_called()
-    # no unsupported effort value forced on the ping
-    assert "reasoning" not in client.responses.create.call_args.kwargs
+    # BUG-1: the ping exercises the SAME reasoning effort complete() will send,
+    # so a model-rejected effort fails fast at init instead of 400-ing every unit.
+    assert client.responses.create.call_args.kwargs["reasoning"] == {"effort": "medium"}
+
+
+def test_validate_gpt5_fails_fast_on_model_rejected_effort():
+    # BUG-1: a model that rejects the configured reasoning effort must fail init,
+    # not pass validation and then 400 every single unit of the scan.
+    def reject_minimal(**kw):
+        if kw.get("reasoning", {}).get("effort") == "minimal":
+            raise openai.BadRequestError(
+                message="Unsupported value: 'minimal' is not supported for this model",
+                response=_fake_http(400), body=None)
+        return _resp(output=[_msg_item(_text_part("OK"))])
+    client = MagicMock(spec=openai.OpenAI)
+    client.responses = MagicMock(); client.responses.create = MagicMock(side_effect=reject_minimal)
+    client.chat = MagicMock(); client.chat.completions = MagicMock()
+    client.chat.completions.create = MagicMock(side_effect=AssertionError("must probe responses, not chat"))
+    adapter = OpenAIAdapter(_client=client, reasoning_effort="minimal")
+    with pytest.raises(LLMResponseError):
+        adapter.validate(G5)
 
 
 def test_validate_gpt4o_uses_chat_endpoint():

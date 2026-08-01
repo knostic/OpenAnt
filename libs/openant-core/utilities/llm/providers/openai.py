@@ -407,15 +407,18 @@ class OpenAIAdapter:
         # fail every unit).
         try:
             if _use_responses_api(model, self._use_responses_api_override):
-                # Prove the /v1/responses endpoint + model are reachable. Omit
-                # ``reasoning`` (effort values are model-specific — e.g. gpt-5.6
-                # rejects "minimal"); the model default is fine for a ping. A
+                # Prove the /v1/responses endpoint + model are reachable, pinging
+                # with the SAME ``reasoning`` effort ``_complete_responses`` will
+                # send. Effort values are model-specific (e.g. gpt-5.6 rejects
+                # "minimal"), so omitting it would let a rejected effort pass init
+                # and then 400 every unit — validate() must fail fast on it. A
                 # structurally valid 200 (incl. status="incomplete" if reasoning
                 # eats the budget) is success — only an exception fails init.
                 self._client.responses.create(
                     model=model,
                     input="Reply with OK.",
                     max_output_tokens=1000,
+                    reasoning={"effort": self._reasoning_effort},
                     store=False,
                 )
             else:
