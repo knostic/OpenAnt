@@ -377,15 +377,19 @@ def _response_to_unified(response: Any) -> CompletionResult:
         if should_warn:
             sys.stderr.write(
                 f"warning: AnthropicAdapter received unknown stop_reason "
-                f"{raw_stop!r}; normalising to 'end_turn'. Add this value "
-                f"to StopReason in utilities/llm/adapter.py and the "
+                f"{raw_stop!r}; treating as 'max_tokens' (not a clean finish). "
+                f"Add this value to StopReason in utilities/llm/adapter.py and the "
                 f"_ANTHROPIC_STOP_REASONS table if it's a new SDK addition.\n"
             )
     return CompletionResult(
         content=content_blocks,
         input_tokens=getattr(usage, "input_tokens", 0),
         output_tokens=getattr(usage, "output_tokens", 0),
-        stop_reason=_ANTHROPIC_STOP_REASONS.get(raw_stop, "end_turn"),
+        # R2-C: an unknown/abnormal stop_reason defaults to "max_tokens" (not
+        # "end_turn") — as the warning above notes, treating a refusal/abnormal
+        # termination as end_turn masks false negatives. Known values (end_turn/
+        # max_tokens/tool_use/stop_sequence) use their explicit mapping.
+        stop_reason=_ANTHROPIC_STOP_REASONS.get(raw_stop, "max_tokens"),
         raw=response,
     )
 

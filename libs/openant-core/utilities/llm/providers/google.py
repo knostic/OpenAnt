@@ -441,16 +441,24 @@ def _response_to_unified(response: Any) -> CompletionResult:
 
     stop_reason: StopReason
     has_tool_use = any(isinstance(b, ToolUseBlock) for b in content_blocks)
-    if has_tool_use:
+    mapped = _GEMINI_FINISH_REASONS.get(raw_finish)
+    if mapped == "max_tokens":
+        # R2-A: a TRUNCATED response wins over tool_use. Gemini emits a
+        # function_call part even when it hit the token cap, so tool_use must
+        # not mask MAX_TOKENS (mirrors the OpenAI responses path) — otherwise a
+        # truncated finish call reaches the consumer as a clean tool_use and is
+        # accepted as a complete verdict/classification (a silent false-negative).
+        stop_reason = "max_tokens"
+    elif has_tool_use:
         # Gemini doesn't use a dedicated finish_reason for tool calls;
         # the presence of a function_call part IS the signal.
         stop_reason = "tool_use"
-    elif raw_finish in _GEMINI_FINISH_REASONS:
-        stop_reason = _GEMINI_FINISH_REASONS[raw_finish]
+    elif mapped is not None:
+        stop_reason = mapped
     else:
-        # SAFETY / RECITATION / BLOCKLIST / OTHER — warn once, fall
-        # back to end_turn so pipeline code keeps moving. A future
-        # release should widen StopReason if these become common.
+        # SAFETY / RECITATION / BLOCKLIST / OTHER — warn once. R2-C: default to
+        # "max_tokens" (not end_turn), mirroring the OpenAI adapter, so an
+        # unknown/abnormal termination is not laundered into a clean completion.
         should_warn = False
         with _warned_finish_reasons_lock:
             if raw_finish not in _warned_finish_reasons:
@@ -459,12 +467,12 @@ def _response_to_unified(response: Any) -> CompletionResult:
         if should_warn:
             sys.stderr.write(
                 f"warning: GoogleAdapter received unknown finish_reason "
-                f"{raw_finish!r}; normalising to 'end_turn'. Add this value "
-                f"to StopReason in utilities/llm/adapter.py and "
+                f"{raw_finish!r}; treating as 'max_tokens' (not a clean finish). "
+                f"Add this value to StopReason in utilities/llm/adapter.py and "
                 f"_GEMINI_FINISH_REASONS if Gemini added a new termination "
                 f"reason.\n"
             )
-        stop_reason = "end_turn"
+        stop_reason = "max_tokens"
 
     return CompletionResult(
         content=content_blocks,
