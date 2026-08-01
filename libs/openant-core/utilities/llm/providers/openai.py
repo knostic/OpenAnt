@@ -180,7 +180,7 @@ def _token_param(model: str) -> str:
     return "max_completion_tokens" if _is_reasoning_model(model) else "max_tokens"
 
 
-def _warn_bad_tool_json(tool_name: str) -> None:
+def _warn_bad_tool_json(tool_name: str, *, adapter: str = "OpenAIAdapter") -> None:
     """One-time stderr warning when a tool call's ``arguments`` aren't valid JSON."""
     should_warn = False
     with _warned_bad_tool_json_lock:
@@ -189,7 +189,7 @@ def _warn_bad_tool_json(tool_name: str) -> None:
             should_warn = True
     if should_warn:
         sys.stderr.write(
-            f"warning: OpenAIAdapter could not parse tool-call arguments for "
+            f"warning: {adapter} could not parse tool-call arguments for "
             f"{tool_name!r} as JSON; passing empty input {{}}. The tool call "
             f"will likely fail downstream with a missing-field error.\n"
         )
@@ -741,8 +741,15 @@ def _responses_to_unified(response: Any) -> CompletionResult:
     )
 
 
-def _response_to_unified(response: Any) -> CompletionResult:
-    """Translate an OpenAI ChatCompletion response into our types."""
+def _response_to_unified(
+    response: Any, *, adapter: str = "OpenAIAdapter"
+) -> CompletionResult:
+    """Translate an OpenAI ChatCompletion response into our types.
+
+    ``adapter`` labels error/warning text so a derivative adapter that reuses
+    this translation (e.g. OpenRouter) attributes failures to itself, not to
+    ``OpenAIAdapter``.
+    """
     choices = getattr(response, "choices", None) or []
     if not choices:
         # No choices → nothing the pipeline can act on. Surface it via
@@ -750,7 +757,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
         # (mirrors the Gemini empty-``candidates`` guard); for a security
         # tool an empty end_turn would read as a clean, passing result.
         raise LLMResponseError(
-            "OpenAI returned no choices (empty completion); the request "
+            f"{adapter} returned no choices (empty completion); the request "
             "may have been filtered or the response was malformed"
         )
     choice = choices[0]
@@ -777,7 +784,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
             # back to an empty dict: the subsequent tool execution
             # surfaces a clear "missing required field" error, and a
             # multi-tool turn's other calls still proceed.
-            _warn_bad_tool_json(getattr(tc.function, "name", "<unknown>"))
+            _warn_bad_tool_json(getattr(tc.function, "name", "<unknown>"), adapter=adapter)
             input_dict = {}
         content_blocks.append(ToolUseBlock(
             id=tc.id,
@@ -792,7 +799,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
     # calls. OpenAI reports this as ``finish_reason == "content_filter"``.
     if raw_finish == _OPENAI_CONTENT_FILTER_REASON:
         raise LLMRefusalError(
-            "OpenAI content-filtered the response "
+            f"{adapter} content-filtered the response "
             "(finish_reason='content_filter'); the completion was withheld "
             "or truncated by the moderation layer"
         )
@@ -807,7 +814,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
     # more specific signal and already raised above.
     if not content_blocks:
         raise LLMResponseError(
-            "OpenAI returned an empty completion (no text or tool calls); the "
+            f"{adapter} returned an empty completion (no text or tool calls); the "
             "request may have been filtered or the response was malformed"
         )
 
@@ -819,7 +826,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
                 should_warn = True
         if should_warn:
             sys.stderr.write(
-                f"warning: OpenAIAdapter received unknown finish_reason "
+                f"warning: {adapter} received unknown finish_reason "
                 f"{raw_finish!r}; treating as 'max_tokens' (not a clean finish) so "
                 f"a truncated/abnormal chat response is not read as complete. Add "
                 f"this value to StopReason in utilities/llm/adapter.py and "
