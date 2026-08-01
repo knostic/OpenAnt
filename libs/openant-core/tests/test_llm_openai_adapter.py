@@ -431,6 +431,59 @@ def test_incomplete_max_tokens_sets_stop_reason():
     assert r.stop_reason == "max_tokens"
 
 
+# --- BUG-2: abnormal status / unknown incomplete-reason must NOT read as a clean end_turn ----
+# A truncated/abnormal response carrying PARTIAL content must not be laundered into a clean
+# stop_reason="end_turn" (a silent false-negative for a SAST tool). It is relabelled "max_tokens"
+# (the honest "not a clean finish" signal) and a one-time stderr warning is emitted, mirroring the
+# chat path's unknown-finish_reason handling. Empty-content abnormal responses still RAISE.
+
+def test_incomplete_unknown_reason_with_partial_is_not_clean_end_turn():
+    # incomplete + reason absent (incomplete_details=None) + partial text
+    adapter, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason=None,
+                                               output=[_msg_item(_text_part("truncated: no issues fou"))]))
+    r = adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert r.stop_reason != "end_turn"          # must NOT launder to a clean finish
+    assert r.stop_reason == "max_tokens"
+    assert [b.text for b in r.content] == ["truncated: no issues fou"]   # content preserved
+
+
+def test_incomplete_other_reason_with_partial_is_not_clean_end_turn():
+    adapter, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason="other",
+                                               output=[_msg_item(_text_part("partial"))]))
+    r = adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert r.stop_reason == "max_tokens"
+
+
+def test_unknown_top_level_status_with_partial_is_not_clean_end_turn():
+    adapter, _ = _stub_resp(lambda **kw: _resp(status="in_progress",
+                                               output=[_msg_item(_text_part("looks clean"))]))
+    r = adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert r.stop_reason != "end_turn"
+    assert r.stop_reason == "max_tokens"
+
+
+def test_bug2_regression_guards_still_hold():
+    # (1) completed + text → clean end_turn (unchanged)
+    a1, _ = _stub_resp(lambda **kw: _resp(status="completed", output=[_msg_item(_text_part("done"))]))
+    assert a1.complete(model=G5, system=None, messages=_hi(), max_tokens=8).stop_reason == "end_turn"
+    # (2) incomplete + content_filter → refusal (unchanged)
+    a2, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason="content_filter", output=[]))
+    with pytest.raises(LLMRefusalError):
+        a2.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    # (3) failed → response error (unchanged)
+    a3, _ = _stub_resp(lambda **kw: _resp(status="failed", error=SimpleNamespace(message="boom"), output=[]))
+    with pytest.raises(LLMResponseError):
+        a3.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    # (4) incomplete + max_output_tokens + text → max_tokens (unchanged)
+    a4, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason="max_output_tokens",
+                                          output=[_msg_item(_text_part("partial"))]))
+    assert a4.complete(model=G5, system=None, messages=_hi(), max_tokens=8).stop_reason == "max_tokens"
+    # (5) abnormal status but EMPTY content → still RAISES (empty-content guard intact)
+    a5, _ = _stub_resp(lambda **kw: _resp(status="in_progress", output=[]))
+    with pytest.raises(LLMResponseError):
+        a5.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+
+
 # --- validate gating ---------------------------------------------------------
 
 def test_validate_gpt5_uses_responses_endpoint():

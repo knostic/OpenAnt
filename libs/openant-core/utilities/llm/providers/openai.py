@@ -171,6 +171,8 @@ def reset_warnings() -> None:
         _warned_bad_tool_json.clear()
     with _warned_unknown_output_items_lock:
         _warned_unknown_output_items.clear()
+    with _warned_responses_statuses_lock:
+        _warned_responses_statuses.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +186,33 @@ def reset_warnings() -> None:
 # dropped output surface is visible — mirrors the Anthropic adapter's guard.
 _warned_unknown_output_items: set[str] = set()
 _warned_unknown_output_items_lock = threading.Lock()
+
+# Abnormal Responses statuses / incomplete-reasons we've already warned about
+# (per-process, lock-guarded) — mirrors ``_warned_finish_reasons`` on the chat
+# path so a truncated/abnormal-but-non-empty response is observable, not silent.
+_warned_responses_statuses: set[str] = set()
+_warned_responses_statuses_lock = threading.Lock()
+
+
+def _warn_unknown_responses_status(value: str) -> None:
+    """One-time stderr warning for an unrecognized/abnormal Responses status or
+    incomplete reason — mirrors the chat path's unknown-``finish_reason`` warning
+    (see ``_response_to_unified``) so an abnormal-but-non-empty response is visible
+    instead of silently reading as a clean ``end_turn`` (a false negative for a
+    security tool)."""
+    should_warn = False
+    with _warned_responses_statuses_lock:
+        if value not in _warned_responses_statuses:
+            _warned_responses_statuses.add(value)
+            should_warn = True
+    if should_warn:
+        sys.stderr.write(
+            f"warning: OpenAIAdapter received an abnormal Responses status/reason "
+            f"{value!r} carrying partial content; relabelling stop_reason to "
+            f"'max_tokens' so a truncated/abnormal response is not read as a clean "
+            f"completion. Add an explicit handler if OpenAI introduced a new "
+            f"termination status/reason.\n"
+        )
 
 
 def _use_responses_api(model: str, override: Optional[bool]) -> bool:
@@ -587,10 +616,24 @@ def _responses_to_unified(response: Any) -> CompletionResult:
                 "OpenAI content-filtered the response (incomplete: content_filter); "
                 "the completion was withheld by the moderation layer"
             )
-        if reason == "max_output_tokens":
+        elif reason == "max_output_tokens":
             stop_reason = "max_tokens"
-        # Other/unknown incomplete reasons fall through to the empty-content
-        # guard below rather than a silent clean pass.
+        else:
+            # Any other/unknown incomplete reason (incl. None): the response was
+            # truncated, so it must NOT read as a clean end_turn even when it
+            # carries partial content — the empty-content guard below only fires
+            # on EMPTY content. Relabel as max_tokens (the honest "not a clean
+            # finish" signal) and warn once, mirroring the chat path's
+            # unknown-finish_reason handling.
+            _warn_unknown_responses_status(f"incomplete:{reason!r}")
+            stop_reason = "max_tokens"
+    elif status not in (None, "completed"):
+        # An unrecognized / non-terminal top-level status (in_progress, queued,
+        # requires_action, or a future value) on a synchronous responses.create
+        # is abnormal; failed/cancelled already raised above. A partial body must
+        # not be laundered into a clean end_turn.
+        _warn_unknown_responses_status(str(status))
+        stop_reason = "max_tokens"
 
     content_blocks: list[ContentBlock] = []
     for item in getattr(response, "output", None) or []:
