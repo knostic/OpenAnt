@@ -525,6 +525,33 @@ def test_bug2_regression_guards_still_hold():
         a5.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
 
 
+# --- BUG-7: chat-path unknown finish_reason must not read as a clean end_turn ---
+# The chat-path analog of BUG-2: an unknown/proxy finish_reason (or a future OpenAI
+# value) carrying partial content is relabelled "max_tokens" (the honest not-a-clean-
+# finish signal) instead of a silent "end_turn". Known reasons are unchanged.
+
+def _chat_resp(*, content="hi", finish_reason="stop"):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None),
+                                 finish_reason=finish_reason)],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+    )
+
+
+def test_chat_unknown_finish_reason_is_not_clean_end_turn():
+    adapter, _ = _stub(lambda **kw: _chat_resp(content="truncated: no issues fou", finish_reason="abort"))
+    r = adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
+    assert r.stop_reason == "max_tokens"          # was a silent "end_turn"
+    assert [b.text for b in r.content] == ["truncated: no issues fou"]   # content preserved
+
+
+def test_chat_known_finish_reasons_unchanged():
+    # regression guard: BUG-7 changes ONLY the unknown-default; known reasons use their map.
+    for fr, expected in (("stop", "end_turn"), ("length", "max_tokens")):
+        adapter, _ = _stub(lambda fr=fr, **kw: _chat_resp(finish_reason=fr))
+        assert adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8).stop_reason == expected
+
+
 # --- validate gating ---------------------------------------------------------
 
 def test_validate_gpt5_uses_responses_endpoint():

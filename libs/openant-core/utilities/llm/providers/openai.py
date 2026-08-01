@@ -806,10 +806,10 @@ def _response_to_unified(response: Any) -> CompletionResult:
         if should_warn:
             sys.stderr.write(
                 f"warning: OpenAIAdapter received unknown finish_reason "
-                f"{raw_finish!r}; normalising to 'end_turn'. Add this value "
-                f"to StopReason in utilities/llm/adapter.py and "
-                f"_OPENAI_FINISH_REASONS if OpenAI added a new termination "
-                f"reason.\n"
+                f"{raw_finish!r}; treating as 'max_tokens' (not a clean finish) so "
+                f"a truncated/abnormal chat response is not read as complete. Add "
+                f"this value to StopReason in utilities/llm/adapter.py and "
+                f"_OPENAI_FINISH_REASONS if OpenAI added a new termination reason.\n"
             )
 
     usage = getattr(response, "usage", None)
@@ -817,7 +817,11 @@ def _response_to_unified(response: Any) -> CompletionResult:
         content=content_blocks,
         input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
         output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
-        stop_reason=_OPENAI_FINISH_REASONS.get(raw_finish, "end_turn"),
+        # BUG-7: an UNKNOWN finish_reason defaults to "max_tokens", not "end_turn" —
+        # the chat-path analog of _responses_to_unified's abnormal-status handling, so
+        # a proxy/future-value truncation isn't laundered into a clean completion.
+        # Known reasons (stop/tool_calls/length) use their explicit mapping above.
+        stop_reason=_OPENAI_FINISH_REASONS.get(raw_finish, "max_tokens"),
         raw=response,
     )
 
