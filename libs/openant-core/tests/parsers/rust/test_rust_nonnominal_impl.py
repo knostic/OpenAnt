@@ -1,4 +1,4 @@
-"""Bug I: trait/inherent impls on non-nominal Self types (primitive/array/tuple/
+"""trait/inherent impls on non-nominal Self types (primitive/array/tuple/
 unit) must still have their methods extracted. `_bare_type_name` names only nominal
 types, so `impl Serialize for u32` was dropped entirely (every method lost)."""
 import pathlib, sys

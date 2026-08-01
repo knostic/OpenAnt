@@ -1,4 +1,4 @@
-"""Bug A: RUST_BUILTINS filter must not drop TYPED/resolvable method-call edges.
+"""RUST_BUILTINS filter must not drop TYPED/resolvable method-call edges.
 
 A method call whose method name happens to be in RUST_BUILTINS (get/parse/new/...)
 on a KNOWN receiver type must still resolve — the builtin guard is a precision knob

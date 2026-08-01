@@ -1,4 +1,4 @@
-"""Bug H: two same-named methods on one type (the ubiquitous `impl Display for P`
+"""two same-named methods on one type (the ubiquitous `impl Display for P`
 + `impl Debug for P`, both `fn fmt`) must both be extracted. Previously both mapped
 to func_id `file:P.fmt` and the second silently clobbered the first (data loss:
 a whole unit vanished from the graph and reachability)."""

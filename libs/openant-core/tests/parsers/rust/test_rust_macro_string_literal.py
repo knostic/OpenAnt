@@ -1,4 +1,4 @@
-"""Bug B: the macro token-tree regex scan must not harvest call-shaped text from
+"""the macro token-tree regex scan must not harvest call-shaped text from
 INSIDE string literals. `println!("call init() first")` must not fabricate an edge
 to an unrelated `init`; real calls OUTSIDE the literal (`format!("{}", foo())`)
 must still be recovered."""

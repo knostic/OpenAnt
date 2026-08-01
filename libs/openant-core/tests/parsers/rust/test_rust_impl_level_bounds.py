@@ -1,4 +1,4 @@
-"""Bug D: a method receiver typed as an IMPL-level generic param (`impl<T: Shape>
+"""a method receiver typed as an IMPL-level generic param (`impl<T: Shape>
 Holder<T> { fn m(&self, x: &T) { x.area() } }`) must dispatch to the bound trait's
 conformers -- same as a fn-level bound. Previously the impl-level bound was invisible
 (only fn-level generics were read), so `x: T` fell to a bare-name lookup on the

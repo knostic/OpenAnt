@@ -1,4 +1,4 @@
-"""Bug F: `let x = Type::assoc()` should type `x` by the assoc fn's ACTUAL return
+"""`let x = Type::assoc()` should type `x` by the assoc fn's ACTUAL return
 type, not the blanket assumption that `Type::assoc()` returns `Type`. `Factory::
 make() -> Widget` must type the binding as Widget (recovering `w.process()` ->
 Widget.process and NOT fabricating Factory.process). The dominant `Type::new() ->

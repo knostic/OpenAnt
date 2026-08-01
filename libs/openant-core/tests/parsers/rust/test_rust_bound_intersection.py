@@ -1,4 +1,4 @@
-"""Bug C: a multi-bound generic must not lose all edges when one bound trait has
+"""a multi-bound generic must not lose all edges when one bound trait has
 no recorded conformers (marker/blanket/derive/cross-crate impls are invisible to
 the extractor). An unseen conformer set is 'unconstrained', not 'empty' — it must
 not annihilate the edges the other bounds establish (reachability over-approx)."""

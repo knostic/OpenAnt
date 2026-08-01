@@ -1,4 +1,4 @@
-"""Bug E: a nested fn's call sites must be attributed to the nested unit, not bled
+"""a nested fn's call sites must be attributed to the nested unit, not bled
 into the OUTER fn (and resolved under the outer fn's — wrong — generic bounds).
 `fn outer<B:Shape>(){ fn inner<B:Logger>(l:&B){ l.log() } ... }` must not create
 `outer -> Circle.log` (Circle is Shape, not Logger). The inner unit keeps its edge."""

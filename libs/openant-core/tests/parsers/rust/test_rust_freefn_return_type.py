@@ -1,7 +1,7 @@
-"""Bug G (recovery, phantom-free): a receiver bound from a free-function call
+"""a receiver bound from a free-function call
 `let c = load()` where `load() -> Cfg` must type `c` as Cfg, so `c.validate()`
 resolves PRECISELY to Cfg.validate -- recovering the unknown-receiver blackout the
-F2/F3/F4 gate would otherwise cause, with NO phantom to a same-named method on an
+unknown-receiver decline gate would otherwise cause, with NO phantom to a same-named method on an
 unrelated type. This makes the receiver KNOWN rather than relaxing the gate."""
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))

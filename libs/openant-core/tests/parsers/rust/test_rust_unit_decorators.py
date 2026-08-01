@@ -1,4 +1,4 @@
-"""Bug J: Rust unit metadata must carry `decorators` (parity with the Swift parser),
+"""Rust unit metadata must carry `decorators` (parity with the Swift parser),
 so dataset units expose the function's attributes like every sibling parser."""
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
