@@ -114,7 +114,19 @@ _REASONING_MODEL_RE = re.compile(r"^o[1-9]")
 # ``use_responses_api`` ctor arg (for base_url proxies that expose a gpt-5 id
 # over a chat-completions-only endpoint). NOTE: ``o1[0-9]`` and future
 # non-``gpt-``-prefixed reasoning families are intentionally out of scope here.
-_RESPONSES_MODEL_RE = re.compile(r"^gpt-[5-9]")
+_RESPONSES_MODEL_RE = re.compile(r"^gpt-[5-9]([.-]|$)")
+
+
+def _is_gpt5_responses_family(bare: str) -> bool:
+    """True for the gpt-5..gpt-9 REASONING ids that use /v1/responses.
+
+    Excludes the non-reasoning chat variants (``gpt-5-chat``,
+    ``gpt-5-chat-latest``) — they reject the ``reasoning`` param the responses
+    path always sends — and, via the tail anchor on ``_RESPONSES_MODEL_RE``, does
+    not match unrelated numbering like ``gpt-50``. ``bare`` must already be
+    lower-cased, proxy-prefix stripped, and whitespace-trimmed.
+    """
+    return bool(_RESPONSES_MODEL_RE.match(bare)) and "-chat" not in bare
 
 # Track finish_reasons we've already warned about. Per-process, lock-guarded.
 _warned_finish_reasons: set[str] = set()
@@ -135,12 +147,13 @@ def _is_reasoning_model(model: str) -> bool:
     the latter is reasoning-class too, so a gpt-5 forced onto the chat path
     (``use_responses_api=False``) gets the right per-request shape instead of
     a 400. This unions ``_REASONING_MODEL_RE`` (o-series) with
-    ``_RESPONSES_MODEL_RE`` (gpt-5+) so the endpoint decision and the
-    token-param/role decisions can never disagree. Strips any proxy prefix
-    (``openai/o1`` → ``o1``). ``gpt-4o`` is NOT a reasoning model.
+    ``_is_gpt5_responses_family`` (gpt-5+, excluding the non-reasoning chat
+    variants) so the endpoint decision and the token-param/role decisions can
+    never disagree. Strips any proxy prefix (``openai/o1`` → ``o1``) and
+    surrounding whitespace. ``gpt-4o`` and ``gpt-5-chat`` are NOT reasoning models.
     """
-    bare = model.lower().rsplit("/", 1)[-1]
-    return bool(_REASONING_MODEL_RE.match(bare) or _RESPONSES_MODEL_RE.match(bare))
+    bare = model.lower().rsplit("/", 1)[-1].strip()
+    return bool(_REASONING_MODEL_RE.match(bare) or _is_gpt5_responses_family(bare))
 
 
 def _token_param(model: str) -> str:
@@ -224,8 +237,8 @@ def _use_responses_api(model: str, override: Optional[bool]) -> bool:
     """
     if override is not None:
         return override
-    bare = model.lower().rsplit("/", 1)[-1]
-    return bool(_RESPONSES_MODEL_RE.match(bare))
+    bare = model.lower().rsplit("/", 1)[-1].strip()
+    return bool(_is_gpt5_responses_family(bare))
 
 
 # Reasoning models spend output tokens on hidden reasoning that counts against

@@ -295,6 +295,26 @@ def test_gate_predicates_partition_models():
     assert _use_responses_api("gpt-5.6", False) is False
 
 
+def test_gpt5_chat_variants_stay_off_responses():
+    # C1: the non-reasoning chat variants reject the reasoning param; they must NOT be
+    # force-routed to /v1/responses (which always sends reasoning -> 400), and must not
+    # be classified reasoning (they take max_tokens + system, the plain chat shape).
+    for m in ("gpt-5-chat-latest", "gpt-5-chat"):
+        assert _use_responses_api(m, None) is False
+        assert _is_reasoning_model(m) is False
+
+
+def test_gpt5_family_boundary_and_whitespace():
+    # C3: unrelated numbering (gpt-50) is not the gpt-5..gpt-9 family; ids are whitespace-trimmed.
+    assert _use_responses_api("gpt-50", None) is False
+    assert _use_responses_api("gpt-5 ", None) is True      # trailing space
+    assert _use_responses_api(" gpt-5", None) is True      # leading space
+    # real reasoning family still routes to responses and classifies as reasoning
+    assert _use_responses_api("gpt-5.6", None) is True
+    assert _use_responses_api("gpt-5-mini", None) is True
+    assert _is_reasoning_model("gpt-5-mini") is True
+
+
 def test_gpt5_routes_to_responses_not_chat():
     adapter, client = _stub_resp(lambda **kw: _resp(output=[_msg_item(_text_part("hello"))]))
     r = adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=4096)
