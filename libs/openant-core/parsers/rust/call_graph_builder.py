@@ -420,9 +420,7 @@ class CallGraphBuilder:
         if macro_name not in _SCANNABLE_MACROS or token_tree is None:
             return
         text = self._text(token_tree, source)
-        # Blank string/char literals first: their contents are data, not calls, so
-        # `println!("call init() first")` must not yield an `init` edge, while a real
-        # call outside the literal (`format!("{}", foo())`) is still recovered.
+        # Blank literals so a call-shaped substring inside a string is not scanned.
         text = _RUST_STR_LITERAL_RE.sub(" ", text)
         for match in _MACRO_CALL_RE.finditer(text):
             call_name = match.group(1)
@@ -948,11 +946,10 @@ class CallGraphBuilder:
         # candidates self-seed so declining them is free; a PRIVATE inherent method
         # whose sole edge is declined can black out. That blackout is RECOVERED
         # upstream wherever the receiver type is inferable -- e.g. `let c = load()`
-        # with `load() -> Cfg` now types the receiver (see _free_fn_return_type), so
-        # the call never reaches this gate. A blanket union of the residual truly
-        # ambiguous case was measured to add one cross-type phantom per call site
-        # (Dog->Cat.speak; precision 1/N) for a contrived reachability gain, so it is
-        # intentionally NOT done here (Sol/Fable reconcile, 2026-08-01).
+        # with `load() -> Cfg` types the receiver (see _free_fn_return_type), so the
+        # call never reaches this gate. A blanket union of the residual truly-ambiguous
+        # case would add a cross-type phantom (Dog->Cat.speak) per call site, so it is
+        # not done here.
         return []
 
     def _resolve_typed_member(

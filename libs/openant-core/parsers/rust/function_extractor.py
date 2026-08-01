@@ -77,7 +77,7 @@ _TYPE_NODE_KINDS = ("type_identifier", "generic_type", "scoped_type_identifier")
 
 # Non-nominal Self-type node kinds that are absent from _TYPE_NODE_KINDS but CAN be
 # an impl target: `impl Trait for u32 / [u8;4] / (i32,i32) / () / &T / *const T /
-# dyn X`. Collected in _handle_impl so their methods are extracted (bug I); for the
+# dyn X`. Collected in _handle_impl so their methods are extracted; for the
 # genuinely non-nominal ones _bare_type_name returns None and _handle_impl falls
 # back to the raw type text, while reference/dynamic types unwrap to their nominal
 # base as usual.
@@ -584,7 +584,7 @@ class FunctionExtractor:
 
         # Bare return-type name (`-> Widget` -> "Widget"), so a binding
         # `let w = Type::assoc()` can be typed by the assoc fn's ACTUAL return type
-        # rather than the constructor-idiom assumption that it returns `Type` (bug F).
+        # rather than the constructor-idiom assumption that it returns `Type`.
         rt_node = node.child_by_field_name("return_type")
         return_type = _bare_type_name(rt_node, source) if rt_node is not None else None
 
@@ -621,7 +621,7 @@ class FunctionExtractor:
             "decorators": attrs,
             # Bounds of the enclosing impl's own generics (`impl<T: Shape> Foo<T>`),
             # so a receiver typed as `T` in this method dispatches to the trait's
-            # conformers (bug D). Empty for free functions / inherent-non-generic impls.
+            # conformers. Empty for free functions / inherent-non-generic impls.
             "impl_type_param_bounds": ctx.get("impl_type_param_bounds", {}),
             "return_type": return_type,
         }
