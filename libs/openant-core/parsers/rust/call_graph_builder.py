@@ -136,7 +136,7 @@ class CallGraphBuilder:
             var_types = self._collect_var_types(code)
             fn_aliases = self._collect_fn_aliases(code, name_to_ids, file_path)
             type_param_bounds = self._collect_type_param_bounds(code)
-            calls = self._find_calls_in_code(code, file_path)
+            calls = self._find_calls_in_code(code, file_path, name_to_ids)
 
             for call in calls:
                 resolved_ids = self._resolve_call(
@@ -237,7 +237,10 @@ class CallGraphBuilder:
 
     # -- call-site extraction ---------------------------------------------------
 
-    def _find_calls_in_code(self, code: str, caller_file: str) -> List[dict]:
+    def _find_calls_in_code(
+        self, code: str, caller_file: str,
+        name_to_ids: Optional[Dict[str, List[str]]] = None,
+    ) -> List[dict]:
         """Return call-site descriptors: {"kind": "bare"|"field"|"scoped", ...}."""
         sites: List[dict] = []
         if not code:
@@ -260,11 +263,24 @@ class CallGraphBuilder:
                 self._scan_macro_body(node, source, sites)
             stack.extend(node.children)
 
+        # The RUST_BUILTINS set is a precision guard for the UNKNOWN-receiver
+        # fallback path only (see `_resolve_unknown_receiver_method`), NOT a reason
+        # to delete a resolvable call at extraction time. A builtin-named site is
+        # dropped here ONLY when the name is a pure std/library name — i.e. it does
+        # NOT name any known repo function/method (`repo_names`) and is not shadowed
+        # in the caller's own file. When the name IS a real repo function/method,
+        # the site is kept and resolution decides precisely (typed dispatch) or
+        # conservatively (the unknown-receiver builtin guard). This mirrors the
+        # Swift parser's filter, whose `text in repo_names` clause keeps exactly
+        # these real calls; the Rust port had dropped that clause, silently
+        # deleting typed cross-file `.get()/.parse()/...`-style edges.
         shadowing = self._same_file_function_names(caller_file)
+        repo_names = set(name_to_ids) if name_to_ids else set()
         filtered = []
         for site in sites:
             bare = site.get("bare_filter_name")
-            if bare is None or bare in shadowing or bare not in RUST_BUILTINS:
+            if (bare is None or bare in shadowing or bare not in RUST_BUILTINS
+                    or bare in repo_names):
                 filtered.append(site)
         return filtered
 
