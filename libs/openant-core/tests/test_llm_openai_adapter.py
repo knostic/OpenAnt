@@ -295,13 +295,21 @@ def test_gate_predicates_partition_models():
     assert _use_responses_api("gpt-5.6", False) is False
 
 
-def test_gpt5_chat_variants_stay_off_responses():
-    # C1: the non-reasoning chat variants reject the reasoning param; they must NOT be
-    # force-routed to /v1/responses (which always sends reasoning -> 400), and must not
-    # be classified reasoning (they take max_tokens + system, the plain chat shape).
-    for m in ("gpt-5-chat-latest", "gpt-5-chat"):
+def test_gpt5_nonreasoning_variants_stay_off_responses():
+    # The non-reasoning gpt-5 variants (chat, search) reject the reasoning param, so they
+    # must NOT be force-routed to /v1/responses (which always sends reasoning -> 400). Only
+    # the reasoning family belongs on responses; search/chat are served on Chat Completions.
+    for m in ("gpt-5-chat-latest", "gpt-5-chat", "gpt-5-search-api", "gpt-5-search-api-2025-10-14"):
         assert _use_responses_api(m, None) is False
         assert _is_reasoning_model(m) is False
+
+
+def test_gpt5_reasoning_variants_stay_on_responses():
+    # guard the other side: real reasoning-family ids must NOT be excluded by the
+    # non-reasoning filter (no "-chat"/"-search" substring in them).
+    for m in ("gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-codex", "gpt-5-pro", "gpt-5.6-sol"):
+        assert _use_responses_api(m, None) is True
+        assert _is_reasoning_model(m) is True
 
 
 def test_gpt5_family_boundary_and_whitespace():

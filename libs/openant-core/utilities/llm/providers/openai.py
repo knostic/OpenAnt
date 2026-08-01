@@ -120,13 +120,18 @@ _RESPONSES_MODEL_RE = re.compile(r"^gpt-[5-9]([.-]|$)")
 def _is_gpt5_responses_family(bare: str) -> bool:
     """True for the gpt-5..gpt-9 REASONING ids that use /v1/responses.
 
-    Excludes the non-reasoning chat variants (``gpt-5-chat``,
-    ``gpt-5-chat-latest``) — they reject the ``reasoning`` param the responses
-    path always sends — and, via the tail anchor on ``_RESPONSES_MODEL_RE``, does
-    not match unrelated numbering like ``gpt-50``. ``bare`` must already be
-    lower-cased, proxy-prefix stripped, and whitespace-trimmed.
+    Excludes the non-reasoning gpt-5 variants — the chat models (``gpt-5-chat``,
+    ``gpt-5-chat-latest``) and the web-search models (``gpt-5-search-api``) —
+    which reject the ``reasoning`` param the responses path always sends and are
+    served on Chat Completions (like ``gpt-4o-search-preview``). Via the tail
+    anchor on ``_RESPONSES_MODEL_RE`` it also does not match unrelated numbering
+    like ``gpt-50``. ``bare`` must already be lower-cased, proxy-prefix stripped,
+    and whitespace-trimmed. NOTE: the token-param OpenAI expects for these
+    non-reasoning variants on Chat Completions (``max_tokens`` vs
+    ``max_completion_tokens``) is a separate, pre-existing question left to the
+    unchanged chat path — a bad choice fails loud at ``validate()``, not silently.
     """
-    return bool(_RESPONSES_MODEL_RE.match(bare)) and "-chat" not in bare
+    return bool(_RESPONSES_MODEL_RE.match(bare)) and "-chat" not in bare and "-search" not in bare
 
 # Track finish_reasons we've already warned about. Per-process, lock-guarded.
 _warned_finish_reasons: set[str] = set()
