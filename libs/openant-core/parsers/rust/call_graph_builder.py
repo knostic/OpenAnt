@@ -55,6 +55,18 @@ _MACRO_CALL_RE = re.compile(
     r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:::<[^>]*>)?\s*\("
 )
 
+# String / char literals inside a macro token tree, blanked BEFORE the call-shaped
+# scan so call-looking text in a diagnostic message (`panic!("call init() first")`)
+# is not harvested as a phantom edge. Covers raw strings (`r"..."`, `r#"..."#`),
+# normal strings with escapes, and char literals; Rust lifetimes (`'a`, no closing
+# quote) intentionally do not match. Best-effort, matching the scan itself.
+_RUST_STR_LITERAL_RE = re.compile(
+    r'r#"(?:[^"]|"(?!#))*"#'      # raw string, one hash
+    r'|r"[^"]*"'                  # raw string, no hash
+    r'|"(?:\\.|[^"\\])*"'         # normal string with escapes
+    r"|'(?:\\.|[^'\\])'"          # char literal
+)
+
 RUST_BUILTINS = {
     # core::fmt / println-family macro names (recovered via token-tree scan,
     # so they can appear as bare "calls" and must be filtered like any std fn)
@@ -388,6 +400,10 @@ class CallGraphBuilder:
         if macro_name not in _SCANNABLE_MACROS or token_tree is None:
             return
         text = self._text(token_tree, source)
+        # Blank string/char literals first: their contents are data, not calls, so
+        # `println!("call init() first")` must not yield an `init` edge, while a real
+        # call outside the literal (`format!("{}", foo())`) is still recovered.
+        text = _RUST_STR_LITERAL_RE.sub(" ", text)
         for match in _MACRO_CALL_RE.finditer(text):
             call_name = match.group(1)
             if "." in call_name:
