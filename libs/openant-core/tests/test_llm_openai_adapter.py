@@ -224,6 +224,7 @@ from utilities.llm import LLMRefusalError, ToolDef, ToolResultBlock, ToolUseBloc
 from utilities.llm.providers.openai import (
     _use_responses_api,
     _is_reasoning_model,
+    _token_param,
     _RESPONSES_MIN_OUTPUT_TOKENS,
     _messages_to_responses,
     _tool_to_responses,
@@ -295,13 +296,25 @@ def test_gate_predicates_partition_models():
     assert _use_responses_api("gpt-5.6", False) is False
 
 
-def test_gpt5_nonreasoning_variants_stay_off_responses():
-    # The non-reasoning gpt-5 variants (chat, search) reject the reasoning param, so they
-    # must NOT be force-routed to /v1/responses (which always sends reasoning -> 400). Only
-    # the reasoning family belongs on responses; search/chat are served on Chat Completions.
-    for m in ("gpt-5-chat-latest", "gpt-5-chat", "gpt-5-search-api", "gpt-5-search-api-2025-10-14"):
+def test_gpt5_chat_variants_chat_endpoint_but_completion_tokens():
+    # Live-verified (gpt-5.2-chat-latest): the gpt-5 chat variants reject the reasoning
+    # param, so they are served on Chat Completions (NOT /v1/responses) — but the gpt-5
+    # generation there requires max_completion_tokens (max_tokens 400s). So endpoint=chat,
+    # token-param/role = the reasoning-class shape (max_completion_tokens + developer).
+    for m in ("gpt-5-chat-latest", "gpt-5.2-chat-latest", "gpt-5-chat"):
+        assert _use_responses_api(m, None) is False
+        assert _is_reasoning_model(m) is True
+        assert _token_param(m) == "max_completion_tokens"
+
+
+def test_gpt5_search_variants_chat_endpoint_and_max_tokens():
+    # Live-verified (gpt-5-search-api): served on Chat Completions with max_tokens (accepts
+    # max_tokens, rejected by the Responses API) — like gpt-4o-search-preview. So endpoint=chat
+    # AND the plain-chat token shape (max_tokens + system), distinct from the chat variants.
+    for m in ("gpt-5-search-api", "gpt-5-search-api-2025-10-14"):
         assert _use_responses_api(m, None) is False
         assert _is_reasoning_model(m) is False
+        assert _token_param(m) == "max_tokens"
 
 
 def test_gpt5_reasoning_variants_stay_on_responses():

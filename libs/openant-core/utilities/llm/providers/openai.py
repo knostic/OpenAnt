@@ -126,12 +126,24 @@ def _is_gpt5_responses_family(bare: str) -> bool:
     served on Chat Completions (like ``gpt-4o-search-preview``). Via the tail
     anchor on ``_RESPONSES_MODEL_RE`` it also does not match unrelated numbering
     like ``gpt-50``. ``bare`` must already be lower-cased, proxy-prefix stripped,
-    and whitespace-trimmed. NOTE: the token-param OpenAI expects for these
-    non-reasoning variants on Chat Completions (``max_tokens`` vs
-    ``max_completion_tokens``) is a separate, pre-existing question left to the
-    unchanged chat path — a bad choice fails loud at ``validate()``, not silently.
+    and whitespace-trimmed. This is the ENDPOINT decision only; the token-param /
+    role class — which the ``-chat`` variants share but the ``-search`` variants
+    don't — is ``_is_gpt5_completion_token_family``.
     """
     return bool(_RESPONSES_MODEL_RE.match(bare)) and "-chat" not in bare and "-search" not in bare
+
+
+def _is_gpt5_completion_token_family(bare: str) -> bool:
+    """True for gpt-5..gpt-9 ids that take ``max_completion_tokens`` + the
+    ``developer`` role on Chat Completions — the whole generation EXCEPT the
+    ``-search`` variants, which take ``max_tokens`` + ``system`` like
+    ``gpt-4o-search-preview``. Live-verified: ``gpt-5.2-chat-latest`` rejects
+    ``max_tokens`` (needs ``max_completion_tokens``) while ``gpt-5-search-api``
+    accepts ``max_tokens``. Decoupled from the ENDPOINT decision
+    (``_is_gpt5_responses_family``): a ``-chat`` id is chat-endpoint yet still
+    completion-token-class. ``bare`` must be lower-cased, proxy-stripped, trimmed.
+    """
+    return bool(_RESPONSES_MODEL_RE.match(bare)) and "-search" not in bare
 
 # Track finish_reasons we've already warned about. Per-process, lock-guarded.
 _warned_finish_reasons: set[str] = set()
@@ -152,13 +164,15 @@ def _is_reasoning_model(model: str) -> bool:
     the latter is reasoning-class too, so a gpt-5 forced onto the chat path
     (``use_responses_api=False``) gets the right per-request shape instead of
     a 400. This unions ``_REASONING_MODEL_RE`` (o-series) with
-    ``_is_gpt5_responses_family`` (gpt-5+, excluding the non-reasoning chat
-    variants) so the endpoint decision and the token-param/role decisions can
-    never disagree. Strips any proxy prefix (``openai/o1`` → ``o1``) and
-    surrounding whitespace. ``gpt-4o`` and ``gpt-5-chat`` are NOT reasoning models.
+    ``_is_gpt5_completion_token_family`` (the gpt-5+ generation minus the
+    ``-search`` variants) — the token-param/role class, which is BROADER than the
+    responses-ENDPOINT class (``_is_gpt5_responses_family``): a gpt-5 ``-chat``
+    variant is served on Chat Completions but still needs ``max_completion_tokens``
+    there. Strips any proxy prefix (``openai/o1`` → ``o1``) and surrounding
+    whitespace. ``gpt-4o`` and the ``-search`` variants are NOT completion-token-class.
     """
     bare = model.lower().rsplit("/", 1)[-1].strip()
-    return bool(_REASONING_MODEL_RE.match(bare) or _is_gpt5_responses_family(bare))
+    return bool(_REASONING_MODEL_RE.match(bare) or _is_gpt5_completion_token_family(bare))
 
 
 def _token_param(model: str) -> str:
