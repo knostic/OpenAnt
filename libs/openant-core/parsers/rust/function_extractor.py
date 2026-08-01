@@ -117,7 +117,7 @@ def _bare_type_name(node: Optional[Node], source: bytes) -> Optional[str]:
         return _text(last, source) if last is not None else None
     if t == "reference_type":
         # `&Point` / `&mut Point` / `&'a Point` -> unwrap to Point;
-        # `&dyn Shape` -> unwrap through the dynamic_type to Shape (val_3_19).
+        # `&dyn Shape` -> unwrap through the dynamic_type to Shape.
         for child in node.children:
             if child.type in _TYPE_NODE_KINDS or child.type == "dynamic_type":
                 return _bare_type_name(child, source)
@@ -125,8 +125,8 @@ def _bare_type_name(node: Optional[Node], source: bytes) -> Optional[str]:
     if t == "dynamic_type":
         # `dyn Shape` / `dyn Shape + Send` -> the trait's bare name, so a
         # `&dyn Shape` receiver types as `Shape` and dispatches to Shape's
-        # conformers via trait_impls (val_3_19; `dyn Shape` is a `dynamic_type`
-        # node, verified against the installed grammar per pr_2_1).
+        # conformers via trait_impls (`dyn Shape` is a `dynamic_type`
+        # node, verified against the installed grammar).
         for child in node.children:
             r = _bare_type_name(child, source)
             if r:

@@ -616,7 +616,7 @@ class CallGraphBuilder:
 
         `let p: fn() = tgt; p();` and `let q = tgt; q();` bind a callable to a
         variable; a later `p()`/`q()` is a real edge to `tgt` that bare-name
-        resolution misses (val_3_18). Only a RHS that is a *bare identifier
+        resolution misses. Only a RHS that is a *bare identifier
         naming a known FREE function* creates an alias -- never a call, closure,
         method, or arbitrary expression. The RHS is resolved through the SAME
         gate a bare call uses -- free functions only (a bare identifier in value
@@ -682,7 +682,7 @@ class CallGraphBuilder:
         dispatch to the trait's conformers via the SAME `trait_impls` closure the
         `&dyn Trait` path uses -- nominal typing makes the conformer set knowable
         and bounded, so this is a reachability-safe over-approximation, not a
-        guess (val_3_19 extended from `dyn` to generic bounds; the Swift parser's
+        guess (extended from `dyn` to generic bounds; the Swift parser's
         protocol-conformer dispatch is the reference).
         """
         bounds: Dict[str, List[str]] = {}
@@ -758,7 +758,7 @@ class CallGraphBuilder:
         fn_aliases: Optional[Dict[str, List[str]]] = None,
     ) -> List[str]:
         # A local variable bound to a function value: `let p = tgt; p()` -> tgt
-        # (val_3_18). Checked before name resolution because `p` is not itself a
+        # Checked before name resolution because `p` is not itself a
         # function name; the alias only exists when RHS named a known function.
         if fn_aliases and call_name in fn_aliases:
             return fn_aliases[call_name]
@@ -845,7 +845,7 @@ class CallGraphBuilder:
                 # Generic trait-bound receiver (`item: &B` where `B: Shape`)
                 # is resolved FIRST and never via a concrete-type lookup on the
                 # letter: dispatch to the intersection of the bound traits'
-                # conformers (val_3_19 for generics). Checking bounds before the
+                # conformers (for generics). Checking bounds before the
                 # concrete lookup is what stops a blanket `impl<T: X> Y for T`
                 # (which mints a pseudo-type `"T"`) from hijacking every generic
                 # receiver named `T`/`B` repo-wide.
@@ -928,7 +928,7 @@ class CallGraphBuilder:
         if not candidates:
             return []
         same_file = [c for c in candidates if self._in_file(c, caller_file)]
-        # F2/F3/F4: only emit an edge when the receiver-less resolution is
+        # Unknown-receiver gate: only emit an edge when the receiver-less resolution is
         # UNAMBIGUOUS. When several same-named `&self` methods live in the same
         # file (e.g. Dog::speak and Cat::speak) and the receiver's static type is
         # unknown (inferred from a fn-return, struct field, `dyn Trait`, or a
