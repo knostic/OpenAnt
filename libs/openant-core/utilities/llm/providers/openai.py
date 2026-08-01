@@ -52,6 +52,7 @@ the right key per model so a probe or scan against ``o1`` doesn't 400.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import threading
@@ -64,6 +65,7 @@ from ..adapter import (
     ContentBlock,
     LLMAuthError,
     LLMConnectionError,
+    LLMError,
     LLMNotFoundError,
     LLMRateLimitError,
     LLMRefusalError,
@@ -94,9 +96,25 @@ _OPENAI_FINISH_REASONS: dict[str, StopReason] = {
 _OPENAI_CONTENT_FILTER_REASON = "content_filter"
 
 # OpenAI reasoning models (o1/o3/o4 families) reject ``max_tokens`` and
-# require ``max_completion_tokens``. Match the bare ``o<digit>`` family
-# — NOT ``gpt-4o`` / ``gpt-4o-mini``, which are regular chat models.
+# require ``max_completion_tokens`` on Chat Completions. Match the bare
+# ``o<digit>`` family — NOT ``gpt-4o`` / ``gpt-4o-mini``, which are regular
+# chat models. The gpt-5+ generation is ALSO reasoning-class (see
+# ``_is_reasoning_model``, which unions this with ``_RESPONSES_MODEL_RE``):
+# it normally routes to the Responses API and so never reaches
+# ``_token_param``/the role logic — EXCEPT when forced onto the chat path
+# via the ``use_responses_api=False`` override, where it must still get
+# ``max_completion_tokens`` + the ``developer`` role or the request 400s.
 _REASONING_MODEL_RE = re.compile(r"^o[1-9]")
+
+# gpt-5+ generation → OpenAI Responses API (/v1/responses). gpt-5 rejects
+# ``tools`` + ``reasoning`` on Chat Completions, which the agentic enhance
+# and verify phases require; Responses supports both. Kept deliberately
+# narrow: only the gpt-5..gpt-9 families. Everything else (gpt-4o, o-series)
+# stays on the unchanged Chat Completions path. Override per-adapter via the
+# ``use_responses_api`` ctor arg (for base_url proxies that expose a gpt-5 id
+# over a chat-completions-only endpoint). NOTE: ``o1[0-9]`` and future
+# non-``gpt-``-prefixed reasoning families are intentionally out of scope here.
+_RESPONSES_MODEL_RE = re.compile(r"^gpt-[5-9]")
 
 # Track finish_reasons we've already warned about. Per-process, lock-guarded.
 _warned_finish_reasons: set[str] = set()
@@ -110,14 +128,19 @@ _warned_bad_tool_json_lock = threading.Lock()
 
 
 def _is_reasoning_model(model: str) -> bool:
-    """True for OpenAI reasoning models (o1/o3/o4…) that need
-    ``max_completion_tokens`` instead of ``max_tokens``.
+    """True for OpenAI reasoning models that need ``max_completion_tokens``
+    (not ``max_tokens``) and the ``developer`` role (not ``system``).
 
-    Strips any proxy prefix (``openai/o1`` → ``o1``) and matches the
-    bare ``o<digit>`` family. ``gpt-4o`` is NOT a reasoning model.
+    Covers the o-series (``o1``/``o3``/``o4``…) AND the gpt-5+ generation —
+    the latter is reasoning-class too, so a gpt-5 forced onto the chat path
+    (``use_responses_api=False``) gets the right per-request shape instead of
+    a 400. This unions ``_REASONING_MODEL_RE`` (o-series) with
+    ``_RESPONSES_MODEL_RE`` (gpt-5+) so the endpoint decision and the
+    token-param/role decisions can never disagree. Strips any proxy prefix
+    (``openai/o1`` → ``o1``). ``gpt-4o`` is NOT a reasoning model.
     """
     bare = model.lower().rsplit("/", 1)[-1]
-    return bool(_REASONING_MODEL_RE.match(bare))
+    return bool(_REASONING_MODEL_RE.match(bare) or _RESPONSES_MODEL_RE.match(bare))
 
 
 def _token_param(model: str) -> str:
@@ -146,6 +169,72 @@ def reset_warnings() -> None:
         _warned_finish_reasons.clear()
     with _warned_bad_tool_json_lock:
         _warned_bad_tool_json.clear()
+    with _warned_unknown_output_items_lock:
+        _warned_unknown_output_items.clear()
+
+
+# ---------------------------------------------------------------------------
+# Responses-API routing + shared helpers
+# ---------------------------------------------------------------------------
+
+# Output items on the Responses API we deliberately do not surface as content:
+# ``reasoning`` (internal chain, kept out of ``CompletionResult.content`` per the
+# adapter's "reasoning stays internal" invariant). Any OTHER unexpected item type
+# (mcp_call, shell_call, custom_tool_call, …) is warned about once so a silently
+# dropped output surface is visible — mirrors the Anthropic adapter's guard.
+_warned_unknown_output_items: set[str] = set()
+_warned_unknown_output_items_lock = threading.Lock()
+
+
+def _use_responses_api(model: str, override: Optional[bool]) -> bool:
+    """Route gpt-5+ to /v1/responses; everything else to Chat Completions.
+
+    ``override`` (from the adapter ctor) wins when not ``None`` — lets a
+    ``base_url`` proxy exposing a gpt-5 id over a chat-completions-only endpoint
+    force the chat path, or force responses for an unrecognised id.
+    """
+    if override is not None:
+        return override
+    bare = model.lower().rsplit("/", 1)[-1]
+    return bool(_RESPONSES_MODEL_RE.match(bare))
+
+
+# Reasoning models spend output tokens on hidden reasoning that counts against
+# ``max_output_tokens``; a Claude-tuned cap (the pipeline passes ~4096) can be
+# fully consumed by reasoning, yielding status="incomplete" with no visible
+# text/tool-call — which for a SAST tool would silently read as "nothing found".
+# Floor the responses-path output budget so the visible answer always has room.
+_RESPONSES_MIN_OUTPUT_TOKENS = 16000
+
+# Reasoning effort for the Responses path. Default from env; "medium" balances
+# quality vs reasoning-token cost across thousands of units. Not threaded through
+# per-phase config: PhaseRef carries only (provider, model), and adding a field
+# would require a coordinated Python + Go CLI config-schema change.
+_DEFAULT_REASONING_EFFORT = os.environ.get("OPENANT_OPENAI_REASONING_EFFORT", "medium")
+
+
+def _map_openai_exception(exc: Exception, *, report_rl: bool) -> "LLMError":
+    """Map an ``openai`` SDK exception to the unified taxonomy (secrets redacted).
+
+    Shared by the Chat Completions and Responses paths so both surface the same
+    error classes and both feed cross-worker backoff on a 429. Raise the result
+    with ``... from redacted_cause_from(exc)`` at the call site.
+    """
+    if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
+        return LLMAuthError(redact_secrets(str(exc)))
+    if isinstance(exc, openai.RateLimitError):
+        retry_after = _retry_after_from(exc)
+        if report_rl:
+            report_rate_limit(retry_after)
+        return LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after)
+    if isinstance(exc, openai.NotFoundError):
+        return LLMNotFoundError(redact_secrets(str(exc)))
+    if isinstance(exc, openai.APIConnectionError):
+        # Covers DNS, TCP, TLS, and SDK-mapped timeouts (APITimeoutError
+        # inherits from APIConnectionError).
+        return LLMConnectionError(redact_secrets(str(exc)))
+    # BadRequestError + any other APIStatusError (5xx, unexpected statuses).
+    return LLMResponseError(redact_secrets(str(exc)))
 
 
 class OpenAIAdapter:
@@ -174,6 +263,8 @@ class OpenAIAdapter:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_retries: int = 5,
+        use_responses_api: Optional[bool] = None,
+        reasoning_effort: Optional[str] = None,
         _client: Optional[openai.OpenAI] = None,
     ):
         """Construct the adapter.
@@ -187,8 +278,18 @@ class OpenAIAdapter:
             max_retries: Forwarded to the SDK. The SDK retries
                 transient 429s and 5xx automatically; the pipeline
                 does not add its own retry loop on top.
+            use_responses_api: Force the endpoint choice. ``None`` (default)
+                auto-selects: gpt-5+ → /v1/responses, everything else →
+                Chat Completions. ``True``/``False`` overrides — needed for a
+                ``base_url`` proxy that exposes a gpt-5 id over a
+                chat-completions-only endpoint (set ``False``), or vice versa.
+            reasoning_effort: Reasoning effort for the Responses path
+                (none|minimal|low|medium|high|xhigh). ``None`` uses the
+                ``OPENANT_OPENAI_REASONING_EFFORT`` env default ("medium").
             _client: Injected SDK instance for testing.
         """
+        self._use_responses_api_override = use_responses_api
+        self._reasoning_effort = reasoning_effort or _DEFAULT_REASONING_EFFORT
         if _client is not None:
             self._client = _client
             return
@@ -213,6 +314,9 @@ class OpenAIAdapter:
         max_tokens: int,
         tools: Optional[list[ToolDef]] = None,
     ) -> CompletionResult:
+        if _use_responses_api(model, self._use_responses_api_override):
+            return self._complete_responses(model, system, messages, max_tokens, tools)
+
         request: dict[str, Any] = {
             "model": model,
             _token_param(model): max_tokens,
@@ -226,50 +330,74 @@ class OpenAIAdapter:
 
         try:
             response = self._client.chat.completions.create(**request)
-        except openai.AuthenticationError as exc:
-            raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except openai.PermissionDeniedError as exc:
-            raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except openai.RateLimitError as exc:
-            retry_after = _retry_after_from(exc)
-            report_rate_limit(retry_after)
-            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
-        except openai.NotFoundError as exc:
-            raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except openai.APIConnectionError as exc:
-            # Covers DNS, TCP, TLS, and SDK-mapped timeouts (the SDK's
-            # APITimeoutError inherits from APIConnectionError).
-            raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except openai.BadRequestError as exc:
-            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except openai.APIStatusError as exc:
-            # Everything else (5xx, unexpected statuses).
-            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
+        except (openai.APIStatusError, openai.APIConnectionError) as exc:
+            raise _map_openai_exception(exc, report_rl=True) from redacted_cause_from(exc)
 
         return _response_to_unified(response)
 
-    def validate(self, model: str) -> None:
+    def _complete_responses(
+        self,
+        model: str,
+        system: Optional[str],
+        messages: list[Message],
+        max_tokens: int,
+        tools: Optional[list[ToolDef]],
+    ) -> CompletionResult:
+        """gpt-5+ path via /v1/responses (supports tools + reasoning together).
+
+        Stateless: the full message history is re-sent each turn. Reasoning
+        items are NOT threaded back between tool turns — empirically the loop's
+        tool-call turns emit no reasoning items to carry, and dropping them
+        costs a negligible re-reason on the final turn (measured). ``store=False``
+        keeps analysed source off OpenAI's servers.
+        """
+        request: dict[str, Any] = {
+            "model": model,
+            "input": _messages_to_responses(messages),
+            "max_output_tokens": max(max_tokens, _RESPONSES_MIN_OUTPUT_TOKENS),
+            "reasoning": {"effort": self._reasoning_effort},
+            "store": False,
+        }
+        if system:
+            request["instructions"] = system
+        if tools:
+            request["tools"] = [_tool_to_responses(t) for t in tools]
+
+        wait_for_rate_limit()
         try:
-            self._client.chat.completions.create(**{
-                "model": model,
-                _token_param(model): 1,
-                "messages": [{"role": "user", "content": "hi"}],
-            })
-        except openai.AuthenticationError as exc:
-            raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except openai.PermissionDeniedError as exc:
-            raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except openai.RateLimitError as exc:
-            retry_after = _retry_after_from(exc)
-            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
-        except openai.NotFoundError as exc:
-            raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except openai.APIConnectionError as exc:
-            raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except openai.BadRequestError as exc:
-            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except openai.APIStatusError as exc:
-            raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
+            response = self._client.responses.create(**request)
+        except (openai.APIStatusError, openai.APIConnectionError) as exc:
+            raise _map_openai_exception(exc, report_rl=True) from redacted_cause_from(exc)
+
+        return _responses_to_unified(response)
+
+    def validate(self, model: str) -> None:
+        # Probe the ENDPOINT the scan will actually use — a chat-completions
+        # ping for a gpt-5 model would both 400 (max_tokens) and validate the
+        # wrong endpoint (a proxy without Responses access would pass init then
+        # fail every unit).
+        try:
+            if _use_responses_api(model, self._use_responses_api_override):
+                # Prove the /v1/responses endpoint + model are reachable. Omit
+                # ``reasoning`` (effort values are model-specific — e.g. gpt-5.6
+                # rejects "minimal"); the model default is fine for a ping. A
+                # structurally valid 200 (incl. status="incomplete" if reasoning
+                # eats the budget) is success — only an exception fails init.
+                self._client.responses.create(
+                    model=model,
+                    input="Reply with OK.",
+                    max_output_tokens=1000,
+                    store=False,
+                )
+            else:
+                self._client.chat.completions.create(**{
+                    "model": model,
+                    _token_param(model): 1,
+                    "messages": [{"role": "user", "content": "hi"}],
+                })
+        except (openai.APIStatusError, openai.APIConnectionError) as exc:
+            # report_rl=False: a validate ping must not back off sibling workers.
+            raise _map_openai_exception(exc, report_rl=False) from redacted_cause_from(exc)
 
 
 # ----------------------------------------------------------------------
@@ -359,6 +487,168 @@ def _tool_to_openai(tool: ToolDef) -> dict[str, Any]:
             "parameters": tool.input_schema,
         },
     }
+
+
+def _messages_to_responses(messages: list[Message]) -> list[dict[str, Any]]:
+    """Translate unified messages to Responses-API ``input`` items.
+
+    System is sent via the ``instructions`` param (not an item). Per message, in
+    order: tool RESULTS first (they reference a prior function_call), then plain
+    text — matching how the API expects ``function_call_output`` to follow its
+    call. Assistant tool calls become ``function_call`` items; assistant/user
+    text becomes a role message. An assistant turn with only tool calls emits no
+    role message (correct for Responses). Parallel tool calls preserve order.
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        text_blocks = [b for b in message.content if isinstance(b, TextBlock)]
+        tool_use_blocks = [b for b in message.content if isinstance(b, ToolUseBlock)]
+        tool_result_blocks = [b for b in message.content if isinstance(b, ToolResultBlock)]
+
+        if message.role == "user":
+            for tr in tool_result_blocks:
+                out.append({
+                    "type": "function_call_output",
+                    "call_id": tr.tool_use_id,
+                    "output": tr.content,
+                })
+            if text_blocks:
+                out.append({
+                    "role": "user",
+                    "content": "\n".join(b.text for b in text_blocks),
+                })
+        elif message.role == "assistant":
+            if text_blocks:
+                out.append({
+                    "role": "assistant",
+                    "content": "\n".join(b.text for b in text_blocks),
+                })
+            for tu in tool_use_blocks:
+                out.append({
+                    "type": "function_call",
+                    "call_id": tu.id,
+                    "name": tu.name,
+                    "arguments": json.dumps(tu.input or {}),
+                })
+        else:  # pragma: no cover — Role is a closed Literal
+            raise LLMResponseError(
+                f"OpenAIAdapter: unknown message role {message.role!r}"
+            )
+    return out
+
+
+def _tool_to_responses(tool: ToolDef) -> dict[str, Any]:
+    # Responses function tools are FLATTENED (no nested "function"), and
+    # ``strict`` must be explicit: OpenAnt's tool schemas are not strict-mode
+    # compatible (no ``additionalProperties: false``), so strict=True would 400.
+    return {
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.input_schema,
+        "strict": False,
+    }
+
+
+def _warn_unknown_output_item(kind: str) -> None:
+    """One-time stderr warning for an unhandled Responses output item type."""
+    should = False
+    with _warned_unknown_output_items_lock:
+        if kind not in _warned_unknown_output_items:
+            _warned_unknown_output_items.add(kind)
+            should = True
+    if should:
+        sys.stderr.write(
+            f"warning: OpenAIAdapter saw an unhandled Responses output item "
+            f"{kind!r}; ignoring it. If it carries output the pipeline needs, add "
+            f"handling in _responses_to_unified.\n"
+        )
+
+
+def _responses_to_unified(response: Any) -> CompletionResult:
+    """Translate an OpenAI ``Response`` (Responses API) into unified types.
+
+    Order matters: a hard failure, a filtered response, or an empty completion
+    must NOT read as a clean ``end_turn`` — for a SAST tool that is a silent
+    false-negative — so status is inspected before content, and a content-free
+    result raises (mirrors the Chat Completions empty-``choices`` guard).
+    """
+    status = getattr(response, "status", None)
+    if status in ("failed", "cancelled"):
+        err = getattr(response, "error", None)
+        detail = (getattr(err, "message", None) or str(err)) if err is not None else status
+        raise LLMResponseError(redact_secrets(f"OpenAI Responses {status}: {detail}"))
+
+    stop_reason: StopReason = "end_turn"
+    if status == "incomplete":
+        reason = getattr(getattr(response, "incomplete_details", None), "reason", None)
+        if reason == "content_filter":
+            raise LLMRefusalError(
+                "OpenAI content-filtered the response (incomplete: content_filter); "
+                "the completion was withheld by the moderation layer"
+            )
+        if reason == "max_output_tokens":
+            stop_reason = "max_tokens"
+        # Other/unknown incomplete reasons fall through to the empty-content
+        # guard below rather than a silent clean pass.
+
+    content_blocks: list[ContentBlock] = []
+    for item in getattr(response, "output", None) or []:
+        itype = getattr(item, "type", None)
+        if itype == "message":
+            for part in getattr(item, "content", None) or []:
+                ptype = getattr(part, "type", None)
+                if ptype == "output_text":
+                    text = getattr(part, "text", "")
+                    if text:
+                        content_blocks.append(TextBlock(text=text))
+                elif ptype == "refusal":
+                    # A refusal is a nested content part (NOT a top-level item and
+                    # NOT part of output_text) — surface as a typed error.
+                    raise LLMRefusalError(
+                        f"OpenAI refused the request "
+                        f"(refusal: {getattr(part, 'refusal', '')!r})"
+                    )
+                else:
+                    _warn_unknown_output_item(f"message.{ptype}")
+        elif itype == "function_call":
+            arguments = getattr(item, "arguments", "") or ""
+            try:
+                input_dict = json.loads(arguments) if arguments else {}
+            except json.JSONDecodeError:
+                _warn_bad_tool_json(getattr(item, "name", "<unknown>"))
+                input_dict = {}
+            content_blocks.append(ToolUseBlock(
+                id=item.call_id,
+                name=item.name,
+                input=input_dict,
+            ))
+        elif itype == "reasoning":
+            # Internal chain — deliberately kept out of unified content.
+            pass
+        else:
+            _warn_unknown_output_item(str(itype))
+
+    # ``incomplete`` (max_output_tokens) wins over tool_use: a function_call in a
+    # truncated response may carry incomplete-JSON arguments, so don't advertise
+    # it as an actionable tool call.
+    if any(isinstance(b, ToolUseBlock) for b in content_blocks) and stop_reason != "max_tokens":
+        stop_reason = "tool_use"
+
+    if not content_blocks:
+        raise LLMResponseError(
+            f"OpenAI Responses returned no usable content (status={status!r}); the "
+            "request may have been truncated (reasoning consumed the budget) or filtered"
+        )
+
+    usage = getattr(response, "usage", None)
+    return CompletionResult(
+        content=content_blocks,
+        input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
+        output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+        stop_reason=stop_reason,
+        raw=response,
+    )
 
 
 def _response_to_unified(response: Any) -> CompletionResult:
