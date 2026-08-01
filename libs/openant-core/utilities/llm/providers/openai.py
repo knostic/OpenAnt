@@ -387,11 +387,23 @@ class OpenAIAdapter:
     ) -> CompletionResult:
         """gpt-5+ path via /v1/responses (supports tools + reasoning together).
 
-        Stateless: the full message history is re-sent each turn. Reasoning
-        items are NOT threaded back between tool turns — empirically the loop's
-        tool-call turns emit no reasoning items to carry, and dropping them
-        costs a negligible re-reason on the final turn (measured). ``store=False``
-        keeps analysed source off OpenAI's servers.
+        Stateless: the full message history is re-sent each turn. The model's
+        ``reasoning`` items ARE emitted (at effort>=medium) but are deliberately
+        dropped and never threaded back (``_responses_to_unified`` discards them;
+        the unified ``Message`` type carries no reasoning block). This does not
+        400 the follow-up tool turns because ``_messages_to_responses`` re-sends
+        ``function_call`` items with ``call_id`` ONLY — never the server-issued
+        ``fc_...`` item id — so the history reads as developer-synthesized tool
+        history, which the Responses API accepts; the model simply re-reasons.
+        ``store=False`` keeps analysed source off OpenAI's servers.
+
+        LATENT TRAP: the reasoning-pairing enforcement is *id-keyed*. Do NOT start
+        echoing the server ``fc_...``/``id`` on re-sent ``function_call`` items, nor
+        re-send ``rs_...`` reasoning items under ``store=False`` without
+        ``include=["reasoning.encrypted_content"]`` — either makes every follow-up
+        turn 400 ("function_call provided without its required reasoning item").
+        Proper reasoning threading needs encrypted_content + a reasoning block in
+        the unified types + the agent.py echo — a deliberate, wider change.
         """
         request: dict[str, Any] = {
             "model": model,
