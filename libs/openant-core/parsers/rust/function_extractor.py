@@ -439,6 +439,7 @@ class FunctionExtractor:
             "module_path": ctx["module_path"],
             "in_test_scope": ctx["in_test_scope"],
             "in_trait_impl": trait_name is not None,
+            "impl_trait": trait_name,
         }
         worklist.append((body, new_ctx))
 
@@ -515,6 +516,22 @@ class FunctionExtractor:
         module_name = "::".join(ctx["module_path"]) if ctx["module_path"] else None
 
         func_id = f"{file_path}:{qualified_name}"
+        if func_id in functions:
+            # Same qualified_name already taken -- e.g. `impl Display for P` and
+            # `impl Debug for P` both yield `P.fmt`, or an inherent method plus a
+            # same-named trait method. Without disambiguation the second silently
+            # clobbers the first (a whole unit lost from the graph AND reachability).
+            # Append the trait (or `impl`) so both survive. The FIRST occurrence
+            # keeps the plain id, so class_name-based resolution and existing
+            # `Type.method` references are unchanged; only the colliding sibling
+            # gets the `#trait` suffix.
+            disc = ctx.get("impl_trait") or "impl"
+            candidate = f"{file_path}:{qualified_name}#{disc}"
+            n = 2
+            while candidate in functions:
+                candidate = f"{file_path}:{qualified_name}#{disc}{n}"
+                n += 1
+            func_id = candidate
         functions[func_id] = {
             "name": name,
             "qualified_name": qualified_name,
