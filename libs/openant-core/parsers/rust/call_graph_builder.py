@@ -539,6 +539,26 @@ class CallGraphBuilder:
                     return rt
         return None
 
+    def _free_fn_return_type(
+        self, fn_name: str, name_to_ids: Optional[Dict[str, List[str]]],
+    ) -> Optional[str]:
+        """Return the recorded return type of a FREE function `fn_name`, if a single
+        unambiguous non-`Self` type. Lets `let c = load()` (where `load() -> Cfg`)
+        type `c` as Cfg, so a later `c.method()` resolves precisely instead of hitting
+        the unknown-receiver gate and blacking out. Precise (typed) -> zero phantom.
+        """
+        if not name_to_ids:
+            return None
+        rts = set()
+        for cand in name_to_ids.get(fn_name, []):
+            info = self.functions.get(cand, {})
+            if info.get("class_name"):  # must be a free function, not a method
+                continue
+            rt = info.get("return_type")
+            if rt and rt != "Self":
+                rts.add(rt)
+        return next(iter(rts)) if len(rts) == 1 else None
+
     def _infer_let_type(
         self, node: Node, source: bytes,
         name_to_ids: Optional[Dict[str, List[str]]] = None,
@@ -582,6 +602,13 @@ class CallGraphBuilder:
                         # qualifier (`Factory`). Falls back to the qualifier when the
                         # return type is unknown or `Self` (the `Type::new()` case).
                         return self._assoc_return_type(qualifier, _leaf, name_to_ids) or qualifier
+                if callee is not None and callee.type == "identifier":
+                    # `let c = load()` where `load() -> Cfg` -> type c as Cfg, so a
+                    # later `c.method()` resolves precisely (recovering the
+                    # unknown-receiver blackout) with zero phantom.
+                    rt = self._free_fn_return_type(self._text(callee, source), name_to_ids)
+                    if rt:
+                        return rt
         return None
 
     def _collect_fn_aliases(
@@ -916,6 +943,16 @@ class CallGraphBuilder:
             return same_file
         if len(candidates) == 1:
             return candidates
+        # Known limitation (deliberate, not a bug): when >=2 same-named `&self`
+        # methods remain and the receiver type is unknown, we decline. Exported
+        # candidates self-seed so declining them is free; a PRIVATE inherent method
+        # whose sole edge is declined can black out. That blackout is RECOVERED
+        # upstream wherever the receiver type is inferable -- e.g. `let c = load()`
+        # with `load() -> Cfg` now types the receiver (see _free_fn_return_type), so
+        # the call never reaches this gate. A blanket union of the residual truly
+        # ambiguous case was measured to add one cross-type phantom per call site
+        # (Dog->Cat.speak; precision 1/N) for a contrived reachability gain, so it is
+        # intentionally NOT done here (Sol/Fable reconcile, 2026-08-01).
         return []
 
     def _resolve_typed_member(
