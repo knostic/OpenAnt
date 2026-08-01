@@ -800,7 +800,15 @@ class CallGraphBuilder:
         if not known:
             return []
         conformer_sets = [set(self.trait_impls.get(t, [])) for t in known]
-        conformers = set.intersection(*conformer_sets) if len(conformer_sets) > 1 else conformer_sets[0]
+        # A bound whose conformer set is EMPTY is *unconstrained*, not impossible:
+        # marker/blanket/derive/cross-crate impls are invisible to the extractor
+        # (blanket pairs are deliberately skipped in function_extractor), so an empty
+        # set means "conformers unknown", and must NOT annihilate the edges the other
+        # bounds legitimately establish (`B: Shape + Marker` still reaches Shape's
+        # conformers). Intersect only over bounds that actually constrain — those with
+        # >=1 known conformer. Reachability over-approximation, not a guess.
+        constraining = [s for s in conformer_sets if s]
+        conformers = set.intersection(*constraining) if constraining else set()
         allowed = conformers | set(known)  # concrete conformers + trait-default bodies
         result: List[str] = []
         for cand in name_to_ids.get(method, []):
