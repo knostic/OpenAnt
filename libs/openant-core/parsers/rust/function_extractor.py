@@ -26,7 +26,7 @@ design notes). In particular:
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from utilities.file_io import write_json
 

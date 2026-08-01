@@ -160,6 +160,9 @@ class UnitGenerator:
                 "generator": "rust_unit_generator.py",
                 "direct_calls": direct_calls,
                 "direct_callers": direct_callers,
+                # Parity with the Swift parser's unit metadata: thread the function's
+                # attributes/decorators through so dataset units carry them too (bug J).
+                "decorators": func_info.get("decorators", []),
             },
         }
 
