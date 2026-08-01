@@ -133,6 +133,96 @@
       "price": {"input": 0.075, "output": 0.30},
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
       "retrieved": "2026-07-23"
+    },
+    {
+      "id": "anthropic/claude-opus-4.8", "provider": "openrouter", "status": "current",
+      "price": {"input": 5.00, "output": 25.00},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "anthropic/claude-sonnet-4.6", "provider": "openrouter", "status": "current",
+      "price": {"input": 3.00, "output": 15.00},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "anthropic/claude-haiku-4.5", "provider": "openrouter", "status": "current",
+      "price": {"input": 1.00, "output": 5.00},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "openai/gpt-4o", "provider": "openrouter", "status": "current",
+      "price": {"input": 2.50, "output": 10.00},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "openai/gpt-4o-mini", "provider": "openrouter", "status": "current",
+      "price": {"input": 0.15, "output": 0.60},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "openai/gpt-4.1", "provider": "openrouter", "status": "current",
+      "price": {"input": 2.00, "output": 8.00},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "openai/gpt-4.1-mini", "provider": "openrouter", "status": "current",
+      "price": {"input": 0.40, "output": 1.60},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "openai/gpt-4.1-nano", "provider": "openrouter", "status": "current",
+      "price": {"input": 0.10, "output": 0.40},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "openai/o1", "provider": "openrouter", "status": "current",
+      "price": {"input": 15.00, "output": 60.00},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "openai/o3", "provider": "openrouter", "status": "current",
+      "price": {"input": 2.00, "output": 8.00},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "openai/o3-mini", "provider": "openrouter", "status": "current",
+      "price": {"input": 1.10, "output": 4.40},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "openai/o4-mini", "provider": "openrouter", "status": "current",
+      "price": {"input": 1.10, "output": 4.40},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "google/gemini-2.5-pro", "provider": "openrouter", "status": "current",
+      "price": {"input": 1.25, "output": 10.00},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "google/gemini-2.5-flash", "provider": "openrouter", "status": "current",
+      "price": {"input": 0.30, "output": 2.50},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
+    },
+    {
+      "id": "google/gemini-2.5-flash-lite", "provider": "openrouter", "status": "current",
+      "price": {"input": 0.10, "output": 0.40},
+      "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
+      "retrieved": "2026-08-01"
     }
   ]
 }

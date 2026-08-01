@@ -43,11 +43,15 @@ def get_adapter_class(provider_type: str) -> Type[LLMAdapter]:
         from .google import GoogleAdapter
 
         return GoogleAdapter
+    if provider_type == "openrouter":
+        from .openrouter import OpenRouterAdapter
+
+        return OpenRouterAdapter
 
     raise ValueError(
         f"Unknown provider type: {provider_type!r}. "
-        f"Supported in this release: 'anthropic', 'openai', 'google'. "
-        f"To add a provider, see "
+        f"Supported in this release: 'anthropic', 'openai', 'google', "
+        f"'openrouter'. To add a provider, see "
         f"docs/features/llm-providers/HOW_TO_ADD_AN_ADAPTER.md."
     )
 
@@ -58,4 +62,4 @@ def known_provider_types() -> list[str]:
     Used by the Go CLI's ``llm-provider set`` to validate the
     ``type`` field before writing config.json.
     """
-    return ["anthropic", "openai", "google"]
+    return ["anthropic", "openai", "google", "openrouter"]

@@ -125,7 +125,7 @@ def _token_param(model: str) -> str:
     return "max_completion_tokens" if _is_reasoning_model(model) else "max_tokens"
 
 
-def _warn_bad_tool_json(tool_name: str) -> None:
+def _warn_bad_tool_json(tool_name: str, *, adapter: str = "OpenAIAdapter") -> None:
     """One-time stderr warning when a tool call's ``arguments`` aren't valid JSON."""
     should_warn = False
     with _warned_bad_tool_json_lock:
@@ -134,7 +134,7 @@ def _warn_bad_tool_json(tool_name: str) -> None:
             should_warn = True
     if should_warn:
         sys.stderr.write(
-            f"warning: OpenAIAdapter could not parse tool-call arguments for "
+            f"warning: {adapter} could not parse tool-call arguments for "
             f"{tool_name!r} as JSON; passing empty input {{}}. The tool call "
             f"will likely fail downstream with a missing-field error.\n"
         )
@@ -361,7 +361,7 @@ def _tool_to_openai(tool: ToolDef) -> dict[str, Any]:
     }
 
 
-def _response_to_unified(response: Any) -> CompletionResult:
+def _response_to_unified(response: Any, *, adapter: str = "OpenAIAdapter") -> CompletionResult:
     """Translate an OpenAI ChatCompletion response into our types."""
     choices = getattr(response, "choices", None) or []
     if not choices:
@@ -370,8 +370,9 @@ def _response_to_unified(response: Any) -> CompletionResult:
         # (mirrors the Gemini empty-``candidates`` guard); for a security
         # tool an empty end_turn would read as a clean, passing result.
         raise LLMResponseError(
-            "OpenAI returned no choices (empty completion); the request "
-            "may have been filtered or the response was malformed"
+            f"{adapter}: provider returned no choices (empty completion); "
+            f"the request may have been filtered or the response was "
+            f"malformed"
         )
     choice = choices[0]
     message = choice.message
@@ -397,7 +398,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
             # back to an empty dict: the subsequent tool execution
             # surfaces a clear "missing required field" error, and a
             # multi-tool turn's other calls still proceed.
-            _warn_bad_tool_json(getattr(tc.function, "name", "<unknown>"))
+            _warn_bad_tool_json(getattr(tc.function, "name", "<unknown>"), adapter=adapter)
             input_dict = {}
         content_blocks.append(ToolUseBlock(
             id=tc.id,
@@ -412,9 +413,9 @@ def _response_to_unified(response: Any) -> CompletionResult:
     # calls. OpenAI reports this as ``finish_reason == "content_filter"``.
     if raw_finish == _OPENAI_CONTENT_FILTER_REASON:
         raise LLMRefusalError(
-            "OpenAI content-filtered the response "
-            "(finish_reason='content_filter'); the completion was withheld "
-            "or truncated by the moderation layer"
+            f"{adapter}: the response was content-filtered "
+            f"(finish_reason='content_filter'); the completion was withheld "
+            f"or truncated by the moderation layer"
         )
 
     if raw_finish not in _OPENAI_FINISH_REASONS:
@@ -425,11 +426,11 @@ def _response_to_unified(response: Any) -> CompletionResult:
                 should_warn = True
         if should_warn:
             sys.stderr.write(
-                f"warning: OpenAIAdapter received unknown finish_reason "
+                f"warning: {adapter} received unknown finish_reason "
                 f"{raw_finish!r}; normalising to 'end_turn'. Add this value "
                 f"to StopReason in utilities/llm/adapter.py and "
-                f"_OPENAI_FINISH_REASONS if OpenAI added a new termination "
-                f"reason.\n"
+                f"_OPENAI_FINISH_REASONS if the provider added a new "
+                f"termination reason.\n"
             )
 
     usage = getattr(response, "usage", None)

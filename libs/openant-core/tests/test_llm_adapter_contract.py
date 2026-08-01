@@ -112,12 +112,19 @@ def _google_factory():
     return make_adapter
 
 
+def _openrouter_factory():
+    from tests._llm_factories.openrouter import make_adapter
+
+    return make_adapter
+
+
 # Each row: (display_name, scenario_factory_callable)
 # Add a row when registering a new adapter.
 ADAPTERS: list[tuple[str, Callable[[str], LLMAdapter]]] = [
     ("anthropic", _anthropic_factory()),
     ("openai", _openai_factory()),
     ("google", _google_factory()),
+    ("openrouter", _openrouter_factory()),
 ]
 
 

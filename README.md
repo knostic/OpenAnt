@@ -87,8 +87,9 @@ Wizard defaults reflect the project's per-phase recommendations (stronger reason
 | `anthropic` | [console.anthropic.com](https://console.anthropic.com/settings/keys) | Reference adapter. NOT included in Claude Pro / Max subscriptions — separate billing. |
 | `openai` | [platform.openai.com](https://platform.openai.com/api-keys) | NOT included in ChatGPT / Codex subscriptions — separate billing. |
 | `google` | [aistudio.google.com](https://aistudio.google.com/apikey) | NOT included in Gemini Advanced — separate billing. |
+| `openrouter` | [openrouter.ai](https://openrouter.ai/settings/keys) | Gateway to many providers with one key and one prepaid balance (also reads `OPENROUTER_API_KEY`). Model IDs are `vendor/model` slugs (`anthropic/claude-sonnet-4.6`, `openai/gpt-4o-mini`, ...) — browse them at [openrouter.ai/models](https://openrouter.ai/models). Not offered by the setup wizard yet; configure by hand (see below). |
 
-All three support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop.
+All four support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop.
 
 #### Quick path for Anthropic-only setups
 
@@ -128,7 +129,7 @@ The wizard writes `~/.config/openant/config.json` for you, but you can edit it d
 }
 ```
 
-Providers accept a custom `base_url` for OpenAI-compatible / Anthropic-compatible proxies (OpenRouter, vLLM, Bedrock, internal gateways). The `openant-default` config (Claude across all phases) is built in and always available regardless of file contents.
+Providers accept a custom `base_url` for OpenAI-compatible / Anthropic-compatible proxies (vLLM, Bedrock, internal gateways); OpenRouter has its own first-class `openrouter` provider type. The `openant-default` config (Claude across all phases) is built in and always available regardless of file contents.
 
 #### Adding a new provider adapter
 
