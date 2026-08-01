@@ -329,6 +329,13 @@ The `reachable` filter uses `utilities/agentic_enhancer/entry_point_detector.py`
 
 ## Registering Your Parser
 
+> **On current `master`, registration is registry-driven — one entry, not the manual edits below.** Add a block to `config/languages.json` (extension → language + parser script); `detect_language`, the `--language` CLI choices (Python + Go CLI), and dispatch all derive from it, so no per-language code edit is needed. Example (Rust):
+> ```json
+> ".rs": "rust",
+> "rust": { "extensions": [".rs"], "parser": {"mode": "subprocess", "script": "parsers/rust/test_pipeline.py"}, "fence": "rust", "enabled": true }
+> ```
+> Adding the language flips the repo's own registry tests (e.g. `test_<lang>_is_not_supported` / `_is_rejected`) — update those in the same change, and add your language to the supported-language prose in README/CLAUDE/DOCUMENTATION/OPENANT/PIPELINE_MANUAL (a repo test enforces it). The manual steps below describe the pre-registry architecture; keep them only for older checkouts.
+
 ### 1. Update `parser_adapter.py`
 
 Location: `libs/openant-core/core/parser_adapter.py`
@@ -608,6 +615,11 @@ Once bare calls and typed-receiver methods resolve, the biggest remaining source
 - **Popular interface** with N implementors → N edges per call. Real dispatch, but watch graph size; the same cap you use for `dyn` applies.
 
 A shared cross-parser *resolver* is tempting but leaky — it no-ops on a language whose conformer map is empty (structural/duck), giving a false sense of coverage. Share at most a dumb `transitive_closure(map)` helper and a cross-parser test contract; keep the map-building and dispatch policy local to each parser.
+
+### Two more gotchas from real parser builds
+- **Bare-call invariant:** a bare `foo()` resolves ONLY to a free function — never an inherent/trait method (a method needs a receiver). If your resolver matches any same-named candidate, filter out anything with a class/type owner, or you fabricate `foo() → SomeType.foo` edges (in one build, filtering this removed 165 phantom edges with zero reachability loss).
+- **Orchestrator import order:** in `test_pipeline.py`, put your `sys.path.insert(...)` BEFORE any `from utilities...` / `from parsers...` import. The adapter runs the script as a subprocess with `cwd=<core>` and no `PYTHONPATH`, so an import above the path insert dies with `ModuleNotFoundError` on the exact invocation the product uses (fixtures/tests that set `PYTHONPATH` won't catch it). Copy the `swift` orchestrator, not the older `zig` one.
+- **Verify node types against the INSTALLED grammar,** not a filtered AST dump — a filtered dump can hide a wrapper node (e.g. `type_parameter` around `type_identifier` + `trait_bounds`) and send you coding for the wrong node type. Dump the full child structure of the exact node you're matching.
 
 ## Questions?
 
