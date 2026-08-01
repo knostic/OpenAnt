@@ -16,8 +16,9 @@ from utilities.llm.adapter import Message, TextBlock, ToolDef, ToolResultBlock, 
 
 
 class _Resp:
-    def __init__(self, content):
+    def __init__(self, content, stop_reason=None):
         self.content = content
+        self.stop_reason = stop_reason
 
 
 class _FakeAdapter:
@@ -58,6 +59,22 @@ def test_finish_returns_payload_and_counts_turns(tmp_path):
                                          "sys", "task", _FINISH)
     assert payload == {"ok": True}
     assert budget.turns == 1
+
+
+def test_truncated_finish_at_max_tokens_is_not_accepted(tmp_path):
+    # R3-A: a finish call on a turn truncated at max_tokens must NOT be accepted as
+    # a complete survey (it under-scopes the threat model every later scan trusts).
+    # The loop skips it and uses a later COMPLETE finish instead.
+    adapter = _FakeAdapter([
+        _Resp((ToolUseBlock(id="tu1", name="finish", input={"partial": True}),),
+              stop_reason="max_tokens"),
+        _Resp((ToolUseBlock(id="tu2", name="finish", input={"complete": True}),),
+              stop_reason="tool_use"),
+    ])
+    payload, budget = explore_repository(_repo(tmp_path), _FakeBinding(adapter),
+                                         "sys", "task", _FINISH)
+    assert payload == {"complete": True}   # the truncated finish was skipped
+    assert budget.turns == 2
 
 
 def test_chatty_turn_is_answered_with_plain_text_not_toolresult(tmp_path):
