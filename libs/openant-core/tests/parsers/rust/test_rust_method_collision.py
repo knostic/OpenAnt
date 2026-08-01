@@ -4,7 +4,7 @@ to func_id `file:P.fmt` and the second silently clobbered the first (data loss:
 a whole unit vanished from the graph and reachability)."""
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import extract  # noqa: E402
+from _rust_helpers import extract  # noqa: E402
 
 
 def test_same_name_methods_both_extracted(tmp_path):

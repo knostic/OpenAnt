@@ -7,7 +7,7 @@ reason to delete a fully-resolvable typed method edge at extraction time.
 """
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import build, edges  # noqa: E402
+from _rust_helpers import build, edges  # noqa: E402
 
 
 def test_typed_cross_file_builtin_named_method_resolves(tmp_path):

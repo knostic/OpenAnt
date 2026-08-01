@@ -2,7 +2,7 @@
 so dataset units expose the function's attributes like every sibling parser."""
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import extract, CallGraphBuilder, UnitGenerator  # noqa: E402
+from _rust_helpers import extract, CallGraphBuilder, UnitGenerator  # noqa: E402
 
 
 def test_unit_metadata_carries_decorators(tmp_path):

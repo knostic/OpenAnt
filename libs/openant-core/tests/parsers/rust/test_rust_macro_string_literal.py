@@ -4,7 +4,7 @@ to an unrelated `init`; real calls OUTSIDE the literal (`format!("{}", foo())`)
 must still be recovered."""
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import build, edges  # noqa: E402
+from _rust_helpers import build, edges  # noqa: E402
 
 
 def test_no_phantom_from_call_shaped_string_literal(tmp_path):

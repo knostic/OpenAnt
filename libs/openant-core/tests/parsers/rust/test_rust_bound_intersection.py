@@ -4,7 +4,7 @@ the extractor). An unseen conformer set is 'unconstrained', not 'empty' — it m
 not annihilate the edges the other bounds establish (reachability over-approx)."""
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import build, edges  # noqa: E402
+from _rust_helpers import build, edges  # noqa: E402
 
 
 def test_multi_bound_survives_impl_less_marker(tmp_path):

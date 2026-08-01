@@ -13,7 +13,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import build, edges  # noqa: E402
+from _rust_helpers import build, edges  # noqa: E402
 
 
 def test_inline_bound_dispatches_to_conformers(tmp_path):

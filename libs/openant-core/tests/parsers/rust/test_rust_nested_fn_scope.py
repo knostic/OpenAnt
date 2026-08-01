@@ -4,7 +4,7 @@ into the OUTER fn (and resolved under the outer fn's — wrong — generic bound
 `outer -> Circle.log` (Circle is Shape, not Logger). The inner unit keeps its edge."""
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import build, edges  # noqa: E402
+from _rust_helpers import build, edges  # noqa: E402
 
 
 def test_nested_fn_calls_not_bled_into_outer(tmp_path):

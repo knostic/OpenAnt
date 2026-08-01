@@ -10,7 +10,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import build  # noqa: E402
+from _rust_helpers import build  # noqa: E402
 
 _REPO = {
     "lib.rs": """

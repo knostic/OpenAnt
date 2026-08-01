@@ -5,7 +5,7 @@ Widget.process and NOT fabricating Factory.process). The dominant `Type::new() -
 Self` idiom must still resolve to Type."""
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import build, edges  # noqa: E402
+from _rust_helpers import build, edges  # noqa: E402
 
 
 def test_factory_return_type_used_for_receiver(tmp_path):

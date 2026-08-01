@@ -5,7 +5,7 @@ unknown-receiver decline gate would otherwise cause, with NO phantom to a same-n
 unrelated type. This makes the receiver KNOWN rather than relaxing the gate."""
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import build, edges  # noqa: E402
+from _rust_helpers import build, edges  # noqa: E402
 
 
 def test_free_fn_return_type_types_the_binding(tmp_path):

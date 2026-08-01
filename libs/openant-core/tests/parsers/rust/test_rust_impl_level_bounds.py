@@ -6,7 +6,7 @@ letter `T`, which an unrelated blanket `impl<U: _> Audit for U` had poisoned wit
 pseudo-type `T.area` -> phantom edge + the real conformer edge dropped."""
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import build, edges  # noqa: E402
+from _rust_helpers import build, edges  # noqa: E402
 
 
 def test_impl_level_bound_dispatches_to_conformers(tmp_path):
