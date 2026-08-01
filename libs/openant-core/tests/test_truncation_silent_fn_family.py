@@ -52,6 +52,14 @@ def test_gemini_unknown_finish_is_max_tokens_not_end_turn():
     assert r.stop_reason == "max_tokens"
 
 
+def test_gemini_unknown_finish_with_tool_call_is_max_tokens_not_tool_use():
+    # round-5: an UNKNOWN/abnormal finish_reason carrying a function_call must surface
+    # as max_tokens, not tool_use — an abnormal termination wins over the tool-call
+    # signal (so a consumer's max_tokens gate can fire), consistent with unknown->max_tokens.
+    r = _google_unify(_gemini_resp(finish_reason="ZZ_FUTURE_REASON", with_tool=True))
+    assert r.stop_reason == "max_tokens"
+
+
 def test_gemini_known_stop_unchanged():
     r = _google_unify(_gemini_resp(finish_reason="STOP", text="hi"))
     assert r.stop_reason == "end_turn"

@@ -442,23 +442,13 @@ def _response_to_unified(response: Any) -> CompletionResult:
     stop_reason: StopReason
     has_tool_use = any(isinstance(b, ToolUseBlock) for b in content_blocks)
     mapped = _GEMINI_FINISH_REASONS.get(raw_finish)
-    if mapped == "max_tokens":
-        # R2-A: a TRUNCATED response wins over tool_use. Gemini emits a
-        # function_call part even when it hit the token cap, so tool_use must
-        # not mask MAX_TOKENS (mirrors the OpenAI responses path) — otherwise a
-        # truncated finish call reaches the consumer as a clean tool_use and is
-        # accepted as a complete verdict/classification (a silent false-negative).
-        stop_reason = "max_tokens"
-    elif has_tool_use:
-        # Gemini doesn't use a dedicated finish_reason for tool calls;
-        # the presence of a function_call part IS the signal.
-        stop_reason = "tool_use"
-    elif mapped is not None:
-        stop_reason = mapped
-    else:
-        # SAFETY / RECITATION / BLOCKLIST / OTHER — warn once. R2-C: default to
-        # "max_tokens" (not end_turn), mirroring the OpenAI adapter, so an
-        # unknown/abnormal termination is not laundered into a clean completion.
+    if mapped is None:
+        # SAFETY/RECITATION/BLOCKLIST refusals already raised above; a remaining
+        # unmapped value is an UNKNOWN/abnormal termination. R2-C + round-5: it is
+        # not a clean finish AND it wins over tool_use — Gemini emits a function_call
+        # part even on an abnormal termination, so an unknown reason carrying a tool
+        # call must NOT be laundered into a clean tool_use. Warn once, treat as
+        # max_tokens (mirrors the OpenAI adapter; checked BEFORE has_tool_use).
         should_warn = False
         with _warned_finish_reasons_lock:
             if raw_finish not in _warned_finish_reasons:
@@ -473,6 +463,20 @@ def _response_to_unified(response: Any) -> CompletionResult:
                 f"reason.\n"
             )
         stop_reason = "max_tokens"
+    elif mapped == "max_tokens":
+        # R2-A: a TRUNCATED response wins over tool_use. Gemini emits a
+        # function_call part even when it hit the token cap, so tool_use must
+        # not mask MAX_TOKENS (mirrors the OpenAI responses path) — otherwise a
+        # truncated finish call reaches the consumer as a clean tool_use and is
+        # accepted as a complete verdict/classification (a silent false-negative).
+        stop_reason = "max_tokens"
+    elif has_tool_use:
+        # A KNOWN, non-truncation finish reason with a function_call part: Gemini
+        # doesn't use a dedicated finish_reason for tool calls, so the part IS the
+        # signal.
+        stop_reason = "tool_use"
+    else:
+        stop_reason = mapped
 
     return CompletionResult(
         content=content_blocks,
