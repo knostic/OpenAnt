@@ -658,6 +658,14 @@ class CallGraphBuilder:
         if fn_aliases and call_name in fn_aliases:
             return fn_aliases[call_name]
 
+        # A bare `foo()` can only resolve to a FREE function -- never an inherent
+        # or trait method (those need a receiver or a `Type::`/`self.` path). So
+        # exclude any candidate that belongs to a type; this also stops a
+        # blanket-impl pseudo-type method (`class_name="T"`) from being a
+        # bare-call target.
+        def _free(ids):
+            return [c for c in ids if not self.functions.get(c, {}).get("class_name")]
+
         # A bare call may be an aliased `use` import: `use foo::bar as baz;`
         # then `baz()`. Expand to the real leaf name and try file-based
         # resolution via that import's module hint first.
@@ -667,14 +675,14 @@ class CallGraphBuilder:
                 if target:
                     return target
                 call_name_for_fallback = imp.get("leaf", call_name)
-                same_file = [
+                same_file = _free([
                     c for c in name_to_ids.get(call_name_for_fallback, [])
                     if self._in_file(c, caller_file)
-                ]
+                ])
                 if same_file:
                     return same_file
 
-        candidates = name_to_ids.get(call_name, [])
+        candidates = _free(name_to_ids.get(call_name, []))
         if not candidates:
             return []
         same_file = [c for c in candidates if self._in_file(c, caller_file)]

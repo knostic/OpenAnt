@@ -113,3 +113,19 @@ def test_nested_generic_item_does_not_bleed_bounds(tmp_path):
     e = edges(build(tmp_path, repo)[1])
     assert ("outer", "RX.measure") in e, e       # outer's B is ShapeX
     assert ("outer", "CX.measure") not in e, e   # inner's B: DrawX must not bleed
+
+
+def test_bare_call_resolves_only_free_fn_not_method(tmp_path):
+    # A bare `run()` can only be a FREE function in Rust -- never an inherent /
+    # trait method (which needs a receiver). A method sharing the name (incl. a
+    # blanket-impl pseudo-type method) must not be a bare-call target.
+    repo = {
+        "lib.rs": """
+            pub fn run() -> i32 { 1 }
+            pub struct Thing; impl Thing { fn run(&self) -> i32 { 2 } }
+            pub fn main_like() { run(); }
+        """
+    }
+    e = edges(build(tmp_path, repo)[1])
+    assert ("main_like", "run") in e, e
+    assert ("main_like", "Thing.run") not in e, e
