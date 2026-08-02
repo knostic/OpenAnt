@@ -192,6 +192,314 @@ def _build_fusion_notes(
             notes.append(f"{candidate.path}: enrichment_errors={enrichment.enrichment_errors!r}")
 
     for rel in relationships:
-        notes.append(f"{rel.from_path} {rel.kind} {rel.to_path} (via {rel.detail})")
+        notes.append(_relationship_note(rel))
 
     return notes
+
+
+def _relationship_note(rel: CandidateRelationship) -> str:
+    """The exact fusion-note text for one relationship. Factored out so the
+    renderer below can recognise (and skip) these lines when rendering
+    fusion_notes separately from the Structural relationships section --
+    same wording either place, computed once."""
+    return f"{rel.from_path} {rel.kind} {rel.to_path} (via {rel.detail})"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Markdown rendering of RepositoryUnderstanding.
+#
+# This is the sole consumption boundary this phase adds: a pure function
+# from RepositoryUnderstanding to a Markdown string, meant to be appended
+# into pipeline.run()'s existing `code_context` string alongside the repo
+# code / vulnerability-pattern-guidance blocks it already builds. Nothing
+# here calls that pipeline -- this module remains dormant until a later,
+# separate wiring phase.
+#
+# No LLM calls, no I/O, no verdicts, no confidence scores. Every line is
+# either a literal passthrough of an existing field or an explicit "not
+# resolved / not evaluated" statement -- never a positive claim inferred
+# from missing evidence.
+# ---------------------------------------------------------------------------
+
+DEFAULT_MAX_CHARS = 4_000
+"""Matches repo_locator.py's _MAX_CONTEXT_CHARS. Candidate selection is
+already bounded to at most DEFAULT_MAX_CANDIDATES (3) candidates
+(candidate_selection.py), so this budget is sized to normally preserve the
+complete deterministic understanding for all of them, not to further
+ration an already-small set."""
+
+_MAX_LIST_ITEMS = 5
+"""Per-list cap (callees, callers, tests, sinks, relationships, notes)
+before a deterministic "(+N more)" note. Keeps any single candidate's
+block bounded regardless of how noisy its enrichment is."""
+
+_TRUNCATION_MARKER = "\n\n*(truncated to fit the character budget)*\n"
+
+_HEADING = "## Repository Understanding"
+
+_PREAMBLE = (
+    "*Deterministic repository analysis, not a vulnerability verdict. These "
+    "are structural facts (parsing, call graph, reachability, tests) -- not "
+    "confirmation that a candidate is vulnerable, exploitable, or on the "
+    "attack path. Missing evidence is reported as missing, never as a "
+    "negative finding.*"
+)
+
+
+def render_repository_understanding(
+    understanding: RepositoryUnderstanding,
+    *,
+    max_chars: int = DEFAULT_MAX_CHARS,
+) -> str:
+    """Render a RepositoryUnderstanding into one deterministic Markdown
+    block, starting with a top-level ``## Repository Understanding``
+    heading.
+
+    Candidates are rendered in the exact order already given by
+    ``understanding.candidate_evidence`` (candidate_selection.py's
+    tier-descending, path-ascending order) -- this function never
+    re-sorts or re-selects. If the character budget cannot fit every
+    candidate, weaker (later) candidates are dropped first and an explicit
+    note names what was omitted; malformed truncation mid-candidate never
+    happens -- a candidate's block is included whole or not at all.
+
+    Never mutates ``understanding`` or anything it references. No LLM
+    calls, no I/O, no parsing.
+
+    The returned string never exceeds ``max_chars`` -- a final safety-net
+    truncation (at a line boundary, with an explicit marker) applies in the
+    unlikely case that even omitting every candidate can't make the fixed
+    sections (heading, preamble, relationships, notes, investigation-context
+    line) fit.
+    """
+    candidate_blocks = [_render_candidate(c) for c in understanding.candidate_evidence]
+    relationships_block = _render_relationships(understanding.relationships)
+    notes_block = _render_notes(understanding)
+    context_block = _render_investigation_context(understanding.investigation_context_available)
+
+    header = _HEADING + "\n\n" + _PREAMBLE + "\n"
+
+    if not candidate_blocks:
+        body = "\nNo repository candidates were selected for investigation.\n"
+    else:
+        fixed_cost = len(header) + len(relationships_block) + len(notes_block) + len(context_block)
+        budget_for_candidates = max(max_chars - fixed_cost, 0)
+
+        included: list[str] = []
+        omitted_paths: list[str] = []
+        running = 0
+        for candidate, block in zip(understanding.candidate_evidence, candidate_blocks):
+            if running + len(block) <= budget_for_candidates:
+                included.append(block)
+                running += len(block)
+            else:
+                omitted_paths.append(candidate.path)
+
+        body = "\n" + "\n".join(included)
+        if omitted_paths:
+            body += (
+                f"\n\n*{len(omitted_paths)} candidate(s) omitted to stay within the "
+                f"{max_chars}-character budget: {', '.join(omitted_paths)}.*\n"
+            )
+
+    rendered = header + body + "\n" + relationships_block + "\n" + notes_block + "\n" + context_block
+
+    if len(rendered) > max_chars:
+        rendered = _hard_clamp(rendered, max_chars)
+
+    return rendered
+
+
+def _hard_clamp(rendered: str, max_chars: int) -> str:
+    """Absolute backstop: truncate at the last full line boundary that fits,
+    so the result is never split mid-item, and append an explicit marker.
+    Guarantees len(result) <= max_chars."""
+    limit = max_chars - len(_TRUNCATION_MARKER)
+    if limit <= 0:
+        return _TRUNCATION_MARKER[:max_chars]
+    cut = rendered.rfind("\n", 0, limit)
+    if cut <= 0:
+        cut = limit
+    return rendered[:cut] + _TRUNCATION_MARKER
+
+
+def _render_candidate(candidate: RepositoryCandidate) -> str:
+    lines = [f"### `{candidate.path}`", "", _render_grounding_line(candidate)]
+
+    enrichment = candidate.enrichment
+    if enrichment is None:
+        lines.append("- Enrichment: not attempted for this candidate")
+        return "\n".join(lines) + "\n"
+
+    lines.append(_render_resolution_line(enrichment))
+    lines.append(_render_list_line("Direct callees", enrichment.callees, "none found"))
+    lines.append(
+        _render_list_line("Direct callers (call graph)", enrichment.callers_by_call_graph, "none found")
+    )
+    lines.append(_render_reachability_line(enrichment))
+    lines.append(_render_test_support_lines(enrichment))
+    lines.append(_render_sink_matches_lines(enrichment))
+    lines.append(_render_enrichment_errors_line(enrichment))
+
+    return "\n".join(lines) + "\n"
+
+
+def _render_grounding_line(candidate: RepositoryCandidate) -> str:
+    ordered = sorted(
+        candidate.evidence,
+        key=lambda e: (-(e.tier if e.tier is not None else -1), e.pass_name),
+    )
+    passes = ", ".join(
+        f"{e.pass_name} (tier {e.tier})" if e.tier is not None else f"{e.pass_name} (tier unknown)"
+        for e in ordered
+    )
+    best = candidate.best_tier if candidate.best_tier is not None else "unknown"
+    return f"- Grounding: best tier {best}; evidence passes: {passes or 'none'}"
+
+
+def _render_resolution_line(enrichment: CandidateEnrichment) -> str:
+    fn = enrichment.resolved_function
+    if fn is None:
+        reason = enrichment.resolution_note or "not attempted"
+        return f"- No function was resolved (reason: {reason})"
+    name = fn.get("name", "?")
+    func_id = fn.get("id", "?")
+    start = fn.get("startLine")
+    end = fn.get("endLine")
+    span = f"lines {start}-{end}" if start is not None and end is not None else "line range unknown"
+    note = f" (note: {enrichment.resolution_note})" if enrichment.resolution_note else ""
+    return f"- Resolved near grounding evidence: `{name}` (id: `{func_id}`, {span}){note}"
+
+
+def _render_list_line(label: str, items: list[str], empty_text: str) -> str:
+    if not items:
+        return f"- {label}: {empty_text}"
+    shown = items[:_MAX_LIST_ITEMS]
+    remainder = len(items) - len(shown)
+    text = ", ".join(f"`{i}`" for i in shown)
+    if remainder > 0:
+        text += f" (+{remainder} more)"
+    return f"- {label}: {text}"
+
+
+def _render_reachability_line(enrichment: CandidateEnrichment) -> str:
+    reachable = enrichment.is_reachable_from_entry_point
+    if reachable is None:
+        return "- Reachability: not evaluated (no investigation context available)"
+    if reachable is False:
+        return "- Reachability: detected as not reachable by current entry-point heuristics"
+
+    path = enrichment.entry_point_path or []
+    shown = path[:_MAX_LIST_ITEMS]
+    remainder = len(path) - len(shown)
+    path_text = " → ".join(f"`{p}`" for p in shown) if shown else "path unavailable"
+    if remainder > 0:
+        path_text += f" (+{remainder} more hop(s))"
+    return f"- Reachability: detected as reachable by current entry-point heuristics (path: {path_text})"
+
+
+def _render_test_support_lines(enrichment: CandidateEnrichment) -> str:
+    rating_tuple = enrichment.test_support_rating
+    tests = enrichment.related_tests or []
+    if rating_tuple is None:
+        return "- Test support: not evaluated (see enrichment errors, if any)"
+
+    rating = rating_tuple[0] if rating_tuple else "unknown"
+    lines = [f"- Test support: {rating} ({len(tests)} related test file(s))"]
+    shown = tests[:_MAX_LIST_ITEMS]
+    remainder = len(tests) - len(shown)
+    for t in shown:
+        lines.append(f"  - `{t.get('path', '?')}` ({t.get('proximity', '?')})")
+    if remainder > 0:
+        lines.append(f"  - (+{remainder} more test file(s))")
+    return "\n".join(lines)
+
+
+def _render_sink_matches_lines(enrichment: CandidateEnrichment) -> str:
+    sinks = enrichment.sink_matches
+    if sinks is None:
+        return "- Sink matches: not evaluated (vulnerability class not recognized, or not attempted)"
+    if not sinks:
+        return "- Sink matches: none found"
+
+    lines = [f"- Sink matches: {len(sinks)} found"]
+    shown = sinks[:_MAX_LIST_ITEMS]
+    remainder = len(sinks) - len(shown)
+    for s in shown:
+        method = s.get("method") or "module level"
+        lines.append(f"  - `{s.get('file', '?')}`:{s.get('line', '?')} in `{method}`")
+    if remainder > 0:
+        lines.append(f"  - (+{remainder} more sink match(es))")
+    return "\n".join(lines)
+
+
+def _render_enrichment_errors_line(enrichment: CandidateEnrichment) -> str:
+    errors = enrichment.enrichment_errors
+    if not errors:
+        return "- Enrichment errors: none"
+
+    shown = errors[:_MAX_LIST_ITEMS]
+    remainder = len(errors) - len(shown)
+    lines = ["- Enrichment errors:"]
+    for e in shown:
+        lines.append(f"  - {e}")
+    if remainder > 0:
+        lines.append(f"  - (+{remainder} more)")
+    return "\n".join(lines)
+
+
+def _render_relationships(relationships: list[CandidateRelationship]) -> str:
+    lines = ["### Structural relationships", ""]
+    if not relationships:
+        lines.append("None detected.")
+        return "\n".join(lines) + "\n"
+
+    shown = relationships[:_MAX_LIST_ITEMS]
+    remainder = len(relationships) - len(shown)
+    for rel in shown:
+        lines.append(
+            f"- `{rel.from_path}` → `{rel.to_path}` -- direct call-graph relationship "
+            f"(via `{rel.detail}`)"
+        )
+    if remainder > 0:
+        lines.append(f"- (+{remainder} more relationship(s))")
+    return "\n".join(lines) + "\n"
+
+
+def _render_notes(understanding: RepositoryUnderstanding) -> str:
+    """Renders fusion_notes minus the entries already covered by their own
+    dedicated sections -- relationship echoes (see Structural relationships,
+    above) and the investigation-context-unavailable note (see Investigation
+    context, below) -- so the same fact is never stated twice in one
+    rendered block."""
+    relationship_texts = {_relationship_note(r) for r in understanding.relationships}
+    other_notes = [
+        n
+        for n in understanding.fusion_notes
+        if n not in relationship_texts and not n.startswith("investigation context unavailable")
+    ]
+
+    lines = ["### Notes", ""]
+    if not other_notes:
+        lines.append("None.")
+        return "\n".join(lines) + "\n"
+
+    shown = other_notes[:_MAX_LIST_ITEMS]
+    remainder = len(other_notes) - len(shown)
+    for n in shown:
+        lines.append(f"- {n}")
+    if remainder > 0:
+        lines.append(f"- (+{remainder} more)")
+    return "\n".join(lines) + "\n"
+
+
+def _render_investigation_context(available: bool) -> str:
+    lines = ["### Investigation context", ""]
+    if available:
+        lines.append("Investigation context was available for this run.")
+    else:
+        lines.append(
+            "Investigation context unavailable -- candidates were enriched in degraded, "
+            "file/test/sink-only mode (no parse/call-graph/reachability)."
+        )
+    return "\n".join(lines) + "\n"
