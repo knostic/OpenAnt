@@ -351,6 +351,35 @@ class ContextAgent:
                             )
                         )
 
+            # R2-B: a finish call on a turn the model TRUNCATED (stop_reason ==
+            # "max_tokens") is not a trustworthy complete classification — a
+            # truncated finish defaulting security_classification to "neutral"
+            # would silently drop a unit from the analysed set (a coverage/recall
+            # loss). Treat it as INCOMPLETE, mirroring this agent's degenerate-exit
+            # handling and the verifier's max_tokens gate.
+            if finish_result and stop_reason == "max_tokens":
+                call_record = self.tracker.record_call(
+                    model=self.binding.model,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
+                )
+                return AgentResult(
+                    include_functions=[],
+                    usage_context="Agent finish call truncated at max_tokens",
+                    security_classification=INCOMPLETE_CLASSIFICATION,
+                    classification_reasoning="Analysis incomplete - finish call truncated",
+                    confidence=0.3,
+                    iterations=iterations,
+                    total_tokens=total_input_tokens + total_output_tokens,
+                    is_entry_point=is_entry_point,
+                    reachable_from_entry=reachable_from_entry,
+                    entry_point_path=entry_point_path,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    cost_usd=call_record.get("cost_usd", 0.0),
+                )
+
             # If finish was called, return result
             if finish_result:
                 # Record token usage

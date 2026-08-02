@@ -422,6 +422,15 @@ class FindingVerifier:
                 # sets result["finding"] = correct_finding, and the report
                 # filters on that field — using "inconclusive" here would drop
                 # a Stage-1 "vulnerable" from the report entirely.
+                # C(a): record spend on this degenerate exit too — the three sibling
+                # degenerate paths (finish, no-tool-calls, max-iterations) all record,
+                # this one alone did not, undercounting the unit's tokens/cost.
+                self.tracker.record_call(
+                    model=self.binding.model,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
+                )
                 return VerificationResult(
                     agree=False,
                     correct_finding=finding,
@@ -462,6 +471,29 @@ class FindingVerifier:
                                 content=json.dumps(outcome),
                             )
                         )
+
+            # A finish call on a turn the model TRUNCATED (stop_reason == "max_tokens")
+            # is not a trustworthy completed verdict: a well-formed
+            # finish(agree=False, "safe") from a cut-off turn would silently downgrade a
+            # Stage-1 vulnerable. Treat it as verification-incomplete (preserve the
+            # Stage-1 verdict for triage) — honoring the adapter's truncation signal
+            # (the responses/chat paths relabel abnormal terminations to "max_tokens")
+            # rather than reading a truncated reply as a clean verdict.
+            if finish_result and stop_reason == "max_tokens":
+                self.tracker.record_call(
+                    model=self.binding.model,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
+                )
+                return VerificationResult(
+                    agree=False,
+                    correct_finding=finding,
+                    explanation="Verification incomplete (finish call truncated at max_tokens)",
+                    iterations=iterations,
+                    total_tokens=total_input_tokens + total_output_tokens,
+                    incomplete=True,
+                )
 
             if finish_result:
                 self.tracker.record_call(

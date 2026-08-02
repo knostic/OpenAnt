@@ -283,6 +283,25 @@ def explore_repository(
             if not isinstance(block, ToolUseBlock):
                 continue
             if block.name == finish_tool.name:
+                # R3-A: a finish call on a turn TRUNCATED at the token cap
+                # (stop_reason=="max_tokens") may carry partial arguments — accepting
+                # it writes an under-scoped application-context / threat-model doc that
+                # every later scan trusts (silent coverage loss). Don't accept it.
+                # R4-1: but the Messages API requires a tool_result for every tool_use,
+                # so ANSWER this finish's tool_use with a retry nudge (rather than
+                # skipping it unanswered, which 400s the next turn) — the loop then
+                # asks for a complete finish and, failing that, exhausts MAX_TURNS and
+                # raises (a visible failure, not a silent partial). Mirrors the
+                # verifier + enhancer max_tokens gate.
+                if getattr(response, "stop_reason", None) == "max_tokens":
+                    results.append(ToolResultBlock(
+                        tool_use_id=block.id, name=block.name,
+                        content=json.dumps({
+                            "error": "Your finish call was cut off at the token limit; "
+                                     "reply again with a complete but more concise finish call."
+                        }),
+                    ))
+                    continue
                 return dict(block.input or {}), budget
             outcome = explorer.execute(block.name, block.input or {})
             results.append(ToolResultBlock(

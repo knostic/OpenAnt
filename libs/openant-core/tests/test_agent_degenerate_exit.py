@@ -113,6 +113,35 @@ def test_degenerate_exit_records_spend():
     assert result.input_tokens == 5000 and result.output_tokens == 200
 
 
+def _finish_block(classification):
+    # a COMPLETE, valid finish call (all required fields, valid classification)
+    return ToolUseBlock(id="t1", name="finish", input={
+        "include_functions": ["f"], "usage_context": "ctx",
+        "security_classification": classification,
+        "classification_reasoning": "r", "confidence": 0.5,
+    })
+
+
+def test_truncated_finish_at_max_tokens_is_incomplete_not_a_verdict():
+    """R2-B: a VALID finish call on a turn truncated at max_tokens must be
+    INCOMPLETE, not accepted as a complete classification — a truncated
+    finish(security_classification="neutral") would silently drop a unit."""
+    result = _run(_agent([
+        CompletionResult(content=[_finish_block("neutral")],
+                         input_tokens=1, output_tokens=1, stop_reason="max_tokens"),
+    ]))
+    assert result.security_classification == "incomplete"
+
+
+def test_complete_finish_still_accepted():
+    """Regression guard: a finish on a NORMAL (tool_use) turn is still accepted."""
+    result = _run(_agent([
+        CompletionResult(content=[_finish_block("security_control")],
+                         input_tokens=1, output_tokens=1, stop_reason="tool_use"),
+    ]))
+    assert result.security_classification == "security_control"
+
+
 def test_no_tool_calls_is_not_a_neutral_verdict():
     """Sibling path: model responded but made no tool calls."""
     result = _run(_agent([
