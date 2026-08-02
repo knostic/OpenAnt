@@ -490,6 +490,27 @@ class CallGraphBuilder:
             return var_types
         source = code.encode("utf-8")
 
+        # A local `let` bound to a CLOSURE shadows a same-named free function as
+        # the call target: `let helper = || ...; let x = helper()` calls the
+        # closure, not a repo `fn helper`. Collect only closure bindings -- a
+        # non-callable rebind (`let load = 5`) can never be `load()`-called, so it
+        # does not shadow a function call and must not block return-type inference.
+        local_closures: Set[str] = set()
+        lstack = [tree.root_node]
+        while lstack:
+            n = lstack.pop()
+            if n.type == "let_declaration":
+                name = None
+                seen_eq = False
+                for c in n.children:
+                    if c.type == "identifier" and name is None and not seen_eq:
+                        name = self._text(c, source)
+                    elif c.type == "=":
+                        seen_eq = True
+                    elif seen_eq and c.type == "closure_expression" and name:
+                        local_closures.add(name)
+            lstack.extend(n.children)
+
         stack = [tree.root_node]
         while stack:
             node = stack.pop()
@@ -514,7 +535,8 @@ class CallGraphBuilder:
                         name = self._text(c, source)
                         break
                 if name:
-                    _set(name, self._infer_let_type(node, source, name_to_ids))
+                    _set(name, self._infer_let_type(
+                        node, source, name_to_ids, local_closures))
             stack.extend(node.children)
         return var_types
 
@@ -529,13 +551,18 @@ class CallGraphBuilder:
         """
         if not leaf or not name_to_ids:
             return None
+        rts = set()
         for cand in name_to_ids.get(leaf, []):
             info = self.functions.get(cand, {})
             if info.get("class_name") == qualifier:
                 rt = info.get("return_type")
                 if rt and rt != "Self":
-                    return rt
-        return None
+                    rts.add(rt)
+        # Two same-named types (`Factory` in different files) with differing
+        # return types is unresolvable here -- decline rather than guess the
+        # first, which would fabricate a wrong-type edge. Mirrors the
+        # uniqueness guard in `_free_fn_return_type`.
+        return next(iter(rts)) if len(rts) == 1 else None
 
     def _free_fn_return_type(
         self, fn_name: str, name_to_ids: Optional[Dict[str, List[str]]],
@@ -560,6 +587,7 @@ class CallGraphBuilder:
     def _infer_let_type(
         self, node: Node, source: bytes,
         name_to_ids: Optional[Dict[str, List[str]]] = None,
+        local_closures: Optional[Set[str]] = None,
     ) -> Optional[str]:
         from .function_extractor import _bare_type_name
 
@@ -603,10 +631,14 @@ class CallGraphBuilder:
                 if callee is not None and callee.type == "identifier":
                     # `let c = load()` where `load() -> Cfg` -> type c as Cfg, so a
                     # later `c.method()` resolves precisely (recovering the
-                    # unknown-receiver blackout) with zero phantom.
-                    rt = self._free_fn_return_type(self._text(callee, source), name_to_ids)
-                    if rt:
-                        return rt
+                    # unknown-receiver blackout) with zero phantom. Skip when the
+                    # name is a local closure binding shadowing the free fn --
+                    # typing from the free fn would be a wrong-type phantom.
+                    fname = self._text(callee, source)
+                    if not (local_closures and fname in local_closures):
+                        rt = self._free_fn_return_type(fname, name_to_ids)
+                        if rt:
+                            return rt
         return None
 
     def _collect_fn_aliases(
@@ -793,6 +825,13 @@ class CallGraphBuilder:
         same_file = [c for c in candidates if self._in_file(c, caller_file)]
         if same_file:
             return same_file
+        # A bare call to a name imported from an EXTERNAL crate (`use
+        # std::thread::spawn`) is that external symbol, not a cross-file repo
+        # function of the same name -- linking to the repo namesake is a
+        # wrong-target phantom. Same-file (checked above) still wins; a genuine
+        # repo import (`use crate::..`) has no external root and is unaffected.
+        if self._name_is_externally_imported(call_name, caller_file):
+            return []
         if len(candidates) == 1:
             return candidates
         return []
@@ -803,6 +842,32 @@ class CallGraphBuilder:
             return []
         candidates = name_to_ids.get(leaf, [])
         return candidates if len(candidates) == 1 else []
+
+    # Crate roots that are unambiguously NOT part of the analyzed repo. A `use`
+    # rooted here binds an external symbol; `crate`/`super`/`self`-rooted paths
+    # (and bare local-mod paths) are repo-internal and never match.
+    _EXTERNAL_CRATE_ROOTS = frozenset({"std", "core", "alloc", "proc_macro", "test"})
+
+    def _name_is_externally_imported(self, call_name: str, caller_file: str) -> bool:
+        """True if `call_name` is brought into `caller_file` by a `use` rooted in a
+        known external crate (`std`/`core`/`alloc`/...) AND is not ALSO repo-imported
+        (`use crate::`/`self`/`super`) in the same file. Such a bare call is the
+        external symbol, so it must not resolve to a same-named repo function. A
+        coexisting repo import means some scope legitimately calls the repo function
+        -- imports are tracked per file, not per scope, so we can't tell which call
+        is which; decline to force-drop and let candidate resolution decide."""
+        ext = repo = False
+        for imp in self.imports.get(caller_file, []):
+            if imp.get("kind") != "use":
+                continue
+            if (imp.get("alias") or imp.get("leaf")) != call_name:
+                continue
+            root = (imp.get("path") or "").split("::", 1)[0]
+            if root in self._EXTERNAL_CRATE_ROOTS:
+                ext = True
+            elif root in ("crate", "self", "super"):
+                repo = True
+        return ext and not repo
 
     def _resolve_field(
         self, site: dict, caller_file: str, caller_class: Optional[str],
