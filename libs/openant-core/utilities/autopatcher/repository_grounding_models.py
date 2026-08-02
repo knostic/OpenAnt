@@ -9,11 +9,19 @@ debug-only ``_debug_raw_candidates``/``_debug_by_file`` structures.
 Only DiscoveryEvidence is modeled: it is the only Evidence kind today's
 passes actually produce. Repository-Relative and Structural Evidence are
 not computed anywhere yet and are deliberately not represented here.
+
+``CandidateEnrichment`` is a later, optional addition (populated by
+``utilities/autopatcher/candidate_enrichment.py``): deterministic
+repository facts about one ``RepositoryCandidate``, gathered from the
+existing parser/call-graph/reachability/test-discovery machinery. It is
+attached via ``RepositoryCandidate.enrichment`` rather than wrapping the
+candidate in a second model — a candidate without it behaves exactly as
+it always has.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -28,11 +36,49 @@ class DiscoveryEvidence:
 
 
 @dataclass
+class CandidateEnrichment:
+    """Deterministic repository facts about one RepositoryCandidate.
+
+    No LLM output, no vulnerability verdict, no confidence score anywhere
+    here — every field is either a verbatim existing function's return
+    value or an explicit, honest reason nothing was resolved. ``None``
+    means "not attempted / not applicable"; ``[]`` means "attempted, found
+    nothing" — the two are never conflated.
+    """
+
+    functions_in_file: list[dict] = field(default_factory=list)
+    resolved_function: "dict | None" = None
+    resolution_note: "str | None" = None
+
+    callees: list[str] = field(default_factory=list)
+    callers_by_call_graph: list[str] = field(default_factory=list)
+    callers_by_text_search: list[dict] = field(default_factory=list)
+
+    is_reachable_from_entry_point: "bool | None" = None
+    entry_point_path: "list[str] | None" = None
+
+    related_tests: list[dict] = field(default_factory=list)
+    test_support_rating: "tuple | None" = None
+
+    sink_matches: "list[dict] | None" = None
+
+    enrichment_errors: list[str] = field(default_factory=list)
+
+
+@dataclass
 class RepositoryCandidate:
-    """One discovered file and everything known about it."""
+    """One discovered file and everything known about it.
+
+    ``enrichment`` is optional and additive: a candidate produced by
+    ``repo_locator.py`` today has ``enrichment=None`` and behaves exactly
+    as before this field existed. Setting it never changes ``path``,
+    ``evidence``, or ``best_tier`` — those remain the sole grounding/
+    ranking inputs (see ``candidate_selection.py``).
+    """
     path: str
     evidence: list[DiscoveryEvidence]
     best_tier: "int | None"
+    enrichment: "CandidateEnrichment | None" = None
 
 
 @dataclass
