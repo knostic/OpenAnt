@@ -276,6 +276,187 @@ class TestRealGitApply:
 
 
 # ---------------------------------------------------------------------------
+# apply_patch: skip/error conditions (mirrors check_applicability's, minus
+# the "skipped" flag — apply_patch just reports applied=False + error)
+# ---------------------------------------------------------------------------
+
+class TestApplyPatchSkipConditions:
+    def test_no_workspace_root(self):
+        from utilities.autopatcher.patch_applicability import apply_patch
+        r = apply_patch(_FENCED_DIFF, None)
+        assert r.applied is False
+        assert "no workspace_root" in r.error
+        assert r.error_kind == "invalid_input"
+
+    def test_not_git_repo(self, tmp_path):
+        from utilities.autopatcher.patch_applicability import apply_patch
+        r = apply_patch(_FENCED_DIFF, tmp_path)
+        assert r.applied is False
+        assert "git" in r.error.lower()
+        assert r.error_kind == "not_git_repository"
+
+    def test_empty_patch(self, tmp_path):
+        from utilities.autopatcher.patch_applicability import apply_patch
+        (tmp_path / ".git").mkdir()
+        r = apply_patch("", tmp_path)
+        assert r.applied is False
+        assert "empty" in r.error.lower()
+        assert r.error_kind == "invalid_input"
+
+    def test_git_not_found(self, tmp_path):
+        from utilities.autopatcher.patch_applicability import apply_patch
+        (tmp_path / ".git").mkdir()
+        with mock.patch("utilities.autopatcher.patch_applicability.run_utf8",
+                        side_effect=FileNotFoundError):
+            r = apply_patch(_FENCED_DIFF, tmp_path)
+        assert r.applied is False
+        assert "git" in r.error.lower()
+        assert r.error_kind == "git_not_found"
+
+
+class TestApplyPatchErrorState:
+    def test_timeout(self, tmp_path):
+        from utilities.autopatcher.patch_applicability import apply_patch
+        (tmp_path / ".git").mkdir()
+        with mock.patch(
+            "utilities.autopatcher.patch_applicability.run_utf8",
+            side_effect=subprocess.TimeoutExpired("git", 10),
+        ):
+            r = apply_patch(_FENCED_DIFF, tmp_path)
+        assert r.applied is False
+        assert "timed out" in r.error.lower()
+        assert r.error_kind == "timeout"
+
+    def test_unexpected_exception(self, tmp_path):
+        from utilities.autopatcher.patch_applicability import apply_patch
+        (tmp_path / ".git").mkdir()
+        with mock.patch(
+            "utilities.autopatcher.patch_applicability.run_utf8",
+            side_effect=RuntimeError("something broke"),
+        ):
+            r = apply_patch(_FENCED_DIFF, tmp_path)
+        assert r.applied is False
+        assert r.error is not None
+        assert r.error_kind == "unexpected_error"
+
+
+class TestApplyPatchResult:
+    def test_applied_true_on_returncode_0(self, tmp_path):
+        from utilities.autopatcher.patch_applicability import apply_patch
+        (tmp_path / ".git").mkdir()
+        with mock.patch("utilities.autopatcher.patch_applicability.run_utf8",
+                        return_value=_mock_git_run(0)):
+            r = apply_patch(_FENCED_DIFF, tmp_path)
+        assert r.applied is True
+        assert r.error is None
+        assert r.error_kind is None
+        assert r.exit_code == 0
+
+    def test_applied_false_on_nonzero_returncode(self, tmp_path):
+        from utilities.autopatcher.patch_applicability import apply_patch
+        (tmp_path / ".git").mkdir()
+        with mock.patch("utilities.autopatcher.patch_applicability.run_utf8",
+                        return_value=_mock_git_run(1, "error: auth.py: does not exist in index")):
+            r = apply_patch(_FENCED_DIFF, tmp_path)
+        assert r.applied is False
+        assert r.exit_code == 1
+        assert r.error_kind == "apply_rejected"
+        assert "does not exist" in r.stderr
+
+    def test_no_check_flag_passed_to_git(self, tmp_path):
+        """apply_patch must NOT pass --check — it mutates the tree."""
+        from utilities.autopatcher.patch_applicability import apply_patch
+        (tmp_path / ".git").mkdir()
+        captured = []
+        def _capture(cmd, **kwargs):
+            captured.append(cmd)
+            return _mock_git_run(0)
+        with mock.patch("utilities.autopatcher.patch_applicability.run_utf8", side_effect=_capture):
+            apply_patch(_FENCED_DIFF, tmp_path)
+        assert captured
+        assert "--check" not in captured[0]
+
+    def test_result_is_frozen_dataclass(self, tmp_path):
+        from utilities.autopatcher.patch_applicability import apply_patch, PatchApplicationResult
+        (tmp_path / ".git").mkdir()
+        with mock.patch("utilities.autopatcher.patch_applicability.run_utf8",
+                        return_value=_mock_git_run(0)):
+            r = apply_patch(_FENCED_DIFF, tmp_path)
+        assert isinstance(r, PatchApplicationResult)
+        with pytest.raises(Exception):  # dataclasses.FrozenInstanceError
+            r.applied = False
+
+
+# ---------------------------------------------------------------------------
+# apply_patch: real git, mutating a disposable copy (never repo_root itself)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+class TestRealGitApplyPatch:
+    def test_correct_patch_applies_and_mutates_file(self, tmp_path):
+        from utilities.autopatcher.patch_applicability import apply_patch
+        _make_git_repo(tmp_path)
+        patch = (
+            "```diff\n"
+            "--- a/auth.py\n"
+            "+++ b/auth.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def authenticate(u, p):\n"
+            "-    return True\n"
+            "+    return check_credentials(u, p)\n"
+            "```"
+        )
+        r = apply_patch(patch, tmp_path)
+        assert r.applied is True
+        assert r.error is None
+        assert r.error_kind is None
+        assert "check_credentials" in (tmp_path / "auth.py").read_text(encoding="utf-8")
+
+    def test_bad_patch_does_not_apply_and_leaves_file_untouched(self, tmp_path):
+        from utilities.autopatcher.patch_applicability import apply_patch
+        _make_git_repo(tmp_path)
+        original = (tmp_path / "auth.py").read_text(encoding="utf-8")
+        patch = (
+            "```diff\n"
+            "--- a/nonexistent.py\n"
+            "+++ b/nonexistent.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old_line()\n"
+            "+new_line()\n"
+            "```"
+        )
+        r = apply_patch(patch, tmp_path)
+        assert r.applied is False
+        assert r.error_kind == "apply_rejected"
+        assert (tmp_path / "auth.py").read_text(encoding="utf-8") == original
+
+    def test_compose_with_temporary_repo_copy_never_touches_real_repo(self, tmp_path):
+        """The intended composition: copy, then apply to the copy only."""
+        from utilities.autopatcher.patch_applicability import apply_patch
+        from utilities.autopatcher.patch_workspace import temporary_repo_copy
+        real_repo = _make_git_repo(tmp_path)
+        original = (real_repo / "auth.py").read_text(encoding="utf-8")
+        patch = (
+            "```diff\n"
+            "--- a/auth.py\n"
+            "+++ b/auth.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def authenticate(u, p):\n"
+            "-    return True\n"
+            "+    return check_credentials(u, p)\n"
+            "```"
+        )
+        with temporary_repo_copy(real_repo) as workspace_root:
+            r = apply_patch(patch, workspace_root)
+            assert r.applied is True
+            assert "check_credentials" in (workspace_root / "auth.py").read_text(encoding="utf-8")
+            # Real repo must be untouched while the copy is mutated.
+            assert (real_repo / "auth.py").read_text(encoding="utf-8") == original
+        # And still untouched after the workspace is torn down.
+        assert (real_repo / "auth.py").read_text(encoding="utf-8") == original
+
+
+# ---------------------------------------------------------------------------
 # Pipeline-level: section renders correctly
 # ---------------------------------------------------------------------------
 
