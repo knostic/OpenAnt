@@ -10,8 +10,8 @@ wrapper around a heavier ``utilities.*`` engine.
 Also supports patching directly from a known CVE identifier
 (``run_patch_cve``), which shares ``run_patch``'s artifact-writing tail
 (``_run_engine_and_write_artifacts``) rather than duplicating it -- both
-entry points converge on the same, unmodified
-``utilities.autopatcher.pipeline.run()`` call.
+entry points converge on the same ``utilities.autopatcher.pipeline.run()``
+call.
 
 The Trust Report is treated as an opaque artifact: this module never parses
 its Recommendation or Trust Signals, only the path it was written to.
@@ -154,9 +154,8 @@ def _run_engine_and_write_artifacts(
 ) -> PatchStepResult:
     """Shared tail of run_patch()/run_patch_cve(): removes any stale trust
     report from a previous failed run, writes {artifact_label}-vulnerability.md,
-    invokes the unchanged Auto Patcher engine
-    (utilities.autopatcher.pipeline.run), and writes
-    {artifact_label}-trust-report.md.
+    invokes the Auto Patcher engine (utilities.autopatcher.pipeline.run),
+    and writes {artifact_label}-trust-report.md.
 
     This is run_patch()'s pre-existing tail, unchanged in behavior, with
     finding_id generalized to a caller-supplied artifact_label so
@@ -208,11 +207,22 @@ def _run_engine_and_write_artifacts(
     patcher_commit = _rm.collect_git_info(openant_root) if openant_root else "unknown"
     repo_commit = _rm.collect_git_info(Path(repo_root)) if repo_root else "-"
 
+    # Run-scoped directory for the Repository Understanding investigation's
+    # parser artifacts (candidate_enrichment.build_investigation_context) --
+    # outside the target repo, under this run's own output directory, keyed
+    # by artifact_label so it doesn't collide with another run's artifacts.
+    # Only needed (and only created) when there's a repository to parse.
+    investigation_dir = None
+    if repo_root:
+        investigation_dir = os.path.join(patch_dir, f"{artifact_label}-investigation")
+        os.makedirs(investigation_dir, exist_ok=True)
+
     api_key = os.environ.get("OPENAI_API_KEY", "")
     report_body = _run_pipeline(
         vulnerability_text=vulnerability_text,
         api_key=api_key,
         repo_root=repo_root,
+        investigation_output_dir=investigation_dir,
     )
 
     provider = _llm._cached_provider or os.environ.get("LLM_PROVIDER", "unknown")
@@ -304,9 +314,24 @@ def run_patch(
     check_eligible(finding)
 
     vulnerability_text = render_vulnerability_markdown(finding)
+
+    # Normalize repo_root once, here at the entry point, before it reaches
+    # InvestigationCase / ground_repository / parsing -- an unresolved path
+    # (e.g. macOS's /var/... symlink to /private/var/...) can otherwise
+    # degrade repository-grounding candidate paths to bare filenames.
+    if repo_root:
+        repo_root = str(Path(repo_root).resolve())
+
+    from utilities.autopatcher.investigation_adapters import case_from_vulnerability_text
+
+    case = case_from_vulnerability_text(
+        vulnerability_text, repo_root=Path(repo_root) if repo_root else None
+    )
+    projection = case.to_context_projection()
+
     return _run_engine_and_write_artifacts(
-        vulnerability_text=vulnerability_text,
-        repo_root=repo_root,
+        vulnerability_text=projection.vulnerability_text,
+        repo_root=str(projection.repo_root) if projection.repo_root else None,
         output_dir=output_dir,
         artifact_label=finding_id,
     )
@@ -348,6 +373,11 @@ def run_patch_cve(
     """
     if not repo_root or not os.path.isdir(repo_root):
         raise ValueError(f"--repo-root does not exist: {repo_root!r}")
+
+    # Normalize once, here at the entry point, before InvestigationCase /
+    # ground_repository / parsing ever see it -- see run_patch()'s matching
+    # comment for why.
+    repo_root = str(Path(repo_root).resolve())
 
     from utilities.autopatcher.cve_fetcher import fetch_cve
     from utilities.autopatcher.investigation_adapters import case_from_cve

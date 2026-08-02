@@ -25,6 +25,7 @@ from .impact_surface import LightweightImpactAnalyzer
 from .behavior_summary import BehaviorAnalyzer
 from .language_support import detect_language
 from pathlib import Path as _Path
+from .evidence_fusion import RepositoryUnderstanding
 from .repository_grounding_models import RepositoryCandidate, RepositoryGroundingResult
 
 # Static patch signals
@@ -115,6 +116,11 @@ class PipelineResult:
     finding_calibration: list[dict] | None = None
     # Repository Grounding (surfaced in the report as "Repository Context").
     grounding: RepositoryGroundingResult | None = None
+    # Deterministic Repository Understanding (candidate selection + enrichment
+    # + fusion) -- retained for later reporting work; not yet surfaced in the
+    # Trust Report. None when investigation didn't run or found nothing to
+    # select (see CandidateSelection.used_fallback).
+    repository_understanding: RepositoryUnderstanding | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -2313,7 +2319,12 @@ def _load_experiment_plan(vulnerability_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def run(vulnerability_text: str, api_key: str = "", repo_root: str | Path | None = None) -> str:
+def run(
+    vulnerability_text: str,
+    api_key: str = "",
+    repo_root: str | Path | None = None,
+    investigation_output_dir: str | Path | None = None,
+) -> str:
     """
     Execute the full patching pipeline.
 
@@ -2325,6 +2336,16 @@ def run(vulnerability_text: str, api_key: str = "", repo_root: str | Path | None
         this function.
     api_key:
         Optional OpenAI API key.  When empty the pipeline uses mock responses.
+    investigation_output_dir:
+        Optional run-scoped directory for the deterministic Repository
+        Understanding investigation's parser artifacts (candidate_enrichment.
+        build_investigation_context's analyzer_output.json/call_graph.json).
+        When omitted, investigation still runs (selection + fusion +
+        rendering) but candidate enrichment degrades to its existing
+        file/test/sink-only mode -- no parse/call-graph/reachability -- same
+        as when candidate_enrichment.enrich_candidates() is given
+        context=None. Callers that don't pass this (all existing callers)
+        are unaffected beyond that graceful degradation.
 
     Returns
     -------
@@ -2369,8 +2390,50 @@ def run(vulnerability_text: str, api_key: str = "", repo_root: str | Path | None
     except Exception:
         pass
 
-    # Assemble final context: plan → repo code → vuln patterns.
-    _ctx_parts = [p for p in [_plan_text, _repo_code, _pattern_ctx] if p and p.strip()]
+    # Deterministic Repository Understanding: bounded candidate selection +
+    # enrichment + fusion, reusing the same _grounding computed above (no
+    # second ground_repository() call, no second candidate set). Best-effort
+    # -- any failure degrades to today's existing repo_code/pattern_ctx
+    # context rather than aborting the run. Rendered only when selection
+    # actually found something to select (CandidateSelection.used_fallback
+    # documents this as the caller's cue to fall back to existing behavior).
+    _repository_understanding: RepositoryUnderstanding | None = None
+    _repository_understanding_ctx = ""
+    if _grounding is not None:
+        try:
+            from .candidate_enrichment import build_investigation_context, enrich_candidates
+            from .candidate_selection import select_candidates
+            from .evidence_fusion import fuse_evidence, render_repository_understanding
+
+            _selection = select_candidates(_grounding)
+            if not _selection.used_fallback:
+                _investigation_context = None
+                if investigation_output_dir:
+                    _investigation_context = build_investigation_context(
+                        Path(repo_root), Path(investigation_output_dir)
+                    )
+                enrich_candidates(_selection, Path(repo_root), vulnerability_text, _investigation_context)
+                _repository_understanding = fuse_evidence(
+                    _selection, investigation_context_available=_investigation_context is not None
+                )
+                _repository_understanding_ctx = render_repository_understanding(_repository_understanding)
+                if _repository_understanding_ctx:
+                    print(
+                        f"[pipeline] Repository Understanding rendered "
+                        f"({len(_repository_understanding_ctx)} chars).",
+                        file=sys.stderr,
+                    )
+        except Exception as exc:
+            print(
+                f"[pipeline] Repository Understanding unavailable: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    # Assemble final context: plan → repo code → vuln patterns → repository understanding.
+    _ctx_parts = [
+        p for p in [_plan_text, _repo_code, _pattern_ctx, _repository_understanding_ctx] if p and p.strip()
+    ]
     code_context = "\n\n".join(_ctx_parts)
 
     print("[pipeline] Step 1/4 – Generating patch …", file=sys.stderr)
@@ -2708,5 +2771,6 @@ def run(vulnerability_text: str, api_key: str = "", repo_root: str | Path | None
         detected_language=_detected_language,
         finding_calibration=finding_calibration,
         grounding=_grounding,
+        repository_understanding=_repository_understanding,
     )
     return _build_report(result)

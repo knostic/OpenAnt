@@ -193,3 +193,53 @@ class TestRunPatchCveRequiresLlmProvider:
         # check inside the shared helper -- fetch_cve is still called here,
         # unlike the repo_root-invalid case above.
         mocked_fetch.assert_called_once()
+
+
+class TestRunPatchCveRepoRootNormalization:
+    """Repository Understanding integration: repo_root must be normalized
+    (resolved) once, at this entry point, before InvestigationCase /
+    ground_repository / parsing ever see it -- an unresolved path (e.g. a
+    macOS /var/... symlink to /private/var/...) can otherwise degrade
+    repository-grounding candidate paths to bare filenames."""
+
+    def test_repo_root_is_resolved_before_reaching_pipeline_run(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        real_repo = tmp_path / "real_repo"
+        real_repo.mkdir()
+        link_repo = tmp_path / "link_repo"
+        link_repo.symlink_to(real_repo)
+
+        import utilities.autopatcher.pipeline as _pipeline_module
+
+        captured = {}
+        original_run = _pipeline_module.run
+
+        def _capturing_run(*, vulnerability_text, api_key, repo_root=None, investigation_output_dir=None):
+            captured["repo_root"] = repo_root
+            return original_run(
+                vulnerability_text=vulnerability_text, api_key=api_key,
+                repo_root=repo_root, investigation_output_dir=investigation_output_dir,
+            )
+
+        with _mock_fetch_cve_at_source(), mock.patch.object(_pipeline_module, "run", side_effect=_capturing_run):
+            run_patch_cve("CVE-2021-12345", str(link_repo), str(tmp_path))
+
+        assert captured["repo_root"] == str(real_repo.resolve())
+        assert captured["repo_root"] != str(link_repo)
+
+
+class TestRunPatchCveInvestigationDirectory:
+    """Run-scoped Repository Understanding parser-artifact directory."""
+
+    def test_created_outside_repo_and_under_output_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        output_dir = tmp_path / "out"
+
+        with _mock_fetch_cve_at_source():
+            run_patch_cve("CVE-2021-12345", str(repo_root), str(output_dir))
+
+        expected = output_dir / "patch" / "CVE-2021-12345-investigation"
+        assert expected.is_dir()
+        assert not str(expected).startswith(str(repo_root))

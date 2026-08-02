@@ -340,6 +340,68 @@ def test_run_patch_input_type_and_input_id_default_to_finding(tmp_path, monkeypa
 
 
 # ---------------------------------------------------------------------------
+# Repository Understanding integration: repo_root normalization and the
+# run-scoped investigation directory, mirroring test_run_patch_cve.py's
+# equivalent coverage for CVE mode.
+# ---------------------------------------------------------------------------
+
+def test_run_patch_repo_root_is_resolved_before_reaching_pipeline_run(tmp_path, monkeypatch):
+    """repo_root must be normalized (resolved) once, here at the entry
+    point, before InvestigationCase / ground_repository / parsing ever see
+    it -- same guarantee as run_patch_cve()."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    real_repo = tmp_path / "real_repo"
+    real_repo.mkdir()
+    link_repo = tmp_path / "link_repo"
+    link_repo.symlink_to(real_repo)
+    po_path = _write_pipeline_output(tmp_path, [FIXTURE_FINDING_ELIGIBLE])
+
+    import utilities.autopatcher.pipeline as _pipeline_module
+
+    captured = {}
+    original_run = _pipeline_module.run
+
+    def _capturing_run(*, vulnerability_text, api_key, repo_root=None, investigation_output_dir=None):
+        captured["repo_root"] = repo_root
+        return original_run(
+            vulnerability_text=vulnerability_text, api_key=api_key,
+            repo_root=repo_root, investigation_output_dir=investigation_output_dir,
+        )
+
+    with mock.patch.object(_pipeline_module, "run", side_effect=_capturing_run):
+        run_patch(po_path, "F-001", str(tmp_path), repo_root=str(link_repo))
+
+    assert captured["repo_root"] == str(real_repo.resolve())
+    assert captured["repo_root"] != str(link_repo)
+
+
+def test_run_patch_without_repo_root_creates_no_investigation_directory(tmp_path, monkeypatch):
+    """Finding mode without a repository must preserve current behavior --
+    no InvestigationCase repo_root, no investigation directory created."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    po_path = _write_pipeline_output(tmp_path, [FIXTURE_FINDING_ELIGIBLE])
+
+    result = run_patch(po_path, "F-001", str(tmp_path), repo_root=None)
+
+    assert not (tmp_path / "patch" / "F-001-investigation").exists()
+    vuln_text_written = open(result.vulnerability_path, encoding="utf-8").read()
+    assert vuln_text_written == render_vulnerability_markdown(FIXTURE_FINDING_ELIGIBLE)
+
+
+def test_run_patch_investigation_directory_created_when_repo_root_given(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    po_path = _write_pipeline_output(tmp_path, [FIXTURE_FINDING_ELIGIBLE])
+
+    run_patch(po_path, "F-001", str(tmp_path), repo_root=str(repo_root))
+
+    expected = tmp_path / "patch" / "F-001-investigation"
+    assert expected.is_dir()
+    assert not str(expected).startswith(str(repo_root))
+
+
+# ---------------------------------------------------------------------------
 # Full CLI dispatch contract (openant/cli.py's cmd_patch) -- the exact
 # envelope shape internal/python.Invoke() parses on the Go side.
 # ---------------------------------------------------------------------------
