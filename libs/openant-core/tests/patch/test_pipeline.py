@@ -446,6 +446,74 @@ class TestDecisionCard:
         assert "should not be deployed" in card
         assert "before deployment" not in card
 
+    def test_manual_review_required_wording_does_not_imply_deployment(self):
+        """Release-polish fix: Manual Review Required previously fell through
+        to the same "Complete the recommended validation check(s) before
+        deployment." wording as Deploy After Validation / Deploy With
+        Caution — differing only by the headline label above. It must
+        instead state plainly that deployment is not the next step and a
+        human reviewer must resolve the open questions first, regardless of
+        how many validation actions exist."""
+        from utilities.autopatcher.pipeline import _render_decision_card
+        rec = {"decision": "Manual Review Required", "reason": "x"}
+        for actions in ([], [{}], [{}, {}, {}]):
+            card = _render_decision_card(rec, self._signals(), actions, [])
+            assert "before deployment" not in card
+            assert "section" not in card.lower()
+            assert "human reviewer" in card.lower()
+            assert "not a signal to deploy" in card.lower()
+
+
+class TestTopAction:
+    """Unit tests for _select_top_action / _render_top_action_line
+    (release-polish change #7): a single "Top action" line rendered
+    immediately under Recommendation, echoing the highest-priority item
+    already in validation_actions — no new prioritization algorithm, no
+    duplication of Validation Actions' own reason/next_step text."""
+
+    def test_omits_when_no_actions(self):
+        from utilities.autopatcher.pipeline import _render_top_action_line
+        assert _render_top_action_line([]) == ""
+        assert _render_top_action_line(None) == ""
+
+    def test_shows_only_the_title_not_reason_or_next_step(self):
+        from utilities.autopatcher.pipeline import _render_top_action_line
+        actions = [{
+            "priority": "LOW",
+            "title": "Add targeted tests for X",
+            "reason": "This exact reason text must not repeat here",
+            "next_step": "This exact next step text must not repeat here",
+        }]
+        line = _render_top_action_line(actions)
+        assert "**Top action:** Add targeted tests for X" in line
+        assert "see Validation Actions below" in line
+        assert "This exact reason text must not repeat here" not in line
+        assert "This exact next step text must not repeat here" not in line
+
+    def test_picks_highest_priority_even_when_not_first(self):
+        """Regression guard: build_validation_plan can unconditionally
+        prepend a MEDIUM-priority behavior-driven action ahead of an
+        existing HIGH-priority one (see its own "behavior" block, which
+        always does `final = [beh_action] + final`) — a naive
+        validation_actions[0] would under-represent the true priority."""
+        from utilities.autopatcher.pipeline import _select_top_action
+        actions = [
+            {"priority": "MEDIUM", "title": "Validate behavior", "reason": "r1", "next_step": "n1"},
+            {"priority": "HIGH", "title": "Review authentication flow", "reason": "r2", "next_step": "n2"},
+            {"priority": "LOW", "title": "Add targeted tests", "reason": "r3", "next_step": "n3"},
+        ]
+        top = _select_top_action(actions)
+        assert top["title"] == "Review authentication flow"
+
+    def test_ties_keep_first_list_order(self):
+        from utilities.autopatcher.pipeline import _select_top_action
+        actions = [
+            {"priority": "HIGH", "title": "First high", "reason": "r1", "next_step": "n1"},
+            {"priority": "HIGH", "title": "Second high", "reason": "r2", "next_step": "n2"},
+        ]
+        top = _select_top_action(actions)
+        assert top["title"] == "First high"
+
 
 class TestValidationActionsDecisionAware:
     """Unit tests for _render_validation_actions_section's decision-aware
@@ -592,13 +660,23 @@ class TestReportTerminologyCleanup:
     def test_hero_banner_does_not_name_a_section(self):
         """Hero wording must remain valid even if section names or positions
         change elsewhere — it must not reference "Validation Actions" or any
-        other section name by name."""
+        other section name by name.
+
+        This fixture's mock pipeline run deterministically resolves to
+        Manual Review Required (patch_integrity "Not Verified" — no
+        repo_root is passed here, so applicability is unavailable). Release-
+        polish pass: Manual Review Required no longer shares the generic
+        "Complete the recommended validation check(s) before deployment."
+        wording with Deploy After Validation / Deploy With Caution (see
+        TestDecisionCard.test_manual_review_required_wording_does_not_imply_deployment)
+        — it must still, per this test's own point, avoid naming a section."""
         from utilities.autopatcher.pipeline import run
         report = run(vulnerability_text=self._vuln_text(), api_key="")
         idx = report.find("# Auto Patcher MVP")
         banner = report[idx:report.find("## Vulnerability summary")]
         assert "section" not in banner.lower()
-        assert "Complete the recommended validation check" in banner
+        assert "MANUAL REVIEW REQUIRED" in banner
+        assert "This is not a signal to deploy" in banner
 
     def test_no_dangling_see_analysis_below(self):
         """Catches regression of the specific dangling phrase this cleanup
@@ -768,8 +846,15 @@ class TestRecommendationConsistencyReport:
         assert "issue(s) flagged" not in report
 
     def test_manual_review_required_gets_no_caveat(self, tmp_path):
-        """A non-top-tier decision must not gain caveats even when both
-        underlying signals are weak — it already reads as cautious."""
+        """A non-top-tier decision must not gain an "Evidence check" caveat
+        even when both underlying signals are weak — it already reads as
+        cautious. Distinct from the decision-relevant open-item scope note
+        added for Manual Review Required (release-polish change #6, see
+        test_manual_review_required_shows_open_item_scope_note below): that
+        note uses its own wording and is not gated by this "Evidence check"
+        mechanism — it simply doesn't fire here because this scenario's
+        empty edge_cases/potential_issues produce zero decision-relevant
+        findings to report."""
         from utilities.autopatcher.pipeline import _build_report, PipelineResult
         challenger = {"still_vulnerable": True, "edge_cases": [], "potential_issues": [], "summary": ""}
         result = PipelineResult(**self._base_kwargs(tmp_path, challenger))
@@ -778,6 +863,86 @@ class TestRecommendationConsistencyReport:
         assert "**Manual Review Required**" in report
         assert "This recommendation currently has no automated test coverage" not in report
         assert "adversarial coverage is heuristic" not in report
+        assert "decision-relevant review item" not in report
+
+    def test_manual_review_required_shows_open_item_scope_note(self, tmp_path):
+        """Release-polish change #6: Manual Review Required must surface the
+        same decision-relevant finding count Evidence-check caveats already
+        compute for the top two decisions — using distinct wording (never
+        the top-tier "Evidence check" / "adversarial coverage is heuristic"
+        phrasing, which stays reserved for Deploy After Validation / Deploy
+        With Caution per the test above)."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        challenger = {
+            "still_vulnerable": True,
+            "edge_cases": ["Cannot verify this without running the test suite"],
+            "potential_issues": [],
+            "summary": "",
+        }
+        result = PipelineResult(**self._base_kwargs(tmp_path, challenger))
+        report = _build_report(result)
+
+        rec_idx = report.find("## Recommendation")
+        explanation_idx = report.find("## Explanation")
+        rec_block = report[rec_idx:explanation_idx]
+
+        assert "**Manual Review Required**" in rec_block
+        assert "1 decision-relevant review item remains open" in rec_block
+        assert "see Review Results below" in rec_block
+        assert "Evidence check" not in rec_block
+        assert "adversarial coverage is heuristic" not in rec_block
+
+    def test_top_action_line_appears_below_recommendation(self, tmp_path):
+        """Release-polish change #7: a single "Top action" line must render
+        immediately under Recommendation, pointing to Validation Actions for
+        the full list, without repeating that action's reason/next_step."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        challenger = {
+            "still_vulnerable": False,
+            "edge_cases": ["custom configurations may not benefit from this change"],
+            "potential_issues": [],
+            "summary": "",
+        }
+        result = PipelineResult(**self._base_kwargs(tmp_path, challenger))
+        report = _build_report(result)
+
+        rec_idx = report.find("## Recommendation")
+        explanation_idx = report.find("## Explanation")
+        rec_block = report[rec_idx:explanation_idx]
+
+        assert "**Top action:**" in rec_block
+        assert "see Validation Actions below" in rec_block
+
+    def test_impact_surface_has_epistemic_disclaimer(self, tmp_path):
+        """Release-polish change #4: Impact Surface was the only major
+        section with no epistemic framing — must state this is static,
+        non-executing analysis."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        challenger = {"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""}
+        result = PipelineResult(**self._base_kwargs(tmp_path, challenger))
+        report = _build_report(result)
+
+        idx = report.find("## Impact Surface")
+        assert idx != -1
+        block = report[idx:idx + 400]
+        assert "static" in block.lower()
+        assert "does not execute the code" in block
+
+    def test_reviewer_notes_has_epistemic_disclaimer(self, tmp_path):
+        """Release-polish change #5: Reviewer Notes was the one un-hedged
+        LLM-prose section — must state it is reviewer-LLM guidance, not
+        independently verified evidence, and must not duplicate Explanation's
+        own disclaimer wording."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        challenger = {"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""}
+        result = PipelineResult(**self._base_kwargs(tmp_path, challenger))
+        report = _build_report(result)
+
+        idx = report.find("### Reviewer Notes")
+        assert idx != -1
+        block = report[idx:idx + 300]
+        assert "not independently verified evidence" in block
+        assert "not independent execution or testing against the target repository" not in block
 
     def test_do_not_apply_gets_no_caveat(self, tmp_path):
         """pygeoapi/curl-representative: applicability hard-block. Must remain
@@ -1144,6 +1309,21 @@ class TestRepositoryContextSection:
         assert "**`retry.py`**" in section
         assert "Selected because\n- Explicitly referenced in the security advisory" in section
         assert "Used for\n- Primary reference (full file)" in section
+
+    def test_intro_clarifies_pre_patch_provenance(self):
+        """Release-polish change #8: Repository Context must state these
+        locations were selected before the patch was generated, and point
+        to Post-Patch Investigation for evidence gathered afterward —
+        without implying patch-touched evidence was selected beforehand."""
+        from utilities.autopatcher.pipeline import _render_repository_context_section
+        candidate = self._candidate("retry.py", [self._evidence("explicit_path", tier=3)], best_tier=3)
+        decision = self._decision("retry.py", "primary_full_file")
+        grounding = self._grounding([candidate], [decision])
+
+        section = _render_repository_context_section(grounding)
+
+        assert "selected **before** the patch was generated" in section
+        assert "Post-Patch Investigation" in section
 
     def test_renderer_multi_location_separated_by_rule(self):
         """§4.3 of the approved plan: a horizontal rule separates entries

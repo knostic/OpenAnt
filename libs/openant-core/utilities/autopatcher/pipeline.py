@@ -639,7 +639,9 @@ def _render_repository_context_section(grounding: "RepositoryGroundingResult | N
 
     lines.append(
         "The following repository locations were selected to provide context "
-        "for patch generation and review.\n"
+        "for patch generation and review. These locations were selected "
+        "**before** the patch was generated — for evidence gathered from the "
+        "final patch diff itself, see Post-Patch Investigation.\n"
     )
 
     candidates_by_path = {c.path: c for c in grounding.candidates}
@@ -1067,7 +1069,7 @@ def _build_recommendation_v1(
             "decision": "Manual Review Required",
             "reason": (
                 "Challenger flagged unverified risks but found no confirmed exploit path; "
-                "review the Known Findings before deploying."
+                "see Review Results below before deploying."
             ),
         }
     if (
@@ -1190,7 +1192,7 @@ def _check_recommendation_consistency(signals: dict, decision: str, known_findin
         caveats.append(
             _build_consistency_caveat(
                 "This recommendation's adversarial coverage is heuristic, not deterministically "
-                "confirmed — see Known Findings below for the validation questions and remaining "
+                "confirmed — see Review Results below for the validation questions and remaining "
                 "uncertainties",
                 f"{decision_relevant_count} decision-relevant finding(s) remain open",
             )
@@ -1199,13 +1201,89 @@ def _check_recommendation_consistency(signals: dict, decision: str, known_findin
     return caveats
 
 
-def _render_recommendation_block(recommendation: dict, caveats: list[str] | None = None) -> str:
+# Presentation-only: the same rank convention build_validation_plan's own
+# local `rank_map` already uses (HIGH=3, MEDIUM=2, LOW=1) — reused here, not
+# reintroduced, purely to pick which already-computed item to echo.
+_ACTION_PRIORITY_RANK = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+
+
+def _select_top_action(validation_actions: list[dict] | None) -> "dict | None":
+    """Return the highest-priority item already in `validation_actions`, or
+    None when the list is empty.
+
+    Presentation only — does not reorder, filter, or recompute
+    `validation_actions` itself (build_validation_plan's own order,
+    priority, and count are untouched). This exists because index [0] is
+    not reliably the highest-priority entry: build_validation_plan
+    unconditionally prepends a MEDIUM-priority behavior-driven action ahead
+    of any HIGH-priority item already present (see its own "behavior"
+    block), so a naive `validation_actions[0]` can under-represent the true
+    top priority. `max()` returns the first item on a tie, so display order
+    for same-priority items still matches the list's own existing order.
+    """
+    if not validation_actions:
+        return None
+    return max(validation_actions, key=lambda a: _ACTION_PRIORITY_RANK.get(a.get("priority"), 0))
+
+
+def _render_top_action_line(validation_actions: list[dict] | None) -> str:
+    """Render a single "Top action" line for display immediately under
+    Recommendation — the concise title only, never the action's reason or
+    next_step (those already render in full, once, in Validation Actions
+    below); this line exists only so a reader isn't required to scroll past
+    Explanation to see the single most important next step. Returns ""
+    when there is no meaningful action to show.
+    """
+    top = _select_top_action(validation_actions)
+    if not top or not top.get("title"):
+        return ""
+    return f"\n**Top action:** {top['title']} — see Validation Actions below for the full list.\n"
+
+
+def _render_manual_review_scope_note(decision: str, known_findings: dict) -> str:
+    """Presentation-only scope note for Manual Review Required: surfaces the
+    same decision-relevant finding count `_check_recommendation_consistency`
+    already computes for the top two decisions (see
+    `_decision_relevant_finding_count`), so a reader triaging Manual Review
+    Required doesn't have to scroll to Review Results just to learn whether
+    one item or several are open.
+
+    Deliberately NOT the "Evidence check" caveat mechanism, and deliberately
+    different wording from it: that mechanism exists to flag that a
+    CONFIDENT-sounding recommendation may be undercut by evidence the reader
+    hasn't seen yet. Manual Review Required already reads as cautious — this
+    is scope information, not a warning, and never describes the open items
+    as defects. Returns "" when the decision isn't Manual Review Required or
+    when the count is zero (nothing to add beyond the reason already shown).
+    """
+    if decision != "Manual Review Required":
+        return ""
+    count = _decision_relevant_finding_count(known_findings)
+    if count == 0:
+        return ""
+    noun = "item" if count == 1 else "items"
+    verb = "remains" if count == 1 else "remain"
+    return f"\n{count} decision-relevant review {noun} {verb} open — see Review Results below for details.\n"
+
+
+def _render_recommendation_block(
+    recommendation: dict,
+    caveats: list[str] | None = None,
+    scope_note: str = "",
+    top_action_line: str = "",
+) -> str:
     """Render just the Recommendation section (no leading rule — the caller's
     preceding block is expected to end with one, matching prior layout)."""
     lines: list[str] = []
     lines.append("## Recommendation\n")
     lines.append(f"**{recommendation['decision']}**\n")
     lines.append(f"{recommendation['reason']}\n")
+
+    if top_action_line:
+        lines.append(top_action_line)
+
+    if scope_note:
+        lines.append(scope_note)
 
     if caveats:
         for c in caveats:
@@ -1517,6 +1595,18 @@ def _render_decision_card(
                 "This patch should not be deployed. "
                 "The items below apply only to a corrected patch, not this one."
             )
+    elif decision == "Manual Review Required":
+        # Reviewer-experience fix: this previously fell through to the same
+        # "before deployment" phrasing as Deploy After Validation / Deploy
+        # With Caution, differing only by the headline word above — a
+        # skim-only reader could easily read this banner as a near-green-
+        # light. Manual Review Required means the policy could not
+        # determine deployability from the evidence collected; deployment
+        # is explicitly not the next step regardless of action_count.
+        validation_line = (
+            "This is not a signal to deploy — a human reviewer must "
+            "resolve the open questions below first."
+        )
     elif action_count == 0:
         validation_line = "No additional validation actions identified."
     elif action_count == 1:
@@ -1909,8 +1999,15 @@ def _build_report(result: PipelineResult) -> str:
         or known_findings["validation_gaps"]
     )
     consistency_caveats = _check_recommendation_consistency(signals, trust_rec["decision"], known_findings)
+    manual_review_scope_note = _render_manual_review_scope_note(trust_rec["decision"], known_findings)
+    top_action_line = _render_top_action_line(validation_actions)
     decision_card = _render_decision_card(trust_rec, signals, validation_actions, files_changed)
-    recommendation_block = _render_recommendation_block(trust_rec, caveats=consistency_caveats)
+    recommendation_block = _render_recommendation_block(
+        trust_rec,
+        caveats=consistency_caveats,
+        scope_note=manual_review_scope_note,
+        top_action_line=top_action_line,
+    )
     trust_signals_block = _render_trust_signals_table(signals, known_findings_rendered=known_findings_relevant)
     known_findings_block = _render_known_findings(known_findings)
     validation_actions_block = _render_validation_actions_section(validation_actions, trust_rec["decision"])
@@ -2094,6 +2191,10 @@ def _build_report(result: PipelineResult) -> str:
         try:
             imp = result.impact
             report += "---\n\n## Impact Surface\n\n"
+            report += (
+                "*Static, AST-based usage analysis — does not execute the code, and may not "
+                "fully represent dynamic dispatch, reflection, or other runtime-only behavior.*\n\n"
+            )
             report += f"**Summary:** {imp.get('impact_summary', '')}\n\n"
             report += f"- Changed files: {len(imp.get('changed_files', []))}\n"
             report += f"- Affected files: {len(imp.get('affected_files', []))}\n"
@@ -2223,6 +2324,8 @@ def _build_report(result: PipelineResult) -> str:
     # supplementary, not part of the core "understand this in 30 seconds" flow.
     report += f"""
 ### Reviewer Notes
+
+*Reviewer-LLM guidance, not independently verified evidence.*
 
 {review_sections["validation_notes"]}
 """

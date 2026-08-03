@@ -142,11 +142,20 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
             )
 
         changed_symbols: List[str] = []
+        # Presentation-only side map (name -> "function"/"class"/"assignment"),
+        # kept separate from changed_symbols itself so the public
+        # ImpactReport.changed_symbols/to_dict() shape is untouched -- used
+        # only by _build_summary to decide whether a symbol may render with
+        # a trailing "()" (see F-XX: constants/fields must not appear
+        # callable).
+        symbol_kinds: Dict[str, str] = {}
         for f in changed_files:
             if f.endswith(".py"):
                 hunks = file_hunks.get(f, [])
                 syms = self._extract_symbols(f, hunks, repo_context=repo_context)
-                changed_symbols.extend(syms)
+                for name, kind in syms:
+                    changed_symbols.append(name)
+                    symbol_kinds.setdefault(name, kind)
 
         # Unique symbols
         changed_symbols = list(dict.fromkeys(changed_symbols))
@@ -163,7 +172,10 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         if context_type and impact_level == "low":
             impact_level = "medium"
 
-        impact_summary = self._build_summary(changed_symbols, affected_files, changed_files, impact_level, context_type)
+        impact_summary = self._build_summary(
+            changed_symbols, affected_files, changed_files, impact_level, context_type,
+            symbol_kinds=symbol_kinds,
+        )
 
         recommendations = self._recommendations_for_level(impact_level)
 
@@ -234,10 +246,17 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         return max(0, match.a - match.b)
 
     # ---- structural symbol resolution via ast (never a text/regex scan) ----
-    def _build_symbol_index(self, file_text: str) -> Optional[List[Tuple[int, int, str]]]:
-        """Parse file_text and return [(lineno, end_lineno, name), ...] for
-        every module-level or class-level function/class/simple assignment,
-        1-indexed and inclusive, matching ast's own line numbering.
+    def _build_symbol_index(self, file_text: str) -> Optional[List[Tuple[int, int, str, str]]]:
+        """Parse file_text and return [(lineno, end_lineno, name, kind), ...]
+        for every module-level or class-level function/class/simple
+        assignment, 1-indexed and inclusive, matching ast's own line
+        numbering. `kind` is one of "function" (def/async def), "class", or
+        "assignment" (a module- or class-level literal/attribute target) —
+        the same isinstance distinction this walk already makes to decide
+        what counts as a symbol at all, carried through rather than
+        discarded, so render-time formatting (_build_summary) can tell a
+        constant/field from a function without a second parse or a
+        naming-convention guess.
 
         Returns None when the file does not parse as valid Python — callers
         must treat that as "structural analysis unavailable" and skip symbol
@@ -248,13 +267,17 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         except (SyntaxError, ValueError):
             return None
 
-        index: List[Tuple[int, int, str]] = []
+        index: List[Tuple[int, int, str, str]] = []
 
         def walk(node: ast.AST) -> None:
             for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     end = getattr(child, "end_lineno", None) or child.lineno
-                    index.append((child.lineno, end, child.name))
+                    index.append((child.lineno, end, child.name, "function"))
+                    walk(child)
+                elif isinstance(child, ast.ClassDef):
+                    end = getattr(child, "end_lineno", None) or child.lineno
+                    index.append((child.lineno, end, child.name, "class"))
                     walk(child)
                 elif isinstance(child, (ast.Assign, ast.AnnAssign)) and isinstance(node, (ast.Module, ast.ClassDef)):
                     # Only direct module-level/class-level assignments count
@@ -266,27 +289,30 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
                     for t in targets:
                         if isinstance(t, ast.Name):
                             end = getattr(child, "end_lineno", None) or child.lineno
-                            index.append((child.lineno, end, t.id))
+                            index.append((child.lineno, end, t.id, "assignment"))
                 else:
                     walk(child)
 
         walk(tree)
         return index
 
-    def _resolve_symbol_at_line(self, index: List[Tuple[int, int, str]], line: int) -> Optional[str]:
-        """Return the name of the smallest span in `index` containing
+    def _resolve_symbol_at_line(self, index: List[Tuple[int, int, str, str]], line: int) -> Optional[Tuple[str, str]]:
+        """Return (name, kind) of the smallest span in `index` containing
         `line` — i.e. the innermost enclosing symbol. Nested scopes always
         have strictly smaller spans than their containers, so this
         naturally prefers a directly-changed function/assignment over its
         enclosing class/module without any separate special case."""
-        candidates = [(end - lineno, name) for lineno, end, name in index if lineno <= line <= end]
+        candidates = [(end - lineno, name, kind) for lineno, end, name, kind in index if lineno <= line <= end]
         if not candidates:
             return None
         candidates.sort(key=lambda c: c[0])
-        return candidates[0][1]
+        return candidates[0][1], candidates[0][2]
 
-    def _extract_symbols(self, file_path: Path | str, hunks: List[DiffHunk], repo_context=None) -> List[str]:
-        """Extract changed Python symbol names for a file's hunks.
+    def _extract_symbols(self, file_path: Path | str, hunks: List[DiffHunk], repo_context=None) -> List[Tuple[str, str]]:
+        """Extract (name, kind) pairs for changed Python symbols in a file's
+        hunks. `kind` (see _build_symbol_index) lets a caller distinguish a
+        function/method from a constant/class-attribute/field assignment
+        for presentation purposes, without re-parsing.
 
         For each hunk: skip it entirely if it's whitespace-only (cosmetic,
         no symbol attribution); otherwise relocate its actual edit by
@@ -295,7 +321,7 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         Silently produces no symbol for a hunk that can't be confidently
         relocated or a file that doesn't parse — never guesses.
         """
-        symbols: List[str] = []
+        symbols: List[Tuple[str, str]] = []
         try:
             if repo_context is not None:
                 rel = file_path if isinstance(file_path, str) else str(file_path)
@@ -412,7 +438,15 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         # 1-2 external files
         return "medium"
 
-    def _build_summary(self, symbols: List[str], affected_files: List[str], changed_files: List[str], level: str, context_type: str | None = None) -> str:
+    def _build_summary(
+        self,
+        symbols: List[str],
+        affected_files: List[str],
+        changed_files: List[str],
+        level: str,
+        context_type: str | None = None,
+        symbol_kinds: Dict[str, str] | None = None,
+    ) -> str:
         # Prefer an explicit symbol name, then changed file path for low-impact summaries
         sym = symbols[0] if symbols else None
         changed_file = changed_files[0] if changed_files else None
@@ -434,10 +468,19 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
         elif level == "medium":
             ex = f"This change affects {sym or changed_file or '(unknown)'} used by a few components ({len(affected_files)}) — validate across flows and add tests."
         else:
-            # low: mention changed symbol or file explicitly when available
+            # low: mention changed symbol or file explicitly when available.
+            # Only a "function" kind may render with a trailing "()" --
+            # constants, class attributes, fields, and any symbol whose kind
+            # is unknown (symbol_kinds omitted, or the name isn't in it) use
+            # plain, neutral formatting, since appending "()" to e.g. a
+            # changed constant renders it as if it were callable.
             target = None
             if sym:
-                target = f"`{sym}()`"
+                kind = (symbol_kinds or {}).get(sym)
+                if kind == "function":
+                    target = f"`{sym}()`"
+                else:
+                    target = f"`{sym}`"
             elif changed_file:
                 target = f"`{changed_file}`"
             else:

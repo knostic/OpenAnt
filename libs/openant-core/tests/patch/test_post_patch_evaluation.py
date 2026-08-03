@@ -1086,3 +1086,87 @@ class TestRenderPostPatchInvestigation:
         assert "patch_touched" not in unchanged_section
         assert "pre_patch" not in unchanged_section
         assert "discovered from patch diff" not in unchanged_section
+
+
+# ---------------------------------------------------------------------------
+# Release-polish change #2: human-readable Anchor values in Changed
+# ---------------------------------------------------------------------------
+
+class TestHumanReadableAnchorValues:
+    """The Changed section must render concise, maintainer-readable
+    before/after values -- never a raw Python NamedTuple repr (e.g.
+    "ResolvedFunctionValue(start_line=1, end_line=5)" or
+    "ConstantValueValue(ast_literal_kind=...)"). Presentation only --
+    evaluate_anchors()'s own status/comparison logic is untouched."""
+
+    def test_resolved_function_shows_line_range_not_namedtuple_repr(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
+
+        anchor = _resolved_function_anchor("a.py:foo", start_line=1, end_line=5)
+        context = _context({"a.py:foo": _function("a.py:foo", start_line=20, end_line=30)})
+        rendered = render_post_patch_investigation(evaluate_anchors([anchor], context))
+        changed_section = rendered[rendered.index("### Changed"):rendered.index("### Disappeared")]
+
+        assert "ResolvedFunctionValue" not in changed_section
+        assert "lines 1-5" in changed_section
+        assert "lines 20-30" in changed_section
+
+    def test_reachability_shows_plain_words_not_namedtuple_repr(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
+
+        func_id = "a.py:foo"
+        anchor = _reachability_anchor(func_id, reachable=True, entry_point_path=["entry.py:main", func_id])
+        context = _context({func_id: _function(func_id)})  # no reverse edges/entry points -> unreachable now
+        rendered = render_post_patch_investigation(evaluate_anchors([anchor], context))
+        changed_section = rendered[rendered.index("### Changed"):rendered.index("### Disappeared")]
+
+        assert "ReachabilityValue" not in changed_section
+        assert "reachable" in changed_section
+        assert "not reachable" in changed_section
+
+    def test_constant_value_shows_bare_literal_not_wrapper_repr(self):
+        """Regression guard alongside test_reproduces_the_cve_2023_43804_report_shape:
+        the wrapper's own class name / ast_literal_kind field must not
+        appear -- only the literal's own value."""
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
+
+        anchor = _constant_value_anchor(
+            "retry.py", "Retry.X", "Retry", "frozenset_call", frozenset({"Authorization"}),
+        )
+        context = _constant_context(constants={
+            "retry.py": {"Retry.X": _constant_entry("Retry.X", "Retry", "X", value=frozenset({"Authorization", "Cookie"}))}
+        })
+        rendered = render_post_patch_investigation(evaluate_anchors([anchor], context))
+        changed_section = rendered[rendered.index("### Changed"):rendered.index("### Disappeared")]
+
+        assert "ConstantValueValue" not in changed_section
+        assert "ast_literal_kind" not in changed_section
+        assert "frozenset({'Authorization'})" in changed_section
+
+    def test_unknown_value_shape_falls_back_safely(self):
+        """Defensive fallback: a value that doesn't match its kind's
+        expected NamedTuple shape must never raise."""
+        from utilities.autopatcher.post_patch_evaluation import _format_anchor_value
+
+        assert _format_anchor_value("resolved_function", "unexpected-shape") == "unexpected-shape"
+        assert _format_anchor_value("resolved_function", None) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Release-polish change #8: Post-Patch Investigation preamble provenance
+# ---------------------------------------------------------------------------
+
+class TestPreamblePatchTouchedProvenance:
+    def test_preamble_clarifies_patch_touched_provenance(self):
+        """The preamble must distinguish this evidence (gathered from the
+        final patch diff, after generation) from Repository Context
+        (locations selected before the patch existed) -- worded without a
+        directional "above"/"below" claim, since this function also renders
+        correctly when exercised standalone (as this test does)."""
+        from utilities.autopatcher.post_patch_evaluation import render_post_patch_investigation
+
+        rendered = render_post_patch_investigation([])
+
+        assert "after the patch was generated" in rendered
+        assert "Repository Context" in rendered
+        assert "before the patch existed" in rendered

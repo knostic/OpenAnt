@@ -66,6 +66,7 @@ from utilities.autopatcher.post_patch_investigation import (
     ConstantValueValue,
     ReachabilityValue,
     ResolvedFunctionValue,
+    SinkMatchValue,
     const_id,
     constant_value_anchor,
     resolved_function_anchor,
@@ -686,7 +687,10 @@ _PREAMBLE = (
     "reachability path, a literal constant value) -- not a verdict that the "
     "patch is correct, safe, or a successful fix, and not a claim that every "
     "change in the diff was checked. Missing evidence is reported as "
-    "missing, never as a negative finding.*"
+    "missing, never as a negative finding. This evidence is gathered from "
+    "the final patch diff itself, after the patch was generated -- distinct "
+    "from Repository Context, which lists locations selected before the "
+    "patch existed.*"
 )
 
 
@@ -727,8 +731,59 @@ def _origin_tag(obs: AnchorObservation) -> str:
     return " (discovered from patch diff)" if obs.origin == "patch_touched" else ""
 
 
+def _format_anchor_value(kind: AnchorKind, value: "AnchorValue | None") -> str:
+    """Concise, maintainer-readable rendering of one anchor value for the
+    Changed section -- presentation only, never consulted by
+    evaluate_anchors() to decide status. Dispatches on `kind` (the
+    evaluation layer already guarantees which value type accompanies each
+    kind -- see _evaluate_resolved_function/_evaluate_reachability/
+    _evaluate_constant_value) rather than isinstance-sniffing alone, so a
+    value shape that doesn't match its kind falls through to the safe
+    fallback below instead of silently mis-rendering.
+
+    Never raises: an unrecognized kind, or a value whose shape doesn't
+    match what that kind expects, falls back to a plain str() -- the same
+    "defensive, unreachable given today's AnchorKind" posture
+    Anchor.display_id already uses for its own unknown-kind fallback.
+    """
+    if value is None:
+        return "unknown"
+
+    if kind == "resolved_function" and isinstance(value, ResolvedFunctionValue):
+        if value.start_line is None or value.end_line is None:
+            return "location unknown"
+        return f"lines {value.start_line}-{value.end_line}"
+
+    if kind == "reachability" and isinstance(value, ReachabilityValue):
+        if value.reachable is None:
+            return "reachability unknown"
+        if not value.reachable:
+            return "not reachable"
+        if value.entry_point_path:
+            return "reachable (via " + " -> ".join(value.entry_point_path) + ")"
+        return "reachable"
+
+    if kind == "constant_value" and isinstance(value, ConstantValueValue):
+        # The literal's own value, not the ConstantValueValue wrapper --
+        # ast_literal_kind is disambiguation metadata for evaluate_anchors()
+        # itself, not something a reader needs repeated back to them.
+        return repr(value.value)
+
+    if kind == "call_edge":
+        return "present" if value else "absent"
+
+    if kind == "sink_match" and isinstance(value, SinkMatchValue):
+        return f"line {value.line}"
+
+    # Defensive fallback only -- unreachable given today's AnchorKind/value
+    # pairings; mirrors Anchor.display_id's own unknown-kind fallback.
+    return str(value)
+
+
 def _render_changed(obs: AnchorObservation) -> str:
-    return f"`{_display_id(obs)}` (`{obs.candidate_path}`){_origin_tag(obs)}: {obs.before_value!r} → {obs.after_value!r}"
+    before = _format_anchor_value(obs.anchor_kind, obs.before_value)
+    after = _format_anchor_value(obs.anchor_kind, obs.after_value)
+    return f"`{_display_id(obs)}` (`{obs.candidate_path}`){_origin_tag(obs)}: {before} → {after}"
 
 
 def _render_disappeared(obs: AnchorObservation) -> str:

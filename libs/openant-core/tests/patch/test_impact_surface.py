@@ -330,6 +330,41 @@ class TestShiftedHunkHeaders:
         assert report_a.affected_files == report_b.affected_files
 
 
+class TestSymbolKindRendering:
+    """Release-polish change #9: the low-impact summary's changed-symbol
+    mention must only append "()" for a function/method — a constant,
+    class attribute, or field must never render as if it were callable
+    (e.g. `DEFAULT_REMOVE_HEADERS_ON_REDIRECT()` for a changed constant)."""
+
+    def test_constant_change_does_not_render_as_callable(self, tmp_path):
+        repo = _write_retry_repo(tmp_path)
+        diff = (
+            "--- a/retry.py\n+++ b/retry.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " class Retry:\n"
+            "-    DEFAULT_REMOVE_HEADERS = frozenset(['Authorization'])\n"
+            "+    DEFAULT_REMOVE_HEADERS = frozenset(['Authorization', 'Cookie'])\n"
+        )
+        report = LightweightImpactAnalyzer().analyze(diff, repo_context=TargetRepoContext(repo))
+        assert report.impact_level == "low"
+        assert "DEFAULT_REMOVE_HEADERS()" not in report.impact_summary
+        assert "`DEFAULT_REMOVE_HEADERS`" in report.impact_summary
+
+    def test_function_change_still_renders_as_callable(self, tmp_path):
+        repo = _write_retry_repo(tmp_path)
+        diff = (
+            "--- a/retry.py\n+++ b/retry.py\n"
+            "@@ -999,2 +999,2 @@\n"
+            "     def new(self, **kw):\n"
+            "-        return Retry(**kw)\n"
+            "+        return Retry(**kw, extra=True)\n"
+        )
+        report = LightweightImpactAnalyzer().analyze(diff, repo_context=TargetRepoContext(repo))
+        assert report.changed_symbols == ["new"]
+        assert report.impact_level == "low"
+        assert "`new()`" in report.impact_summary
+
+
 class TestWhitespaceOnlyChanges:
     def test_reindentation_only_produces_no_symbol_and_low_impact(self, tmp_path):
         repo = _write_retry_repo(tmp_path)
