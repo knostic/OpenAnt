@@ -267,3 +267,152 @@ def evaluate_anchors(
             ))
 
     return observations
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Markdown rendering of list[AnchorObservation].
+#
+# Mirrors evidence_fusion.py's render_repository_understanding(): a pure
+# function from data to a bounded Markdown string, with a "not a verdict"
+# preamble and a hard-clamp backstop that guarantees the result never
+# exceeds max_chars. Local constants (DEFAULT_MAX_CHARS/_MAX_LIST_ITEMS),
+# not imported from evidence_fusion.py -- that module's values are sized
+# for its own <=3-candidate assumption, which doesn't hold here (anchor
+# count per candidate is unbounded, e.g. multiple call_edge anchors).
+#
+# Unlike evidence_fusion's per-candidate whole-block-drop-from-budget
+# mechanism, Changed/Disappeared observations are never silently dropped
+# here -- they're the rarest and most report-worthy groups. Only a
+# per-group item count cap applies (mirroring evidence_fusion's own
+# _render_list_line "+N more" convention), with _hard_clamp as the sole,
+# unconditional final backstop.
+# ---------------------------------------------------------------------------
+
+DEFAULT_MAX_CHARS = 4_000
+"""Same order of magnitude as evidence_fusion.DEFAULT_MAX_CHARS, sized
+independently: anchor count per candidate is unbounded here, unlike that
+module's <=3-candidate sizing."""
+
+_MAX_LIST_ITEMS = 5
+"""Per-status-group item cap before a "(+N more)" note -- mirrors
+evidence_fusion._render_list_line's convention."""
+
+_TRUNCATION_MARKER = "\n\n*(truncated to fit the character budget)*\n"
+
+_HEADING = "## Post-Patch Investigation"
+
+_PREAMBLE = (
+    "*Deterministic re-evaluation of pre-patch Anchors against an isolated, "
+    "patched copy of the repository. These are structural observations "
+    "(unchanged, changed, disappeared, or not statically verifiable) -- not "
+    "a verdict that the patch is correct, safe, or a successful fix. Missing "
+    "evidence is reported as missing, never as a negative finding.*"
+)
+
+
+def _display_id(obs: AnchorObservation) -> str:
+    """Same anchor-kind-specific formatting as Anchor.display_id, applied
+    to an evaluated AnchorObservation instead."""
+    if obs.anchor_kind == "resolved_function":
+        return f"resolved_function:{obs.anchor_key.func_id}"
+    if obs.anchor_kind == "call_edge":
+        return f"call_edge:{obs.anchor_key.caller_func_id}->{obs.anchor_key.callee_func_id}"
+    if obs.anchor_kind == "reachability":
+        return f"reachability:{obs.anchor_key.func_id}"
+    if obs.anchor_kind == "sink_match":
+        method_label = obs.anchor_key.method or "<module>"
+        return f"sink_match:{obs.anchor_key.candidate_path}:{method_label}"
+    return f"{obs.anchor_kind}:{obs.anchor_key!r}"
+
+
+def _render_group_items(observations: list, render_one) -> str:
+    shown = observations[:_MAX_LIST_ITEMS]
+    remainder = len(observations) - len(shown)
+    lines = [f"- {render_one(o)}" for o in shown]
+    if remainder > 0:
+        lines.append(f"- (+{remainder} more)")
+    return "\n".join(lines) + "\n"
+
+
+def _render_changed(obs: AnchorObservation) -> str:
+    return f"`{_display_id(obs)}` (`{obs.candidate_path}`): {obs.before_value!r} → {obs.after_value!r}"
+
+
+def _render_disappeared(obs: AnchorObservation) -> str:
+    detail = f" -- {obs.details}" if obs.details else ""
+    return f"`{_display_id(obs)}` (`{obs.candidate_path}`): no longer present{detail}"
+
+
+def _render_unknown(obs: AnchorObservation) -> str:
+    detail = f" -- {obs.details}" if obs.details else ""
+    return f"`{_display_id(obs)}` (`{obs.candidate_path}`): {obs.status}{detail}"
+
+
+def _hard_clamp(rendered: str, max_chars: int) -> str:
+    """Absolute backstop: truncate at the last full line boundary that
+    fits, so the result is never split mid-item, and append an explicit
+    marker. Guarantees len(result) <= max_chars."""
+    limit = max_chars - len(_TRUNCATION_MARKER)
+    if limit <= 0:
+        return _TRUNCATION_MARKER[:max_chars]
+    cut = rendered.rfind("\n", 0, limit)
+    if cut <= 0:
+        cut = limit
+    return rendered[:cut] + _TRUNCATION_MARKER
+
+
+def render_post_patch_investigation(
+    observations: list[AnchorObservation],
+    *,
+    max_chars: int = DEFAULT_MAX_CHARS,
+) -> str:
+    """Render a list[AnchorObservation] into one deterministic Markdown
+    block, starting with a top-level ``## Post-Patch Investigation``
+    heading.
+
+    Never mutates `observations`. No LLM calls, no I/O, no parsing.
+    Observations are grouped by `status`: Changed and Disappeared are
+    shown in full (capped per-group at `_MAX_LIST_ITEMS` with a "+N more"
+    note, never silently dropped to fit a byte budget); Unchanged is
+    compressed to a count/breakdown; Unresolved and evaluation_error are
+    merged into a separate "Remaining Unknowns" section, never mixed into
+    the determinate-looking groups above. The returned string never
+    exceeds `max_chars` -- a final hard-clamp backstop applies only in the
+    unlikely case the grouped sections alone exceed it.
+    """
+    header = _HEADING + "\n\n" + _PREAMBLE + "\n"
+
+    if not observations:
+        rendered = header + "\nNo anchors were available to re-evaluate.\n"
+        return rendered if len(rendered) <= max_chars else _hard_clamp(rendered, max_chars)
+
+    changed = [o for o in observations if o.status == "changed"]
+    disappeared = [o for o in observations if o.status == "disappeared"]
+    unchanged = [o for o in observations if o.status == "unchanged"]
+    unknown = [o for o in observations if o.status in ("unresolved", "evaluation_error")]
+
+    parts = ["\n### Changed\n\n"]
+    parts.append(_render_group_items(changed, _render_changed) if changed else "None observed.\n")
+
+    parts.append("\n### Disappeared\n\n")
+    parts.append(_render_group_items(disappeared, _render_disappeared) if disappeared else "None observed.\n")
+
+    parts.append("\n### Unchanged\n\n")
+    if unchanged:
+        by_kind: dict[str, int] = {}
+        for o in unchanged:
+            by_kind[o.anchor_kind] = by_kind.get(o.anchor_kind, 0) + 1
+        breakdown = ", ".join(f"{kind}: {count}" for kind, count in sorted(by_kind.items()))
+        parts.append(f"{len(unchanged)} anchor(s) confirmed unchanged ({breakdown}).\n")
+    else:
+        parts.append("None observed.\n")
+
+    parts.append("\n### Remaining Unknowns\n\n")
+    parts.append(_render_group_items(unknown, _render_unknown) if unknown else "None observed.\n")
+
+    rendered = header + "".join(parts)
+
+    if len(rendered) > max_chars:
+        rendered = _hard_clamp(rendered, max_chars)
+
+    return rendered

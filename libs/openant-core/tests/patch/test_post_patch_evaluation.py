@@ -413,3 +413,127 @@ class TestDeterminismAndPurity:
             text = (obs.details or "").lower()
             for word in blocklist:
                 assert word not in text, f"{word!r} found in details: {text!r}"
+
+
+# ---------------------------------------------------------------------------
+# render_post_patch_investigation
+# ---------------------------------------------------------------------------
+
+class TestRenderPostPatchInvestigation:
+    def test_empty_observations(self):
+        from utilities.autopatcher.post_patch_evaluation import render_post_patch_investigation
+
+        rendered = render_post_patch_investigation([])
+        assert rendered.startswith("## Post-Patch Investigation")
+        assert "No anchors were available to re-evaluate." in rendered
+
+    def test_grouped_by_status(self):
+        from utilities.autopatcher.post_patch_evaluation import (
+            AnchorObservation, render_post_patch_investigation,
+        )
+
+        def _obs(status, kind="resolved_function", details=None):
+            return AnchorObservation(
+                anchor_kind=kind,
+                anchor_key=ResolvedFunctionKey(func_id="a.py:foo", name="foo", class_name=None, unit_type="function"),
+                candidate_path="a.py",
+                status=status,
+                before_value=ResolvedFunctionValue(start_line=1, end_line=5),
+                after_value=ResolvedFunctionValue(start_line=1, end_line=9) if status == "changed" else None,
+                details=details,
+                source="candidate_enrichment.resolved_function",
+                evaluated_via="agentic_enhancer.repository_index.RepositoryIndex.get_function",
+            )
+
+        observations = [
+            _obs("changed"),
+            _obs("disappeared", details="function id no longer present in the patched copy"),
+            _obs("unchanged"),
+            _obs("unresolved", details="function id no longer resolves in the patched copy"),
+            _obs("evaluation_error", details="lookup failed: RuntimeError: boom"),
+        ]
+        rendered = render_post_patch_investigation(observations)
+
+        assert "### Changed" in rendered
+        assert "### Disappeared" in rendered
+        assert "### Unchanged" in rendered
+        assert "### Remaining Unknowns" in rendered
+        # Changed/Disappeared content appears under their own headings.
+        changed_idx = rendered.index("### Changed")
+        disappeared_idx = rendered.index("### Disappeared")
+        unchanged_idx = rendered.index("### Unchanged")
+        unknowns_idx = rendered.index("### Remaining Unknowns")
+        assert changed_idx < disappeared_idx < unchanged_idx < unknowns_idx
+        assert "resolved_function:a.py:foo" in rendered[changed_idx:disappeared_idx]
+        assert "no longer present" in rendered[disappeared_idx:unchanged_idx]
+        assert "1 anchor(s) confirmed unchanged" in rendered[unchanged_idx:unknowns_idx]
+        # Both unresolved and evaluation_error land in Remaining Unknowns, never elsewhere.
+        unknowns_section = rendered[unknowns_idx:]
+        assert "unresolved" in unknowns_section
+        assert "evaluation_error" in unknowns_section
+
+    def test_sink_match_always_lands_in_remaining_unknowns(self):
+        """sink_match is always status='unresolved' today (Phase 3 defers
+        it) -- confirms it's never miscategorized into a determinate group."""
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
+
+        anchors = [_sink_match_anchor()]
+        observations = evaluate_anchors(anchors, None)
+        rendered = render_post_patch_investigation(observations)
+
+        assert "### Remaining Unknowns" in rendered
+        unknowns_idx = rendered.index("### Remaining Unknowns")
+        assert "sink_match" in rendered[unknowns_idx:]
+        # Never appears in the determinate-looking sections above.
+        assert "sink_match" not in rendered[:rendered.index("### Changed")]
+
+    def test_never_mutates_input(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
+
+        func_id = "a.py:foo"
+        anchors = [_resolved_function_anchor(func_id)]
+        context = _context({func_id: _function(func_id)})
+        observations = evaluate_anchors(anchors, context)
+        snapshot = list(observations)
+
+        render_post_patch_investigation(observations)
+
+        assert observations == snapshot
+
+    def test_never_exceeds_max_chars(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
+
+        anchors = [
+            _resolved_function_anchor(f"a{i}.py:foo", candidate_path=f"a{i}.py")
+            for i in range(50)
+        ]
+        context = _context({})  # everything -> disappeared, exercises the per-group item cap
+        observations = evaluate_anchors(anchors, context)
+
+        rendered = render_post_patch_investigation(observations, max_chars=500)
+        assert len(rendered) <= 500
+        assert "(+" in rendered or "truncated" in rendered
+
+    def test_no_recommendation_or_verdict_vocabulary_in_data_sections(self):
+        """The blocklist applies to the data-driven sections (Changed/
+        Disappeared/Unchanged/Remaining Unknowns), not the fixed preamble
+        -- which legitimately says "not a verdict that the patch is
+        correct... or a successful fix" to explicitly disclaim exactly
+        those words, the same way evidence_fusion.py's own preamble does."""
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
+
+        func_id = "a.py:foo"
+        anchors = [
+            _resolved_function_anchor(func_id),
+            _call_edge_anchor(func_id, "b.py:bar"),
+            _reachability_anchor(func_id, reachable=True),
+            _sink_match_anchor(),
+        ]
+        context = _context({})
+        rendered = render_post_patch_investigation(evaluate_anchors(anchors, context))
+
+        data_sections = rendered[rendered.index("### Changed"):]
+        blocklist = ["fixed", "correct", "success", "vulnerable", "safe", "remediat"]
+        lowered = data_sections.lower()
+        for word in blocklist:
+            assert word not in lowered, f"{word!r} found in rendered data sections"

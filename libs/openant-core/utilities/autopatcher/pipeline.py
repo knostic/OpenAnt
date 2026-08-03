@@ -27,6 +27,7 @@ from .language_support import detect_language
 from pathlib import Path as _Path
 from .evidence_fusion import RepositoryUnderstanding
 from .repository_grounding_models import RepositoryCandidate, RepositoryGroundingResult
+from .post_patch_evaluation import AnchorObservation, render_post_patch_investigation
 
 # Static patch signals
 try:
@@ -121,6 +122,16 @@ class PipelineResult:
     # Trust Report. None when investigation didn't run or found nothing to
     # select (see CandidateSelection.used_fallback).
     repository_understanding: RepositoryUnderstanding | None = None
+    # Post-Patch Vulnerability Investigation (Phase 4): deterministic
+    # re-evaluation of pre-patch Anchors against an isolated, patched copy
+    # of repo_root. None when the investigation didn't run (no repo_root,
+    # no anchors, or an internal failure -- see stderr). Whatever patch
+    # string the observations actually describe is recorded in
+    # post_patch_investigated_patch; if it no longer equals `patch` above
+    # (the repair loop replaced it), the evidence is stale and
+    # _build_report must not render it as current.
+    post_patch_observations: list[AnchorObservation] | None = None
+    post_patch_investigated_patch: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -2048,6 +2059,28 @@ def _build_report(result: PipelineResult) -> str:
     else:
         report += _render_repository_context_section(result.grounding)
 
+    # §9c: Post-Patch Investigation
+    if result.post_patch_observations is None:
+        # Distinct wording from the "no repository root was provided" guard
+        # above (F-01, §9b/§10/Test Support) -- reusing that exact string
+        # here would inflate its count in tests that assert on it, and it
+        # also isn't the only reason this section can be unevaluated (no
+        # anchors, or an internal failure, both also land here).
+        report += (
+            "---\n\n## Post-Patch Investigation\n\n"
+            "*Not evaluated for this run (no repository root, no anchors "
+            "to re-evaluate, or the investigation itself did not "
+            "complete).*\n\n"
+        )
+    elif result.patch != result.post_patch_investigated_patch:
+        report += (
+            "---\n\n## Post-Patch Investigation\n\n"
+            "*Not shown — the patch was revised after this evidence was "
+            "computed, and it no longer describes the reported patch.*\n\n"
+        )
+    else:
+        report += "---\n\n" + render_post_patch_investigation(result.post_patch_observations) + "\n"
+
     # §10: Impact Surface
     if result.impact:
         try:
@@ -2399,6 +2432,7 @@ def run(
     # documents this as the caller's cue to fall back to existing behavior).
     _repository_understanding: RepositoryUnderstanding | None = None
     _repository_understanding_ctx = ""
+    _pre_patch_anchors: list | None = None
     if _grounding is not None:
         try:
             from .candidate_enrichment import build_investigation_context, enrich_candidates
@@ -2423,6 +2457,9 @@ def run(
                         f"({len(_repository_understanding_ctx)} chars).",
                         file=sys.stderr,
                     )
+
+                from .post_patch_investigation import derive_pre_patch_anchors
+                _pre_patch_anchors = derive_pre_patch_anchors(_repository_understanding)
         except Exception as exc:
             print(
                 f"[pipeline] Repository Understanding unavailable: "
@@ -2534,8 +2571,58 @@ def run(
         else:
             print("[pipeline] Applicability failed — target file not identified; retry skipped.", file=sys.stderr)
 
+    # Post-Patch Vulnerability Investigation: re-evaluate the pre-patch
+    # Anchors against an isolated, patched copy of repo_root. Runs once,
+    # here -- right after the applicability-retry loop settles and before
+    # the FIRST challenge_patch() call below -- so its evidence can reach
+    # that call, not just the Trust Report. The Challenger-driven repair
+    # loop further down is single-shot (fires at most once, per its own
+    # comment); if it replaces `patch`, this evidence describes a patch
+    # that no longer exists. The staleness guard after that loop (comparing
+    # `patch` against `_investigated_patch`) keeps it out of
+    # calibrate_findings()/score_confidence() in that case. Never re-run
+    # inside the repair loop itself -- extending fresh evidence to that
+    # path is an explicitly separate, later decision.
+    _post_patch_observations: list | None = None
+    _post_patch_ctx = ""
+    _investigated_patch: str | None = None
+    if repo_root and _pre_patch_anchors:
+        try:
+            from .patch_workspace import temporary_repo_copy
+            from .patch_applicability import apply_patch
+            from .candidate_enrichment import build_investigation_context
+            from .post_patch_evaluation import evaluate_anchors
+
+            _investigated_patch = patch
+            _resolved_repo_root = Path(repo_root).resolve()
+            with temporary_repo_copy(_resolved_repo_root) as _workspace_root:
+                _apply_result = apply_patch(_investigated_patch, _workspace_root)
+                _post_patch_context = None
+                if _apply_result.applied:
+                    _investigation_output_dir = _workspace_root.parent / "investigation"
+                    _post_patch_context = build_investigation_context(_workspace_root, _investigation_output_dir)
+                _post_patch_observations = evaluate_anchors(_pre_patch_anchors, _post_patch_context)
+                _post_patch_ctx = render_post_patch_investigation(_post_patch_observations)
+            if _post_patch_ctx:
+                print(
+                    f"[pipeline] Post-Patch Investigation rendered "
+                    f"({len(_post_patch_ctx)} chars).",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(
+                f"[pipeline] Post-Patch Investigation unavailable: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            _post_patch_observations = None
+            _post_patch_ctx = ""
+            _investigated_patch = None
+
+    challenger_context = code_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else "")
+
     print("[pipeline] Step 2/4 – Challenging patch …", file=sys.stderr)
-    challenger = challenge_patch(vulnerability_text, patch, llm, code_context=code_context)
+    challenger = challenge_patch(vulnerability_text, patch, llm, code_context=challenger_context)
 
     # Phase C: Challenger-driven repair loop.
     # Fires once when the patch applies cleanly but has confirmed security defects.
@@ -2610,6 +2697,16 @@ def run(
         except Exception as exc:
             print(f"[pipeline] Repair loop failed unexpectedly: {exc}", file=sys.stderr)
 
+    # Post-Patch Investigation staleness guard: if the repair loop above
+    # replaced `patch`, the evidence computed before the first Challenger
+    # call describes a patch that no longer exists. Never let it leak into
+    # calibrate_findings()/score_confidence() below in that case -- they
+    # must fall back to the plain code_context, same as if the feature
+    # never ran.
+    _post_patch_evidence_current = (
+        _post_patch_observations is not None and patch == _investigated_patch
+    )
+
     # Deterministic patch signals — run on final patch after any repair loop changes
     _c_signals: list[dict] | None = None
     _r_signals: list[dict] | None = None
@@ -2645,7 +2742,8 @@ def run(
     if _calibration_inputs:
         try:
             finding_calibration = calibrate_findings(
-                vulnerability_text, patch, _calibration_inputs, llm, code_context=code_context
+                vulnerability_text, patch, _calibration_inputs, llm,
+                code_context=(challenger_context if _post_patch_evidence_current else code_context),
             )
         except Exception as _exc:
             print(f"[pipeline] Finding calibration failed (non-fatal): {_exc}", file=sys.stderr)
@@ -2654,7 +2752,10 @@ def run(
     review = review_patch(vulnerability_text, patch, llm)
 
     print("[pipeline] Step 4/4 – Evaluating Trust Signals…", file=sys.stderr)
-    score_text = score_confidence(vulnerability_text, patch, review, llm, code_context=code_context)
+    score_text = score_confidence(
+        vulnerability_text, patch, review, llm,
+        code_context=(challenger_context if _post_patch_evidence_current else code_context),
+    )
 
     # Adjust the numeric score based on adversarial challenger results
     orig_score_str = _extract_score(score_text)
@@ -2772,5 +2873,7 @@ def run(
         finding_calibration=finding_calibration,
         grounding=_grounding,
         repository_understanding=_repository_understanding,
+        post_patch_observations=_post_patch_observations,
+        post_patch_investigated_patch=_investigated_patch,
     )
     return _build_report(result)
