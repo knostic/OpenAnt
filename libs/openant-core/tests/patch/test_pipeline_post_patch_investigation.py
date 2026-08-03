@@ -336,3 +336,113 @@ class TestFailureIsolation:
 
         assert result_ok.final_score == result_fail.final_score
         assert result_ok.hygiene == result_fail.hygiene
+
+
+# ---------------------------------------------------------------------------
+# Candidate-selection-independent patch-touched Anchors (end-to-end regression)
+#
+# Reproduces, hermetically, the exact real-repo gap found while validating
+# this feature against urllib3/CVE-2023-43804: Candidate Selection runs on
+# the vulnerability TEXT before any patch exists, so it can never select a
+# file the text doesn't textually resemble -- even when the eventual patch
+# touches it. `app/rate_limit_config.py` below is deliberately unrelated,
+# in vocabulary, to the SQL-injection vulnerability.md text (no "auth"/
+# "password"/"query"/"sql" overlap) precisely so real, unmodified grounding
+# genuinely does not select it -- the same way real grounding for the
+# urllib3 CVE never selected retry.py. No candidate is manually injected
+# anywhere in this test.
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_CONFIG_DIFF = """\
+```diff
+--- a/app/rate_limit_config.py
++++ b/app/rate_limit_config.py
+@@ -1,5 +1,5 @@
+ class RateLimitConfig:
+-    DEFAULT_ALLOWED_METHODS = frozenset(["GET"])
++    DEFAULT_ALLOWED_METHODS = frozenset(["GET", "POST"])
+
+     def as_dict(self):
+         return {"methods": self.DEFAULT_ALLOWED_METHODS}
+```"""
+
+
+def _write_auth_and_rate_limit_repo(root: Path) -> None:
+    """_write_auth_repo's app/auth.py (matches vulnerability.md, so real
+    grounding selects it) plus a second, vocabulary-disjoint file holding
+    a class-level literal constant that the final patch below touches but
+    that no selected candidate ever surfaces.
+
+    The class has a real method (not just the constant) deliberately --
+    matching urllib3's actual `Retry` class, which has plenty of real
+    methods. A class with zero methods produces no RepositoryIndex entry
+    at all for its file (a separate, pre-existing parser limitation,
+    unrelated to this feature); this fixture avoids that degenerate shape
+    so the test exercises the real gap, not an incidental one.
+    """
+    _write_auth_repo(root)  # commits app/auth.py + git init
+    rate_limit = root / "app" / "rate_limit_config.py"
+    rate_limit.write_text(
+        "class RateLimitConfig:\n"
+        "    DEFAULT_ALLOWED_METHODS = frozenset([\"GET\"])\n"
+        "\n"
+        "    def as_dict(self):\n"
+        "        return {\"methods\": self.DEFAULT_ALLOWED_METHODS}\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "add rate_limit_config"], cwd=root, capture_output=True)
+
+
+class TestPatchTouchedAnchorsIndependentOfCandidateSelection:
+    def test_constant_untouched_by_selection_still_detected_as_changed_and_covered(self, tmp_path):
+        repo_root = tmp_path / "repo"
+        _write_auth_and_rate_limit_repo(repo_root)
+
+        result, report, calls, _ = _run_pipeline(
+            tmp_path,
+            patches_gen=[_RATE_LIMIT_CONFIG_DIFF],
+            patches_chall=[_CHALLENGER_CLEAN],
+            repo_root=str(repo_root),
+        )
+
+        # 1. The changed file is genuinely not in selection.selected --
+        # real, unmodified Candidate Selection, no manual injection.
+        assert result.repository_understanding is not None
+        selected_paths = {c.path for c in result.repository_understanding.candidate_evidence}
+        assert "app/rate_limit_config.py" not in selected_paths
+
+        # 2. No PRE-PATCH Anchor exists for the changed constant (proves
+        # the gap is real, not already closed by some other mechanism).
+        pre_patch_const_anchors = [
+            o for o in result.post_patch_observations
+            if o.anchor_kind == "constant_value" and o.origin == "pre_patch"
+            and "rate_limit_config.py" in o.candidate_path
+        ]
+        assert pre_patch_const_anchors == []
+
+        # 3. A patch_touched constant_value Anchor WAS derived from the
+        # final diff, and (4) it reports Changed: GET -> {GET, POST}.
+        touched = [
+            o for o in result.post_patch_observations
+            if o.anchor_kind == "constant_value" and o.origin == "patch_touched"
+        ]
+        assert len(touched) == 1
+        obs = touched[0]
+        assert obs.status == "changed"
+        assert obs.before_value.value == frozenset({"GET"})
+        assert obs.after_value.value == frozenset({"GET", "POST"})
+        assert "app/rate_limit_config.py" in obs.candidate_path
+
+        # 5. Coverage reports 1 of 1 covered, 0 uncovered for this element.
+        assert result.post_patch_coverage is not None
+        ref = obs.anchor_key.const_id
+        assert ref in result.post_patch_coverage.covered
+        assert ref not in result.post_patch_coverage.uncovered
+
+        # Rendered report shows the fact, tagged as patch-discovered, and
+        # is reachable by the Challenger (evidence actually flows downstream).
+        assert "### Changed" in report
+        changed_section = report[report.index("### Changed"):report.index("### Disappeared")]
+        assert "discovered from patch diff" in changed_section
+        assert "1 of 1 element(s)" in calls["challenge"][0] or "1 of 1 element(s)" in report

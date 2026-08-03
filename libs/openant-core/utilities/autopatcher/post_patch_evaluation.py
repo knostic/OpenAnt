@@ -28,9 +28,11 @@ never whether the change is good, expected, or a successful fix. That
 judgement is entirely a downstream consumer's responsibility (Trust
 Signals, Trust Report, Challenger) -- never this module's.
 
-Anchor kinds evaluated now: resolved_function, call_edge, reachability --
-all resolvable purely from an InvestigationContext (RepositoryIndex +
-call_graph + ReachabilityAnalyzer), with no additional input.
+Anchor kinds evaluated now: resolved_function, call_edge, reachability,
+constant_value -- all resolvable purely from an InvestigationContext
+(RepositoryIndex + call_graph + ReachabilityAnalyzer + the constants table
+built once by candidate_enrichment.build_investigation_context()), with no
+additional input and no I/O performed by this module itself.
 
 Anchor kind NOT evaluated here: sink_match. Re-checking a sink_match
 anchor requires knowing which vulnerability class's pattern to re-scan for
@@ -50,16 +52,23 @@ future, separately-scoped change.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from utilities.autopatcher.candidate_enrichment import InvestigationContext
+from utilities.autopatcher.diff_parsing import parse_diff
 from utilities.autopatcher.post_patch_investigation import (
     Anchor,
     AnchorKey,
     AnchorKind,
+    AnchorOrigin,
     AnchorValue,
+    ConstantValueValue,
     ReachabilityValue,
     ResolvedFunctionValue,
+    const_id,
+    constant_value_anchor,
+    resolved_function_anchor,
 )
 
 ObservationStatus = Literal["unchanged", "changed", "disappeared", "unresolved", "evaluation_error"]
@@ -85,7 +94,15 @@ class AnchorObservation:
     `source` is echoed verbatim from the originating Anchor (pre-patch
     provenance: which existing capability produced `before_value`).
     `evaluated_via` names the capability used to compute `after_value` in
-    THIS phase (post-patch provenance). Together with `anchor_kind`/
+    THIS phase (post-patch provenance). `origin` is likewise echoed
+    verbatim from the originating Anchor -- whether this fact was
+    selected before the patch existed (`"pre_patch"`) or discovered
+    because the final patch touched this location
+    (`"patch_touched"`, see post_patch_evaluation.derive_patch_touched_anchors).
+    It is copied mechanically by `_observation()` below, exactly like
+    `source`/`candidate_path` -- evaluate_anchors() never branches on it;
+    it is inert provenance metadata carried through, not something the
+    evaluation logic reasons about. Together with `anchor_kind`/
     `anchor_key`/`candidate_path`, every observation is fully traceable
     back to its originating Anchor without needing to keep the original
     Anchor list around.
@@ -100,6 +117,7 @@ class AnchorObservation:
     details: "str | None"
     source: str
     evaluated_via: str
+    origin: AnchorOrigin = "pre_patch"
 
 
 def _observation(
@@ -115,6 +133,7 @@ def _observation(
         candidate_path=anchor.candidate_path,
         status=status,
         before_value=anchor.before_value,
+        origin=anchor.origin,
         after_value=after_value,
         details=details,
         source=anchor.source,
@@ -208,6 +227,36 @@ def _evaluate_reachability(anchor: Anchor, context: InvestigationContext) -> Anc
     return _observation(anchor, status, after, None, _REACHABILITY_EVALUATED_VIA)
 
 
+_CONSTANT_VALUE_EVALUATED_VIA = "candidate_enrichment.InvestigationContext.constants"
+
+
+def _evaluate_constant_value(anchor: Anchor, context: InvestigationContext) -> AnchorObservation:
+    """Pure dict lookup against ``context.constants`` -- built once, with
+    I/O, by ``build_investigation_context()`` (mirroring how
+    ``_evaluate_resolved_function`` is a pure lookup against
+    ``context.index``). No file read happens here."""
+    file_constants = context.constants.get(anchor.candidate_path, {})
+    entry = file_constants.get(anchor.key.qualified_name)
+
+    if entry is None:
+        return _observation(
+            anchor, "disappeared", None,
+            "assignment target no longer found in the patched copy",
+            _CONSTANT_VALUE_EVALUATED_VIA,
+        )
+
+    if entry.get("outcome") != "literal":
+        return _observation(
+            anchor, "unresolved", None,
+            f"target's assigned value is no longer a supported literal shape (outcome={entry.get('outcome')!r})",
+            _CONSTANT_VALUE_EVALUATED_VIA,
+        )
+
+    after = ConstantValueValue(ast_literal_kind=entry["ast_literal_kind"], value=entry["value"])
+    status: ObservationStatus = "unchanged" if after == anchor.before_value else "changed"
+    return _observation(anchor, status, after, None, _CONSTANT_VALUE_EVALUATED_VIA)
+
+
 _SINK_MATCH_DEFERRED_NOTE = (
     "sink_match evaluation deferred: vuln_class is not captured on the "
     "Anchor and evaluate_anchors() does not accept it as an input; "
@@ -256,6 +305,8 @@ def evaluate_anchors(
             observations.append(_evaluate_call_edge(anchor, post_patch_context))
         elif anchor.kind == "reachability":
             observations.append(_evaluate_reachability(anchor, post_patch_context))
+        elif anchor.kind == "constant_value":
+            observations.append(_evaluate_constant_value(anchor, post_patch_context))
         else:
             # Defensive only -- AnchorKind is a closed Literal covering
             # every kind post_patch_investigation.py currently derives;
@@ -267,6 +318,333 @@ def evaluate_anchors(
             ))
 
     return observations
+
+
+# ---------------------------------------------------------------------------
+# Coverage Analysis: deterministic accounting of how much of a generated
+# patch's diff is tracked by at least one pre-patch Anchor.
+#
+# This answers a question distinct from (and prior to) AnchorObservation's
+# unchanged/changed/disappeared taxonomy: "did our instrumentation even
+# reach this part of the diff at all?" A hunk with no covering Anchor was
+# never checked below -- it is not evidence of stability, just an
+# instrumentation gap. Motivating case: CVE-2023-43804's actual fix (a
+# one-line class-constant value change) produced zero changed/disappeared
+# anchors purely because no anchor kind existed that could see it -- this
+# reports that gap explicitly instead of letting "N unchanged" imply
+# completeness it doesn't have.
+#
+# Deliberately reuses, not reimplements, existing machinery: diff parsing
+# (diff_parsing.parse_diff) and content-based hunk relocation
+# (impact_surface.LightweightImpactAnalyzer's own relocation primitives,
+# which never trust a hunk header's claimed line number) are the same
+# primitives impact_surface.py already uses for its own, unrelated
+# blast-radius analysis. What's new here is small: resolving a relocated
+# hunk to a ref string that is IDENTICAL to what an Anchor's own key
+# already carries (a resolved_function/reachability anchor's `func_id`,
+# or a constant_value anchor's `const_id`) -- so a covering Anchor is a
+# plain set-membership check, never a fuzzy/heuristic match.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CoverageResult:
+    """Deterministic coverage accounting for one generated patch's diff.
+
+    ``covered``/``uncovered`` are deduplicated ref strings (func_id or
+    const_id -- the same identity strings Anchor keys already use), sorted
+    for reproducible rendering. ``unattributed`` counts non-cosmetic hunks
+    that could not be confidently relocated, or whose file didn't parse --
+    never silently dropped, never guessed into either bucket."""
+
+    total: int
+    covered: "tuple[str, ...]"
+    uncovered: "tuple[str, ...]"
+    unattributed: int
+
+
+@dataclass(frozen=True)
+class _PatchTouchedElement:
+    """One patch-diff hunk, resolved (by content, never by trusting the
+    hunk header) to the smallest containing function or literal-assignment
+    target already known to an InvestigationContext. `ref` is identical to
+    what an Anchor's own key already carries for that element (a func_id
+    or const_id) -- comparing `ref` against an existing Anchor's key is a
+    plain string/set check, never fuzzy. `function`/`constant_entry` carry
+    the raw dict needed to actually construct an Anchor for this element
+    (see derive_patch_touched_anchors) -- Coverage Analysis only needs
+    `ref`/`kind`, but building this once and sharing it is what lets both
+    consumers use one resolution pass instead of two."""
+
+    ref: str
+    kind: Literal["resolved_function", "constant_value"]
+    file: str
+    function: "dict | None" = None
+    constant_entry: "dict | None" = None
+
+
+def _anchor_refs(anchors: "list[Anchor]") -> "set[str]":
+    """The set of identity strings (func_id/const_id) `anchors` already
+    covers -- shared by compute_coverage (what's already tracked) and
+    derive_patch_touched_anchors (what to skip re-deriving).
+
+    call_edge is deliberately excluded: its key names a relationship
+    between two OTHER locations, not an observable property of either
+    location's own content -- crediting it would let a pure topology fact
+    manufacture false "covered" status for a hunk whose actual edit (e.g.
+    rewritten body) no anchor ever observed. sink_match's `method` is a
+    bare, unqualified name from a different convention
+    (vulnerability_patterns.py's regex scan) and is not comparable to a
+    func_id/const_id."""
+    refs: "set[str]" = set()
+    for anchor in anchors:
+        if anchor.kind in ("resolved_function", "reachability"):
+            refs.add(anchor.key.func_id)
+        elif anchor.kind == "constant_value":
+            refs.add(anchor.key.const_id)
+    return refs
+
+
+def _resolve_patch_touched_elements(
+    patch_diff: str,
+    repo_root: "Path",
+    context: InvestigationContext,
+) -> "tuple[list[_PatchTouchedElement], int]":
+    """Resolve every non-cosmetic hunk in `patch_diff` to a
+    `_PatchTouchedElement` (deduplicated by ref) using content-based
+    relocation (never trusting a hunk header's claimed line number) plus
+    `context.index`/`context.constants` -- both already built, repo-wide,
+    independent of Candidate Selection. Returns `(elements, unattributed)`;
+    `unattributed` counts hunks that could not be confidently relocated,
+    or whose file didn't parse -- never silently dropped, never guessed
+    into an element.
+
+    Shared, unchanged-behavior resolution step for both compute_coverage
+    (which only needs to know a ref was touched) and
+    derive_patch_touched_anchors (which additionally needs the raw
+    function/constant-entry dict to build an Anchor) -- one pass, two
+    consumers, instead of duplicating hunk relocation twice.
+    """
+    from utilities.autopatcher.impact_surface import LightweightImpactAnalyzer
+
+    analyzer = LightweightImpactAnalyzer()
+    changed_files, file_hunks = parse_diff(patch_diff)
+
+    elements: "dict[str, _PatchTouchedElement]" = {}
+    unattributed = 0
+
+    for file_path in changed_files:
+        if not file_path.endswith((".py", ".pyi")):
+            continue
+        try:
+            file_text = (repo_root / file_path).read_text(encoding="utf-8")
+        except Exception:
+            unattributed += len(file_hunks.get(file_path, []))
+            continue
+
+        file_lines = file_text.splitlines()
+        try:
+            functions = context.index.list_functions_in_file(file_path)
+        except Exception:
+            functions = []
+        constants = context.constants.get(file_path, {})
+
+        for hunk in file_hunks.get(file_path, []):
+            if analyzer._is_whitespace_only_hunk(hunk.lines):
+                continue
+            anchor_text, changed_flags = analyzer._anchor_lines(hunk.lines)
+            start_idx = analyzer._locate_hunk(anchor_text, file_lines)
+            if start_idx is None:
+                unattributed += 1
+                continue
+            changed_positions = [start_idx + i for i, c in enumerate(changed_flags) if c]
+            if not changed_positions:
+                changed_positions = list(range(start_idx, start_idx + len(anchor_text)))
+            true_start = min(changed_positions) + 1  # 1-indexed
+            true_end = max(changed_positions) + 1
+
+            element = (
+                _resolve_element_at_line(file_path, functions, constants, true_start)
+                or (_resolve_element_at_line(file_path, functions, constants, true_end) if true_end != true_start else None)
+            )
+            if element is None:
+                unattributed += 1
+                continue
+            elements[element.ref] = element
+
+    return list(elements.values()), unattributed
+
+
+def _resolve_element_at_line(
+    file_path: str, functions: "list[dict]", constants: dict, line: int
+) -> "_PatchTouchedElement | None":
+    """Resolve one line to the smallest containing function or
+    literal-assignment target -- whichever span is smaller. Returns None
+    when no containing element is found (a non-Python-parseable line, or
+    module-level code with no matching constant and no functions_in_file
+    entry at all -- functions_in_file's own whole-file `module_level`
+    fallback unit still participates here like any other function span,
+    so it only ever wins when nothing finer-grained contains the line)."""
+    best: "tuple[int, _PatchTouchedElement] | None" = None
+    for f in functions:
+        start, end = f.get("startLine"), f.get("endLine")
+        if start is None or end is None or not (start <= line <= end):
+            continue
+        span = end - start
+        if best is None or span < best[0]:
+            best = (span, _PatchTouchedElement(ref=f["id"], kind="resolved_function", file=file_path, function=f))
+    for qualified, entry in constants.items():
+        start = entry.get("line")
+        end = entry.get("end_line", start)
+        if start is None or end is None or not (start <= line <= end):
+            continue
+        span = end - start
+        if best is None or span < best[0]:
+            ref = const_id(file_path, qualified)
+            best = (span, _PatchTouchedElement(ref=ref, kind="constant_value", file=file_path, constant_entry=entry))
+    return best[1] if best else None
+
+
+def compute_coverage(
+    patch_diff: str,
+    anchors: "list[Anchor]",
+    repo_root: "Path",
+    context: "InvestigationContext | None",
+) -> "CoverageResult | None":
+    """Deterministically account for how much of `patch_diff` is tracked by
+    at least one Anchor in `anchors` -- `anchors` is expected to be the
+    MERGED pre-patch + patch-touched list (see derive_patch_touched_anchors)
+    so that "uncovered" means "genuinely unsupported element type", not
+    "Candidate Selection happened not to pick this file." Treats every
+    Anchor equally regardless of `origin` -- coverage answers "is this
+    location tracked by anything," which doesn't depend on which phase
+    produced the tracking.
+
+    Returns None (never raises) when `context` is None -- there is no
+    RepositoryIndex/constants table to resolve against. Reads only Python
+    files named in the diff, from `repo_root` (the PRE-patch repository --
+    the diff's context/removed lines describe that state, not the patched
+    one). A per-file read/parse failure counts that file's hunks as
+    unattributed rather than aborting the whole computation.
+    """
+    if context is None:
+        return None
+
+    elements, unattributed = _resolve_patch_touched_elements(patch_diff, repo_root, context)
+    anchor_refs = _anchor_refs(anchors)
+
+    covered = tuple(sorted(e.ref for e in elements if e.ref in anchor_refs))
+    uncovered = tuple(sorted(e.ref for e in elements if e.ref not in anchor_refs))
+    return CoverageResult(total=len(elements), covered=covered, uncovered=uncovered, unattributed=unattributed)
+
+
+def derive_patch_touched_anchors(
+    patch_diff: str,
+    repo_root: "Path",
+    context: "InvestigationContext | None",
+    existing_anchors: "list[Anchor]",
+) -> "list[Anchor]":
+    """Derive NEW Anchors, independent of Candidate Selection entirely, for
+    semantic elements the final patch's diff touches but which no existing
+    Anchor already tracks.
+
+    Resolves directly against `context` (repo-wide, already built by
+    build_investigation_context() before Candidate Selection even runs)
+    and `patch_diff` (the final, applicability-adjusted patch) -- never
+    against `understanding.candidate_evidence`, so a file Candidate
+    Selection never selected is exactly as resolvable as one it did.
+
+    Returns only the net-new anchors, already deduplicated against
+    `existing_anchors` and against each other by (kind, key), each marked
+    `origin="patch_touched"`. `existing_anchors` itself is never mutated,
+    read for identity comparison only -- callers concatenate this
+    function's return value onto it.
+
+    Supports exactly the two element kinds compute_coverage's own
+    resolution already produces: resolved_function and constant_value.
+    Two cases are deliberately never anchored, left to render as
+    "uncovered" by Coverage Analysis instead of fabricating a fact:
+      - a function-tier match whose `unitType` is `"module_level"` (the
+        whole-file catch-all unit) -- its before/after span is the entire
+        file, so it carries no meaningful signal, and constructing an
+        anchor for it would manufacture false "covered" status for a
+        location where nothing was actually captured (the same category
+        of bug already fixed once in candidate_enrichment's own
+        scope_constants scoping, applied here to a different call site);
+      - a constant-tier match whose `outcome` isn't `"literal"` -- there
+        is no value to compare, so no constant_value Anchor is buildable
+        without guessing one.
+    Anything else the diff touches (a control-flow change, a new call, an
+    edit inside a function body that doesn't move its boundaries) has no
+    corresponding fact type at all yet and is likewise left uncovered.
+
+    Returns [] (never raises) when `context` is None.
+    """
+    if context is None:
+        return []
+
+    existing_refs = _anchor_refs(existing_anchors)
+    elements, _unattributed = _resolve_patch_touched_elements(patch_diff, repo_root, context)
+
+    new_anchors: "list[Anchor]" = []
+    for element in elements:
+        if element.ref in existing_refs:
+            continue
+        if element.kind == "resolved_function":
+            if element.function is None or element.function.get("unitType") == "module_level":
+                continue
+            new_anchors.append(resolved_function_anchor(
+                element.file, element.function, element.ref, origin="patch_touched",
+            ))
+        elif element.kind == "constant_value":
+            if element.constant_entry is None or element.constant_entry.get("outcome") != "literal":
+                continue
+            new_anchors.append(constant_value_anchor(
+                element.file, element.constant_entry, origin="patch_touched",
+            ))
+
+    return new_anchors
+
+
+_COVERAGE_MAX_LIST_ITEMS = 5
+
+
+def _render_coverage_section(coverage: "CoverageResult | None") -> str:
+    if coverage is None:
+        return (
+            "\n### Anchor Coverage\n\n"
+            "*Not computed for this run (no repository index available).*\n"
+        )
+
+    total = coverage.total
+    covered_n = len(coverage.covered)
+    uncovered_n = len(coverage.uncovered)
+
+    if total == 0:
+        if coverage.unattributed:
+            body = f"No semantic elements could be attributed to this diff ({coverage.unattributed} hunk(s) unattributed).\n"
+        else:
+            body = "No hunks required attribution (cosmetic-only diff, or no Python files changed).\n"
+        return "\n### Anchor Coverage\n\n" + body
+
+    lines = [
+        "\n### Anchor Coverage\n\n",
+        f"{covered_n} of {total} element(s) changed by the diff are covered by at least one Anchor; "
+        f"{uncovered_n} are not -- uncovered elements were never checked below, not confirmed unchanged.",
+    ]
+    if coverage.unattributed:
+        lines.append(f" {coverage.unattributed} hunk(s) could not be attributed to any element at all.")
+    lines.append("\n")
+
+    if uncovered_n:
+        shown = coverage.uncovered[:_COVERAGE_MAX_LIST_ITEMS]
+        remainder = uncovered_n - len(shown)
+        lines.append("\nUncovered:\n\n")
+        lines.extend(f"- `{ref}`\n" for ref in shown)
+        if remainder > 0:
+            lines.append(f"- (+{remainder} more)\n")
+
+    return "".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -303,10 +681,12 @@ _HEADING = "## Post-Patch Investigation"
 
 _PREAMBLE = (
     "*Deterministic re-evaluation of pre-patch Anchors against an isolated, "
-    "patched copy of the repository. These are structural observations "
-    "(unchanged, changed, disappeared, or not statically verifiable) -- not "
-    "a verdict that the patch is correct, safe, or a successful fix. Missing "
-    "evidence is reported as missing, never as a negative finding.*"
+    "patched copy of the repository. These are structural observations about "
+    "specific, pre-selected facts (a function's boundaries, a call edge, a "
+    "reachability path, a literal constant value) -- not a verdict that the "
+    "patch is correct, safe, or a successful fix, and not a claim that every "
+    "change in the diff was checked. Missing evidence is reported as "
+    "missing, never as a negative finding.*"
 )
 
 
@@ -322,6 +702,8 @@ def _display_id(obs: AnchorObservation) -> str:
     if obs.anchor_kind == "sink_match":
         method_label = obs.anchor_key.method or "<module>"
         return f"sink_match:{obs.anchor_key.candidate_path}:{method_label}"
+    if obs.anchor_kind == "constant_value":
+        return f"constant_value:{obs.anchor_key.const_id}"
     return f"{obs.anchor_kind}:{obs.anchor_key!r}"
 
 
@@ -334,13 +716,24 @@ def _render_group_items(observations: list, render_one) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _origin_tag(obs: AnchorObservation) -> str:
+    """Concise marker distinguishing a patch_touched observation -- one
+    discovered because the final patch touched this location, independent
+    of Candidate Selection -- from a pre_patch one, selected before the
+    patch existed. Applied only to Changed/Disappeared (the statuses
+    where a reader most needs to know evidence came from outside the
+    originally selected candidates); Unchanged's aggregate count stays a
+    single breakdown axis (by anchor_kind only), not a second one."""
+    return " (discovered from patch diff)" if obs.origin == "patch_touched" else ""
+
+
 def _render_changed(obs: AnchorObservation) -> str:
-    return f"`{_display_id(obs)}` (`{obs.candidate_path}`): {obs.before_value!r} → {obs.after_value!r}"
+    return f"`{_display_id(obs)}` (`{obs.candidate_path}`){_origin_tag(obs)}: {obs.before_value!r} → {obs.after_value!r}"
 
 
 def _render_disappeared(obs: AnchorObservation) -> str:
     detail = f" -- {obs.details}" if obs.details else ""
-    return f"`{_display_id(obs)}` (`{obs.candidate_path}`): no longer present{detail}"
+    return f"`{_display_id(obs)}` (`{obs.candidate_path}`){_origin_tag(obs)}: no longer present{detail}"
 
 
 def _render_unknown(obs: AnchorObservation) -> str:
@@ -363,6 +756,7 @@ def _hard_clamp(rendered: str, max_chars: int) -> str:
 
 def render_post_patch_investigation(
     observations: list[AnchorObservation],
+    coverage: "CoverageResult | None" = None,
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
 ) -> str:
@@ -371,19 +765,32 @@ def render_post_patch_investigation(
     heading.
 
     Never mutates `observations`. No LLM calls, no I/O, no parsing.
+    An optional ``coverage`` (see ``compute_coverage()``) renders as an
+    "### Anchor Coverage" section immediately after the preamble --
+    before Changed/Disappeared/Unchanged/Remaining Unknowns, and
+    deliberately not last, so it survives `_hard_clamp`'s end-of-string
+    truncation under budget pressure (the one section whose entire job is
+    "here's what we did NOT check" should not be the first thing dropped).
+    Omitted entirely when ``coverage`` is ``None`` (caller didn't compute
+    it), never rendered as a fabricated zero.
+
     Observations are grouped by `status`: Changed and Disappeared are
     shown in full (capped per-group at `_MAX_LIST_ITEMS` with a "+N more"
     note, never silently dropped to fit a byte budget); Unchanged is
-    compressed to a count/breakdown; Unresolved and evaluation_error are
-    merged into a separate "Remaining Unknowns" section, never mixed into
-    the determinate-looking groups above. The returned string never
-    exceeds `max_chars` -- a final hard-clamp backstop applies only in the
-    unlikely case the grouped sections alone exceed it.
+    compressed to a count/breakdown (with a one-line caveat pointing at
+    Anchor Coverage whenever `coverage` shows any uncovered elements, so
+    "N unchanged" is never misread as "everything was checked"); Unresolved
+    and evaluation_error are merged into a separate "Remaining Unknowns"
+    section, never mixed into the determinate-looking groups above. The
+    returned string never exceeds `max_chars` -- a final hard-clamp
+    backstop applies only in the unlikely case the grouped sections alone
+    exceed it.
     """
     header = _HEADING + "\n\n" + _PREAMBLE + "\n"
+    coverage_section = _render_coverage_section(coverage) if coverage is not None else ""
 
     if not observations:
-        rendered = header + "\nNo anchors were available to re-evaluate.\n"
+        rendered = header + coverage_section + "\nNo anchors were available to re-evaluate.\n"
         return rendered if len(rendered) <= max_chars else _hard_clamp(rendered, max_chars)
 
     changed = [o for o in observations if o.status == "changed"]
@@ -403,14 +810,20 @@ def render_post_patch_investigation(
         for o in unchanged:
             by_kind[o.anchor_kind] = by_kind.get(o.anchor_kind, 0) + 1
         breakdown = ", ".join(f"{kind}: {count}" for kind, count in sorted(by_kind.items()))
-        parts.append(f"{len(unchanged)} anchor(s) confirmed unchanged ({breakdown}).\n")
+        caveat = ""
+        if coverage is not None and coverage.uncovered:
+            caveat = (
+                " -- this covers only the fact types anchors track; "
+                "see Anchor Coverage above for what else the diff changed"
+            )
+        parts.append(f"{len(unchanged)} anchor(s) confirmed unchanged ({breakdown}){caveat}.\n")
     else:
         parts.append("None observed.\n")
 
     parts.append("\n### Remaining Unknowns\n\n")
     parts.append(_render_group_items(unknown, _render_unknown) if unknown else "None observed.\n")
 
-    rendered = header + "".join(parts)
+    rendered = header + coverage_section + "".join(parts)
 
     if len(rendered) > max_chars:
         rendered = _hard_clamp(rendered, max_chars)

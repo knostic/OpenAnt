@@ -28,8 +28,9 @@ level instead of eliminated.
 
 from __future__ import annotations
 
+import ast
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from core.parser_adapter import parse_repository
@@ -55,6 +56,179 @@ class InvestigationContext:
     call_graph: dict
     reverse_call_graph: dict
     reachability: ReachabilityAnalyzer
+    # file_path -> {qualified_name -> literal-assignment record}. Populated
+    # once here (see _collect_repo_constants below), covering every Python
+    # file RepositoryIndex already knows about (i.e. every file containing
+    # at least one function/class) -- a file with zero functions/classes is
+    # never scanned, an accepted gap for a "smallest extension" (see
+    # build_investigation_context's docstring). Default {} keeps existing
+    # hand-built test fixtures (which construct this dataclass without the
+    # field) working unchanged.
+    constants: dict = field(default_factory=dict)
+
+
+_LITERAL_WRAPPER_CTORS = {"frozenset": frozenset, "set": set, "list": list, "tuple": tuple, "dict": dict}
+_BASE_LITERAL_NODE_TYPES = (ast.Set, ast.List, ast.Tuple, ast.Dict, ast.Constant, ast.UnaryOp)
+
+
+def _canonicalize_literal(value: object) -> object:
+    """Recursively convert an ast.literal_eval() result into a hashable
+    form, so it can live inside a frozen, hashable Anchor/AnchorValue
+    (mutable set/list/dict are not hashable). Shape-preserving: a set-like
+    input always canonicalizes to frozenset, list-like to tuple, dict to a
+    sorted tuple of (key, value) pairs -- recursively, so nested literal
+    containers are handled too."""
+    if isinstance(value, dict):
+        return tuple(sorted(
+            (_canonicalize_literal(k), _canonicalize_literal(v)) for k, v in value.items()
+        ))
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_canonicalize_literal(v) for v in value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_canonicalize_literal(v) for v in value)
+    return value  # str/int/float/bool/bytes/None/complex -- already hashable
+
+
+def _evaluate_literal_rhs(node: "ast.AST") -> "tuple[str, str | None, object]":
+    """Evaluate one assignment's RHS deterministically. Returns
+    ``(outcome, ast_literal_kind, value)``. ``outcome`` is ``"literal"`` or
+    ``"non_literal"`` -- never guessed, never partially evaluated (e.g. a
+    dict literal with one non-literal value fails whole, never yields a
+    partial dict).
+
+    Supports bare literal expressions (Set/List/Tuple/Dict/Constant, or
+    UnaryOp of one -- e.g. ``-1``) directly via ``ast.literal_eval``, plus
+    exactly one call-shaped exception: a zero-or-one-argument call to
+    ``frozenset``/``set``/``list``/``tuple``/``dict`` wrapping a bare
+    literal (e.g. ``frozenset(["Authorization"])``) -- the exact shape
+    urllib3's own ``DEFAULT_REMOVE_HEADERS_ON_REDIRECT`` declaration uses.
+    Any other call, attribute access, name reference, or expression is
+    ``"non_literal"``.
+    """
+    ctor_name: "str | None" = None
+    literal_node = node
+
+    if isinstance(node, ast.Call):
+        func = node.func
+        if not (
+            isinstance(func, ast.Name)
+            and func.id in _LITERAL_WRAPPER_CTORS
+            and not node.keywords
+            and len(node.args) <= 1
+        ):
+            return "non_literal", None, None
+        ctor_name = func.id
+        if not node.args:
+            try:
+                return "literal", f"{ctor_name}_call", _canonicalize_literal(_LITERAL_WRAPPER_CTORS[ctor_name]())
+            except Exception:
+                return "non_literal", None, None
+        literal_node = node.args[0]
+
+    if not isinstance(literal_node, _BASE_LITERAL_NODE_TYPES):
+        return "non_literal", None, None
+
+    try:
+        raw = ast.literal_eval(literal_node)
+    except Exception:
+        return "non_literal", None, None
+
+    if ctor_name is not None:
+        try:
+            raw = _LITERAL_WRAPPER_CTORS[ctor_name](raw)
+        except Exception:
+            return "non_literal", None, None
+        return "literal", f"{ctor_name}_call", _canonicalize_literal(raw)
+
+    return "literal", type(literal_node).__name__, _canonicalize_literal(raw)
+
+
+def _extract_literal_constants(file_text: str) -> "dict[str, dict]":
+    """Walk module-level and class-level simple assignments in ``file_text``
+    and return ``{qualified_name: record}`` -- ``qualified_name`` is the
+    bare name at module scope, ``"ClassName.name"`` at class scope, matching
+    ``RepositoryIndex``'s own func_id convention.
+
+    Only ``Assign``/``AnnAssign`` nodes with a single ``ast.Name`` target,
+    at module level or directly inside a class body, are considered --
+    mirroring ``impact_surface.py``'s own module/class-scope restriction.
+    Multi-target (``a = b = {...}``) and destructuring/attribute targets
+    are excluded here entirely (not "non_literal" -- they're not a
+    single-name assignment at all). Augmented assignment (``X |= {...}``)
+    and annotation-only (``x: int``, no RHS) are recorded with their own
+    explicit outcome, never a guessed/fabricated value.
+
+    Returns ``{}`` when ``file_text`` does not parse as Python -- callers
+    must treat that as "no constants available", never guess.
+    """
+    try:
+        tree = ast.parse(file_text)
+    except (SyntaxError, ValueError):
+        return {}
+
+    result: "dict[str, dict]" = {}
+
+    def _record(name: str, class_name: "str | None", line: int, end_line: int,
+                outcome: str, kind: "str | None", value: object) -> None:
+        qualified = f"{class_name}.{name}" if class_name else name
+        result[qualified] = {
+            "qualified_name": qualified,
+            "class_name": class_name,
+            "name": name,
+            "outcome": outcome,
+            "ast_literal_kind": kind,
+            "value": value,
+            "line": line,
+            "end_line": end_line,
+        }
+
+    def _handle(node: "ast.Assign | ast.AnnAssign | ast.AugAssign", class_name: "str | None") -> None:
+        end_line = getattr(node, "end_lineno", node.lineno) or node.lineno
+        if isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name):
+                _record(node.target.id, class_name, node.lineno, end_line, "augmented_assign", None, None)
+            return
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            return  # multi-target / destructuring / attribute target -- out of scope, not a guess
+        name = targets[0].id
+        if isinstance(node, ast.AnnAssign) and node.value is None:
+            _record(name, class_name, node.lineno, end_line, "annotation_only", None, None)
+            return
+        outcome, kind, value = _evaluate_literal_rhs(node.value)
+        _record(name, class_name, node.lineno, end_line, outcome, kind, value)
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            _handle(node, None)
+        elif isinstance(node, ast.ClassDef):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    _handle(child, node.name)
+
+    return result
+
+
+def _collect_repo_constants(repo_root: Path, index: RepositoryIndex) -> dict:
+    """Build the ``InvestigationContext.constants`` table: for every Python
+    file ``index`` already knows about (i.e. every file containing at least
+    one function/class -- ``index.by_file``), read and AST-walk it once for
+    module/class-level literal assignments. A single file's read/parse
+    failure is isolated to that file (skipped, never aborts the whole
+    table); there is no dedicated error channel here because this mirrors
+    ``list_functions_in_file``'s own best-effort, per-file posture."""
+    constants: dict = {}
+    for file_path in index.by_file.keys():
+        if not file_path.endswith((".py", ".pyi")):
+            continue
+        try:
+            file_text = (repo_root / file_path).read_text(encoding="utf-8")
+        except Exception:
+            continue
+        per_file = _extract_literal_constants(file_text)
+        if per_file:
+            constants[file_path] = per_file
+    return constants
 
 
 def build_investigation_context(repo_root: Path, output_dir: Path) -> "InvestigationContext | None":
@@ -116,11 +290,17 @@ def build_investigation_context(repo_root: Path, output_dir: Path) -> "Investiga
     except Exception:
         return None
 
+    try:
+        constants = _collect_repo_constants(repo_root, index)
+    except Exception:
+        constants = {}
+
     return InvestigationContext(
         index=index,
         call_graph=call_graph,
         reverse_call_graph=reverse_call_graph,
         reachability=reachability,
+        constants=constants,
     )
 
 
@@ -194,6 +374,46 @@ def _enrich_one(
             "(parse produced no usable analyzer_output.json/call_graph.json)"
         )
 
+    scope_constants: list[dict] = []
+    if context is not None:
+        try:
+            file_constants = context.constants.get(candidate.path, {})
+            # unitType == "module_level" is this parser's one-per-file
+            # whole-module catch-all unit (spans the entire file), used by
+            # _resolve_containing_function whenever no real function's
+            # line range contains the hit_line -- exactly what happens for
+            # a class-body constant sitting between methods (observed
+            # directly against a real repo: a hit_line on
+            # Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT resolved to this
+            # catch-all, with className=None, even though the constant
+            # itself is class-scoped). That className=None carries no real
+            # narrowing signal -- it must be treated the same as
+            # resolved_function being None entirely, not as "the real
+            # scope is module-only" (which would incorrectly exclude every
+            # class-level constant in the file). A genuine top-level
+            # function/method resolution (unitType != "module_level")
+            # still narrows normally.
+            have_narrowing_signal = (
+                resolved_function is not None
+                and resolved_function.get("unitType") != "module_level"
+            )
+            resolved_class_name = resolved_function.get("className") if have_narrowing_signal else None
+            for entry in file_constants.values():
+                entry_class = entry["class_name"]
+                # Module-level constants (entry_class is None) are always
+                # in scope. Class-level constants are scoped to the
+                # resolved function's own class when there is a real
+                # narrowing signal; otherwise every class-level constant
+                # in the file is included rather than silently missed
+                # (mirrors sink_matches' independence from
+                # resolved_function, below, applied to the analogous "no
+                # signal to narrow by" case here).
+                if entry_class is not None and have_narrowing_signal and entry_class != resolved_class_name:
+                    continue
+                scope_constants.append(entry)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"constant scope resolution failed: {type(exc).__name__}: {exc}")
+
     try:
         target_file = repo_root / candidate.path
         related_tests = testing_support.tests_for_file(repo_root, target_file)
@@ -223,6 +443,7 @@ def _enrich_one(
         related_tests=related_tests,
         test_support_rating=test_support_rating,
         sink_matches=sink_matches,
+        scope_constants=scope_constants,
         enrichment_errors=errors,
     )
 

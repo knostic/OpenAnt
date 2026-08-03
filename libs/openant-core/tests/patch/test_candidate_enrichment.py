@@ -299,6 +299,182 @@ class TestNoLLMPath:
         assert not any("llm" in name.lower() for name in imported), imported
 
 
+class TestExtractLiteralConstants:
+    def test_module_level_bare_literal(self):
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants("TIMEOUT = 30\n")
+        assert result["TIMEOUT"]["outcome"] == "literal"
+        assert result["TIMEOUT"]["ast_literal_kind"] == "Constant"
+        assert result["TIMEOUT"]["value"] == 30
+        assert result["TIMEOUT"]["class_name"] is None
+
+    def test_class_level_wrapper_call_literal_urllib3_shape(self):
+        """The exact shape of CVE-2023-43804's actual fix: a class-level
+        frozenset(...) call wrapping a bare list literal."""
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        text = (
+            "class Retry:\n"
+            "    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n"
+        )
+        result = _extract_literal_constants(text)
+        entry = result["Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"]
+        assert entry["outcome"] == "literal"
+        assert entry["ast_literal_kind"] == "frozenset_call"
+        assert entry["value"] == frozenset({"Authorization"})
+        assert entry["class_name"] == "Retry"
+        assert entry["name"] == "DEFAULT_REMOVE_HEADERS_ON_REDIRECT"
+
+    def test_detects_the_actual_cve_2023_43804_value_change(self):
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        before = _extract_literal_constants(
+            "class Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n"
+        )
+        after = _extract_literal_constants(
+            "class Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Cookie\", \"Authorization\"])\n"
+        )
+        key = "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"
+        assert before[key]["value"] == frozenset({"Authorization"})
+        assert after[key]["value"] == frozenset({"Authorization", "Cookie"})
+        assert before[key]["value"] != after[key]["value"]
+
+    def test_call_rhs_that_is_not_a_wrapper_is_non_literal(self):
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants("BACKEND = default_backend()\n")
+        assert result["BACKEND"]["outcome"] == "non_literal"
+        assert result["BACKEND"]["value"] is None
+
+    def test_attribute_and_name_rhs_are_non_literal(self):
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants("X = some.attr\nY = other_name\n")
+        assert result["X"]["outcome"] == "non_literal"
+        assert result["Y"]["outcome"] == "non_literal"
+
+    def test_augmented_assignment_is_recorded_without_a_fabricated_value(self):
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants("FLAGS = {1}\nFLAGS |= {2}\n")
+        # The AugAssign itself is recorded, but note it overwrites the
+        # plain Assign's entry for the same name -- both are direct
+        # children of Module, encountered in source order.
+        assert result["FLAGS"]["outcome"] == "augmented_assign"
+        assert result["FLAGS"]["value"] is None
+
+    def test_annotation_only_has_no_value(self):
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants("x: int\n")
+        assert result["x"]["outcome"] == "annotation_only"
+
+    def test_multi_target_and_destructuring_assignments_are_excluded(self):
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants("a = b = {1}\nc, d = (1, 2)\n")
+        assert result == {}
+
+    def test_function_body_assignment_is_out_of_scope(self):
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants("def f():\n    LOCAL = {1}\n    return LOCAL\n")
+        assert result == {}
+
+    def test_set_and_list_literals_with_same_elements_are_distinguished(self):
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants("A = {1, 2}\nB = [1, 2]\n")
+        assert result["A"]["ast_literal_kind"] != result["B"]["ast_literal_kind"]
+        assert result["A"]["value"] != result["B"]["value"]  # frozenset({1,2}) != (1,2)
+
+    def test_unparseable_file_returns_empty_dict_not_a_guess(self):
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        assert _extract_literal_constants("def f(:\n") == {}
+
+    def test_zero_arg_wrapper_call(self):
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants("EMPTY = frozenset()\n")
+        assert result["EMPTY"]["outcome"] == "literal"
+        assert result["EMPTY"]["value"] == frozenset()
+
+
+class TestScopeConstantsInEnrichment:
+    """_enrich_one's module/class-level scoping rule for scope_constants,
+    tested through enrich_candidates() with a hand-built InvestigationContext
+    (no file I/O, matching this test file's existing style)."""
+
+    def _ctx_with_constants(self, functions, constants):
+        return InvestigationContext(
+            index=RepositoryIndex({"functions": functions}),
+            call_graph={},
+            reverse_call_graph={},
+            reachability=ReachabilityAnalyzer(functions, {}, set()),
+            constants=constants,
+        )
+
+    def test_module_level_constant_always_in_scope(self):
+        functions = {"a.py:f": {"name": "f", "startLine": 1, "endLine": 2, "unitType": "function", "className": None, "code": ""}}
+        constants = {"a.py": {"TIMEOUT": {"qualified_name": "TIMEOUT", "class_name": None, "name": "TIMEOUT", "outcome": "literal", "ast_literal_kind": "Constant", "value": 30, "line": 1, "end_line": 1}}}
+        candidate = _candidate("a.py", "symbol_search", 2, hit_line=1)
+        enrich_candidates(_selection(candidate), "/nonexistent", "irrelevant vuln text with no sinks", self._ctx_with_constants(functions, constants))
+        names = [e["qualified_name"] for e in candidate.enrichment.scope_constants]
+        assert "TIMEOUT" in names
+
+    def test_class_level_constant_scoped_to_resolved_functions_class(self):
+        functions = {
+            "a.py:Retry.increment": {"name": "increment", "startLine": 5, "endLine": 6, "unitType": "function", "className": "Retry", "code": ""},
+            "a.py:Other.method": {"name": "method", "startLine": 8, "endLine": 9, "unitType": "function", "className": "Other", "code": ""},
+        }
+        constants = {"a.py": {
+            "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": {"qualified_name": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "class_name": "Retry", "name": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "outcome": "literal", "ast_literal_kind": "frozenset_call", "value": frozenset({"Authorization"}), "line": 1, "end_line": 1},
+            "Other.UNRELATED": {"qualified_name": "Other.UNRELATED", "class_name": "Other", "name": "UNRELATED", "outcome": "literal", "ast_literal_kind": "Constant", "value": 1, "line": 2, "end_line": 2},
+        }}
+        # hit_line=5 falls inside Retry.increment, resolving className="Retry".
+        candidate = _candidate("a.py", "symbol_search", 2, hit_line=5)
+        enrich_candidates(_selection(candidate), "/nonexistent", "irrelevant vuln text", self._ctx_with_constants(functions, constants))
+        names = {e["qualified_name"] for e in candidate.enrichment.scope_constants}
+        assert "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in names
+        assert "Other.UNRELATED" not in names
+
+    def test_no_resolved_function_includes_every_class_level_constant(self):
+        """No narrowing signal available -- never silently drop a
+        class-level constant just because no function was resolved."""
+        functions = {}  # nothing resolvable
+        constants = {"a.py": {
+            "Retry.X": {"qualified_name": "Retry.X", "class_name": "Retry", "name": "X", "outcome": "literal", "ast_literal_kind": "Constant", "value": 1, "line": 1, "end_line": 1},
+            "Other.Y": {"qualified_name": "Other.Y", "class_name": "Other", "name": "Y", "outcome": "literal", "ast_literal_kind": "Constant", "value": 2, "line": 2, "end_line": 2},
+        }}
+        candidate = _candidate("a.py", "symbol_search", 2, hit_line=1)
+        enrich_candidates(_selection(candidate), "/nonexistent", "irrelevant vuln text", self._ctx_with_constants(functions, constants))
+        names = {e["qualified_name"] for e in candidate.enrichment.scope_constants}
+        assert names == {"Retry.X", "Other.Y"}
+
+    def test_module_level_fallback_resolution_includes_every_class_level_constant(self):
+        """Regression, found by running against the real urllib3 repo: a
+        class-body constant (between methods, contained by no real
+        function's line range) resolves via _resolve_containing_function's
+        own whole-file "module_level" catch-all unit -- which carries
+        className=None. That None must NOT be read as "the real scope is
+        module-only" (it would incorrectly exclude every class-level
+        constant, including the one the hit_line actually sits inside);
+        it must be treated exactly like resolved_function being None."""
+        functions = {
+            "a.py:__module__": {"name": "__module__", "startLine": 1, "endLine": 20, "unitType": "module_level", "className": None, "code": ""},
+        }
+        constants = {"a.py": {
+            "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": {"qualified_name": "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "class_name": "Retry", "name": "DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "outcome": "literal", "ast_literal_kind": "frozenset_call", "value": frozenset({"Authorization"}), "line": 5, "end_line": 5},
+        }}
+        candidate = _candidate("a.py", "symbol_search", 2, hit_line=5)
+        enrich_candidates(_selection(candidate), "/nonexistent", "irrelevant vuln text", self._ctx_with_constants(functions, constants))
+        assert candidate.enrichment.resolved_function["unitType"] == "module_level"
+        names = {e["qualified_name"] for e in candidate.enrichment.scope_constants}
+        assert "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in names
+
+
 class TestRealIntegration:
     def test_select_then_enrich_against_a_real_small_repo(self, tmp_path):
         from utilities.autopatcher.candidate_selection import select_candidates

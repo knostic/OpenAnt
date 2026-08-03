@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+from pathlib import Path
 from unittest import mock
 
 from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
@@ -56,13 +57,14 @@ def _context(functions, call_graph=None, reverse_call_graph=None, entry_points=N
     )
 
 
-def _resolved_function_anchor(func_id, start_line=1, end_line=5, candidate_path="a.py"):
+def _resolved_function_anchor(func_id, start_line=1, end_line=5, candidate_path="a.py", origin="pre_patch"):
     return Anchor(
         kind="resolved_function",
         candidate_path=candidate_path,
         key=ResolvedFunctionKey(func_id=func_id, name=func_id.rsplit(":", 1)[-1], class_name=None, unit_type="function"),
         before_value=ResolvedFunctionValue(start_line=start_line, end_line=end_line),
         source="candidate_enrichment.resolved_function",
+        origin=origin,
     )
 
 
@@ -273,6 +275,156 @@ class TestReachabilityEvaluation:
 
 
 # ---------------------------------------------------------------------------
+# constant_value
+# ---------------------------------------------------------------------------
+
+def _constant_context(functions=None, constants=None) -> InvestigationContext:
+    functions = functions or {}
+    return InvestigationContext(
+        index=RepositoryIndex({"functions": functions}),
+        call_graph={},
+        reverse_call_graph={},
+        reachability=ReachabilityAnalyzer(functions, {}, set()),
+        constants=constants or {},
+    )
+
+
+def _constant_value_anchor(candidate_path, qualified_name, class_name, kind, value, origin="pre_patch"):
+    from utilities.autopatcher.post_patch_investigation import ConstantValueKey, ConstantValueValue
+
+    return Anchor(
+        kind="constant_value",
+        candidate_path=candidate_path,
+        key=ConstantValueKey(
+            const_id=f"{candidate_path}:{qualified_name}", qualified_name=qualified_name, class_name=class_name,
+        ),
+        before_value=ConstantValueValue(ast_literal_kind=kind, value=value),
+        source="candidate_enrichment.scope_constants",
+        origin=origin,
+    )
+
+
+def _constant_entry(qualified_name, class_name, name, outcome="literal", kind="frozenset_call", value=None, line=1, end_line=1):
+    return {
+        "qualified_name": qualified_name, "class_name": class_name, "name": name,
+        "outcome": outcome, "ast_literal_kind": kind, "value": value, "line": line, "end_line": end_line,
+    }
+
+
+class TestConstantValueEvaluation:
+    def test_unchanged(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors
+
+        anchor = _constant_value_anchor("retry.py", "Retry.X", "Retry", "frozenset_call", frozenset({"Authorization"}))
+        context = _constant_context(constants={
+            "retry.py": {"Retry.X": _constant_entry("Retry.X", "Retry", "X", value=frozenset({"Authorization"}))}
+        })
+
+        obs = evaluate_anchors([anchor], context)[0]
+        assert obs.status == "unchanged"
+        assert obs.after_value.value == frozenset({"Authorization"})
+        assert obs.evaluated_via == "candidate_enrichment.InvestigationContext.constants"
+
+    def test_changed_detects_the_actual_cve_2023_43804_fix(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors
+
+        anchor = _constant_value_anchor(
+            "retry.py", "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "Retry",
+            "frozenset_call", frozenset({"Authorization"}),
+        )
+        context = _constant_context(constants={
+            "retry.py": {"Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": _constant_entry(
+                "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "Retry", "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                value=frozenset({"Authorization", "Cookie"}),
+            )}
+        })
+
+        obs = evaluate_anchors([anchor], context)[0]
+        assert obs.status == "changed"
+        assert obs.before_value.value == frozenset({"Authorization"})
+        assert obs.after_value.value == frozenset({"Authorization", "Cookie"})
+
+    def test_disappeared_when_target_no_longer_found(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors
+
+        anchor = _constant_value_anchor("a.py", "X", None, "Constant", 30)
+        context = _constant_context(constants={})
+
+        obs = evaluate_anchors([anchor], context)[0]
+        assert obs.status == "disappeared"
+        assert obs.after_value is None
+
+    def test_unresolved_when_now_non_literal(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors
+
+        anchor = _constant_value_anchor("a.py", "BACKEND", None, "Call", "default_backend")
+        context = _constant_context(constants={
+            "a.py": {"BACKEND": _constant_entry("BACKEND", None, "BACKEND", outcome="non_literal", kind=None, value=None)}
+        })
+
+        obs = evaluate_anchors([anchor], context)[0]
+        assert obs.status == "unresolved"
+        assert "non_literal" in obs.details
+
+    def test_evaluation_error_becomes_evaluation_error_status_when_no_context(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors
+
+        anchor = _constant_value_anchor("a.py", "X", None, "Constant", 1)
+        observations = evaluate_anchors([anchor], None)
+        assert observations[0].status == "evaluation_error"
+
+
+# ---------------------------------------------------------------------------
+# origin: pre_patch (default) vs patch_touched -- mechanical propagation only,
+# never a branch in evaluation logic itself.
+# ---------------------------------------------------------------------------
+
+class TestAnchorOriginPropagation:
+    def test_default_origin_is_pre_patch(self):
+        anchor = _resolved_function_anchor("a.py:foo")
+        assert anchor.origin == "pre_patch"
+
+    def test_observation_echoes_the_anchors_origin(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors
+
+        func_id = "a.py:foo"
+        pre_patch = _resolved_function_anchor(func_id, origin="pre_patch")
+        patch_touched = _resolved_function_anchor("b.py:bar", origin="patch_touched")
+        context = _context({func_id: _function(func_id), "b.py:bar": _function("b.py:bar")})
+
+        observations = evaluate_anchors([pre_patch, patch_touched], context)
+        by_kind_key = {(o.anchor_key.func_id): o for o in observations}
+        assert by_kind_key[func_id].origin == "pre_patch"
+        assert by_kind_key["b.py:bar"].origin == "patch_touched"
+
+    def test_origin_never_changes_evaluated_status_or_after_value(self):
+        """Two anchors identical except for origin must evaluate
+        identically in every other respect -- proves evaluate_anchors()
+        does not branch on origin, it only carries it through."""
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors
+
+        func_id = "a.py:foo"
+        pre_patch = _resolved_function_anchor(func_id, start_line=1, end_line=5, origin="pre_patch")
+        patch_touched = _resolved_function_anchor(func_id, start_line=1, end_line=5, origin="patch_touched")
+        context = _context({func_id: _function(func_id, start_line=20, end_line=30)})
+
+        obs_pre, obs_patch = evaluate_anchors([pre_patch, patch_touched], context)
+        assert obs_pre.status == obs_patch.status == "changed"
+        assert obs_pre.after_value == obs_patch.after_value
+        assert obs_pre.evaluated_via == obs_patch.evaluated_via
+        assert obs_pre.origin == "pre_patch"
+        assert obs_patch.origin == "patch_touched"
+
+    def test_origin_defaults_on_constant_value_and_evaluation_error_paths_too(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors
+
+        anchor = _constant_value_anchor("a.py", "X", None, "Constant", 1, origin="patch_touched")
+        observations = evaluate_anchors([anchor], None)  # no context -> evaluation_error
+        assert observations[0].status == "evaluation_error"
+        assert observations[0].origin == "patch_touched"
+
+
+# ---------------------------------------------------------------------------
 # sink_match -- deferred, always unresolved
 # ---------------------------------------------------------------------------
 
@@ -308,6 +460,7 @@ class TestMissingContext:
             _resolved_function_anchor("a.py:foo"),
             _call_edge_anchor("a.py:foo", "b.py:bar"),
             _reachability_anchor("a.py:foo", reachable=True),
+            _constant_value_anchor("a.py", "X", None, "Constant", 1),
         ]
         observations = evaluate_anchors(anchors, None)
         assert all(o.status == "evaluation_error" for o in observations)
@@ -418,6 +571,264 @@ class TestDeterminismAndPurity:
 # ---------------------------------------------------------------------------
 # render_post_patch_investigation
 # ---------------------------------------------------------------------------
+
+def _diff(file_path, before_lines, after_lines, start=1):
+    """Minimal unified-diff builder covering exactly what diff_parsing.parse_diff
+    understands: '--- a/', '+++ b/', an '@@ ... +start,count @@' header, and
+    ' '/'+'/'-' body lines. Produces one hunk with every before-line removed
+    and every after-line added (a full-file replace) -- simple and sufficient
+    for these tests, which only care about symbol attribution, not minimal diffs."""
+    count = max(len(before_lines), len(after_lines))
+    lines = [f"--- a/{file_path}", f"+++ b/{file_path}", f"@@ -{start},{len(before_lines)} +{start},{count} @@"]
+    lines += [f"-{l}" for l in before_lines]
+    lines += [f"+{l}" for l in after_lines]
+    return "\n".join(lines) + "\n"
+
+
+class TestComputeCoverage:
+    def test_returns_none_without_a_context(self):
+        from utilities.autopatcher.post_patch_evaluation import compute_coverage
+
+        assert compute_coverage("--- a/x.py\n+++ b/x.py\n", [], Path("/nonexistent"), None) is None
+
+    def test_treats_pre_patch_and_patch_touched_origins_equally(self, tmp_path):
+        """Explicit requirement: coverage accounting must not care which
+        phase produced the covering Anchor."""
+        from utilities.autopatcher.post_patch_evaluation import compute_coverage
+
+        (tmp_path / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        diff = _diff("a.py", ["    return 1"], ["    return 2"], start=2)
+        func_id = "a.py:foo"
+        context = _constant_context(functions={func_id: _function(func_id, start_line=1, end_line=2)})
+
+        pre_patch_result = compute_coverage(
+            diff, [_resolved_function_anchor(func_id, start_line=1, end_line=2, origin="pre_patch")], tmp_path, context,
+        )
+        patch_touched_result = compute_coverage(
+            diff, [_resolved_function_anchor(func_id, start_line=1, end_line=2, origin="patch_touched")], tmp_path, context,
+        )
+        assert pre_patch_result.covered == patch_touched_result.covered == (func_id,)
+        assert pre_patch_result.uncovered == patch_touched_result.uncovered == ()
+
+    def test_covered_element_matches_a_resolved_function_anchor(self, tmp_path):
+        from utilities.autopatcher.post_patch_evaluation import compute_coverage
+
+        (tmp_path / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        diff = _diff("a.py", ["    return 1"], ["    return 2"], start=2)
+        func_id = "a.py:foo"
+        anchors = [_resolved_function_anchor(func_id, start_line=1, end_line=2, candidate_path="a.py")]
+        context = _constant_context(functions={func_id: _function(func_id, start_line=1, end_line=2)})
+
+        result = compute_coverage(diff, anchors, tmp_path, context)
+        assert result.total == 1
+        assert result.covered == (func_id,)
+        assert result.uncovered == ()
+
+    def test_uncovered_element_when_no_anchor_names_it(self, tmp_path):
+        """The CVE-2023-43804 shape before constant_value anchors exist:
+        the diff touches a class constant, but only resolved_function
+        anchors exist -- must report uncovered, never fabricate coverage."""
+        from utilities.autopatcher.post_patch_evaluation import compute_coverage
+
+        (tmp_path / "retry.py").write_text(
+            "class Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n",
+            encoding="utf-8",
+        )
+        diff = _diff(
+            "retry.py",
+            ['    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])'],
+            ['    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization"])'],
+            start=2,
+        )
+        # The element is resolvable (it's a known constant, on line 2 of
+        # the file) -- but no Anchor names it, since anchors=[] below.
+        context = _constant_context(constants={
+            "retry.py": {"Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": _constant_entry(
+                "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "Retry", "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                value=frozenset({"Authorization"}),
+                line=2, end_line=2,
+            )}
+        })
+        result = compute_coverage(diff, anchors=[], repo_root=tmp_path, context=context)
+        assert result.total == 1
+        assert result.covered == ()
+        assert len(result.uncovered) == 1
+        assert "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in result.uncovered[0]
+
+    def test_covered_once_constant_value_anchor_exists(self, tmp_path):
+        """Same diff as above, but now a constant_value anchor exists for
+        the touched constant -- must report covered."""
+        from utilities.autopatcher.post_patch_evaluation import compute_coverage
+
+        (tmp_path / "retry.py").write_text(
+            "class Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n",
+            encoding="utf-8",
+        )
+        diff = _diff(
+            "retry.py",
+            ['    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])'],
+            ['    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization"])'],
+            start=2,
+        )
+        anchors = [_constant_value_anchor(
+            "retry.py", "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "Retry", "frozenset_call", frozenset({"Authorization"}),
+        )]
+        context = _constant_context(
+            functions={},
+            constants={"retry.py": {"Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": _constant_entry(
+                "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "Retry", "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                value=frozenset({"Authorization"}),
+                line=2, end_line=2,
+            )}},
+        )
+        result = compute_coverage(diff, anchors, tmp_path, context)
+        assert result.total == 1
+        assert len(result.covered) == 1
+        assert "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in result.covered[0]
+        assert result.uncovered == ()
+
+    def test_unreadable_file_counts_as_unattributed_not_dropped(self, tmp_path):
+        from utilities.autopatcher.post_patch_evaluation import compute_coverage
+
+        diff = _diff("missing.py", ["x = 1"], ["x = 2"])
+        context = _constant_context()
+        result = compute_coverage(diff, [], tmp_path, context)
+        assert result.total == 0
+        assert result.unattributed == 1
+
+    def test_call_edge_anchors_never_credited_as_coverage(self, tmp_path):
+        """call_edge's key names a relationship between two OTHER
+        locations, not an observable property of the touched location's
+        own content -- must never manufacture false coverage."""
+        from utilities.autopatcher.post_patch_evaluation import compute_coverage
+
+        (tmp_path / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        diff = _diff("a.py", ["    return 1"], ["    return 2"], start=2)
+        anchors = [_call_edge_anchor("a.py:foo", "b.py:bar", candidate_path="a.py")]
+        context = _constant_context(functions={"a.py:foo": _function("a.py:foo", start_line=1, end_line=2)})
+
+        result = compute_coverage(diff, anchors, tmp_path, context)
+        assert result.covered == ()
+        assert result.uncovered == ("a.py:foo",)
+
+
+class TestDerivePatchTouchedAnchors:
+    """derive_patch_touched_anchors -- the candidate-selection-independent
+    fix: resolves the final patch's own diff directly against the
+    pre-patch InvestigationContext, never against selected candidates."""
+
+    def test_returns_empty_list_without_a_context(self):
+        from utilities.autopatcher.post_patch_evaluation import derive_patch_touched_anchors
+
+        assert derive_patch_touched_anchors("--- a/x.py\n+++ b/x.py\n", Path("/nonexistent"), None, []) == []
+
+    def test_derives_a_new_constant_value_anchor_for_the_cve_2023_43804_shape(self, tmp_path):
+        """The exact motivating scenario: retry.py was never a selected
+        candidate (existing_anchors has nothing for it), but the final
+        patch touches Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT -- must
+        derive a fresh, origin="patch_touched" Anchor for it."""
+        from utilities.autopatcher.post_patch_evaluation import derive_patch_touched_anchors
+
+        (tmp_path / "retry.py").write_text(
+            "class Retry:\n    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n",
+            encoding="utf-8",
+        )
+        diff = _diff(
+            "retry.py",
+            ['    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])'],
+            ['    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization"])'],
+            start=2,
+        )
+        context = _constant_context(constants={
+            "retry.py": {"Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": _constant_entry(
+                "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "Retry", "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                value=frozenset({"Authorization"}), line=2, end_line=2,
+            )}
+        })
+
+        derived = derive_patch_touched_anchors(diff, tmp_path, context, existing_anchors=[])
+        assert len(derived) == 1
+        anchor = derived[0]
+        assert anchor.kind == "constant_value"
+        assert anchor.origin == "patch_touched"
+        assert anchor.key.qualified_name == "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"
+        assert anchor.before_value.value == frozenset({"Authorization"})
+
+    def test_skips_a_ref_already_covered_by_an_existing_anchor(self, tmp_path):
+        """No duplicate anchor when the file WAS a selected candidate and
+        already has an anchor for this exact element."""
+        from utilities.autopatcher.post_patch_evaluation import derive_patch_touched_anchors
+
+        (tmp_path / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        diff = _diff("a.py", ["    return 1"], ["    return 2"], start=2)
+        existing = [_resolved_function_anchor("a.py:foo", start_line=1, end_line=2, candidate_path="a.py")]
+        context = _constant_context(functions={"a.py:foo": _function("a.py:foo", start_line=1, end_line=2)})
+
+        derived = derive_patch_touched_anchors(diff, tmp_path, context, existing_anchors=existing)
+        assert derived == []
+
+    def test_skips_module_level_fallback_matches(self, tmp_path):
+        """A hunk resolving only to the whole-file module_level catch-all
+        unit carries no meaningful signal -- must never fabricate a
+        near-content-free resolved_function anchor for it (it should
+        render as uncovered via Coverage Analysis instead)."""
+        from utilities.autopatcher.post_patch_evaluation import derive_patch_touched_anchors
+
+        (tmp_path / "a.py").write_text("x = 1\ny = 2\n", encoding="utf-8")
+        diff = _diff("a.py", ["x = 1"], ["x = 100"], start=1)
+        context = _constant_context(functions={
+            "a.py:__module__": _function("a.py:__module__", start_line=1, end_line=2, unit_type="module_level"),
+        })
+
+        derived = derive_patch_touched_anchors(diff, tmp_path, context, existing_anchors=[])
+        assert derived == []
+
+    def test_skips_non_literal_constants(self, tmp_path):
+        """No fabricated value for a constant whose RHS isn't a
+        supported literal shape."""
+        from utilities.autopatcher.post_patch_evaluation import derive_patch_touched_anchors
+
+        (tmp_path / "a.py").write_text("BACKEND = default_backend()\n", encoding="utf-8")
+        diff = _diff("a.py", ["BACKEND = default_backend()"], ["BACKEND = other_backend()"], start=1)
+        context = _constant_context(constants={
+            "a.py": {"BACKEND": _constant_entry("BACKEND", None, "BACKEND", outcome="non_literal", kind=None, value=None)}
+        })
+
+        derived = derive_patch_touched_anchors(diff, tmp_path, context, existing_anchors=[])
+        assert derived == []
+
+    def test_deduplicates_multiple_hunks_resolving_to_the_same_element(self, tmp_path):
+        from utilities.autopatcher.post_patch_evaluation import derive_patch_touched_anchors
+
+        (tmp_path / "a.py").write_text("def foo():\n    x = 1\n    return x\n", encoding="utf-8")
+        diff = (
+            "--- a/a.py\n+++ b/a.py\n@@ -1,3 +1,3 @@\n"
+            " def foo():\n-    x = 1\n+    x = 2\n-    return x\n+    return x + 1\n"
+        )
+        context = _constant_context(functions={"a.py:foo": _function("a.py:foo", start_line=1, end_line=3)})
+
+        derived = derive_patch_touched_anchors(diff, tmp_path, context, existing_anchors=[])
+        assert len(derived) == 1
+
+    def test_new_anchors_only_never_returns_existing_anchors_object(self, tmp_path):
+        """Contract: existing_anchors is read for identity comparison only,
+        never mutated, never echoed back."""
+        from utilities.autopatcher.post_patch_evaluation import derive_patch_touched_anchors
+
+        (tmp_path / "retry.py").write_text(
+            "class Retry:\n    X = frozenset([\"A\"])\n", encoding="utf-8",
+        )
+        diff = _diff("retry.py", ['    X = frozenset(["A"])'], ['    X = frozenset(["A", "B"])'], start=2)
+        context = _constant_context(constants={
+            "retry.py": {"Retry.X": _constant_entry("Retry.X", "Retry", "X", value=frozenset({"A"}), line=2, end_line=2)}
+        })
+        existing = [_resolved_function_anchor("unrelated.py:bar")]
+        snapshot = list(existing)
+
+        derived = derive_patch_touched_anchors(diff, tmp_path, context, existing_anchors=existing)
+        assert existing == snapshot
+        assert all(a not in existing for a in derived)
+
 
 class TestRenderPostPatchInvestigation:
     def test_empty_observations(self):
@@ -537,3 +948,141 @@ class TestRenderPostPatchInvestigation:
         lowered = data_sections.lower()
         for word in blocklist:
             assert word not in lowered, f"{word!r} found in rendered data sections"
+
+    def test_coverage_omitted_entirely_when_not_provided(self):
+        """No fabricated coverage section when the caller didn't compute
+        one (coverage=None is the default)."""
+        from utilities.autopatcher.post_patch_evaluation import render_post_patch_investigation
+
+        rendered = render_post_patch_investigation([])
+        assert "Anchor Coverage" not in rendered
+
+    def test_coverage_section_appears_before_changed_and_survives_truncation(self):
+        from utilities.autopatcher.post_patch_evaluation import CoverageResult, render_post_patch_investigation
+
+        coverage = CoverageResult(total=8, covered=("a.py:foo",), uncovered=tuple(f"b{i}.py:x" for i in range(7)), unattributed=0)
+        rendered = render_post_patch_investigation([], coverage)
+
+        assert "### Anchor Coverage" in rendered
+        assert "1 of 8 element(s)" in rendered
+        assert "7 are not" in rendered
+        coverage_idx = rendered.index("### Anchor Coverage")
+        assert coverage_idx < rendered.index("No anchors were available")
+
+        # Placed early enough to survive a tight character budget, unlike
+        # a section placed last (which _hard_clamp would drop first). The
+        # budget below is tight enough to truncate well before any of the
+        # Changed/Disappeared/Unchanged/Remaining-Unknowns sections could
+        # render, yet still fits header + preamble + Anchor Coverage.
+        tight = render_post_patch_investigation([], coverage, max_chars=760)
+        assert "Anchor Coverage" in tight
+        assert "*(truncated to fit the character budget)*" in tight
+
+    def test_uncovered_list_capped_with_plus_n_more(self):
+        from utilities.autopatcher.post_patch_evaluation import CoverageResult, render_post_patch_investigation
+
+        coverage = CoverageResult(total=7, covered=(), uncovered=tuple(f"f{i}.py:x" for i in range(7)), unattributed=0)
+        rendered = render_post_patch_investigation([], coverage)
+        assert "(+2 more)" in rendered
+
+    def test_unchanged_caveat_appears_only_when_something_is_uncovered(self):
+        from utilities.autopatcher.post_patch_evaluation import (
+            CoverageResult, evaluate_anchors, render_post_patch_investigation,
+        )
+
+        func_id = "a.py:foo"
+        anchors = [_resolved_function_anchor(func_id)]
+        context = _context({func_id: _function(func_id)})
+        observations = evaluate_anchors(anchors, context)
+
+        fully_covered = CoverageResult(total=1, covered=(func_id,), uncovered=(), unattributed=0)
+        rendered_full = render_post_patch_investigation(observations, fully_covered)
+        unchanged_full = rendered_full[rendered_full.index("### Unchanged"):rendered_full.index("### Remaining Unknowns")]
+        assert "see Anchor Coverage above" not in unchanged_full
+
+        partially_covered = CoverageResult(total=2, covered=(func_id,), uncovered=("b.py:bar",), unattributed=0)
+        rendered_partial = render_post_patch_investigation(observations, partially_covered)
+        unchanged_partial = rendered_partial[rendered_partial.index("### Unchanged"):rendered_partial.index("### Remaining Unknowns")]
+        assert "see Anchor Coverage above" in unchanged_partial
+
+    def test_reproduces_the_cve_2023_43804_report_shape(self):
+        """End-to-end render check for the motivating case: a
+        constant_value anchor shows the actual fix under Changed, and
+        Anchor Coverage names what else in the file has no anchor at
+        all -- instead of today's misleading "0 changed, 7 unchanged"."""
+        from utilities.autopatcher.post_patch_evaluation import (
+            CoverageResult, evaluate_anchors, render_post_patch_investigation,
+        )
+
+        anchor = _constant_value_anchor(
+            "retry.py", "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "Retry",
+            "frozenset_call", frozenset({"Authorization"}),
+        )
+        context = _constant_context(constants={
+            "retry.py": {"Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT": _constant_entry(
+                "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "Retry", "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+                value=frozenset({"Authorization", "Cookie"}),
+            )}
+        })
+        observations = evaluate_anchors([anchor], context)
+        coverage = CoverageResult(total=1, covered=("retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT",), uncovered=(), unattributed=0)
+
+        rendered = render_post_patch_investigation(observations, coverage)
+        changed_idx = rendered.index("### Changed")
+        disappeared_idx = rendered.index("### Disappeared")
+        assert "constant_value:retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in rendered[changed_idx:disappeared_idx]
+        assert "frozenset({'Authorization'})" in rendered[changed_idx:disappeared_idx]
+        assert "1 of 1 element(s)" in rendered
+
+    def test_patch_touched_changed_item_is_tagged(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
+
+        anchor = _constant_value_anchor(
+            "retry.py", "Retry.X", "Retry", "frozenset_call", frozenset({"Authorization"}), origin="patch_touched",
+        )
+        context = _constant_context(constants={
+            "retry.py": {"Retry.X": _constant_entry("Retry.X", "Retry", "X", value=frozenset({"Authorization", "Cookie"}))}
+        })
+        rendered = render_post_patch_investigation(evaluate_anchors([anchor], context))
+        changed_section = rendered[rendered.index("### Changed"):rendered.index("### Disappeared")]
+        assert "(discovered from patch diff)" in changed_section
+
+    def test_pre_patch_changed_item_is_not_tagged(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
+
+        anchor = _constant_value_anchor(
+            "retry.py", "Retry.X", "Retry", "frozenset_call", frozenset({"Authorization"}), origin="pre_patch",
+        )
+        context = _constant_context(constants={
+            "retry.py": {"Retry.X": _constant_entry("Retry.X", "Retry", "X", value=frozenset({"Authorization", "Cookie"}))}
+        })
+        rendered = render_post_patch_investigation(evaluate_anchors([anchor], context))
+        changed_section = rendered[rendered.index("### Changed"):rendered.index("### Disappeared")]
+        assert "(discovered from patch diff)" not in changed_section
+
+    def test_patch_touched_disappeared_item_is_tagged(self):
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
+
+        anchor = _resolved_function_anchor("a.py:foo", origin="patch_touched")
+        context = _context({})  # func_id no longer present -> disappeared
+        rendered = render_post_patch_investigation(evaluate_anchors([anchor], context))
+        disappeared_section = rendered[rendered.index("### Disappeared"):rendered.index("### Unchanged")]
+        assert "(discovered from patch diff)" in disappeared_section
+
+    def test_unchanged_summary_has_no_second_origin_breakdown(self):
+        """Explicit requirement: Unchanged stays a single breakdown axis
+        (by anchor_kind), never a second one by origin."""
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors, render_post_patch_investigation
+
+        func_id = "a.py:foo"
+        anchors = [
+            _resolved_function_anchor(func_id, origin="pre_patch"),
+            _resolved_function_anchor("b.py:bar", origin="patch_touched"),
+        ]
+        context = _context({func_id: _function(func_id), "b.py:bar": _function("b.py:bar")})
+        rendered = render_post_patch_investigation(evaluate_anchors(anchors, context))
+        unchanged_section = rendered[rendered.index("### Unchanged"):rendered.index("### Remaining Unknowns")]
+        assert "2 anchor(s) confirmed unchanged (resolved_function: 2)" in unchanged_section
+        assert "patch_touched" not in unchanged_section
+        assert "pre_patch" not in unchanged_section
+        assert "discovered from patch diff" not in unchanged_section

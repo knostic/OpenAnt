@@ -35,6 +35,12 @@ Anchor kinds derived now, one Anchor per atomic fact:
                         unresolved (None)
   sink_match         -- one existing vulnerability-pattern sink match,
                         never claimed to BE the vulnerability
+  constant_value     -- the canonicalized value of one module-level or
+                        class-level literal assignment in scope for a
+                        candidate (see candidate_enrichment.scope_constants);
+                        only entries whose value was actually captured
+                        ("literal" outcome) become an anchor -- a
+                        non-literal RHS produces no anchor, never a guess
 
 Anchor kinds deliberately NOT derived here:
   related_test -- CandidateEnrichment.related_tests[].path is already an
@@ -136,23 +142,66 @@ class SinkMatchValue(NamedTuple):
     snippet: str
 
 
-AnchorKind = Literal["resolved_function", "call_edge", "reachability", "sink_match"]
+class ConstantValueKey(NamedTuple):
+    """Identity of one module-level or class-level literal assignment
+    target. ``const_id`` follows RepositoryIndex's own func_id convention
+    ("file/path.py:name" or "file/path.py:ClassName.name" -- see
+    repository_index.py's own comment on that format) so identity is
+    self-contained, independent of the sibling Anchor.candidate_path
+    field, exactly like every other anchor kind's key."""
 
-AnchorKey = Union[ResolvedFunctionKey, CallEdgeKey, ReachabilityKey, SinkMatchKey]
-AnchorValue = Union[ResolvedFunctionValue, bool, ReachabilityValue, SinkMatchValue]
+    const_id: str
+    qualified_name: str  # "name" at module scope, "ClassName.name" at class scope
+    class_name: "str | None"
+
+
+class ConstantValueValue(NamedTuple):
+    """The literal's canonicalized, hashable value (see
+    candidate_enrichment._canonicalize_literal -- raw set/list/dict are not
+    hashable and would break Anchor's frozen/hashable contract).
+    ``ast_literal_kind`` disambiguates literal shapes that could
+    canonicalize to the same value (e.g. a set literal vs. a list literal
+    with identical elements, or a plain ``set(...)`` vs. a ``frozenset``
+    literal)."""
+
+    ast_literal_kind: "str | None"
+    value: object
+
+
+AnchorKind = Literal["resolved_function", "call_edge", "reachability", "sink_match", "constant_value"]
+
+AnchorKey = Union[ResolvedFunctionKey, CallEdgeKey, ReachabilityKey, SinkMatchKey, ConstantValueKey]
+AnchorValue = Union[ResolvedFunctionValue, bool, ReachabilityValue, SinkMatchValue, ConstantValueValue]
+
+AnchorOrigin = Literal["pre_patch", "patch_touched"]
+"""Which phase decided this Anchor was worth tracking -- never part of
+semantic identity or deduplication (see Anchor's docstring: identity is
+strictly `(kind, key)`). ``"pre_patch"`` (the default): derived by
+``derive_pre_patch_anchors()`` from selected-candidate evidence, before the
+patch exists. ``"patch_touched"``: derived by
+``post_patch_evaluation.derive_patch_touched_anchors()`` from the final
+patch's own diff, independent of Candidate Selection -- for a semantic
+element the patch touches but no selected candidate ever surfaced."""
 
 
 @dataclass(frozen=True)
 class Anchor:
-    """One atomic, deterministic, pre-patch observation.
+    """One atomic, deterministic observation -- either selected before the
+    patch existed (``origin="pre_patch"``), or discovered because the
+    final patch touched this location (``origin="patch_touched"``).
 
     Contains only: a stable identity (kind + key), the deterministic
-    pre-patch value (before_value), and provenance (source) -- never a
-    complete RepositoryCandidate/CandidateEnrichment/RepositoryUnderstanding,
-    never an expected remediation direction, never a verdict or confidence
+    before_value, and provenance (source, origin) -- never a complete
+    RepositoryCandidate/CandidateEnrichment/RepositoryUnderstanding, never
+    an expected remediation direction, never a verdict or confidence
     score.
 
-    Semantic identity is the pair ``(kind, key)`` -- not `key` alone.
+    Semantic identity is the pair ``(kind, key)`` -- not `key` alone, and
+    NOT including `origin` (two anchors with the same (kind, key) are the
+    same fact regardless of which phase found it first; origin is
+    provenance metadata, never a dedup axis -- see
+    ``derive_pre_patch_anchors``'s and ``derive_patch_touched_anchors``'s
+    own dedup, both keyed strictly on `(kind, key)`).
     `NamedTuple` equality/hash ignore the declared subclass (they inherit
     `tuple.__eq__`/`__hash__`, which compare positionally), so two
     different anchor kinds whose key shapes happen to share a field count
@@ -174,6 +223,7 @@ class Anchor:
     key: AnchorKey
     before_value: AnchorValue
     source: str
+    origin: AnchorOrigin = "pre_patch"
 
     @property
     def display_id(self) -> str:
@@ -190,6 +240,8 @@ class Anchor:
         if self.kind == "sink_match":
             method_label = self.key.method or "<module>"
             return f"sink_match:{self.key.candidate_path}:{method_label}"
+        if self.kind == "constant_value":
+            return f"constant_value:{self.key.const_id}"
         return f"{self.kind}:{self.key!r}"  # defensive fallback; unreachable given AnchorKind
 
 
@@ -204,7 +256,17 @@ def _file_part(func_id: str) -> str:
     return func_id[:colon_idx]
 
 
-def _resolved_function_anchor(candidate_path: str, resolved: dict, func_id: str) -> Anchor:
+def resolved_function_anchor(
+    candidate_path: str, resolved: dict, func_id: str, origin: AnchorOrigin = "pre_patch"
+) -> Anchor:
+    """Build a ``resolved_function`` Anchor from a RepositoryIndex-shaped
+    function dict (the exact shape ``list_functions_in_file``/
+    ``get_function`` already return: name/startLine/endLine/unitType/
+    className). Exported (no leading underscore): shared by
+    derive_pre_patch_anchors below and
+    post_patch_evaluation.derive_patch_touched_anchors -- the only
+    difference between a pre-patch and a patch-touched resolved_function
+    Anchor is which `origin` the caller passes."""
     key = ResolvedFunctionKey(
         func_id=func_id,
         name=resolved.get("name"),
@@ -221,6 +283,7 @@ def _resolved_function_anchor(candidate_path: str, resolved: dict, func_id: str)
         key=key,
         before_value=value,
         source="candidate_enrichment.resolved_function",
+        origin=origin,
     )
 
 
@@ -265,6 +328,46 @@ def _sink_match_anchor(candidate_path: str, sink: dict) -> Anchor:
     )
 
 
+def const_id(candidate_path: str, qualified_name: str) -> str:
+    """Build a constant's identity string using the exact same
+    "file:qualified_name" convention RepositoryIndex uses for func_id
+    (see repository_index.py's own comment on that format), so a
+    constant_value anchor's identity is self-contained and directly
+    comparable to a func_id string wherever both need to be joined.
+
+    Exported (no leading underscore): shared by derive_pre_patch_anchors
+    below and post_patch_evaluation.derive_patch_touched_anchors, so both
+    phases build identical, joinable identities without duplicating this
+    one-line format."""
+    return f"{candidate_path}:{qualified_name}"
+
+
+def constant_value_anchor(candidate_path: str, entry: dict, origin: AnchorOrigin = "pre_patch") -> Anchor:
+    """Build a ``constant_value`` Anchor from one ``scope_constants``-shaped
+    entry (see candidate_enrichment._extract_literal_constants for the
+    exact dict shape). Exported (no leading underscore): shared by
+    derive_pre_patch_anchors below and
+    post_patch_evaluation.derive_patch_touched_anchors -- the only
+    difference between a pre-patch and a patch-touched constant_value
+    Anchor is which `origin` the caller passes; the construction itself
+    is identical."""
+    cid = const_id(candidate_path, entry["qualified_name"])
+    key = ConstantValueKey(
+        const_id=cid,
+        qualified_name=entry["qualified_name"],
+        class_name=entry["class_name"],
+    )
+    value = ConstantValueValue(ast_literal_kind=entry["ast_literal_kind"], value=entry["value"])
+    return Anchor(
+        kind="constant_value",
+        candidate_path=candidate_path,
+        key=key,
+        before_value=value,
+        source="candidate_enrichment.scope_constants",
+        origin=origin,
+    )
+
+
 def derive_pre_patch_anchors(understanding: RepositoryUnderstanding) -> list[Anchor]:
     """Derive atomic, deterministic anchors from already-computed pre-patch
     evidence.
@@ -300,7 +403,7 @@ def derive_pre_patch_anchors(understanding: RepositoryUnderstanding) -> list[Anc
         if resolved is not None:
             func_id = resolved["id"]
 
-            _add(_resolved_function_anchor(candidate.path, resolved, func_id))
+            _add(resolved_function_anchor(candidate.path, resolved, func_id))
 
             for callee_id in enrichment.callees:
                 _add(_call_edge_anchor(func_id, callee_id, "candidate_enrichment.callees"))
@@ -316,5 +419,17 @@ def derive_pre_patch_anchors(understanding: RepositoryUnderstanding) -> list[Anc
         if enrichment.sink_matches:
             for sink in enrichment.sink_matches:
                 _add(_sink_match_anchor(candidate.path, sink))
+
+        # scope_constants, like sink_matches, does not depend on
+        # resolved_function -- candidate_enrichment already scoped it
+        # (module-level always; class-level narrowed to resolved_function's
+        # own class when one was resolved, else left unnarrowed). Only
+        # entries with a captured literal value become anchors -- a
+        # "non_literal"/"augmented_assign"/etc. entry has no comparable
+        # before_value and is silently excluded here, never guessed.
+        for entry in enrichment.scope_constants:
+            if entry.get("outcome") != "literal":
+                continue
+            _add(constant_value_anchor(candidate.path, entry))
 
     return anchors

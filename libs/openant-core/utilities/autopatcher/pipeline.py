@@ -27,7 +27,7 @@ from .language_support import detect_language
 from pathlib import Path as _Path
 from .evidence_fusion import RepositoryUnderstanding
 from .repository_grounding_models import RepositoryCandidate, RepositoryGroundingResult
-from .post_patch_evaluation import AnchorObservation, render_post_patch_investigation
+from .post_patch_evaluation import AnchorObservation, CoverageResult, render_post_patch_investigation
 
 # Static patch signals
 try:
@@ -132,6 +132,12 @@ class PipelineResult:
     # _build_report must not render it as current.
     post_patch_observations: list[AnchorObservation] | None = None
     post_patch_investigated_patch: str | None = None
+    # Deterministic Coverage Analysis (see post_patch_evaluation.compute_coverage):
+    # how much of `patch`'s diff is tracked by at least one pre-patch Anchor.
+    # Computed alongside post_patch_observations, from the same patch and
+    # anchors, so it shares that field's staleness gate -- no separate
+    # "coverage_investigated_patch" field exists or is needed.
+    post_patch_coverage: "CoverageResult | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -2079,7 +2085,9 @@ def _build_report(result: PipelineResult) -> str:
             "computed, and it no longer describes the reported patch.*\n\n"
         )
     else:
-        report += "---\n\n" + render_post_patch_investigation(result.post_patch_observations) + "\n"
+        report += "---\n\n" + render_post_patch_investigation(
+            result.post_patch_observations, result.post_patch_coverage
+        ) + "\n"
 
     # §10: Impact Surface
     if result.impact:
@@ -2433,6 +2441,10 @@ def run(
     _repository_understanding: RepositoryUnderstanding | None = None
     _repository_understanding_ctx = ""
     _pre_patch_anchors: list | None = None
+    _investigation_context = None  # InvestigationContext | None -- only set below when
+    # investigation_output_dir is provided and grounding/selection succeed; kept as a
+    # top-level local so the Post-Patch Investigation block below (which reuses it for
+    # Coverage Analysis) can safely check it without a NameError on every other path.
     if _grounding is not None:
         try:
             from .candidate_enrichment import build_investigation_context, enrich_candidates
@@ -2584,6 +2596,7 @@ def run(
     # inside the repair loop itself -- extending fresh evidence to that
     # path is an explicitly separate, later decision.
     _post_patch_observations: list | None = None
+    _post_patch_coverage: "CoverageResult | None" = None
     _post_patch_ctx = ""
     _investigated_patch: str | None = None
     if repo_root and _pre_patch_anchors:
@@ -2591,18 +2604,39 @@ def run(
             from .patch_workspace import temporary_repo_copy
             from .patch_applicability import apply_patch
             from .candidate_enrichment import build_investigation_context
-            from .post_patch_evaluation import evaluate_anchors
+            from .post_patch_evaluation import compute_coverage, derive_patch_touched_anchors, evaluate_anchors
 
             _investigated_patch = patch
             _resolved_repo_root = Path(repo_root).resolve()
+            # Candidate-selection-independent gap fix: derive_patch_touched_anchors
+            # resolves the FINAL patch's own diff directly against the pre-patch
+            # InvestigationContext (repo-wide, built before Candidate Selection
+            # ever ran) -- catching a semantic element (e.g. a literal constant)
+            # the patch touches even when no selected candidate ever surfaced it.
+            # _pre_patch_anchors itself is never mutated; this only concatenates a
+            # disjoint, already-deduplicated list of net-new, origin="patch_touched"
+            # anchors onto it for evaluation/coverage purposes below.
+            _patch_touched_anchors = derive_patch_touched_anchors(
+                _investigated_patch, _resolved_repo_root, _investigation_context, _pre_patch_anchors
+            )
+            _all_anchors = _pre_patch_anchors + _patch_touched_anchors
             with temporary_repo_copy(_resolved_repo_root) as _workspace_root:
                 _apply_result = apply_patch(_investigated_patch, _workspace_root)
                 _post_patch_context = None
                 if _apply_result.applied:
                     _investigation_output_dir = _workspace_root.parent / "investigation"
                     _post_patch_context = build_investigation_context(_workspace_root, _investigation_output_dir)
-                _post_patch_observations = evaluate_anchors(_pre_patch_anchors, _post_patch_context)
-                _post_patch_ctx = render_post_patch_investigation(_post_patch_observations)
+                _post_patch_observations = evaluate_anchors(_all_anchors, _post_patch_context)
+                # Coverage Analysis reuses the PRE-patch InvestigationContext (the
+                # diff's context/removed lines describe that state) and the same
+                # repo_root -- unrelated to the isolated post-patch workspace above,
+                # so it runs regardless of whether patch application succeeded.
+                # Fed the merged list so "uncovered" means "genuinely unsupported
+                # element type", not "Candidate Selection didn't pick this file."
+                _post_patch_coverage = compute_coverage(
+                    _investigated_patch, _all_anchors, _resolved_repo_root, _investigation_context
+                )
+                _post_patch_ctx = render_post_patch_investigation(_post_patch_observations, _post_patch_coverage)
             if _post_patch_ctx:
                 print(
                     f"[pipeline] Post-Patch Investigation rendered "
@@ -2616,6 +2650,7 @@ def run(
                 file=sys.stderr,
             )
             _post_patch_observations = None
+            _post_patch_coverage = None
             _post_patch_ctx = ""
             _investigated_patch = None
 
@@ -2875,5 +2910,6 @@ def run(
         repository_understanding=_repository_understanding,
         post_patch_observations=_post_patch_observations,
         post_patch_investigated_patch=_investigated_patch,
+        post_patch_coverage=_post_patch_coverage,
     )
     return _build_report(result)

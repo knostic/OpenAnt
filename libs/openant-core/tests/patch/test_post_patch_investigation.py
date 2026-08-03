@@ -297,6 +297,85 @@ class TestSinkMatchAnchor:
         assert anchors[0].kind == "sink_match"
 
 
+def _literal_entry(qualified_name, name, class_name=None, kind="frozenset_call", value=None, line=1, end_line=1):
+    return {
+        "qualified_name": qualified_name, "class_name": class_name, "name": name,
+        "outcome": "literal", "ast_literal_kind": kind, "value": value,
+        "line": line, "end_line": end_line,
+    }
+
+
+class TestConstantValueAnchor:
+    def test_derived_for_the_cve_2023_43804_shape(self):
+        """The exact motivating case: a class-level frozenset constant."""
+        from utilities.autopatcher.post_patch_investigation import derive_pre_patch_anchors
+
+        entry = _literal_entry(
+            "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+            class_name="Retry", value=frozenset({"Authorization"}),
+        )
+        candidate = _candidate("retry.py", _enrichment(
+            resolved_function=_resolved("retry.py:Retry.increment", class_name="Retry"),
+            scope_constants=[entry],
+        ))
+        anchors = derive_pre_patch_anchors(_understanding([candidate]))
+        matches = [a for a in anchors if a.kind == "constant_value"]
+        assert len(matches) == 1
+        anchor = matches[0]
+        assert anchor.display_id == "constant_value:retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"
+        assert anchor.key.qualified_name == "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT"
+        assert anchor.key.class_name == "Retry"
+        assert anchor.before_value.value == frozenset({"Authorization"})
+        assert anchor.before_value.ast_literal_kind == "frozenset_call"
+        assert anchor.source == "candidate_enrichment.scope_constants"
+
+    def test_non_literal_outcome_produces_no_anchor(self):
+        from utilities.autopatcher.post_patch_investigation import derive_pre_patch_anchors
+
+        entry = _literal_entry("BACKEND", "BACKEND", kind=None, value=None)
+        entry["outcome"] = "non_literal"
+        candidate = _candidate("a.py", _enrichment(scope_constants=[entry]))
+        anchors = derive_pre_patch_anchors(_understanding([candidate]))
+        assert not [a for a in anchors if a.kind == "constant_value"]
+
+    def test_derived_even_when_resolved_function_is_none(self):
+        """Mirrors sink_match's independence from resolved_function --
+        candidate_enrichment already decided scoping; derivation must not
+        re-gate on it."""
+        from utilities.autopatcher.post_patch_investigation import derive_pre_patch_anchors
+
+        entry = _literal_entry("TIMEOUT", "TIMEOUT", value=30, kind="Constant")
+        candidate = _candidate("a.py", _enrichment(resolved_function=None, scope_constants=[entry]))
+        anchors = derive_pre_patch_anchors(_understanding([candidate]))
+        assert len(anchors) == 1
+        assert anchors[0].kind == "constant_value"
+
+    def test_deduplicated_across_two_candidates_in_the_same_class(self):
+        from utilities.autopatcher.post_patch_investigation import derive_pre_patch_anchors
+
+        entry = _literal_entry(
+            "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT", "DEFAULT_REMOVE_HEADERS_ON_REDIRECT",
+            class_name="Retry", value=frozenset({"Authorization"}),
+        )
+        candidate_a = _candidate("retry.py", _enrichment(
+            resolved_function=_resolved("retry.py:Retry.increment", name="increment", class_name="Retry"),
+            scope_constants=[entry],
+        ))
+        candidate_b = _candidate("retry.py", _enrichment(
+            resolved_function=_resolved("retry.py:Retry.__repr__", name="__repr__", class_name="Retry"),
+            scope_constants=[dict(entry)],
+        ))
+        anchors = derive_pre_patch_anchors(_understanding([candidate_a, candidate_b]))
+        assert len([a for a in anchors if a.kind == "constant_value"]) == 1
+
+    def test_none_vs_empty_scope_constants_both_produce_no_anchors(self):
+        from utilities.autopatcher.post_patch_investigation import derive_pre_patch_anchors
+
+        empty_candidate = _candidate("a.py", _enrichment(scope_constants=[]))
+        anchors = derive_pre_patch_anchors(_understanding([empty_candidate]))
+        assert not [a for a in anchors if a.kind == "constant_value"]
+
+
 # ---------------------------------------------------------------------------
 # 8. related_test is deferred -- never produced by this phase
 # ---------------------------------------------------------------------------
@@ -468,7 +547,7 @@ class TestIdentitySemantics:
 
         field_names = {f.name for f in dataclasses.fields(Anchor)}
         assert "id" not in field_names
-        assert field_names == {"kind", "candidate_path", "key", "before_value", "source"}
+        assert field_names == {"kind", "candidate_path", "key", "before_value", "source", "origin"}
 
     def test_display_id_is_a_computed_property_not_a_field(self):
         from utilities.autopatcher.post_patch_investigation import derive_pre_patch_anchors

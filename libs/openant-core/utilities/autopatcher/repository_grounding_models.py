@@ -62,6 +62,16 @@ class CandidateEnrichment:
 
     sink_matches: "list[dict] | None" = None
 
+    # Module-level and class-level literal assignments in scope for this
+    # candidate (see candidate_enrichment.InvestigationContext.constants).
+    # Each dict: {"qualified_name", "class_name", "name", "outcome"
+    # ("literal"|"non_literal"|"augmented_assign"|"unsupported_target"|
+    # "annotation_only"), "ast_literal_kind", "value", "line", "end_line"}.
+    # [] means "no context, or no literal assignments found" -- there is
+    # no separate "not applicable" case beyond a parse failure, which
+    # already routes to enrichment_errors like every other concern here.
+    scope_constants: list[dict] = field(default_factory=list)
+
     enrichment_errors: list[str] = field(default_factory=list)
 
 
