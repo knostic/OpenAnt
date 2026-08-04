@@ -588,3 +588,231 @@ class TestFencedPatch:
             text=True,
         )
         assert result.returncode == 0, f"git apply failed: {result.stderr.strip()}"
+
+
+# ---------------------------------------------------------------------------
+# Structural rebuild: repeated / interleaved file-header sections
+# ---------------------------------------------------------------------------
+
+def _make_three_file_fixture(tmp_path: Path) -> Path:
+    """A real git repo whose three files' line content matches, line for
+    line, the hunk anchors used by the tests below (lines 100/150 in
+    connectionpool.py, line 50 in retry.py, line 10 in poolmanager.py)."""
+    cp_lines = [f"// filler {i}\n" for i in range(1, 250)]
+    cp_lines[99] = "context_line\n"
+    cp_lines[100] = "old_line\n"
+    cp_lines[149] = "context2\n"
+    cp_lines[150] = "old2\n"
+    retry_lines = [f"// r{i}\n" for i in range(1, 100)]
+    retry_lines[49] = "r_context\n"
+    retry_lines[50] = "r_old\n"
+    pool_lines = [f"// p{i}\n" for i in range(1, 30)]
+    pool_lines[9] = "p_context\n"
+    pool_lines[10] = "p_old\n"
+
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, capture_output=True)
+    (tmp_path / "src" / "urllib3" / "util").mkdir(parents=True)
+    (tmp_path / "src" / "urllib3" / "connectionpool.py").write_text("".join(cp_lines), encoding="utf-8")
+    (tmp_path / "src" / "urllib3" / "util" / "retry.py").write_text("".join(retry_lines), encoding="utf-8")
+    (tmp_path / "src" / "urllib3" / "poolmanager.py").write_text("".join(pool_lines), encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, check=True)
+    return tmp_path
+
+
+def _git_apply_check(repo: Path, patch_text: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "apply", "--check", "--whitespace=nowarn", "-"],
+        input=patch_text, cwd=str(repo), capture_output=True, text=True,
+    )
+
+
+class TestOneFile:
+    def test_single_file_single_hunk_unaffected_by_grouping(self):
+        patch = (
+            "--- a/x.py\n+++ b/x.py\n"
+            "@@ -1,2 +1,3 @@\n context\n-old\n+new1\n+new2\n"
+        )
+        repaired, meta = repair_hunk_headers(patch)
+        assert repaired == "--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,3 @@\n context\n-old\n+new1\n+new2\n"
+        assert meta.files_rewritten == 0  # counts were already correct
+
+
+class TestTwoFiles:
+    def test_two_distinct_files_correct_headers_are_noop(self):
+        patch = (
+            "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n"
+            "--- a/b.py\n+++ b/b.py\n@@ -5,1 +5,1 @@\n-x\n+y\n"
+        )
+        repaired, meta = repair_hunk_headers(patch)
+        assert repaired == patch
+        assert meta.normalization_applied is False
+
+
+class TestThreeFiles:
+    def test_three_files_order_and_counts_preserved(self, tmp_path):
+        repo = _make_three_file_fixture(tmp_path)
+        # Each hunk carries a trailing context line (matching the fixture's
+        # stable filler content) in addition to the leading one -- git apply
+        # rejects a hunk with context on only one side (verified directly
+        # against real git apply, independent of this repair code).
+        malformed = (
+            "--- a/src/urllib3/connectionpool.py\n+++ b/src/urllib3/connectionpool.py\n"
+            "@@ -100,99 +100,99 @@\n context_line\n-old_line\n+new_line\n // filler 102\n"
+            "--- a/src/urllib3/util/retry.py\n+++ b/src/urllib3/util/retry.py\n"
+            "@@ -50,99 +50,99 @@\n r_context\n-r_old\n+r_new\n // r52\n"
+            "--- a/src/urllib3/poolmanager.py\n+++ b/src/urllib3/poolmanager.py\n"
+            "@@ -10,99 +10,99 @@\n p_context\n-p_old\n+p_new\n // p12\n"
+        )
+        repaired, meta = repair_hunk_headers(malformed)
+        headers = [l for l in repaired.splitlines() if l.startswith("---") or l.startswith("+++")]
+        assert headers == [
+            "--- a/src/urllib3/connectionpool.py", "+++ b/src/urllib3/connectionpool.py",
+            "--- a/src/urllib3/util/retry.py", "+++ b/src/urllib3/util/retry.py",
+            "--- a/src/urllib3/poolmanager.py", "+++ b/src/urllib3/poolmanager.py",
+        ]
+        assert meta.files_rewritten == 3
+        assert meta.hunks_rewritten == 3
+        result = _git_apply_check(repo, repaired)
+        assert result.returncode == 0, result.stderr
+
+
+class TestRepeatedFileHeaders:
+    def test_same_file_repeated_immediately_consolidates_with_correct_delta(self):
+        # Same file, two back-to-back sections (not interleaved with
+        # another file) -- hunk2's new_start must reflect hunk1's net
+        # delta (+1), not reset to hunk1's own old_start.
+        patch = (
+            "--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new1\n+new2\n"
+            "--- a/x.py\n+++ b/x.py\n@@ -10,2 +10,2 @@\n c2\n-old2\n+new3\n"
+        )
+        repaired, meta = repair_hunk_headers(patch)
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        assert len(hunk_lines) == 2
+        assert hunk_lines[0] == "@@ -1,2 +1,3 @@"
+        assert hunk_lines[1] == "@@ -10,2 +11,2 @@"  # 10 + delta(+1) = 11
+        # exactly one header pair in the output -- consolidated, not duplicated
+        assert repaired.count("--- a/x.py") == 1
+        assert repaired.count("+++ b/x.py") == 1
+        assert meta.normalization_applied is True
+
+    def test_repeated_header_order_and_dedup(self, tmp_path):
+        repo = _make_three_file_fixture(tmp_path)
+        malformed = (
+            "--- a/src/urllib3/connectionpool.py\n+++ b/src/urllib3/connectionpool.py\n"
+            "@@ -100,3 +100,4 @@\n context_line\n-old_line\n+new1\n+new2\n // filler 102\n"
+            "--- a/src/urllib3/connectionpool.py\n+++ b/src/urllib3/connectionpool.py\n"
+            "@@ -150,3 +150,3 @@\n context2\n-old2\n+new2b\n // filler 152\n"
+        )
+        repaired, meta = repair_hunk_headers(malformed)
+        assert repaired.count("--- a/src/urllib3/connectionpool.py") == 1
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        # hunk1: old=3 (context_line + removed + trailing filler), new=4
+        #   (context_line + new1 + new2 + trailing filler) -> delta +1.
+        # hunk2: new_start = 150 + delta(1) = 151.
+        assert hunk_lines == ["@@ -100,3 +100,4 @@", "@@ -150,3 +151,3 @@"]
+        result = _git_apply_check(repo, repaired)
+        assert result.returncode == 0, result.stderr
+
+
+class TestInterleavedFileHeaders:
+    def test_file_split_by_another_files_section_is_reunified(self, tmp_path):
+        repo = _make_three_file_fixture(tmp_path)
+        # connectionpool.py's two hunks are split apart by retry.py's
+        # section in between -- exactly the urllib3-trace shape.
+        malformed = (
+            "--- a/src/urllib3/connectionpool.py\n+++ b/src/urllib3/connectionpool.py\n"
+            "@@ -100,99 +100,99 @@\n context_line\n-old_line\n+new1\n+new2\n // filler 102\n"
+            "--- a/src/urllib3/util/retry.py\n+++ b/src/urllib3/util/retry.py\n"
+            "@@ -50,99 +50,99 @@\n r_context\n-r_old\n+r_new\n // r52\n"
+            "--- a/src/urllib3/connectionpool.py\n+++ b/src/urllib3/connectionpool.py\n"
+            "@@ -150,99 +150,99 @@\n context2\n-old2\n+new2b\n // filler 152\n"
+        )
+        # Raw form is what real LLM output looked like -- must be rejected
+        # as corrupt/malformed by git before repair (sanity check that this
+        # fixture actually reproduces the failure mode, not just a strawman).
+        raw_check = _git_apply_check(repo, malformed)
+        assert raw_check.returncode != 0
+        assert "corrupt patch" in raw_check.stderr
+
+        repaired, meta = repair_hunk_headers(malformed)
+
+        # File order = first-appearance order; connectionpool.py's hunks
+        # reunified under ONE header pair, in original relative order;
+        # retry.py's section follows, unaffected.
+        assert repaired.count("--- a/src/urllib3/connectionpool.py") == 1
+        assert repaired.count("--- a/src/urllib3/util/retry.py") == 1
+        cp_idx = repaired.index("src/urllib3/connectionpool.py")
+        retry_idx = repaired.index("src/urllib3/util/retry.py")
+        assert cp_idx < retry_idx
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        # connectionpool.py's two hunks, in original order (hunk1 delta +1
+        # propagates into hunk2's new_start = 150+1 = 151), THEN retry.py's
+        # one hunk (its own delta series, unaffected by connectionpool.py's).
+        assert hunk_lines == ["@@ -100,3 +100,4 @@", "@@ -150,3 +151,3 @@", "@@ -50,3 +50,3 @@"]
+        assert meta.normalization_applied is True
+        assert meta.files_rewritten == 2
+
+        result = _git_apply_check(repo, repaired)
+        assert result.returncode == 0, result.stderr
+
+
+class TestAlreadyValidMultiFileDiff:
+    def test_already_valid_three_file_diff_is_untouched(self, tmp_path):
+        repo = _make_three_file_fixture(tmp_path)
+        valid = (
+            "--- a/src/urllib3/connectionpool.py\n+++ b/src/urllib3/connectionpool.py\n"
+            "@@ -100,3 +100,4 @@\n context_line\n-old_line\n+new1\n+new2\n // filler 102\n"
+            "--- a/src/urllib3/util/retry.py\n+++ b/src/urllib3/util/retry.py\n"
+            "@@ -50,3 +50,3 @@\n r_context\n-r_old\n+r_new\n // r52\n"
+            "--- a/src/urllib3/poolmanager.py\n+++ b/src/urllib3/poolmanager.py\n"
+            "@@ -10,3 +10,3 @@\n p_context\n-p_old\n+p_new\n // p12\n"
+        )
+        repaired, meta = repair_hunk_headers(valid)
+        assert repaired == valid
+        assert meta.normalization_applied is False
+        result = _git_apply_check(repo, valid)
+        assert result.returncode == 0, result.stderr
+
+
+class TestUrllib3TraceReproduction:
+    """The exact malformation this task was written to fix: the model's
+    diff for connectionpool.py appears complete, but a second file's
+    header (retry.py) is interleaved before connectionpool.py's remaining
+    hunk -- reproduced with the exact filenames from the real trace."""
+
+    def test_urllib3_trace_shaped_diff_is_corrupt_before_repair_and_clean_after(self, tmp_path):
+        repo = _make_three_file_fixture(tmp_path)
+        malformed = (
+            "--- a/src/urllib3/connectionpool.py\n"
+            "+++ b/src/urllib3/connectionpool.py\n"
+            "@@ -100,99 +100,99 @@\n"
+            " context_line\n"
+            "-old_line\n"
+            "+new1\n"
+            " // filler 102\n"
+            "--- a/src/urllib3/util/retry.py\n"
+            "+++ b/src/urllib3/util/retry.py\n"
+            "@@ -50,99 +50,99 @@\n"
+            " r_context\n"
+            "-r_old\n"
+            "+r_new\n"
+            " // r52\n"
+            "--- a/src/urllib3/connectionpool.py\n"
+            "+++ b/src/urllib3/connectionpool.py\n"
+            "@@ -150,99 +150,99 @@\n"
+            " context2\n"
+            "-old2\n"
+            "+new2b\n"
+            " // filler 152\n"
+        )
+        before = _git_apply_check(repo, malformed)
+        assert before.returncode != 0
+        assert "corrupt patch" in before.stderr
+
+        repaired, meta = repair_hunk_headers(malformed)
+        after = _git_apply_check(repo, repaired)
+        assert after.returncode == 0, after.stderr
+        assert "corrupt" not in (after.stderr or "")

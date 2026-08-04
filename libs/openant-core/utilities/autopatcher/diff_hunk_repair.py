@@ -6,11 +6,26 @@ recomputes c as old_start + cumulative_prior_net_delta within the same file.
 The old start line (a) is preserved as-is — it is the LLM's positional anchor
 and requires knowledge of the original file to validate independently.
 
+It also structurally REBUILDS the diff so every file appears exactly once —
+one "--- a/X"/"+++ b/X" header pair followed by ALL of that file's hunks, in
+their original relative order. LLMs sometimes emit a file's hunks split
+across multiple, non-contiguous header-pair sections (interleaved with
+another file's section in between, or simply repeated) — each section
+parses fine on its own, but splits what should be one cumulative per-file
+line-offset delta into several independently-reset deltas, and produces a
+file/hunk layout git considers malformed for a single coherent multi-file
+patch. Rebuilding never changes file order (first-appearance order),
+never changes hunk order within a file, and never changes a single changed
+line — only which header a hunk is filed under and where in the output it
+appears.
+
 Public API:
     repair_hunk_headers(patch: str) -> tuple[str, RepairResult]
 
 RepairResult fields:
-    normalization_applied : bool  — True if any @@ line was changed
+    normalization_applied : bool  — True if any @@ line was changed, or any
+                                     file's hunks were consolidated from more
+                                     than one header-pair section
     hunks_rewritten       : int   — number of @@ headers with corrected values
     files_rewritten       : int   — number of distinct filenames with ≥1 rewrite
 """
@@ -71,16 +86,37 @@ def _strip_md_fences(patch: str) -> tuple[str, str, str]:
     return open_fence, "".join(lines), close_fence
 
 
+@dataclass
+class _FileSection:
+    header_a: str  # the "--- a/X" line, exactly as first seen for this file
+    header_b: str  # the "+++ b/X" line, exactly as first seen for this file
+    hunks: list = field(default_factory=list)  # list of (header_line, body_lines)
+
+
 def _repair(patch: str, meta: RepairResult) -> tuple[str, RepairResult]:
     lines = patch.splitlines(keepends=True)
-    output: list[str] = []
 
-    # Per-file accumulator: sum of (new_count - old_count) for prior hunks
-    file_delta: int = 0
-    current_file: str | None = None
+    # Content that appears before the first recognised file header (or,
+    # for pathological/non-diff input, everything — see the final-assembly
+    # fallback below). Also the catch-all for a handful of edge cases that
+    # were unconditional `output.append(line)` passthroughs before this
+    # function grouped hunks by file: a malformed `@@` line whose header
+    # doesn't parse, and any line that appears outside a hunk while no
+    # file header has been recognised yet.
+    preamble: list[str] = []
+
+    file_order: list[str] = []               # first-appearance order, deduplicated
+    sections: dict[str, _FileSection] = {}   # keyed the same way, one entry per file
+    file_delta: dict[str, int] = {}          # cumulative net-line delta, PER FILE,
+    # persists across every section seen for that file — this is the exact
+    # bookkeeping a repeated/interleaved header pattern used to reset to 0
+    # on every new section, corrupting every subsequent hunk's new_start
+    # for that file.
+
     files_touched: set[str] = set()
+    repeated_section_seen = False
 
-    # Per-hunk state
+    current_key: str | None = None
     hunk_orig_header: str | None = None
     hunk_old_start: int = 0
     hunk_claimed_new_start: int = 0
@@ -89,20 +125,34 @@ def _repair(patch: str, meta: RepairResult) -> tuple[str, RepairResult]:
     in_hunk: bool = False
 
     def flush_hunk() -> None:
-        nonlocal file_delta, in_hunk, hunk_orig_header, hunk_body
+        nonlocal in_hunk, hunk_orig_header, hunk_body
 
         if not in_hunk:
             return
 
         old_count, new_count = _count_body(hunk_body)
 
+        if current_key is None:
+            # A hunk with no recognised file header at all (malformed
+            # input) has nowhere structurally correct to go. Preserve it,
+            # unrewritten, in its original relative position rather than
+            # losing it -- this only ever happens on already-pathological
+            # input no test relies on the exact shape of.
+            preamble.append(hunk_orig_header)
+            preamble.extend(hunk_body)
+            in_hunk = False
+            hunk_orig_header = None
+            hunk_body = []
+            return
+
+        delta = file_delta.get(current_key, 0)
         # New-file sentinel: old_start=0 means the old file doesn't exist.
         # The delta formula doesn't apply; preserve the original new_start
         # (conventionally 1 for a new non-empty file, 0 for an empty one).
         if hunk_old_start == 0:
             correct_new_start = hunk_claimed_new_start
         else:
-            correct_new_start = hunk_old_start + file_delta
+            correct_new_start = hunk_old_start + delta
         rewritten = (
             f"@@ -{hunk_old_start},{old_count}"
             f" +{correct_new_start},{new_count}"
@@ -112,13 +162,11 @@ def _repair(patch: str, meta: RepairResult) -> tuple[str, RepairResult]:
         if rewritten != hunk_orig_header:
             meta.hunks_rewritten += 1
             meta.normalization_applied = True
-            if current_file is not None:
-                files_touched.add(current_file)
+            files_touched.add(current_key)
 
-        output.append(rewritten)
-        output.extend(hunk_body)
+        sections[current_key].hunks.append((rewritten, list(hunk_body)))
+        file_delta[current_key] = delta + (new_count - old_count)
 
-        file_delta += new_count - old_count
         in_hunk = False
         hunk_orig_header = None
         hunk_body = []
@@ -133,7 +181,7 @@ def _repair(patch: str, meta: RepairResult) -> tuple[str, RepairResult]:
             flush_hunk()
             m = _HUNK_RE.match(stripped)
             if not m:
-                output.append(line)  # malformed — pass through unchanged
+                preamble.append(line)  # malformed — pass through unchanged
                 i += 1
                 continue
             hunk_old_start = int(m.group(1))
@@ -158,12 +206,24 @@ def _repair(patch: str, meta: RepairResult) -> tuple[str, RepairResult]:
             and lines[i + 1].rstrip("\n").startswith("+++ ")
         ):
             flush_hunk()
-            file_delta = 0
-            # Track filename for metadata (strip a/ prefix when present)
-            raw = stripped[4:].split("\t")[0].strip()
-            current_file = raw[2:] if raw.startswith("a/") else raw
-            output.append(line)
-            output.append(lines[i + 1])
+            a_line, b_line = line, lines[i + 1]
+            a_raw = stripped[4:].split("\t")[0].strip()
+            b_raw = b_line.rstrip("\n")[4:].split("\t")[0].strip()
+            a_path = a_raw[2:] if a_raw.startswith("a/") else a_raw
+            b_path = b_raw[2:] if b_raw.startswith("b/") else b_raw
+            # Prefer the new-side path as the grouping key: for a new file
+            # the old side is always the literal "/dev/null" regardless of
+            # which new file it is, so keying on it would wrongly merge two
+            # unrelated new files in the same patch into one section.
+            key = b_path if b_path != "/dev/null" else a_path
+
+            if key not in sections:
+                sections[key] = _FileSection(header_a=a_line, header_b=b_line)
+                file_order.append(key)
+                file_delta[key] = 0
+            else:
+                repeated_section_seen = True
+            current_key = key
             i += 2
             continue
 
@@ -172,11 +232,29 @@ def _repair(patch: str, meta: RepairResult) -> tuple[str, RepairResult]:
             i += 1
             continue
 
-        output.append(line)  # preamble, diff --git lines, stray +++, etc.
+        if current_key is None:
+            preamble.append(line)  # preamble before any file header at all
+        # else: stray non-hunk, non-header content between sections of an
+        # already-malformed diff (e.g. injected prose) — not valid diff
+        # syntax either way, and rebuilding a valid structure has no
+        # correct place to put it; dropped rather than re-introducing the
+        # exact kind of misplaced content this function exists to repair.
         i += 1
 
     flush_hunk()
     meta.files_rewritten = len(files_touched)
+    if repeated_section_seen:
+        meta.normalization_applied = True
+
+    output: list[str] = list(preamble)
+    for key in file_order:
+        section = sections[key]
+        output.append(section.header_a)
+        output.append(section.header_b)
+        for header, body in section.hunks:
+            output.append(header)
+            output.extend(body)
+
     return "".join(output), meta
 
 
