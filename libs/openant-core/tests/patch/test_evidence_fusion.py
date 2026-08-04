@@ -421,6 +421,117 @@ class TestRenderCandidateFacts:
         assert "Enrichment: not attempted for this candidate" in rendered
 
 
+class TestRenderCandidateRoles:
+    def test_single_candidate_is_labeled_primary_only(self):
+        a = _candidate("a.py", "symbol_search", 2)
+        selection = _selection(a)
+        understanding = fuse_evidence(selection, investigation_context_available=True)
+
+        rendered = render_repository_understanding(understanding, max_chars=4_000)
+
+        assert "**Primary evidence**" in rendered
+        assert "**Supporting evidence**" not in rendered
+        assert "**Additional candidate**" not in rendered
+
+    def test_second_candidate_connected_by_call_graph_is_labeled_supporting(self):
+        primary = _candidate(
+            "primary.py", "explicit_path", 4,
+            enrichment=_enrichment(callees=["other.py:helper"]),
+        )
+        other = _candidate("other.py", "symbol_search", 2, enrichment=_enrichment())
+        selection = _selection(primary, other)
+        understanding = fuse_evidence(selection, investigation_context_available=True)
+
+        rendered = render_repository_understanding(understanding, max_chars=4_000)
+
+        primary_block = rendered.split("### `primary.py`", 1)[1].split("### `other.py`", 1)[0]
+        other_block = rendered.split("### `other.py`", 1)[1].split("###", 1)[0]
+
+        assert "**Primary evidence**" in primary_block
+        assert "**Supporting evidence**" in other_block
+        assert "**Additional candidate**" not in other_block
+
+    def test_relationship_detected_from_either_direction_still_labels_supporting(self):
+        # The edge is recorded via the OTHER candidate's callers_by_call_graph
+        # naming the primary, not via the primary's own callees -- role
+        # assignment must not care which side recorded it.
+        primary = _candidate("primary.py", "explicit_path", 4, enrichment=_enrichment())
+        other = _candidate(
+            "other.py", "symbol_search", 2,
+            enrichment=_enrichment(callers_by_call_graph=["primary.py:entry"]),
+        )
+        selection = _selection(primary, other)
+        understanding = fuse_evidence(selection, investigation_context_available=True)
+
+        rendered = render_repository_understanding(understanding, max_chars=4_000)
+
+        other_block = rendered.split("### `other.py`", 1)[1].split("###", 1)[0]
+        assert "**Supporting evidence**" in other_block
+
+    def test_second_candidate_with_no_relationship_is_labeled_independent(self):
+        primary = _candidate("primary.py", "explicit_path", 4, enrichment=_enrichment())
+        unrelated = _candidate("unrelated.py", "symbol_search", 2, enrichment=_enrichment())
+        selection = _selection(primary, unrelated)
+        understanding = fuse_evidence(selection, investigation_context_available=True)
+
+        rendered = render_repository_understanding(understanding, max_chars=4_000)
+
+        unrelated_block = rendered.split("### `unrelated.py`", 1)[1].split("###", 1)[0]
+
+        assert "**Additional candidate**" in unrelated_block
+        assert "**Supporting evidence**" not in unrelated_block
+
+    def test_text_search_only_connection_does_not_count_as_supporting(self):
+        # callers_by_text_search is regex-based and noisier than the call
+        # graph -- _find_call_relationships deliberately never builds a
+        # relationship from it, so role assignment must not either.
+        primary = _candidate(
+            "primary.py", "explicit_path", 4,
+            enrichment=_enrichment(
+                callers_by_text_search=[
+                    {"id": "other.py:maybe", "name": "maybe", "file": "other.py", "matches": []}
+                ],
+            ),
+        )
+        other = _candidate("other.py", "symbol_search", 2, enrichment=_enrichment())
+        selection = _selection(primary, other)
+        understanding = fuse_evidence(selection, investigation_context_available=True)
+
+        rendered = render_repository_understanding(understanding, max_chars=4_000)
+
+        other_block = rendered.split("### `other.py`", 1)[1].split("###", 1)[0]
+        assert "**Additional candidate**" in other_block
+        assert "**Supporting evidence**" not in other_block
+
+    def test_only_relationships_touching_the_primary_count_as_supporting(self):
+        # b and c are connected to EACH OTHER but neither is connected to
+        # the primary (a) -- that must not make either one "supporting";
+        # the signal is specifically "connected to the primary."
+        a = _candidate("a.py", "explicit_path", 4, enrichment=_enrichment())
+        b = _candidate("b.py", "symbol_search", 2, enrichment=_enrichment(callees=["c.py:helper"]))
+        c = _candidate("c.py", "cwe_keywords", 1, enrichment=_enrichment())
+        selection = _selection(a, b, c, max_candidates=3)
+        understanding = fuse_evidence(selection, investigation_context_available=True)
+
+        rendered = render_repository_understanding(understanding, max_chars=4_000)
+
+        b_block = rendered.split("### `b.py`", 1)[1].split("### `c.py`", 1)[0]
+        c_block = rendered.split("### `c.py`", 1)[1].split("###", 1)[0]
+
+        assert "**Additional candidate**" in b_block
+        assert "**Additional candidate**" in c_block
+
+    def test_role_labels_do_not_change_candidate_order(self):
+        a = _candidate("a.py", "explicit_path", 4, enrichment=_enrichment())
+        b = _candidate("b.py", "symbol_search", 2, enrichment=_enrichment())
+        selection = _selection(a, b)
+        understanding = fuse_evidence(selection, investigation_context_available=True)
+
+        rendered = render_repository_understanding(understanding, max_chars=4_000)
+
+        assert rendered.index("`a.py`") < rendered.index("`b.py`")
+
+
 class TestRenderRelationshipsAndNotes:
     def test_relationship_rendered_once_not_duplicated_in_notes(self):
         a = _candidate(

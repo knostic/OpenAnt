@@ -272,7 +272,13 @@ def render_repository_understanding(
     sections (heading, preamble, relationships, notes, investigation-context
     line) fit.
     """
-    candidate_blocks = [_render_candidate(c) for c in understanding.candidate_evidence]
+    candidate_blocks = [
+        _render_candidate(c, role)
+        for c, role in zip(
+            understanding.candidate_evidence,
+            _candidate_roles(understanding.candidate_evidence, understanding.relationships),
+        )
+    ]
     relationships_block = _render_relationships(understanding.relationships)
     notes_block = _render_notes(understanding)
     context_block = _render_investigation_context(understanding.investigation_context_available)
@@ -323,8 +329,56 @@ def _hard_clamp(rendered: str, max_chars: int) -> str:
     return rendered[:cut] + _TRUNCATION_MARKER
 
 
-def _render_candidate(candidate: RepositoryCandidate) -> str:
-    lines = [f"### `{candidate.path}`", "", _render_grounding_line(candidate)]
+_ROLE_LABELS = {
+    "primary": (
+        "**Primary evidence** -- the strongest-grounded candidate; not "
+        "necessarily the only location that needs to change."
+    ),
+    "supporting": (
+        "**Supporting evidence** -- connected to the primary candidate by a "
+        "direct call-graph relationship (see Structural relationships, "
+        "below); may be part of the same remediation flow."
+    ),
+    "independent": (
+        "**Additional candidate** -- matched independently during "
+        "grounding; not confirmed to be related to the primary candidate."
+    ),
+}
+
+
+def _candidate_roles(
+    candidate_evidence: list[RepositoryCandidate],
+    relationships: list[CandidateRelationship],
+) -> list[str]:
+    """One role per candidate, same order as ``candidate_evidence``.
+
+    Positional, not re-ranked: index 0 is "primary" because
+    candidate_selection.py has already sorted the list tier-descending/
+    path-ascending before fusion ever sees it -- this function trusts that
+    order rather than recomputing it. Every other candidate is "supporting"
+    only if a real call-graph edge (from ``relationships``, never the
+    noisier ``callers_by_text_search``) connects it to the primary; that is
+    the one existing signal for "same remediation flow." Everything else is
+    "independent" -- evidence found on its own, not claimed to be related.
+    """
+    if not candidate_evidence:
+        return []
+
+    primary_path = candidate_evidence[0].path
+    connected_to_primary = {
+        rel.to_path if rel.from_path == primary_path else rel.from_path
+        for rel in relationships
+        if rel.from_path == primary_path or rel.to_path == primary_path
+    }
+
+    roles = ["primary"]
+    for candidate in candidate_evidence[1:]:
+        roles.append("supporting" if candidate.path in connected_to_primary else "independent")
+    return roles
+
+
+def _render_candidate(candidate: RepositoryCandidate, role: str) -> str:
+    lines = [f"### `{candidate.path}`", "", _ROLE_LABELS[role], "", _render_grounding_line(candidate)]
 
     enrichment = candidate.enrichment
     if enrichment is None:
