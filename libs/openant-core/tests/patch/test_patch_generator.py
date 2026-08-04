@@ -496,3 +496,54 @@ class TestRetryHint:
 
         _system, user_message = llm.complete.call_args[0]
         assert "## Retry instruction" not in user_message
+
+
+# ---------------------------------------------------------------------------
+# Base prompt content — no repository-specific contamination
+# ---------------------------------------------------------------------------
+
+class TestPromptGeneratorMarkdownIsGeneric:
+    """The base system prompt is sent verbatim to every patch-generation
+    call, for every target repository. It must never contain terms specific
+    to one repository (e.g. GitPython internals leaked into the universal
+    template) -- those are hard errors for a completely unrelated repo like
+    urllib3, not real patch-generation rules."""
+
+    # Exact, proven-leaked terms only -- not a broad denylist of every
+    # benchmark repo name, and not generic words (`HEAD`, `file`, `git`,
+    # `repository`, `path`) that would produce fragile false positives.
+    _LEAKED_GITPYTHON_TERMS = [
+        "for_git_dir",
+        "repo.common_dir",
+        "ORIG_HEAD",
+        "FETCH_HEAD",
+        "MERGE_HEAD",
+        "LockedFD",
+        "assure_directory_exists",
+    ]
+
+    def _prompt_text(self) -> str:
+        from utilities.autopatcher.patch_generator import _PROMPT_PATH
+        return _PROMPT_PATH.read_text(encoding="utf-8")
+
+    def test_no_gitpython_specific_terms_in_base_prompt(self):
+        prompt = self._prompt_text()
+        leaked = [term for term in self._LEAKED_GITPYTHON_TERMS if term in prompt]
+        assert leaked == [], f"repository-specific terms leaked into the universal prompt: {leaked}"
+
+    def test_prompt_still_requires_a_unified_diff(self):
+        prompt = self._prompt_text()
+        assert "unified diff" in prompt.lower()
+
+    def test_prompt_still_references_repository_code_context(self):
+        prompt = self._prompt_text()
+        assert "repository code context" in prompt.lower()
+
+    def test_prompt_still_discourages_unrelated_changes(self):
+        prompt = self._prompt_text()
+        assert "unrelated" in prompt.lower()
+
+    def test_prompt_still_honors_an_authoritative_patch_plan(self):
+        prompt = self._prompt_text()
+        assert "Patch Plan" in prompt
+        assert "authoritative" in prompt.lower()
