@@ -20,6 +20,13 @@ _PIP_STDERR = (
 
 _CORRUPT_STDERR = "error: corrupt patch at line 7\n"
 
+_URLLIB3_MULTI_STDERR = (
+    "error: patch failed: src/urllib3/util/retry.py:262\n"
+    "error: src/urllib3/util/retry.py: patch does not apply\n"
+    "error: patch failed: src/urllib3/poolmanager.py:8\n"
+    "error: src/urllib3/poolmanager.py: patch does not apply\n"
+)
+
 _PIP_DIFF_ORIG = """\
 ```diff
 --- a/src/pip/_internal/download.py
@@ -83,6 +90,75 @@ class TestExtractFailedFile:
         # Both formats present — patch failed is matched first
         result = _extract_failed_file(_PIP_STDERR)
         assert result == "src/pip/_internal/download.py"
+
+
+# ---------------------------------------------------------------------------
+# _extract_failed_files (multi-file)
+# ---------------------------------------------------------------------------
+
+class TestExtractFailedFiles:
+    def test_single_file_stderr_returns_length_one_list(self):
+        from utilities.autopatcher.pipeline import _extract_failed_files
+        result = _extract_failed_files(_PIP_STDERR)
+        assert result == ["src/pip/_internal/download.py"]
+
+    def test_two_file_stderr_returns_ordered_list(self):
+        from utilities.autopatcher.pipeline import _extract_failed_files
+        result = _extract_failed_files(_URLLIB3_MULTI_STDERR)
+        assert result == [
+            "src/urllib3/util/retry.py",
+            "src/urllib3/poolmanager.py",
+        ]
+
+    def test_file_matched_by_both_regexes_appears_once(self):
+        from utilities.autopatcher.pipeline import _extract_failed_files
+        # _PIP_STDERR names the same file via both the "patch failed" and
+        # "patch does not apply" lines.
+        result = _extract_failed_files(_PIP_STDERR)
+        assert result.count("src/pip/_internal/download.py") == 1
+
+    def test_empty_stderr_returns_empty_list(self):
+        from utilities.autopatcher.pipeline import _extract_failed_files
+        assert _extract_failed_files("") == []
+
+    def test_none_stderr_returns_empty_list(self):
+        from utilities.autopatcher.pipeline import _extract_failed_files
+        assert _extract_failed_files(None) == []
+
+    def test_three_file_stderr_returns_ordered_list(self):
+        from utilities.autopatcher.pipeline import _extract_failed_files
+        stderr = (
+            "error: patch failed: src/urllib3/util/retry.py:1\n"
+            "error: src/urllib3/util/retry.py: patch does not apply\n"
+            "error: patch failed: src/urllib3/poolmanager.py:5\n"
+            "error: src/urllib3/poolmanager.py: patch does not apply\n"
+            "error: patch failed: src/urllib3/contrib/pyopenssl.py:9\n"
+            "error: src/urllib3/contrib/pyopenssl.py: patch does not apply\n"
+        )
+        result = _extract_failed_files(stderr)
+        assert result == [
+            "src/urllib3/util/retry.py",
+            "src/urllib3/poolmanager.py",
+            "src/urllib3/contrib/pyopenssl.py",
+        ]
+
+    def test_mixed_dedup_with_other_single_match_files(self):
+        # fileA is named by BOTH regexes, fileB only by "patch failed",
+        # fileC only by "patch does not apply" -- dedup must not accidentally
+        # drop or reorder B/C just because A appears twice.
+        from utilities.autopatcher.pipeline import _extract_failed_files
+        stderr = (
+            "error: patch failed: src/urllib3/util/retry.py:1\n"
+            "error: src/urllib3/util/retry.py: patch does not apply\n"
+            "error: patch failed: src/urllib3/poolmanager.py:5\n"
+            "error: src/urllib3/contrib/pyopenssl.py: patch does not apply\n"
+        )
+        result = _extract_failed_files(stderr)
+        assert result == [
+            "src/urllib3/util/retry.py",
+            "src/urllib3/poolmanager.py",
+            "src/urllib3/contrib/pyopenssl.py",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +335,220 @@ class TestRetryTriggered:
             run("pip vuln", api_key="", repo_root=str(tmp_path))
             _args, kwargs = mock_gen.call_args_list[1]
             assert kwargs.get("retry_hint") or (len(_args) > 3 and _args[3])
+
+
+# ---------------------------------------------------------------------------
+# Retry triggered — multi-file stderr (regression test for the single-file
+# recovery bug: a real multi-file "does not apply" failure must recover
+# every named file, not just the first).
+# ---------------------------------------------------------------------------
+
+class TestRetryMultiFile:
+    def _setup_mocks(self, retry_applicable: bool = True):
+        first_app = {
+            "applicable": False, "skipped": False, "stderr": _URLLIB3_MULTI_STDERR,
+            "exit_code": 1, "skipped_reason": None, "error": None,
+        }
+        retry_app = {
+            "applicable": retry_applicable, "skipped": False, "stderr": "",
+            "exit_code": 0 if retry_applicable else 1,
+            "skipped_reason": None, "error": None,
+        }
+        return first_app, retry_app
+
+    def test_retry_code_context_includes_both_files(self, tmp_path):
+        retry_file = tmp_path / "src/urllib3/util/retry.py"
+        pool_file = tmp_path / "src/urllib3/poolmanager.py"
+        retry_file.parent.mkdir(parents=True, exist_ok=True)
+        pool_file.parent.mkdir(parents=True, exist_ok=True)
+        retry_file.write_text("RETRY_MARKER_CONTENT\ndef retry(): pass\n", encoding="utf-8")
+        pool_file.write_text("POOLMANAGER_MARKER_CONTENT\nclass PoolManager: pass\n", encoding="utf-8")
+
+        first_app, retry_app = self._setup_mocks(retry_applicable=True)
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+                       side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       side_effect=[first_app, retry_app]),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("urllib3 vuln", api_key="", repo_root=str(tmp_path))
+            assert mock_gen.call_count == 2
+            _args, kwargs = mock_gen.call_args_list[1]
+            retry_code_context = kwargs.get("code_context", "")
+            # Both files' real content must be present — not just the first
+            # file named in a multi-file "patch does not apply" failure.
+            assert "RETRY_MARKER_CONTENT" in retry_code_context
+            assert "POOLMANAGER_MARKER_CONTENT" in retry_code_context
+            assert "src/urllib3/util/retry.py" in retry_code_context
+            assert "src/urllib3/poolmanager.py" in retry_code_context
+
+    def test_retry_proceeds_when_one_of_two_files_missing(self, tmp_path):
+        # Only the first failed file exists on disk; the second was
+        # deleted/renamed. The retry must still proceed using the readable
+        # file's real content, with the missing one noted (not silently
+        # dropped, not a crash).
+        retry_file = tmp_path / "src/urllib3/util/retry.py"
+        retry_file.parent.mkdir(parents=True, exist_ok=True)
+        retry_file.write_text("RETRY_MARKER_CONTENT\ndef retry(): pass\n", encoding="utf-8")
+
+        first_app, retry_app = self._setup_mocks(retry_applicable=True)
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+                       side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       side_effect=[first_app, retry_app]),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("urllib3 vuln", api_key="", repo_root=str(tmp_path))
+            assert mock_gen.call_count == 2
+            _args, kwargs = mock_gen.call_args_list[1]
+            retry_code_context = kwargs.get("code_context", "")
+            assert "RETRY_MARKER_CONTENT" in retry_code_context
+            assert "src/urllib3/poolmanager.py" in retry_code_context
+            assert "could not be read" in retry_code_context
+
+    def test_retry_skipped_when_all_failed_files_missing(self, tmp_path):
+        # Neither failed file exists on disk. No real content can be
+        # included at all, so the retry must not be attempted a second time.
+        first_app, _retry_app = self._setup_mocks(retry_applicable=True)
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+                       return_value=_CLEAN_DIFF) as mock_gen,
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value=first_app),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("urllib3 vuln", api_key="", repo_root=str(tmp_path))
+            # generate_patch must be called exactly once — the initial
+            # generation — never a second time for a retry with no content.
+            assert mock_gen.call_count == 1
+
+    def test_aggregate_budget_omission_note(self, tmp_path):
+        # Each file is well under _RETRY_CONTENT_LIMIT alone, but together
+        # they exceed it -- the first must be included in full, the second
+        # omitted (not truncated) with an explicit note naming it.
+        from utilities.autopatcher.pipeline import _RETRY_CONTENT_LIMIT
+
+        retry_file = tmp_path / "src/urllib3/util/retry.py"
+        pool_file = tmp_path / "src/urllib3/poolmanager.py"
+        retry_file.parent.mkdir(parents=True, exist_ok=True)
+        pool_file.parent.mkdir(parents=True, exist_ok=True)
+        chunk = int(_RETRY_CONTENT_LIMIT * 0.6)
+        retry_file.write_text("RETRY_MARKER_CONTENT\n" + ("a" * chunk), encoding="utf-8")
+        pool_file.write_text("POOLMANAGER_MARKER_CONTENT\n" + ("b" * chunk), encoding="utf-8")
+
+        first_app, retry_app = self._setup_mocks(retry_applicable=True)
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+                       side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       side_effect=[first_app, retry_app]),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("urllib3 vuln", api_key="", repo_root=str(tmp_path))
+            assert mock_gen.call_count == 2
+            _args, kwargs = mock_gen.call_args_list[1]
+            retry_code_context = kwargs.get("code_context", "")
+            assert "RETRY_MARKER_CONTENT" in retry_code_context
+            assert "POOLMANAGER_MARKER_CONTENT" not in retry_code_context
+            assert "omitted to stay within" in retry_code_context
+            assert "src/urllib3/poolmanager.py" in retry_code_context
+
+    def test_oversized_alone_plus_missing_file_skips_retry_entirely(self, tmp_path):
+        # File A is readable but exceeds the budget by itself (so it lands
+        # in omitted_files, contributing no real content); file B is simply
+        # missing (so it only ever contributes a "could not be read" note).
+        # No real content survives from either file, so the retry must not
+        # be attempted -- this is the regression test for the bug where
+        # "any read attempt succeeded" was wrongly treated as "there is
+        # real content to send."
+        from utilities.autopatcher.pipeline import _RETRY_CONTENT_LIMIT
+
+        retry_file = tmp_path / "src/urllib3/util/retry.py"
+        retry_file.parent.mkdir(parents=True, exist_ok=True)
+        retry_file.write_text("a" * (_RETRY_CONTENT_LIMIT + 1_000), encoding="utf-8")
+        # src/urllib3/poolmanager.py deliberately not created on disk.
+
+        first_app, _retry_app = self._setup_mocks(retry_applicable=True)
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+                       return_value=_CLEAN_DIFF) as mock_gen,
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value=first_app),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("urllib3 vuln", api_key="", repo_root=str(tmp_path))
+            assert mock_gen.call_count == 1
+
+    def test_retry_failed_file_is_first_of_multiple(self, tmp_path):
+        # retry_failed_file (the report-facing field) must stay a single
+        # string -- the first failed file -- even when multiple files failed.
+        retry_file = tmp_path / "src/urllib3/util/retry.py"
+        pool_file = tmp_path / "src/urllib3/poolmanager.py"
+        retry_file.parent.mkdir(parents=True, exist_ok=True)
+        pool_file.parent.mkdir(parents=True, exist_ok=True)
+        retry_file.write_text("RETRY_MARKER_CONTENT\n", encoding="utf-8")
+        pool_file.write_text("POOLMANAGER_MARKER_CONTENT\n", encoding="utf-8")
+
+        first_app, retry_app = self._setup_mocks(retry_applicable=True)
+        captured_result = {}
+        import utilities.autopatcher.pipeline as _pipeline_mod
+        original_build_report = _pipeline_mod._build_report
+
+        def capture_result(r):
+            captured_result["result"] = r
+            return original_build_report(r)
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+                       side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]),
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       side_effect=[first_app, retry_app]),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.pipeline._build_report", side_effect=capture_result),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("urllib3 vuln", api_key="", repo_root=str(tmp_path))
+
+        result = captured_result["result"]
+        assert result.retry_failed_file == "src/urllib3/util/retry.py"
+        assert isinstance(result.retry_failed_file, str)
 
 
 # ---------------------------------------------------------------------------

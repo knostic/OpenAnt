@@ -2377,14 +2377,21 @@ _RETRY_CONTENT_LIMIT = 50_000
 _RETRY_STDERR_LINES = 6
 
 
+def _extract_failed_files(stderr: str) -> list[str]:
+    """Every file named in git-apply failure stderr, in stderr order,
+    de-duplicated (a file matched by both regexes appears once). Patch-failed
+    matches are collected before does-not-apply matches, so the priority
+    established by the old single-file `_extract_failed_file` is preserved.
+    """
+    stderr = stderr or ""
+    names = [m.group(1).strip() for m in _PATCH_FAILED_RE.finditer(stderr)]
+    names += [m.group(1).strip() for m in _DOES_NOT_APPLY_RE.finditer(stderr)]
+    return list(dict.fromkeys(names))
+
+
 def _extract_failed_file(stderr: str) -> str | None:
-    m = _PATCH_FAILED_RE.search(stderr or "")
-    if m:
-        return m.group(1).strip()
-    m = _DOES_NOT_APPLY_RE.search(stderr or "")
-    if m:
-        return m.group(1).strip()
-    return None
+    files = _extract_failed_files(stderr)
+    return files[0] if files else None
 
 
 def _extract_patch_target(patch: str) -> str | None:
@@ -2632,23 +2639,60 @@ def run(
 
     if applicability_result.get("applicable") is False and repo_root:
         stderr = applicability_result.get("stderr", "")
-        failed_file = _extract_failed_file(stderr)
-        if not failed_file:
-            failed_file = _extract_patch_target(patch)
+        failed_files = _extract_failed_files(stderr)
+        if not failed_files:
+            _target = _extract_patch_target(patch)
+            if _target:
+                failed_files = [_target]
 
-        if failed_file:
+        if failed_files:
+            failed_file = failed_files[0]
             print(f"[pipeline] Applicability failed — `{failed_file}` did not apply; attempting retry …", file=sys.stderr)
             retry_failed_file = failed_file
             retry_error_before = stderr
             try:
                 repo_ctx = TargetRepoContext(Path(repo_root))
-                actual_content = repo_ctx.read_file(failed_file)
-                if len(actual_content) > _RETRY_CONTENT_LIMIT:
+                # True only once a *successfully-read* file's block actually lands in
+                # `blocks` (not `omitted_files`). Gating on this — rather than on "was
+                # any read attempt successful" — matters because a large-but-readable
+                # file can itself exceed the budget and land in `omitted_files` while
+                # an unrelated unreadable file's small "(could not be read)" note still
+                # fits and lands in `blocks`; without this distinction the retry would
+                # proceed with a code_context containing zero real source.
+                included_real_content = False
+                blocks: list[str] = []
+                omitted_files: list[str] = []
+                running = 0
+                for f in failed_files:
+                    is_real_content = False
+                    try:
+                        f_content = repo_ctx.read_file(f)
+                        is_real_content = True
+                        n_lines = len(f_content.splitlines())
+                        block = f"# {f} (full file, {n_lines} lines)\n{f_content}\n"
+                    except Exception:
+                        block = f"### {f}\n\n(could not be read — likely deleted or renamed)\n"
+                    if running + len(block) <= _RETRY_CONTENT_LIMIT:
+                        blocks.append(block)
+                        running += len(block)
+                        included_real_content = included_real_content or is_real_content
+                    else:
+                        omitted_files.append(f)
+
+                if not included_real_content:
                     print(
-                        f"[pipeline] Retry skipped — `{failed_file}` is "
-                        f"{len(actual_content)} chars (limit {_RETRY_CONTENT_LIMIT})."
-                    , file=sys.stderr)
+                        f"[pipeline] Retry skipped — no real content for the failed "
+                        f"file(s) ({', '.join(failed_files)}) could be included "
+                        f"(missing, unreadable, or over the {_RETRY_CONTENT_LIMIT}-character budget).",
+                        file=sys.stderr,
+                    )
                 else:
+                    actual_content = "\n".join(blocks)
+                    if omitted_files:
+                        actual_content += (
+                            f"\n\n*({len(omitted_files)} file(s) omitted to stay within the "
+                            f"{_RETRY_CONTENT_LIMIT}-character budget: {', '.join(omitted_files)})*\n"
+                        )
                     retry_attempted = True
                     hint = _build_retry_hint(stderr, failed_file)
                     r_patch_raw = generate_patch(
