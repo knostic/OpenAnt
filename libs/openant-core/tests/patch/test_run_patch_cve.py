@@ -214,11 +214,12 @@ class TestRunPatchCveRepoRootNormalization:
         captured = {}
         original_run = _pipeline_module.run
 
-        def _capturing_run(*, vulnerability_text, api_key, repo_root=None, investigation_output_dir=None):
+        def _capturing_run(*, vulnerability_text, api_key, repo_root=None, investigation_output_dir=None, budget_controller=None):
             captured["repo_root"] = repo_root
             return original_run(
                 vulnerability_text=vulnerability_text, api_key=api_key,
                 repo_root=repo_root, investigation_output_dir=investigation_output_dir,
+                budget_controller=budget_controller,
             )
 
         with _mock_fetch_cve_at_source(), mock.patch.object(_pipeline_module, "run", side_effect=_capturing_run):

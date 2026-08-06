@@ -1541,3 +1541,96 @@ class TestRepositoryContextSection:
 
         assert "References a symbol named in the advisory" in block_b
         assert "Supporting reference (excerpt)" in block_b
+
+
+# ---------------------------------------------------------------------------
+# Evidence Sufficiency Gate (Phase 1) -- end-to-end report rendering
+#
+# source_verification.py computes the signal; pipeline.py merges it into
+# the Trust Signals dict as a NEW key, observability-only. These tests
+# build PipelineResult directly and call _build_report() -- no LLM calls.
+# ---------------------------------------------------------------------------
+
+class TestSourceVerificationInReport:
+    def _base_kwargs(self, tmp_path, source_verification=None):
+        return dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch=(
+                "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n"
+                " def foo():\n-    return 1\n+    return 2\n"
+            ),
+            review=(
+                "**Explanation:**\nThe code was vulnerable because of X.\n\n"
+                "**Affected areas:**\n- mod.py\n\n"
+                "**Validation notes:**\n- Test with payload Y.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""},
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            repo_root=tmp_path,
+            detected_language="python",
+            source_verification=source_verification,
+        )
+
+    def test_signal_absent_falls_back_to_not_verified(self, tmp_path):
+        """A run/test predating this field (or one where the classification
+        itself failed) must render "Not verified" -- never a false
+        "Confirmed" manufactured from missing data."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs(tmp_path, source_verification=None))
+        report = _build_report(result)
+        assert "Was the edited content verified against the repository?" in report
+        row = [l for l in report.splitlines() if l.startswith("| Was the edited content")][0]
+        assert "? Not verified" in row
+
+    def test_confirmed_signal_renders_as_good(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        sig = {"value": "Confirmed", "label": "✓ Confirmed", "notes": "1 hunk(s) matched the repository uniquely"}
+        result = PipelineResult(**self._base_kwargs(tmp_path, source_verification=sig))
+        report = _build_report(result)
+        row = [l for l in report.splitlines() if l.startswith("| Was the edited content")][0]
+        assert "✅ Good" in row
+        assert "1 hunk(s) matched the repository uniquely" in row
+
+    def test_unverified_signal_renders_but_does_not_change_decision(self, tmp_path):
+        """The core Phase-1 contract: the signal is visible, but the
+        Recommendation is unaffected -- same decision as the Confirmed case
+        above, for otherwise-identical inputs."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        confirmed = {"value": "Confirmed", "label": "Confirmed", "notes": ""}
+        unverified = {
+            "value": "Unverified", "label": "Unverified",
+            "notes": "1 hunk(s) edit content not found anywhere in the repository: mod.py",
+        }
+
+        good_report = _build_report(PipelineResult(**self._base_kwargs(tmp_path, source_verification=confirmed)))
+        bad_report = _build_report(PipelineResult(**self._base_kwargs(tmp_path, source_verification=unverified)))
+
+        bad_row = [l for l in bad_report.splitlines() if l.startswith("| Was the edited content")][0]
+        assert "❌ Content not found" in bad_row
+        assert "mod.py" in bad_row
+
+        # Same Recommendation decision either way -- this signal does not
+        # yet drive Recommendation Policy. Both inputs are identical except
+        # for source_verification, so whichever of the four known decision
+        # strings appears in one report must appear in the other too.
+        known_decisions = (
+            "Deploy After Validation", "Deploy With Caution",
+            "Manual Review Required", "Do Not Apply",
+        )
+        for decision in known_decisions:
+            if f"**{decision}**" in good_report:
+                assert f"**{decision}**" in bad_report, (
+                    f"good_report chose {decision!r} but bad_report did not"
+                )
+                break
+        else:
+            raise AssertionError("no known decision string found in good_report")

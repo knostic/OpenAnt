@@ -3,8 +3,18 @@
 LLMs frequently generate unified diffs with arithmetically wrong @@ -a,b +c,d @@
 counts. This module recomputes b and d from the actual hunk body lines, and
 recomputes c as old_start + cumulative_prior_net_delta within the same file.
-The old start line (a) is preserved as-is — it is the LLM's positional anchor
-and requires knowledge of the original file to validate independently.
+
+The old start line (a) is the LLM's positional anchor. When `repo_root` is
+supplied, `a` is no longer trusted blindly either: the hunk's own OLD-side
+content (context + removed lines) is searched for in the real target file
+via content_relocation.find_unique_occurrence, and `a` is corrected to that
+location when a unique match is found. This is the same failure mode
+impact_surface.py's module docstring documents independently -- an
+LLM-generated hunk can be anchored at a drifted line number even when its
+content is byte-identical to the real file -- fixed here at the point that
+actually matters for `git apply`, not only for impact analysis. When no
+`repo_root` is given, or the match is absent or ambiguous, `a` is left
+exactly as the LLM wrote it, same as before this capability existed.
 
 It also structurally REBUILDS the diff so every file appears exactly once —
 one "--- a/X"/"+++ b/X" header pair followed by ALL of that file's hunks, in
@@ -20,7 +30,7 @@ line — only which header a hunk is filed under and where in the output it
 appears.
 
 Public API:
-    repair_hunk_headers(patch: str) -> tuple[str, RepairResult]
+    repair_hunk_headers(patch: str, repo_root: Path | str | None = None) -> tuple[str, RepairResult]
 
 RepairResult fields:
     normalization_applied : bool  — True if any @@ line was changed, or any
@@ -28,12 +38,21 @@ RepairResult fields:
                                      than one header-pair section
     hunks_rewritten       : int   — number of @@ headers with corrected values
     files_rewritten       : int   — number of distinct filenames with ≥1 rewrite
+    hunks_relocated       : int   — number of hunks whose old-side line number
+                                     was corrected by content relocation
+                                     (subset of hunks_rewritten; 0 whenever
+                                     repo_root is omitted)
+    relocations           : list[HunkRelocationRecord] — one entry per hunk,
+                                     observability only (see class docstring)
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
+
+from .content_relocation import find_unique_occurrence, locate_occurrence, old_side_anchors
 
 
 _HUNK_RE = re.compile(
@@ -42,15 +61,50 @@ _HUNK_RE = re.compile(
 _FENCE_OPEN_RE = re.compile(r"^```")
 
 
+@dataclass(frozen=True)
+class HunkRelocationRecord:
+    """Observability-only record of one hunk's relocation attempt.
+
+    Never consulted by any decision logic — the actual relocation decision
+    (whether/where to move `hunk_old_start`) is made entirely by the
+    existing `find_unique_occurrence` call in `_repair`'s `flush_hunk`;
+    this record is populated alongside it, from a separate
+    `locate_occurrence` call, purely so a caller can report what happened.
+
+    relocation_reason: "unique_match" | "ambiguous" | "no_match" | "skipped"
+      "skipped" covers every case relocation was never attempted at all —
+      no repo_root, a new-file hunk (old_start == 0), the target file
+      couldn't be read, or the hunk has no old-side anchors to search for
+      (a pure-insertion hunk).
+    relocated_hunk_start: set whenever a unique match was found, even when
+      it equals original_hunk_start (the LLM's claim was already correct —
+      no correction was needed, but the position was confirmed). None for
+      ambiguous/no_match/skipped.
+    """
+    file: str
+    relocation_attempted: bool
+    relocation_performed: bool
+    relocation_reason: str
+    original_hunk_start: int
+    relocated_hunk_start: "int | None"
+
+
 @dataclass
 class RepairResult:
     normalization_applied: bool = False
     hunks_rewritten: int = 0
     files_rewritten: int = 0
+    hunks_relocated: int = 0
+    relocations: "list[HunkRelocationRecord]" = field(default_factory=list)
 
 
-def repair_hunk_headers(patch: str) -> tuple[str, RepairResult]:
-    """Recompute unified diff hunk header counts from body content.
+def repair_hunk_headers(patch: str, repo_root: "Path | str | None" = None) -> tuple[str, RepairResult]:
+    """Recompute unified diff hunk header counts from body content, and —
+    when `repo_root` is given — correct each hunk's old-side line number by
+    locating its actual content in the real target file (see module
+    docstring and content_relocation.py). `repo_root` is optional and
+    defaults to None, preserving prior behavior for existing callers that
+    don't pass it (position is left exactly as the LLM wrote it).
 
     Returns (repaired_patch, RepairResult).
     Never raises — on any unexpected error returns (original_patch, RepairResult()).
@@ -60,7 +114,7 @@ def repair_hunk_headers(patch: str) -> tuple[str, RepairResult]:
         return patch, meta
     try:
         open_fence, clean, close_fence = _strip_md_fences(patch)
-        repaired, meta = _repair(clean, meta)
+        repaired, meta = _repair(clean, meta, Path(repo_root) if repo_root else None)
         return open_fence + repaired + close_fence, meta
     except Exception:
         return patch, meta
@@ -93,8 +147,36 @@ class _FileSection:
     hunks: list = field(default_factory=list)  # list of (header_line, body_lines)
 
 
-def _repair(patch: str, meta: RepairResult) -> tuple[str, RepairResult]:
+def _repair(patch: str, meta: RepairResult, repo_root: "Path | None" = None) -> tuple[str, RepairResult]:
     lines = patch.splitlines(keepends=True)
+
+    # Lazily-loaded, per-file cache of the CURRENT (pre-patch) target file's
+    # lines, keyed the same way `sections`/`file_delta` are keyed below (the
+    # new-side path, or the old-side path for a deletion). None is cached
+    # for a file that can't be read (missing, renamed, repo_root omitted) so
+    # every hunk in that file skips relocation without re-attempting the
+    # read each time.
+    _file_lines_cache: dict[str, "list[str] | None"] = {}
+
+    def _load_file_lines(key: str) -> "list[str] | None":
+        if key in _file_lines_cache:
+            return _file_lines_cache[key]
+        result: "list[str] | None" = None
+        if repo_root is not None:
+            try:
+                # `key` comes from the LLM-authored diff header, same trust
+                # level as the rest of the patch text -- resolve and require
+                # it stays inside repo_root before reading (same guard
+                # remediation_planner._verify_file uses for the same reason).
+                resolved_root = repo_root.resolve()
+                candidate = (resolved_root / key).resolve()
+                candidate.relative_to(resolved_root)
+                if candidate.is_file():
+                    result = candidate.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                result = None
+        _file_lines_cache[key] = result
+        return result
 
     # Content that appears before the first recognised file header (or,
     # for pathological/non-diff input, everything — see the final-assembly
@@ -125,7 +207,7 @@ def _repair(patch: str, meta: RepairResult) -> tuple[str, RepairResult]:
     in_hunk: bool = False
 
     def flush_hunk() -> None:
-        nonlocal in_hunk, hunk_orig_header, hunk_body
+        nonlocal in_hunk, hunk_orig_header, hunk_body, hunk_old_start
 
         if not in_hunk:
             return
@@ -144,6 +226,55 @@ def _repair(patch: str, meta: RepairResult) -> tuple[str, RepairResult]:
             hunk_orig_header = None
             hunk_body = []
             return
+
+        # Content-based relocation (Candidate 1): the LLM's claimed
+        # old_start is a positional guess that can drift from the real file
+        # even when the hunk's own content is byte-identical to it (see
+        # module docstring). Confirm/correct that guess by finding where
+        # the hunk's OLD-side lines actually, uniquely occur in the real
+        # target file -- never for a new-file hunk (old_start == 0, there
+        # is no old file to search), and never when the match is absent or
+        # ambiguous (leave the claimed position untouched rather than
+        # guess). Purely textual: no AST, no language-specific parsing.
+        #
+        # Telemetry (observability only): the four `_telemetry_*` locals
+        # below record what happened for HunkRelocationRecord. They are
+        # populated alongside the decision, never instead of it -- the
+        # actual decision (whether/where to move `hunk_old_start`) is made
+        # entirely by the `find_unique_occurrence` call and its `if` below,
+        # byte-for-byte the same as before telemetry existed. The
+        # `locate_occurrence` call exists only to classify *why*, via a
+        # separate function (see its docstring), and its own return value
+        # is read here only for the telemetry record, never for the decision.
+        _telemetry_original_start = hunk_old_start
+        _telemetry_attempted = False
+        _telemetry_performed = False
+        _telemetry_reason = "skipped"
+        _telemetry_relocated_start: "int | None" = None
+        if hunk_old_start != 0:
+            file_lines = _load_file_lines(current_key)
+            if file_lines is not None:
+                anchors = old_side_anchors(hunk_body)
+                if anchors:
+                    _telemetry_attempted = True
+                    _located_for_telemetry, _telemetry_reason = locate_occurrence(anchors, file_lines)
+                    if _located_for_telemetry is not None:
+                        _telemetry_relocated_start = _located_for_telemetry + 1
+
+                located = find_unique_occurrence(anchors, file_lines)
+                if located is not None and located + 1 != hunk_old_start:
+                    hunk_old_start = located + 1  # 1-indexed
+                    meta.hunks_relocated += 1
+                    _telemetry_performed = True
+
+        meta.relocations.append(HunkRelocationRecord(
+            file=current_key,
+            relocation_attempted=_telemetry_attempted,
+            relocation_performed=_telemetry_performed,
+            relocation_reason=_telemetry_reason,
+            original_hunk_start=_telemetry_original_start,
+            relocated_hunk_start=_telemetry_relocated_start,
+        ))
 
         delta = file_delta.get(current_key, 0)
         # New-file sentinel: old_start=0 means the old file doesn't exist.

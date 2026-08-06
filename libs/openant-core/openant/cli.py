@@ -39,6 +39,19 @@ def _output_json(data: dict):
     sys.stdout.write("\n")
 
 
+def _positive_int(value: str) -> int:
+    """argparse `type=` validator for --max-context-budget-windows -- a
+    positive integer only, no unbounded sentinel (e.g. 0/-1/"unlimited")
+    accepted."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return parsed
+
+
 def _load_step_reports(directory: str) -> list[dict]:
     """Load all {step}.report.json files from a directory.
 
@@ -586,6 +599,7 @@ def cmd_patch(args):
     from core.patch import run_patch, run_patch_cve
     from core.schemas import success, error
     from core.step_report import step_context
+    from utilities.autopatcher.context_budget import ContextBudgetController
 
     finding_id = getattr(args, "finding_id", None)
     cve = getattr(args, "cve", None)
@@ -604,6 +618,16 @@ def cmd_patch(args):
 
     output_dir = args.output or tempfile.mkdtemp(prefix="openant_patch_")
 
+    # Conservative defaults (see patch_p.add_argument("--context-budget-policy",
+    # ...) above): "ask" for an interactive run, "never" otherwise -- so a
+    # non-interactive invocation (CI, a pipe) never blocks on input just
+    # because no policy was explicitly chosen.
+    policy = getattr(args, "context_budget_policy", None) or (
+        "ask" if sys.stdin.isatty() else "never"
+    )
+    max_windows = getattr(args, "max_context_budget_windows", None) or 10
+    budget_controller = ContextBudgetController(policy=policy, max_windows=max_windows)
+
     try:
         if cve:
             with step_context("patch", output_dir, inputs={"cve": cve}) as ctx:
@@ -611,6 +635,7 @@ def cmd_patch(args):
                     cve_id=cve,
                     repo_root=args.repo_root,
                     output_dir=output_dir,
+                    budget_controller=budget_controller,
                 )
                 ctx.outputs = {
                     "vulnerability_path": result.vulnerability_path,
@@ -626,6 +651,7 @@ def cmd_patch(args):
                     finding_id=finding_id,
                     output_dir=output_dir,
                     repo_root=args.repo_root,
+                    budget_controller=budget_controller,
                 )
                 ctx.outputs = {
                     "vulnerability_path": result.vulnerability_path,
@@ -1622,6 +1648,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo-root", help="Path to the target repository root (required when using --cve)"
     )
     patch_p.add_argument("--output", "-o", help="Output directory (default: temp dir)")
+    patch_p.add_argument(
+        "--context-budget-policy",
+        choices=["ask", "always", "never"],
+        default=None,
+        help=(
+            "How to handle a repository source/context acquisition budget "
+            "exhausted purely by character capacity (never a safety/"
+            "verification failure): 'ask' prompts for another fixed-size "
+            "context window (default No; degrades to 'never' when stdin "
+            "isn't a TTY), 'always' auto-approves up to "
+            "--max-context-budget-windows, 'never' preserves the existing "
+            "fail-closed behavior. Default: 'ask' for an interactive run, "
+            "'never' otherwise."
+        ),
+    )
+    patch_p.add_argument(
+        "--max-context-budget-windows",
+        type=_positive_int,
+        default=10,
+        help=(
+            "Hard cap on total context-budget windows (initial + approved) "
+            "per acquisition stage, even under --context-budget-policy "
+            "always. Must be a positive integer (default: 10)."
+        ),
+    )
     patch_p.set_defaults(func=cmd_patch)
 
     # ---------------------------------------------------------------

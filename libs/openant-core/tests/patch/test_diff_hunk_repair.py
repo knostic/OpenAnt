@@ -816,3 +816,339 @@ class TestUrllib3TraceReproduction:
         after = _git_apply_check(repo, repaired)
         assert after.returncode == 0, after.stderr
         assert "corrupt" not in (after.stderr or "")
+
+
+# ---------------------------------------------------------------------------
+# Content-based hunk relocation (Candidate 1)
+#
+# The LLM's claimed old-side line number (`a` in `@@ -a,b +c,d @@`) can
+# drift from the real file even when the hunk's own content is correct --
+# the exact urllib3 failure this feature was built for. These tests cover:
+# successful relocation, refusal to guess on an ambiguous or absent match,
+# backward compatibility when repo_root is omitted, the new-file sentinel,
+# and language-agnosticism (no AST, no Python-specific assumptions).
+# ---------------------------------------------------------------------------
+
+def _make_git_repo(tmp_path: Path, files: dict) -> Path:
+    """Minimal git repo fixture: writes each {relpath: content} pair and
+    commits it, so relocation has a real git-tracked file to search."""
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, capture_output=True)
+    for relpath, content in files.items():
+        path = tmp_path / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, check=True)
+    return tmp_path
+
+
+class TestContentRelocation:
+    def test_drifted_old_start_relocated_to_real_position(self, tmp_path):
+        """The reported failure shape: the hunk's content is correct and
+        unique in the file, but the LLM's claimed @@ -L,N @@ start is
+        wrong. Without repo_root the patch is rejected by real git apply;
+        with it, relocation finds the true position and it applies."""
+        lines = [f"line{i}\n" for i in range(1, 50)]
+        lines[29] = "context_before\n"   # 1-indexed line 30
+        lines[30] = "old_value = 1\n"    # 1-indexed line 31
+        lines[31] = "context_after\n"    # 1-indexed line 32
+        repo = _make_git_repo(tmp_path, {"mod.py": "".join(lines)})
+
+        wrong_patch = (
+            "--- a/mod.py\n+++ b/mod.py\n@@ -5,3 +5,3 @@\n"
+            " context_before\n-old_value = 1\n+old_value = 2\n context_after\n"
+        )
+
+        # Note: `git apply` itself has a content-based fallback search for a
+        # single, uniquely-positioned hunk, so the *unrepaired* patch is not
+        # a reliable rejection fixture on its own (verified directly: git
+        # recovers this exact drift unaided in some cases). What matters
+        # here is that OUR relocation deterministically finds and reports
+        # the true position, and that the repaired result applies.
+        repaired, meta = repair_hunk_headers(wrong_patch, repo_root=repo)
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        assert hunk_lines[0].startswith("@@ -30,3 +30,3 @@"), hunk_lines[0]
+        assert meta.hunks_relocated == 1
+
+        after = _git_apply_check(repo, repaired)
+        assert after.returncode == 0, after.stderr
+
+    def test_semantic_edit_preserved_across_relocation(self, tmp_path):
+        """Relocation must only move the header -- added/removed body
+        content, and their order, are untouched."""
+        lines = [f"line{i}\n" for i in range(1, 20)]
+        lines[9] = "context\n"
+        lines[10] = "removed_line\n"
+        repo = _make_git_repo(tmp_path, {"f.py": "".join(lines)})
+        wrong_patch = (
+            "--- a/f.py\n+++ b/f.py\n@@ -1,2 +1,2 @@\n"
+            " context\n-removed_line\n+added_line\n"
+        )
+        repaired, meta = repair_hunk_headers(wrong_patch, repo_root=repo)
+        body = [l for l in repaired.splitlines() if not l.startswith("@@")]
+        assert body == [
+            "--- a/f.py", "+++ b/f.py", " context", "-removed_line", "+added_line",
+        ]
+        assert meta.hunks_relocated == 1
+
+    def test_ambiguous_match_leaves_position_unchanged(self, tmp_path):
+        """The same old-side content occurs twice in the file -- relocation
+        must refuse to guess and leave the LLM's claimed (wrong) position
+        untouched, exactly like an absent match."""
+        block = ["context\n", "dup_line\n"]
+        lines = block + [f"filler{i}\n" for i in range(1, 10)] + block
+        repo = _make_git_repo(tmp_path, {"f.py": "".join(lines)})
+        wrong_patch = (
+            "--- a/f.py\n+++ b/f.py\n@@ -99,2 +99,2 @@\n"
+            " context\n-dup_line\n+new_line\n"
+        )
+        repaired, meta = repair_hunk_headers(wrong_patch, repo_root=repo)
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        assert hunk_lines[0].startswith("@@ -99,"), hunk_lines[0]
+        assert meta.hunks_relocated == 0
+
+    def test_no_match_leaves_position_unchanged(self, tmp_path):
+        """Content that doesn't exist anywhere in the file (a different
+        failure mode than positional drift -- the context/removed text
+        itself is wrong) must not be relocated: there is nowhere correct
+        to move it to."""
+        repo = _make_git_repo(tmp_path, {"f.py": "totally unrelated content\n" * 5})
+        wrong_patch = (
+            "--- a/f.py\n+++ b/f.py\n@@ -42,2 +42,2 @@\n"
+            " nonexistent_context\n-nonexistent_old\n+new_value\n"
+        )
+        repaired, meta = repair_hunk_headers(wrong_patch, repo_root=repo)
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        assert hunk_lines[0].startswith("@@ -42,"), hunk_lines[0]
+        assert meta.hunks_relocated == 0
+
+    def test_no_repo_root_preserves_prior_behavior(self, tmp_path):
+        """Omitting repo_root must behave exactly as before this feature
+        existed: counts repaired, position never touched, zero relocation
+        attempts."""
+        lines = [f"line{i}\n" for i in range(1, 50)]
+        lines[29] = "context_before\n"
+        lines[30] = "old_value = 1\n"
+        lines[31] = "context_after\n"
+        _make_git_repo(tmp_path, {"mod.py": "".join(lines)})  # written, but never passed in
+        wrong_patch = (
+            "--- a/mod.py\n+++ b/mod.py\n@@ -5,3 +5,3 @@\n"
+            " context_before\n-old_value = 1\n+old_value = 2\n context_after\n"
+        )
+        repaired, meta = repair_hunk_headers(wrong_patch)  # no repo_root
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        assert hunk_lines[0].startswith("@@ -5,3 +5,3 @@"), hunk_lines[0]
+        assert meta.hunks_relocated == 0
+
+    def test_new_file_hunk_relocation_skipped(self, tmp_path):
+        """A hunk creating a brand-new file (old_start == 0) has no old
+        file to search against -- relocation must be a no-op, not an
+        error, even when repo_root is supplied."""
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        patch = "--- /dev/null\n+++ b/newfile.py\n@@ -0,0 +1,2 @@\n+line1\n+line2\n"
+        repaired, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        assert hunk_lines[0].startswith("@@ -0,0 +1,2 @@"), hunk_lines[0]
+        assert meta.hunks_relocated == 0
+
+    def test_relocation_is_language_agnostic_go_style_file(self, tmp_path):
+        """No AST, no language keywords: relocation must work identically
+        against a non-Python file with entirely different syntax."""
+        lines = [f"// filler {i}\n" for i in range(1, 40)]
+        lines[24] = "func doWork() error {\n"
+        lines[25] = "\treturn errors.New(\"unsafe\")\n"
+        lines[26] = "}\n"
+        repo = _make_git_repo(tmp_path, {"main.go": "".join(lines)})
+        wrong_patch = (
+            "--- a/main.go\n+++ b/main.go\n@@ -1,3 +1,3 @@\n"
+            " func doWork() error {\n"
+            "-\treturn errors.New(\"unsafe\")\n"
+            "+\treturn errors.New(\"safe\")\n"
+            " }\n"
+        )
+        repaired, meta = repair_hunk_headers(wrong_patch, repo_root=repo)
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        assert hunk_lines[0].startswith("@@ -25,3 +25,3 @@"), hunk_lines[0]
+        assert meta.hunks_relocated == 1
+        after = _git_apply_check(repo, repaired)
+        assert after.returncode == 0, after.stderr
+
+    def test_relocation_does_not_corrupt_lines_starting_with_dash(self, tmp_path):
+        """A real repository file can legitimately have lines whose first
+        non-whitespace character is '-' (SQL/Lua `--` comments, YAML/
+        Markdown '- ' list items). Relocation must match these verbatim --
+        NOT silently strip a leading character the way a diff-body-line
+        normalizer would (see content_relocation.py's module docstring for
+        why this deliberately differs from impact_surface.py's shared
+        normalize function)."""
+        lines = [f"item {i}\n" for i in range(1, 20)]
+        lines[9] = "- list item\n"    # 1-indexed line 10 -- real, single leading dash
+        lines[10] = "trailer\n"        # trailing context so the hunk has context on both sides
+        repo = _make_git_repo(tmp_path, {"schema.yaml": "".join(lines)})
+        # Removed line's raw diff form is "-" + "- list item" = "-- list item"
+        # (two dashes -- deliberately not three, to stay clear of
+        # _count_body's unrelated "---"-prefixed-line handling and isolate
+        # just the leading-character-corruption question this test targets).
+        wrong_patch = (
+            "--- a/schema.yaml\n+++ b/schema.yaml\n@@ -1,2 +1,2 @@\n"
+            "-- list item\n"
+            "+- renamed item\n"
+            " trailer\n"
+        )
+        repaired, meta = repair_hunk_headers(wrong_patch, repo_root=repo)
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        assert hunk_lines[0].startswith("@@ -10,2 +10,2 @@"), hunk_lines[0]
+        assert meta.hunks_relocated == 1
+        after = _git_apply_check(repo, repaired)
+        assert after.returncode == 0, after.stderr
+
+    def test_both_position_and_counts_wrong_are_both_corrected(self, tmp_path):
+        """Position drift and arithmetic error can co-occur; relocation and
+        the pre-existing count repair must both apply in the same pass."""
+        lines = [f"line{i}\n" for i in range(1, 30)]
+        lines[19] = "ctx\n"
+        lines[20] = "old\n"
+        # `git apply` requires context on both sides of a hunk, not only
+        # the leading side (documented precedent: _make_three_file_fixture
+        # above) -- lines[21] stays as trailing filler context.
+        repo = _make_git_repo(tmp_path, {"f.py": "".join(lines)})
+        wrong_patch = (
+            "--- a/f.py\n+++ b/f.py\n@@ -3,99 +3,99 @@\n"  # wrong position AND wrong counts
+            " ctx\n-old\n+new\n line22\n"
+        )
+        repaired, meta = repair_hunk_headers(wrong_patch, repo_root=repo)
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        assert hunk_lines[0].startswith("@@ -20,3 +20,3 @@"), hunk_lines[0]
+        assert meta.hunks_relocated == 1
+        after = _git_apply_check(repo, repaired)
+        assert after.returncode == 0, after.stderr
+
+    def test_repo_root_as_string_is_accepted(self, tmp_path):
+        """repo_root may be passed as a str, not only a Path (matches
+        check_applicability's own accepted type)."""
+        lines = [f"line{i}\n" for i in range(1, 20)]
+        lines[9] = "ctx\n"
+        lines[10] = "old\n"
+        repo = _make_git_repo(tmp_path, {"f.py": "".join(lines)})
+        wrong_patch = "--- a/f.py\n+++ b/f.py\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n"
+        repaired, meta = repair_hunk_headers(wrong_patch, repo_root=str(repo))
+        hunk_lines = [l for l in repaired.splitlines() if l.startswith("@@")]
+        assert hunk_lines[0].startswith("@@ -10,2 +10,2 @@"), hunk_lines[0]
+        assert meta.hunks_relocated == 1
+
+
+# ---------------------------------------------------------------------------
+# Relocation telemetry (RepairResult.relocations) -- observability only
+# ---------------------------------------------------------------------------
+
+class TestRelocationTelemetry:
+    def test_successful_relocation_recorded(self, tmp_path):
+        lines = [f"line{i}\n" for i in range(1, 20)]
+        lines[9] = "ctx\n"
+        lines[10] = "old\n"
+        repo = _make_git_repo(tmp_path, {"f.py": "".join(lines)})
+        wrong_patch = "--- a/f.py\n+++ b/f.py\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n"
+        _, meta = repair_hunk_headers(wrong_patch, repo_root=repo)
+        assert len(meta.relocations) == 1
+        r = meta.relocations[0]
+        assert r.file == "f.py"
+        assert r.relocation_attempted is True
+        assert r.relocation_performed is True
+        assert r.relocation_reason == "unique_match"
+        assert r.original_hunk_start == 1
+        assert r.relocated_hunk_start == 10
+
+    def test_unique_match_but_already_correct_is_not_performed(self, tmp_path):
+        """A unique match that equals the claimed position is still a
+        genuine unique_match (confirmed, not corrected) -- performed must
+        be False and hunks_relocated must not count it."""
+        lines = [f"line{i}\n" for i in range(1, 10)]
+        lines[0] = "ctx\n"
+        lines[1] = "old\n"
+        repo = _make_git_repo(tmp_path, {"f.py": "".join(lines)})
+        correct_patch = "--- a/f.py\n+++ b/f.py\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n"
+        _, meta = repair_hunk_headers(correct_patch, repo_root=repo)
+        r = meta.relocations[0]
+        assert r.relocation_reason == "unique_match"
+        assert r.relocated_hunk_start == 1
+        assert r.original_hunk_start == 1
+        assert r.relocation_performed is False
+        assert meta.hunks_relocated == 0
+
+    def test_ambiguous_reason_recorded(self, tmp_path):
+        block = ["context\n", "dup_line\n"]
+        lines = block + [f"filler{i}\n" for i in range(1, 10)] + block
+        repo = _make_git_repo(tmp_path, {"f.py": "".join(lines)})
+        wrong_patch = (
+            "--- a/f.py\n+++ b/f.py\n@@ -99,2 +99,2 @@\n context\n-dup_line\n+new_line\n"
+        )
+        _, meta = repair_hunk_headers(wrong_patch, repo_root=repo)
+        r = meta.relocations[0]
+        assert r.relocation_attempted is True
+        assert r.relocation_performed is False
+        assert r.relocation_reason == "ambiguous"
+        assert r.relocated_hunk_start is None
+        assert r.original_hunk_start == 99
+
+    def test_no_match_reason_recorded(self, tmp_path):
+        repo = _make_git_repo(tmp_path, {"f.py": "totally unrelated content\n" * 5})
+        wrong_patch = (
+            "--- a/f.py\n+++ b/f.py\n@@ -42,2 +42,2 @@\n"
+            " nonexistent_context\n-nonexistent_old\n+new_value\n"
+        )
+        _, meta = repair_hunk_headers(wrong_patch, repo_root=repo)
+        r = meta.relocations[0]
+        assert r.relocation_attempted is True
+        assert r.relocation_performed is False
+        assert r.relocation_reason == "no_match"
+        assert r.relocated_hunk_start is None
+
+    def test_skipped_reason_when_no_repo_root(self, tmp_path):
+        wrong_patch = "--- a/f.py\n+++ b/f.py\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n"
+        _, meta = repair_hunk_headers(wrong_patch)  # no repo_root
+        r = meta.relocations[0]
+        assert r.relocation_attempted is False
+        assert r.relocation_performed is False
+        assert r.relocation_reason == "skipped"
+        assert r.relocated_hunk_start is None
+        assert r.original_hunk_start == 1
+
+    def test_skipped_reason_for_new_file_hunk(self, tmp_path):
+        import subprocess
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        patch = "--- /dev/null\n+++ b/newfile.py\n@@ -0,0 +1,2 @@\n+line1\n+line2\n"
+        _, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+        r = meta.relocations[0]
+        assert r.relocation_attempted is False
+        assert r.relocation_reason == "skipped"
+        assert r.original_hunk_start == 0
+
+    def test_skipped_reason_for_pure_insertion_hunk(self, tmp_path):
+        """A hunk with only added lines has no old-side anchors to search
+        for -- relocation must be reported as skipped, not attempted."""
+        lines = [f"line{i}\n" for i in range(1, 10)]
+        repo = _make_git_repo(tmp_path, {"f.py": "".join(lines)})
+        patch = "--- a/f.py\n+++ b/f.py\n@@ -5,0 +5,2 @@\n+added1\n+added2\n"
+        _, meta = repair_hunk_headers(patch, repo_root=repo)
+        r = meta.relocations[0]
+        assert r.relocation_attempted is False
+        assert r.relocation_reason == "skipped"
+
+    def test_relocations_list_has_one_entry_per_hunk_across_files(self, tmp_path):
+        lines1 = [f"a{i}\n" for i in range(1, 10)]
+        lines1[4] = "ctx1\n"
+        lines1[5] = "old1\n"
+        lines2 = [f"b{i}\n" for i in range(1, 10)]
+        lines2[4] = "ctx2\n"
+        lines2[5] = "old2\n"
+        repo = _make_git_repo(tmp_path, {"f1.py": "".join(lines1), "f2.py": "".join(lines2)})
+        patch = (
+            "--- a/f1.py\n+++ b/f1.py\n@@ -1,2 +1,2 @@\n ctx1\n-old1\n+new1\n"
+            "--- a/f2.py\n+++ b/f2.py\n@@ -1,2 +1,2 @@\n ctx2\n-old2\n+new2\n"
+        )
+        _, meta = repair_hunk_headers(patch, repo_root=repo)
+        assert len(meta.relocations) == 2
+        assert {r.file for r in meta.relocations} == {"f1.py", "f2.py"}
+        assert all(r.relocation_reason == "unique_match" for r in meta.relocations)

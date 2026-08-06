@@ -151,6 +151,7 @@ def _run_engine_and_write_artifacts(
     input_type: str = "finding",
     advisory_id: str | None = None,
     advisory_source: str | None = None,
+    budget_controller: "object | None" = None,
 ) -> PatchStepResult:
     """Shared tail of run_patch()/run_patch_cve(): removes any stale trust
     report from a previous failed run, writes {artifact_label}-vulnerability.md,
@@ -167,6 +168,12 @@ def _run_engine_and_write_artifacts(
     before these parameters existed. run_patch_cve() passes
     input_type="cve" so the written Trust Report honestly discloses its
     provenance (see run_metadata.render_metadata_section).
+
+    budget_controller is additive too: an optional
+    utilities.autopatcher.context_budget.ContextBudgetController, threaded
+    unmodified into pipeline.run() -- omitted (None), this engine's
+    pre-existing fixed-budget, fail-closed behavior for repository source/
+    context acquisition is unchanged.
 
     Raises:
         RuntimeError: if LLM_PROVIDER is unset. (Also checked by run_patch()
@@ -223,6 +230,7 @@ def _run_engine_and_write_artifacts(
         api_key=api_key,
         repo_root=repo_root,
         investigation_output_dir=investigation_dir,
+        budget_controller=budget_controller,
     )
 
     provider = _llm._cached_provider or os.environ.get("LLM_PROVIDER", "unknown")
@@ -281,6 +289,7 @@ def run_patch(
     finding_id: str,
     output_dir: str,
     repo_root: str | None = None,
+    budget_controller: "object | None" = None,
 ) -> PatchStepResult:
     """Generate and evaluate a candidate remediation for one finding.
 
@@ -334,6 +343,7 @@ def run_patch(
         repo_root=str(projection.repo_root) if projection.repo_root else None,
         output_dir=output_dir,
         artifact_label=finding_id,
+        budget_controller=budget_controller,
     )
 
 
@@ -341,6 +351,7 @@ def run_patch_cve(
     cve_id: str,
     repo_root: str,
     output_dir: str,
+    budget_controller: "object | None" = None,
 ) -> PatchStepResult:
     """Generate and evaluate a candidate remediation seeded from a public CVE
     advisory instead of an OpenAnt Finding.
@@ -394,4 +405,5 @@ def run_patch_cve(
         input_type="cve",
         advisory_id=cve_id,
         advisory_source="NVD",
+        budget_controller=budget_controller,
     )

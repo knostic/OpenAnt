@@ -561,6 +561,15 @@ class TestComputeTrustSignals:
         assert s["test_availability"]["value"] == "Not Verified"
         assert s["deployment_safety"]["value"] == "Not Verified"
 
+    def test_does_not_compute_source_verification(self):
+        """Evidence Sufficiency Gate (Phase 1) is deliberately computed
+        OUTSIDE this function (see pipeline.py's merge into `signals` right
+        after this call, and source_verification.py) so that adding it can
+        never perturb this function's own six-signal computation or its
+        I1-I6 invariants. Locks in that the split is real, not accidental."""
+        s = _compute_trust_signals([], _clean_applicability(), _classified(), "None", "low")
+        assert "source_verification" not in s
+
 
 # ---------------------------------------------------------------------------
 # _resolve_impact_level
@@ -603,8 +612,13 @@ def _signals_for(integrity="Clean", improvement="High", alignment="Aligned", saf
 # ---------------------------------------------------------------------------
 
 def _signals_full(**overrides):
-    """All six keys with a neutral 'good' baseline, so tests only need to
-    override the one signal they're checking."""
+    """All seven keys with a neutral 'good' baseline, so tests only need to
+    override the one signal they're checking.
+
+    "source_verification" (Evidence Sufficiency Gate, Phase 1) is included
+    here with a good/"Confirmed" baseline like every other key -- it is a
+    real Trust Signals row now (see pipeline._TRUST_SIGNALS_V2_ROWS), even
+    though it is not yet read by _build_recommendation_v1."""
     base = {
         "patch_integrity":       {"value": "Clean", "label": "Clean", "notes": "Applies cleanly · no hygiene issues"},
         "security_improvement":  {"value": "High", "label": "High", "notes": "Adversarial review found no remaining exploit path"},
@@ -612,6 +626,7 @@ def _signals_full(**overrides):
         "coverage_confidence":   {"value": "High", "label": "High", "notes": "No gaps identified by adversarial analysis"},
         "test_availability":     {"value": "Tests Available", "label": "Tests Available", "notes": "Good — test files cover this module"},
         "deployment_safety":     {"value": "Low Risk", "label": "Low Risk", "notes": "Localized change · low regression risk"},
+        "source_verification":   {"value": "Confirmed", "label": "✓ Confirmed", "notes": "1 hunk(s) matched the repository uniquely"},
     }
     base.update(overrides)
     return base
@@ -635,6 +650,7 @@ class TestTrustSignalsV2Table:
             "Are there unresolved concerns?",
             "Do relevant tests already exist?",
             "Is deployment risk low?",
+            "Was the edited content verified against the repository?",
         ]:
             assert question in table
 
@@ -723,6 +739,36 @@ class TestTrustSignalsV2Table:
             ))
             row = [l for l in table.splitlines() if l.startswith("| Is deployment risk low?")][0]
             assert status in row, f"{value} -> expected {status!r} in row: {row!r}"
+
+    def test_source_verification_status_mapping(self):
+        """Evidence Sufficiency Gate (Phase 1) -- deliberately does NOT use
+        '❌ Blocked' wording for Unverified (see pipeline._TRUST_SIGNALS_V2_ROWS'
+        comment): this signal does not yet drive any decision."""
+        from utilities.autopatcher.pipeline import _render_trust_signals_table
+        expected = {
+            "Confirmed": "✅ Good",
+            "Position Unconfirmed": "⚠️ Needs review",
+            "Unverified": "❌ Content not found",
+            "Not Verified": "? Not verified",
+        }
+        for value, status in expected.items():
+            table = _render_trust_signals_table(_signals_full(
+                source_verification={"value": value, "label": value, "notes": ""}
+            ))
+            row = [l for l in table.splitlines() if l.startswith("| Was the edited content")][0]
+            assert status in row, f"{value} -> expected {status!r} in row: {row!r}"
+
+    def test_source_verification_never_gets_a_forward_pointer(self):
+        """Unlike every other row, source_verification's target_section is
+        None -- there is no dedicated report section with hunk-level detail
+        yet, so even a non-good status must not produce a dangling 'see X
+        section below' reference."""
+        from utilities.autopatcher.pipeline import _render_trust_signals_table
+        table = _render_trust_signals_table(_signals_full(
+            source_verification={"value": "Unverified", "label": "Unverified", "notes": "3 hunk(s) not found"}
+        ))
+        row = [l for l in table.splitlines() if l.startswith("| Was the edited content")][0]
+        assert "see" not in row.lower()
 
     def test_coverage_medium_note_points_to_review_results_section(self):
         from utilities.autopatcher.pipeline import _render_trust_signals_table
@@ -821,6 +867,25 @@ class TestTrustSignalsV2Table:
 
 
 class TestRecommendationV1:
+    def test_decision_unaffected_by_source_verification(self):
+        """Evidence Sufficiency Gate (Phase 1) is explicitly NOT wired into
+        Recommendation Policy yet -- _build_recommendation_v1 must produce
+        the identical decision regardless of what source_verification says,
+        including the "worst" value (Unverified), and even when the key is
+        absent entirely (matching a hand-built signals dict from before
+        this signal existed)."""
+        base = _signals_for()
+        baseline = _build_recommendation_v1(base)
+
+        for value in ("Confirmed", "Position Unconfirmed", "Unverified", "Not Verified"):
+            with_signal = dict(base)
+            with_signal["source_verification"] = {"value": value, "label": value, "notes": ""}
+            rec = _build_recommendation_v1(with_signal)
+            assert rec == baseline, (
+                f"source_verification={value!r} changed the decision: "
+                f"{baseline} -> {rec}"
+            )
+
     def test_do_not_apply_for_does_not_apply_integrity(self):
         rec = _build_recommendation_v1(_signals_for(integrity="Does Not Apply"))
         assert rec["decision"] == "Do Not Apply"

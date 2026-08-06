@@ -10,6 +10,7 @@ libs/openant-core/parsers/javascript/.openant-npm-install.lock
 _docs/
 docs/
 .worktrees/
+reports/
 
 # Local-only scratch and generated artifacts (not part of the codebase)
 *knowledge-graph.*

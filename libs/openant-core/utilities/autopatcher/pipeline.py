@@ -138,6 +138,59 @@ class PipelineResult:
     # anchors, so it shares that field's staleness gate -- no separate
     # "coverage_investigated_patch" field exists or is needed.
     post_patch_coverage: "CoverageResult | None" = None
+    # Candidate 1 relocation telemetry (observability only -- see
+    # relocation_telemetry.py). Never read by _compute_trust_signals,
+    # _build_recommendation_v1, or any other decision logic; not currently
+    # rendered into the Markdown Trust Report either. None whenever there
+    # was no repo_root/patch to measure, or the telemetry probe failed.
+    relocation_telemetry: "object | None" = None
+    # Evidence Sufficiency Gate (Phase 1) -- see source_verification.py.
+    # A Trust-signal-shaped dict ({"value", "label", "notes"}), derived from
+    # RepairResult.relocations for whichever repair pass produced the FINAL
+    # `patch` above. _build_report merges this into the Trust Signals dict
+    # (as a NEW key, "source_verification") so it is surfaced in the Trust
+    # Report and made available to Recommendation Policy's inputs --
+    # deliberately NOT read by _build_recommendation_v1 today; that is an
+    # explicit, separate, later decision. None when unavailable (no
+    # repo_root, no patch, or the classification itself failed) -- callers
+    # must fall back to "Not Verified", never infer "Confirmed".
+    source_verification: "dict | None" = None
+    # Edit Readiness Gate (Slice 1) -- see remediation_planner.EditReadinessResult
+    # / check_edit_readiness. Observability + the actual gating signal
+    # _skip_patch_generation was set from; never read by
+    # _compute_trust_signals/_build_recommendation_v1 -- no Recommendation
+    # Policy change. None when Final Strategy never ran, named no targets,
+    # or the Slice/Gate computation itself failed (best-effort, same as
+    # every other optional pipeline section). When Slice 2 and/or Slice 3
+    # acquisition ran (see edit_acquisition/guided_acquisition below), this
+    # is the FINAL, RECALCULATED readiness after both -- still the same
+    # final gating signal, just possibly improved by newly-acquired source.
+    edit_readiness: "object | None" = None
+    # Slice 2 (Deterministic Pre-Patch Retrieval) -- see
+    # remediation_planner.AcquisitionResult / run_deterministic_
+    # acquisition. Observability only, same as edit_readiness above:
+    # never read by _compute_trust_signals/_build_recommendation_v1. None
+    # whenever acquisition never ran at all (initial readiness was
+    # already complete, or the Edit Readiness Gate itself never ran).
+    edit_acquisition: "object | None" = None
+    # Slice 3 (Bounded LLM-guided pre-patch context retrieval) -- see
+    # remediation_planner.GuidedAcquisitionResult / run_guided_
+    # acquisition. Observability only, same as edit_acquisition above:
+    # never read by _compute_trust_signals/_build_recommendation_v1. None
+    # whenever guided acquisition never ran at all (Slice 2 already made
+    # readiness complete, or the Edit Readiness Gate itself never ran).
+    guided_acquisition: "object | None" = None
+    # Slice 4 (Post-Patch Target Conformance and Recovery) -- see
+    # remediation_planner.PatchConformanceReport/PostPatchRecoveryResult.
+    # Observability only, same as every earlier slice's own field: never
+    # read by _compute_trust_signals/_build_recommendation_v1. patch_
+    # target_conformance is None only when Patch Generation produced no
+    # patch at all, or ran with no Edit Readiness context to compare
+    # against (no Final Strategy). post_patch_recovery is None whenever
+    # recovery never triggered (conformance was already fine, or
+    # conformance/recovery itself never ran).
+    patch_target_conformance: "object | None" = None
+    post_patch_recovery: "object | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -1419,6 +1472,23 @@ _TRUST_SIGNALS_V2_ROWS = [
         "High Risk": "❌ Blocked",
         "Not Verified": "? Not verified",
     }, "Impact Surface"),
+    # Evidence Sufficiency Gate (Phase 1, source_verification.py). Display
+    # only, same as every other row here -- deliberately does NOT use "❌
+    # Blocked" wording for "Unverified": unlike patch_integrity/
+    # remediation_alignment, this signal does not yet drive
+    # _build_recommendation_v1 (explicit product decision, see
+    # source_verification.py's module docstring), so its status wording
+    # describes what was observed rather than implying a policy consequence
+    # that doesn't exist yet. No target_section: there is no dedicated
+    # report section with hunk-level detail today, so this row's `notes`
+    # (built in classify_source_verification) carry the detail inline
+    # instead of pointing elsewhere.
+    ("Was the edited content verified against the repository?", "source_verification", {
+        "Confirmed": "✅ Good",
+        "Position Unconfirmed": "⚠️ Needs review",
+        "Unverified": "❌ Content not found",
+        "Not Verified": "? Not verified",
+    }, None),
 ]
 
 def _render_trust_signals_table(signals: dict, known_findings_rendered: bool = True) -> str:
@@ -1977,6 +2047,16 @@ def _build_report(result: PipelineResult) -> str:
     signals = _compute_trust_signals(
         result.hygiene, result.applicability, classified_challenger, rating, impact_level_str
     )
+    # Evidence Sufficiency Gate (Phase 1) -- merged in as a NEW key, separate
+    # from _compute_trust_signals itself, so that function's own six-signal
+    # computation and its I1-I6 Recommendation Policy invariants are never
+    # touched by this addition. Falls back to a safe "Not Verified" default
+    # (never "Confirmed") when the field is absent -- e.g. a hand-built
+    # PipelineResult in a test, or a run with no repo_root.
+    signals["source_verification"] = result.source_verification or {
+        "value": "Not Verified", "label": "? Not Verified",
+        "notes": "No source-verification data available for this run",
+    }
     trust_rec = _build_recommendation_v1(
         signals,
         still_vulnerable=classified_challenger.get("still_vulnerable", False),
@@ -2475,6 +2555,7 @@ def run(
     api_key: str = "",
     repo_root: str | Path | None = None,
     investigation_output_dir: str | Path | None = None,
+    budget_controller: "object | None" = None,
 ) -> str:
     """
     Execute the full patching pipeline.
@@ -2497,6 +2578,19 @@ def run(
         as when candidate_enrichment.enrich_candidates() is given
         context=None. Callers that don't pass this (all existing callers)
         are unaffected beyond that graceful degradation.
+    budget_controller:
+        Optional utilities.autopatcher.context_budget.ContextBudgetController,
+        threaded unmodified into Slices 2/3/4's own acquisition/recovery
+        calls (run_deterministic_acquisition/run_guided_acquisition/
+        recover_post_patch_source) -- the ONLY thing that lets a soft
+        character budget exhausted purely by capacity (never a safety/
+        verification failure) be extended by one more fixed-size window,
+        with the user's approval, instead of failing the run closed. This
+        is the CLI's responsibility to build (see openant/cli.py's `patch`
+        command --context-budget-policy/--max-context-budget-windows) --
+        `None` (every existing caller, and any library caller) preserves
+        the pre-existing fixed-budget behavior exactly, with zero
+        interactive prompts from this module.
 
     Returns
     -------
@@ -2589,27 +2683,621 @@ def run(
                 file=sys.stderr,
             )
 
-    # Assemble final context: plan → repo code → vuln patterns → repository understanding.
+    # Experimental: Remediation Planner. One bounded LLM call that asks the
+    # model to commit to a narrow remediation strategy before Patch
+    # Generation runs, using exactly the evidence already assembled above.
+    # Not verified against the repository by itself -- an intentionally
+    # minimal proof-of-concept, not a trust boundary on its own. Skipped
+    # when a hand-authored plan (_plan_text) already exists. Best-effort:
+    # any failure degrades to no plan, same as every other optional
+    # context section.
+    _plan_ctx = ""
+    _planner_evidence_ctx = ""
+    _plan_result = None  # set below only when the Planner actually runs; read again
+    # much further down (as a source of "files already connected via Planner
+    # evidence") by the Final-Target Remediation Slice builder.
+    if not _plan_text:
+        try:
+            from .remediation_planner import build_planner_evidence, generate_remediation_plan
+            _evidence_so_far = "\n\n".join(
+                p for p in [_repo_code, _pattern_ctx, _repository_understanding_ctx] if p and p.strip()
+            )
+            _plan_result = generate_remediation_plan(vulnerability_text, llm, code_context=_evidence_so_far)
+            _plan_ctx = _plan_result.rendered
+            if _plan_ctx:
+                print(f"[pipeline] Remediation plan generated ({len(_plan_ctx)} chars).", file=sys.stderr)
+
+            # Deterministic bridge: verify the Planner's proposed files/symbols
+            # against the real repository, then run only what verifies through
+            # the SAME enrich_candidates/fuse_evidence/render_repository_
+            # understanding chain already used above -- reusing
+            # _investigation_context as-is, never rebuilding it. No new LLM
+            # call happens here. Kept in its own try/except so a failure here
+            # can never suppress the plan text itself, gathered just above.
+            try:
+                _planner_evidence_ctx = build_planner_evidence(
+                    _plan_result, repo_root, vulnerability_text, _investigation_context
+                )
+                if _planner_evidence_ctx:
+                    print(
+                        f"[pipeline] Planner-proposed candidate evidence rendered "
+                        f"({len(_planner_evidence_ctx)} chars).",
+                        file=sys.stderr,
+                    )
+            except Exception as exc:
+                print(f"[pipeline] Planner candidate evidence unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[pipeline] Remediation planning unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    # Final Strategy: a second, distinct Planner call (stage
+    # "remediation_strategy") that runs only once verified Planner evidence
+    # exists -- it receives materially new evidence (the verified structural
+    # facts and source excerpts above) the first call never saw, and is not
+    # a blind retry of it. Skipped entirely (no LLM call) when
+    # _planner_evidence_ctx is empty -- generate_remediation_strategy enforces
+    # this itself. Best-effort: any failure here leaves the Target Discovery
+    # Plan and Planner-Proposed Candidate Evidence exactly as already
+    # gathered, and the pipeline continues without a Final Strategy section.
+    _strategy_ctx = ""
+    _strategy_result = None  # read again below by the Final-Target Remediation Slice builder
+    if _planner_evidence_ctx:
+        try:
+            from .remediation_planner import generate_remediation_strategy
+            _strategy_result = generate_remediation_strategy(
+                vulnerability_text, llm, repo_root, _investigation_context,
+                repo_grounding_ctx=_repo_code,
+                repository_understanding_ctx=_repository_understanding_ctx,
+                discovery_plan_ctx=_plan_ctx,
+                planner_evidence_ctx=_planner_evidence_ctx,
+            )
+            _strategy_ctx = _strategy_result.rendered
+            if _strategy_ctx:
+                print(
+                    f"[pipeline] Final remediation strategy generated "
+                    f"({len(_strategy_ctx)} chars).",
+                    file=sys.stderr,
+                )
+            if _strategy_result.warnings:
+                print(
+                    f"[pipeline] Final strategy dropped unverified item(s): "
+                    f"{_strategy_result.warnings}",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(f"[pipeline] Final remediation strategy unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    # Final-Target Remediation Slice: deterministic, bounded exact source
+    # built ONLY from generate_remediation_strategy()'s VERIFIED result --
+    # never the earlier, exploratory Target Discovery candidates, so
+    # source budget is never spent on a candidate the Final Strategy
+    # already rejected. No new LLM call (build_final_target_slice takes no
+    # `llm` parameter), no new repository parse -- reuses
+    # _investigation_context as-is. Best-effort: any failure degrades to a
+    # short note and the pipeline continues with whatever context already
+    # exists; only a genuinely ZERO-coverage Final Strategy result (one
+    # that named targets but produced no usable verified source for any of
+    # them) skips the Patch Generator call itself, per the coverage
+    # contract below -- this never fails the run and never introduces a
+    # new recommendation category.
+    _slice_ctx = ""
+    _coverage_warning_ctx = ""
+    _skip_patch_generation = False
+    _edit_readiness = None  # EditReadinessResult | None -- see PipelineResult.edit_readiness
+    _edit_acquisition = None  # AcquisitionResult | None -- see PipelineResult.edit_acquisition
+    _guided_acquisition = None  # GuidedAcquisitionResult | None -- see PipelineResult.guided_acquisition
+    # Minimal compatibility pre-inits for Slice 4 (Patch Target Conformance
+    # Gate + Post-Patch Recovery, much further below in this function): both
+    # are otherwise only ever assigned inside the `if _strategy_result is
+    # not None...` block below, so a run with no Final Strategy (or one
+    # naming no targets) would leave them undefined by the time Slice 4
+    # reads them -- never actually reassigned above, only guaranteed defined.
+    _slice_result = None  # FinalTargetSliceResult | None
+    _intended_edits = []  # list[IntendedEdit]
+    if _strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols):
+        try:
+            from .remediation_planner import build_final_target_slice
+            _planner_evidence_files = list(_plan_result.target_files) if _plan_result is not None else []
+            _slice_result = build_final_target_slice(
+                _strategy_result, repo_root, _investigation_context,
+                planner_evidence_files=_planner_evidence_files,
+            )
+            _slice_ctx = _slice_result.rendered
+            _coverage_warning_ctx = _slice_result.warning_text
+            if _slice_ctx:
+                print(
+                    f"[pipeline] Final-Target Remediation Slice built "
+                    f"({len(_slice_ctx)} chars); covered files={_slice_result.covered_target_files}, "
+                    f"covered symbols={_slice_result.covered_target_symbols}.",
+                    file=sys.stderr,
+                )
+            if not _slice_result.coverage_complete:
+                print(
+                    f"[pipeline] Final-target source coverage incomplete -- "
+                    f"uncovered files={_slice_result.uncovered_target_files}, "
+                    f"uncovered symbols={_slice_result.uncovered_target_symbols}.",
+                    file=sys.stderr,
+                )
+
+            # Edit Readiness Gate (Slice 1) -- replaces the coarse
+            # "has_any_coverage == safe to generate" assumption with a
+            # decision made separately for every intended edit. Reuses only
+            # data build_final_target_slice() already computed above; no
+            # new repository read, no new resolution, no new LLM call.
+            from .remediation_planner import build_intended_edits, check_edit_readiness
+            _intended_edits = build_intended_edits(_strategy_result, _slice_result)
+            _initial_edit_readiness = check_edit_readiness(_intended_edits, _slice_result)
+            print(
+                f"[pipeline] Edit Readiness Gate: strategy_ready={_initial_edit_readiness.strategy_ready}, "
+                f"edit_source_ready={_initial_edit_readiness.edit_source_ready}, "
+                f"{len(_initial_edit_readiness.ready_edits)}/{len(_initial_edit_readiness.intended_edits)} "
+                f"intended edit(s) ready"
+                + (f", failure_reasons={_initial_edit_readiness.failure_reasons}"
+                   if _initial_edit_readiness.unready_edits else ""),
+                file=sys.stderr,
+            )
+
+            # Slice 2 -- Deterministic Pre-Patch Retrieval: attempt
+            # additional verified repository source for whatever is still
+            # unready, deterministically and bounded (see
+            # remediation_planner.run_deterministic_acquisition). No-op
+            # (0 rounds) when the initial readiness above was already
+            # complete. Best-effort: any failure here leaves the initial
+            # readiness/slice exactly as already computed.
+            _edit_readiness = _initial_edit_readiness
+            if not _initial_edit_readiness.edit_source_ready:
+                try:
+                    from .remediation_planner import run_deterministic_acquisition
+                    _edit_acquisition = run_deterministic_acquisition(
+                        _strategy_result, repo_root, _investigation_context,
+                        _slice_result, _initial_edit_readiness,
+                        budget_controller=budget_controller,
+                    )
+                    if _edit_acquisition.rounds_used > 0:
+                        _slice_result = _edit_acquisition.slice_result
+                        _slice_ctx = _slice_result.rendered
+                        _coverage_warning_ctx = _slice_result.warning_text
+                        _edit_readiness = check_edit_readiness(_intended_edits, _slice_result)
+                        print(
+                            f"[pipeline] Deterministic Pre-Patch Retrieval: "
+                            f"{_edit_acquisition.rounds_used} round(s), "
+                            f"{len(_edit_acquisition.attempts)} attempt(s); "
+                            f"edit_source_ready now={_edit_readiness.edit_source_ready} "
+                            f"({len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)} "
+                            f"intended edit(s) ready)"
+                            + (f", failure_reasons={_edit_readiness.failure_reasons}"
+                               if _edit_readiness.unready_edits else ""),
+                            file=sys.stderr,
+                        )
+                except Exception as exc:
+                    print(
+                        f"[pipeline] Deterministic Pre-Patch Retrieval unavailable: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+
+            # Snapshot for the debug artifact's own "readiness_after_
+            # deterministic_acquisition" key -- BEFORE Slice 3 (below) can
+            # reassign _edit_readiness again.
+            _readiness_after_deterministic = _edit_readiness
+
+            # Slice 3 -- Bounded LLM-guided pre-patch context retrieval:
+            # runs ONLY when Slice 2 above still leaves readiness
+            # incomplete (see remediation_planner.run_guided_acquisition).
+            # At most MAX_GUIDED_ACQUISITION_ROUNDS narrow LLM calls
+            # (stage "guided_context_request") -- never the Patch
+            # Generator, never a Planner/Final Strategy rerun, never the
+            # Challenger. Best-effort: any failure here leaves the
+            # Slice-2 readiness/slice exactly as already computed.
+            if not _edit_readiness.edit_source_ready:
+                try:
+                    from .remediation_planner import run_guided_acquisition
+                    _deterministic_attempts = _edit_acquisition.attempts if _edit_acquisition is not None else []
+                    _guided_acquisition = run_guided_acquisition(
+                        _strategy_result, vulnerability_text, llm, repo_root, _investigation_context,
+                        _slice_result, _edit_readiness, _deterministic_attempts,
+                        budget_controller=budget_controller,
+                    )
+                    if _guided_acquisition.rounds_used > 0:
+                        _slice_result = _guided_acquisition.slice_result
+                        _slice_ctx = _slice_result.rendered
+                        _coverage_warning_ctx = _slice_result.warning_text
+                        _edit_readiness = _guided_acquisition.readiness
+                        print(
+                            f"[pipeline] Guided Context Retrieval: "
+                            f"{_guided_acquisition.rounds_used} round(s), "
+                            f"{len(_guided_acquisition.attempts)} request(s); "
+                            f"edit_source_ready now={_edit_readiness.edit_source_ready} "
+                            f"({len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)} "
+                            f"intended edit(s) ready)"
+                            + (f", failure_reasons={_edit_readiness.failure_reasons}"
+                               if _edit_readiness.unready_edits else ""),
+                            file=sys.stderr,
+                        )
+                except Exception as exc:
+                    print(
+                        f"[pipeline] Guided Context Retrieval unavailable: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+
+            if os.environ.get("AUTOPATCHER_DEBUG"):
+                try:
+                    import datetime as _dt
+                    import json as _json
+
+                    def _readiness_doc(r):
+                        if r is None:
+                            return None
+                        return {
+                            "strategy_ready": r.strategy_ready,
+                            "edit_source_ready": r.edit_source_ready,
+                            "intended_edits": [{"file": e.file, "symbol": e.symbol} for e in r.intended_edits],
+                            "ready_edits": [
+                                {"file": rd.file, "symbol": rd.symbol, "role": rd.role} for rd in r.ready_edits
+                            ],
+                            "unready_edits": [
+                                {"file": u.edit.file, "symbol": u.edit.symbol, "reason": u.reason}
+                                for u in r.unready_edits
+                            ],
+                            "failure_reasons": r.failure_reasons,
+                        }
+
+                    # Explicit even when Slice 2 never ran at all (initial
+                    # readiness was already complete, or it failed) -- a
+                    # present `null`/empty-list value, never an omitted key.
+                    _deterministic_doc = None
+                    if _edit_acquisition is not None:
+                        _deterministic_doc = {
+                            "rounds": _edit_acquisition.rounds_used,
+                            "source_added": any(a.success for a in _edit_acquisition.attempts),
+                            "attempts": [
+                                {
+                                    "round": a.round,
+                                    "file": a.intended_edit.file,
+                                    "symbol": a.intended_edit.symbol,
+                                    "retrieval_strategy": a.retrieval_strategy,
+                                    "resolved_file": a.resolved_file,
+                                    "resolved_symbol": a.resolved_symbol,
+                                    "start_line": a.start_line,
+                                    "end_line": a.end_line,
+                                    "source_kind": a.source_kind,
+                                    "source_chars": a.source_chars,
+                                    "success": a.success,
+                                    "failure_reason": a.failure_reason,
+                                }
+                                for a in _edit_acquisition.attempts
+                            ],
+                        }
+
+                    # Same explicitness rule for Slice 3: present (as null)
+                    # even when Slice 2 alone already made readiness
+                    # complete, so guided acquisition never ran.
+                    _guided_doc = None
+                    if _guided_acquisition is not None:
+                        _guided_doc = {
+                            "rounds": _guided_acquisition.rounds_used,
+                            "source_added": any(a.verified and a.source_chars > 0 for a in _guided_acquisition.attempts),
+                            "requests": [
+                                {
+                                    "round": a.round,
+                                    "request_type": a.request.request_type,
+                                    "file_hint": a.request.file_hint,
+                                    "symbol": a.request.symbol,
+                                    "identifier": a.request.identifier,
+                                    "reason": a.request.reason,
+                                    "attributed_file": a.request.intended_edit.file if a.request.intended_edit else None,
+                                    "attributed_symbol": a.request.intended_edit.symbol if a.request.intended_edit else None,
+                                }
+                                for a in _guided_acquisition.attempts
+                            ],
+                            "verification_results": [
+                                {
+                                    "round": a.round,
+                                    "schema_valid": a.schema_valid,
+                                    "verified": a.verified,
+                                    "failure_reason": a.failure_reason,
+                                    "resolved_file": a.resolved_file,
+                                    "resolved_symbol": a.resolved_symbol,
+                                    "start_line": a.start_line,
+                                    "end_line": a.end_line,
+                                    "source_kind": a.source_kind,
+                                    "source_chars": a.source_chars,
+                                    "readiness_improved": a.readiness_improved,
+                                }
+                                for a in _guided_acquisition.attempts
+                            ],
+                        }
+
+                    _debug_dir = Path("reports") / "debug"
+                    _debug_dir.mkdir(parents=True, exist_ok=True)
+                    _ts = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+                    _doc = {
+                        "initial_edit_readiness": _readiness_doc(_initial_edit_readiness),
+                        "deterministic_acquisition": _deterministic_doc,
+                        "readiness_after_deterministic_acquisition": _readiness_doc(_readiness_after_deterministic),
+                        "guided_acquisition": _guided_doc,
+                        "final_edit_readiness": _readiness_doc(_edit_readiness),
+                        "patch_generation_skipped": not _edit_readiness.edit_source_ready,
+                        # Best-effort only -- see ContextBudgetController.to_trace_dict();
+                        # None whenever no controller was supplied (policy="never"-equivalent
+                        # library use, or a CLI run that never built one).
+                        "budget_trace": budget_controller.to_trace_dict() if budget_controller is not None else None,
+                    }
+                    (_debug_dir / f"edit_readiness_{_ts}.json").write_text(
+                        _json.dumps(_doc, indent=2), encoding="utf-8"
+                    )
+                except Exception:
+                    pass
+
+            if not _edit_readiness.edit_source_ready:
+                _skip_patch_generation = True
+                print(
+                    "[pipeline] Not every intended edit has verified, patch-ready repository "
+                    f"source -- skipping Patch Generation for this run. "
+                    f"failure_reasons={_edit_readiness.failure_reasons}",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(f"[pipeline] Final-Target Remediation Slice unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    # Assemble final context, in order: hand-authored Patch Plan → original
+    # Repository Grounding → vuln patterns → ordinary Repository
+    # Understanding → Target Discovery Plan (exploratory) → Planner-Proposed
+    # Candidate Evidence (deterministically verified) → Final
+    # Evidence-Backed Remediation Strategy → Final-Target Remediation Slice
+    # (the last source-bearing section before Patch Generation) →
+    # final-target source coverage warning, only when incomplete.
     _ctx_parts = [
-        p for p in [_plan_text, _repo_code, _pattern_ctx, _repository_understanding_ctx] if p and p.strip()
+        p for p in [
+            _plan_text, _repo_code, _pattern_ctx, _repository_understanding_ctx,
+            _plan_ctx, _planner_evidence_ctx, _strategy_ctx, _slice_ctx, _coverage_warning_ctx,
+        ]
+        if p and p.strip()
     ]
     code_context = "\n\n".join(_ctx_parts)
 
-    print("[pipeline] Step 1/4 – Generating patch …", file=sys.stderr)
-    patch = generate_patch(vulnerability_text, llm, code_context=code_context)
+    if _skip_patch_generation:
+        print("[pipeline] Step 1/4 – Patch Generation skipped (no verified final-target source).", file=sys.stderr)
+        patch = ""
+    else:
+        print("[pipeline] Step 1/4 – Generating patch …", file=sys.stderr)
+        patch = generate_patch(vulnerability_text, llm, code_context=code_context)
 
-    # Hunk header repair — recompute @@ counts from body; never blocks the pipeline
+    # Hunk header repair — recompute @@ counts from body, and (with repo_root)
+    # relocate a drifted old-side line number by content; never blocks the pipeline
+    _raw_patch_for_telemetry = patch  # captured BEFORE repair, for the telemetry block below
+    # Tracks the RepairResult (and therefore .relocations) belonging to
+    # whichever repair pass actually produced the CURRENT `patch` — reassigned
+    # below whenever the retry or challenger-repair loop replaces `patch`, so
+    # the Evidence Sufficiency Gate signal computed further down always
+    # describes the patch that's actually being reported on, never a
+    # superseded earlier attempt.
+    _final_repair_meta = None
     try:
         from .diff_hunk_repair import repair_hunk_headers
-        patch, _repair_meta = repair_hunk_headers(patch)
+        patch, _repair_meta = repair_hunk_headers(patch, repo_root=repo_root)
+        _final_repair_meta = _repair_meta
         if _repair_meta.normalization_applied:
             print(
                 f"[pipeline] Hunk headers repaired: "
                 f"{_repair_meta.hunks_rewritten} hunk(s) in "
                 f"{_repair_meta.files_rewritten} file(s)"
+                f" ({_repair_meta.hunks_relocated} relocated by content)"
             , file=sys.stderr)
     except Exception:
         pass
+
+    # Candidate 1 relocation telemetry — observability only. Independently
+    # recomputes both a WITHOUT-relocation and a WITH-relocation variant of
+    # the same raw patch and checks `git apply --check` against each, so it
+    # can never mutate or influence `patch`/`applicability_result` above or
+    # below (see relocation_telemetry.py's module docstring). Read-only,
+    # deterministic, never blocks the pipeline, never consulted by the
+    # retry loop, the repair loop, or the Recommendation Policy below.
+    _relocation_telemetry = None
+    try:
+        from .relocation_telemetry import build_relocation_telemetry, summarize as _summarize_relocation
+        _relocation_telemetry = build_relocation_telemetry(_raw_patch_for_telemetry, repo_root)
+        print(f"[pipeline] Relocation telemetry: {_summarize_relocation(_relocation_telemetry)}", file=sys.stderr)
+        if os.environ.get("AUTOPATCHER_DEBUG") and _relocation_telemetry is not None:
+            import datetime as _dt
+            import json as _json
+            _debug_dir = Path("reports") / "debug"
+            _debug_dir.mkdir(parents=True, exist_ok=True)
+            _ts = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+            (_debug_dir / f"relocation_telemetry_{_ts}.json").write_text(
+                _json.dumps(_relocation_telemetry.to_dict(), indent=2), encoding="utf-8"
+            )
+    except Exception as exc:
+        print(f"[pipeline] Relocation telemetry unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    # Slice 4 -- Patch Target Conformance Gate + Post-Patch Recovery: the
+    # final deterministic gate, catching a generated patch that edits a
+    # DIFFERENT repository target than the one Edit Readiness actually
+    # approved -- something no earlier slice can catch, since Slices 1-3
+    # only validate/acquire source for targets known BEFORE Patch
+    # Generation runs. Runs only when there IS an Edit Readiness context
+    # to compare against (a Final Strategy ran) and a non-empty patch was
+    # actually generated. Reuses _final_repair_meta.relocations (already
+    # computed above, as a side effect of repair_hunk_headers' own repair
+    # pass over THIS `patch`) for old-side verification -- no second
+    # relocation mechanism, no new git call. Best-effort: any failure here
+    # leaves `patch` exactly as already computed.
+    _patch_target_conformance = None        # initial conformance (this section's own PipelineResult field)
+    _regenerated_patch_target_conformance = None  # only set if regeneration actually ran
+    _post_patch_recovery = None
+    _initial_patch_before_slice4 = patch     # captured for the trace artifact below, regardless of outcome
+    if patch and patch.strip() and repo_root and _edit_readiness is not None:
+        try:
+            from .remediation_planner import (
+                build_post_patch_recovery_hint, check_patch_target_conformance,
+                post_patch_recovery_trigger_reasons, recover_post_patch_source,
+            )
+            _patch_target_conformance = check_patch_target_conformance(
+                patch, _final_repair_meta.relocations if _final_repair_meta is not None else [],
+                _edit_readiness.ready_edits, _slice_result,
+            )
+            _recovery_reasons = post_patch_recovery_trigger_reasons(_patch_target_conformance)
+            print(
+                f"[pipeline] Patch Target Conformance: all_conformant={_patch_target_conformance.all_conformant}, "
+                f"edited files={_patch_target_conformance.edited_files}"
+                + (f", trigger_reasons={_recovery_reasons}" if _recovery_reasons else ""),
+                file=sys.stderr,
+            )
+
+            if _recovery_reasons:
+                _post_patch_recovery = recover_post_patch_source(
+                    _strategy_result, repo_root, _investigation_context,
+                    _slice_result, _patch_target_conformance, patch,
+                    budget_controller=budget_controller,
+                )
+                print(
+                    f"[pipeline] Post-Patch Recovery: targets={_post_patch_recovery.recovery_targets}, "
+                    f"ready_for_regeneration={_post_patch_recovery.ready_for_regeneration}"
+                    + (f", failure_reason={_post_patch_recovery.failure_reason}"
+                       if _post_patch_recovery.failure_reason else ""),
+                    file=sys.stderr,
+                )
+
+                if not _post_patch_recovery.ready_for_regeneration:
+                    print("[pipeline] Post-Patch Recovery: insufficient recovered evidence — failing closed.", file=sys.stderr)
+                    patch = ""
+                else:
+                    _recovery_hint = build_post_patch_recovery_hint(_patch_target_conformance, _post_patch_recovery, patch)
+                    _recovery_context = code_context
+                    _recovered_rendered = (
+                        _post_patch_recovery.slice_result.rendered if _post_patch_recovery.slice_result else ""
+                    )
+                    if _recovered_rendered:
+                        _recovery_context = (code_context + "\n\n" if code_context else "") + _recovered_rendered
+
+                    try:
+                        _regenerated_raw = generate_patch(
+                            vulnerability_text, llm, code_context=_recovery_context, retry_hint=_recovery_hint,
+                        )
+                    except Exception:
+                        _regenerated_raw = ""
+
+                    if not _regenerated_raw or not _regenerated_raw.strip():
+                        print(
+                            "[pipeline] Post-Patch Recovery: regeneration produced an empty/malformed "
+                            "patch — failing closed.", file=sys.stderr,
+                        )
+                        patch = ""
+                    else:
+                        from .diff_hunk_repair import repair_hunk_headers as _repair_regenerated
+                        _regenerated_patch, _regen_meta = _repair_regenerated(_regenerated_raw, repo_root=repo_root)
+                        _regen_conformance = check_patch_target_conformance(
+                            _regenerated_patch, _regen_meta.relocations,
+                            _edit_readiness.ready_edits, _post_patch_recovery.slice_result,
+                        )
+                        _regenerated_patch_target_conformance = _regen_conformance
+                        _regen_ok = _regen_conformance.all_conformant and not _regen_conformance.unexpected_files
+                        print(
+                            f"[pipeline] Post-Patch Recovery: regeneration_performed=True, "
+                            f"regenerated all_conformant={_regen_conformance.all_conformant}, "
+                            f"accepted={_regen_ok}",
+                            file=sys.stderr,
+                        )
+                        if _regen_ok:
+                            patch = _regenerated_patch
+                            _final_repair_meta = _regen_meta
+                            _slice_result = _post_patch_recovery.slice_result
+                            _patch_target_conformance = _regen_conformance
+                        else:
+                            print(
+                                "[pipeline] Post-Patch Recovery: regenerated patch still fails target "
+                                "conformance — failing closed.", file=sys.stderr,
+                            )
+                            patch = ""
+        except Exception as exc:
+            print(f"[pipeline] Patch Target Conformance unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    if os.environ.get("AUTOPATCHER_DEBUG"):
+        try:
+            import datetime as _dt4
+            import json as _json4
+
+            def _conformance_doc(c):
+                if c is None:
+                    return None
+                return {
+                    "all_conformant": c.all_conformant,
+                    "edited_files": c.edited_files,
+                    "unexpected_files": c.unexpected_files,
+                    "uncovered_files": c.uncovered_files,
+                    "no_match_files": c.no_match_files,
+                    "results": [
+                        {
+                            "file": r.file, "hunk_index": r.hunk_index,
+                            "target_coverage": r.target_coverage,
+                            "old_side_status": r.old_side_status,
+                            "conformant": r.conformant,
+                        }
+                        for r in c.results
+                    ],
+                }
+
+            def _recovery_doc(rec):
+                if rec is None:
+                    return None
+                return {
+                    "triggered": rec.triggered,
+                    "trigger_reasons": rec.trigger_reasons,
+                    "recovery_targets": rec.recovery_targets,
+                    "ready_for_regeneration": rec.ready_for_regeneration,
+                    "failure_reason": rec.failure_reason,
+                    "attempts": [
+                        {
+                            "file": a.file, "trigger_reason": a.trigger_reason,
+                            "identifiers_considered": a.identifiers_considered,
+                            "resolved_file": a.resolved_file,
+                            "start_line": a.start_line, "end_line": a.end_line,
+                            "source_kind": a.source_kind, "source_chars": a.source_chars,
+                            "success": a.success, "failure_reason": a.failure_reason,
+                        }
+                        for a in rec.attempts
+                    ],
+                }
+
+            try:
+                from .diff_parsing import parse_diff as _parse_diff_for_trace
+                _initial_changed_files, _initial_file_hunks = _parse_diff_for_trace(_initial_patch_before_slice4 or "")
+            except Exception:
+                _initial_changed_files, _initial_file_hunks = [], {}
+
+            _debug_dir4 = Path("reports") / "debug"
+            _debug_dir4.mkdir(parents=True, exist_ok=True)
+            _ts4 = _dt4.datetime.now().strftime("%Y%m%dT%H%M%S")
+            _post_patch_doc = {
+                "initial_patch_files": _initial_changed_files,
+                "initial_patch_hunks": {f: len(hs) for f, hs in _initial_file_hunks.items()},
+                "approved_intended_targets": [
+                    {"file": e.file, "symbol": e.symbol}
+                    for e in (_edit_readiness.ready_edits if _edit_readiness is not None else [])
+                ],
+                "target_conformance_results": _conformance_doc(_patch_target_conformance),
+                "recovery_triggered": _post_patch_recovery.triggered if _post_patch_recovery is not None else False,
+                "recovery_reasons": _post_patch_recovery.trigger_reasons if _post_patch_recovery is not None else [],
+                "recovery_targets": _post_patch_recovery.recovery_targets if _post_patch_recovery is not None else [],
+                "post_patch_recovery": _recovery_doc(_post_patch_recovery),
+                "regeneration_performed": _regenerated_patch_target_conformance is not None,
+                "regenerated_target_conformance_results": _conformance_doc(_regenerated_patch_target_conformance),
+                "final_recovery_state": (
+                    "not_triggered" if _post_patch_recovery is None or not _post_patch_recovery.triggered
+                    else "regenerated_and_accepted" if patch and patch.strip() and _regenerated_patch_target_conformance is not None
+                    else "failed_closed"
+                ),
+                "patch_generation_skipped": not bool(patch and patch.strip()),
+                # Best-effort only -- see ContextBudgetController.to_trace_dict();
+                # None whenever no controller was supplied.
+                "budget_trace": budget_controller.to_trace_dict() if budget_controller is not None else None,
+            }
+            (_debug_dir4 / f"post_patch_recovery_{_ts4}.json").write_text(
+                _json4.dumps(_post_patch_doc, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
 
     # Patch hygiene — deterministic, best-effort, never blocks the pipeline
     try:
@@ -2703,9 +3391,10 @@ def run(
                     if not r_patch_raw or not r_patch_raw.strip():
                         print("[pipeline] Retry produced an empty patch; keeping original.", file=sys.stderr)
                     else:
+                        _r_repair_meta = None
                         try:
                             from .diff_hunk_repair import repair_hunk_headers
-                            r_patch_raw, _r_repair = repair_hunk_headers(r_patch_raw)
+                            r_patch_raw, _r_repair_meta = repair_hunk_headers(r_patch_raw, repo_root=repo_root)
                         except Exception:
                             pass
                         r_hygiene: list = []
@@ -2722,6 +3411,8 @@ def run(
                             patch = r_patch_raw
                             hygiene_findings = r_hygiene
                             applicability_result = r_app
+                            if _r_repair_meta is not None:
+                                _final_repair_meta = _r_repair_meta
                             print("[pipeline] Retry succeeded — patch applies cleanly.", file=sys.stderr)
                         else:
                             print("[pipeline] Retry did not apply; keeping original patch.", file=sys.stderr)
@@ -2842,9 +3533,10 @@ def run(
                 code_context=code_context,
                 retry_hint=_r_hint,
             )
+            _repair_loop_meta = None
             try:
                 from .diff_hunk_repair import repair_hunk_headers
-                _r_raw, _ = repair_hunk_headers(_r_raw)
+                _r_raw, _repair_loop_meta = repair_hunk_headers(_r_raw, repo_root=repo_root)
             except Exception:
                 pass
             _r_hygiene: list = []
@@ -2868,6 +3560,8 @@ def run(
                     challenger = _r_challenger
                     hygiene_findings = _r_hygiene
                     applicability_result = _r_app
+                    if _repair_loop_meta is not None:
+                        _final_repair_meta = _repair_loop_meta
                     print("[pipeline] Repair succeeded – 0 confirmed defects after re-challenge.", file=sys.stderr)
                 else:
                     print(
@@ -2878,6 +3572,25 @@ def run(
                 print("[pipeline] Repair patch does not apply; keeping original.", file=sys.stderr)
         except Exception as exc:
             print(f"[pipeline] Repair loop failed unexpectedly: {exc}", file=sys.stderr)
+
+    # Evidence Sufficiency Gate (Phase 1) -- a deterministic Trust Signal,
+    # computed here because everything above (the retry and challenger-repair
+    # loops) has now settled and `_final_repair_meta` reflects whichever
+    # repair pass actually produced the FINAL `patch`. Derived entirely from
+    # data Candidate 1 already computes (RepairResult.relocations) -- no new
+    # git calls, no new LLM calls. Deliberately observability-only: this
+    # signal is exposed in the Trust Report and in relocation telemetry, and
+    # made available in the Trust Signals dict, but is NOT read by
+    # _build_recommendation_v1 -- current Recommendation Policy behavior is
+    # unchanged by this signal's presence. See source_verification.py.
+    _source_verification_signal = None
+    try:
+        from .source_verification import classify_source_verification
+        _source_verification_signal = classify_source_verification(
+            _final_repair_meta.relocations if _final_repair_meta is not None else []
+        )
+    except Exception:
+        pass
 
     # Post-Patch Investigation staleness guard: if the repair loop above
     # replaced `patch`, the evidence computed before the first Challenger
@@ -3058,5 +3771,12 @@ def run(
         post_patch_observations=_post_patch_observations,
         post_patch_investigated_patch=_investigated_patch,
         post_patch_coverage=_post_patch_coverage,
+        relocation_telemetry=_relocation_telemetry,
+        source_verification=_source_verification_signal,
+        edit_readiness=_edit_readiness,
+        edit_acquisition=_edit_acquisition,
+        guided_acquisition=_guided_acquisition,
+        patch_target_conformance=_patch_target_conformance,
+        post_patch_recovery=_post_patch_recovery,
     )
     return _build_report(result)
