@@ -439,6 +439,23 @@ def _response_to_unified(response: Any) -> CompletionResult:
             "the candidate was withheld for safety or policy reasons"
         )
 
+    # R4-1: a candidate that carried NO usable content -- no TextBlock and no
+    # function_call ToolUseBlock (a thinking-only/blank candidate, or one whose
+    # parts were all dropped) -- has nothing the pipeline can act on. Surface it
+    # via the taxonomy instead of returning an empty end_turn, which pipeline
+    # code would read as a clean (passing) result -- for a security tool that
+    # masks a blank as a non-finding. Mirrors the no-candidates guard above and
+    # the Anthropic / OpenAI empty-content guards. A tool-use-only candidate is
+    # VALID and not caught here because content_blocks is non-empty. Refusal is
+    # the more specific signal and already raised above.
+    if not content_blocks:
+        raise LLMResponseError(
+            "Gemini returned a candidate with no usable content (empty "
+            "completion); the response may have been truncated (a thinking "
+            "model consumed the token budget before emitting output) or "
+            "filtered/malformed"
+        )
+
     stop_reason: StopReason
     has_tool_use = any(isinstance(b, ToolUseBlock) for b in content_blocks)
     mapped = _GEMINI_FINISH_REASONS.get(raw_finish)
