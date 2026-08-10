@@ -38,6 +38,8 @@ from pathlib import Path
 
 from utilities.file_io import UnsafeRepoFile, read_repo_file
 from utilities.llm.adapter import (
+    LLMRefusalError,
+    LLMResponseError,
     Message,
     TextBlock,
     ToolDef,
@@ -48,6 +50,12 @@ from utilities.llm.adapter import (
 # Bounds. Chosen so a survey of a mid-sized repository completes in a few dollars
 # rather than tens, and so a pathological tree cannot run away.
 MAX_TURNS = 24
+# A blank/malformed turn (an adapter raises LLMResponseError -- e.g. an empty
+# completion, which every adapter guards) is treated as a transient: the survey
+# retries rather than aborting work already done. This many CONSECUTIVE blanks
+# are tolerated; the NEXT one re-raises, so a persistently-empty model fails
+# loudly after MAX_CONSECUTIVE_EMPTY_TURNS + 1 calls -- well short of MAX_TURNS.
+MAX_CONSECUTIVE_EMPTY_TURNS = 2
 MAX_FILE_BYTES = 40_000
 MAX_TOTAL_BYTES = 400_000
 MAX_LIST_ENTRIES = 300
@@ -267,15 +275,35 @@ def explore_repository(
     tools = [*EXPLORATION_TOOLS, finish_tool]
     messages = [Message(role="user", content=(TextBlock(text=task_prompt),))]
 
+    consecutive_empty = 0
     while budget.turns < MAX_TURNS:
         budget.turns += 1
-        response = binding.adapter.complete(
-            model=binding.model,
-            system=system_prompt,
-            messages=messages,
-            max_tokens=MAX_TOKENS_PER_TURN,
-            tools=tools,
-        )
+        try:
+            response = binding.adapter.complete(
+                model=binding.model,
+                system=system_prompt,
+                messages=messages,
+                max_tokens=MAX_TOKENS_PER_TURN,
+                tools=tools,
+            )
+        except LLMRefusalError:
+            # A deliberate refusal / content-filter is NOT transient: propagate it
+            # so a safety signal is never silently churned past. (Caught before the
+            # broader LLMResponseError below since it is a subclass.)
+            raise
+        except LLMResponseError:
+            # A structurally-bad turn -- most often an empty completion, also a
+            # missing usage block or malformed tool_use -- must not abort a survey
+            # that may already have read useful context. Retry the SAME messages
+            # (appending nothing keeps the user/assistant roles alternating). This
+            # helps a transient blank; a deterministic malformation just re-raises
+            # once the consecutive count exceeds the cap (bounded, well short of
+            # MAX_TURNS). A refusal is caught above and never reaches here.
+            consecutive_empty += 1
+            if consecutive_empty > MAX_CONSECUTIVE_EMPTY_TURNS:
+                raise
+            continue
+        consecutive_empty = 0
         assistant_content = tuple(response.content)
         results: list[ToolResultBlock] = []
 
