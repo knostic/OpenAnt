@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/knostic/open-ant-cli/internal/python"
@@ -39,10 +40,12 @@ the active project's repo path when not given explicitly.`,
 }
 
 var (
-	patchFindingID string
-	patchCVE       string
-	patchRepoRoot  string
-	patchOutput    string
+	patchFindingID               string
+	patchCVE                     string
+	patchRepoRoot                string
+	patchOutput                  string
+	patchContextBudgetPolicy     string
+	patchMaxContextBudgetWindows int
 )
 
 func init() {
@@ -50,11 +53,51 @@ func init() {
 	patchCmd.Flags().StringVar(&patchCVE, "cve", "", "CVE identifier to fetch from NVD and remediate (mutually exclusive with --finding-id)")
 	patchCmd.Flags().StringVar(&patchRepoRoot, "repo-root", "", "Path to the target repository root (defaults to the active project's repo path; required for --cve)")
 	patchCmd.Flags().StringVarP(&patchOutput, "output", "o", "", "Output directory (default: active scan directory)")
+	// Both flags are forwarded verbatim to the Python `patch` CLI, which is
+	// the sole authority on valid values (openant/cli.py's argparse choices=
+	// / _positive_int, utilities.autopatcher.context_budget.
+	// ContextBudgetController). Go never validates policy or max-windows --
+	// see contextBudgetFlags/appendContextBudgetArgs below.
+	patchCmd.Flags().StringVar(&patchContextBudgetPolicy, "context-budget-policy", "",
+		"Context-budget extension policy: ask, always, or never (default: Python's own -- ask if interactive, else never)")
+	patchCmd.Flags().IntVar(&patchMaxContextBudgetWindows, "max-context-budget-windows", 0,
+		"Hard cap on total context-budget windows per acquisition stage (default: Python's own, 10)")
+}
+
+// contextBudgetFlags carries the raw --context-budget-policy /
+// --max-context-budget-windows values plus whether each was explicitly
+// supplied on the command line (via cmd.Flags().Changed(...)), so the Go
+// CLI can forward exactly what the user typed -- including an explicit
+// zero/invalid value -- without ever judging whether it's valid. Go is
+// transport only here: Python (openant/cli.py, ContextBudgetController)
+// remains the sole authority on what policy/max-windows values are
+// acceptable.
+type contextBudgetFlags struct {
+	policy        string
+	policySet     bool
+	maxWindows    int
+	maxWindowsSet bool
+}
+
+// appendContextBudgetArgs conditionally forwards the two context-budget
+// flags as raw Python CLI args. A flag is appended if and only if the user
+// explicitly supplied it (`*Set`) -- never based on the value itself, so an
+// explicit `--max-context-budget-windows 0` is still forwarded for Python
+// to reject, and omitting both flags leaves argv byte-for-byte unchanged
+// from before these flags existed.
+func appendContextBudgetArgs(pyArgs []string, budget contextBudgetFlags) []string {
+	if budget.policySet {
+		pyArgs = append(pyArgs, "--context-budget-policy", budget.policy)
+	}
+	if budget.maxWindowsSet {
+		pyArgs = append(pyArgs, "--max-context-budget-windows", strconv.Itoa(budget.maxWindows))
+	}
+	return pyArgs
 }
 
 var cveIDPattern = regexp.MustCompile(`^CVE-\d{4}-\d{4,}$`)
 
-func buildPatchPyArgs(pipelineOutputPath, findingID, repoRoot, outputDir string) []string {
+func buildPatchPyArgs(pipelineOutputPath, findingID, repoRoot, outputDir string, budget contextBudgetFlags) []string {
 	pyArgs := []string{"patch", pipelineOutputPath, "--finding-id", findingID}
 	if repoRoot != "" {
 		pyArgs = append(pyArgs, "--repo-root", repoRoot)
@@ -62,15 +105,15 @@ func buildPatchPyArgs(pipelineOutputPath, findingID, repoRoot, outputDir string)
 	if outputDir != "" {
 		pyArgs = append(pyArgs, "--output", outputDir)
 	}
-	return pyArgs
+	return appendContextBudgetArgs(pyArgs, budget)
 }
 
-func buildPatchCVEPyArgs(cve, repoRoot, outputDir string) []string {
+func buildPatchCVEPyArgs(cve, repoRoot, outputDir string, budget contextBudgetFlags) []string {
 	pyArgs := []string{"patch", "--cve", cve, "--repo-root", repoRoot}
 	if outputDir != "" {
 		pyArgs = append(pyArgs, "--output", outputDir)
 	}
-	return pyArgs
+	return appendContextBudgetArgs(pyArgs, budget)
 }
 
 func runPatch(cmd *cobra.Command, args []string) {
@@ -83,14 +126,24 @@ func runPatch(cmd *cobra.Command, args []string) {
 		os.Exit(2)
 	}
 
+	// Built once here, from the cobra.Command that actually parsed the
+	// flags, then threaded down unmodified -- see contextBudgetFlags for
+	// why Changed() (not the parsed value) decides whether to forward.
+	budget := contextBudgetFlags{
+		policy:        patchContextBudgetPolicy,
+		policySet:     cmd.Flags().Changed("context-budget-policy"),
+		maxWindows:    patchMaxContextBudgetWindows,
+		maxWindowsSet: cmd.Flags().Changed("max-context-budget-windows"),
+	}
+
 	if patchCVE != "" {
-		runPatchCVE(args)
+		runPatchCVE(args, budget)
 		return
 	}
-	runPatchFinding(args)
+	runPatchFinding(args, budget)
 }
 
-func runPatchFinding(args []string) {
+func runPatchFinding(args []string, budget contextBudgetFlags) {
 	pipelineOutputPath, ctx, err := resolveFileArg(args, "pipeline_output.json")
 	if err != nil {
 		output.PrintError(err.Error())
@@ -126,7 +179,7 @@ func runPatchFinding(args []string) {
 		os.Exit(2)
 	}
 
-	pyArgs := buildPatchPyArgs(pipelineOutputPath, patchFindingID, repoRoot, outputDir)
+	pyArgs := buildPatchPyArgs(pipelineOutputPath, patchFindingID, repoRoot, outputDir, budget)
 
 	// Auto Patcher's LLM calls are independently configured via LLM_PROVIDER /
 	// OPENAI_API_KEY / ANTHROPIC_API_KEY -- never OpenAnt's own --api-key or
@@ -143,7 +196,7 @@ func runPatchFinding(args []string) {
 	printPatchResultAndExit(result)
 }
 
-func runPatchCVE(args []string) {
+func runPatchCVE(args []string, budget contextBudgetFlags) {
 	if len(args) > 0 {
 		output.PrintError("openant patch --cve does not take a pipeline-output-path argument")
 		os.Exit(2)
@@ -191,7 +244,7 @@ func runPatchCVE(args []string) {
 		os.Exit(2)
 	}
 
-	pyArgs := buildPatchCVEPyArgs(patchCVE, repoRoot, outputDir)
+	pyArgs := buildPatchCVEPyArgs(patchCVE, repoRoot, outputDir, budget)
 
 	// Same deliberate omission as Finding mode: Auto Patcher's LLM calls are
 	// configured independently via LLM_PROVIDER / OPENAI_API_KEY /

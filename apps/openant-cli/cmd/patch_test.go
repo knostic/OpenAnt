@@ -7,7 +7,7 @@ import (
 )
 
 func TestBuildPatchPyArgsBaseline(t *testing.T) {
-	args := buildPatchPyArgs("/scan/pipeline_output.json", "F-001", "", "")
+	args := buildPatchPyArgs("/scan/pipeline_output.json", "F-001", "", "", contextBudgetFlags{})
 	want := []string{"patch", "/scan/pipeline_output.json", "--finding-id", "F-001"}
 	if len(args) != len(want) {
 		t.Fatalf("argv = %v, want %v", args, want)
@@ -20,7 +20,7 @@ func TestBuildPatchPyArgsBaseline(t *testing.T) {
 }
 
 func TestBuildPatchPyArgsWithRepoRootAndOutput(t *testing.T) {
-	args := buildPatchPyArgs("/scan/pipeline_output.json", "F-001", "/repo", "/scan")
+	args := buildPatchPyArgs("/scan/pipeline_output.json", "F-001", "/repo", "/scan", contextBudgetFlags{})
 	want := []string{
 		"patch", "/scan/pipeline_output.json", "--finding-id", "F-001",
 		"--repo-root", "/repo",
@@ -37,12 +37,106 @@ func TestBuildPatchPyArgsWithRepoRootAndOutput(t *testing.T) {
 }
 
 func TestBuildPatchPyArgsOmitsRepoRootAndOutputWhenEmpty(t *testing.T) {
-	args := buildPatchPyArgs("/scan/pipeline_output.json", "F-001", "", "")
+	args := buildPatchPyArgs("/scan/pipeline_output.json", "F-001", "", "", contextBudgetFlags{})
 	if found, _ := findFlag(args, "--repo-root"); found {
 		t.Errorf("did not expect --repo-root in pyArgs when unset, got %v", args)
 	}
 	if found, _ := findFlag(args, "--output"); found {
 		t.Errorf("did not expect --output in pyArgs when unset, got %v", args)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// --context-budget-policy / --max-context-budget-windows: transport-only
+// forwarding. Go never validates these values -- see contextBudgetFlags and
+// appendContextBudgetArgs in patch.go. Whether a flag is forwarded depends
+// solely on *Set (i.e. cmd.Flags().Changed(...) at the real call site),
+// never on the value itself.
+// ---------------------------------------------------------------------------
+
+func TestPatchCmdHasContextBudgetPolicyFlag(t *testing.T) {
+	flag := patchCmd.Flags().Lookup("context-budget-policy")
+	if flag == nil {
+		t.Fatal("patchCmd is missing the --context-budget-policy flag")
+	}
+	if flag.DefValue != "" {
+		t.Errorf("--context-budget-policy default should be empty, got %q", flag.DefValue)
+	}
+}
+
+func TestPatchCmdHasMaxContextBudgetWindowsFlag(t *testing.T) {
+	flag := patchCmd.Flags().Lookup("max-context-budget-windows")
+	if flag == nil {
+		t.Fatal("patchCmd is missing the --max-context-budget-windows flag")
+	}
+	if flag.DefValue != "0" {
+		t.Errorf("--max-context-budget-windows default should be 0, got %q", flag.DefValue)
+	}
+}
+
+func TestBuildPatchPyArgsForwardsPolicyWhenSet(t *testing.T) {
+	args := buildPatchPyArgs("/scan/pipeline_output.json", "F-001", "", "", contextBudgetFlags{
+		policy:    "always",
+		policySet: true,
+	})
+	found, val := findFlag(args, "--context-budget-policy")
+	if !found {
+		t.Fatalf("expected --context-budget-policy in pyArgs, got %v", args)
+	}
+	if val != "always" {
+		t.Errorf("--context-budget-policy = %q, want %q", val, "always")
+	}
+}
+
+func TestBuildPatchPyArgsOmitsPolicyWhenNotSet(t *testing.T) {
+	// Any string value in `policy` must be ignored when policySet is false --
+	// forwarding is gated purely on *Set, never on the value.
+	args := buildPatchPyArgs("/scan/pipeline_output.json", "F-001", "", "", contextBudgetFlags{
+		policy:    "always",
+		policySet: false,
+	})
+	if found, _ := findFlag(args, "--context-budget-policy"); found {
+		t.Errorf("did not expect --context-budget-policy in pyArgs when policySet=false, got %v", args)
+	}
+}
+
+func TestBuildPatchPyArgsForwardsMaxWindowsWhenSet(t *testing.T) {
+	args := buildPatchPyArgs("/scan/pipeline_output.json", "F-001", "", "", contextBudgetFlags{
+		maxWindows:    25,
+		maxWindowsSet: true,
+	})
+	found, val := findFlag(args, "--max-context-budget-windows")
+	if !found {
+		t.Fatalf("expected --max-context-budget-windows in pyArgs, got %v", args)
+	}
+	if val != "25" {
+		t.Errorf("--max-context-budget-windows = %q, want %q", val, "25")
+	}
+}
+
+func TestBuildPatchPyArgsForwardsExplicitZeroMaxWindows(t *testing.T) {
+	// An explicit 0 must still be forwarded -- Python is the only place
+	// that rejects a non-positive value. Go must never swallow it.
+	args := buildPatchPyArgs("/scan/pipeline_output.json", "F-001", "", "", contextBudgetFlags{
+		maxWindows:    0,
+		maxWindowsSet: true,
+	})
+	found, val := findFlag(args, "--max-context-budget-windows")
+	if !found {
+		t.Fatalf("expected --max-context-budget-windows in pyArgs even for an explicit 0, got %v", args)
+	}
+	if val != "0" {
+		t.Errorf("--max-context-budget-windows = %q, want %q", val, "0")
+	}
+}
+
+func TestBuildPatchPyArgsOmitsMaxWindowsWhenNotSet(t *testing.T) {
+	args := buildPatchPyArgs("/scan/pipeline_output.json", "F-001", "", "", contextBudgetFlags{
+		maxWindows:    10,
+		maxWindowsSet: false,
+	})
+	if found, _ := findFlag(args, "--max-context-budget-windows"); found {
+		t.Errorf("did not expect --max-context-budget-windows in pyArgs when maxWindowsSet=false, got %v", args)
 	}
 }
 
@@ -80,7 +174,7 @@ func TestPatchCmdIsRegisteredOnRoot(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBuildPatchCVEPyArgsBaseline(t *testing.T) {
-	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "")
+	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "", contextBudgetFlags{})
 	want := []string{"patch", "--cve", "CVE-2022-25883", "--repo-root", "/repo"}
 	if len(args) != len(want) {
 		t.Fatalf("argv = %v, want %v", args, want)
@@ -93,7 +187,7 @@ func TestBuildPatchCVEPyArgsBaseline(t *testing.T) {
 }
 
 func TestBuildPatchCVEPyArgsWithOutput(t *testing.T) {
-	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "/scan")
+	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "/scan", contextBudgetFlags{})
 	want := []string{
 		"patch", "--cve", "CVE-2022-25883",
 		"--repo-root", "/repo",
@@ -110,9 +204,63 @@ func TestBuildPatchCVEPyArgsWithOutput(t *testing.T) {
 }
 
 func TestBuildPatchCVEPyArgsOmitsOutputWhenEmpty(t *testing.T) {
-	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "")
+	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "", contextBudgetFlags{})
 	if found, _ := findFlag(args, "--output"); found {
 		t.Errorf("did not expect --output in pyArgs when unset, got %v", args)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// --context-budget-policy / --max-context-budget-windows in CVE mode: same
+// transport-only forwarding contract as Finding mode (see equivalent tests
+// above for buildPatchPyArgs).
+// ---------------------------------------------------------------------------
+
+func TestBuildPatchCVEPyArgsForwardsPolicyWhenSet(t *testing.T) {
+	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "", contextBudgetFlags{
+		policy:    "never",
+		policySet: true,
+	})
+	found, val := findFlag(args, "--context-budget-policy")
+	if !found {
+		t.Fatalf("expected --context-budget-policy in pyArgs, got %v", args)
+	}
+	if val != "never" {
+		t.Errorf("--context-budget-policy = %q, want %q", val, "never")
+	}
+}
+
+func TestBuildPatchCVEPyArgsOmitsPolicyWhenNotSet(t *testing.T) {
+	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "", contextBudgetFlags{
+		policy:    "never",
+		policySet: false,
+	})
+	if found, _ := findFlag(args, "--context-budget-policy"); found {
+		t.Errorf("did not expect --context-budget-policy in pyArgs when policySet=false, got %v", args)
+	}
+}
+
+func TestBuildPatchCVEPyArgsForwardsExplicitZeroMaxWindows(t *testing.T) {
+	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "", contextBudgetFlags{
+		maxWindows:    0,
+		maxWindowsSet: true,
+	})
+	found, val := findFlag(args, "--max-context-budget-windows")
+	if !found {
+		t.Fatalf("expected --max-context-budget-windows in pyArgs even for an explicit 0, got %v", args)
+	}
+	if val != "0" {
+		t.Errorf("--max-context-budget-windows = %q, want %q", val, "0")
+	}
+}
+
+func TestBuildPatchCVEPyArgsOmitsMaxWindowsWhenNotSet(t *testing.T) {
+	args := buildPatchCVEPyArgs("CVE-2022-25883", "/repo", "", contextBudgetFlags{
+		maxWindows:    10,
+		maxWindowsSet: false,
+	})
+	if found, _ := findFlag(args, "--max-context-budget-windows"); found {
+		t.Errorf("did not expect --max-context-budget-windows in pyArgs when maxWindowsSet=false, got %v", args)
 	}
 }
 
