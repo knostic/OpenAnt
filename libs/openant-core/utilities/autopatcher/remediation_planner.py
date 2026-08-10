@@ -3431,7 +3431,28 @@ class PatchTargetConformanceResult(NamedTuple):
     relocation mechanism). `conformant` is the single, strict verdict:
     True only when both are satisfied (or, for a genuine new-file hunk,
     when the file is an approved target -- there is no old side to
-    verify)."""
+    verify).
+
+    `target_coverage`'s primary check (see check_patch_target_conformance)
+    matches the hunk's old-side text verbatim against the rendered
+    EDIT-TARGET capsule for its file. That capsule is deliberately narrow
+    (a "Target definition" block is padded by only
+    _DEFINITION_CONTEXT_LINES lines on each side -- sized for LLM
+    reasoning, not for re-verifying an arbitrary hunk's own context
+    width). A hunk whose own diff context happens to be wider than that
+    padding can still be genuinely, uniquely verified against the real
+    repository file (old_side_status == "old_side_verified") while its
+    full old-side text no longer fits inside the narrower capsule
+    verbatim. For that specific case ONLY, check_patch_target_conformance
+    falls back to a position check: the hunk's own REMOVED lines (never
+    its surrounding context -- see _removed_line_span) must fall, in the
+    real repository file's own line numbers already resolved by
+    HunkRelocationRecord, entirely inside one of the approved target's
+    own rendered "Target definition" line ranges (see
+    _edit_target_line_ranges_for_file). This never widens what counts as
+    "approved" beyond a verified target's own real span -- it only stops
+    a hunk's incidental context width from defeating a match that is
+    otherwise squarely inside it."""
 
     file: str
     hunk_index: int
@@ -3487,6 +3508,77 @@ def _edit_target_source_for_file(rendered: str, file: str) -> str:
     return "\n".join(blocks)
 
 
+def _edit_target_line_ranges_for_file(rendered: str, file: str) -> "list[tuple[int, int]]":
+    """The real repository (start, end) line range of every "Target
+    definition" EDIT-TARGET-role block already rendered for exactly
+    `file` -- read back from the SAME block headers
+    `_edit_target_source_for_file` already parses (this module's own
+    _render_definition_block, which always renders a "(lines
+    start-end)" annotation via _RENDERED_LINES_RE -- the identical
+    regex _sniff_rendered_lines already uses, reused here rather than a
+    second one). Deliberately excludes "Full file (last resort)" blocks:
+    those already contain the whole file as CODE text, so the existing
+    verbatim text match in check_patch_target_conformance already
+    succeeds for them regardless of a hunk's context width -- no
+    position fallback is needed, or computed, for that case.
+
+    Used only for the narrow fallback described in
+    PatchTargetConformanceResult's docstring: never a new resolution
+    pass, never a new repository read -- purely re-parsing text this
+    module itself already rendered."""
+    if not rendered or not file:
+        return []
+    ranges: "list[tuple[int, int]]" = []
+    for part in re.split(r"\n(?=#### )", rendered):
+        if not part.startswith("#### Target definition:"):
+            continue
+        header_line = part.splitlines()[0] if part.splitlines() else ""
+        m = re.search(r"`([^`]+)`", header_line)
+        if not m or m.group(1).split(":")[0] != file:
+            continue
+        start, end = _sniff_rendered_lines(header_line)
+        if start is not None and end is not None:
+            ranges.append((start, end))
+    return ranges
+
+
+def _removed_line_span(relocated_start: "int | None", hunk_lines: "list[str]") -> "tuple[int, int] | None":
+    """The real (1-indexed) repository file line range spanned by this
+    hunk's own REMOVED ('-') lines ONLY -- context lines never count
+    towards this span, so a hunk whose surrounding context is wider
+    than a verified target's own rendered capsule cannot, merely by
+    padding its own context, expand what counts as "inside" the
+    approved target (see PatchTargetConformanceResult's docstring).
+
+    `relocated_start` is the real file line HunkRelocationRecord already
+    resolved for this hunk's first old-side (context or removed) line --
+    reused verbatim, never re-derived by a second relocation pass. Every
+    old-side line (context ' ' or removed '-') advances the running
+    real-file line counter by exactly one, in hunk order, exactly
+    mirroring how a unified diff's OLD side maps onto real file lines;
+    only removed lines are recorded into the returned span. Returns None
+    for a hunk with no removed line (a pure addition -- has no old-side
+    position to check) or when `relocated_start` itself is unknown (no
+    unique real-file match was ever found for this hunk)."""
+    if relocated_start is None:
+        return None
+    offset = 0
+    first: "int | None" = None
+    last: "int | None" = None
+    for line in hunk_lines:
+        marker = line[:1]
+        if marker not in (" ", "-"):
+            continue
+        if marker == "-":
+            if first is None:
+                first = relocated_start + offset
+            last = relocated_start + offset
+        offset += 1
+    if first is None or last is None:
+        return None
+    return (first, last)
+
+
 def check_patch_target_conformance(
     patch: str,
     relocations: "list",
@@ -3512,7 +3604,19 @@ def check_patch_target_conformance(
     "this file happens to be a ready target" (see
     PatchTargetConformanceResult's docstring): an edit to an unrelated
     part of a ready-edit's own file, or to a mechanism consumer, is
-    "uncovered_target", not "approved_target".
+    "uncovered_target", not "approved_target". When that verbatim-text
+    match fails but the hunk's old side was independently, uniquely
+    verified against the real repository file (old_side_status ==
+    "old_side_verified"), one narrow fallback applies: the hunk's own
+    REMOVED lines' real position (see _removed_line_span) is checked
+    against the approved target's own rendered line range (see
+    _edit_target_line_ranges_for_file) -- this is what keeps a hunk whose
+    own diff context is simply wider than the rendered capsule's fixed
+    padding from being misclassified "uncovered_target" despite editing
+    exactly, and only, verified target content (see
+    PatchTargetConformanceResult's docstring for why this is still
+    strict: it is never satisfied by "same file", only by a position
+    inside a specific approved target's own verified span).
 
     A hunk whose declared old_start is 0 (repair_hunk_headers' own
     new-file sentinel) is a genuine new-file creation -- there is no old
@@ -3540,6 +3644,7 @@ def check_patch_target_conformance(
         hunks = file_hunks.get(file, [])
         file_relocations = by_file_relocations.get(file, [])
         target_source = _edit_target_source_for_file(rendered, file)
+        target_ranges = _edit_target_line_ranges_for_file(rendered, file)
 
         for idx, hunk in enumerate(hunks):
             record = file_relocations[idx] if idx < len(file_relocations) else None
@@ -3565,10 +3670,26 @@ def check_patch_target_conformance(
                 target_coverage = "approved_target"
             else:
                 anchors = old_side_anchors(hunk.lines)
-                if anchors and target_source and find_unique_occurrence(anchors, target_source.splitlines()) is not None:
-                    target_coverage = "approved_target"
-                else:
-                    target_coverage = "uncovered_target"
+                matched = bool(anchors) and bool(target_source) and (
+                    find_unique_occurrence(anchors, target_source.splitlines()) is not None
+                )
+                if not matched and old_side_status == "old_side_verified" and target_ranges:
+                    # Fallback ONLY for a hunk already independently,
+                    # uniquely verified against the real repository file
+                    # (see this function's own docstring): its own
+                    # verbatim old-side text simply didn't fit inside the
+                    # rendered capsule's fixed padding, but its REMOVED
+                    # lines' real position still lands entirely inside
+                    # one of the approved target's own rendered ranges.
+                    removed_span = _removed_line_span(
+                        getattr(record, "relocated_hunk_start", None), hunk.lines,
+                    )
+                    if removed_span is not None:
+                        matched = any(
+                            start <= removed_span[0] and removed_span[1] <= end
+                            for (start, end) in target_ranges
+                        )
+                target_coverage = "approved_target" if matched else "uncovered_target"
 
             conformant = (
                 target_coverage == "approved_target"
@@ -4292,12 +4413,25 @@ def build_post_patch_recovery_hint(
     that the now-available verified source above must be copied
     verbatim, and that the same intended fix must be preserved without
     introducing unrelated edits -- never repository-specific wording, no
-    vulnerability-family rules."""
-    lines = ["The previous patch edited repository content that could not be verified:"]
+    vulnerability-family rules.
+
+    The header line and each per-file bullet are deliberately worded
+    per-reason rather than one shared claim: `uncovered_files` means the
+    edited content WAS verified against the repository (old_side_status
+    can be "old_side_verified") but fell outside the approved edit
+    target(s) -- a wrong-target problem, not an unverified-content one
+    -- while `unexpected_files` and `no_match_files` are genuinely about
+    an unapproved file or content that could not be found at all. Using
+    one blanket "could not be verified" line for all three would
+    misstate the uncovered_target case specifically."""
+    lines = ["The previous patch did not pass Patch Target Conformance:"]
     for f in conformance.unexpected_files:
         lines.append(f"- `{f}` was not an approved edit target for this vulnerability.")
     for f in conformance.uncovered_files:
-        lines.append(f"- `{f}` was edited, but the specific content changed there did not match verified evidence.")
+        lines.append(
+            f"- `{f}` was edited, and that content was verified against the repository, "
+            f"but the edit fell outside the approved edit target(s) for this vulnerability."
+        )
     for f in conformance.no_match_files:
         lines.append(f"- `{f}`'s removed/context lines could not be found anywhere in the repository (no_match).")
     lines.append("")

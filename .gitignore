@@ -14,3 +14,6 @@ reports/
 
 # Local-only scratch and generated artifacts (not part of the codebase)
 *knowledge-graph.*
+
+# Local scripts and tools
+*run_traced*

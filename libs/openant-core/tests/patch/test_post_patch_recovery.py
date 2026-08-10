@@ -245,6 +245,208 @@ class TestPatchTargetConformance:
 
 
 # ---------------------------------------------------------------------------
+# Regression coverage for the wide-diff-context / narrow-rendered-capsule
+# mismatch: a hunk whose own context is wider than _DEFINITION_CONTEXT_LINES
+# can be genuinely old_side_verified (unique match against the real file)
+# yet still miss the verbatim text search against the narrower rendered
+# capsule. check_patch_target_conformance's position-based fallback (see
+# its own docstring) must recover exactly this case without loosening
+# Case 1 (an edit outside an explicitly-approved symbol must still fail).
+# ---------------------------------------------------------------------------
+
+def _write_class_with_many_attrs(tmp_path, target_line_1indexed=14, total_attrs=24):
+    """A file with one target constant surrounded by enough sibling
+    attributes that a hunk can carry more diff context (5 lines each
+    side) than the rendered capsule's own padding (_DEFINITION_CONTEXT_
+    LINES == 3) without running off either end of the file. Returns the
+    written lines (1-indexed access via lines[n-1])."""
+    before = target_line_1indexed - 2
+    after = total_attrs - before
+    lines = ["class Widget(object):\n"]
+    for i in range(before):
+        lines.append(f"    ATTR_{i} = {i}\n")
+    lines.append('    TARGET_CONST = frozenset(["A"])\n')
+    for i in range(before, before + after):
+        lines.append(f"    ATTR_{i} = {i}\n")
+    (tmp_path / "mod.py").write_text("".join(lines), encoding="utf-8")
+    return lines
+
+
+def _wide_context_patch(lines, target_line, context_width=5):
+    """A one-line-change hunk whose old-side context is wider than
+    _DEFINITION_CONTEXT_LINES (3) on each side -- exactly the shape that
+    exposed the bug: fully verifiable against the real file, but not
+    verbatim-containable inside the narrower rendered capsule."""
+    ctx_before = [" " + lines[i - 1] for i in range(target_line - context_width, target_line)]
+    ctx_after = [" " + lines[i - 1] for i in range(target_line + 1, target_line + context_width + 1)]
+    removed = "-" + lines[target_line - 1]
+    added = '+    TARGET_CONST = frozenset(["A", "B"])\n'
+    body = "".join(ctx_before) + removed + added + "".join(ctx_after)
+    start = target_line - context_width
+    count = context_width * 2 + 1
+    return f"--- a/mod.py\n+++ b/mod.py\n@@ -{start},{count} +{start},{count} @@\n" + body
+
+
+class TestWideContextHunkConformance:
+    def test_file_level_ready_edit_wide_context_hunk_becomes_approved(self, tmp_path):
+        """Regression for Test 1/3: a file-level (symbol=None) intended
+        edit that became ready via identifier_definition_covered (a
+        deterministically verified identifier, not a mere symbol=null
+        placeholder) must not be classified uncovered_target merely
+        because the generated hunk's own diff context is wider than the
+        rendered capsule's fixed padding."""
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+            check_patch_target_conformance, post_patch_recovery_trigger_reasons,
+        )
+
+        target_line = 14
+        lines = _write_class_with_many_attrs(tmp_path, target_line)
+        context = _make_context(constants={"mod.py": {
+            "Widget.TARGET_CONST": {
+                "qualified_name": "Widget.TARGET_CONST", "class_name": "Widget",
+                "name": "TARGET_CONST", "line": target_line, "end_line": target_line,
+            },
+        }}, repo_path=tmp_path)
+        # File-level target: no target_symbols at all -- readiness for this
+        # file can ONLY come from identifier_definition_covered (category 2),
+        # driven by extended_mechanism naming the real identifier.
+        strategy = _make_strategy(
+            target_files=["mod.py"], target_symbols=[],
+            extended_mechanism="Update TARGET_CONST to include B",
+        )
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert "mod.py" in slice_result.identifier_definition_covered
+
+        intended_edits = build_intended_edits(strategy, slice_result)
+        readiness = check_edit_readiness(intended_edits, slice_result)
+        assert readiness.edit_source_ready is True
+        assert readiness.ready_edits[0].symbol is None  # file-level identity, as documented
+
+        patch = _wide_context_patch(lines, target_line)
+        patch, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+        assert meta.relocations[0].relocation_reason == "unique_match"
+
+        report = check_patch_target_conformance(patch, meta.relocations, readiness.ready_edits, slice_result)
+        assert report.results[0].old_side_status == "old_side_verified"
+        assert report.results[0].target_coverage == "approved_target"
+        assert report.all_conformant is True
+        assert post_patch_recovery_trigger_reasons(report) == []
+
+    def test_symbol_level_ready_edit_wide_context_hunk_becomes_approved(self, tmp_path):
+        """Same shape as above, but for an EXPLICIT symbol-level intended
+        edit (file + symbol both given) -- proves the fix is general,
+        not file-level-specific."""
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+            check_patch_target_conformance,
+        )
+
+        target_line = 14
+        lines = _write_class_with_many_attrs(tmp_path, target_line)
+        context = _make_context(constants={"mod.py": {
+            "Widget.TARGET_CONST": {
+                "qualified_name": "Widget.TARGET_CONST", "class_name": "Widget",
+                "name": "TARGET_CONST", "line": target_line, "end_line": target_line,
+            },
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:Widget.TARGET_CONST"])
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        intended_edits = build_intended_edits(strategy, slice_result)
+        readiness = check_edit_readiness(intended_edits, slice_result)
+        assert readiness.edit_source_ready is True
+        assert readiness.ready_edits[0].symbol == "mod.py:Widget.TARGET_CONST"
+
+        patch = _wide_context_patch(lines, target_line)
+        patch, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+
+        report = check_patch_target_conformance(patch, meta.relocations, readiness.ready_edits, slice_result)
+        assert report.results[0].old_side_status == "old_side_verified"
+        assert report.results[0].target_coverage == "approved_target"
+        assert report.all_conformant is True
+
+    def test_symbol_level_wide_context_hunk_on_unrelated_content_stays_uncovered(self, tmp_path):
+        """Case 1 regression guard: the position-based fallback must
+        never widen coverage beyond the approved symbol's own verified
+        range. A hunk that is old_side_verified (unique match in the
+        real file) but edits unrelated content far from the approved
+        symbol must remain uncovered_target/non-conformant even though
+        it uses the exact same wide-context hunk shape as the fix
+        above."""
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+            check_patch_target_conformance, post_patch_recovery_trigger_reasons,
+        )
+
+        target_line = 14
+        lines = _write_class_with_many_attrs(tmp_path, target_line, total_attrs=40)
+        context = _make_context(constants={"mod.py": {
+            "Widget.TARGET_CONST": {
+                "qualified_name": "Widget.TARGET_CONST", "class_name": "Widget",
+                "name": "TARGET_CONST", "line": target_line, "end_line": target_line,
+            },
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:Widget.TARGET_CONST"])
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        intended_edits = build_intended_edits(strategy, slice_result)
+        readiness = check_edit_readiness(intended_edits, slice_result)
+        assert readiness.edit_source_ready is True
+
+        # Edit a sibling attribute far outside TARGET_CONST's own rendered
+        # (padded) range -- never rendered as this ready edit's own source.
+        far_line = next(i + 1 for i, l in enumerate(lines) if l.strip().startswith("ATTR_30 "))
+        patch = (
+            f"--- a/mod.py\n+++ b/mod.py\n@@ -{far_line},1 +{far_line},1 @@\n"
+            f"-    ATTR_30 = 30\n+    ATTR_30 = 999\n"
+        )
+        patch, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+        assert meta.relocations[0].relocation_reason == "unique_match"
+
+        report = check_patch_target_conformance(patch, meta.relocations, readiness.ready_edits, slice_result)
+        assert report.results[0].old_side_status == "old_side_verified"
+        assert report.results[0].target_coverage == "uncovered_target"
+        assert report.all_conformant is False
+        assert "uncovered_target" in post_patch_recovery_trigger_reasons(report)
+
+    def test_narrow_context_hunk_behavior_is_unchanged(self, tmp_path):
+        """Baseline: the ORIGINAL verbatim-text match path (hunk context
+        within the rendered capsule's own padding) still governs when it
+        already succeeds -- the position-based fallback is additive
+        only, never consulted when the primary text match already
+        works."""
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+            check_patch_target_conformance,
+        )
+
+        target_line = 14
+        lines = _write_class_with_many_attrs(tmp_path, target_line)
+        context = _make_context(constants={"mod.py": {
+            "Widget.TARGET_CONST": {
+                "qualified_name": "Widget.TARGET_CONST", "class_name": "Widget",
+                "name": "TARGET_CONST", "line": target_line, "end_line": target_line,
+            },
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:Widget.TARGET_CONST"])
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        intended_edits = build_intended_edits(strategy, slice_result)
+        readiness = check_edit_readiness(intended_edits, slice_result)
+
+        patch = _wide_context_patch(lines, target_line, context_width=1)  # fits the 3-line padding
+        patch, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+
+        report = check_patch_target_conformance(patch, meta.relocations, readiness.ready_edits, slice_result)
+        assert report.results[0].target_coverage == "approved_target"
+        assert report.all_conformant is True
+
+
+# ---------------------------------------------------------------------------
 # recover_post_patch_source
 # ---------------------------------------------------------------------------
 
@@ -1035,6 +1237,74 @@ class TestSlice4PipelineIntegration:
         doc = _json.loads(files[0].read_text(encoding="utf-8"))
         assert doc["recovery_triggered"] is False
         assert doc["final_recovery_state"] == "not_triggered"
+
+
+# ---------------------------------------------------------------------------
+# build_post_patch_recovery_hint wording -- must accurately distinguish
+# WHY recovery triggered rather than sharing one "could not be verified"
+# claim across unexpected_file / uncovered_target / old_side_no_match.
+# ---------------------------------------------------------------------------
+
+class TestPostPatchRecoveryHintWording:
+    def test_uncovered_target_wording_does_not_claim_unverified_source(self):
+        """The real-world trigger this slice is meant to describe: the
+        edited content WAS verified against the repository
+        (old_side_status could be "old_side_verified"), but the edit
+        fell outside the approved target -- the hint must say that, not
+        the source-unverified claim that only applies to no_match."""
+        from utilities.autopatcher.remediation_planner import (
+            PatchConformanceReport, PostPatchRecoveryResult, build_post_patch_recovery_hint,
+        )
+
+        conformance = PatchConformanceReport(
+            results=[], all_conformant=False, edited_files=["mod.py"],
+            unexpected_files=[], uncovered_files=["mod.py"], no_match_files=[],
+        )
+        recovery = PostPatchRecoveryResult(
+            triggered=True, trigger_reasons=["uncovered_target"], recovery_targets=["mod.py"],
+            slice_result=None, attempts=[], ready_for_regeneration=True, failure_reason=None,
+        )
+        hint = build_post_patch_recovery_hint(conformance, recovery, "")
+        assert "could not be verified" not in hint.lower()
+        assert "mod.py" in hint
+        assert "verified" in hint.lower() and "outside" in hint.lower()
+
+    def test_unexpected_file_wording_still_names_unapproved_target(self):
+        from utilities.autopatcher.remediation_planner import (
+            PatchConformanceReport, PostPatchRecoveryResult, build_post_patch_recovery_hint,
+        )
+
+        conformance = PatchConformanceReport(
+            results=[], all_conformant=False, edited_files=["other.py"],
+            unexpected_files=["other.py"], uncovered_files=[], no_match_files=[],
+        )
+        recovery = PostPatchRecoveryResult(
+            triggered=True, trigger_reasons=["unexpected_file"], recovery_targets=[],
+            slice_result=None, attempts=[], ready_for_regeneration=False, failure_reason="too_many_recovery_targets",
+        )
+        hint = build_post_patch_recovery_hint(conformance, recovery, "")
+        assert "other.py" in hint
+        assert "not an approved edit target" in hint
+
+    def test_no_match_wording_is_the_only_case_naming_unverified_content(self):
+        """no_match is the one genuine "content could not be found/
+        verified anywhere" case -- its own bullet keeps that wording;
+        it must not also apply to the uncovered_target bullet (see
+        test_uncovered_target_wording_does_not_claim_unverified_source)."""
+        from utilities.autopatcher.remediation_planner import (
+            PatchConformanceReport, PostPatchRecoveryResult, build_post_patch_recovery_hint,
+        )
+
+        conformance = PatchConformanceReport(
+            results=[], all_conformant=False, edited_files=["mod.py"],
+            unexpected_files=[], uncovered_files=[], no_match_files=["mod.py"],
+        )
+        recovery = PostPatchRecoveryResult(
+            triggered=True, trigger_reasons=["old_side_no_match"], recovery_targets=["mod.py"],
+            slice_result=None, attempts=[], ready_for_regeneration=True, failure_reason=None,
+        )
+        hint = build_post_patch_recovery_hint(conformance, recovery, "")
+        assert "could not be found anywhere in the repository" in hint
 
 
 # ---------------------------------------------------------------------------
