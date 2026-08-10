@@ -1634,3 +1634,104 @@ class TestSourceVerificationInReport:
                 break
         else:
             raise AssertionError("no known decision string found in good_report")
+
+
+class TestNoPatchProducedOutcome:
+    """Issue 2 -- an empty FINAL patch is a report-level execution outcome
+    (`no_patch`, derived inside _build_report), never a fifth Recommendation
+    Policy value and never presented via the normal Manual Review Required /
+    Deploy / Do Not Apply bottom line."""
+
+    def _base_kwargs(self, tmp_path, patch=""):
+        return dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch=patch,
+            review=(
+                "**Explanation:**\nThe code was vulnerable because of X.\n\n"
+                "**Affected areas:**\n- mod.py\n\n"
+                "**Validation notes:**\n- Test with payload Y.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""},
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": None, "skipped": True,
+                "skipped_reason": "empty diff after stripping fences",
+                "error": None, "stderr": "",
+            },
+            repo_root=tmp_path,
+            detected_language="python",
+        )
+
+    def test_heading_and_execution_outcome_wording(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs(tmp_path, patch=""))
+        report = _build_report(result)
+
+        assert "NO PATCH PRODUCED" in report
+        assert "The pipeline did not produce a final candidate patch." in report
+        assert "No patch is available for deployment or review." in report
+
+    def test_no_manual_review_or_deploy_bottom_line(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs(tmp_path, patch=""))
+        report = _build_report(result)
+
+        assert "MANUAL REVIEW REQUIRED" not in report
+        assert "DEPLOY AFTER VALIDATION" not in report
+        assert "DEPLOY WITH CAUTION" not in report
+        assert "DO NOT APPLY" not in report
+        assert "## Recommendation" not in report
+
+    def test_no_misleading_wording(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs(tmp_path, patch=""))
+        report = _build_report(result)
+
+        assert "Patch was not verified" not in report
+        assert "before deployment" not in report
+        assert "review the patch" not in report
+
+    def test_no_top_action_or_validation_actions_section(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs(tmp_path, patch=""))
+        report = _build_report(result)
+
+        assert "**Top action:**" not in report
+        assert "## Validation Actions" not in report
+
+    def test_proposed_patch_section_is_not_blank(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs(tmp_path, patch=""))
+        report = _build_report(result)
+
+        idx = report.find("## Proposed patch")
+        assert idx != -1
+        section = report[idx:idx + 200]
+        assert "No final candidate patch was produced" in section
+
+    def test_whitespace_only_patch_is_also_treated_as_no_patch(self, tmp_path):
+        """`no_patch` must be whitespace-tolerant -- not merely `== ""`."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs(tmp_path, patch="   \n  "))
+        report = _build_report(result)
+        assert "NO PATCH PRODUCED" in report
+
+    def test_normal_patch_is_unaffected(self, tmp_path):
+        """Regression: a real, non-empty patch must still render the normal
+        Recommendation Policy bottom line, not the no-patch card."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 2\n"
+        kwargs = self._base_kwargs(tmp_path, patch=patch)
+        kwargs["applicability"] = {
+            "applicable": True, "skipped": False, "skipped_reason": None, "error": None, "stderr": "",
+        }
+        result = PipelineResult(**kwargs)
+        report = _build_report(result)
+
+        assert "NO PATCH PRODUCED" not in report
+        assert "## Recommendation" in report

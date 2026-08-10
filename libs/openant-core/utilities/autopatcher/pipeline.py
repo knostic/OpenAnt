@@ -1696,6 +1696,27 @@ def _render_decision_card(
     return "\n".join(lines)
 
 
+def _render_no_patch_card(files_changed: list[str]) -> str:
+    """First-screen execution-outcome card for a run that produced no
+    final candidate patch. Deliberately NOT a Recommendation Policy
+    decision (see _build_recommendation_v1, left untouched) -- a report
+    stating there is nothing to deploy, review, or validate must never
+    reuse _render_decision_card's signals-driven wording, which would
+    otherwise render a misleading "Patch was not verified." line for a
+    patch that does not exist.
+    """
+    lines = [
+        "## ⚫ NO PATCH PRODUCED\n",
+        "The pipeline did not produce a final candidate patch.  ",
+        "No patch is available for deployment or review.  ",
+        f"Files changed: {len(files_changed)}",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def _render_deterministic_signals(
     constraint_signals: list[dict] | None,
     remediation_signals: list[dict] | None,
@@ -1821,6 +1842,13 @@ def _build_report(result: PipelineResult) -> str:
     for line in (result.patch or "").splitlines():
         if line.startswith("+++ b/"):
             files_changed.append(line[6:].strip())
+
+    # Report-level execution outcome -- NOT a Recommendation Policy value
+    # (see _build_recommendation_v1, left untouched below). When the FINAL
+    # result.patch is empty, there is nothing to deploy, review, or
+    # validate, regardless of what the (still-computed) Recommendation
+    # Policy signals say.
+    no_patch = not (result.patch and result.patch.strip())
 
     # Build Patch Hygiene section
     hygiene_findings = result.hygiene or []
@@ -2038,6 +2066,13 @@ def _build_report(result: PipelineResult) -> str:
     validation_actions = build_validation_plan(
         challenger, suggestions, matches, rating, result.impact, behavior
     )
+    if no_patch:
+        # Nothing to validate, deploy, or review for this outcome -- emptying
+        # here (rather than special-casing every renderer that consumes this
+        # list) means the existing "no validation actions" fallbacks already
+        # in this module -- no Top Action, no Validation Actions section --
+        # apply for free, with no changes to those renderers.
+        validation_actions = []
 
     # -----------------------
     # Trust Package computation (uses hoisted data above)
@@ -2081,13 +2116,22 @@ def _build_report(result: PipelineResult) -> str:
     consistency_caveats = _check_recommendation_consistency(signals, trust_rec["decision"], known_findings)
     manual_review_scope_note = _render_manual_review_scope_note(trust_rec["decision"], known_findings)
     top_action_line = _render_top_action_line(validation_actions)
-    decision_card = _render_decision_card(trust_rec, signals, validation_actions, files_changed)
-    recommendation_block = _render_recommendation_block(
-        trust_rec,
-        caveats=consistency_caveats,
-        scope_note=manual_review_scope_note,
-        top_action_line=top_action_line,
-    )
+    if no_patch:
+        # Execution outcome, not a Recommendation Policy presentation --
+        # _build_recommendation_v1's result (trust_rec, computed above) is
+        # intentionally not read here; the normal Manual Review Required /
+        # Deploy / Do Not Apply bottom line must never appear for an empty
+        # final patch.
+        decision_card = _render_no_patch_card(files_changed)
+        recommendation_block = ""
+    else:
+        decision_card = _render_decision_card(trust_rec, signals, validation_actions, files_changed)
+        recommendation_block = _render_recommendation_block(
+            trust_rec,
+            caveats=consistency_caveats,
+            scope_note=manual_review_scope_note,
+            top_action_line=top_action_line,
+        )
     trust_signals_block = _render_trust_signals_table(signals, known_findings_rendered=known_findings_relevant)
     known_findings_block = _render_known_findings(known_findings)
     validation_actions_block = _render_validation_actions_section(validation_actions, trust_rec["decision"])
@@ -2127,8 +2171,10 @@ def _build_report(result: PipelineResult) -> str:
     # of the core "understand this in 30 seconds" flow.
     #
     # This reorders, relabels, and removes duplicated content only: no
-    # change to how `patch`, `challenger`, `signals`, `trust_rec`,
-    # `classified_challenger`, or `validation_actions` are computed.
+    # change to how `patch`, `challenger`, `signals`, `trust_rec`, or
+    # `classified_challenger` are computed. `validation_actions` and the
+    # Hero Banner/Recommendation presentation are the two exceptions,
+    # overridden for the `no_patch` execution-outcome state above.
     # -----------------------
 
     # §1: Header + Hero Banner
@@ -2151,7 +2197,7 @@ def _build_report(result: PipelineResult) -> str:
     # §4: Proposed Patch
     report += f"""## Proposed patch
 
-{result.patch.strip()}
+{"*No final candidate patch was produced.*" if no_patch else result.patch.strip()}
 
 """
 
@@ -2543,6 +2589,56 @@ def _load_experiment_plan(vulnerability_text: str) -> str:
         return text
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Post-Patch Recovery -> ReadyEdit reconciliation (Slice 4)
+#
+# Post-Patch Recovery's own certification that a target now has verified,
+# patch-ready source must reach the SECOND (post-regeneration) Patch Target
+# Conformance check, or a regenerated patch re-targeting the very file
+# recovery just verified fails closed unconditionally regardless of match
+# quality. This promotes a recovery attempt to a real ReadyEdit -- the
+# exact shape check_edit_readiness itself already produces -- rather than
+# passing the attempt object through structurally: check_patch_target_
+# conformance currently reads only `.file` off each ready_edits element,
+# but this must keep working even if that ever reads `.symbol` too.
+# ---------------------------------------------------------------------------
+
+
+def _recovered_ready_edit(attempt):
+    """Promote one Post-Patch Recovery attempt to a real ReadyEdit, using
+    ONLY its deterministically verified recovery identity
+    (resolved_file/resolved_target) -- never the original, possibly-
+    unexpected `attempt.file`. Returns None when the attempt does not
+    clear every verification bar (success, patch_ready, a real
+    resolved_file) -- a partial or failed attempt is never promoted."""
+    if not (attempt.success and attempt.patch_ready and attempt.resolved_file is not None):
+        return None
+    from .remediation_planner import IntendedEdit, ReadyEdit
+    edit = IntendedEdit(file=attempt.resolved_file, symbol=attempt.resolved_target)
+    return ReadyEdit(
+        edit=edit, role="edit_target",
+        file=attempt.resolved_file, symbol=attempt.resolved_target,
+    )
+
+
+def _prior_supported_target_files(plan_result, strategy_result) -> "set[str]":
+    """Files with prior support BEFORE Patch Generation ran -- Target
+    Discovery's own (unverified) target_files, or Final Strategy's
+    deterministically re-verified target_files. File-level only: this is
+    the evidence floor a recovered target's resolved FILE must clear to be
+    promoted (see _recovered_ready_edit) -- it deliberately does not also
+    require the exact recovered SYMBOL to have been named up front, since
+    recovery discovering a better symbol inside an already-supported file
+    is exactly what this slice exists to allow (a file already named by
+    Target Discovery or Final Strategy, with the wrong symbol initially
+    proposed inside it, where recovery later finds the real one -- the
+    file itself was never a new, unsupported target)."""
+    return (
+        set(plan_result.target_files if plan_result is not None else [])
+        | set(strategy_result.target_files if strategy_result is not None else [])
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3187,9 +3283,43 @@ def run(
                     else:
                         from .diff_hunk_repair import repair_hunk_headers as _repair_regenerated
                         _regenerated_patch, _regen_meta = _repair_regenerated(_regenerated_raw, repo_root=repo_root)
+                        # Reconcile Post-Patch Recovery's own verified identity into the
+                        # ready-edit set used for THIS (second, post-regeneration) check
+                        # only -- the first check above, and any target that never went
+                        # through recovery, are unaffected. Deduplicated conservatively
+                        # by (file, symbol); a recovered attempt is only ever promoted via
+                        # _recovered_ready_edit's own strict gate (success, patch_ready, a
+                        # real resolved_file) -- never merely `attempt.file`.
+                        #
+                        # Evidence-floor guard (security): _recovered_ready_edit's checks
+                        # prove the recovered SOURCE is real and patch-ready, but not that
+                        # the FILE had any support before Patch Generation ran. Without
+                        # this, Patch Generation could invent a brand-new target file with
+                        # zero prior evidence and have recovery "launder" it into an
+                        # approved target merely because the file happens to exist and its
+                        # source can be read. Reuses Target Discovery's own (unverified)
+                        # target_files and Final Strategy's deterministically re-verified
+                        # target_files -- no new retrieval, no LLM call, no Markdown
+                        # parsing. File-level only: recovery refining WHICH symbol inside
+                        # an already-supported file is exactly what this slice exists to
+                        # allow -- a file already named by Target Discovery/Final
+                        # Strategy, with the wrong symbol initially proposed inside it,
+                        # where recovery later finds the real one in that same,
+                        # already-supported file.
+                        _prior_supported_files = _prior_supported_target_files(_plan_result, _strategy_result)
+                        _reconciled_ready_edits = list(_edit_readiness.ready_edits)
+                        _reconciled_ready_keys = {(e.file, e.symbol) for e in _reconciled_ready_edits}
+                        for _attempt in _post_patch_recovery.attempts:
+                            _promoted = _recovered_ready_edit(_attempt)
+                            if _promoted is None or _promoted.file not in _prior_supported_files:
+                                continue
+                            _key = (_promoted.file, _promoted.symbol)
+                            if _key not in _reconciled_ready_keys:
+                                _reconciled_ready_edits.append(_promoted)
+                                _reconciled_ready_keys.add(_key)
                         _regen_conformance = check_patch_target_conformance(
                             _regenerated_patch, _regen_meta.relocations,
-                            _edit_readiness.ready_edits, _post_patch_recovery.slice_result,
+                            _reconciled_ready_edits, _post_patch_recovery.slice_result,
                         )
                         _regenerated_patch_target_conformance = _regen_conformance
                         _regen_ok = _regen_conformance.all_conformant and not _regen_conformance.unexpected_files

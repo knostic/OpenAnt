@@ -447,6 +447,146 @@ class TestWideContextHunkConformance:
 
 
 # ---------------------------------------------------------------------------
+# _recovered_ready_edit -- promoting a Post-Patch Recovery attempt into the
+# reconciled ReadyEdit set used only by the SECOND (post-regeneration) Patch
+# Target Conformance check. Promotion must use ONLY deterministically
+# verified recovery identity (resolved_file/resolved_target), never the
+# original, possibly-unexpected `attempt.file`.
+# ---------------------------------------------------------------------------
+
+def _make_attempt(
+    file="other.py", trigger_reason="unexpected_file", resolved_file="other.py",
+    resolved_target=None, success=True, patch_ready=True, failure_reason=None,
+):
+    from utilities.autopatcher.remediation_planner import RecoveryTargetAttempt
+    return RecoveryTargetAttempt(
+        file=file, trigger_reason=trigger_reason, identifiers_considered=[],
+        resolved_file=resolved_file, resolved_target=resolved_target,
+        target_start_line=None, target_end_line=None, start_line=None, end_line=None,
+        enclosing_symbol=None, source_kind=None, source_chars=0,
+        patch_ready=patch_ready, identifier_verified_in_window=False,
+        success=success, failure_reason=failure_reason,
+    )
+
+
+class TestRecoveredReadyEditPromotion:
+    def test_successful_patch_ready_attempt_becomes_a_real_ready_edit(self):
+        """Test 1."""
+        from utilities.autopatcher.pipeline import _recovered_ready_edit
+        from utilities.autopatcher.remediation_planner import IntendedEdit, ReadyEdit
+
+        attempt = _make_attempt(resolved_file="other.py", resolved_target="X")
+        promoted = _recovered_ready_edit(attempt)
+
+        assert isinstance(promoted, ReadyEdit)
+        assert promoted.edit == IntendedEdit(file="other.py", symbol="X")
+        assert promoted.role == "edit_target"
+        assert promoted.file == "other.py"
+        assert promoted.symbol == "X"
+
+    def test_promotion_uses_resolved_file_not_original_requested_file(self):
+        """Test 2: `attempt.file` (the original, possibly-unexpected
+        requested target) must never be used as the promoted identity when
+        `resolved_file` differs from it."""
+        from utilities.autopatcher.pipeline import _recovered_ready_edit
+
+        attempt = _make_attempt(file="requested.py", resolved_file="actual_source.py", resolved_target="Y")
+        promoted = _recovered_ready_edit(attempt)
+
+        assert promoted is not None
+        assert promoted.file == "actual_source.py"
+        assert promoted.edit.file == "actual_source.py"
+        assert promoted.file != "requested.py"
+
+    def test_success_without_patch_ready_is_not_promoted(self):
+        """Test 3."""
+        from utilities.autopatcher.pipeline import _recovered_ready_edit
+
+        attempt = _make_attempt(success=True, patch_ready=False, resolved_file="other.py")
+        assert _recovered_ready_edit(attempt) is None
+
+    def test_attempt_with_no_resolved_file_is_not_promoted(self):
+        """Test 4."""
+        from utilities.autopatcher.pipeline import _recovered_ready_edit
+
+        attempt = _make_attempt(success=True, patch_ready=True, resolved_file=None)
+        assert _recovered_ready_edit(attempt) is None
+
+    def test_failed_attempt_is_not_promoted(self):
+        """Extra safety net: success=False alone must also block promotion,
+        independent of patch_ready/resolved_file."""
+        from utilities.autopatcher.pipeline import _recovered_ready_edit
+
+        attempt = _make_attempt(success=False, patch_ready=False, resolved_file="other.py")
+        assert _recovered_ready_edit(attempt) is None
+
+
+# ---------------------------------------------------------------------------
+# Evidence-floor guard: a recovered target may only be promoted when its
+# resolved FILE already had prior support before Patch Generation ran
+# (Target Discovery's own target_files, or Final Strategy's target_files).
+# _recovered_ready_edit's checks prove the recovered SOURCE is real and
+# patch-ready; they do not, by themselves, prove the file was ever an
+# approved candidate in the first place -- this is the second, independent
+# gate applied at the reconciliation call site.
+# ---------------------------------------------------------------------------
+
+def _is_promoted(attempt, plan_result, strategy_result):
+    """Mirrors exactly how pipeline.run()'s reconciliation loop combines
+    _recovered_ready_edit with _prior_supported_target_files."""
+    from utilities.autopatcher.pipeline import _prior_supported_target_files, _recovered_ready_edit
+    promoted = _recovered_ready_edit(attempt)
+    if promoted is None:
+        return False
+    return promoted.file in _prior_supported_target_files(plan_result, strategy_result)
+
+
+class TestRecoveredTargetEvidenceFloor:
+    def test_file_present_in_target_discovery_but_not_final_strategy_is_promoted(self):
+        """Test 1: the urllib3-shape case -- a file was already named by
+        Target Discovery, then dropped by Final Strategy, but recovery may
+        still reconcile it."""
+        from utilities.autopatcher.remediation_planner import RemediationPlanResult
+
+        plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=[])
+        strategy = _make_strategy(target_files=["mod.py"])
+        attempt = _make_attempt(
+            success=True, patch_ready=True, resolved_file="retry.py", resolved_target="SOME_CONST",
+        )
+        assert _is_promoted(attempt, plan, strategy) is True
+
+    def test_file_present_in_final_strategy_is_promoted(self):
+        """Test 2."""
+        from utilities.autopatcher.remediation_planner import RemediationPlanResult
+
+        plan = RemediationPlanResult(rendered="", target_files=[], target_symbols=[])
+        strategy = _make_strategy(target_files=["mod.py"])
+        attempt = _make_attempt(
+            success=True, patch_ready=True, resolved_file="mod.py", resolved_target="CONST_A",
+        )
+        assert _is_promoted(attempt, plan, strategy) is True
+
+    def test_file_absent_from_both_is_not_promoted(self):
+        """Test 3: Patch Generation must not be able to invent a brand-new
+        target file with zero prior evidence and have recovery launder it
+        into an approved target merely because its source can be read."""
+        from utilities.autopatcher.remediation_planner import RemediationPlanResult
+
+        plan = RemediationPlanResult(rendered="", target_files=["mod.py"], target_symbols=[])
+        strategy = _make_strategy(target_files=["mod.py"])
+        attempt = _make_attempt(
+            success=True, patch_ready=True, resolved_file="invented.py", resolved_target="Z",
+        )
+        assert _is_promoted(attempt, plan, strategy) is False
+
+    def test_missing_plan_and_strategy_yield_no_prior_support(self):
+        """A recovery target must never be promoted merely because there is
+        no prior evidence to check against."""
+        attempt = _make_attempt(success=True, patch_ready=True, resolved_file="mod.py", resolved_target="CONST_A")
+        assert _is_promoted(attempt, None, None) is False
+
+
+# ---------------------------------------------------------------------------
 # recover_post_patch_source
 # ---------------------------------------------------------------------------
 
@@ -1067,12 +1207,17 @@ class TestSlice4PipelineIntegration:
     """Tests 17-26, 30-33 -- exercised through the real pipeline.py wiring."""
 
     @staticmethod
-    def _side_effect(stage_calls, patch_calls, bad_patch, good_patch):
+    def _side_effect(stage_calls, patch_calls, bad_patch, good_patch, planning_target_files=None):
+        # planning_target_files defaults to exactly the prior, hardcoded
+        # ["mod.py"] -- every existing call site (which doesn't pass this
+        # kwarg) sees byte-identical Target Discovery output to before.
+        planning_target_files = list(planning_target_files) if planning_target_files is not None else ["mod.py"]
+
         def side_effect(system_prompt, user_message, stage="unknown"):
             stage_calls.append(stage)
             if stage == "remediation_planning":
                 return json.dumps({
-                    "remediation_mechanism": "fix it", "target_files": ["mod.py"],
+                    "remediation_mechanism": "fix it", "target_files": planning_target_files,
                     "target_symbols": [], "security_invariant": "stub", "required_edits": [],
                     "approaches_to_avoid": [], "explicit_unknowns": [],
                 })
@@ -1085,7 +1230,7 @@ class TestSlice4PipelineIntegration:
             return "{}"
         return side_effect
 
-    def _run(self, tmp_path, bad_patch, good_patch):
+    def _run(self, tmp_path, bad_patch, good_patch, planning_target_files=None):
         (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
         # Present unconditionally so any fixture referencing these paths
         # in a hunk has a real, verifiable file to recover from/reject.
@@ -1097,7 +1242,9 @@ class TestSlice4PipelineIntegration:
         stage_calls: list = []
         patch_calls: list = []
         mock_llm = mock.MagicMock()
-        mock_llm.complete.side_effect = self._side_effect(stage_calls, patch_calls, bad_patch, good_patch)
+        mock_llm.complete.side_effect = self._side_effect(
+            stage_calls, patch_calls, bad_patch, good_patch, planning_target_files=planning_target_files,
+        )
 
         def _gen_patch_side_effect(vulnerability_text, llm, code_context="", retry_hint=""):
             patch_calls.append(retry_hint)
@@ -1144,6 +1291,55 @@ class TestSlice4PipelineIntegration:
         assert result.patch_target_conformance.all_conformant is True
         assert mock_review.called  # existing downstream stages still ran
         assert mock_challenge.called
+
+    def test_regenerated_patch_reusing_recovered_file_present_in_target_discovery_is_accepted(self, tmp_path):
+        """Test 4 (Issue 1 reconciliation + evidence-floor guard): the
+        urllib3-shape scenario -- Target Discovery names BOTH mod.py and
+        other.py; Final Strategy keeps only mod.py; Patch Generation edits
+        other.py; Post-Patch Recovery verifies it (with a different,
+        better symbol than anything named up front). Because other.py had
+        prior support in Target Discovery, the second conformance check
+        must accept it -- even though Final Strategy dropped it and no
+        exact symbol inside it was ever named."""
+        bad_patch = "--- a/other.py\n+++ b/other.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 2\n"
+        good_patch = "--- a/other.py\n+++ b/other.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 99\n"
+        (tmp_path / "other.py").write_text("X = 1\n", encoding="utf-8")
+
+        result, _stage_calls, _patch_calls, mock_gen, mock_review, mock_challenge = self._run(
+            tmp_path, bad_patch, good_patch, planning_target_files=["mod.py", "other.py"],
+        )
+
+        assert mock_gen.call_count == 2
+        assert result.patch_target_conformance is not None
+        assert result.patch_target_conformance.all_conformant is True
+        assert not result.patch_target_conformance.unexpected_files
+        assert result.patch is not None and result.patch.strip() != ""
+        assert mock_review.called
+        assert mock_challenge.called
+
+    def test_regenerated_patch_reusing_file_absent_from_all_prior_evidence_still_fails_closed(self, tmp_path):
+        """Test 5 (Issue 1 evidence-floor regression): a file Patch
+        Generation effectively invents -- never named by Target Discovery
+        OR Final Strategy -- must remain rejected even though Post-Patch
+        Recovery can genuinely, successfully read real source for it.
+        Recovery may reconcile/correct an earlier LLM judgment about a
+        previously-supported file; it must not let Patch Generation
+        introduce a brand-new target with zero prior evidence."""
+        bad_patch = "--- a/invented.py\n+++ b/invented.py\n@@ -1,1 +1,1 @@\n-Z = 1\n+Z = 2\n"
+        good_patch = "--- a/invented.py\n+++ b/invented.py\n@@ -1,1 +1,1 @@\n-Z = 1\n+Z = 99\n"
+        (tmp_path / "invented.py").write_text("Z = 1\n", encoding="utf-8")
+
+        result, _stage_calls, _patch_calls, mock_gen, _mock_review, _mock_challenge = self._run(
+            tmp_path, bad_patch, good_patch,  # default planning_target_files == ["mod.py"] only
+        )
+
+        assert mock_gen.call_count == 2
+        # Confirm recovery genuinely succeeded for invented.py -- this test
+        # must prove the evidence-floor guard, not merely that recovery
+        # itself failed to read the file.
+        assert result.post_patch_recovery is not None
+        assert any(a.resolved_file == "invented.py" and a.success for a in result.post_patch_recovery.attempts)
+        assert result.patch is None or result.patch == ""
 
     def test_planner_and_final_strategy_and_guided_acquisition_not_rerun(self, tmp_path):
         """Tests 18, 19, 20."""
@@ -1196,12 +1392,17 @@ class TestSlice4PipelineIntegration:
         assert result.patch is None or result.patch == ""
 
     def test_recommendation_policy_unchanged(self):
-        """Test 31."""
+        """Test 31. Also guards Issue 2's "No Patch Produced" execution
+        outcome: that branching lives one level up in _build_report, never
+        inside the Recommendation Policy function itself, which stays
+        completely unaware of it."""
         import inspect
         from utilities.autopatcher.pipeline import _build_recommendation_v1
         source = inspect.getsource(_build_recommendation_v1)
         assert "patch_target_conformance" not in source
         assert "post_patch_recovery" not in source
+        assert "no_patch" not in source
+        assert "No Patch Produced" not in source
 
     def test_trace_artifact_emitted_when_recovery_runs(self, tmp_path, monkeypatch):
         """Test 32."""
