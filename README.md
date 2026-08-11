@@ -73,7 +73,7 @@ OpenAnt routes each pipeline phase through a configurable (provider, model) pair
 openant setup llm
 ```
 
-You name the config (e.g. `my-llm`), pick a provider per pipeline phase (`anthropic`, `openai`, or `google`), enter an API key once per provider, and the wizard probes each unique provider+model pair with a 1-token request before writing `~/.config/openant/config.json`. Run a scan against it with `--llm-config`:
+You name the config (e.g. `my-llm`), pick a provider per pipeline phase (any of the shipped adapters below), enter its API key once per provider (Bedrock uses the AWS credential chain instead — leave the key blank), and the wizard probes each unique provider+model pair with a 1-token request before writing `~/.config/openant/config.json`. Run a scan against it with `--llm-config`:
 
 ```bash
 openant scan /path/to/repo --llm-config my-llm
