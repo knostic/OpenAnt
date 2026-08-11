@@ -39,7 +39,7 @@ from pathlib import Path
 _CONFIG_REL = Path("config") / "models.json"
 _SEARCH_LEVELS = 6
 _VALID_STATUS = frozenset({"current", "retired", "unknown"})
-_VALID_PROVIDERS = frozenset({"anthropic", "openai", "google", "bedrock"})
+_VALID_PROVIDERS = frozenset({"anthropic", "openai", "google", "bedrock", "openrouter"})
 
 
 def _search_upward(start: Path) -> Path | None:

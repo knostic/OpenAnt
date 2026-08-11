@@ -29,7 +29,31 @@ func probeOpenAI(apiKey, baseURL, model string) error {
 	if baseURL != "" {
 		endpoint = strings.TrimRight(baseURL, "/") + "/v1/chat/completions"
 	}
+	return probeChatCompletionsAt(apiKey, endpoint, model)
+}
 
+// openrouterAPIBase is the default OpenRouter base URL — it already includes
+// the ``/v1`` segment (matching the Python adapter's ``_DEFAULT_BASE_URL`` and
+// the openai SDK's path handling). Package var so tests can point at httptest.
+var openrouterAPIBase = "https://openrouter.ai/api/v1"
+
+// probeOpenRouter verifies an OpenRouter key+model. OpenRouter speaks the
+// OpenAI chat-completions wire API, but its base_url already carries ``/v1``,
+// so we append only ``/chat/completions`` (NOT ``/v1/chat/completions`` like
+// probeOpenAI) and default a BLANK base_url to OpenRouter — not api.openai.com,
+// which probeOpenAI would hit, failing the probe with an OpenRouter key.
+func probeOpenRouter(apiKey, baseURL, model string) error {
+	base := strings.TrimRight(baseURL, "/")
+	if base == "" {
+		base = openrouterAPIBase
+	}
+	return probeChatCompletionsAt(apiKey, base+"/chat/completions", model)
+}
+
+// probeChatCompletionsAt POSTs a minimal 1-token request to a full
+// chat-completions endpoint and maps the HTTP status to a probe error. Shared
+// by the OpenAI and OpenRouter probes (both speak the OpenAI wire API).
+func probeChatCompletionsAt(apiKey, endpoint, model string) error {
 	// Reasoning models (o1/o3/o4) reject ``max_tokens`` and require
 	// ``max_completion_tokens``; regular chat models keep ``max_tokens``.
 	tokenKey := "max_tokens"

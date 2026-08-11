@@ -72,6 +72,50 @@ func TestProbeOpenAI_Rejects404AsModelNotFound(t *testing.T) {
 	}
 }
 
+func TestProbeOpenRouter_BlankBaseURLTargetsOpenRouterSingleV1(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if got := r.Header.Get("authorization"); got != "Bearer sk-or-test" {
+			t.Errorf("authorization = %q, want 'Bearer sk-or-test'", got)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// A blank base_url must default to OpenRouter (the server here), NOT
+	// api.openai.com (which probeOpenAI would hit, 401-ing an OpenRouter key),
+	// and append /chat/completions to the /api/v1 base — no double /v1.
+	orig := openrouterAPIBase
+	defer func() { openrouterAPIBase = orig }()
+	openrouterAPIBase = server.URL + "/api/v1"
+
+	if err := probeOpenRouter("sk-or-test", "", "anthropic/claude-sonnet-4.6"); err != nil {
+		t.Fatalf("expected nil error for 200, got: %v", err)
+	}
+	if gotPath != "/api/v1/chat/completions" {
+		t.Errorf("path = %q, want '/api/v1/chat/completions'", gotPath)
+	}
+}
+
+func TestProbeOpenRouter_ExplicitBaseURLNoDoubleV1(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// An explicit base_url already ending in /v1 (what OPENROUTER.md tells the
+	// user to set) must not get a second /v1 appended.
+	if err := probeOpenRouter("sk-or-test", server.URL+"/api/v1", "openai/gpt-4o"); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if gotPath != "/api/v1/chat/completions" {
+		t.Errorf("path = %q, want '/api/v1/chat/completions' (single /v1)", gotPath)
+	}
+}
+
 func TestProbeOpenAI_RespectsBaseURL(t *testing.T) {
 	var gotPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
