@@ -49,6 +49,16 @@ def _isolate_shared_infra(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
     monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    # call_llm() now records every successful live completion into
+    # utilities.llm_client's global TokenTracker singleton -- reset it
+    # before AND after each test so execution order in this file (and
+    # relative to other test files sharing the same process) can never
+    # leak call counts/cost into an unrelated test.
+    from utilities.llm_client import reset_global_tracker
+
+    reset_global_tracker()
+    yield
+    reset_global_tracker()
 
 
 class _FakeInteractiveStdin:
@@ -1051,3 +1061,162 @@ def test_full_explicit_env_override_wins_over_a_different_config_binding(monkeyp
 
     assert fake.calls[0]["model"] == "claude-sonnet-4-6"
     assert captured_cfg["value"].api_key == "sk-env-key"
+
+
+# ---------------------------------------------------------------------------
+# Usage/cost propagation into OpenAnt's shared global TokenTracker
+# ---------------------------------------------------------------------------
+#
+# call_llm() forwards every successful live CompletionResult's real
+# input_tokens/output_tokens (plus the adapter's own pricing table) to
+# utilities.llm_client.get_global_tracker().record_call() -- the same
+# mechanism the seven-phase scan pipeline uses -- so a live Auto Patcher
+# run's cost shows up via core.tracking.get_usage() / core.step_report's
+# cost delta instead of always reading $0. See _isolate_shared_infra above
+# for the tracker reset that keeps these tests hermetic against each other.
+
+
+def test_live_completion_records_usage_in_global_tracker(monkeypatch):
+    from utilities.llm_client import get_global_tracker
+
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-8")
+    fake = _install_fake_adapter(
+        monkeypatch, outcomes=[_completion_result(input_tokens=1000, output_tokens=500)]
+    )
+    fake.pricing = {"claude-opus-4-8": {"input": 15.0, "output": 75.0}}
+
+    call_llm("prompt", stage="patch_generation")
+
+    totals = get_global_tracker().get_totals()
+    assert totals["total_calls"] == 1
+    call_record = get_global_tracker().get_summary()["calls"][-1]
+    assert call_record["model"] == "claude-opus-4-8"
+    assert call_record["input_tokens"] == 1000
+    assert call_record["output_tokens"] == 500
+    expected_cost = (1000 / 1_000_000) * 15.0 + (500 / 1_000_000) * 75.0
+    assert call_record["cost_usd"] == pytest.approx(expected_cost)
+    assert call_record["cost_usd"] > 0
+
+
+def test_live_completion_records_exactly_once(monkeypatch):
+    """A single successful call_llm() invocation must increment the
+    tracker's call count by exactly one -- not zero (dropped), not two
+    (double-counted across the two live adapter.complete() call sites)."""
+    from utilities.llm_client import get_global_tracker
+
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    monkeypatch.setenv("LLM_MODEL", "claude-sonnet-4-6")
+    _install_fake_adapter(monkeypatch, outcomes=[_completion_result(input_tokens=10, output_tokens=5)])
+
+    call_llm("prompt", stage="stage_a")
+    assert get_global_tracker().get_totals()["total_calls"] == 1
+
+    call_llm("prompt", stage="stage_b")
+    assert get_global_tracker().get_totals()["total_calls"] == 2
+
+
+def test_reselected_model_records_usage_against_the_actual_alternate_model(monkeypatch):
+    """original model unavailable -> user explicitly picks an alternate ->
+    alternate succeeds: usage/cost must be recorded against the ALTERNATE
+    model and its pricing, never the originally rejected model."""
+    from utilities.llm_client import get_global_tracker
+
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
+    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
+    _monkeypatch_known_models(
+        monkeypatch,
+        [{"id": "claude-opus-4-8", "status": "current"}, {"id": "claude-sonnet-4-6", "status": "current"}],
+    )
+    monkeypatch.setattr("builtins.input", lambda: "1")  # pick claude-opus-4-8
+
+    fake = _install_fake_adapter(
+        monkeypatch,
+        outcomes=[
+            LLMNotFoundError("model: claude-opus-4-6"),
+            _completion_result(input_tokens=200, output_tokens=100),
+        ],
+    )
+    fake.pricing = {"claude-opus-4-8": {"input": 15.0, "output": 75.0}}
+
+    call_llm("prompt", stage="patch_generation")
+
+    totals = get_global_tracker().get_totals()
+    assert totals["total_calls"] == 1  # only the successful reselected call is recorded
+    call_record = get_global_tracker().get_summary()["calls"][-1]
+    assert call_record["model"] == "claude-opus-4-8"  # actual executed model, not the rejected one
+    expected_cost = (200 / 1_000_000) * 15.0 + (100 / 1_000_000) * 75.0
+    assert call_record["cost_usd"] == pytest.approx(expected_cost)
+    assert call_record["cost_usd"] > 0
+
+
+def test_mock_mode_never_records_paid_usage(monkeypatch):
+    from utilities.llm_client import get_global_tracker
+
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+
+    call_llm("prompt", stage="patch_generation")
+
+    assert get_global_tracker().get_totals()["total_calls"] == 0
+
+
+def test_unpriced_model_still_records_tokens_with_zero_cost(monkeypatch, capsys):
+    """Preserve the existing shared-infra behavior for a model with no
+    pricing data (e.g. today's claude-opus-4-6, status "unknown"/price
+    null in config/models.json): token counts are still recorded, cost
+    is 0, and the existing one-time warning still fires -- never a
+    fabricated price."""
+    from utilities.llm_client import get_global_tracker
+
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
+    fake = _install_fake_adapter(
+        monkeypatch, outcomes=[_completion_result(input_tokens=1000, output_tokens=500)]
+    )
+    # No fake.pricing set -- adapter reports no pricing for this model,
+    # and it's genuinely unpriced (null) in the real config/models.json too.
+
+    call_llm("prompt", stage="patch_generation")
+
+    call_record = get_global_tracker().get_summary()["calls"][-1]
+    assert call_record["model"] == "claude-opus-4-6"
+    assert call_record["input_tokens"] == 1000
+    assert call_record["output_tokens"] == 500
+    assert call_record["cost_usd"] == 0.0
+    assert "no pricing for model 'claude-opus-4-6'" in capsys.readouterr().err
+
+
+def test_step_report_cost_delta_reflects_fake_live_auto_patcher_call(monkeypatch, tmp_path):
+    """End-to-end (still fully fake/hermetic): a fake live Auto Patcher LLM
+    call recorded into the global tracker must be visible through
+    core.step_report's cost-delta mechanism, which is what ultimately
+    produces the CLI's printed "(...s, $X)" line and patch.report.json's
+    cost_usd field."""
+    from core.step_report import step_context
+
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-8")
+    fake = _install_fake_adapter(
+        monkeypatch, outcomes=[_completion_result(input_tokens=1000, output_tokens=500)]
+    )
+    fake.pricing = {"claude-opus-4-8": {"input": 15.0, "output": 75.0}}
+
+    with step_context("patch", str(tmp_path)) as ctx:
+        call_llm("prompt", stage="patch_generation")
+        ctx.summary = {}
+        ctx.outputs = {}
+
+    report_path = tmp_path / "patch.report.json"
+    assert report_path.exists()
+    written = __import__("json").loads(report_path.read_text())
+    assert written["cost_usd"] > 0
+    expected_cost = round((1000 / 1_000_000) * 15.0 + (500 / 1_000_000) * 75.0, 6)
+    assert written["cost_usd"] == pytest.approx(expected_cost)
+    assert written["token_usage"]["input_tokens"] == 1000
+    assert written["token_usage"]["output_tokens"] == 500

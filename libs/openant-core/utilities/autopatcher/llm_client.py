@@ -44,6 +44,7 @@ import sys
 from typing import Optional
 
 from ..model_config import GPT_4O_MINI
+from ..llm_client import get_global_tracker
 from ..llm import (
     ConfigError,
     LLMAuthError,
@@ -855,6 +856,24 @@ def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> s
         )
     except LLMError as exc:
         raise RuntimeError(f"{_DISPLAY_NAME.get(provider, provider)} API call failed: {exc}") from exc
+
+    # Record real usage/cost against OpenAnt's shared global tracker -- the
+    # same TokenTracker.record_call() the seven-phase scan pipeline uses --
+    # so a live run's cost shows up via core.tracking.get_usage() / step
+    # reports instead of always reading $0. This line is reached exactly
+    # once per call_llm() invocation: either the try block above succeeded
+    # directly, or it raised LLMNotFoundError and _handle_model_unavailable
+    # returned a successful reselected completion (any other outcome -- a
+    # non-LLMNotFoundError failure, or every reselection attempt failing --
+    # raises before reaching here, so nothing failed is ever recorded).
+    # `model_to_use` is whatever ACTUALLY executed -- the original request,
+    # or an explicitly user-picked alternative -- never the rejected model.
+    get_global_tracker().record_call(
+        model=model_to_use,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        pricing=getattr(adapter, "pricing", {}).get(model_to_use),
+    )
 
     # _cached_model always reflects the model that ACTUALLY executed --
     # core/patch.py's RunMetadata reads this for the Trust Report, so a
