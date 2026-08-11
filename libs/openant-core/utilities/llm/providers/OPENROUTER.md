@@ -30,9 +30,10 @@ same `openai` SDK the OpenAI adapter ships with.
 
 ## Configuration
 
-The `openant setup llm` wizard does not offer `openrouter` yet; add it
-to `~/.config/openant/config.json` by hand. A complete single-provider
-example (all seven pipeline phases are required):
+The `openant setup llm` wizard offers `openrouter` (leave the base URL blank
+to use `https://openrouter.ai/api/v1`), or configure `~/.config/openant/config.json`
+by hand. A complete single-provider example (all seven pipeline phases are
+required):
 
 ```json
 {
@@ -161,9 +162,9 @@ never routing, pricing, or auth.
 
 ## Current limitations
 
-- Not offered by the `openant setup llm` wizard yet (config by hand, as
-  above). Wizard support needs a few Go touch-points in
-  `apps/openant-cli/cmd/setup.go`.
+- The wizard does not yet pre-fill per-phase model suggestions for
+  `openrouter` (no `tierModel` entry in `internal/models/registry.go`), so
+  you type each phase's model at the prompt (the "Known models" hint helps).
 - OpenRouter-specific request extensions (provider routing preferences,
   fallback model lists, ZDR enforcement) are not exposed; requests use
   OpenRouter's account-level defaults, which you can set at
