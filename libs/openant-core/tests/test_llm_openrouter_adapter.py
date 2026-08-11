@@ -296,6 +296,22 @@ class TestErrorMapping:
         with pytest.raises(LLMRefusalError):
             _complete(adapter)
 
+    def test_403_moderation_mentioning_banned_stays_refusal_not_fatal_auth(self):
+        """A moderation 403 about the INPUT that happens to contain 'banned'/
+        'abuse' must stay a refusal (per-batch, non-fatal), not be misrouted to
+        a fatal auth abort — auth requires an account noun too, not a bare word."""
+
+        def respond(**kw):
+            raise openai.PermissionDeniedError(
+                message="Your input was banned by the content filter",
+                response=_fake_http_resp(403),
+                body=None,
+            )
+
+        adapter, _ = _stub_adapter(respond)
+        with pytest.raises(LLMRefusalError):
+            _complete(adapter)
+
     def test_finish_reason_error_raises_response_error(self):
         """A provider failing mid-generation comes back as HTTP 200
         with finish_reason == 'error'; it must raise, never normalise

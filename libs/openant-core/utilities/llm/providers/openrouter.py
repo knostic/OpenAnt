@@ -98,14 +98,17 @@ _ATTRIBUTION_HEADERS = {
 _INVALID_MODEL_MARKER = "not a valid model id"
 
 # OpenRouter's 403 moderation errors carry wording like "your input was
-# flagged" / "requires moderation" / "violates the content policy"; a 403
-# without it is a real permission problem.
-_MODERATION_MARKERS = ("moderation", "flagged", "content policy", "violat")
+# flagged" / "requires moderation" / "violates the content policy" / "content
+# filter"; a 403 without it is a real permission problem.
+_MODERATION_MARKERS = ("moderation", "flagged", "content policy", "content filter", "violat")
 
-# A 403 that names the KEY/account (disabled, abuse, suspended, revoked) is an
-# auth/permission problem, NOT content moderation — it must win over the
-# moderation markers above, since "flagged for abuse" contains "flagged".
-_KEY_DISABLED_MARKERS = ("abuse", "disabled", "suspended", "revoked", "banned")
+# A 403 is an AUTH problem (a fatal, rotate-the-key signal) only when it names
+# the KEY/ACCOUNT ITSELF being disabled — require BOTH an account noun AND a
+# disable-state. A bare "abuse"/"banned" is NOT enough, because those words also
+# appear in *moderation* 403s about the INPUT ("input banned by the content
+# filter"), which must stay a per-batch refusal, not abort the whole scan.
+_ACCOUNT_NOUNS = ("key", "account", "credential", "organization", "org ")
+_DISABLE_STATES = ("disabled", "deactivat", "suspended", "revoked", "banned", "abuse")
 
 _CREDITS_HINT = (
     " (HTTP 402 from OpenRouter means the account balance is exhausted — "
@@ -132,11 +135,16 @@ def _classify_error(exc: Exception, *, report_429: bool) -> Exception:
     if isinstance(exc, openai.AuthenticationError):
         return LLMAuthError(message)
     if isinstance(exc, openai.PermissionDeniedError):
-        # OpenRouter reserves 403 for input-moderation flags. A key/account
-        # problem (disabled, flagged FOR ABUSE, suspended) is also a 403 but is
-        # an auth issue — check that first so a dead key isn't reported as a
-        # per-prompt content refusal. Fall back to auth when neither matches.
-        if any(marker in lowered for marker in _KEY_DISABLED_MARKERS):
+        # OpenRouter reserves 403 for input-moderation flags AND for
+        # key/account problems. Classify a KEY/account disable (needs both an
+        # account noun and a disable-state) as auth FIRST — a dead key must read
+        # as "rotate the key", not a per-prompt refusal. Otherwise moderation
+        # wording -> refusal (per-batch, non-fatal). Fall back to auth.
+        key_disabled = (
+            any(noun in lowered for noun in _ACCOUNT_NOUNS)
+            and any(state in lowered for state in _DISABLE_STATES)
+        )
+        if key_disabled:
             return LLMAuthError(message)
         if any(marker in lowered for marker in _MODERATION_MARKERS):
             return LLMRefusalError(message)
