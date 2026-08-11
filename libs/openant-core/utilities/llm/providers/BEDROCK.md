@@ -70,8 +70,9 @@ aws bedrock list-inference-profiles --query 'inferenceProfileSummaries[].inferen
 
 ## Configuration
 
-The `openant setup llm` wizard does not offer `bedrock` yet; add it to
-`~/.config/openant/config.json` by hand. Note the provider entry has
+The `openant setup llm` wizard offers `bedrock` (leave the API key BLANK — it
+uses the AWS credential chain; the wizard skips the key probe accordingly), or
+add it to `~/.config/openant/config.json` by hand. Note the provider entry has
 **no `api_key`** — a complete single-provider example (all seven
 pipeline phases are required):
 
@@ -176,9 +177,10 @@ adapter:
 
 ## Current limitations
 
-- Not offered by the `openant setup llm` wizard yet (config by hand, as
-  above). Wizard support needs a few Go touch-points in
-  `apps/openant-cli/cmd/setup.go`.
+- The wizard does not yet pre-fill per-phase model suggestions for
+  `bedrock` (no `tierModel` entry in `internal/models/registry.go`), so you
+  type each phase's inference-profile ID at the prompt (the "Known models"
+  hint helps). The key probe is intentionally skipped (AWS creds, no API key).
 - Only Claude models. Bedrock hosts other model families, but this
   adapter speaks Anthropic's wire format; non-Claude Bedrock models
   would need their own adapter.
