@@ -5,7 +5,10 @@ description = "Two-stage SAST tool using Claude for vulnerability analysis"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=0.40.0",
+    # The ``[bedrock]`` extra pulls boto3, which ``anthropic.AnthropicBedrock``
+    # needs to resolve AWS credentials and SigV4-sign requests (the Bedrock
+    # adapter constructs fine without it, but a real call fails without boto3).
+    "anthropic[bedrock]>=0.40.0",
     # openai adapter uses the Responses API (``client.responses.create`` with
     # ``reasoning``/``max_output_tokens``/``store``) for the gpt-5+ path AND
     # ``max_completion_tokens`` for o-series on Chat Completions. Both are 2.x

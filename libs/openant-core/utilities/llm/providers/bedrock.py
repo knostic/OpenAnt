@@ -267,10 +267,11 @@ def _classify_status_error(exc: anthropic.APIStatusError, *, report_429: bool) -
     """
     status = getattr(exc, "status_code", None)
     message = redact_secrets(str(exc))
-    if status == 529:
-        # Bedrock itself never sends 529, but base_url may point at an
-        # Anthropic-compat gateway that does; classify it transient,
-        # same as the reference adapter.
+    if status in (429, 529):
+        # 429 is Bedrock's throttling status; 529 is the Anthropic-compat
+        # "overloaded" a base_url gateway may send. A typed RateLimitError
+        # is normally caught upstream in ``complete()``; this covers a 429
+        # that arrives as a bare APIStatusError. Both are transient.
         retry_after = _retry_after_from(exc)
         if report_429:
             report_rate_limit(retry_after)
