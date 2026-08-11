@@ -84,7 +84,8 @@ def detect_languages(repo_path: str) -> dict[str, int]:
     if not counts:
         raise ValueError(
             f"No supported source files found in {repo_path}. "
-            "Supported languages: Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Zig."
+            "Supported languages: Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, "
+            "Zig, Swift, Rust."
         )
 
     return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))

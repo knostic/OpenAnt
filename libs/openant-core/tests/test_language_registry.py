@@ -109,20 +109,22 @@ class TestRegistryShape:
 class TestSupportedLanguages:
     def test_matches_the_known_set(self):
         assert supported_languages() == [
-            "c", "go", "javascript", "php", "python", "ruby", "swift", "zig",
+            "c", "go", "javascript", "php", "python", "ruby", "rust", "swift", "zig",
         ]
 
     def test_is_sorted_and_deterministic(self):
         assert supported_languages() == sorted(supported_languages())
         assert supported_languages() == supported_languages()
 
-    def test_rust_is_not_supported(self):
-        """parsers/rust/ contains only __pycache__ and is untracked by git.
+    def test_rust_is_supported(self):
+        """Rust is now a first-class subprocess parser.
 
-        It has no config entry and no dispatch branch, so it must not appear as
-        a supported language. Pinned so a stray directory can't imply support.
+        It has a config entry (`config/languages.json`) claiming `.rs`, an
+        enabled registry spec, and a parser script on disk, so it must appear
+        as a supported language. (Was `test_rust_is_not_supported`, pinned while
+        parsers/rust/ was a dead stub; flipped when the parser was implemented.)
         """
-        assert "rust" not in supported_languages()
+        assert "rust" in supported_languages()
 
 
 class TestLanguageForPath:

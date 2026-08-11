@@ -193,6 +193,14 @@ USER_INPUT_PATTERNS = [
     r'\bshouldAcceptNewConnection\b',
     r'\bxpc_connection_',
     r'\bNWListener\b',
+    # Rust CLI / stdin / env input surfaces: a function that reads these IS a
+    # user-input entry point even when it carries no route/main marker of its
+    # own (e.g. a helper called from `main` via `std::env::args()`).
+    r'std::env::args',
+    r'\benv::args\b',
+    r'\bstd::io::stdin\b',
+    r'\bio::stdin\b',
+    r'\bstdin\(\)',
 ]
 
 # Patterns that indicate module-level scripts with user input
