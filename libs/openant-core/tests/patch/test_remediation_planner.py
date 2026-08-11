@@ -2677,6 +2677,67 @@ class TestPipelineContextOrderingWithSlice:
 
         assert not mock_gen.called
 
+    def test_zero_coverage_no_patch_stderr_shows_no_patch_produced(self, tmp_path, capsys):
+        """Regression for the terminal/report consistency fix: the SAME
+        real, zero-coverage pipeline.run() as the test above -- which
+        deterministically ends with result.patch == "" -- must print
+        NO PATCH PRODUCED to stderr, never a Recommendation Policy
+        decision such as Manual Review Required, as its primary outcome
+        line (the Go CLI streams this stderr verbatim)."""
+        target = tmp_path / "policy.py"
+        target.write_text("class Policy:\n    ALLOWED_VALUES = frozenset(['a'])\n", encoding="utf-8")
+
+        def side_effect(system_prompt, user_message, stage="unknown"):
+            if stage == "remediation_planning":
+                return json.dumps({
+                    "remediation_mechanism": "extend policy", "target_files": ["policy.py"],
+                    "target_symbols": [], "security_invariant": "stub", "required_edits": [],
+                    "approaches_to_avoid": [], "explicit_unknowns": [],
+                })
+            if stage == "remediation_strategy":
+                return json.dumps({
+                    "extended_mechanism": "Policy.ALLOWED_VALUES", "target_files": ["policy.py"],
+                    "target_symbols": ["policy.py:Policy.ALLOWED_VALUES"],
+                    "required_edits": ["stub edit"], "rejected_targets": [],
+                    "security_invariant": "stub", "insufficient_evidence": [],
+                })
+            return "{}"
+
+        mock_llm = mock.MagicMock()
+        mock_llm.complete.side_effect = side_effect
+
+        zero_coverage_result = mock.MagicMock(
+            rendered="", warning_text="## Final-target source coverage warning\n\n*none found*\n",
+            coverage_complete=False, has_any_coverage=False,
+            covered_target_files=[], covered_target_symbols=[],
+            uncovered_target_files=["policy.py"], uncovered_target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+        )
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
+            mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice",
+                       return_value=zero_coverage_result),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+                       return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value={"applicable": None, "skipped": True, "stderr": "",
+                                     "exit_code": None, "skipped_reason": "empty diff", "error": None}),
+        ):
+            from utilities.autopatcher.pipeline import run
+            report = run("some vulnerability", api_key="", repo_root=str(tmp_path))
+
+        assert not mock_gen.called
+        captured = capsys.readouterr()
+        assert "[pipeline] Recommendation:" in captured.err
+        assert "⚫ NO PATCH PRODUCED" in captured.err
+        assert "Manual Review Required" not in captured.err
+        assert "NO PATCH PRODUCED" in report
+
 
 class TestGenericExtendVsParallelFixture:
     """Synthetic, fully generic (non-urllib3) fixture: an existing policy

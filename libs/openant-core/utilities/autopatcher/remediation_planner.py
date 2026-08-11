@@ -3405,8 +3405,10 @@ render (category 4) -- no new, separate size policy for what counts as
 POST_PATCH_RECOVERY_FAILURE_REASONS = (
     "too_many_recovery_targets",
     "unsafe_file_path",
+    "not_recovery_eligible",
     "target_budget_exhausted",
     "partial_recovery_evidence",
+    "partial_hunk_coverage",
     "regeneration_call_failed",
     "malformed_or_empty_regenerated_patch",
     "regenerated_patch_still_uncovered",
@@ -3477,6 +3479,63 @@ class PatchConformanceReport(NamedTuple):
     unexpected_files: "list[str]"
     uncovered_files: "list[str]"
     no_match_files: "list[str]"
+
+
+class RecoveryTarget(NamedTuple):
+    """One RECOVERY-ELIGIBILITY statement -- what Post-Patch Recovery is
+    allowed to investigate after a conformance failure. Deliberately NOT
+    consumed by check_patch_target_conformance (see that function's own
+    docstring): recovery eligibility is a strictly BROADER set than
+    "currently approved edit intent" (ReadyEdit) -- it also includes
+    files with prior support from Target Discovery/Final Strategy that
+    were never approved as a ReadyEdit at all (see build_recovery_targets)
+    -- so it must never be mistaken for, or substituted into, the
+    approved-target set conformance checks against. `kind`/`identity` are
+    deliberately generic (never hardcoded to "file"-only): "symbol" for a
+    ReadyEdit-derived target with a symbol, "file" otherwise (including
+    every prior-supported-only target, which has no symbol at all); a
+    future finer kind (function/constant/class/usage) is purely a change
+    to build_recovery_targets, never to anything that consumes a
+    RecoveryTarget."""
+
+    file: str
+    kind: str  # "file" | "symbol" (function | constant | class | usage reserved for future use)
+    identity: "str | None"
+
+
+def build_recovery_targets(ready_edits: "list", prior_supported_files: "frozenset | set" = frozenset()) -> "list[RecoveryTarget]":
+    """Recovery's own eligibility set -- ReadyEdit files (Patch
+    Generation's currently approved intent) UNION prior-supported files
+    (Target Discovery/Final Strategy target_files that named a file
+    before Patch Generation ran, whether or not it ended up approved --
+    reuses the EXACT existing prior-support set the reconciliation guard
+    already computes, see pipeline._prior_supported_target_files; no new
+    prior-evidence source). A file absent from BOTH is not returned here
+    at all -- recover_post_patch_source treats any failing file with no
+    matching RecoveryTarget (when an eligibility list was supplied) as
+    ineligible and fails it closed without attempting retrieval (see its
+    own docstring).
+
+    One RecoveryTarget per ReadyEdit first, in order, no filtering --
+    mirrors check_patch_target_conformance's own `ready_files`
+    construction exactly (every ready edit's file counts, regardless of
+    symbol). Then one file-level RecoveryTarget(kind="file", identity=None)
+    per prior-supported file not already covered by a ReadyEdit's own
+    file -- prior support alone never implies a specific symbol. Pure and
+    deterministic: no repository access, no LLM call."""
+    targets = [
+        RecoveryTarget(
+            file=getattr(e, "file", None),
+            kind="file" if getattr(e, "symbol", None) is None else "symbol",
+            identity=getattr(e, "symbol", None),
+        )
+        for e in (ready_edits or [])
+        if getattr(e, "file", None)
+    ]
+    covered_files = {t.file for t in targets}
+    for f in sorted(set(prior_supported_files or ()) - covered_files):
+        targets.append(RecoveryTarget(file=f, kind="file", identity=None))
+    return targets
 
 
 def _edit_target_source_for_file(rendered: str, file: str) -> str:
@@ -3587,6 +3646,12 @@ def check_patch_target_conformance(
 ) -> PatchConformanceReport:
     """Compare the ACTUAL edited targets of a generated patch against the
     pre-patch Edit Readiness Gate's own ready edits and verified source.
+    This is deliberately the ONLY target model Patch Target Conformance
+    ever consumes -- never RecoveryTarget/build_recovery_targets (see
+    RecoveryTarget's own docstring), so "did the generated patch stay
+    within the currently APPROVED edit intent" never gets silently
+    widened by whatever Post-Patch Recovery is separately allowed to
+    investigate.
 
     Reuses diff_parsing.parse_diff (the existing, generic unified-diff
     parser -- no second diff parser) for every edited file/hunk, and
@@ -4058,7 +4123,20 @@ class RecoveryTargetAttempt(NamedTuple):
     diff against -- see _build_post_patch_window's module comment for
     exactly what that excludes. `identifier_verified_in_window` is a
     purely observational trace flag (_window_confirms_target) -- never a
-    gate on `success` itself."""
+    gate on `success` itself.
+
+    `target_kind`/`target_identity` mirror the RecoveryTarget this
+    attempt was built for (see RecoveryTarget) -- purely descriptive,
+    never a gate. `covered_hunk_indices` is the subset of this target's
+    FILE's own failing hunk_index values (per PatchConformanceReport.results
+    -- target_coverage in ("unexpected_file", "uncovered_target") or
+    old_side_status == "old_side_no_match") whose own old-side text was
+    found verbatim inside THIS attempt's rendered source, via the same
+    content-matching primitive check_patch_target_conformance itself uses
+    (old_side_anchors + find_unique_occurrence) -- never a new matching
+    mechanism. This is what lets `ready_for_regeneration` require every
+    failing hunk to be covered, not merely one successful attempt per
+    file (see recover_post_patch_source's docstring)."""
 
     file: str
     trigger_reason: str
@@ -4076,20 +4154,27 @@ class RecoveryTargetAttempt(NamedTuple):
     identifier_verified_in_window: bool
     success: bool
     failure_reason: "str | None"
+    target_kind: str
+    target_identity: "str | None"
+    covered_hunk_indices: "list[int]"
 
 
 class PostPatchRecoveryResult(NamedTuple):
     """recover_post_patch_source()'s own output -- retrieval only, no LLM
     call. `slice_result` is the ORIGINAL slice extended additively with
     whatever this round retrieved (never evicting anything already
-    present, exactly like Slices 2/3's own merge). `ready_for_regeneration`
-    is True only when EVERY recovery target obtained genuine EDIT-TARGET-
-    role source (never a partial subset) -- pipeline.py must not attempt
-    regeneration otherwise (see recover_post_patch_source's docstring)."""
+    present, exactly like Slices 2/3's own merge). `recovery_targets` is
+    the subset of the PRE-EXISTING RecoveryTarget list (see RecoveryTarget)
+    this round actually attempted -- never rebuilt from the patch.
+    `ready_for_regeneration` is True only when every recovery-triggering
+    hunk (per PatchConformanceReport.results, not merely one attempt per
+    file) obtained genuine, verified, patch-ready source -- pipeline.py
+    must not attempt regeneration otherwise (see recover_post_patch_source's
+    docstring)."""
 
     triggered: bool
     trigger_reasons: "list[str]"
-    recovery_targets: "list[str]"
+    recovery_targets: "list[RecoveryTarget]"
     attempts: "list[RecoveryTargetAttempt]"
     slice_result: "FinalTargetSliceResult | None"
     ready_for_regeneration: bool
@@ -4109,6 +4194,7 @@ def recover_post_patch_source(
     slice_result: "FinalTargetSliceResult | None",
     conformance: PatchConformanceReport,
     patch: str,
+    recovery_targets: "list[RecoveryTarget] | None" = None,
     budget_controller: "ContextBudgetController | None" = None,
 ) -> PostPatchRecoveryResult:
     """
@@ -4125,16 +4211,49 @@ def recover_post_patch_source(
     False, no failure) when there is nothing to recover, or when
     `repo_root`/`slice_result` is unavailable.
 
-    Recovery targets are the union of unexpected/uncovered/no_match
-    files, capped at MAX_RECOVERY_TARGETS (more than that fails closed
-    immediately, before attempting anything -- "too many unexpected
-    targets to safely recover from"). For each target file: the file
-    itself is re-verified (_verify_file) -- an unsafe/unverifiable path
-    fails that target outright; candidate identifiers are extracted from
-    every hunk's own old/new text in that file (_extract_identifiers_from_text,
-    reused, never a line number), changed-line identifiers ordered ahead
-    of context-line ones so the identifier actually being edited is tried
-    first.
+    `recovery_targets` is recovery's own ELIGIBILITY set (see
+    RecoveryTarget/build_recovery_targets) -- pre-existing, built from
+    the Edit Readiness Gate's own ready edits UNION prior-supported files
+    (Target Discovery/Final Strategy), before this patch was ever
+    generated or inspected. This is deliberately NOT the same set
+    check_patch_target_conformance uses (see that function's own
+    docstring) -- eligibility is broader than "currently approved",
+    which is exactly what lets a file with prior support but no ReadyEdit
+    (named by Target Discovery, then dropped by Final Strategy) still be
+    investigated here, while a file with NEITHER a ReadyEdit NOR any
+    prior support is never attempted at all.
+
+    `recovery_targets=None` (the default) means no eligibility list was
+    modeled by this caller at all -- every failing file is attempted
+    exactly as this function behaved before eligibility existed (pure
+    backward compatibility for callers/tests that don't model prior
+    support). `recovery_targets=[]` (an explicit, possibly-empty list --
+    what pipeline.py always passes) means eligibility IS enforced: a
+    failing file whose own file is not among `{t.file for t in
+    recovery_targets}` fails immediately and closed as
+    "not_recovery_eligible", with NO retrieval, NO `_verify_file` call,
+    and NO budget spent for it -- it never reaches window-building or the
+    tier-5 fallback.
+
+    This function never derives a target's identity from the patch;
+    `diff_parsing.parse_diff` is used below only to read what the ACTUAL
+    patch changed (hunks, identifiers-as-hints, per-hunk coverage), never
+    to discover what should be recovered. Recovery targets attempted
+    this round are every file in the union of unexpected/uncovered/
+    no_match files (`conformance`'s own aggregate sets); when eligibility
+    is enforced, ineligible ones are still given exactly one observable,
+    immediately-failed attempt (never silently dropped) so the trace
+    always names every failing file. The cap (MAX_RECOVERY_TARGETS, more
+    than that fails closed immediately, before attempting anything --
+    "too many unexpected targets to safely recover from") counts ALL
+    failing files, eligible or not -- unchanged from before eligibility
+    existed. For each eligible attempted target:
+    the file itself is re-verified (_verify_file) -- an unsafe/
+    unverifiable path fails that target outright; candidate identifiers
+    are extracted from every hunk's own old/new text in that file
+    (_extract_identifiers_from_text, reused, never a line number),
+    changed-line identifiers ordered ahead of context-line ones so the
+    identifier actually being edited is tried first.
 
     A SINGLE contiguous, patch-ready window is then built for the file
     (_build_post_patch_window) -- source priority: (1, only for
@@ -4164,9 +4283,15 @@ def recover_post_patch_source(
     reintroduce exactly the under-context failure mode this function
     exists to prevent.
 
-    `ready_for_regeneration` is True only when EVERY recovery target
-    succeeded -- "Do not regenerate a patch from partial recovery
-    evidence" is enforced here, not left to the caller.
+    `ready_for_regeneration` is True only when EVERY recovery-triggering
+    hunk (per `conformance.results` -- never merely "one successful
+    attempt per file") had its own old-side text verified present inside
+    some attempt's rendered source -- "Do not regenerate a patch from
+    partial recovery evidence" is enforced here, not left to the caller,
+    and is enforced at the granularity the evidence actually failed at: a
+    single resolved window covering only one of a file's several failing
+    hunks is not sufficient merely because that file's own attempt
+    "succeeded" at building A window.
 
     `budget_controller=None` (the default, and every existing caller)
     preserves this exact fixed-budget, fail-closed behavior unchanged.
@@ -4183,13 +4308,40 @@ def recover_post_patch_source(
         return _EMPTY_RECOVERY_RESULT_NOT_TRIGGERED
 
     root = Path(repo_root)
-    target_files = sorted(
-        set(conformance.unexpected_files) | set(conformance.uncovered_files) | set(conformance.no_match_files)
-    )
+    failing_files = set(conformance.unexpected_files) | set(conformance.uncovered_files) | set(conformance.no_match_files)
 
-    if len(target_files) > MAX_RECOVERY_TARGETS:
+    # Eligibility is OPT-IN by presence, not by emptiness: `None` (no
+    # caller-modeled eligibility set at all) preserves this function's
+    # exact pre-eligibility, permissive behavior for every failing file --
+    # the low-level/backward-compatible path. Any actual list (including
+    # an empty one, exactly what a run with zero ReadyEdits and zero
+    # prior-supported files would legitimately produce) turns eligibility
+    # ON: a failing file not named by it is ineligible, full stop -- see
+    # the per-target loop below.
+    eligibility_enforced = recovery_targets is not None
+    eligible_files = {t.file for t in (recovery_targets or [])}
+    targets_by_file: "dict[str, list[RecoveryTarget]]" = {}
+    for t in (recovery_targets or []):
+        targets_by_file.setdefault(t.file, []).append(t)
+
+    implicated_targets: "list[RecoveryTarget]" = []
+    for f in sorted(failing_files):
+        existing = targets_by_file.get(f)
+        if existing:
+            implicated_targets.extend(existing)
+        else:
+            # No RecoveryTarget names this file. When eligibility is not
+            # enforced (recovery_targets=None) this is the pre-existing,
+            # permissive, file-only path -- unchanged. When eligibility IS
+            # enforced this file is simply ineligible; a placeholder is
+            # still built so it gets exactly one observable, immediately-
+            # failed attempt below (see "not_recovery_eligible") rather
+            # than being silently dropped from the trace.
+            implicated_targets.append(RecoveryTarget(file=f, kind="file", identity=None))
+
+    if len(implicated_targets) > MAX_RECOVERY_TARGETS:
         return PostPatchRecoveryResult(
-            triggered=True, trigger_reasons=reasons, recovery_targets=target_files,
+            triggered=True, trigger_reasons=reasons, recovery_targets=implicated_targets,
             attempts=[], slice_result=slice_result, ready_for_regeneration=False,
             failure_reason="too_many_recovery_targets",
         )
@@ -4230,8 +4382,72 @@ def recover_post_patch_source(
             extended = True
         return extended
 
-    for file in target_files:
+    def _covered_hunks_for(file: str, rendered_text: str) -> "list[int]":
+        """Which of `file`'s own recovery-triggering hunks (per
+        `conformance.results` -- target_coverage in ("unexpected_file",
+        "uncovered_target") or old_side_status == "old_side_no_match")
+        this SUCCESSFUL attempt's `rendered_text` covers. Only ever
+        called from a success=True branch (a non-empty `rendered_text` is
+        already guaranteed), never from a failure path.
+
+        Two cases:
+        - `old_side_status in ("old_side_no_match", "new_file")`: there is
+          no real anchor text to verify anywhere in the repository (a
+          no_match hunk's own old side is, by construction, wrong and
+          exists nowhere real; a new-file hunk has no old side at all) --
+          the only meaningful signal is that THIS target's own attempt
+          retrieved genuine, verified, patch-ready source at all, which is
+          already established by the caller only invoking this helper on
+          success.
+        - otherwise (old_side_verified/ambiguous/not_verifiable): the
+          hunk's real old-side content exists somewhere in the repository
+          by definition -- covered only when it is found, verbatim,
+          inside THIS attempt's own `rendered_text`, via the SAME
+          content-matching primitive check_patch_target_conformance
+          itself uses (old_side_anchors + find_unique_occurrence), never
+          a new mechanism. This is what stops one narrow window from
+          silently covering several disjoint failing hunks in the same
+          file."""
+        hunks = file_hunks.get(file, [])
+        covered: "list[int]" = []
+        for r in conformance.results:
+            if r.file != file:
+                continue
+            if not (
+                r.target_coverage in ("unexpected_file", "uncovered_target")
+                or r.old_side_status == "old_side_no_match"
+            ):
+                continue
+            if r.hunk_index >= len(hunks):
+                continue
+            if r.old_side_status in ("old_side_no_match", "new_file"):
+                covered.append(r.hunk_index)
+                continue
+            anchors = old_side_anchors(hunks[r.hunk_index].lines)
+            if anchors and find_unique_occurrence(anchors, rendered_text.splitlines()) is not None:
+                covered.append(r.hunk_index)
+        return covered
+
+    for target in implicated_targets:
+        file = target.file
         trigger_reason = _recovery_reason_for_file(file, conformance)
+
+        if eligibility_enforced and file not in eligible_files:
+            # Ineligible: neither a current ReadyEdit nor prior-supported
+            # (Target Discovery/Final Strategy). Fails closed immediately,
+            # before any retrieval -- _verify_file, identifier extraction,
+            # and window-building are never reached for this target, so
+            # no budget is spent and no repository read happens for it.
+            attempts.append(RecoveryTargetAttempt(
+                file=file, trigger_reason=trigger_reason, identifiers_considered=[],
+                resolved_file=None, resolved_target=None, target_start_line=None, target_end_line=None,
+                start_line=None, end_line=None, enclosing_symbol=None, source_kind=None,
+                source_chars=0, patch_ready=False, identifier_verified_in_window=False,
+                success=False, failure_reason="not_recovery_eligible",
+                target_kind=target.kind, target_identity=target.identity, covered_hunk_indices=[],
+            ))
+            continue
+
         verified_file = _verify_file(file, root)
         if verified_file is None:
             attempts.append(RecoveryTargetAttempt(
@@ -4240,6 +4456,7 @@ def recover_post_patch_source(
                 start_line=None, end_line=None, enclosing_symbol=None, source_kind=None,
                 source_chars=0, patch_ready=False, identifier_verified_in_window=False,
                 success=False, failure_reason="unsafe_file_path",
+                target_kind=target.kind, target_identity=target.identity, covered_hunk_indices=[],
             ))
             continue
 
@@ -4273,6 +4490,7 @@ def recover_post_patch_source(
                     start_line=None, end_line=None, enclosing_symbol=None, source_kind=None,
                     source_chars=0, patch_ready=False, identifier_verified_in_window=False,
                     success=False, failure_reason="target_budget_exhausted",
+                    target_kind=target.kind, target_identity=target.identity, covered_hunk_indices=[],
                 ))
                 continue
 
@@ -4302,6 +4520,7 @@ def recover_post_patch_source(
                         source_kind=None, source_chars=len(rendered_text),
                         patch_ready=False, identifier_verified_in_window=False,
                         success=False, failure_reason="target_budget_exhausted",
+                        target_kind=target.kind, target_identity=target.identity, covered_hunk_indices=[],
                     ))
                     continue
 
@@ -4317,6 +4536,8 @@ def recover_post_patch_source(
                 patch_ready=True,
                 identifier_verified_in_window=_window_confirms_target(window, identifiers, hunks_for_file),
                 success=True, failure_reason=None,
+                target_kind=target.kind, target_identity=target.identity,
+                covered_hunk_indices=_covered_hunks_for(file, rendered_text),
             ))
             continue
 
@@ -4393,14 +4614,30 @@ def recover_post_patch_source(
             source_kind=kind, source_chars=len(addition.rendered),
             patch_ready=succeeded, identifier_verified_in_window=False,
             success=succeeded, failure_reason=failure_reason,
+            target_kind=target.kind, target_identity=target.identity,
+            covered_hunk_indices=_covered_hunks_for(file, addition.rendered) if succeeded else [],
         ))
 
     all_succeeded = bool(attempts) and all(a.success for a in attempts)
+    covered = {(a.file, hi) for a in attempts for hi in a.covered_hunk_indices}
+    failing_hunks = {
+        (r.file, r.hunk_index) for r in conformance.results
+        if r.file in failing_files
+        and (r.target_coverage in ("unexpected_file", "uncovered_target") or r.old_side_status == "old_side_no_match")
+    }
+    fully_covered = failing_hunks.issubset(covered)
+    ready_for_regeneration = all_succeeded and fully_covered
+    if ready_for_regeneration:
+        failure_reason_out = None
+    elif not all_succeeded:
+        failure_reason_out = "partial_recovery_evidence"
+    else:
+        failure_reason_out = "partial_hunk_coverage"
     return PostPatchRecoveryResult(
-        triggered=True, trigger_reasons=reasons, recovery_targets=target_files,
+        triggered=True, trigger_reasons=reasons, recovery_targets=implicated_targets,
         attempts=attempts, slice_result=current_slice,
-        ready_for_regeneration=all_succeeded,
-        failure_reason=None if all_succeeded else "partial_recovery_evidence",
+        ready_for_regeneration=ready_for_regeneration,
+        failure_reason=failure_reason_out,
     )
 
 

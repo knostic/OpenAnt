@@ -2099,8 +2099,17 @@ def _build_report(result: PipelineResult) -> str:
     )
     # Demo polish: surface the already-computed decision on stdout the moment
     # it's known. Reuses the existing decision->emoji mapping (Hero Banner) —
-    # no new value, no new classification.
-    print(f"[pipeline] Recommendation:\n{_DECISION_CARD_EMOJI.get(trust_rec['decision'], '⚪')} {trust_rec['decision']}", file=sys.stderr)
+    # no new value, no new classification. Gated on the SAME `no_patch`
+    # this function already uses, below, to choose between
+    # _render_no_patch_card/_render_decision_card -- the terminal (which
+    # just streams this stderr line verbatim) must never show a Manual
+    # Review Required / Deploy / Do Not Apply bottom line for a run that
+    # produced no final candidate patch, matching what the report itself
+    # already renders in that case.
+    if no_patch:
+        print("[pipeline] Recommendation:\n⚫ NO PATCH PRODUCED", file=sys.stderr)
+    else:
+        print(f"[pipeline] Recommendation:\n{_DECISION_CARD_EMOJI.get(trust_rec['decision'], '⚪')} {trust_rec['decision']}", file=sys.stderr)
     security_gain = _extract_security_gain(review_sections.get("explanation", ""))
     known_findings = _build_known_findings(classified_challenger, result.finding_calibration)
     # Gate the Trust Signals table's forward pointer on the same finding
@@ -3226,9 +3235,23 @@ def run(
     if patch and patch.strip() and repo_root and _edit_readiness is not None:
         try:
             from .remediation_planner import (
-                build_post_patch_recovery_hint, check_patch_target_conformance,
+                build_post_patch_recovery_hint, build_recovery_targets,
+                check_patch_target_conformance,
                 post_patch_recovery_trigger_reasons, recover_post_patch_source,
             )
+            # Patch Target Conformance is checked against ReadyEdit ONLY --
+            # "currently approved edit intent" -- never against the
+            # broader recovery-eligibility set built below. Post-Patch
+            # Recovery is what's allowed to look beyond ReadyEdit (at
+            # prior-supported files); conformance itself must not.
+            #
+            # _prior_supported_files is computed ONCE, here -- before the
+            # patch is even inspected -- and reused both to build recovery
+            # eligibility below AND, unchanged, by the reconciliation
+            # guard further down (no second computation, same existing
+            # helper/data the guard already used).
+            _prior_supported_files = _prior_supported_target_files(_plan_result, _strategy_result)
+            _recovery_targets = build_recovery_targets(_edit_readiness.ready_edits, _prior_supported_files)
             _patch_target_conformance = check_patch_target_conformance(
                 patch, _final_repair_meta.relocations if _final_repair_meta is not None else [],
                 _edit_readiness.ready_edits, _slice_result,
@@ -3245,10 +3268,11 @@ def run(
                 _post_patch_recovery = recover_post_patch_source(
                     _strategy_result, repo_root, _investigation_context,
                     _slice_result, _patch_target_conformance, patch,
+                    recovery_targets=_recovery_targets,
                     budget_controller=budget_controller,
                 )
                 print(
-                    f"[pipeline] Post-Patch Recovery: targets={_post_patch_recovery.recovery_targets}, "
+                    f"[pipeline] Post-Patch Recovery: targets={[t.file for t in _post_patch_recovery.recovery_targets]}, "
                     f"ready_for_regeneration={_post_patch_recovery.ready_for_regeneration}"
                     + (f", failure_reason={_post_patch_recovery.failure_reason}"
                        if _post_patch_recovery.failure_reason else ""),
@@ -3306,7 +3330,8 @@ def run(
                         # Strategy, with the wrong symbol initially proposed inside it,
                         # where recovery later finds the real one in that same,
                         # already-supported file.
-                        _prior_supported_files = _prior_supported_target_files(_plan_result, _strategy_result)
+                        # Reuses the SAME _prior_supported_files computed above --
+                        # no second call to _prior_supported_target_files.
                         _reconciled_ready_edits = list(_edit_readiness.ready_edits)
                         _reconciled_ready_keys = {(e.file, e.symbol) for e in _reconciled_ready_edits}
                         for _attempt in _post_patch_recovery.attempts:
@@ -3374,7 +3399,10 @@ def run(
                 return {
                     "triggered": rec.triggered,
                     "trigger_reasons": rec.trigger_reasons,
-                    "recovery_targets": rec.recovery_targets,
+                    "recovery_targets": [
+                        {"file": t.file, "kind": t.kind, "identity": t.identity}
+                        for t in rec.recovery_targets
+                    ],
                     "ready_for_regeneration": rec.ready_for_regeneration,
                     "failure_reason": rec.failure_reason,
                     "attempts": [
@@ -3385,6 +3413,7 @@ def run(
                             "start_line": a.start_line, "end_line": a.end_line,
                             "source_kind": a.source_kind, "source_chars": a.source_chars,
                             "success": a.success, "failure_reason": a.failure_reason,
+                            "covered_hunk_indices": a.covered_hunk_indices,
                         }
                         for a in rec.attempts
                     ],
@@ -3409,7 +3438,10 @@ def run(
                 "target_conformance_results": _conformance_doc(_patch_target_conformance),
                 "recovery_triggered": _post_patch_recovery.triggered if _post_patch_recovery is not None else False,
                 "recovery_reasons": _post_patch_recovery.trigger_reasons if _post_patch_recovery is not None else [],
-                "recovery_targets": _post_patch_recovery.recovery_targets if _post_patch_recovery is not None else [],
+                "recovery_targets": (
+                    [{"file": t.file, "kind": t.kind, "identity": t.identity} for t in _post_patch_recovery.recovery_targets]
+                    if _post_patch_recovery is not None else []
+                ),
                 "post_patch_recovery": _recovery_doc(_post_patch_recovery),
                 "regeneration_performed": _regenerated_patch_target_conformance is not None,
                 "regenerated_target_conformance_results": _conformance_doc(_regenerated_patch_target_conformance),

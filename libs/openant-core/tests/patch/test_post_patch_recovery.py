@@ -12,6 +12,8 @@ from unittest import mock
 
 import pytest
 
+from utilities.autopatcher.remediation_planner import build_recovery_targets
+
 
 def _make_context(functions=None, constants=None, repo_path=None):
     from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
@@ -466,6 +468,7 @@ def _make_attempt(
         enclosing_symbol=None, source_kind=None, source_chars=0,
         patch_ready=patch_ready, identifier_verified_in_window=False,
         success=success, failure_reason=failure_reason,
+        target_kind="file", target_identity=None, covered_hunk_indices=[],
     )
 
 
@@ -765,6 +768,242 @@ class TestPostPatchRecovery:
         )
         assert result.ready_for_regeneration is False
         assert result.failure_reason == "partial_recovery_evidence"
+
+
+# ---------------------------------------------------------------------------
+# Hunk-level recovery coverage -- the GitPython-shaped regression: one FILE
+# with several independent failing hunks must not be declared ready for
+# regeneration merely because ONE window/attempt for that file "succeeded".
+# Every recovery-triggering hunk (PatchConformanceReport.results) must be
+# individually verified present in recovered source.
+# ---------------------------------------------------------------------------
+
+class TestHunkLevelRecoveryCoverage:
+    def test_one_file_multiple_hunks_partial_coverage_stays_not_ready(self, tmp_path):
+        """Required regression 1: three independent, disjoint edit regions
+        in one file; recovery's single resolved window only covers the
+        FIRST one (CONST_A) -- CONST_B/CONST_C sit far enough away (each
+        in its own class, so never grouped as siblings) that the window
+        never reaches them. ready_for_regeneration must stay False with
+        partial_hunk_coverage, even though the one attempt for this file
+        itself "succeeded" at building a window."""
+        from utilities.autopatcher.remediation_planner import (
+            PatchConformanceReport, PatchTargetConformanceResult, recover_post_patch_source,
+        )
+
+        lines = (
+            "class GroupA:\n    CONST_A = 1\n"
+            + "".join(f"    filler_a{i} = {i}\n" for i in range(1, 12))
+            + "class GroupB:\n    CONST_B = 2\n"
+            + "".join(f"    filler_b{i} = {i}\n" for i in range(1, 12))
+            + "class GroupC:\n    CONST_C = 3\n"
+        )
+        (tmp_path / "mod.py").write_text(lines, encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "GroupA.CONST_A": {"qualified_name": "GroupA.CONST_A", "class_name": "GroupA", "name": "CONST_A", "line": 2, "end_line": 2},
+            "GroupB.CONST_B": {"qualified_name": "GroupB.CONST_B", "class_name": "GroupB", "name": "CONST_B", "line": 15, "end_line": 15},
+            "GroupC.CONST_C": {"qualified_name": "GroupC.CONST_C", "class_name": "GroupC", "name": "CONST_C", "line": 28, "end_line": 28},
+        }}, repo_path=tmp_path)
+        patch = (
+            "--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -2,1 +2,1 @@\n-    CONST_A = 1\n+    CONST_A = 9\n"
+            "@@ -15,1 +15,1 @@\n-    CONST_B = 2\n+    CONST_B = 9\n"
+            "@@ -28,1 +28,1 @@\n-    CONST_C = 3\n+    CONST_C = 9\n"
+        )
+        conformance = PatchConformanceReport(
+            results=[
+                PatchTargetConformanceResult(file="mod.py", hunk_index=0, target_coverage="uncovered_target", old_side_status="old_side_verified", conformant=False),
+                PatchTargetConformanceResult(file="mod.py", hunk_index=1, target_coverage="uncovered_target", old_side_status="old_side_verified", conformant=False),
+                PatchTargetConformanceResult(file="mod.py", hunk_index=2, target_coverage="uncovered_target", old_side_status="old_side_verified", conformant=False),
+            ],
+            all_conformant=False, edited_files=["mod.py"],
+            unexpected_files=[], uncovered_files=["mod.py"], no_match_files=[],
+        )
+
+        result = recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+        )
+        assert result.attempts[0].success is True  # the window itself was built fine
+        assert result.attempts[0].covered_hunk_indices == [0]  # only CONST_A's hunk
+        assert result.ready_for_regeneration is False
+        assert result.failure_reason == "partial_hunk_coverage"
+
+    def test_one_file_window_genuinely_covers_all_failing_hunks(self, tmp_path):
+        """Required regression 2: three failing hunks whose real content
+        all sits inside ONE small sibling-constant group -- the single
+        resolved window genuinely covers all three, so ready_for_regeneration
+        may become True."""
+        from utilities.autopatcher.remediation_planner import (
+            PatchConformanceReport, PatchTargetConformanceResult, recover_post_patch_source,
+        )
+
+        (tmp_path / "mod.py").write_text(
+            "class Policy:\n    CONST_A = 1\n    CONST_B = 2\n    CONST_C = 3\n", encoding="utf-8",
+        )
+        context = _make_context(constants={"mod.py": {
+            "Policy.CONST_A": {"qualified_name": "Policy.CONST_A", "class_name": "Policy", "name": "CONST_A", "line": 2, "end_line": 2},
+            "Policy.CONST_B": {"qualified_name": "Policy.CONST_B", "class_name": "Policy", "name": "CONST_B", "line": 3, "end_line": 3},
+            "Policy.CONST_C": {"qualified_name": "Policy.CONST_C", "class_name": "Policy", "name": "CONST_C", "line": 4, "end_line": 4},
+        }}, repo_path=tmp_path)
+        patch = (
+            "--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -2,1 +2,1 @@\n-    CONST_A = 1\n+    CONST_A = 9\n"
+            "@@ -3,1 +3,1 @@\n-    CONST_B = 2\n+    CONST_B = 9\n"
+            "@@ -4,1 +4,1 @@\n-    CONST_C = 3\n+    CONST_C = 9\n"
+        )
+        conformance = PatchConformanceReport(
+            results=[
+                PatchTargetConformanceResult(file="mod.py", hunk_index=0, target_coverage="uncovered_target", old_side_status="old_side_verified", conformant=False),
+                PatchTargetConformanceResult(file="mod.py", hunk_index=1, target_coverage="uncovered_target", old_side_status="old_side_verified", conformant=False),
+                PatchTargetConformanceResult(file="mod.py", hunk_index=2, target_coverage="uncovered_target", old_side_status="old_side_verified", conformant=False),
+            ],
+            all_conformant=False, edited_files=["mod.py"],
+            unexpected_files=[], uncovered_files=["mod.py"], no_match_files=[],
+        )
+
+        result = recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+        )
+        assert sorted(result.attempts[0].covered_hunk_indices) == [0, 1, 2]
+        assert result.ready_for_regeneration is True
+
+    def test_multiple_files_every_failing_hunk_covered(self, tmp_path):
+        """Required regression 3: two files, one failing hunk each, both
+        genuinely covered -- ready_for_regeneration may become True."""
+        from utilities.autopatcher.remediation_planner import (
+            PatchConformanceReport, PatchTargetConformanceResult, recover_post_patch_source,
+        )
+
+        (tmp_path / "a.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("CONST_B = 2\n", encoding="utf-8")
+        context = _make_context(constants={
+            "a.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+            "b.py": {"CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        patch = (
+            "--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n-CONST_A = 1\n+CONST_A = 9\n"
+            "--- a/b.py\n+++ b/b.py\n@@ -1,1 +1,1 @@\n-CONST_B = 2\n+CONST_B = 9\n"
+        )
+        conformance = PatchConformanceReport(
+            results=[
+                PatchTargetConformanceResult(file="a.py", hunk_index=0, target_coverage="unexpected_file", old_side_status="old_side_verified", conformant=False),
+                PatchTargetConformanceResult(file="b.py", hunk_index=0, target_coverage="unexpected_file", old_side_status="old_side_verified", conformant=False),
+            ],
+            all_conformant=False, edited_files=["a.py", "b.py"],
+            unexpected_files=["a.py", "b.py"], uncovered_files=[], no_match_files=[],
+        )
+
+        result = recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+        )
+        assert result.attempts[0].covered_hunk_indices == [0]
+        assert result.attempts[1].covered_hunk_indices == [0]
+        assert result.ready_for_regeneration is True
+
+
+# ---------------------------------------------------------------------------
+# Recovery eligibility -- RecoveryTarget/build_recovery_targets. Recovery
+# may investigate a file that is EITHER a current ReadyEdit OR has prior
+# support (Target Discovery/Final Strategy); a file with neither fails
+# closed immediately, before any retrieval. Deliberately never consumed by
+# check_patch_target_conformance (see that function's own docstring).
+# ---------------------------------------------------------------------------
+
+class TestRecoveryEligibility:
+    def test_recovery_targets_none_preserves_permissive_backward_compatible_behavior(self, tmp_path):
+        """Required regression 6: recovery_targets=None means no
+        eligibility list was modeled by this caller at all -- every
+        failing file is still attempted exactly as before eligibility
+        existed."""
+        from utilities.autopatcher.remediation_planner import (
+            PatchConformanceReport, recover_post_patch_source,
+        )
+
+        (tmp_path / "mod.py").write_text("CONST_B = 42\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        conformance = PatchConformanceReport(
+            results=[], all_conformant=False, edited_files=["mod.py"],
+            unexpected_files=["mod.py"], uncovered_files=[], no_match_files=[],
+        )
+        patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_B = 42\n+CONST_B = 43\n"
+
+        result = recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+            recovery_targets=None,
+        )
+        assert result.attempts[0].success is True
+        assert result.attempts[0].failure_reason is None
+        assert result.ready_for_regeneration is True
+
+    def test_prior_supported_file_without_ready_edit_is_eligible(self, tmp_path):
+        """Required regression 4 (A/B, focused at the recovery level): B
+        has prior support (Target Discovery/Final Strategy) but no
+        ReadyEdit at all -- ReadyEdit approves only A. B must still be
+        eligible and recoverable."""
+        from utilities.autopatcher.remediation_planner import (
+            PatchConformanceReport, build_recovery_targets, recover_post_patch_source,
+        )
+
+        (tmp_path / "b.py").write_text("CONST_B = 1\n", encoding="utf-8")
+        context = _make_context(constants={"b.py": {
+            "CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        conformance = PatchConformanceReport(
+            results=[], all_conformant=False, edited_files=["b.py"],
+            unexpected_files=["b.py"], uncovered_files=[], no_match_files=[],
+        )
+        patch = "--- a/b.py\n+++ b/b.py\n@@ -1,1 +1,1 @@\n-CONST_B = 1\n+CONST_B = 9\n"
+
+        ready_edits = [_make_ready_edit("a.py", "a.py:CONST_A")]  # only A is a ready edit
+        recovery_targets = build_recovery_targets(ready_edits, prior_supported_files={"a.py", "b.py"})
+
+        result = recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+            recovery_targets=recovery_targets,
+        )
+        assert result.attempts[0].success is True
+        assert result.attempts[0].failure_reason != "not_recovery_eligible"
+        assert result.ready_for_regeneration is True
+
+    def test_ineligible_file_fails_closed_with_no_retrieval(self, tmp_path, monkeypatch):
+        """Required regression 5: C is absent from ReadyEdit, Target
+        Discovery, and Final Strategy entirely. Recovery must fail C
+        closed immediately as not_recovery_eligible, WITHOUT performing
+        any retrieval -- proven here by tracking that _verify_file (the
+        first thing any real attempt calls) is never invoked for it."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.remediation_planner import PatchConformanceReport
+
+        (tmp_path / "c.py").write_text("Z = 1\n", encoding="utf-8")
+        context = _make_context(constants={"c.py": {
+            "Z": {"qualified_name": "Z", "class_name": None, "name": "Z", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        conformance = PatchConformanceReport(
+            results=[], all_conformant=False, edited_files=["c.py"],
+            unexpected_files=["c.py"], uncovered_files=[], no_match_files=[],
+        )
+        patch = "--- a/c.py\n+++ b/c.py\n@@ -1,1 +1,1 @@\n-Z = 1\n+Z = 2\n"
+
+        calls: list = []
+        real_verify_file = rp._verify_file
+
+        def _tracking_verify_file(file, root):
+            calls.append(file)
+            return real_verify_file(file, root)
+
+        monkeypatch.setattr(rp, "_verify_file", _tracking_verify_file)
+
+        result = rp.recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+            recovery_targets=[],  # eligibility enforced; nothing eligible
+        )
+        assert calls == []  # _verify_file never called -- no retrieval for the ineligible target
+        assert len(result.attempts) == 1
+        assert result.attempts[0].success is False
+        assert result.attempts[0].failure_reason == "not_recovery_eligible"
+        assert result.ready_for_regeneration is False
 
 
 # ---------------------------------------------------------------------------
@@ -1278,12 +1517,17 @@ class TestSlice4PipelineIntegration:
     def test_valid_regenerated_patch_continues_through_existing_pipeline(self, tmp_path):
         """Test 30 + Test 22-24: a good regenerated patch is rechecked for
         conformance, then flows through applicability/challenger/reviewer
-        exactly like any other patch."""
+        exactly like any other patch. This test's own point is the
+        DOWNSTREAM flow after a successful recovery+regeneration, not
+        recovery eligibility itself -- other.py's recovery has always been
+        expected to succeed here, which (post-eligibility) requires prior
+        support. planning_target_files makes that pre-existing, implicit
+        assumption explicit rather than changing what this test verifies."""
         bad_patch = "--- a/other.py\n+++ b/other.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 2\n"
         good_patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_A = 1\n+CONST_A = 2\n"
 
         result, stage_calls, patch_calls, mock_gen, mock_review, mock_challenge = self._run(
-            tmp_path, bad_patch, good_patch,
+            tmp_path, bad_patch, good_patch, planning_target_files=["mod.py", "other.py"],
         )
 
         assert mock_gen.call_count == 2  # Test 17: exactly one additional call
@@ -1318,13 +1562,20 @@ class TestSlice4PipelineIntegration:
         assert mock_challenge.called
 
     def test_regenerated_patch_reusing_file_absent_from_all_prior_evidence_still_fails_closed(self, tmp_path):
-        """Test 5 (Issue 1 evidence-floor regression): a file Patch
-        Generation effectively invents -- never named by Target Discovery
-        OR Final Strategy -- must remain rejected even though Post-Patch
-        Recovery can genuinely, successfully read real source for it.
-        Recovery may reconcile/correct an earlier LLM judgment about a
-        previously-supported file; it must not let Patch Generation
-        introduce a brand-new target with zero prior evidence."""
+        """Test 5 (Issue 1 evidence-floor regression -> now enforced one
+        step earlier, at recovery ELIGIBILITY): a file Patch Generation
+        effectively invents -- never named by Target Discovery, Final
+        Strategy, OR ReadyEdit -- must remain rejected. Before recovery
+        eligibility existed, recovery would genuinely read real source
+        for invented.py and only get rejected later, at promotion (the
+        evidence-floor guard). Now the SAME safety property is enforced
+        earlier and more cheaply: invented.py is not_recovery_eligible, so
+        recovery fails it closed immediately, with NO retrieval attempted
+        and NO regeneration call made at all -- there is no later
+        promotion decision left to make. This is a stricter, not weaker,
+        version of the original guarantee (still: Patch Generation can
+        never launder a brand-new, zero-prior-evidence target through
+        recovery)."""
         bad_patch = "--- a/invented.py\n+++ b/invented.py\n@@ -1,1 +1,1 @@\n-Z = 1\n+Z = 2\n"
         good_patch = "--- a/invented.py\n+++ b/invented.py\n@@ -1,1 +1,1 @@\n-Z = 1\n+Z = 99\n"
         (tmp_path / "invented.py").write_text("Z = 1\n", encoding="utf-8")
@@ -1333,12 +1584,15 @@ class TestSlice4PipelineIntegration:
             tmp_path, bad_patch, good_patch,  # default planning_target_files == ["mod.py"] only
         )
 
-        assert mock_gen.call_count == 2
-        # Confirm recovery genuinely succeeded for invented.py -- this test
-        # must prove the evidence-floor guard, not merely that recovery
-        # itself failed to read the file.
+        # Regeneration is never attempted -- recovery fails closed at the
+        # eligibility gate, before generate_patch's one bounded retry call.
+        assert mock_gen.call_count == 1
         assert result.post_patch_recovery is not None
-        assert any(a.resolved_file == "invented.py" and a.success for a in result.post_patch_recovery.attempts)
+        assert any(
+            a.file == "invented.py" and a.success is False and a.failure_reason == "not_recovery_eligible"
+            for a in result.post_patch_recovery.attempts
+        )
+        assert result.post_patch_recovery.ready_for_regeneration is False
         assert result.patch is None or result.patch == ""
 
     def test_planner_and_final_strategy_and_guided_acquisition_not_rerun(self, tmp_path):
@@ -1355,38 +1609,54 @@ class TestSlice4PipelineIntegration:
         assert "guided_context_request" not in stage_calls
 
     def test_regenerated_patch_with_no_match_fails_closed(self, tmp_path):
-        """Test 25."""
+        """Test 25. The intent is the SECOND conformance check's own
+        no_match handling (a regenerated patch whose content still can't
+        be verified anywhere) -- that requires round-1 recovery for
+        other.py to actually succeed first, so regeneration is attempted
+        at all. planning_target_files gives other.py the prior support
+        this test always implicitly relied on; without it, this test would
+        instead exercise the (already separately covered) eligibility
+        gate and never reach the no_match path it's named for."""
         bad_patch = "--- a/other.py\n+++ b/other.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 2\n"
         # "Good" patch still can't be verified -- content never existed.
         still_bad_patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-NEVER_EXISTED = 1\n+NEVER_EXISTED = 2\n"
         (tmp_path / "other.py").write_text("X = 1\n", encoding="utf-8")
 
         result, _stage_calls, patch_calls, mock_gen, _mock_review, _mock_challenge = self._run(
-            tmp_path, bad_patch, still_bad_patch,
+            tmp_path, bad_patch, still_bad_patch, planning_target_files=["mod.py", "other.py"],
         )
         assert mock_gen.call_count == 2
         assert result.patch is None or result.patch == ""
 
     def test_regenerated_patch_with_new_unexpected_file_fails_closed(self, tmp_path):
-        """Test 26."""
+        """Test 26. Same reasoning as test_regenerated_patch_with_no_match_
+        fails_closed above: the intent is the SECOND conformance check
+        rejecting a DIFFERENT unexpected file in the regenerated patch,
+        which requires round-1 recovery for other.py to succeed first.
+        planning_target_files makes that prior-support precondition
+        explicit."""
         bad_patch = "--- a/other.py\n+++ b/other.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 2\n"
         another_bad_patch = "--- a/yet_another.py\n+++ b/yet_another.py\n@@ -1,1 +1,1 @@\n-Y = 1\n+Y = 2\n"
         (tmp_path / "other.py").write_text("X = 1\n", encoding="utf-8")
         (tmp_path / "yet_another.py").write_text("Y = 1\n", encoding="utf-8")
 
         result, _stage_calls, _patch_calls, mock_gen, _mock_review, _mock_challenge = self._run(
-            tmp_path, bad_patch, another_bad_patch,
+            tmp_path, bad_patch, another_bad_patch, planning_target_files=["mod.py", "other.py"],
         )
         assert mock_gen.call_count == 2
         assert result.patch is None or result.patch == ""
 
     def test_empty_regenerated_diff_fails_closed(self, tmp_path):
-        """Test 29."""
+        """Test 29. The intent is the empty/malformed-regenerated-diff
+        branch, which is only reachable after round-1 recovery for
+        other.py succeeds and generate_patch is actually called again.
+        planning_target_files makes that always-implicit precondition
+        explicit."""
         bad_patch = "--- a/other.py\n+++ b/other.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 2\n"
         (tmp_path / "other.py").write_text("X = 1\n", encoding="utf-8")
 
         result, _stage_calls, _patch_calls, mock_gen, _mock_review, _mock_challenge = self._run(
-            tmp_path, bad_patch, "",
+            tmp_path, bad_patch, "", planning_target_files=["mod.py", "other.py"],
         )
         assert mock_gen.call_count == 2
         assert result.patch is None or result.patch == ""
@@ -1405,7 +1675,11 @@ class TestSlice4PipelineIntegration:
         assert "No Patch Produced" not in source
 
     def test_trace_artifact_emitted_when_recovery_runs(self, tmp_path, monkeypatch):
-        """Test 32."""
+        """Test 32. The intent is the "regenerated_and_accepted" trace
+        state, which is only reachable when round-1 recovery for other.py
+        actually succeeds and regeneration is accepted end to end.
+        planning_target_files gives other.py the prior support this test
+        always implicitly relied on to reach that named state."""
         import json as _json
         bad_patch = "--- a/other.py\n+++ b/other.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 2\n"
         good_patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_A = 1\n+CONST_A = 2\n"
@@ -1414,7 +1688,7 @@ class TestSlice4PipelineIntegration:
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         monkeypatch.chdir(tmp_path)
-        self._run(run_dir, bad_patch, good_patch)
+        self._run(run_dir, bad_patch, good_patch, planning_target_files=["mod.py", "other.py"])
 
         files = list((tmp_path / "reports" / "debug").glob("post_patch_recovery_*.json"))
         assert len(files) == 1

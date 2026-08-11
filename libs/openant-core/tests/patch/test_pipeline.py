@@ -1735,3 +1735,69 @@ class TestNoPatchProducedOutcome:
 
         assert "NO PATCH PRODUCED" not in report
         assert "## Recommendation" in report
+
+    # -----------------------------------------------------------------
+    # Terminal/report consistency (Issue 3): the SAME `no_patch` state
+    # that already gates the report's decision card must also gate the
+    # stderr "[pipeline] Recommendation:" line the terminal streams
+    # verbatim -- a no-patch run must never print Manual Review Required/
+    # Deploy/Do Not Apply as its primary terminal outcome.
+    # -----------------------------------------------------------------
+
+    def test_stderr_shows_no_patch_produced_not_manual_review_required(self, tmp_path, capsys):
+        """The default no-patch fixture's signals naturally land on the
+        Recommendation Policy's own "Manual Review Required" catch-all
+        (see test_no_manual_review_or_deploy_bottom_line) -- exactly the
+        real-world shape of the reported bug. stderr must show
+        NO PATCH PRODUCED instead, never that decision string."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs(tmp_path, patch=""))
+        report = _build_report(result)
+
+        captured = capsys.readouterr()
+        assert "[pipeline] Recommendation:" in captured.err
+        assert "⚫ NO PATCH PRODUCED" in captured.err
+        assert "Manual Review Required" not in captured.err
+        assert "NO PATCH PRODUCED" in report
+
+    def test_stderr_precedence_independent_of_recommendation_value(self, tmp_path, monkeypatch, capsys):
+        """Precedence must hold for ANY underlying decision, not merely the
+        Manual Review Required catch-all above -- proven by substituting a
+        different decision ("Do Not Apply") and confirming it still never
+        reaches the terminal as the primary outcome."""
+        from utilities.autopatcher import pipeline as pl
+
+        monkeypatch.setattr(
+            pl, "_build_recommendation_v1",
+            lambda *args, **kwargs: {"decision": "Do Not Apply", "reason": "stub"},
+        )
+        result = pl.PipelineResult(**self._base_kwargs(tmp_path, patch=""))
+        report = pl._build_report(result)
+
+        captured = capsys.readouterr()
+        assert "[pipeline] Recommendation:" in captured.err
+        assert "⚫ NO PATCH PRODUCED" in captured.err
+        assert "Do Not Apply" not in captured.err
+        assert "NO PATCH PRODUCED" in report
+
+    def test_stderr_normal_patch_recommendation_unchanged(self, tmp_path, capsys):
+        """Regression: a real, non-empty patch must still print the normal
+        Recommendation Policy decision to stderr, exactly as before this
+        fix -- the fix must only change the no-patch case."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 2\n"
+        kwargs = self._base_kwargs(tmp_path, patch=patch)
+        kwargs["applicability"] = {
+            "applicable": True, "skipped": False, "skipped_reason": None, "error": None, "stderr": "",
+        }
+        result = PipelineResult(**kwargs)
+        report = _build_report(result)
+
+        captured = capsys.readouterr()
+        assert "[pipeline] Recommendation:" in captured.err
+        assert "NO PATCH PRODUCED" not in captured.err
+        assert "NO PATCH PRODUCED" not in report
+        assert any(
+            decision in captured.err
+            for decision in ("Deploy After Validation", "Deploy With Caution", "Manual Review Required", "Do Not Apply")
+        )
