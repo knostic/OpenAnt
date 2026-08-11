@@ -26,7 +26,7 @@ design notes). In particular:
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from utilities.file_io import write_json
 
@@ -75,6 +75,17 @@ _ROUTE_ATTR_NAMES = {"get", "post", "put", "delete", "patch", "head", "options",
 # `impl` block, or as the RHS of a `let x: <type> = ...` annotation.
 _TYPE_NODE_KINDS = ("type_identifier", "generic_type", "scoped_type_identifier")
 
+# Non-nominal Self-type node kinds that are absent from _TYPE_NODE_KINDS but CAN be
+# an impl target: `impl Trait for u32 / [u8;4] / (i32,i32) / () / &T / *const T /
+# dyn X`. Collected in _handle_impl so their methods are extracted; for the
+# genuinely non-nominal ones _bare_type_name returns None and _handle_impl falls
+# back to the raw type text, while reference/dynamic types unwrap to their nominal
+# base as usual.
+_IMPL_SELF_EXTRA_KINDS = (
+    "primitive_type", "array_type", "tuple_type", "unit_type",
+    "reference_type", "pointer_type", "dynamic_type",
+)
+
 
 def _bare_type_name(node: Optional[Node], source: bytes) -> Optional[str]:
     """Reduce a type node to its bare (unqualified, non-generic) name.
@@ -106,7 +117,7 @@ def _bare_type_name(node: Optional[Node], source: bytes) -> Optional[str]:
         return _text(last, source) if last is not None else None
     if t == "reference_type":
         # `&Point` / `&mut Point` / `&'a Point` -> unwrap to Point;
-        # `&dyn Shape` -> unwrap through the dynamic_type to Shape (val_3_19).
+        # `&dyn Shape` -> unwrap through the dynamic_type to Shape.
         for child in node.children:
             if child.type in _TYPE_NODE_KINDS or child.type == "dynamic_type":
                 return _bare_type_name(child, source)
@@ -114,8 +125,8 @@ def _bare_type_name(node: Optional[Node], source: bytes) -> Optional[str]:
     if t == "dynamic_type":
         # `dyn Shape` / `dyn Shape + Send` -> the trait's bare name, so a
         # `&dyn Shape` receiver types as `Shape` and dispatches to Shape's
-        # conformers via trait_impls (val_3_19; `dyn Shape` is a `dynamic_type`
-        # node, verified against the installed grammar per pr_2_1).
+        # conformers via trait_impls (`dyn Shape` is a `dynamic_type`
+        # node, verified against the installed grammar).
         for child in node.children:
             r = _bare_type_name(child, source)
             if r:
@@ -127,6 +138,53 @@ def _bare_type_name(node: Optional[Node], source: bytes) -> Optional[str]:
             if r:
                 return r
     return None
+
+
+def _impl_generic_bounds(impl_node: Node, source: bytes) -> Dict[str, List[str]]:
+    """Map an impl block's OWN generic param letter -> its bound trait(s).
+
+    `impl<T: Shape + Draw> Foo<T>` and `impl<T> Foo<T> where T: Shape` both yield
+    `{"T": ["Shape", ...]}`. Only the impl header's own generics (the `<...>` before
+    the self type, plus the where-clause) are read. Threaded onto each method so a
+    receiver typed as the impl's generic param (`x: &T`) dispatches to the bound
+    trait's conformers -- the SAME reachability-safe closure fn-level bounds use --
+    instead of falling to a bare lookup on the letter `T` (which a blanket impl's
+    pseudo-type `T` would poison). Mirrors CallGraphBuilder._collect_type_param_bounds.
+    """
+    bounds: Dict[str, List[str]] = {}
+
+    def _traits(tb: Node) -> List[str]:
+        return [_text(c, source) for c in tb.children if c.type == "type_identifier"]
+
+    def _add(param: Optional[str], tb: Node) -> None:
+        if not param:
+            return
+        bounds.setdefault(param, [])
+        for t in _traits(tb):
+            if t not in bounds[param]:
+                bounds[param].append(t)
+
+    def _param(node: Node) -> None:
+        pid = None
+        for cc in node.children:
+            if cc.type == "type_identifier" and pid is None:
+                pid = _text(cc, source)
+            elif cc.type == "trait_bounds":
+                _add(pid, cc)
+
+    seen_for = False
+    for child in impl_node.children:
+        if child.type == "for":
+            seen_for = True
+        elif child.type == "type_parameters" and not seen_for:
+            for tp in child.children:
+                if tp.type in ("type_parameter", "constrained_type_parameter"):
+                    _param(tp)
+        elif child.type == "where_clause":
+            for wp in child.children:
+                if wp.type == "where_predicate":
+                    _param(wp)
+    return bounds
 
 
 def _text(node: Optional[Node], source: bytes) -> str:
@@ -403,7 +461,7 @@ class FunctionExtractor:
                             if cc.type == "type_identifier":
                                 impl_generics.add(_text(cc, source))
                                 break
-            if child.type in _TYPE_NODE_KINDS:
+            if child.type in _TYPE_NODE_KINDS or child.type in _IMPL_SELF_EXTRA_KINDS:
                 type_nodes.append((child, seen_for))
             elif child.type == "declaration_list":
                 body = child
@@ -418,6 +476,14 @@ class FunctionExtractor:
             self_node = type_nodes[0][0] if type_nodes else None
 
         self_type = _bare_type_name(self_node, source)
+        if not self_type and self_node is not None:
+            # Non-nominal Self type (primitive `u32`, array `[u8; 4]`, tuple
+            # `(i32, i32)`, unit `()`): `_bare_type_name` only names nominal types,
+            # so `impl Serialize for u32` would be dropped ENTIRELY -- every method
+            # in the block lost from extraction, the graph, and reachability. Fall
+            # back to the raw type text so the methods are still extracted (keyed by
+            # that type spelling).
+            self_type = _text(self_node, source).strip()
         trait_name = _bare_type_name(trait_node, source)
 
         if not self_type or body is None:
@@ -439,6 +505,8 @@ class FunctionExtractor:
             "module_path": ctx["module_path"],
             "in_test_scope": ctx["in_test_scope"],
             "in_trait_impl": trait_name is not None,
+            "impl_trait": trait_name,
+            "impl_type_param_bounds": _impl_generic_bounds(node, source),
         }
         worklist.append((body, new_ctx))
 
@@ -514,7 +582,29 @@ class FunctionExtractor:
 
         module_name = "::".join(ctx["module_path"]) if ctx["module_path"] else None
 
+        # Bare return-type name (`-> Widget` -> "Widget"), so a binding
+        # `let w = Type::assoc()` can be typed by the assoc fn's ACTUAL return type
+        # rather than the constructor-idiom assumption that it returns `Type`.
+        rt_node = node.child_by_field_name("return_type")
+        return_type = _bare_type_name(rt_node, source) if rt_node is not None else None
+
         func_id = f"{file_path}:{qualified_name}"
+        if func_id in functions:
+            # Same qualified_name already taken -- e.g. `impl Display for P` and
+            # `impl Debug for P` both yield `P.fmt`, or an inherent method plus a
+            # same-named trait method. Without disambiguation the second silently
+            # clobbers the first (a whole unit lost from the graph AND reachability).
+            # Append the trait (or `impl`) so both survive. The FIRST occurrence
+            # keeps the plain id, so class_name-based resolution and existing
+            # `Type.method` references are unchanged; only the colliding sibling
+            # gets the `#trait` suffix.
+            disc = ctx.get("impl_trait") or "impl"
+            candidate = f"{file_path}:{qualified_name}#{disc}"
+            n = 2
+            while candidate in functions:
+                candidate = f"{file_path}:{qualified_name}#{disc}{n}"
+                n += 1
+            func_id = candidate
         functions[func_id] = {
             "name": name,
             "qualified_name": qualified_name,
@@ -529,6 +619,11 @@ class FunctionExtractor:
             "is_exported": is_exported,
             "has_self": has_self,
             "decorators": attrs,
+            # Bounds of the enclosing impl's own generics (`impl<T: Shape> Foo<T>`),
+            # so a receiver typed as `T` in this method dispatches to the trait's
+            # conformers. Empty for free functions / inherent-non-generic impls.
+            "impl_type_param_bounds": ctx.get("impl_type_param_bounds", {}),
+            "return_type": return_type,
         }
 
         block = None

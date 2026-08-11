@@ -10,7 +10,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import extract, CallGraphBuilder, UnitGenerator  # noqa: E402
+from _rust_helpers import extract, CallGraphBuilder, UnitGenerator  # noqa: E402
 
 _SRC = {
     "widget.rs": """

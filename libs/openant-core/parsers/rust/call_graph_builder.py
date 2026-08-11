@@ -55,6 +55,18 @@ _MACRO_CALL_RE = re.compile(
     r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:::<[^>]*>)?\s*\("
 )
 
+# String / char literals inside a macro token tree, blanked BEFORE the call-shaped
+# scan so call-looking text in a diagnostic message (`panic!("call init() first")`)
+# is not harvested as a phantom edge. Covers raw strings (`r"..."`, `r#"..."#`),
+# normal strings with escapes, and char literals; Rust lifetimes (`'a`, no closing
+# quote) intentionally do not match. Best-effort, matching the scan itself.
+_RUST_STR_LITERAL_RE = re.compile(
+    r'r#"(?:[^"]|"(?!#))*"#'      # raw string, one hash
+    r'|r"[^"]*"'                  # raw string, no hash
+    r'|"(?:\\.|[^"\\])*"'         # normal string with escapes
+    r"|'(?:\\.|[^'\\])'"          # char literal
+)
+
 RUST_BUILTINS = {
     # core::fmt / println-family macro names (recovered via token-tree scan,
     # so they can appear as bare "calls" and must be filtered like any std fn)
@@ -133,10 +145,18 @@ class CallGraphBuilder:
             file_path = func_info.get("file_path", "")
             caller_class = func_info.get("class_name")
 
-            var_types = self._collect_var_types(code)
+            var_types = self._collect_var_types(code, name_to_ids)
             fn_aliases = self._collect_fn_aliases(code, name_to_ids, file_path)
-            type_param_bounds = self._collect_type_param_bounds(code)
-            calls = self._find_calls_in_code(code, file_path)
+            # Merge the enclosing impl's generic bounds (`impl<T: Shape> Foo<T>`,
+            # recorded by the extractor) with the fn's OWN generics; the fn's own
+            # bound wins on a letter collision (inner shadows outer). Without the
+            # impl-level bounds a receiver typed as the impl's `T` would fall to a
+            # bare lookup on the letter and be hijacked by a blanket pseudo-type (D).
+            type_param_bounds = {
+                **func_info.get("impl_type_param_bounds", {}),
+                **self._collect_type_param_bounds(code),
+            }
+            calls = self._find_calls_in_code(code, file_path, name_to_ids)
 
             for call in calls:
                 resolved_ids = self._resolve_call(
@@ -237,7 +257,10 @@ class CallGraphBuilder:
 
     # -- call-site extraction ---------------------------------------------------
 
-    def _find_calls_in_code(self, code: str, caller_file: str) -> List[dict]:
+    def _find_calls_in_code(
+        self, code: str, caller_file: str,
+        name_to_ids: Optional[Dict[str, List[str]]] = None,
+    ) -> List[dict]:
         """Return call-site descriptors: {"kind": "bare"|"field"|"scoped", ...}."""
         sites: List[dict] = []
         if not code:
@@ -249,8 +272,20 @@ class CallGraphBuilder:
         source = code.encode("utf-8")
 
         stack = [tree.root_node]
+        entered_fn = False
         while stack:
             node = stack.pop()
+            if node.type == "function_item":
+                # The outermost function_item IS this unit; a NESTED `fn` is its own
+                # extracted unit (`outer::inner`) that collects its own call sites
+                # under its own generic bounds. Do not descend into a nested fn body
+                # here — attributing its calls to the outer unit resolves them under
+                # the outer fn's (wrong) bounds and fabricates phantom edges. Closures
+                # (closure_expression) are NOT function_items, so they still belong to
+                # this unit, which is correct (they capture the outer bounds).
+                if entered_fn:
+                    continue
+                entered_fn = True
             if node.type == "call_expression":
                 callee = node.children[0] if node.children else None
                 site = self._describe_callee(callee, source)
@@ -260,11 +295,24 @@ class CallGraphBuilder:
                 self._scan_macro_body(node, source, sites)
             stack.extend(node.children)
 
+        # The RUST_BUILTINS set is a precision guard for the UNKNOWN-receiver
+        # fallback path only (see `_resolve_unknown_receiver_method`), NOT a reason
+        # to delete a resolvable call at extraction time. A builtin-named site is
+        # dropped here ONLY when the name is a pure std/library name — i.e. it does
+        # NOT name any known repo function/method (`repo_names`) and is not shadowed
+        # in the caller's own file. When the name IS a real repo function/method,
+        # the site is kept and resolution decides precisely (typed dispatch) or
+        # conservatively (the unknown-receiver builtin guard). This mirrors the
+        # Swift parser's filter, whose `text in repo_names` clause keeps exactly
+        # these real calls; the Rust port had dropped that clause, silently
+        # deleting typed cross-file `.get()/.parse()/...`-style edges.
         shadowing = self._same_file_function_names(caller_file)
+        repo_names = set(name_to_ids) if name_to_ids else set()
         filtered = []
         for site in sites:
             bare = site.get("bare_filter_name")
-            if bare is None or bare in shadowing or bare not in RUST_BUILTINS:
+            if (bare is None or bare in shadowing or bare not in RUST_BUILTINS
+                    or bare in repo_names):
                 filtered.append(site)
         return filtered
 
@@ -372,6 +420,8 @@ class CallGraphBuilder:
         if macro_name not in _SCANNABLE_MACROS or token_tree is None:
             return
         text = self._text(token_tree, source)
+        # Blank literals so a call-shaped substring inside a string is not scanned.
+        text = _RUST_STR_LITERAL_RE.sub(" ", text)
         for match in _MACRO_CALL_RE.finditer(text):
             call_name = match.group(1)
             if "." in call_name:
@@ -403,7 +453,9 @@ class CallGraphBuilder:
 
     # -- receiver static-type inference ----------------------------------------
 
-    def _collect_var_types(self, code: str) -> Dict[str, str]:
+    def _collect_var_types(
+        self, code: str, name_to_ids: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, str]:
         """Map local variable/parameter name -> its declared/inferred type.
 
         Sources, in order of confidence: parameter type annotations
@@ -438,6 +490,27 @@ class CallGraphBuilder:
             return var_types
         source = code.encode("utf-8")
 
+        # A local `let` bound to a CLOSURE shadows a same-named free function as
+        # the call target: `let helper = || ...; let x = helper()` calls the
+        # closure, not a repo `fn helper`. Collect only closure bindings -- a
+        # non-callable rebind (`let load = 5`) can never be `load()`-called, so it
+        # does not shadow a function call and must not block return-type inference.
+        local_closures: Set[str] = set()
+        lstack = [tree.root_node]
+        while lstack:
+            n = lstack.pop()
+            if n.type == "let_declaration":
+                name = None
+                seen_eq = False
+                for c in n.children:
+                    if c.type == "identifier" and name is None and not seen_eq:
+                        name = self._text(c, source)
+                    elif c.type == "=":
+                        seen_eq = True
+                    elif seen_eq and c.type == "closure_expression" and name:
+                        local_closures.add(name)
+            lstack.extend(n.children)
+
         stack = [tree.root_node]
         while stack:
             node = stack.pop()
@@ -462,11 +535,60 @@ class CallGraphBuilder:
                         name = self._text(c, source)
                         break
                 if name:
-                    _set(name, self._infer_let_type(node, source))
+                    _set(name, self._infer_let_type(
+                        node, source, name_to_ids, local_closures))
             stack.extend(node.children)
         return var_types
 
-    def _infer_let_type(self, node: Node, source: bytes) -> Optional[str]:
+    def _assoc_return_type(
+        self, qualifier: str, leaf: Optional[str],
+        name_to_ids: Optional[Dict[str, List[str]]],
+    ) -> Optional[str]:
+        """Return the recorded return type of associated fn `qualifier::leaf`, if
+        known and not `Self`. Lets `let w = Factory::make()` type `w` as make()'s
+        real return type (Widget) instead of the constructor-idiom guess (Factory).
+        `Self` returns fall through to the qualifier (the `Type::new() -> Self` case).
+        """
+        if not leaf or not name_to_ids:
+            return None
+        rts = set()
+        for cand in name_to_ids.get(leaf, []):
+            info = self.functions.get(cand, {})
+            if info.get("class_name") == qualifier:
+                rt = info.get("return_type")
+                if rt and rt != "Self":
+                    rts.add(rt)
+        # Two same-named types (`Factory` in different files) with differing
+        # return types is unresolvable here -- decline rather than guess the
+        # first, which would fabricate a wrong-type edge. Mirrors the
+        # uniqueness guard in `_free_fn_return_type`.
+        return next(iter(rts)) if len(rts) == 1 else None
+
+    def _free_fn_return_type(
+        self, fn_name: str, name_to_ids: Optional[Dict[str, List[str]]],
+    ) -> Optional[str]:
+        """Return the recorded return type of a FREE function `fn_name`, if a single
+        unambiguous non-`Self` type. Lets `let c = load()` (where `load() -> Cfg`)
+        type `c` as Cfg, so a later `c.method()` resolves precisely instead of hitting
+        the unknown-receiver gate and blacking out. Precise (typed) -> zero phantom.
+        """
+        if not name_to_ids:
+            return None
+        rts = set()
+        for cand in name_to_ids.get(fn_name, []):
+            info = self.functions.get(cand, {})
+            if info.get("class_name"):  # must be a free function, not a method
+                continue
+            rt = info.get("return_type")
+            if rt and rt != "Self":
+                rts.add(rt)
+        return next(iter(rts)) if len(rts) == 1 else None
+
+    def _infer_let_type(
+        self, node: Node, source: bytes,
+        name_to_ids: Optional[Dict[str, List[str]]] = None,
+        local_closures: Optional[Set[str]] = None,
+    ) -> Optional[str]:
         from .function_extractor import _bare_type_name
 
         # `let x: Type = ...;` -- explicit annotation wins.
@@ -501,7 +623,22 @@ class CallGraphBuilder:
                 if callee is not None and callee.type == "scoped_identifier":
                     qualifier, _leaf = self._split_scoped(callee, source)
                     if qualifier and qualifier not in ("Self",):
-                        return qualifier
+                        # Prefer the assoc fn's ACTUAL return type (`make() -> Widget`)
+                        # over the constructor-idiom assumption that it returns the
+                        # qualifier (`Factory`). Falls back to the qualifier when the
+                        # return type is unknown or `Self` (the `Type::new()` case).
+                        return self._assoc_return_type(qualifier, _leaf, name_to_ids) or qualifier
+                if callee is not None and callee.type == "identifier":
+                    # `let c = load()` where `load() -> Cfg` -> type c as Cfg, so a
+                    # later `c.method()` resolves precisely (recovering the
+                    # unknown-receiver blackout) with zero phantom. Skip when the
+                    # name is a local closure binding shadowing the free fn --
+                    # typing from the free fn would be a wrong-type phantom.
+                    fname = self._text(callee, source)
+                    if not (local_closures and fname in local_closures):
+                        rt = self._free_fn_return_type(fname, name_to_ids)
+                        if rt:
+                            return rt
         return None
 
     def _collect_fn_aliases(
@@ -511,7 +648,7 @@ class CallGraphBuilder:
 
         `let p: fn() = tgt; p();` and `let q = tgt; q();` bind a callable to a
         variable; a later `p()`/`q()` is a real edge to `tgt` that bare-name
-        resolution misses (val_3_18). Only a RHS that is a *bare identifier
+        resolution misses. Only a RHS that is a *bare identifier
         naming a known FREE function* creates an alias -- never a call, closure,
         method, or arbitrary expression. The RHS is resolved through the SAME
         gate a bare call uses -- free functions only (a bare identifier in value
@@ -577,7 +714,7 @@ class CallGraphBuilder:
         dispatch to the trait's conformers via the SAME `trait_impls` closure the
         `&dyn Trait` path uses -- nominal typing makes the conformer set knowable
         and bounded, so this is a reachability-safe over-approximation, not a
-        guess (val_3_19 extended from `dyn` to generic bounds; the Swift parser's
+        guess (extended from `dyn` to generic bounds; the Swift parser's
         protocol-conformer dispatch is the reference).
         """
         bounds: Dict[str, List[str]] = {}
@@ -653,7 +790,7 @@ class CallGraphBuilder:
         fn_aliases: Optional[Dict[str, List[str]]] = None,
     ) -> List[str]:
         # A local variable bound to a function value: `let p = tgt; p()` -> tgt
-        # (val_3_18). Checked before name resolution because `p` is not itself a
+        # Checked before name resolution because `p` is not itself a
         # function name; the alias only exists when RHS named a known function.
         if fn_aliases and call_name in fn_aliases:
             return fn_aliases[call_name]
@@ -688,6 +825,13 @@ class CallGraphBuilder:
         same_file = [c for c in candidates if self._in_file(c, caller_file)]
         if same_file:
             return same_file
+        # A bare call to a name imported from an EXTERNAL crate (`use
+        # std::thread::spawn`) is that external symbol, not a cross-file repo
+        # function of the same name -- linking to the repo namesake is a
+        # wrong-target phantom. Same-file (checked above) still wins; a genuine
+        # repo import (`use crate::..`) has no external root and is unaffected.
+        if self._name_is_externally_imported(call_name, caller_file):
+            return []
         if len(candidates) == 1:
             return candidates
         return []
@@ -698,6 +842,32 @@ class CallGraphBuilder:
             return []
         candidates = name_to_ids.get(leaf, [])
         return candidates if len(candidates) == 1 else []
+
+    # Crate roots that are unambiguously NOT part of the analyzed repo. A `use`
+    # rooted here binds an external symbol; `crate`/`super`/`self`-rooted paths
+    # (and bare local-mod paths) are repo-internal and never match.
+    _EXTERNAL_CRATE_ROOTS = frozenset({"std", "core", "alloc", "proc_macro", "test"})
+
+    def _name_is_externally_imported(self, call_name: str, caller_file: str) -> bool:
+        """True if `call_name` is brought into `caller_file` by a `use` rooted in a
+        known external crate (`std`/`core`/`alloc`/...) AND is not ALSO repo-imported
+        (`use crate::`/`self`/`super`) in the same file. Such a bare call is the
+        external symbol, so it must not resolve to a same-named repo function. A
+        coexisting repo import means some scope legitimately calls the repo function
+        -- imports are tracked per file, not per scope, so we can't tell which call
+        is which; decline to force-drop and let candidate resolution decide."""
+        ext = repo = False
+        for imp in self.imports.get(caller_file, []):
+            if imp.get("kind") != "use":
+                continue
+            if (imp.get("alias") or imp.get("leaf")) != call_name:
+                continue
+            root = (imp.get("path") or "").split("::", 1)[0]
+            if root in self._EXTERNAL_CRATE_ROOTS:
+                ext = True
+            elif root in ("crate", "self", "super"):
+                repo = True
+        return ext and not repo
 
     def _resolve_field(
         self, site: dict, caller_file: str, caller_class: Optional[str],
@@ -740,7 +910,7 @@ class CallGraphBuilder:
                 # Generic trait-bound receiver (`item: &B` where `B: Shape`)
                 # is resolved FIRST and never via a concrete-type lookup on the
                 # letter: dispatch to the intersection of the bound traits'
-                # conformers (val_3_19 for generics). Checking bounds before the
+                # conformers (for generics). Checking bounds before the
                 # concrete lookup is what stops a blanket `impl<T: X> Y for T`
                 # (which mints a pseudo-type `"T"`) from hijacking every generic
                 # receiver named `T`/`B` repo-wide.
@@ -784,7 +954,15 @@ class CallGraphBuilder:
         if not known:
             return []
         conformer_sets = [set(self.trait_impls.get(t, [])) for t in known]
-        conformers = set.intersection(*conformer_sets) if len(conformer_sets) > 1 else conformer_sets[0]
+        # A bound whose conformer set is EMPTY is *unconstrained*, not impossible:
+        # marker/blanket/derive/cross-crate impls are invisible to the extractor
+        # (blanket pairs are deliberately skipped in function_extractor), so an empty
+        # set means "conformers unknown", and must NOT annihilate the edges the other
+        # bounds legitimately establish (`B: Shape + Marker` still reaches Shape's
+        # conformers). Intersect only over bounds that actually constrain — those with
+        # >=1 known conformer. Reachability over-approximation, not a guess.
+        constraining = [s for s in conformer_sets if s]
+        conformers = set.intersection(*constraining) if constraining else set()
         allowed = conformers | set(known)  # concrete conformers + trait-default bodies
         result: List[str] = []
         for cand in name_to_ids.get(method, []):
@@ -815,7 +993,7 @@ class CallGraphBuilder:
         if not candidates:
             return []
         same_file = [c for c in candidates if self._in_file(c, caller_file)]
-        # F2/F3/F4: only emit an edge when the receiver-less resolution is
+        # Unknown-receiver gate: only emit an edge when the receiver-less resolution is
         # UNAMBIGUOUS. When several same-named `&self` methods live in the same
         # file (e.g. Dog::speak and Cat::speak) and the receiver's static type is
         # unknown (inferred from a fn-return, struct field, `dyn Trait`, or a
@@ -828,6 +1006,15 @@ class CallGraphBuilder:
             return same_file
         if len(candidates) == 1:
             return candidates
+        # Known limitation (deliberate, not a bug): when >=2 same-named `&self`
+        # methods remain and the receiver type is unknown, we decline. Exported
+        # candidates self-seed so declining them is free; a PRIVATE inherent method
+        # whose sole edge is declined can black out. That blackout is RECOVERED
+        # upstream wherever the receiver type is inferable -- e.g. `let c = load()`
+        # with `load() -> Cfg` types the receiver (see _free_fn_return_type), so the
+        # call never reaches this gate. A blanket union of the residual truly-ambiguous
+        # case would add a cross-type phantom (Dog->Cat.speak) per call site, so it is
+        # not done here.
         return []
 
     def _resolve_typed_member(
