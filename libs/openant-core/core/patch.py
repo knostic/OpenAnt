@@ -134,13 +134,32 @@ def _find_openant_root() -> Path | None:
 
 
 def _require_llm_provider() -> None:
-    if not os.environ.get("LLM_PROVIDER"):
-        raise RuntimeError(
-            "LLM_PROVIDER is not set. The patch engine requires an explicit "
-            "provider (e.g. LLM_PROVIDER=anthropic) so a run triggered by "
-            "OpenAnt never silently falls back to mock mode. Set "
-            "LLM_PROVIDER=mock only if you intentionally want a mock run."
-        )
+    """Fail fast, before any pipeline setup work, if no LLM provider can be
+    resolved.
+
+    Delegates entirely to ``utilities.autopatcher.llm_client``'s
+    authoritative resolver (explicit ``LLM_PROVIDER``, OpenAnt's configured
+    ``default_llm.analyze`` binding, or interactive selection) rather than
+    re-implementing any part of that resolution here. This function's only
+    remaining job is to invoke that check EARLY -- before file I/O, an NVD
+    fetch, or investigation-directory creation -- for the same fail-fast
+    UX the old env-only check provided. It used to check only
+    ``os.environ.get("LLM_PROVIDER")`` directly, which incorrectly
+    rejected a valid config-only run (a real live acceptance test with a
+    configured ``default_llm.analyze`` binding and every LLM env var
+    unset) before the authoritative resolver ever got a chance to approve
+    it.
+
+    Raises:
+        RuntimeError: no explicit provider and no valid OpenAnt config
+            binding (non-interactive), or an unrecognized explicit
+            provider. Never silently degrades to mock -- see
+            ``llm_client.ensure_provider_configured`` for the exact
+            precedence and fail-closed guarantee.
+    """
+    from utilities.autopatcher.llm_client import ensure_provider_configured
+
+    ensure_provider_configured()
 
 
 def _run_engine_and_write_artifacts(
@@ -176,8 +195,10 @@ def _run_engine_and_write_artifacts(
     context acquisition is unchanged.
 
     Raises:
-        RuntimeError: if LLM_PROVIDER is unset. (Also checked by run_patch()
-            itself before this is reached, preserving its exact existing
+        RuntimeError: if no LLM provider can be resolved -- no explicit
+            LLM_PROVIDER and no valid OpenAnt config binding (see
+            _require_llm_provider). (Also checked by run_patch() itself
+            before this is reached, preserving its exact existing
             error-ordering relative to the pipeline_output-not-found check;
             checked again here so run_patch_cve(), which has no equivalent
             earlier check, still gets the guarantee.)
@@ -293,19 +314,22 @@ def run_patch(
 ) -> PatchStepResult:
     """Generate and evaluate a candidate remediation for one finding.
 
-    Requires LLM_PROVIDER to be set explicitly in the environment: Auto
-    Patcher's engine silently falls back to a deterministic mock LLM when
-    LLM_PROVIDER is unset and stdin is non-interactive (always true when
-    invoked from OpenAnt's Go CLI). An OpenAnt-triggered run must never
-    silently produce a mock Trust Report that looks real -- LLM_PROVIDER=mock
-    is allowed, it just must have been explicitly chosen.
+    Requires an LLM provider to be resolvable before any pipeline work
+    starts -- either an explicit LLM_PROVIDER env var, or a valid OpenAnt
+    ``default_llm.analyze`` config binding (see
+    utilities.autopatcher.llm_client.ensure_provider_configured for the
+    exact precedence). An OpenAnt-triggered, non-interactive run with
+    neither must never silently produce a mock Trust Report that looks
+    real -- it fails clearly instead. LLM_PROVIDER=mock remains allowed;
+    it just must have been explicitly chosen.
 
     Writes two artifacts under ``{output_dir}/patch/``:
         {finding_id}-vulnerability.md  -- the rendered input (for transparency)
         {finding_id}-trust-report.md   -- the engine's opaque Trust Report
 
     Raises:
-        RuntimeError: if LLM_PROVIDER is unset.
+        RuntimeError: if no LLM provider can be resolved (see
+            _require_llm_provider).
         FileNotFoundError: if pipeline_output_path doesn't exist.
         ValueError: if finding_id is unknown or ineligible.
     """
@@ -378,7 +402,8 @@ def run_patch_cve(
 
     Raises:
         ValueError: repo_root is missing or not a directory.
-        RuntimeError: if LLM_PROVIDER is unset.
+        RuntimeError: if no LLM provider can be resolved (see
+            _require_llm_provider).
         CVENotFoundError: NVD has no record for cve_id.
         CVEFetchError: network/HTTP/parse failure while contacting NVD.
     """

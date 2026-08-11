@@ -28,9 +28,10 @@ CVE-sourced report additionally discloses that its input was a public
 advisory, not an OpenAnt Finding, and that advisory claims are not
 repository-verified facts.
 
-Requires LLM_PROVIDER to be set explicitly (e.g. LLM_PROVIDER=anthropic) so
-a run never silently falls back to a mock LLM. Set LLM_PROVIDER=mock only
-if you intentionally want a mock run.
+Requires a resolvable LLM provider so a run never silently falls back to a
+mock LLM: either LLM_PROVIDER set explicitly (e.g. LLM_PROVIDER=anthropic),
+or a valid default_llm.analyze binding configured via 'openant setup llm'.
+Set LLM_PROVIDER=mock only if you intentionally want a mock run.
 
 If no path is given for --finding-id, the active project's
 pipeline_output.json is used. --cve requires --repo-root, which defaults to
@@ -181,12 +182,18 @@ func runPatchFinding(args []string, budget contextBudgetFlags) {
 
 	pyArgs := buildPatchPyArgs(pipelineOutputPath, patchFindingID, repoRoot, outputDir, budget)
 
-	// Auto Patcher's LLM calls are independently configured via LLM_PROVIDER /
-	// OPENAI_API_KEY / ANTHROPIC_API_KEY -- never OpenAnt's own --api-key or
-	// llm_providers config, so no legacy API key is forwarded here. llmEnv
-	// carries only what resolvePatchLLMEnv resolved (explicit env passthrough
-	// needs nothing added; interactive selection adds LLM_PROVIDER + the
-	// chosen provider's key) into the Python subprocess's environment only.
+	// Auto Patcher's LLM provider selection is driven by LLM_PROVIDER /
+	// OPENAI_API_KEY / ANTHROPIC_API_KEY, not OpenAnt's own --api-key, so no
+	// legacy API key is forwarded here. llmEnv carries only what
+	// resolvePatchLLMEnv resolved (explicit env passthrough needs nothing
+	// added; interactive selection adds LLM_PROVIDER + the chosen provider's
+	// key) into the Python subprocess's environment only -- Go never copies a
+	// config.json-stored credential into extraEnv on the explicit-provider
+	// path. Python's utilities.llm.resolve_provider() reads the SAME
+	// config.json's llm_providers entry itself once the subprocess starts
+	// (see validateExplicitPatchProvider), so a credential configured via
+	// `openant setup llm` reaches Auto Patcher without ever passing through
+	// this env map.
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, "", llmEnv)
 	if err != nil {
 		output.PrintError(err.Error())
@@ -246,11 +253,12 @@ func runPatchCVE(args []string, budget contextBudgetFlags) {
 
 	pyArgs := buildPatchCVEPyArgs(patchCVE, repoRoot, outputDir, budget)
 
-	// Same deliberate omission as Finding mode: Auto Patcher's LLM calls are
-	// configured independently via LLM_PROVIDER / OPENAI_API_KEY /
-	// ANTHROPIC_API_KEY, never OpenAnt's own --api-key. llmEnv carries only
-	// what resolvePatchLLMEnv resolved into the Python subprocess's
-	// environment only.
+	// Same deliberate omission as Finding mode: provider *selection* is
+	// LLM_PROVIDER / OPENAI_API_KEY / ANTHROPIC_API_KEY, never OpenAnt's own
+	// --api-key. llmEnv carries only what resolvePatchLLMEnv resolved into
+	// the Python subprocess's environment -- see runPatchFinding's matching
+	// comment for why a config.json-stored credential still reaches Python
+	// without appearing here.
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, "", llmEnv)
 	if err != nil {
 		output.PrintError(err.Error())

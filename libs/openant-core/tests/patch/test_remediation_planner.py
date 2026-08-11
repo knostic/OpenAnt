@@ -1672,6 +1672,116 @@ class TestFinalStrategyFailureDegradation:
         assert any("Retry.X" in w for w in result.warnings)
 
 
+class TestModelUnavailableErrorPropagation:
+    """ModelUnavailableError represents an explicit execution/configuration
+    decision (non-interactive rejection, or a declined/cancelled interactive
+    model reselection) -- not ordinary evidence-acquisition failure. Unlike
+    every other exception these three best-effort Planner stages see, it
+    must propagate and abort the run rather than degrade to an empty
+    result. Ordinary failures (network, malformed JSON, etc.) must keep
+    degrading exactly as before -- see TestPlanResultParsing's and
+    TestFinalStrategyFailureDegradation's existing `RuntimeError("boom")`
+    tests for that half of the contract."""
+
+    def test_generate_remediation_plan_reraises_model_unavailable_error(self):
+        from utilities.autopatcher.llm_client import ModelUnavailableError
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = ModelUnavailableError("model rejected")
+
+        with pytest.raises(ModelUnavailableError):
+            generate_remediation_plan("some vuln", llm)
+
+    def test_generate_remediation_plan_ordinary_error_still_degrades(self):
+        """Confirms the fix didn't make every exception fatal: a plain
+        RuntimeError (what most non-ModelUnavailableError LLM/network
+        failures surface as) still degrades to the empty result."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = RuntimeError("ordinary network hiccup")
+
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+    def test_generate_remediation_strategy_reraises_model_unavailable_error(self):
+        from utilities.autopatcher.llm_client import ModelUnavailableError
+        from utilities.autopatcher.remediation_planner import generate_remediation_strategy
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = ModelUnavailableError("model rejected")
+
+        with pytest.raises(ModelUnavailableError):
+            generate_remediation_strategy(
+                "vuln", llm, None, None, planner_evidence_ctx="EVIDENCE",
+            )
+
+    def test_generate_remediation_strategy_ordinary_error_still_degrades(self):
+        from utilities.autopatcher.remediation_planner import (
+            generate_remediation_strategy, _EMPTY_STRATEGY_RESULT,
+        )
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = RuntimeError("ordinary network hiccup")
+
+        result = generate_remediation_strategy(
+            "vuln", llm, None, None, planner_evidence_ctx="EVIDENCE",
+        )
+        assert result == _EMPTY_STRATEGY_RESULT
+
+    def test_guided_context_request_reraises_model_unavailable_error(self):
+        """Exercises the third stage via generate_guided_context_requests
+        directly -- this function has no try/except of its own for the
+        happy-path-vs-failure split other than the one added for
+        ModelUnavailableError, so this is the most direct proof."""
+        from utilities.autopatcher.llm_client import ModelUnavailableError
+        from utilities.autopatcher.remediation_planner import generate_guided_context_requests
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = ModelUnavailableError("model rejected")
+        strategy = _make_strategy()
+        slice_result = _make_slice_result()
+
+        with pytest.raises(ModelUnavailableError):
+            generate_guided_context_requests(strategy, "vuln", llm, mock.MagicMock(), slice_result)
+
+    def test_guided_context_request_ordinary_error_still_returns_empty_list(self):
+        from utilities.autopatcher.remediation_planner import generate_guided_context_requests
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = RuntimeError("ordinary network hiccup")
+        strategy = _make_strategy()
+        slice_result = _make_slice_result()
+
+        assert generate_guided_context_requests(strategy, "vuln", llm, mock.MagicMock(), slice_result) == []
+
+    def test_run_guided_acquisition_reraises_model_unavailable_error(self, tmp_path):
+        """End-to-end through run_guided_acquisition (the caller
+        generate_guided_context_requests has no try/except of its own
+        inside) -- proves there's no additional wrapping layer inside
+        run_guided_acquisition that would re-swallow the exception before
+        it reaches pipeline.py's own guard."""
+        from utilities.autopatcher.llm_client import ModelUnavailableError
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        edit = IntendedEdit(file="mod.py", symbol="mod.py:CONST_A")
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness([edit], initial_slice)
+
+        llm = mock.MagicMock()
+        llm.complete.side_effect = ModelUnavailableError("model rejected")
+
+        with pytest.raises(ModelUnavailableError):
+            run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+
+
 class TestFinalStrategyNoNewAnalysisOrDiff:
     def test_no_new_investigation_context_built(self, tmp_path, monkeypatch):
         from utilities.autopatcher.remediation_planner import generate_remediation_strategy

@@ -1,7 +1,19 @@
 """Centralized LLM provider and model configuration.
 
 Keep simple Python structures here so callers can dynamically build menus
-and validate models without hardcoding values in `llm_client.py`.
+without hardcoding values in `llm_client.py`.
+
+IMPORTANT: `LLM_CONFIG["<provider>"]["models"]` below is INFORMATIONAL
+ONLY -- it drives the interactive model menu and the non-interactive
+default, nothing else. It is NOT a whitelist: `llm_client.call_llm()` does
+NOT reject an explicitly requested model (via LLM_MODEL or the interactive
+menu) merely because it is absent from this dict, marked "retired", or
+unpriced in config/models.json. The provider itself is the sole authority
+on whether a model can actually be used -- an unrecognized model is only
+ever discovered by the live API call rejecting it (LLMNotFoundError), which
+llm_client.py handles explicitly (ModelUnavailableError / interactive
+reselection) rather than silently substituting a different model. See
+llm_client.py's module docstring for the full rationale.
 """
 
 from ..model_config import (

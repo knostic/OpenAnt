@@ -95,21 +95,30 @@ class TestPipelineLLMModeLog:
     def test_live_mode_log_has_no_model_name(self, monkeypatch, capsys):
         # With Anthropic configured, the early log should say LIVE with no model.
         import utilities.autopatcher.llm_client as llm_client
-        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        from utilities.llm import CompletionResult, TextBlock, empty_config
+
+        monkeypatch.setattr(llm_client, "load_config_file", lambda: empty_config())
         monkeypatch.setattr(llm_client, "_cached_provider", None)
+        monkeypatch.setattr(llm_client, "_cached_api_keys", {})
+        monkeypatch.setattr(llm_client, "_cached_model", {})
+        monkeypatch.setattr(llm_client, "_cached_adapters", {})
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("LLM_MODEL", "claude-test-model")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
 
-        # Stub out the actual Anthropic call so the test stays offline.
-        import types
-        class FakeAnthropic:
-            def __init__(self, api_key=None): pass
-            class messages:
-                @staticmethod
-                def create(model, max_tokens, messages):
-                    import types
-                    msg = types.SimpleNamespace(content=[types.SimpleNamespace(text="```diff\n--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-old\n+new\n```")])
-                    return types.SimpleNamespace(content=[msg.content[0]])
-        monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=FakeAnthropic))
+        # Stub out the shared adapter (not the raw SDK) so the test stays
+        # offline -- llm_client.py no longer constructs anthropic.Anthropic
+        # directly, it goes through utilities.llm.build_adapter().
+        class FakeAdapter:
+            def complete(self, *, model, system, messages, max_tokens, tools=None):
+                return CompletionResult(
+                    content=[TextBlock(text="```diff\n--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-old\n+new\n```")],
+                    input_tokens=1,
+                    output_tokens=1,
+                    stop_reason="end_turn",
+                )
+
+        monkeypatch.setattr(llm_client, "build_adapter", lambda provider_config: FakeAdapter())
 
         from utilities.autopatcher.pipeline import run
         run("path traversal in upload handler")
@@ -118,6 +127,90 @@ class TestPipelineLLMModeLog:
         # Must not include a specific model name in the early log.
         assert "gpt-4o" not in captured.err.split("[pipeline] LLM mode:")[1].split("\n")[0]
         assert "claude" not in captured.err.split("[pipeline] LLM mode:")[1].split("\n")[0].lower()
+
+
+# ---------------------------------------------------------------------------
+# ModelUnavailableError must abort the whole pipeline run -- not just the
+# individual Planner stage that first hits it. Proves the fix at both
+# remediation_planner.py's own try/except AND pipeline.py's outer
+# try/except (which independently wraps each Planner call site) actually
+# lets the exception reach pipeline.run()'s caller, and that Patch
+# Generation is never reached once it does.
+# ---------------------------------------------------------------------------
+
+class TestModelUnavailableAbortsPipeline:
+    def test_non_interactive_model_unavailable_aborts_before_patch_generation(self, monkeypatch):
+        import utilities.autopatcher.llm_client as llm_client
+        from utilities.autopatcher.llm_client import ModelUnavailableError
+        from utilities.llm import LLMNotFoundError, empty_config
+
+        monkeypatch.setattr(llm_client, "load_config_file", lambda: empty_config())
+        monkeypatch.setattr(llm_client, "_cached_provider", None)
+        monkeypatch.setattr(llm_client, "_cached_api_keys", {})
+        monkeypatch.setattr(llm_client, "_cached_model", {})
+        monkeypatch.setattr(llm_client, "_cached_adapters", {})
+        monkeypatch.setattr(llm_client, "_call_metadata", {})
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+        monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
+
+        class _NonInteractiveStdin:
+            def isatty(self):
+                return False
+
+        monkeypatch.setattr("sys.stdin", _NonInteractiveStdin())
+
+        class FakeAdapter:
+            def complete(self, *, model, system, messages, max_tokens, tools=None):
+                raise LLMNotFoundError("model: claude-opus-4-6")
+
+        monkeypatch.setattr(llm_client, "build_adapter", lambda provider_config: FakeAdapter())
+
+        from utilities.autopatcher.pipeline import run
+
+        with pytest.raises(ModelUnavailableError):
+            run("XSS in login form")
+
+        # Patch Generation -- and every later stage -- must never have run.
+        assert "patch_generation" not in llm_client.get_call_metadata()
+
+    def test_interactive_declined_reselection_never_reaches_patch_generation(self, monkeypatch):
+        """User cancellation (blank input at the reselection prompt) must
+        abort before Patch Generation, not just degrade the Planner stage
+        that hit the rejected model."""
+        import utilities.autopatcher.llm_client as llm_client
+        from utilities.autopatcher.llm_client import ModelUnavailableError
+        from utilities.llm import LLMNotFoundError, empty_config
+
+        monkeypatch.setattr(llm_client, "load_config_file", lambda: empty_config())
+        monkeypatch.setattr(llm_client, "_cached_provider", None)
+        monkeypatch.setattr(llm_client, "_cached_api_keys", {})
+        monkeypatch.setattr(llm_client, "_cached_model", {})
+        monkeypatch.setattr(llm_client, "_cached_adapters", {})
+        monkeypatch.setattr(llm_client, "_call_metadata", {})
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+        monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
+
+        class _InteractiveStdin:
+            def isatty(self):
+                return True
+
+        monkeypatch.setattr("sys.stdin", _InteractiveStdin())
+        monkeypatch.setattr("builtins.input", lambda: "")  # decline reselection
+
+        class FakeAdapter:
+            def complete(self, *, model, system, messages, max_tokens, tools=None):
+                raise LLMNotFoundError("model: claude-opus-4-6")
+
+        monkeypatch.setattr(llm_client, "build_adapter", lambda provider_config: FakeAdapter())
+
+        from utilities.autopatcher.pipeline import run
+
+        with pytest.raises(ModelUnavailableError):
+            run("XSS in login form")
+
+        assert "patch_generation" not in llm_client.get_call_metadata()
 
 
 # ---------------------------------------------------------------------------

@@ -308,7 +308,37 @@ def test_run_patch_missing_pipeline_output(tmp_path, monkeypatch):
 # LLM_PROVIDER in the subprocess env before Python starts) must not trigger
 # this at all -- these tests confirm that directly rather than only
 # indirectly through run_patch().
+#
+# _require_llm_provider() now delegates entirely to
+# utilities.autopatcher.llm_client.ensure_provider_configured() (the
+# authoritative resolver) instead of checking os.environ.get("LLM_PROVIDER")
+# directly -- it used to reject a valid config-only run (a real live
+# acceptance test: every LLM env var unset, but OpenAnt's config.json has an
+# explicit default_llm.analyze binding) before that resolver ever got a
+# chance to approve it. These tests cover both the original env-only
+# contract and the config-only path, at the exact core.patch boundary.
 # ---------------------------------------------------------------------------
+
+def _config_with_valid_analyze_binding():
+    """A ConfigFile whose default_llm points at a fully valid, explicitly
+    user-authored llm-config -- Anthropic/claude-opus-4-6 analyze binding
+    plus a configured credential -- mirroring the exact shape from the
+    live acceptance test (default_llm -> llm_configs[..].analyze ->
+    {provider, model} -> llm_providers[provider] -> credential)."""
+    from utilities.llm import PHASES, ConfigFile, LLMConfig, PhaseRef, ProviderConfig
+
+    filler = PhaseRef(provider="anthropic", model="claude-sonnet-4-6")
+    phases = {p: filler for p in PHASES}
+    phases["analyze"] = PhaseRef(provider="anthropic", model="claude-opus-4-6")
+    llm_config = LLMConfig(name="test-config", phases=phases)
+    return ConfigFile(
+        default_llm="test-config",
+        llm_configs={"test-config": llm_config},
+        llm_providers={
+            "anthropic": ProviderConfig(name="anthropic", type="anthropic", api_key="configured-test-key"),
+        },
+    )
+
 
 def test_require_llm_provider_does_not_raise_when_set(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "anthropic")
@@ -322,6 +352,53 @@ def test_require_llm_provider_does_not_raise_for_mock(monkeypatch):
 
 def test_require_llm_provider_raises_when_unset(monkeypatch):
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+        _require_llm_provider()
+
+
+def test_require_llm_provider_does_not_raise_for_config_only_binding(monkeypatch):
+    """Regression test for the exact live failure: all LLM env vars unset
+    (LLM_PROVIDER, LLM_MODEL, ANTHROPIC_API_KEY, OPENAI_API_KEY), but a
+    valid default_llm.analyze binding exists in OpenAnt's config --
+    _require_llm_provider() must NOT reject this; it must let the run
+    reach the authoritative LLM resolution/engine boundary rather than
+    blocking it with a stale env-only check. No live Anthropic request is
+    made -- this only proves the preflight gets out of the way."""
+    import utilities.autopatcher.llm_client as llm_client
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(llm_client, "load_config_file", _config_with_valid_analyze_binding)
+
+    _require_llm_provider()  # must not raise
+
+
+def test_require_llm_provider_raises_when_nothing_configured_never_mock(monkeypatch, capsys):
+    """No env provider AND no valid explicit default config -> fail
+    clearly. Must never become mock."""
+    import utilities.autopatcher.llm_client as llm_client
+    from utilities.llm import empty_config
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: empty_config())
+
+    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+        _require_llm_provider()
+    assert "mock" not in capsys.readouterr().err.lower()
+
+
+def test_require_llm_provider_raises_for_invalid_default_llm_reference(monkeypatch):
+    """An invalid/dangling default_llm reference (names a config that was
+    never defined) must fail clearly, exactly like "nothing configured" --
+    never silently mock, never silently accepted as valid."""
+    import utilities.autopatcher.llm_client as llm_client
+    from utilities.llm import ConfigFile
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: ConfigFile(default_llm="does-not-exist"))
+
     with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
         _require_llm_provider()
 

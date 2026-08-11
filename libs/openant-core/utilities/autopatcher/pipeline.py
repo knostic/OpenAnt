@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .confidence_scorer import score_confidence
 from .finding_calibration import calibrate_findings
-from .llm_client import LLMClient
+from .llm_client import LLMClient, ModelUnavailableError
 from .patch_challenger import challenge_patch
 from .patch_generator import generate_patch
 from .patch_reviewer import review_patch
@@ -2831,6 +2831,12 @@ def run(
                     )
             except Exception as exc:
                 print(f"[pipeline] Planner candidate evidence unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+        except ModelUnavailableError:
+            # An explicit execution/configuration decision (non-interactive
+            # rejection, or a declined/cancelled interactive reselection),
+            # not ordinary evidence-acquisition failure -- must abort the
+            # run, not degrade to "no plan" like every other failure here.
+            raise
         except Exception as exc:
             print(f"[pipeline] Remediation planning unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
 
@@ -2868,6 +2874,9 @@ def run(
                     f"{_strategy_result.warnings}",
                     file=sys.stderr,
                 )
+        except ModelUnavailableError:
+            # See the matching guard around generate_remediation_plan above.
+            raise
         except Exception as exc:
             print(f"[pipeline] Final remediation strategy unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
 
@@ -3018,6 +3027,13 @@ def run(
                                if _edit_readiness.unready_edits else ""),
                             file=sys.stderr,
                         )
+                except ModelUnavailableError:
+                    # See the matching guard around generate_remediation_plan
+                    # above -- run_guided_acquisition calls
+                    # generate_guided_context_requests without its own
+                    # try/except, so this is the layer that would otherwise
+                    # swallow it.
+                    raise
                 except Exception as exc:
                     print(
                         f"[pipeline] Guided Context Retrieval unavailable: "

@@ -101,12 +101,14 @@ func TestResolvePatchLLMEnv_ExplicitMock(t *testing.T) {
 
 func TestResolvePatchLLMEnv_ExplicitRealProviderMissingKeyFailsClearly(t *testing.T) {
 	clearPatchLLMEnv(t)
+	withFakeConfigHome(t) // empty config -- no stored credential to fall back to either
 	t.Setenv("LLM_PROVIDER", "anthropic")
-	// ANTHROPIC_API_KEY intentionally left unset.
+	// ANTHROPIC_API_KEY intentionally left unset, and config.json is empty:
+	// missing in BOTH places must still fail clearly.
 
 	_, err := resolvePatchLLMEnv()
 	if err == nil {
-		t.Fatal("expected an error when LLM_PROVIDER=anthropic has no matching API key")
+		t.Fatal("expected an error when LLM_PROVIDER=anthropic has no matching API key or stored config credential")
 	}
 	if !strings.Contains(err.Error(), "ANTHROPIC_API_KEY") {
 		t.Errorf("error should name the missing env var, got: %v", err)
@@ -115,14 +117,127 @@ func TestResolvePatchLLMEnv_ExplicitRealProviderMissingKeyFailsClearly(t *testin
 
 func TestResolvePatchLLMEnv_ExplicitOpenAIMissingKeyFailsClearly(t *testing.T) {
 	clearPatchLLMEnv(t)
+	withFakeConfigHome(t) // empty config -- no stored credential to fall back to either
 	t.Setenv("LLM_PROVIDER", "openai")
 
 	_, err := resolvePatchLLMEnv()
 	if err == nil {
-		t.Fatal("expected an error when LLM_PROVIDER=openai has no matching API key")
+		t.Fatal("expected an error when LLM_PROVIDER=openai has no matching API key or stored config credential")
 	}
 	if !strings.Contains(err.Error(), "OPENAI_API_KEY") {
 		t.Errorf("error should name the missing env var, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CRITICAL: the primary migration goal -- a credential already configured
+// through OpenAnt's shared config.json (llm_providers) must let an explicit
+// LLM_PROVIDER=<provider> run reach Python, with NO matching env var set.
+// This exercises the actual resolvePatchLLMEnv/validateExplicitPatchProvider
+// boundary, not just Python's own _resolve_provider_config() unit tests.
+// ---------------------------------------------------------------------------
+
+func TestResolvePatchLLMEnv_ExplicitAnthropicFromStoredConfigNoEnvKey(t *testing.T) {
+	clearPatchLLMEnv(t)
+	configPath := withFakeConfigHome(t)
+	writeConfigJSON(t, configPath, map[string]any{
+		"$schema_version": 2,
+		"llm_providers": map[string]any{
+			"anthropic": map[string]any{"type": "anthropic", "api_key": "sk-stored-anthropic"},
+		},
+	})
+	t.Setenv("LLM_PROVIDER", "anthropic")
+	// ANTHROPIC_API_KEY intentionally left unset -- the whole point.
+
+	env, err := resolvePatchLLMEnv()
+	if err != nil {
+		t.Fatalf("a config.json-configured Anthropic credential must let the run through without ANTHROPIC_API_KEY, got error: %v", err)
+	}
+	// Go must NOT copy the stored secret into a new env var here -- Python's
+	// shared provider layer resolves it from the same config.json itself.
+	if len(env) != 0 {
+		t.Fatalf("expected no extraEnv additions (Python resolves the stored credential itself), got %v", env)
+	}
+}
+
+func TestResolvePatchLLMEnv_ExplicitOpenAIFromStoredConfigNoEnvKey(t *testing.T) {
+	clearPatchLLMEnv(t)
+	configPath := withFakeConfigHome(t)
+	writeConfigJSON(t, configPath, map[string]any{
+		"$schema_version": 2,
+		"llm_providers": map[string]any{
+			"openai": map[string]any{"type": "openai", "api_key": "sk-stored-openai"},
+		},
+	})
+	t.Setenv("LLM_PROVIDER", "openai")
+	// OPENAI_API_KEY intentionally left unset.
+
+	env, err := resolvePatchLLMEnv()
+	if err != nil {
+		t.Fatalf("a config.json-configured OpenAI credential must let the run through without OPENAI_API_KEY, got error: %v", err)
+	}
+	if len(env) != 0 {
+		t.Fatalf("expected no extraEnv additions (Python resolves the stored credential itself), got %v", env)
+	}
+}
+
+func TestResolvePatchLLMEnv_ExplicitAnthropicFromLegacyV1ConfigNoEnvKey(t *testing.T) {
+	// The legacy (pre-v2) top-level api_key field is always an Anthropic
+	// key -- existingPatchCredential() already special-cases it; prove the
+	// explicit-provider preflight honors that too, not just the interactive
+	// reuse-prompt path.
+	clearPatchLLMEnv(t)
+	configPath := withFakeConfigHome(t)
+	writeConfigJSON(t, configPath, map[string]any{"api_key": "sk-legacy-anthropic"})
+	t.Setenv("LLM_PROVIDER", "anthropic")
+
+	env, err := resolvePatchLLMEnv()
+	if err != nil {
+		t.Fatalf("a legacy v1 stored Anthropic credential must let the run through, got error: %v", err)
+	}
+	if len(env) != 0 {
+		t.Fatalf("expected no extraEnv additions, got %v", env)
+	}
+}
+
+func TestResolvePatchLLMEnv_EnvKeyStillTakesPrecedenceOverStoredConfig(t *testing.T) {
+	// Explicit env credentials must still work even when config.json also
+	// has one -- the env check is the first branch and short-circuits.
+	clearPatchLLMEnv(t)
+	configPath := withFakeConfigHome(t)
+	writeConfigJSON(t, configPath, map[string]any{
+		"llm_providers": map[string]any{
+			"anthropic": map[string]any{"type": "anthropic", "api_key": "sk-stored-anthropic"},
+		},
+	})
+	t.Setenv("LLM_PROVIDER", "anthropic")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-env-anthropic")
+
+	env, err := resolvePatchLLMEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(env) != 0 {
+		t.Fatalf("expected no extraEnv additions, got %v", env)
+	}
+}
+
+func TestResolvePatchLLMEnv_GoogleOnlyStoredConfigDoesNotSatisfyAnthropicPreflight(t *testing.T) {
+	// A stored credential for a provider Auto Patcher didn't ask for must
+	// not be treated as satisfying the check for the one it did ask for.
+	clearPatchLLMEnv(t)
+	configPath := withFakeConfigHome(t)
+	writeConfigJSON(t, configPath, map[string]any{
+		"$schema_version": 2,
+		"llm_providers": map[string]any{
+			"google": map[string]any{"type": "google", "api_key": "sk-google-only"},
+		},
+	})
+	t.Setenv("LLM_PROVIDER", "anthropic")
+
+	_, err := resolvePatchLLMEnv()
+	if err == nil {
+		t.Fatal("a Google-only stored config must not satisfy an explicit LLM_PROVIDER=anthropic preflight")
 	}
 }
 
@@ -147,6 +262,7 @@ func TestResolvePatchLLMEnv_UnrecognizedExplicitProviderNotGatekept(t *testing.T
 
 func TestResolvePatchLLMEnv_NonInteractiveUnsetProviderFailsClearly(t *testing.T) {
 	clearPatchLLMEnv(t)
+	withFakeConfigHome(t) // empty config -- no default_llm binding to defer to either
 	forceInteractive(t, false)
 
 	_, err := resolvePatchLLMEnv()
@@ -187,6 +303,7 @@ func TestResolvePatchLLMEnv_InteractiveFreshProviderSelection(t *testing.T) {
 func TestResolvePatchLLMEnv_InteractiveMockSelection(t *testing.T) {
 	silenceStderr(t)
 	clearPatchLLMEnv(t)
+	withFakeConfigHome(t) // empty config -- no default_llm binding to defer to
 	forceInteractive(t, true)
 	withScriptedStdin(t, "3\n") // choose Mock
 
@@ -205,6 +322,7 @@ func TestResolvePatchLLMEnv_InteractiveMockSelection(t *testing.T) {
 func TestResolvePatchLLMEnv_InteractiveInvalidChoiceFailsClearly(t *testing.T) {
 	silenceStderr(t)
 	clearPatchLLMEnv(t)
+	withFakeConfigHome(t) // empty config -- no default_llm binding to defer to
 	forceInteractive(t, true)
 	withScriptedStdin(t, "9\n")
 
@@ -298,6 +416,112 @@ func TestResolvePatchLLMEnv_NeverMutatesProcessEnvironment(t *testing.T) {
 	}
 	if v := os.Getenv("ANTHROPIC_API_KEY"); v != "" {
 		t.Fatalf("resolvePatchLLMEnv must never os.Setenv this process's own ANTHROPIC_API_KEY; got %q", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Config-only resolution: no LLM_PROVIDER at all, but OpenAnt's config.json
+// has an explicitly user-configured default_llm.analyze binding -- Go must
+// defer entirely to Python rather than prompting or failing. Mirrors the
+// Python-side default_llm -> llm_configs[default_llm].analyze inheritance
+// (utilities.autopatcher.llm_client._resolve_analyze_binding).
+// ---------------------------------------------------------------------------
+
+// fullyValidAutopatcherConfigDoc returns a config.json document shaped like
+// a real `openant setup llm` output: default_llm names a config with all
+// seven canonical phases (Go's own check only inspects "analyze", but a
+// realistic fixture exercises the actual end-to-end shape described in the
+// task's "Desired user experience").
+func fullyValidAutopatcherConfigDoc(analyzeProvider, analyzeModel string) map[string]any {
+	phase := map[string]any{"provider": "anthropic", "model": "claude-opus-4-8"}
+	return map[string]any{
+		"$schema_version": 2,
+		"default_llm":     "my-llm",
+		"llm_providers": map[string]any{
+			"anthropic": map[string]any{"type": "anthropic", "api_key": "sk-configured-anthropic"},
+		},
+		"llm_configs": map[string]any{
+			"my-llm": map[string]any{
+				"analyze":      map[string]any{"provider": analyzeProvider, "model": analyzeModel},
+				"enhance":      phase,
+				"verify":       phase,
+				"report":       phase,
+				"dynamic_test": phase,
+				"llm_reach":    phase,
+				"app_context":  phase,
+			},
+		},
+	}
+}
+
+func TestResolvePatchLLMEnv_ValidDefaultAnalyzeBindingDefersToPythonNonInteractive(t *testing.T) {
+	clearPatchLLMEnv(t)
+	configPath := withFakeConfigHome(t)
+	writeConfigJSON(t, configPath, fullyValidAutopatcherConfigDoc("anthropic", "claude-opus-4-6"))
+	forceInteractive(t, false) // must NOT need an interactive terminal either
+
+	env, err := resolvePatchLLMEnv()
+	if err != nil {
+		t.Fatalf("a valid default_llm.analyze binding must let a non-interactive run through, got error: %v", err)
+	}
+	if len(env) != 0 {
+		t.Fatalf("expected no extraEnv additions (Python resolves provider/model/credential itself), got %v", env)
+	}
+}
+
+func TestResolvePatchLLMEnv_ValidDefaultAnalyzeBindingDefersWithoutPromptingInteractively(t *testing.T) {
+	// Deliberately do NOT call withScriptedStdin: if the fix regresses and
+	// the code tries to prompt anyway, reading from `go test`'s real
+	// (non-scripted, non-terminal) stdin fails/returns EOF immediately,
+	// which surfaces as a non-nil error below -- so this test fails loudly
+	// on a regression rather than hanging.
+	clearPatchLLMEnv(t)
+	configPath := withFakeConfigHome(t)
+	writeConfigJSON(t, configPath, fullyValidAutopatcherConfigDoc("anthropic", "claude-opus-4-6"))
+	forceInteractive(t, true)
+
+	env, err := resolvePatchLLMEnv()
+	if err != nil {
+		t.Fatalf("a valid default_llm.analyze binding must require NO additional LLM selection prompt, got error: %v", err)
+	}
+	if len(env) != 0 {
+		t.Fatalf("expected no extraEnv additions, got %v", env)
+	}
+}
+
+func TestResolvePatchLLMEnv_BrokenDefaultLLMReferenceFallsBackToOldBehavior(t *testing.T) {
+	// default_llm names a config that was never actually defined --
+	// structurally invalid, not "unset". Must NOT be treated as a valid
+	// binding to defer to; falls back to the pre-existing non-interactive
+	// failure.
+	clearPatchLLMEnv(t)
+	configPath := withFakeConfigHome(t)
+	writeConfigJSON(t, configPath, map[string]any{
+		"$schema_version": 2,
+		"default_llm":     "does-not-exist",
+	})
+	forceInteractive(t, false)
+
+	_, err := resolvePatchLLMEnv()
+	if err == nil {
+		t.Fatal("a dangling default_llm reference must not be treated as a valid binding to defer to")
+	}
+}
+
+func TestResolvePatchLLMEnv_ExplicitLLMProviderStillWinsOverValidConfigBinding(t *testing.T) {
+	// Explicit LLM_PROVIDER must take priority over the config binding --
+	// even a fully valid, different-provider binding never gets consulted.
+	clearPatchLLMEnv(t)
+	configPath := withFakeConfigHome(t)
+	writeConfigJSON(t, configPath, fullyValidAutopatcherConfigDoc("openai", "some-openai-model"))
+	t.Setenv("LLM_PROVIDER", "mock")
+
+	env, err := resolvePatchLLMEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(env) != 0 {
+		t.Fatalf("expected no extraEnv additions for explicit mock, got %v", env)
 	}
 }
 

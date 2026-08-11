@@ -51,6 +51,7 @@ from typing import NamedTuple
 from .content_relocation import find_unique_occurrence, old_side_anchors
 from .context_budget import ContextBudgetController
 from .diff_parsing import parse_diff
+from .llm_client import ModelUnavailableError
 from .repository_grounding_models import DiscoveryEvidence, RepositoryCandidate
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "remediation_planner.md"
@@ -135,10 +136,17 @@ def _string_list(value) -> "list[str]":
 def generate_remediation_plan(vulnerability_text: str, llm, code_context: str = "") -> RemediationPlanResult:
     """
     Ask the model to commit to a remediation strategy before Patch
-    Generation runs. Never generates code or a diff. Best-effort: any call
-    or parsing failure returns an all-empty RemediationPlanResult so the
-    pipeline degrades exactly like every other optional context section --
-    no rendered plan, and no Planner candidates for the enrichment bridge.
+    Generation runs. Never generates code or a diff. Best-effort: any
+    ordinary call or parsing failure (network, timeout, malformed
+    response) returns an all-empty RemediationPlanResult so the pipeline
+    degrades exactly like every other optional context section -- no
+    rendered plan, and no Planner candidates for the enrichment bridge.
+
+    ModelUnavailableError is the one exception NOT treated as best-effort:
+    it means the requested model was rejected and either the run is
+    non-interactive or the user declined to pick a working alternative --
+    an explicit execution/configuration decision, not ordinary evidence
+    acquisition failure. It must abort the run, not degrade to "no plan".
     """
     system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
     user_message = "## Vulnerability report\n\n" + vulnerability_text
@@ -147,6 +155,8 @@ def generate_remediation_plan(vulnerability_text: str, llm, code_context: str = 
 
     try:
         raw = llm.complete(system_prompt, user_message, stage="remediation_planning")
+    except ModelUnavailableError:
+        raise
     except Exception:
         return _EMPTY_PLAN_RESULT
 
@@ -857,6 +867,10 @@ def generate_remediation_strategy(
 
     try:
         raw = llm.complete(system_prompt, user_message, stage="remediation_strategy")
+    except ModelUnavailableError:
+        # Explicit execution/configuration decision, not ordinary evidence
+        # acquisition failure -- must abort, not degrade to "no strategy".
+        raise
     except Exception:
         return _EMPTY_STRATEGY_RESULT
 
@@ -3077,6 +3091,10 @@ def generate_guided_context_requests(
     )
     try:
         raw = llm.complete(system_prompt, user_message, stage="guided_context_request")
+    except ModelUnavailableError:
+        # Explicit execution/configuration decision, not ordinary evidence
+        # acquisition failure -- must abort, not degrade to "nothing to ask".
+        raise
     except Exception:
         return []
 
