@@ -1,9 +1,17 @@
 """Fetch a CVE record by ID from the NVD REST API (v2.0).
 
-Ported from the standalone Auto Patcher project's ``cve_fetcher.py``. Uses
-only stdlib -- no third-party deps. Set ``NVD_API_KEY`` in the environment to
-raise NVD's rate limits; the key is only ever placed in an outgoing request
-header, never logged or included in any exception message.
+Ported from the standalone Auto Patcher project's ``cve_fetcher.py``, which
+used only stdlib. This version uses ``requests`` instead of
+``urllib.request`` -- ``requests`` is already a direct OpenAnt dependency and
+already the established client for plain REST API calls elsewhere in this
+codebase (see ``github_scanner/github_repo_filter.py``). It also verifies
+TLS certificates against ``certifi``'s bundled CA roots by default, rather
+than the selected Python interpreter's own OpenSSL default trust store --
+which stdlib ``urllib``/``ssl`` fall back to, and which is not guaranteed to
+be populated on every interpreter this CLI might run under. Set
+``NVD_API_KEY`` in the environment to raise NVD's rate limits; the key is
+only ever placed in an outgoing request header, never logged or included in
+any exception message.
 
 Unlike the original, "not found" and "fetch failure" are distinct exception
 types (``CVENotFoundError`` / ``CVEFetchError``) rather than a single bare
@@ -19,10 +27,9 @@ given failure kind (retrying a CVENotFoundError is never useful).
 
 from __future__ import annotations
 
-import json
 import os
-import urllib.error
-import urllib.request
+
+import requests
 
 _API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
@@ -65,26 +72,23 @@ def fetch_cve(cve_id: str, timeout: int = 15) -> dict:
     if api_key:
         headers["apiKey"] = api_key
 
-    req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            raise CVENotFoundError(f"CVE {cve_id} not found in NVD (HTTP 404)") from exc
-        raise CVEFetchError(
-            f"Failed to fetch {cve_id} from NVD: HTTP {exc.code} {exc.reason}"
-        ) from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        # HTTPError is a URLError subclass, so it's already handled above by
-        # the time we get here. A bare TimeoutError can reach us directly
-        # when the socket layer raises it without urllib wrapping it first
-        # (e.g. when a caller mocks urlopen itself, bypassing that wrapping).
+        resp = requests.get(url, headers=headers, timeout=timeout)
+    except requests.exceptions.RequestException as exc:
+        # Covers connection failures, timeouts, and TLS errors alike -- all
+        # of them mean "we couldn't talk to NVD", not a parseable response.
         raise CVEFetchError(f"Failed to fetch {cve_id} from NVD: {exc}") from exc
 
+    if resp.status_code == 404:
+        raise CVENotFoundError(f"CVE {cve_id} not found in NVD (HTTP 404)") from None
+    if not resp.ok:
+        raise CVEFetchError(
+            f"Failed to fetch {cve_id} from NVD: HTTP {resp.status_code} {resp.reason}"
+        )
+
     try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as exc:
+        payload = resp.json()
+    except ValueError as exc:
         raise CVEFetchError(f"NVD returned an unparseable response for {cve_id}") from exc
 
     vulnerabilities = payload.get("vulnerabilities") or []
