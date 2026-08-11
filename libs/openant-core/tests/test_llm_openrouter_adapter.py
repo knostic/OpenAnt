@@ -265,6 +265,37 @@ class TestErrorMapping:
         with pytest.raises(LLMAuthError):
             _complete(adapter)
 
+    def test_403_abuse_flagged_key_stays_auth_not_refusal(self):
+        """A disabled/abuse-flagged KEY is a 403 whose body contains 'flagged'
+        but is an auth problem, not content moderation — the operator needs to
+        rotate the key, so it must NOT be reported as a per-prompt refusal."""
+
+        def respond(**kw):
+            raise openai.PermissionDeniedError(
+                message="Your API key has been flagged for abuse and disabled",
+                response=_fake_http_resp(403),
+                body=None,
+            )
+
+        adapter, _ = _stub_adapter(respond)
+        with pytest.raises(LLMAuthError):
+            _complete(adapter)
+
+    def test_403_content_policy_violation_maps_to_refusal(self):
+        """A moderation 403 that says 'violates the content policy' (no literal
+        'moderation'/'flagged') must still surface as a refusal."""
+
+        def respond(**kw):
+            raise openai.PermissionDeniedError(
+                message="Your request violates the content policy",
+                response=_fake_http_resp(403),
+                body=None,
+            )
+
+        adapter, _ = _stub_adapter(respond)
+        with pytest.raises(LLMRefusalError):
+            _complete(adapter)
+
     def test_finish_reason_error_raises_response_error(self):
         """A provider failing mid-generation comes back as HTTP 200
         with finish_reason == 'error'; it must raise, never normalise

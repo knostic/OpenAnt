@@ -98,9 +98,14 @@ _ATTRIBUTION_HEADERS = {
 _INVALID_MODEL_MARKER = "not a valid model id"
 
 # OpenRouter's 403 moderation errors carry wording like "your input was
-# flagged" / "requires moderation"; a 403 without it is a real
-# permission problem.
-_MODERATION_MARKERS = ("moderation", "flagged")
+# flagged" / "requires moderation" / "violates the content policy"; a 403
+# without it is a real permission problem.
+_MODERATION_MARKERS = ("moderation", "flagged", "content policy", "violat")
+
+# A 403 that names the KEY/account (disabled, abuse, suspended, revoked) is an
+# auth/permission problem, NOT content moderation — it must win over the
+# moderation markers above, since "flagged for abuse" contains "flagged".
+_KEY_DISABLED_MARKERS = ("abuse", "disabled", "suspended", "revoked", "banned")
 
 _CREDITS_HINT = (
     " (HTTP 402 from OpenRouter means the account balance is exhausted — "
@@ -127,8 +132,12 @@ def _classify_error(exc: Exception, *, report_429: bool) -> Exception:
     if isinstance(exc, openai.AuthenticationError):
         return LLMAuthError(message)
     if isinstance(exc, openai.PermissionDeniedError):
-        # OpenRouter reserves 403 for input-moderation flags; only fall
-        # back to auth semantics when the body says nothing about it.
+        # OpenRouter reserves 403 for input-moderation flags. A key/account
+        # problem (disabled, flagged FOR ABUSE, suspended) is also a 403 but is
+        # an auth issue — check that first so a dead key isn't reported as a
+        # per-prompt content refusal. Fall back to auth when neither matches.
+        if any(marker in lowered for marker in _KEY_DISABLED_MARKERS):
+            return LLMAuthError(message)
         if any(marker in lowered for marker in _MODERATION_MARKERS):
             return LLMRefusalError(message)
         return LLMAuthError(message)
