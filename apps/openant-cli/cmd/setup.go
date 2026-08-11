@@ -533,10 +533,10 @@ func probeAllPhases(
 			fmt.Fprintln(os.Stderr, "SKIPPED (AWS credentials)")
 			continue
 		case "openrouter":
-			// OpenRouter is OpenAI-compatible; probe it through the OpenAI
-			// path against its base URL (the config carries the OpenRouter
-			// endpoint in prov.BaseURL).
-			probeErr = probeOpenAI(prov.APIKey, prov.BaseURL, ref.Model)
+			// OpenRouter speaks the OpenAI wire API but on its own endpoint;
+			// probeOpenRouter defaults a blank base_url to openrouter.ai/api/v1
+			// (NOT api.openai.com) and appends /chat/completions correctly.
+			probeErr = probeOpenRouter(prov.APIKey, prov.BaseURL, ref.Model)
 		default:
 			fmt.Fprintln(os.Stderr, "SKIPPED")
 			return fmt.Errorf("provider type %q has no probe implementation yet", prov.Type)
