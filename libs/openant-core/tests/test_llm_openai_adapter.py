@@ -172,6 +172,23 @@ def test_empty_choices_raises_llm_response_error():
         adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
 
 
+def test_empty_content_raises_llm_response_error():
+    # A choice with neither text nor tool calls is an empty completion: it must
+    # surface via the taxonomy, not read as a clean end_turn. Parity with the
+    # Responses path's no-usable-content guard and the Anthropic/Gemini adapters
+    # -- for a security tool an empty end_turn would read as a clean pass.
+    empty = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=None, tool_calls=None),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=0),
+    )
+    adapter, _ = _stub(lambda **kw: empty)
+    with pytest.raises(LLMResponseError):
+        adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
+
+
 # ---------------------------------------------------------------------------
 # L3 — pricing table carries current models so they don't report $0
 # ---------------------------------------------------------------------------

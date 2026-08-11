@@ -797,6 +797,20 @@ def _response_to_unified(response: Any) -> CompletionResult:
             "or truncated by the moderation layer"
         )
 
+    # An empty completion -- no text AND no tool calls (``message.content`` is
+    # None/empty with no ``tool_calls``) -- carries nothing the pipeline can act
+    # on. Surface it via the taxonomy instead of returning an empty end_turn
+    # (mirrors the Responses path's no-usable-content guard and the Anthropic/
+    # Gemini adapters); for a SECURITY tool an empty end_turn would read as a
+    # clean, passing result. A tool-use-only response is VALID and not caught
+    # here because ``content_blocks`` is non-empty. Refusal/content_filter is the
+    # more specific signal and already raised above.
+    if not content_blocks:
+        raise LLMResponseError(
+            "OpenAI returned an empty completion (no text or tool calls); the "
+            "request may have been filtered or the response was malformed"
+        )
+
     if raw_finish not in _OPENAI_FINISH_REASONS:
         should_warn = False
         with _warned_finish_reasons_lock:
