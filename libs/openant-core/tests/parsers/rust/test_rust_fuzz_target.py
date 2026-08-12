@@ -191,6 +191,27 @@ def test_nested_harness_struct_does_not_clobber_real_type(tmp_path):
     assert "bogus" not in str(cfg.get("code", "")), f"real Cfg code overwritten: {cfg}"
 
 
+def test_synthetic_harness_seed_only_not_analyzed(tmp_path):
+    # Seed-only: the harness seeds reachability (its decode callee stays an
+    # analysis unit) but the harness itself is NOT emitted as a Stage-1 unit —
+    # it's synthetic instrumentation (lifted body references the dropped closure
+    # param) that would ship broken code to the LLM and re-analyze the decoder.
+    from parsers.rust.unit_generator import UnitGenerator
+    repo = {
+        "src.rs": "pub struct Foo; impl Foo { pub fn decode(d: &[u8]) -> Foo { Foo } }\n",
+        "fuzz/h.rs": "fuzz_target!(|data: &[u8]| { Foo::decode(data); });\n",
+    }
+    _, cg = build(tmp_path, repo, skip_tests=False)
+    dataset, analyzer_output = UnitGenerator(cg, str(tmp_path)).generate()
+    unit_ids = {u["id"] for u in dataset["units"]}
+    assert not any(i.rsplit(":", 1)[-1].startswith("fuzz_target") for i in unit_ids), \
+        f"harness emitted as a Stage-1 analysis unit; units={sorted(unit_ids)}"
+    assert any("Foo.decode" in i for i in unit_ids), "the decode callee must stay analyzable"
+    # call-graph symmetry: the harness stays in analyzer_output (its edges exist)
+    assert any(i.rsplit(":", 1)[-1].startswith("fuzz_target")
+               for i in analyzer_output["functions"]), "harness must remain for call-graph symmetry"
+
+
 def test_hybrid_lib_with_bin_still_filters(tmp_path):
     # A hybrid target (a real `fn main` bin + fuzz harnesses) keeps real structural
     # seeds, so the keep-all net does NOT fire and reachability still prunes — the
