@@ -419,9 +419,10 @@ class CallGraphBuilder:
         invisible to the AST walk above. For a small set of well-known
         macros whose arguments are ordinary expressions (format/print/assert/
         vec/...), regex-recover call-shaped identifiers from the raw token
-        text. This can only find bare/dotted names -- it cannot see argument
-        structure -- so results feed the same bare/field resolution paths
-        with a conservative shape.
+        text. It recovers bare, dotted, and scoped (`Type::method`) call names
+        -- it cannot see argument structure -- so results feed the same
+        bare/field/scoped resolution paths as the AST walk, with a conservative
+        shape.
         """
         macro_name = None
         token_tree = None
