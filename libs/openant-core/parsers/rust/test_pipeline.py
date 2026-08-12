@@ -226,9 +226,24 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
     )
     reachable = analyzer.get_all_reachable()
 
-    if not entry_points and functions:
-        print("  [Warning] No entry points detected — keeping all units unfiltered "
-              "to avoid a silent blackout.", file=sys.stderr)
+    # A synthesized fuzz harness seeds the BFS but is NOT a real structural entry
+    # point (main/route/CLI). If the ONLY seeds are synthetic harnesses — a pure-
+    # library-with-fuzz target whose real public API is often macro-hidden from
+    # the call graph (e.g. httparse's `complete!`-wrapped internals) — keep the
+    # blackout safety net instead of trusting a harness-only reachable set, which
+    # would silently drop the un-reached public API. Hybrid targets that also ship
+    # a real bin/route still have real seeds, so they filter normally. `--library-
+    # mode` (which adds non-synthetic public-API seeds) also defeats the fallback.
+    real_entry_points = {
+        ep for ep in entry_points
+        if not functions.get(ep, {}).get("synthetic_harness")
+    }
+    if not real_entry_points and functions:
+        why = ("Only synthetic fuzz-harness entry points detected"
+               if entry_points else "No entry points detected")
+        print(f"  [Warning] {why} — keeping all units unfiltered to avoid a silent "
+              "blackout. Use --library-mode to seed the exported public API.",
+              file=sys.stderr)
         reachable = set(functions.keys())
 
     filtered_functions = {

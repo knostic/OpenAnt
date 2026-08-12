@@ -347,6 +347,19 @@ class FunctionExtractor:
                     pending_attrs = []
                     continue
 
+                # libFuzzer harness: `fuzz_target!(|data| { .. })`. The closure
+                # body is the real program entry point but sits inside an opaque
+                # macro token_tree, so no function_item is emitted and its calls
+                # (e.g. `Frame::decode`) never reach the call graph. Emit a
+                # synthetic entry-point unit carrying the body as ordinary Rust.
+                if t == "macro_invocation" and self._is_fuzz_target_macro(child, source):
+                    self._handle_fuzz_target(
+                        child, source, file_path, functions, classes,
+                        imports_local, cur_ctx, pending_attrs,
+                    )
+                    pending_attrs = []
+                    continue
+
                 # Anything else (block, let_declaration, if_expression,
                 # match_expression, closure_expression, unsafe_block, ...)
                 # may still contain nested fn/impl/struct/mod definitions
@@ -639,6 +652,133 @@ class FunctionExtractor:
                 "in_test_scope": ctx["in_test_scope"] or is_test_attr,
             }
             worklist.append((block, new_ctx))
+
+    _FUZZ_MACRO_NAMES = ("fuzz_target",)
+
+    def _is_fuzz_target_macro(self, node: Node, source: bytes) -> bool:
+        """True if `node` is a `fuzz_target!( .. )` macro invocation (bare or
+        path-qualified, e.g. `libfuzzer_sys::fuzz_target!`)."""
+        for child in node.children:
+            if child.type in ("identifier", "scoped_identifier"):
+                return _text(child, source).split("::")[-1] in self._FUZZ_MACRO_NAMES
+        return False
+
+    def _handle_fuzz_target(
+        self, node: Node, source: bytes, file_path: str,
+        functions: Dict[str, Any], classes: Dict[str, Any],
+        imports_local: List[dict], ctx: dict, attrs: List[str],
+    ) -> None:
+        """Synthesize an entry-point unit from a `fuzz_target!(|d| { .. })` body.
+
+        libFuzzer's `fuzz_target!` expands to the program `main`; its closure
+        body is the actual fuzzed code path but lives inside an opaque macro
+        token_tree that emits no `function_item`, so the calls it makes never
+        enter the call graph. We lift the body out as `fn <name>() { .. }` and
+        run the ORDINARY extractor walk over it, so any nested `fn`/`impl`/
+        `struct` in the body becomes its own same-file unit. This preserves the
+        call-graph builder's nested-fn invariant (a nested fn is its own unit, so
+        its edges are not lost and a bare call to it binds to the local unit, not
+        a same-named global) — a flat single-unit lift violates it, dropping the
+        nested fn's edges AND mis-binding its bare calls. The harness unit is
+        forced to ``unit_type="main"`` so it seeds reachability, and tagged
+        ``synthetic_harness`` so downstream stages can special-case it.
+        """
+        # Test-gated harness (`#[cfg(test)] fuzz_target!` or inside a test scope)
+        # is skipped like a normal test function when tests are excluded.
+        is_test_attr = any(_TEST_ATTR_RE.match(a) for a in attrs)
+        if (is_test_attr or ctx.get("in_test_scope")) and self.skip_tests:
+            return
+
+        # Locate the closure body via tree-sitter token_tree nodes (string/comment
+        # -safe, unlike a raw brace scan). Macro args are `( |params| BODY )`.
+        outer = next((c for c in node.children if c.type == "token_tree"), None)
+        if outer is None:
+            return
+        kids = outer.children
+        # Block form `|params| { .. }`: the LAST `{`-delimited token_tree (an
+        # earlier one would be a param destructure, before the body).
+        block_tts = [
+            c for c in kids
+            if c.type == "token_tree" and _text(c, source).lstrip().startswith("{")
+        ]
+        if block_tts:
+            body = _text(block_tts[-1], source)
+            base_line = block_tts[-1].start_point[0]  # 0-based line of body `{`
+        else:
+            # Expr form `|params| expr` (no block): lift the expression after the
+            # second top-level `|`, up to the closing `)`, into a statement body.
+            pipes = [i for i, c in enumerate(kids) if c.type == "|"]
+            if len(pipes) < 2:
+                return
+            expr = source[kids[pipes[1]].end_byte:kids[-1].start_byte].decode(
+                "utf-8", "replace"
+            ).strip()
+            if not expr:
+                return
+            body = "{ " + expr + "; }"
+            base_line = node.start_point[0]
+
+        # Unique harness fn name per file (multiple `fuzz_target!` in one file).
+        name = "fuzz_target"
+        n = 2
+        while f"{file_path}:{name}" in functions:
+            name = f"fuzz_target__{n}"
+            n += 1
+
+        # Run the lifted body through the ordinary walk so nested items become
+        # their own units. Use a fresh functions slice to post-process (retype the
+        # harness to `main`, offset lines) before merging; classes/imports go to
+        # the real tables since a nested struct/impl/use IS a same-file item.
+        synth = f"fn {name}() {body}".encode("utf-8")
+        synth_funcs: Dict[str, Any] = {}
+        # Throwaway classes table: the synth walk records nested `struct`/`enum`
+        # with synth-relative coordinates, and a harness that re-declares a real
+        # crate type's name would otherwise clobber the real entry (classes are
+        # bare-name keyed). Merge below with offset lines, never overwriting a
+        # real type.
+        synth_classes: Dict[str, Any] = {}
+        walk_ctx = {
+            "qual_prefix": "",
+            "class_name": None,
+            "module_path": ctx.get("module_path", ()),
+            "in_test_scope": ctx.get("in_test_scope", False),
+        }
+        try:
+            self._walk(
+                self.parser.parse(synth).root_node, synth, file_path,
+                synth_funcs, synth_classes, imports_local, walk_ctx,
+            )
+        except Exception:
+            return
+
+        harness_id = f"{file_path}:{name}"
+        if harness_id not in synth_funcs:
+            return  # body didn't parse to a fn; nothing to seed
+
+        def _offset(info):
+            for k in ("start_line", "end_line"):
+                if isinstance(info.get(k), int):
+                    info[k] = info[k] + base_line
+
+        for fid, info in synth_funcs.items():
+            # Offset the synthetic line numbers back onto the real harness body.
+            _offset(info)
+            if fid == harness_id:
+                # The walk classified the lifted `fn` as a plain function; retype
+                # it to a structural entry point and tag it synthetic.
+                info["unit_type"] = "main"
+                info["is_exported"] = False
+                info["synthetic_harness"] = True
+            if fid not in functions:
+                functions[fid] = info
+
+        # Nested harness-local types: record with offset lines, but never clobber
+        # a real same-named crate type (a real definition always wins).
+        for cid, cinfo in synth_classes.items():
+            if cid in classes:
+                continue
+            _offset(cinfo)
+            classes[cid] = cinfo
 
     def _classify(
         self, name: str, class_name: Optional[str], has_self: bool,
