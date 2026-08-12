@@ -70,6 +70,34 @@ def test_expr_form_no_block(tmp_path):
     assert any("decode" in c for c in _callees(cg, ids[0]))
 
 
+def test_expr_form_with_line_comment_still_seeds(tmp_path):
+    # expr-form `fuzz_target!(|d| expr // comment)` — a trailing `//` line comment
+    # INSIDE the macro parens must not swallow the synthesized body terminator
+    # (`;}`) and make the lifted fn unparseable, silently dropping the harness and
+    # the fuzzed path from reachability. Regression for F-NEW-1.
+    _, cg = build(tmp_path, {
+        "src.rs": FRAME,
+        "fuzz/h.rs": "fuzz_target!(|data: &[u8]| Frame::decode(data) // fuzz it\n);\n",
+    }, skip_tests=False)
+    ids = _fuzz_ids(cg)
+    assert ids, "expr-form-with-comment harness was silently dropped"
+    assert any("decode" in c for c in _callees(cg, ids[0])), "fuzzed target not seeded"
+
+
+def test_expr_form_destructure_param_lifts_body_not_param(tmp_path):
+    # expr-form with a struct-destructure closure param `|Wrap { inner }: Wrap| body`:
+    # the `{ inner }` is the PARAM destructure, not the body — the lift must take the
+    # expression AFTER the closure params, not the first brace token. Regression for F-NEW-2.
+    _, cg = build(tmp_path, {
+        "src.rs": "pub struct Wrap { pub inner: u32 }\npub fn real_call(x: u32) -> u32 { x }\n",
+        "fuzz/h.rs": "fuzz_target!(|Wrap { inner }: Wrap| real_call(inner));\n",
+    }, skip_tests=False)
+    ids = _fuzz_ids(cg)
+    assert ids, "harness not synthesized"
+    assert any("real_call" in c for c in _callees(cg, ids[0])), \
+        f"real body dropped as param destructure; code={cg['functions'][ids[0]]['code']!r}"
+
+
 def test_path_qualified_macro(tmp_path):
     files = {
         "src.rs": FRAME,

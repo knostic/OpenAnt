@@ -695,28 +695,37 @@ class FunctionExtractor:
         if outer is None:
             return
         kids = outer.children
-        # Block form `|params| { .. }`: the LAST `{`-delimited token_tree (an
-        # earlier one would be a param destructure, before the body).
+        # The closure is `|params| body`. Everything after the SECOND top-level
+        # `|` is the body; a `{`-delimited token_tree BEFORE it is a param
+        # destructure (`|Wrap { inner }: Wrap| ..`), never the body. Restrict the
+        # body-brace search to after the params so an expr-form harness whose
+        # only brace IS the param destructure is not mis-lifted.
+        pipes = [i for i, c in enumerate(kids) if c.type == "|"]
+        after = pipes[1] if len(pipes) >= 2 else -1
         block_tts = [
-            c for c in kids
-            if c.type == "token_tree" and _text(c, source).lstrip().startswith("{")
+            c for i, c in enumerate(kids)
+            if i > after and c.type == "token_tree"
+            and _text(c, source).lstrip().startswith("{")
         ]
         if block_tts:
+            # Block form `|params| { .. }`: the body is the last such brace.
             body = _text(block_tts[-1], source)
             base_line = block_tts[-1].start_point[0]  # 0-based line of body `{`
-        else:
+        elif len(pipes) >= 2:
             # Expr form `|params| expr` (no block): lift the expression after the
             # second top-level `|`, up to the closing `)`, into a statement body.
-            pipes = [i for i, c in enumerate(kids) if c.type == "|"]
-            if len(pipes) < 2:
-                return
             expr = source[kids[pipes[1]].end_byte:kids[-1].start_byte].decode(
                 "utf-8", "replace"
             ).strip()
             if not expr:
                 return
-            body = "{ " + expr + "; }"
+            # Terminate on a fresh line so a trailing `//` line comment on the
+            # expr does not swallow the appended `;}` (which would make the lifted
+            # fn unparseable and silently drop the harness).
+            body = "{\n" + expr + "\n; }"
             base_line = node.start_point[0]
+        else:
+            return
 
         # Unique harness fn name per file (multiple `fuzz_target!` in one file).
         name = "fuzz_target"
