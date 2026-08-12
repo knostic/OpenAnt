@@ -1164,7 +1164,15 @@ class CallGraphBuilder:
             return same_file
         if len(candidates) == 1:
             return candidates
-        return []
+        # The qualifier bound nothing in Steps 1-3 and the raw leaf is ambiguous.
+        # Fall back to exactly what a bare `leaf(` call resolves to (free-function
+        # filter + import/external handling) -- this is what the pre-scoped-recovery
+        # bare capture produced, so macro scoped-call recovery stays strictly
+        # ADD-ONLY and never drops an edge the bare path would have kept (e.g. a
+        # leaf shared by a free fn and a method: raw count == 2 here, but the bare
+        # resolver picks the unique FREE function). Purely additive: only reached
+        # when the raw fallback above would have returned [].
+        return self._resolve_bare(leaf, caller_file, name_to_ids)
 
     def _mod_target_files(self, mod_name: str, caller_file: str) -> Set[str]:
         """Candidate file paths a `mod <mod_name>;` declaration could map to.

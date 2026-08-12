@@ -39,3 +39,19 @@ def test_macro_wrapped_bare_call_still_bare(tmp_path):
     repo = {"lib.rs": 'pub fn caller() { assert_eq!(helper(), 1); }\npub fn helper() -> i32 { 1 }\n'}
     e = edges(build(tmp_path, repo)[1])
     assert ("caller", "helper") in e, e
+
+
+def test_scoped_recovery_is_add_only_on_leaf_collision(tmp_path):
+    # Add-only invariant: a scoped call whose qualifier is NOT a repo type/module,
+    # with the leaf shared by a free fn AND a method, must still bind the free fn
+    # (exactly what the pre-scoped bare capture resolved). Scoped recovery must
+    # never DROP an edge master produced. `_resolve_scoped` Step 4 previously
+    # returned [] here (raw candidate count == 2), losing the edge.
+    repo = {
+        "caller.rs": "pub fn drive() { assert!(alpha::beta::c(1)); }\n",
+        "cee.rs": "pub fn c(x: u32) -> u32 { x }\n",
+        "dee.rs": "pub struct S; impl S { pub fn c(x: u32) -> u32 { x } }\n",
+    }
+    e = edges(build(tmp_path, repo)[1])
+    assert ("drive", "c") in e, \
+        f"scoped recovery dropped the free-fn edge master had; drive edges={sorted(x for x in e if x[0]=='drive')}"
