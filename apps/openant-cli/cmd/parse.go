@@ -24,13 +24,13 @@ If no repository path is given, the active project is used (see: openant init).`
 }
 
 var (
-	parseOutput    string
-	parseLanguage  string
-	parseLevel     string
-	parseDiffBase  string
-	parsePR        int
-	parseDiffScope string
-	parseFresh     bool
+	parseOutput      string
+	parseLanguage    string
+	parseLevel       string
+	parseDiffBase    string
+	parsePR          int
+	parseDiffScope   string
+	parseFresh       bool
 	parseLibraryMode bool
 )
 
