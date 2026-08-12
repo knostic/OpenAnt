@@ -49,10 +49,23 @@ _SCANNABLE_MACROS = {
 }
 
 # A conservative call-shaped pattern used ONLY inside macro token trees
-# (real code is parsed by the grammar and does not need this). Matches
-# `name(` and `recv.name(` / `recv.name::<T>(`.
+# (real code is parsed by the grammar and does not need this). Matches, in
+# alternation order:
+#   `A::B::c(`         scoped associated/module call -> emitted as a `scoped`
+#                      site so cross-file `Type::method`/`mod::fn` targets
+#                      resolve (the AST walk gets these for free; the macro
+#                      scanner did not, silently dropping the most common
+#                      fuzz-harness idiom `assert!(Type::method(d))`).
+#   `name(` / `recv.name(` / `recv.name::<T>(`   bare or dotted method chain.
+# Scoped is tried first so `Codec::roundtrip(` binds the qualifier rather than
+# degrading to a bare same-file-only `roundtrip`. A trailing turbofish
+# (`foo::<T>(`) is NOT an identifier after `::`, so it falls through to the
+# bare branch exactly as before (no scoped false-match).
 _MACRO_CALL_RE = re.compile(
-    r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:::<[^>]*>)?\s*\("
+    r"\b("
+    r"(?:[A-Za-z_][A-Za-z0-9_]*::)+[A-Za-z_][A-Za-z0-9_]*"       # A::B::c (scoped)
+    r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"      # bare / recv.name
+    r")\s*(?:::<[^>]*>)?\s*\("
 )
 
 # String / char literals inside a macro token tree, blanked BEFORE the call-shaped
@@ -424,7 +437,21 @@ class CallGraphBuilder:
         text = _RUST_STR_LITERAL_RE.sub(" ", text)
         for match in _MACRO_CALL_RE.finditer(text):
             call_name = match.group(1)
-            if "." in call_name:
+            if "::" in call_name:
+                # Scoped `A::B::c` -> a `scoped` site with the IMMEDIATE
+                # qualifier (segment just before the leaf), matching the shape
+                # `_split_scoped` produces for an AST scoped_identifier so it
+                # routes through the same `_resolve_scoped` path (associated-fn
+                # via class_name, module via mod-file). Add-only vs the prior
+                # bare capture: a `Type::method(` token that previously yielded
+                # bare `method` (same-file-only) now yields the qualified call.
+                qualifier, leaf = call_name.rsplit("::", 1)
+                immediate = qualifier.rsplit("::", 1)[-1]
+                sites.append({
+                    "kind": "scoped", "qualifier": immediate, "leaf": leaf,
+                    "bare_filter_name": None,
+                })
+            elif "." in call_name:
                 receiver_name, method = call_name.rsplit(".", 1)
                 if receiver_name == "self":
                     sites.append({

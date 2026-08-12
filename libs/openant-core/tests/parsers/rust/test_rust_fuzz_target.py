@@ -212,6 +212,32 @@ def test_synthetic_harness_seed_only_not_analyzed(tmp_path):
                for i in analyzer_output["functions"]), "harness must remain for call-graph symmetry"
 
 
+def test_harness_macro_wrapped_scoped_call_seeds_target(tmp_path):
+    # The most common fuzz-harness idiom wraps the target in an assert:
+    # `fuzz_target!(|d| { assert!(Type::method(d)); })`. The macro-body call
+    # scanner must recover the SCOPED call `Type::method` (not just bare
+    # `method`, which fails cross-file resolution) — otherwise, in a HYBRID repo
+    # (a real bin is present so the (C) keep-all net does NOT fire), the harness
+    # seeds zero edges and its decode target is silently pruned. Regression for
+    # F1 (call_graph_builder._MACRO_CALL_RE / _scan_macro_body scoped-call loss).
+    repo = {
+        "lib.rs": (
+            "pub struct Codec;\n"
+            "impl Codec { pub fn roundtrip(d: &[u8]) -> bool { vuln_decoder(d); true } }\n"
+            "pub fn vuln_decoder(d: &[u8]) -> u32 { d.len() as u32 }\n"
+        ),
+        "src/bin/cli.rs": "fn main() { boot(); }\nfn boot() { let _ = 1; }\n",
+        "fuzz/h.rs": "fuzz_target!(|d: &[u8]| { assert!(Codec::roundtrip(d)); });\n",
+    }
+    _, cg = build(tmp_path, repo, skip_tests=False)
+    hid = _fuzz_ids(cg)[0]
+    assert any("roundtrip" in c for c in _callees(cg, hid)), \
+        f"harness did not seed the macro-wrapped scoped call; edges={cg['call_graph'].get(hid)}"
+    kept = {leaf(k) for k in _apply_reachability(cg, tmp_path)["functions"].keys()}
+    assert "Codec.roundtrip" in kept, f"macro-wrapped scoped target pruned; kept={sorted(kept)}"
+    assert "vuln_decoder" in kept, f"transitive sink pruned; kept={sorted(kept)}"
+
+
 def test_hybrid_lib_with_bin_still_filters(tmp_path):
     # A hybrid target (a real `fn main` bin + fuzz harnesses) keeps real structural
     # seeds, so the keep-all net does NOT fire and reachability still prunes — the
