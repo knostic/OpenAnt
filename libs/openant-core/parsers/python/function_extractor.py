@@ -237,44 +237,50 @@ class FunctionExtractor:
                 for a in node.names:
                     if a.name in self._ROUTER_CTORS and a.asname:
                         ctor_names.add(a.asname)
-        for node in ast.walk(tree):
-            targets, value = [], None
-            if isinstance(node, ast.Assign):
-                targets, value = node.targets, node.value
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                targets, value = [node.target], node.value
-            if not (isinstance(value, ast.Call)):
-                continue
-            f = value.func
-            ctor = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
-            if ctor in ctor_names:
-                for t in targets:
-                    if isinstance(t, ast.Name):
-                        names.add(t.id.lower())
-        # Alias propagation (B-FN-02): `r = <known router>` (plain OR annotated
-        # `r: T = <known router>`) makes `r` a router too. Build the Name->targets
-        # alias-edge map in ONE pass, then BFS from the ctor-bound routers over it
-        # (O(V+E)) -- not a per-round full-AST re-walk, which was O(n^2) on long
-        # alias chains (a DoS risk on untrusted scanned repos). Pure recall: a
-        # non-router RHS is never a BFS source, so `r = cache` is not promoted.
-        # (KNOWN over-seed, reachability-safe & documented: names are `.lower()`d
-        # to match the lowercased decorator string, so two vars differing only in
-        # case -- `APP=FastAPI()` + `app=cache` -- collide; contrived, and an
-        # over-seed only mislabels a non-route AS reachable, never drops a route.)
-        alias_edges = {}
+        # Collect (target_name, value) bindings from every LOCAL binding form:
+        # plain Assign (incl. multi-target `a = b = ...`), AnnAssign, and walrus
+        # NamedExpr (`(r := ...)`) anywhere. For a value that is itself a walrus
+        # (`x = (y := r)`) the outer target binds to the walrus's inner value, so
+        # both x and y alias r. (Interprocedural forms -- factory returns, imported
+        # routers, attribute targets `self.router` -- stay documented FN limits.)
+        bindings = []   # list[(name_lower, value_node)]
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign):
-                a_targets, a_value = node.targets, node.value
+                pairs = [(t, node.value) for t in node.targets]
             elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                a_targets, a_value = [node.target], node.value
+                pairs = [(node.target, node.value)]
+            elif isinstance(node, ast.NamedExpr):
+                pairs = [(node.target, node.value)]
             else:
                 continue
-            if not isinstance(a_value, ast.Name):
+            for tgt, val in pairs:
+                while isinstance(val, ast.NamedExpr):   # unwrap x = (y := r)
+                    val = val.value
+                if isinstance(tgt, ast.Name):
+                    bindings.append((tgt.id.lower(), val))
+        # Ctor-bound routers: `name = <RouterCtor>()` (bare or attribute-qualified
+        # like `web.RouteTableDef()`), across all binding forms above.
+        for name, val in bindings:
+            if not isinstance(val, ast.Call):
                 continue
-            src_name = a_value.id.lower()
-            for t in a_targets:
-                if isinstance(t, ast.Name):
-                    alias_edges.setdefault(src_name, set()).add(t.id.lower())
+            f = val.func
+            ctor = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+            if ctor in ctor_names:
+                names.add(name)
+        # Alias propagation (B-FN-02): `r = <known router>` (plain, annotated, or
+        # walrus) makes `r` a router too. Build the Name->targets alias-edge map in
+        # ONE pass, then BFS from the ctor-bound routers over it (O(V+E)) -- not a
+        # per-round full-AST re-walk, which was O(n^2) on long alias chains (a DoS
+        # risk on untrusted scanned repos). Pure recall: a non-router RHS is never a
+        # BFS source, so `r = cache` is not promoted.
+        # (KNOWN over-seed, reachability-safe & documented: names are `.lower()`d to
+        # match the lowercased decorator string, so two vars differing only in case
+        # -- `APP=FastAPI()` + `app=cache` -- collide; contrived, and an over-seed
+        # only mislabels a non-route AS reachable, never drops a route.)
+        alias_edges = {}
+        for name, val in bindings:
+            if isinstance(val, ast.Name):
+                alias_edges.setdefault(val.id.lower(), set()).add(name)
         frontier = list(names)
         while frontier:
             src_name = frontier.pop()

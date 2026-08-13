@@ -97,3 +97,20 @@ def test_deep_alias_chain_resolves():
 ])
 def test_declared_ctor_and_verb_coverage(src):
     assert _unit_type(src, "handler") == "route_handler"
+
+
+# ---- F-R2-1 (re-exam round 2): walrus (NamedExpr) binding forms --------------
+@pytest.mark.parametrize("src", [
+    # router constructed by a walrus
+    "from fastapi import APIRouter\nif (r := APIRouter()):\n    pass\n@r.get('/x')\ndef handler(): pass\n",
+    # alias THROUGH a walrus: x = (y := admin) -> both x and y alias admin
+    "from fastapi import APIRouter\nadmin = APIRouter()\nx = (y := admin)\n@y.get('/x')\ndef handler(): pass\n",
+])
+def test_walrus_bound_router_is_route_handler(src):
+    assert _unit_type(src, "handler") == "route_handler"
+
+
+def test_walrus_bound_nonrouter_is_not_route_handler():
+    # walrus binding a NON-router must NOT be promoted
+    src = "d = (r := dict())\n@r.get('/x')\ndef helper(): pass\n"
+    assert _unit_type(src, "helper") != "route_handler"
