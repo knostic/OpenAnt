@@ -251,21 +251,37 @@ class FunctionExtractor:
                 for t in targets:
                     if isinstance(t, ast.Name):
                         names.add(t.id.lower())
-        # Alias propagation (B-FN-02): `r = <known router var>` makes `r` a
-        # router too. Fixpoint over simple Name = Name assignments whose RHS is
-        # already a router. Pure recall: a non-router RHS is never in `names`,
-        # so `r = cache` is not promoted.
-        changed = True
-        while changed:
-            changed = False
-            for node in ast.walk(tree):
-                if (isinstance(node, ast.Assign)
-                        and isinstance(node.value, ast.Name)
-                        and node.value.id.lower() in names):
-                    for t in node.targets:
-                        if isinstance(t, ast.Name) and t.id.lower() not in names:
-                            names.add(t.id.lower())
-                            changed = True
+        # Alias propagation (B-FN-02): `r = <known router>` (plain OR annotated
+        # `r: T = <known router>`) makes `r` a router too. Build the Name->targets
+        # alias-edge map in ONE pass, then BFS from the ctor-bound routers over it
+        # (O(V+E)) -- not a per-round full-AST re-walk, which was O(n^2) on long
+        # alias chains (a DoS risk on untrusted scanned repos). Pure recall: a
+        # non-router RHS is never a BFS source, so `r = cache` is not promoted.
+        # (KNOWN over-seed, reachability-safe & documented: names are `.lower()`d
+        # to match the lowercased decorator string, so two vars differing only in
+        # case -- `APP=FastAPI()` + `app=cache` -- collide; contrived, and an
+        # over-seed only mislabels a non-route AS reachable, never drops a route.)
+        alias_edges = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                a_targets, a_value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                a_targets, a_value = [node.target], node.value
+            else:
+                continue
+            if not isinstance(a_value, ast.Name):
+                continue
+            src_name = a_value.id.lower()
+            for t in a_targets:
+                if isinstance(t, ast.Name):
+                    alias_edges.setdefault(src_name, set()).add(t.id.lower())
+        frontier = list(names)
+        while frontier:
+            src_name = frontier.pop()
+            for tgt in alias_edges.get(src_name, ()):
+                if tgt not in names:
+                    names.add(tgt)
+                    frontier.append(tgt)
         return frozenset(names)
 
     def _router_vars_for(self, file_path: str, content: str) -> frozenset:
