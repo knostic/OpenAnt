@@ -95,3 +95,39 @@ def test_base_path_qualified_libfuzzer_still_seeded(tmp_path):
     cg = _one(tmp_path,
               "libfuzzer_sys::fuzz_target!(|data: &[u8]| { let _ = Frame::decode(data); });\n")
     assert len(_harness_ids(cg)) == 1, "base libfuzzer_sys::fuzz_target! regressed"
+
+
+# --- AFL brought into bare macro scope (classic afl.rs forms) ---
+
+def test_afl_macro_use_extern_crate_is_seeded(tmp_path):
+    # The classic afl.rs README form: `#[macro_use] extern crate afl;` brings
+    # `fuzz!` into bare scope.
+    cg = _one(tmp_path,
+              "#[macro_use] extern crate afl;\n"
+              "fn main() { fuzz!(|data: &[u8]| { let _ = Frame::decode(data); }); }\n")
+    assert len(_harness_ids(cg)) == 1, "`#[macro_use] extern crate afl` harness not seeded"
+
+
+def test_afl_glob_import_is_seeded(tmp_path):
+    cg = _one(tmp_path,
+              "use afl::*;\n"
+              "fuzz!(|data: &[u8]| { let _ = Frame::decode(data); });\n")
+    assert len(_harness_ids(cg)) == 1, "`use afl::*; fuzz!` harness not seeded"
+
+
+def test_plain_extern_crate_afl_without_macro_use_is_not_seeded(tmp_path):
+    # `extern crate afl;` WITHOUT `#[macro_use]` does NOT bring the macro into
+    # scope (edition-2015 rule) — a bare `fuzz!` must not be recognized.
+    cg = _one(tmp_path,
+              "extern crate afl;\n"
+              "fn main() { fuzz!(|data: &[u8]| { let _ = Frame::decode(data); }); }\n")
+    assert len(_harness_ids(cg)) == 0, "over-matched `fuzz!` under plain `extern crate afl`"
+
+
+def test_afl_non_macro_import_does_not_scope_fuzz(tmp_path):
+    # Importing a specific non-macro item from afl does NOT bring `fuzz!` into
+    # scope; a coincidental bare `fuzz!` must not be recognized.
+    cg = _one(tmp_path,
+              "use afl::Corpus;\n"
+              "fuzz!(some, args);\n")
+    assert len(_harness_ids(cg)) == 0, "over-matched a bare `fuzz!` on a non-macro afl import"

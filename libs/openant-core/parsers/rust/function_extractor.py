@@ -307,6 +307,22 @@ class FunctionExtractor:
                     pending_attrs = []
                     continue
 
+                if t == "extern_crate_declaration":
+                    # `#[macro_use] extern crate afl;` (classic afl.rs form)
+                    # brings the crate's macros into bare scope. Record the crate
+                    # only when #[macro_use] is present (plain `extern crate` does
+                    # NOT scope the macros).
+                    if any("macro_use" in a for a in pending_attrs):
+                        cname = next((_text(c, source) for c in child.children
+                                      if c.type == "identifier"), None)
+                        if cname:
+                            imports_local.append({
+                                "kind": "extern_macro_use", "crate": cname,
+                                "leaf": None, "alias": None,
+                            })
+                    pending_attrs = []
+                    continue
+
                 if t == "mod_item":
                     self._handle_mod(
                         child, source, file_path, functions, classes,
@@ -697,7 +713,27 @@ class FunctionExtractor:
             crate, macro_name = self._resolve_macro_origin(text, imports_local)
         if macro_name in self._FUZZ_MACRO_NAMES:
             return True
-        return (crate, macro_name) == self._AFL_FUZZ
+        if (crate, macro_name) == self._AFL_FUZZ:
+            return True
+        # AFL brought into bare macro scope via `#[macro_use] extern crate afl`
+        # or `use afl::*`: an otherwise-unresolved bare `fuzz!` is then afl's
+        # harness macro. Gated on afl provenance so a generic `fuzz!` in a file
+        # that doesn't scope afl's macros is NOT matched.
+        if (crate is None and macro_name == "fuzz"
+                and self._afl_in_macro_scope(imports_local)):
+            return True
+        return False
+
+    def _afl_in_macro_scope(self, imports_local: List[dict]) -> bool:
+        """True if the file brings AFL's macros into bare scope, via
+        ``#[macro_use] extern crate afl`` or a ``use afl::*`` glob."""
+        for imp in imports_local:
+            kind = imp.get("kind")
+            if kind == "extern_macro_use" and imp.get("crate") == "afl":
+                return True
+            if kind == "use_glob" and (imp.get("path") or "").split("::")[0] == "afl":
+                return True
+        return False
 
     def _handle_fuzz_target(
         self, node: Node, source: bytes, file_path: str,
@@ -881,7 +917,18 @@ class FunctionExtractor:
         if target is None:
             return
         for path_segs, leaf, alias in self._flatten_use_node(target, source, ()):
-            if leaf == "*" or not leaf:
+            if not leaf:
+                continue
+            if leaf == "*":
+                # A glob `use crate::*` is not resolvable to a specific symbol,
+                # but it DOES bring the crate's macros into bare scope — recorded
+                # (kind=use_glob) so fuzz-harness recognition can see `use afl::*`.
+                imports_local.append({
+                    "kind": "use_glob",
+                    "path": "::".join(path_segs),
+                    "leaf": None,
+                    "alias": None,
+                })
                 continue
             imports_local.append({
                 "kind": "use",
@@ -942,6 +989,20 @@ class FunctionExtractor:
                     results.extend(self._flatten_use_node(child, source, prefix))
             return results
         if t == "use_wildcard":
+            # `path::*` — recover the path prefix from the wildcard's own path
+            # child (e.g. `use afl::*` -> prefix ('afl',)) so a glob import records
+            # its crate. Previously the prefix was dropped (wildcards were skipped
+            # by the caller, so it never mattered).
+            path_child = next(
+                (c for c in node.children
+                 if c.type in ("identifier", "scoped_identifier",
+                               "crate", "self", "super")),
+                None,
+            )
+            if path_child is not None:
+                sub = self._flatten_use_node(path_child, source, prefix)
+                base = sub[0][0] if sub else prefix
+                return [(base, "*", None)]
             return [(prefix, "*", None)]
         return []
 
