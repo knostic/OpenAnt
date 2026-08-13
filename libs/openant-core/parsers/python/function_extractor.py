@@ -208,6 +208,94 @@ class FunctionExtractor:
         segments = {s.lower() for s in p.with_suffix('').parts}
         return token.lower() in segments
 
+    # Constructors whose returned object is a route-registering router/app. A
+    # module-level `name = <one of these>()` makes `@name.<verb>(...)` a route.
+    _ROUTER_CTORS = frozenset({
+        "APIRouter", "FastAPI", "Starlette",   # FastAPI / Starlette
+        "Blueprint", "Flask",            # Flask
+        "RouteTableDef",                 # aiohttp (`web.RouteTableDef()`)
+    })
+
+    def _collect_router_vars(self, content: str) -> frozenset:
+        """Lowercased names of module variables bound to a router/app constructor.
+
+        Receiver identity — not path syntax — is the correct route signal (a
+        `@cache.get("/k")` cache decorator has a slash-path too). Handles bare and
+        attribute-qualified constructors (`APIRouter()`, `web.RouteTableDef()`),
+        plain and annotated assignments, and multiple targets.
+        """
+        names = set()
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return frozenset()
+        # Local names that resolve to a router ctor, incl. import aliases
+        # (`from fastapi import APIRouter as AR` -> `AR` is a router ctor).
+        ctor_names = set(self._ROUTER_CTORS)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    if a.name in self._ROUTER_CTORS and a.asname:
+                        ctor_names.add(a.asname)
+        # Collect (target_name, value) bindings from every LOCAL binding form:
+        # plain Assign (incl. multi-target `a = b = ...`), AnnAssign, and walrus
+        # NamedExpr (`(r := ...)`) anywhere. For a value that is itself a walrus
+        # (`x = (y := r)`) the outer target binds to the walrus's inner value, so
+        # both x and y alias r. (Interprocedural forms -- factory returns, imported
+        # routers, attribute targets `self.router` -- stay documented FN limits.)
+        bindings = []   # list[(name_lower, value_node)]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                pairs = [(t, node.value) for t in node.targets]
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                pairs = [(node.target, node.value)]
+            elif isinstance(node, ast.NamedExpr):
+                pairs = [(node.target, node.value)]
+            else:
+                continue
+            for tgt, val in pairs:
+                while isinstance(val, ast.NamedExpr):   # unwrap x = (y := r)
+                    val = val.value
+                if isinstance(tgt, ast.Name):
+                    bindings.append((tgt.id.lower(), val))
+        # Ctor-bound routers: `name = <RouterCtor>()` (bare or attribute-qualified
+        # like `web.RouteTableDef()`), across all binding forms above.
+        for name, val in bindings:
+            if not isinstance(val, ast.Call):
+                continue
+            f = val.func
+            ctor = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+            if ctor in ctor_names:
+                names.add(name)
+        # Alias propagation (B-FN-02): `r = <known router>` (plain, annotated, or
+        # walrus) makes `r` a router too. Build the Name->targets alias-edge map in
+        # ONE pass, then BFS from the ctor-bound routers over it (O(V+E)) -- not a
+        # per-round full-AST re-walk, which was O(n^2) on long alias chains (a DoS
+        # risk on untrusted scanned repos). Pure recall: a non-router RHS is never a
+        # BFS source, so `r = cache` is not promoted.
+        # (KNOWN over-seed, reachability-safe & documented: names are `.lower()`d to
+        # match the lowercased decorator string, so two vars differing only in case
+        # -- `APP=FastAPI()` + `app=cache` -- collide; contrived, and an over-seed
+        # only mislabels a non-route AS reachable, never drops a route.)
+        alias_edges = {}
+        for name, val in bindings:
+            if isinstance(val, ast.Name):
+                alias_edges.setdefault(val.id.lower(), set()).add(name)
+        frontier = list(names)
+        while frontier:
+            src_name = frontier.pop()
+            for tgt in alias_edges.get(src_name, ()):
+                if tgt not in names:
+                    names.add(tgt)
+                    frontier.append(tgt)
+        return frozenset(names)
+
+    def _router_vars_for(self, file_path: str, content: str) -> frozenset:
+        cache = self.__dict__.setdefault("_router_var_cache", {})
+        if file_path not in cache:
+            cache[file_path] = self._collect_router_vars(content)
+        return cache[file_path]
+
     def classify_function(self, func_name: str, decorators: List[str],
                           class_name: Optional[str], file_path: str) -> str:
         """Classify a function by its type/purpose."""
@@ -232,6 +320,16 @@ class FunctionExtractor:
         # receiver is a route. This is ADDED alongside (never replaces) those checks;
         # over-approximating a route is reachability-safe.
         if re.search(r'@(api|v1|router)\.\w', dec_str):
+            return 'route_handler'
+        # FIX (silent-FN, precise): a decorator `@<var>.<httpverb>(` is a route ONLY when
+        # <var> is a known router INSTANCE (`admin = APIRouter()`, `auth = Blueprint()`,
+        # `v2 = FastAPI()`, `routes = web.RouteTableDef()`, ...) collected per-file from the
+        # module AST. This catches custom-named routers the fixed allowlist above misses
+        # (the silent reachability false-negative) WITHOUT the over-match a bare
+        # `@\w+.<verb>(` regex causes (e.g. `@cache.get(...)` on a non-router object, which
+        # would mislabel a cache helper as an attacker-facing route and mis-prime the LLM).
+        m = re.search(r'@(\w+)\.(get|post|put|delete|patch|options|head|websocket_route|websocket|route|api_route)\s*\(', dec_str)
+        if m and m.group(1) in getattr(self, '_active_router_vars', frozenset()):
             return 'route_handler'
         # F4 additive: aiohttp RouteTableDef — `routes = web.RouteTableDef()` then
         # `@routes.get(...)` / `@routes.post(...)` / `@routes.view(...)` / `@routes.route(...)`.
@@ -607,6 +705,9 @@ class FunctionExtractor:
         docstring = self.get_docstring(node)
         code = self.get_source_segment(content, node)
         is_async = isinstance(node, ast.AsyncFunctionDef)
+        # Router-instance set for THIS file drives precise route classification
+        # (`@<router_var>.<verb>(` -> route_handler; a non-router receiver does not).
+        self._active_router_vars = self._router_vars_for(file_path, content)
         unit_type = self.classify_function(func_name, decorators, class_name, relative_path)
 
         # The captured `code` (get_source_segment) includes any decorator lines,
