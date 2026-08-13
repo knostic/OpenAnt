@@ -466,6 +466,9 @@ def build_pipeline_output(
             "vulnerable": metrics.get("vulnerable", 0) + metrics.get("bypassable", 0),
             "safe": metrics.get("safe", 0) + metrics.get("protected", 0),
             "inconclusive": metrics.get("inconclusive", 0),
+            # F13: errored units are part of `total` (see units_analyzed above), so the
+            # results buckets must include them or they cannot reconcile to `total`.
+            "errors": metrics.get("errors", 0),
             "total": total_units,
         },
         "findings": findings_data,
