@@ -138,22 +138,26 @@ def _require_llm_provider() -> None:
     resolved.
 
     Delegates entirely to ``utilities.autopatcher.llm_client``'s
-    authoritative resolver (explicit ``LLM_PROVIDER``, OpenAnt's configured
-    ``default_llm.analyze`` binding, or interactive selection) rather than
+    authoritative resolver -- OpenAnt's canonical ``default_llm.analyze``
+    binding (falling back to the built-in ``openant-default``, exactly
+    like every other OpenAnt command), or the explicit
+    ``LLM_PROVIDER=mock`` test/research escape hatch -- rather than
     re-implementing any part of that resolution here. This function's only
     remaining job is to invoke that check EARLY -- before file I/O, an NVD
     fetch, or investigation-directory creation -- for the same fail-fast
-    UX the old env-only check provided. It used to check only
-    ``os.environ.get("LLM_PROVIDER")`` directly, which incorrectly
-    rejected a valid config-only run (a real live acceptance test with a
-    configured ``default_llm.analyze`` binding and every LLM env var
-    unset) before the authoritative resolver ever got a chance to approve
-    it.
+    UX an env-only check used to provide, back when ``LLM_PROVIDER`` was
+    itself the real-provider selector. It no longer is: real-provider
+    selection now comes ONLY from OpenAnt's canonical configuration, and a
+    non-mock ``LLM_PROVIDER``/``LLM_MODEL`` value is a hard failure, not an
+    override -- see ``llm_client._resolve_active_provider``/``_resolve_model``.
 
     Raises:
-        RuntimeError: no explicit provider and no valid OpenAnt config
-            binding (non-interactive), or an unrecognized explicit
-            provider. Never silently degrades to mock -- see
+        ConfigError: OpenAnt's config.json is malformed, or ``default_llm``
+            names a config that doesn't exist -- the identical failure
+            canonical OpenAnt commands raise for the same problem.
+        RuntimeError: a non-mock ``LLM_PROVIDER``/``LLM_MODEL`` value was
+            set, or no usable credential exists for the resolved provider.
+            Never silently degrades to mock -- see
             ``llm_client.ensure_provider_configured`` for the exact
             precedence and fail-closed guarantee.
     """
@@ -195,13 +199,16 @@ def _run_engine_and_write_artifacts(
     context acquisition is unchanged.
 
     Raises:
-        RuntimeError: if no LLM provider can be resolved -- no explicit
-            LLM_PROVIDER and no valid OpenAnt config binding (see
-            _require_llm_provider). (Also checked by run_patch() itself
-            before this is reached, preserving its exact existing
-            error-ordering relative to the pipeline_output-not-found check;
-            checked again here so run_patch_cve(), which has no equivalent
-            earlier check, still gets the guarantee.)
+        ConfigError: OpenAnt's config.json is malformed, or ``default_llm``
+            names a config that doesn't exist (see _require_llm_provider).
+        RuntimeError: no usable credential exists for the resolved
+            provider, or a non-mock ``LLM_PROVIDER``/``LLM_MODEL`` value
+            was set (see _require_llm_provider). (Also checked by
+            run_patch() itself before this is reached, preserving its
+            exact existing error-ordering relative to the
+            pipeline_output-not-found check; checked again here so
+            run_patch_cve(), which has no equivalent earlier check, still
+            gets the guarantee.)
     """
     _require_llm_provider()
 
@@ -254,11 +261,19 @@ def _run_engine_and_write_artifacts(
         budget_controller=budget_controller,
     )
 
-    provider = _llm._cached_provider or os.environ.get("LLM_PROVIDER", "unknown")
-    if provider and provider != "unknown":
-        model = _llm._cached_model.get(provider, "unknown")
-    else:
-        model = "unknown"
+    # The provider is already authoritatively resolved by this point --
+    # _require_llm_provider() (above) ran the canonical resolver before any
+    # pipeline work started, and _run_pipeline() has since completed
+    # successfully, so llm_client's own session cache is the single source
+    # of truth here. Deliberately does NOT re-read LLM_PROVIDER from the
+    # environment: that variable is no longer a provider-selection
+    # mechanism (see llm_client's module docstring), and re-reading it for
+    # display could report a provider Auto Patcher never actually
+    # resolved/used. "unknown" is a defensive literal for the
+    # near-impossible case of a still-empty cache, never a fallback to a
+    # second, independent source of provider identity.
+    provider = _llm._cached_provider or "unknown"
+    model = _llm._cached_model.get(provider, "unknown") if provider != "unknown" else "unknown"
     if provider == "mock":
         model = "mock"
 
@@ -315,13 +330,16 @@ def run_patch(
     """Generate and evaluate a candidate remediation for one finding.
 
     Requires an LLM provider to be resolvable before any pipeline work
-    starts -- either an explicit LLM_PROVIDER env var, or a valid OpenAnt
-    ``default_llm.analyze`` config binding (see
+    starts -- OpenAnt's canonical ``default_llm.analyze`` config binding,
+    falling back to the built-in ``openant-default`` exactly like every
+    other OpenAnt command (see
     utilities.autopatcher.llm_client.ensure_provider_configured for the
-    exact precedence). An OpenAnt-triggered, non-interactive run with
-    neither must never silently produce a mock Trust Report that looks
-    real -- it fails clearly instead. LLM_PROVIDER=mock remains allowed;
-    it just must have been explicitly chosen.
+    exact precedence). A run with an unresolvable/invalid config must
+    never silently produce a mock Trust Report that looks real -- it fails
+    clearly instead. LLM_PROVIDER=mock remains allowed as an explicit
+    test/research escape hatch; it is the ONLY value LLM_PROVIDER is still
+    read for -- any other non-empty value is itself a hard failure now,
+    never a real-provider selector.
 
     Writes two artifacts under ``{output_dir}/patch/``:
         {finding_id}-vulnerability.md  -- the rendered input (for transparency)

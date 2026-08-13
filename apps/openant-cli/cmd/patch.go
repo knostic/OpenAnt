@@ -29,9 +29,11 @@ advisory, not an OpenAnt Finding, and that advisory claims are not
 repository-verified facts.
 
 Requires a resolvable LLM provider so a run never silently falls back to a
-mock LLM: either LLM_PROVIDER set explicitly (e.g. LLM_PROVIDER=anthropic),
-or a valid default_llm.analyze binding configured via 'openant setup llm'.
-Set LLM_PROVIDER=mock only if you intentionally want a mock run.
+mock LLM: configure one via 'openant setup llm' -- Auto Patcher inherits
+the active config's 'analyze' phase binding, exactly like every other
+OpenAnt command. Set LLM_PROVIDER=mock only if you intentionally want a
+mock run; LLM_PROVIDER/LLM_MODEL are not a supported way to select a real
+provider or model.
 
 If no path is given for --finding-id, the active project's
 pipeline_output.json is used. --cve requires --repo-root, which defaults to
@@ -166,14 +168,6 @@ func runPatchFinding(args []string, budget contextBudgetFlags) {
 		repoRoot = ctx.RepoPath
 	}
 
-	// Resolved before ensurePython() so a missing/declined provider fails
-	// fast, without paying for a venv/dependency bootstrap first.
-	llmEnv, err := resolvePatchLLMEnv()
-	if err != nil {
-		output.PrintError(err.Error())
-		os.Exit(2)
-	}
-
 	rt, err := ensurePython()
 	if err != nil {
 		output.PrintError(err.Error())
@@ -182,19 +176,14 @@ func runPatchFinding(args []string, budget contextBudgetFlags) {
 
 	pyArgs := buildPatchPyArgs(pipelineOutputPath, patchFindingID, repoRoot, outputDir, budget)
 
-	// Auto Patcher's LLM provider selection is driven by LLM_PROVIDER /
-	// OPENAI_API_KEY / ANTHROPIC_API_KEY, not OpenAnt's own --api-key, so no
-	// legacy API key is forwarded here. llmEnv carries only what
-	// resolvePatchLLMEnv resolved (explicit env passthrough needs nothing
-	// added; interactive selection adds LLM_PROVIDER + the chosen provider's
-	// key) into the Python subprocess's environment only -- Go never copies a
-	// config.json-stored credential into extraEnv on the explicit-provider
-	// path. Python's utilities.llm.resolve_provider() reads the SAME
-	// config.json's llm_providers entry itself once the subprocess starts
-	// (see validateExplicitPatchProvider), so a credential configured via
-	// `openant setup llm` reaches Auto Patcher without ever passing through
-	// this env map.
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, "", llmEnv)
+	// LLM provider/model selection and credential resolution are entirely
+	// OpenAnt's canonical LLM configuration, resolved by the Python Auto
+	// Patcher engine (utilities.autopatcher.llm_client) -- Go performs no
+	// preflight of its own here and forwards no extra env. The subprocess
+	// already inherits this process's own environment (os.Environ()) via
+	// python.Invoke, so an explicit LLM_PROVIDER=mock test/research
+	// override still reaches Python unchanged with nothing computed here.
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, "", nil)
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)
@@ -237,14 +226,6 @@ func runPatchCVE(args []string, budget contextBudgetFlags) {
 		outputDir = ctx.ScanDir
 	}
 
-	// Resolved before ensurePython() so a missing/declined provider fails
-	// fast, without paying for a venv/dependency bootstrap first.
-	llmEnv, err := resolvePatchLLMEnv()
-	if err != nil {
-		output.PrintError(err.Error())
-		os.Exit(2)
-	}
-
 	rt, err := ensurePython()
 	if err != nil {
 		output.PrintError(err.Error())
@@ -253,13 +234,9 @@ func runPatchCVE(args []string, budget contextBudgetFlags) {
 
 	pyArgs := buildPatchCVEPyArgs(patchCVE, repoRoot, outputDir, budget)
 
-	// Same deliberate omission as Finding mode: provider *selection* is
-	// LLM_PROVIDER / OPENAI_API_KEY / ANTHROPIC_API_KEY, never OpenAnt's own
-	// --api-key. llmEnv carries only what resolvePatchLLMEnv resolved into
-	// the Python subprocess's environment -- see runPatchFinding's matching
-	// comment for why a config.json-stored credential still reaches Python
-	// without appearing here.
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, "", llmEnv)
+	// Same deliberate omission as Finding mode -- see runPatchFinding's
+	// matching comment: no Go-side LLM preflight, no extra env forwarded.
+	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, "", nil)
 	if err != nil {
 		output.PrintError(err.Error())
 		os.Exit(2)

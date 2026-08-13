@@ -246,10 +246,23 @@ def test_run_patch_mock_mode_is_self_disclosing(tmp_path, monkeypatch):
 
 
 def test_run_patch_requires_llm_provider(tmp_path, monkeypatch):
+    """No credential anywhere for the canonically-resolved provider --
+    must fail clearly before any pipeline work. Uses OpenAI so the
+    failure is guaranteed at the eager _require_llm_provider() preflight
+    (see the module-level comment above for why Anthropic's construction-
+    time leniency makes it a worse choice for this specific test)."""
+    import utilities.autopatcher.llm_client as llm_client
+    from utilities.llm import PHASES, ConfigFile, LLMConfig, PhaseRef
+
+    phases = {p: PhaseRef(provider="openai", model="gpt-test-model") for p in PHASES}
+    cf = ConfigFile(default_llm="test-config", llm_configs={"test-config": LLMConfig(name="test-config", phases=phases)})
+
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     po_path = _write_pipeline_output(tmp_path, [FIXTURE_FINDING_ELIGIBLE])
 
-    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+    with pytest.raises(RuntimeError, match="No usable credential for provider 'openai'"):
         run_patch(po_path, "F-001", str(tmp_path), repo_root=None)
 
 
@@ -340,9 +353,13 @@ def _config_with_valid_analyze_binding():
     )
 
 
-def test_require_llm_provider_does_not_raise_when_set(monkeypatch):
+def test_require_llm_provider_raises_for_real_provider_value(monkeypatch):
+    """LLM_PROVIDER is no longer a supported way to select a real provider
+    -- this must fail at the SAME early preflight point it used to
+    succeed at, not just deeper inside call_llm()."""
     monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    _require_llm_provider()  # must not raise
+    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+        _require_llm_provider()
 
 
 def test_require_llm_provider_does_not_raise_for_mock(monkeypatch):
@@ -350,20 +367,15 @@ def test_require_llm_provider_does_not_raise_for_mock(monkeypatch):
     _require_llm_provider()  # must not raise
 
 
-def test_require_llm_provider_raises_when_unset(monkeypatch):
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
-    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
-        _require_llm_provider()
-
-
 def test_require_llm_provider_does_not_raise_for_config_only_binding(monkeypatch):
-    """Regression test for the exact live failure: all LLM env vars unset
-    (LLM_PROVIDER, LLM_MODEL, ANTHROPIC_API_KEY, OPENAI_API_KEY), but a
-    valid default_llm.analyze binding exists in OpenAnt's config --
-    _require_llm_provider() must NOT reject this; it must let the run
-    reach the authoritative LLM resolution/engine boundary rather than
-    blocking it with a stale env-only check. No live Anthropic request is
-    made -- this only proves the preflight gets out of the way."""
+    """All LLM env vars unset (LLM_PROVIDER, LLM_MODEL, ANTHROPIC_API_KEY,
+    OPENAI_API_KEY), but a valid default_llm.analyze binding -- with a
+    configured credential -- exists in OpenAnt's config: _require_llm_provider()
+    must resolve AND validate the credential (eagerly building the shared
+    adapter) rather than only checking that a provider name resolved, so a
+    real, but unconfigured, run still fails before pipeline work rather
+    than mid-run. No live Anthropic request is made -- adapter
+    construction alone proves the preflight gets out of the way."""
     import utilities.autopatcher.llm_client as llm_client
 
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
@@ -372,34 +384,48 @@ def test_require_llm_provider_does_not_raise_for_config_only_binding(monkeypatch
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(llm_client, "load_config_file", _config_with_valid_analyze_binding)
 
-    _require_llm_provider()  # must not raise
+    _require_llm_provider()  # must not raise -- config supplies a real credential
 
 
-def test_require_llm_provider_raises_when_nothing_configured_never_mock(monkeypatch, capsys):
-    """No env provider AND no valid explicit default config -> fail
-    clearly. Must never become mock."""
+def test_require_llm_provider_raises_when_no_credential_available_never_mock(monkeypatch, capsys):
+    """A config resolves a provider (as it always does now, via the
+    default_llm/openant-default binding), but no credential is available
+    anywhere for it -- must fail clearly, before any pipeline work, never
+    mock. Uses OpenAI: unlike Anthropic's SDK (which constructs
+    successfully with no key and only rejects the request later), OpenAI's
+    canonical resolve_provider() raises immediately when no llm_providers
+    entry exists, so this failure is guaranteed to surface at THIS eager
+    preflight step -- see test_llm_client.py's
+    test_anthropic_missing_credential_raises_clearly_never_mock for the
+    Anthropic-specific case, which surfaces later, at the first real
+    call_llm()."""
     import utilities.autopatcher.llm_client as llm_client
-    from utilities.llm import empty_config
+    from utilities.llm import PHASES, ConfigFile, LLMConfig, PhaseRef
+
+    phases = {p: PhaseRef(provider="openai", model="gpt-test-model") for p in PHASES}
+    cf = ConfigFile(default_llm="test-config", llm_configs={"test-config": LLMConfig(name="test-config", phases=phases)})
 
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
-    monkeypatch.setattr(llm_client, "load_config_file", lambda: empty_config())
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
 
-    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+    with pytest.raises(RuntimeError, match="No usable credential for provider 'openai'"):
         _require_llm_provider()
     assert "mock" not in capsys.readouterr().err.lower()
 
 
 def test_require_llm_provider_raises_for_invalid_default_llm_reference(monkeypatch):
     """An invalid/dangling default_llm reference (names a config that was
-    never defined) must fail clearly, exactly like "nothing configured" --
-    never silently mock, never silently accepted as valid."""
+    never defined) must fail clearly -- the SAME ConfigError canonical
+    OpenAnt commands raise for the identical broken config -- never
+    silently mock, never silently accepted as valid."""
     import utilities.autopatcher.llm_client as llm_client
-    from utilities.llm import ConfigFile
+    from utilities.llm import ConfigError, ConfigFile
 
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.setattr(llm_client, "load_config_file", lambda: ConfigFile(default_llm="does-not-exist"))
 
-    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+    with pytest.raises(ConfigError, match="does-not-exist"):
         _require_llm_provider()
 
 

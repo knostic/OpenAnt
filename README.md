@@ -220,7 +220,7 @@ openant project switch <org/repo> # switch active project
 
 Auto Patcher exists to answer one question: **does this AI-generated patch deserve to be trusted?** Generating a candidate patch is only the first step. Auto Patcher focuses on producing the evidence humans need to decide whether that patch should be trusted and deployed.
 
-Given a specific finding from an OpenAnt scan, it generates a candidate patch and then subjects that patch to independent, adversarial scrutiny, producing a Trust Report that states whether the patch is fit to deploy — backed by the evidence behind that call. It does not autofix your repository: the patch and its Trust Report are written to disk for a human to review, and the target repository is never modified.
+Given a known CVE or a specific finding from an OpenAnt scan, it generates a candidate patch and then subjects that patch to independent, adversarial scrutiny, producing a Trust Report that states whether the patch is fit to deploy — backed by the evidence behind that call. It does not autofix your repository: the patch and its Trust Report are written to disk for a human to review, and the target repository is never modified.
 
 ### Why AI-generated patches can't be trusted at face value
 
@@ -254,36 +254,81 @@ The adversarial pass is a distinct reasoning step whose only job is to argue the
 
 ### Quick start
 
-Auto Patcher runs against a finding already produced by an OpenAnt scan (`openant scan` / `openant build-output`) whose verdict is patch-eligible — `confirmed`, `agreed`, `vulnerable`, or `bypassable`.
+Check out the repository revision you want patched, then point `patch` at it with a CVE:
 
-To find an eligible finding's id, check the `findings` array in your project's `pipeline_output.json` (written by `openant build-output`) — the snippet below requires [`jq`](https://jqlang.org/):
+```bash
+git clone <repository-url> /tmp/the-repo-to-patch
+cd /tmp/the-repo-to-patch
+git checkout <version-or-tag-to-patch>
+
+openant patch \
+  --cve <CVE-ID> \
+  --repo-root /tmp/the-repo-to-patch \
+  --output /tmp/patch-report
+```
+
+Auto Patcher's LLM provider and model come from OpenAnt's own configuration, not a separate system: run `openant setup llm` once, and every `openant patch` run inherits that config's `analyze` phase provider/model automatically — including the built-in default if you've never run the wizard (e.g. after `openant set-api-key`). There's no provider or model picker specific to Auto Patcher; if the configuration is missing or unusable, the run fails clearly and points you at `openant setup llm` rather than opening a menu. `LLM_PROVIDER=mock` remains available as an explicit way to run without a real provider, for testing/research.
+
+### Example
+
+```bash
+git clone https://github.com/urllib3/urllib3.git /tmp/urllib3-eval
+cd /tmp/urllib3-eval
+git checkout 2.0.5
+
+openant patch \
+  --cve CVE-2023-43804 \
+  --repo-root /tmp/urllib3-eval \
+  --output /tmp/urllib3-report
+```
+
+### Context budget
+
+Several pipeline stages (final-target slicing, pre-patch and post-patch source acquisition) share a fixed character budget for how much repository source they can pull in — this is a cap on repository text gathered from disk, not the LLM's context-window size or a token/dollar budget, and it's entirely optional. By default each stage starts with one 10,000-character window. `--context-budget-policy` controls whether a stage can be granted additional windows once it runs out:
+
+- `ask` — prompt before granting another window (the default for an interactive run).
+- `always` — grant windows automatically up to the cap, with no prompting (useful for CI / batch runs).
+- `never` — never extend; the original fixed-budget behavior (the default for a non-interactive run).
+
+Each granted window adds the same fixed size as the first (10K → 20K → 30K → …, never exponential), up to `--max-context-budget-windows` (default `10`, i.e. up to 100,000 characters per stage). Extending the budget only grants more source text to work from — it never bypasses applicability, source verification, or the Recommendation Policy.
+
+```bash
+openant patch \
+  --cve CVE-2023-43804 \
+  --repo-root /tmp/urllib3-eval \
+  --output /tmp/urllib3-report \
+  --context-budget-policy always \
+  --max-context-budget-windows 10
+```
+
+### Remediating a finding instead
+
+Auto Patcher can also remediate a finding already produced by an OpenAnt scan (`openant scan` / `openant build-output`), instead of a CVE. Pick a finding whose verdict is patch-eligible — `confirmed`, `agreed`, `vulnerable`, or `bypassable` — from the `findings` array in your project's `pipeline_output.json` (the snippet below requires [`jq`](https://jqlang.org/)):
 
 ```bash
 jq -r '.findings[] | "\(.id)\t\(.stage2_verdict // .stage1_verdict)"' pipeline_output.json
 ```
 
-Pick an id whose verdict is one of the four above, then pass it to `patch` (`VULN-001` below is a placeholder — use the id you found):
-
 ```bash
-LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... openant patch --finding-id VULN-001
+openant patch --finding-id VULN-001
 ```
-
-`LLM_PROVIDER` (`anthropic` or `openai`) and the matching API key must be set explicitly. This is configured independently of OpenAnt's own `--llm-config` system, and deliberately does not fall back to a mock LLM unless you ask for one.
 
 ### The Trust Report
 
-Each run writes two files under `patch/` in the project's scan directory:
+Each run writes two files under `patch/` in the project's scan directory, named after the input (a CVE id or a finding id):
 
-- `{finding-id}-vulnerability.md` — the finding as rendered into the input Auto Patcher worked from.
-- `{finding-id}-trust-report.md` — the Trust Report.
+- `{id}-vulnerability.md` — the input as rendered into what Auto Patcher worked from.
+- `{id}-trust-report.md` — the Trust Report.
 
-The Trust Report leads with a single recommendation — **Deploy After Validation**, **Deploy With Caution**, **Manual Review Required**, or **Do Not Apply** — followed by the evidence behind it: whether the patch applies to the repository, whether adversarial review turned up a remaining exploit path, whether tests already cover the affected code, and what deployment risk the change carries. Each item is marked as either a deterministic check or a heuristic judgment.
+If no final candidate patch could be produced, the report leads with **NO PATCH PRODUCED** — an execution outcome, not a recommendation. Otherwise, it leads with a single recommendation — **Deploy After Validation**, **Deploy With Caution**, **Manual Review Required**, or **Do Not Apply** — computed by a fixed decision policy, never an LLM's self-assessment. A Trust Signals table below it shows the evidence behind that call: whether the patch applies cleanly, whether its edited content was actually verified against the repository, whether adversarial review found it addresses the vulnerability, whether tests already cover the affected code, and what deployment risk it carries. Each signal is marked as either a deterministic check or a heuristic judgment, and a check that didn't run is reported as unverified, never as a quiet pass.
+
+A clean apply and passing hygiene checks mean the patch is well-formed — not that the vulnerability is fixed. Post-Patch Investigation re-checks the vulnerability's original code locations against the patched repository for evidence closer to that claim. When the input is a CVE, the report also flags that the advisory's own claims are unverified against the repository, and that the recommendation is based on evidence gathered against it — not the advisory's severity score.
 
 ### Known limitations
 
 - Auto Patcher is an early-stage capability — its own reports are labeled MVP output today.
 - Some evidence signals (impact analysis, existing-test discovery) currently run meaningfully only on Python codebases; on other languages they report as not applicable rather than being silently skipped.
-- Auto Patcher's LLM access supports Anthropic and OpenAI only; unlike `--llm-config`, it does not support Google.
+- Auto Patcher does not build the target repository or execute its test suite. Test availability means relevant existing tests were discovered, not that they were run or passed; suggested tests are recommendations for follow-up validation. Adding test suite run is part of the roadmap. 
 - This is a decision aid for a human reviewer, not a replacement for manual security review.
 
 ## Roadmap

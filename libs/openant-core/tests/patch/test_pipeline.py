@@ -20,6 +20,19 @@ PROMPTS_DIR = Path(_ap_pkg.__file__).parent / "prompts"
 EXAMPLES_DIR = Path(__file__).parent / "fixtures" / "examples"
 
 
+def _anthropic_config(analyze_model, name="test-config"):
+    """A ConfigFile whose default_llm points at a fully valid, explicitly
+    user-authored llm-config with the "analyze" phase bound to Anthropic
+    and the given model. Auto Patcher's real-provider resolution now comes
+    ONLY from configuration like this (or the built-in openant-default) --
+    never from LLM_PROVIDER/LLM_MODEL."""
+    from utilities.llm import ConfigFile, LLMConfig, PhaseRef, PHASES
+
+    phases = {p: PhaseRef(provider="anthropic", model="claude-sonnet-4-6") for p in PHASES}
+    phases["analyze"] = PhaseRef(provider="anthropic", model=analyze_model)
+    return ConfigFile(default_llm=name, llm_configs={name: LLMConfig(name=name, phases=phases)})
+
+
 # ---------------------------------------------------------------------------
 # llm_client
 # ---------------------------------------------------------------------------
@@ -95,15 +108,13 @@ class TestPipelineLLMModeLog:
     def test_live_mode_log_has_no_model_name(self, monkeypatch, capsys):
         # With Anthropic configured, the early log should say LIVE with no model.
         import utilities.autopatcher.llm_client as llm_client
-        from utilities.llm import CompletionResult, TextBlock, empty_config
+        from utilities.llm import CompletionResult, TextBlock
 
-        monkeypatch.setattr(llm_client, "load_config_file", lambda: empty_config())
+        monkeypatch.setattr(llm_client, "load_config_file", lambda: _anthropic_config("claude-test-model"))
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
         monkeypatch.setattr(llm_client, "_cached_provider", None)
-        monkeypatch.setattr(llm_client, "_cached_api_keys", {})
         monkeypatch.setattr(llm_client, "_cached_model", {})
         monkeypatch.setattr(llm_client, "_cached_adapters", {})
-        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-        monkeypatch.setenv("LLM_MODEL", "claude-test-model")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
 
         # Stub out the shared adapter (not the raw SDK) so the test stays
@@ -119,6 +130,14 @@ class TestPipelineLLMModeLog:
                 )
 
         monkeypatch.setattr(llm_client, "build_adapter", lambda provider_config: FakeAdapter())
+
+        # Mirrors core/patch.py's _require_llm_provider(), which always
+        # runs (and resolves/caches the provider) before pipeline.run() in
+        # production -- pipeline.run()'s own early "LLM mode" log reads
+        # that cache rather than triggering resolution itself, since
+        # provider/model resolution is otherwise fully lazy now (there's
+        # no LLM_PROVIDER env var left to peek at directly).
+        llm_client.ensure_provider_configured()
 
         from utilities.autopatcher.pipeline import run
         run("path traversal in upload handler")
@@ -142,17 +161,15 @@ class TestModelUnavailableAbortsPipeline:
     def test_non_interactive_model_unavailable_aborts_before_patch_generation(self, monkeypatch):
         import utilities.autopatcher.llm_client as llm_client
         from utilities.autopatcher.llm_client import ModelUnavailableError
-        from utilities.llm import LLMNotFoundError, empty_config
+        from utilities.llm import LLMNotFoundError
 
-        monkeypatch.setattr(llm_client, "load_config_file", lambda: empty_config())
+        monkeypatch.setattr(llm_client, "load_config_file", lambda: _anthropic_config("claude-opus-4-6"))
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
         monkeypatch.setattr(llm_client, "_cached_provider", None)
-        monkeypatch.setattr(llm_client, "_cached_api_keys", {})
         monkeypatch.setattr(llm_client, "_cached_model", {})
         monkeypatch.setattr(llm_client, "_cached_adapters", {})
         monkeypatch.setattr(llm_client, "_call_metadata", {})
-        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-        monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
 
         class _NonInteractiveStdin:
             def isatty(self):
@@ -174,30 +191,31 @@ class TestModelUnavailableAbortsPipeline:
         # Patch Generation -- and every later stage -- must never have run.
         assert "patch_generation" not in llm_client.get_call_metadata()
 
-    def test_interactive_declined_reselection_never_reaches_patch_generation(self, monkeypatch):
-        """User cancellation (blank input at the reselection prompt) must
-        abort before Patch Generation, not just degrade the Planner stage
-        that hit the rejected model."""
+    def test_model_unavailable_aborts_pipeline_without_prompting_even_when_interactive(self, monkeypatch):
+        """There is no more interactive reselection loop to decline -- a
+        TTY must not change this outcome, and input() must never even be
+        called, let alone determine the result."""
         import utilities.autopatcher.llm_client as llm_client
         from utilities.autopatcher.llm_client import ModelUnavailableError
-        from utilities.llm import LLMNotFoundError, empty_config
+        from utilities.llm import LLMNotFoundError
 
-        monkeypatch.setattr(llm_client, "load_config_file", lambda: empty_config())
+        monkeypatch.setattr(llm_client, "load_config_file", lambda: _anthropic_config("claude-opus-4-6"))
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
         monkeypatch.setattr(llm_client, "_cached_provider", None)
-        monkeypatch.setattr(llm_client, "_cached_api_keys", {})
         monkeypatch.setattr(llm_client, "_cached_model", {})
         monkeypatch.setattr(llm_client, "_cached_adapters", {})
         monkeypatch.setattr(llm_client, "_call_metadata", {})
-        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-        monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
 
         class _InteractiveStdin:
             def isatty(self):
                 return True
 
         monkeypatch.setattr("sys.stdin", _InteractiveStdin())
-        monkeypatch.setattr("builtins.input", lambda: "")  # decline reselection
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input must never be called")),
+        )
 
         class FakeAdapter:
             def complete(self, *, model, system, messages, max_tokens, tools=None):

@@ -1,39 +1,45 @@
 """
 Abstract LLM client.
 
-Live calls (LLM_PROVIDER=anthropic/openai) go through OpenAnt's shared
-provider infrastructure (``utilities.llm``) -- the same adapter registry
-the seven-phase scan pipeline uses -- instead of constructing SDK clients
-directly. This is a thin, Auto Patcher-specific layer BELOW that registry:
-Auto Patcher is not one of the seven scan phases and does not go through
-``PhaseRegistry`` / the ``llm_configs`` schema. See ``_resolve_provider_config``
-and ``_get_or_build_adapter`` below.
+Auto Patcher is a consumer of OpenAnt's LLM platform, not a second
+configuration system. For REAL providers (anthropic/openai/google/...),
+provider and model selection come ONLY from OpenAnt's canonical LLM
+configuration -- the same ``default_llm`` -> ``llm_configs[default_llm]``
+-> ``{provider, model}`` resolution every scan-pipeline phase uses. Auto
+Patcher reuses the existing "analyze" phase binding as the closest
+semantic fit (it is not one of the seven scan phases and does not go
+through ``PhaseRegistry``), and inherits the built-in ``openant-default``
+config exactly like every other OpenAnt command -- there is no
+Auto-Patcher-specific exclusion of it anymore.
 
-When no explicit LLM_PROVIDER/LLM_MODEL env var is set, provider and model
-resolution fall back to OpenAnt's shared config.json:
-``default_llm -> llm_configs[default_llm].analyze -> {provider, model}``.
-Auto Patcher does NOT get its own scan phase for this -- it reuses the
-existing "analyze" phase's binding as the closest semantic fit (the
-architectural decision recorded against this migration). Only an
-EXPLICITLY user-authored llm-config counts: the built-in "openant-default"
-(what ``default_llm`` resolves to on an install where the user has never
-run ``openant setup llm``) is deliberately excluded from this inheritance,
-so a never-configured install keeps today's interactive-menu-or-fail
-behavior instead of being silently funneled into Anthropic-only credential
-prompting with no provider choice. See ``_resolve_analyze_binding``.
+``LLM_PROVIDER`` / ``LLM_MODEL`` are NOT a supported way to select a real
+provider or model here (normal OpenAnt has no such mechanism either).
+Setting either to select a real provider/model is a hard, clear failure --
+never a silent no-op -- so an existing script asking for one provider/model
+never silently runs against a different one. See ``_resolve_active_provider``
+/ ``_resolve_model``.
 
-Falls back to deterministic mock responses ONLY when LLM_PROVIDER=mock is
-selected explicitly (env var, or the interactive menu's "Mock" choice) --
-never implicitly. Mock mode is Auto-Patcher-specific and bypasses the
-shared infrastructure entirely.
+``LLM_PROVIDER=mock`` is the one narrow, intentional exception: an explicit
+Auto-Patcher-specific test/research escape hatch that bypasses live
+resolution and the shared adapter layer entirely. It is never an implicit
+fallback -- there is no "unset -> mock" default.
 
-Model identity is never silently substituted. If a caller-requested model
-(via LLM_MODEL, the interactive menu, or the inherited config binding) is
+Live calls (any real provider) go through OpenAnt's shared provider
+infrastructure (``utilities.llm``) -- the same ``resolve_provider()`` /
+``build_adapter()`` the seven-phase scan pipeline uses -- with no
+Auto-Patcher-specific credential resolution layered in front. Credential
+behavior therefore matches canonical OpenAnt exactly: config.json's
+``llm_providers[<name>].api_key`` first, then whatever environment-variable
+fallback the shared resolver / provider SDK itself already provides (e.g.
+``resolve_provider``'s anthropic-only credential-less synthesis, letting
+the Anthropic SDK read ``ANTHROPIC_API_KEY``). Auto Patcher does not expand
+that contract for any provider.
+
+Model identity is never silently substituted. If a configured model is
 rejected by the provider, this module never falls back to a different
-model on its own -- see ``ModelUnavailableError`` and
-``_handle_model_unavailable``. Nor does it ever combine an explicitly
-resolved provider with a *different* provider's configured model -- see
-``_resolve_model``.
+model and never offers an interactive reselection -- it fails clearly and
+points at ``openant setup llm``. See ``ModelUnavailableError`` and
+``_handle_model_unavailable``.
 """
 
 from __future__ import annotations
@@ -46,72 +52,49 @@ from typing import Optional
 from ..model_config import GPT_4O_MINI
 from ..llm_client import get_global_tracker
 from ..llm import (
-    ConfigError,
-    LLMAuthError,
     LLMError,
     LLMNotFoundError,
     Message,
-    ProviderConfig,
     TextBlock,
     build_adapter,
     load_config_file,
     resolve_llm_config,
     resolve_provider,
 )
-from .llm_config import LLM_CONFIG, MODEL_ALIASES, DEFAULT_MAX_TOKENS
 
-# In-memory cached choices for the running session so we don't prompt
+# Default max output tokens for LLM completions. Override per-run via the
+# LLM_MAX_TOKENS environment variable (see _resolve_max_tokens).
+DEFAULT_MAX_TOKENS = 4096
+
+# In-memory cached choices for the running session so we don't re-resolve
 # repeatedly. Lifetime is the whole process/session (mirrors PhaseRegistry's
 # "build once, reuse across calls" adapter lifecycle) -- NOT reset by
 # clear_call_metadata(), which only clears per-run stage metadata.
 _cached_provider: Optional[str] = None
-_cached_api_keys: dict = {}
 _cached_model: dict = {}
 _cached_adapters: dict = {}
 
 # Per-stage call metadata for the current run, keyed by stage name (e.g.
 # "patch_generation", "patch_review", "challenger", "confidence_scorer").
-# Populated as a side effect of call_llm(), mirroring _cached_provider /
-# _cached_model above; read by main.py after the pipeline run completes.
+# Populated as a side effect of call_llm(); read by main.py after the
+# pipeline run completes.
 #
-# `model` here is ALWAYS the model that actually executed -- if a requested
-# model was rejected and the user explicitly picked an alternative
-# interactively, this records the alternative, never the original request.
+# `model` here is ALWAYS the model that actually executed.
 _call_metadata: dict = {}
 
 # Display names for user-facing messages. Internal `provider` strings stay
-# lowercase ("anthropic", "openai") to match LLM_PROVIDER's convention.
-_DISPLAY_NAME = {"anthropic": "Anthropic", "openai": "OpenAI"}
-
-# Env var Auto Patcher reads the API key from per provider, when no
-# config.json llm_providers entry supplies one -- unchanged from before
-# the migration, preserved for backward compatibility / CI / headless use.
-_ENV_KEY_NAME = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
-
-# Safety bound on the interactive model-reselection loop so a user who keeps
-# picking models the provider also rejects doesn't spin forever.
-_MAX_RESELECTION_ATTEMPTS = 5
+# lowercase ("anthropic", "openai") to match canonical config's convention.
+_DISPLAY_NAME = {"anthropic": "Anthropic", "openai": "OpenAI", "google": "Google"}
 
 
 class ModelUnavailableError(RuntimeError):
     """The requested model cannot be used and no live call may proceed.
 
-    Raised in exactly three situations -- callers deciding what to do next
-    can handle all of them with one except clause, because in every case
-    the invariant is the same: no LLM call happens with a model other than
-    one the user (or config) explicitly asked for.
-
-    * Non-interactive execution and the provider rejected the requested
-      model (no prompting is possible; fail closed).
-    * Interactive execution and the user explicitly declined/cancelled
-      model reselection.
-    * Interactive execution and every reselection attempt was itself
-      rejected by the provider, up to ``_MAX_RESELECTION_ATTEMPTS``.
-
-    Never raised for "the user picked a working alternative" -- that case
-    returns a normal string result to the original caller, with
-    ``_call_metadata``/``_cached_model`` updated to the model that actually
-    ran.
+    Raised whenever a resolved model is rejected by the provider
+    (``LLMNotFoundError``) -- Auto Patcher never falls back to a different
+    model or offers an interactive reselection; the caller is directed to
+    update OpenAnt's canonical LLM configuration instead. Interactive and
+    non-interactive execution behave identically here.
     """
 
 
@@ -151,8 +134,8 @@ def _resolve_max_tokens() -> int:
 # pipeline stage gets a realistic-looking placeholder.
 #
 # Mock mode is Auto-Patcher-specific and deliberately does NOT go through
-# utilities.llm (the shared registry has no mock provider, by design -- see
-# migration notes). It bypasses live config/provider resolution entirely.
+# utilities.llm (the shared registry has no mock provider, by design). It
+# bypasses live config/provider resolution entirely.
 # ---------------------------------------------------------------------------
 
 _MOCK_PATCH = """\
@@ -307,8 +290,8 @@ class LLMClient:
 
     @property
     def is_mock(self) -> bool:
-        # Check the resolved provider first — LLM_PROVIDER=anthropic/openai means
-        # call_llm() will use a real provider even when OPENAI_API_KEY is absent.
+        # Check the resolved provider first — a resolved real provider
+        # means call_llm() will use it regardless of OPENAI_API_KEY.
         provider = _cached_provider or os.environ.get("LLM_PROVIDER", "")
         if provider and provider != "mock":
             return False
@@ -339,111 +322,83 @@ class LLMClient:
 
 
 # ---------------------------------------------------------------------------
-# Provider selection (unchanged from before the migration)
+# Provider + model selection
+#
+# Real providers: ONLY OpenAnt's canonical configuration. No local
+# whitelist, no Auto-Patcher-specific provider/model override.
+# Mock: the one explicit, narrow exception -- see the module docstring.
 # ---------------------------------------------------------------------------
 
 
-_SUPPORTED_PROVIDERS = ("anthropic", "openai", "mock")
+def _resolve_canonical_binding() -> "tuple[str, str]":
+    """Resolve ``(provider, model)`` from OpenAnt's canonical LLM
+    configuration -- ``default_llm`` -> ``llm_configs[default_llm].analyze``
+    -> ``{provider, model}``, falling back to the built-in
+    ``openant-default`` exactly like every other OpenAnt command (scan,
+    analyze, verify, ...). This is Auto Patcher's ONLY real-provider
+    configuration mechanism now -- there is no Auto-Patcher-specific
+    override above it, and no exclusion of ``openant-default``.
 
-
-def _resolve_analyze_binding() -> "Optional[tuple[str, str]]":
-    """Return ``(provider, model)`` inherited from OpenAnt's shared
-    ``default_llm -> llm_configs[default_llm].analyze`` binding, or
-    ``None`` when unavailable.
-
-    Auto Patcher does not get its own scan phase for this (see this
-    module's docstring for the architectural decision) -- it reuses the
-    existing "analyze" phase's binding as the closest semantic fit.
-
-    Only an EXPLICITLY user-authored llm-config counts: the built-in
-    "openant-default" -- what ``default_llm`` resolves to on an install
-    where the user has never run ``openant setup llm`` -- is deliberately
-    excluded. Without this exclusion, a never-configured install would be
-    silently funneled into Anthropic-only credential prompting with no
-    provider choice, and (more subtly) local development/test machines
-    that HAVE run the scan-pipeline wizard would have that config
-    unexpectedly govern Auto Patcher too.
-
-    Returns ``None`` on any resolution problem (missing/invalid
-    ``default_llm``, or -- structurally near-impossible via real parsing,
-    but guarded defensively -- a resolved config missing the "analyze"
-    phase) rather than raising: callers treat "no binding" the same as "no
-    config at all" and fall through to interactive selection or a clear
-    failure, never a partial/guessed binding.
+    Raises:
+        ConfigError (a ``utilities.llm.LLMError`` subclass): config.json is
+            malformed, or ``default_llm`` names a config that doesn't
+            exist -- the identical failure canonical OpenAnt commands raise
+            for the same problem.
+        RuntimeError: the resolved llm-config has no usable "analyze" phase
+            binding. Structurally near-impossible via real parsing --
+            ``LLMConfig.__post_init__`` requires all seven phases -- but
+            guarded defensively rather than assumed.
     """
-    try:
-        cf = load_config_file()
-    except Exception:
-        return None
-    if not cf.default_llm or cf.default_llm == "openant-default":
-        return None
-    try:
-        llm_config = resolve_llm_config(cf, cf.default_llm)
-    except ConfigError:
-        return None
+    cf = load_config_file()
+    llm_config = resolve_llm_config(cf, cf.default_llm)
     ref = llm_config.phases.get("analyze")
     if ref is None or not ref.provider or not ref.model:
-        return None
+        raise RuntimeError(
+            f"llm-config {llm_config.name!r} has no usable 'analyze' phase "
+            f"binding. Run `openant setup llm` to reconfigure."
+        )
     return (ref.provider, ref.model)
 
 
 def _resolve_active_provider() -> str:
-    """Resolve which provider this session uses: "anthropic" | "openai" | "mock".
+    """Resolve which provider this session uses: "mock", or whatever
+    OpenAnt's canonical configuration resolves for the "analyze" phase.
 
     Precedence:
     1. Cached choice for this session.
-    2. LLM_PROVIDER env var, if set.
-    3. OpenAnt's configured ``default_llm.analyze.provider`` (see
-       `_resolve_analyze_binding`), if available.
-    4. Interactive prompt (tty only).
-    5. Non-interactive with nothing resolved: fail clearly. There is no
-       "unset -> mock" default anymore -- mock mode is permitted ONLY when
-       explicitly selected as "mock" (env var or interactive menu choice).
-
-    An explicitly-requested provider that isn't one Auto Patcher supports
-    is a hard failure, never a silent mock fallback: a live-provider
-    request must either use that exact provider or fail clearly; it must
-    never quietly produce a mock Trust Report the user could mistake for a
-    real one.
+    2. LLM_PROVIDER=mock -- the ONLY recognized value; an explicit,
+       Auto-Patcher-specific test/research escape hatch (see module
+       docstring). Never an implicit fallback.
+    3. Any OTHER non-empty LLM_PROVIDER value -- hard, clear failure.
+       Real-provider selection is not a supported Auto Patcher interface
+       through this variable (normal OpenAnt has none either); it is never
+       silently ignored, so an existing script asking for one provider can
+       never end up silently running against a different one.
+    4. OpenAnt's canonical default_llm/analyze binding (see
+       _resolve_canonical_binding) -- always resolves for any valid
+       config.json, exactly like every other OpenAnt command, including a
+       never-configured install (via the built-in openant-default).
     """
     global _cached_provider
 
-    provider = _cached_provider or os.environ.get("LLM_PROVIDER")
-    if not provider:
-        analyze_binding = _resolve_analyze_binding()
-        if analyze_binding is not None:
-            provider = analyze_binding[0]
-            _cached_provider = provider
-        elif not sys.stdin.isatty():
-            raise RuntimeError(
-                "No LLM_PROVIDER is set, and OpenAnt's config.json has no "
-                "explicitly configured default_llm with an 'analyze' binding "
-                "to inherit. Set LLM_PROVIDER=anthropic|openai|mock, or "
-                "configure a default via `openant setup llm`."
-            )
-        else:
-            print("Select LLM provider:", file=sys.stderr)
-            print("1) OpenAI", file=sys.stderr)
-            print("2) Anthropic", file=sys.stderr)
-            print("3) Mock", file=sys.stderr)
-            print("Choose (1/2/3): ", file=sys.stderr, end="", flush=True)
-            choice = input().strip()
-            mapping = {"1": "openai", "2": "anthropic", "3": "mock"}
-            if choice not in mapping:
-                raise RuntimeError(f"Invalid choice {choice!r}; expected 1, 2, or 3.")
-            provider = mapping[choice]
-            _cached_provider = provider
+    if _cached_provider:
+        return _cached_provider
 
-    # An explicitly-requested provider (env var, config binding, or --
-    # above -- a session already carrying one from a prior explicit
-    # request) must be one Auto Patcher actually supports. No
-    # warning-then-mock: fail closed.
-    if isinstance(LLM_CONFIG, dict) and provider not in LLM_CONFIG:
+    env_provider = os.environ.get("LLM_PROVIDER", "").strip()
+    if env_provider == "mock":
+        _cached_provider = "mock"
+        return _cached_provider
+    if env_provider:
         raise RuntimeError(
-            f"Unknown LLM provider {provider!r}. Supported Auto Patcher providers: "
-            f"{', '.join(_SUPPORTED_PROVIDERS)}."
+            f"LLM_PROVIDER={env_provider!r} is no longer used to select a "
+            "real provider for Auto Patcher. Configure a provider and model "
+            "via `openant setup llm`. Set LLM_PROVIDER=mock to use Auto "
+            "Patcher's test/research mock mode."
         )
 
+    provider, model = _resolve_canonical_binding()
+    _cached_provider = provider
+    _cached_model[provider] = model
     return provider
 
 
@@ -455,131 +410,73 @@ def ensure_provider_configured() -> None:
     ``core.patch``) that want the same early, fail-closed guarantee
     ``call_llm()`` already provides on its first real invocation, but
     before paying for setup work (file I/O, an NVD fetch, investigation
-    directory creation, ...) the pipeline would otherwise do first. It is
-    a pure delegation to `_resolve_active_provider` -- the ONE
-    authoritative resolver -- not a second, independent check: env
-    selection, OpenAnt's configured ``default_llm.analyze`` binding, and
-    interactive selection are all honored exactly as `call_llm` honors
-    them, because this calls the identical function.
+    directory creation, ...) the pipeline would otherwise do first.
 
-    Side effects mirror `_resolve_active_provider`: the resolved choice is
-    cached for the rest of the session (so calling this and then later
-    making a real call never re-prompts or re-raises), and an interactive
-    terminal may prompt here rather than at the first actual LLM call.
+    For a real provider, this also eagerly builds (and caches, for reuse
+    by the first real `call_llm()`) the shared adapter via
+    `_get_or_build_adapter` -- catching an undefined provider in
+    config.json (`ConfigError`) or an adapter-construction-time credential
+    failure early. This is NOT a full credential guarantee for every
+    provider: some SDKs (Anthropic's, as of this writing) construct their
+    client successfully with no key at all and only reject the request
+    when a real completion is attempted -- that specific failure mode
+    surfaces later, at the first real `call_llm()`, not here. Auto Patcher
+    deliberately does not add a live 1-token probe call (like canonical
+    OpenAnt's `probe_registry_or_raise`) to close that gap -- that would be
+    new, heavier behavior no caller asked for, not a smallest-change
+    alignment with existing behavior.
+
+    Since OpenAnt's canonical `openant-default` is now always inheritable,
+    provider/model RESOLUTION itself (as opposed to the credential) always
+    succeeds for any valid config.json, exactly like every other OpenAnt
+    command -- there is no more "unconfigured install" state for
+    resolution to fail fast on; only a broken config.json reference, or a
+    disallowed env var, does.
 
     Raises:
-        RuntimeError: non-interactive execution with no explicit provider
-            and no valid OpenAnt config binding, or an explicitly
-            requested provider Auto Patcher doesn't support. Never
-            degrades to mock -- mock is only ever returned when
+        ConfigError: OpenAnt's config.json is malformed, or `default_llm`
+            names a config that doesn't exist -- the identical failure
+            canonical OpenAnt commands raise for the same problem.
+        RuntimeError: a non-mock LLM_PROVIDER/LLM_MODEL value was set
+            (real-provider selection is not supported through them), or a
+            credential failure was caught at adapter-construction time.
+            Never degrades to mock -- mock is only ever returned when
             explicitly selected.
     """
-    _resolve_active_provider()
-
-
-# ---------------------------------------------------------------------------
-# Model selection
-#
-# IMPORTANT: there is no local whitelist here. config/models.json's
-# "status" field (current/retired/unknown) and LLM_CONFIG's "models" dict
-# are informational only -- an explicitly requested model (LLM_MODEL, an
-# interactive menu choice, or the inherited config binding) is NEVER
-# rejected or silently substituted here. The provider is the sole
-# authority on whether a model can actually be used; see call_llm()'s
-# handling of LLMNotFoundError / ModelUnavailableError for what happens
-# when it says no.
-# ---------------------------------------------------------------------------
+    provider = _resolve_active_provider()
+    if provider != "mock":
+        _get_or_build_adapter(provider)
 
 
 def _resolve_model(provider: str, fallback_model: str) -> str:
     """Resolve which model string to request for the already-resolved
     `provider`.
 
-    Precedence:
-    1. Already resolved earlier this session (`_cached_model[provider]`) --
-       checked FIRST so that once a model has been confirmed to work (or
-       explicitly reselected after a failure), every later stage call in
-       the same run reuses that exact model rather than re-deriving the
-       original (possibly rejected) request from LLM_MODEL on every call.
-       Model identity is part of experiment reproducibility: a run should
-       use one confirmed model throughout, not re-litigate the choice once
-       per stage.
-    2. LLM_MODEL environment variable, if set -- passed through verbatim
-       (after a small legacy-alias mapping; see MODEL_ALIASES), with no
-       whitelist check.
-    3. OpenAnt's configured ``default_llm.analyze.model``, but ONLY when
-       its provider matches `provider` exactly. An explicit/resolved
-       provider is never combined with a *different* provider's
-       configured model -- if they don't match, this falls straight
-       through to step 4/5 exactly as if no binding existed at all.
-    4. Interactive: a numbered menu built from LLM_CONFIG (informational
-       display only -- the choice is never validated against it).
-    5. Non-interactive with nothing resolved: fail clearly. There is no
-       silent default model anymore (not the old Auto Patcher default, not
-       Haiku, not anything chosen from the registry).
+    `provider == "mock"`: always "mock" -- LLM_MODEL is irrelevant to mock.
+
+    Otherwise: the model was already resolved atomically alongside the
+    provider, from OpenAnt's canonical configuration (see
+    `_resolve_active_provider` / `_resolve_canonical_binding`) -- there is
+    no separate real-provider model-selection step anymore. LLM_MODEL is
+    recognized only to fail clearly if set, for the same reason
+    LLM_PROVIDER is: silently ignoring it could let a real provider run
+    with a different model than a caller explicitly asked for.
 
     `fallback_model` (the legacy `model=` argument threaded through from
-    `LLMClient`/`call_llm`) is intentionally never consulted as a silent
-    default -- kept only for call-site signature compatibility.
+    `LLMClient`/`call_llm`) is intentionally never consulted -- kept only
+    for call-site signature compatibility.
     """
-    if provider in _cached_model:
-        return _cached_model[provider]
+    if provider == "mock":
+        return "mock"
 
     env_model = os.environ.get("LLM_MODEL", "").strip()
     if env_model:
-        mapped = MODEL_ALIASES.get(env_model, env_model) if isinstance(MODEL_ALIASES, dict) else env_model
-        if mapped != env_model:
-            print(f"Mapping model name to latest version: {mapped}", file=sys.stderr)
-        _cached_model[provider] = mapped
-        return mapped
-
-    analyze_binding = _resolve_analyze_binding()
-    if analyze_binding is not None:
-        binding_provider, binding_model = analyze_binding
-        if binding_provider == provider:
-            _cached_model[provider] = binding_model
-            return binding_model
-        print(
-            f"Note: OpenAnt's configured default model ({binding_model!r}) is for "
-            f"provider {binding_provider!r}, not {provider!r} -- an explicit model "
-            f"is required.",
-            file=sys.stderr,
-        )
-
-    if not sys.stdin.isatty():
         raise RuntimeError(
-            f"No LLM_MODEL is set and no compatible model is configured for "
-            f"provider {provider!r} in OpenAnt's config.json. Set "
-            f"LLM_MODEL=<model> explicitly."
+            f"LLM_MODEL={env_model!r} is no longer used to select a model "
+            "for Auto Patcher. Configure a model via `openant setup llm`."
         )
 
-    # Interactive menu -- built from LLM_CONFIG purely for discoverability.
-    # The selection is never rejected locally; only the provider (via the
-    # actual API call in call_llm()) can reject it.
-    provider_cfg = LLM_CONFIG.get(provider, {}) if isinstance(LLM_CONFIG, dict) else {}
-    models_dict = provider_cfg.get("models", {})
-    items = list(models_dict.items())
-    print(f"Select {provider.capitalize()} model:", file=sys.stderr)
-    for idx, (mname, meta) in enumerate(items, start=1):
-        label = meta.get("label") if isinstance(meta, dict) else ""
-        print(f"{idx}) {mname} ({label})", file=sys.stderr)
-    print(f"Choose (1-{len(items)}): ", file=sys.stderr, end="", flush=True)
-    choice = input().strip()
-    try:
-        sel = int(choice) - 1
-        if sel < 0:
-            raise ValueError
-        chosen = items[sel][0]
-    except Exception:
-        raise RuntimeError(f"Invalid choice {choice!r}; expected 1-{len(items)}.")
-
-    if isinstance(MODEL_ALIASES, dict) and chosen in MODEL_ALIASES:
-        mapped = MODEL_ALIASES[chosen]
-        print(f"Mapping model name to latest version: {mapped}", file=sys.stderr)
-        chosen = mapped
-
-    _cached_model[provider] = chosen
-    return chosen
+    return _cached_model[provider]
 
 
 def _known_models_for(provider: str) -> list:
@@ -589,7 +486,9 @@ def _known_models_for(provider: str) -> list:
     These are LOCALLY KNOWN, not provider-confirmed available -- status
     ("current"/"retired"/"unknown") is OpenAnt's own shipped claim, not a
     live check. Reuses the existing registry rather than maintaining a
-    second Auto Patcher-specific model list.
+    second Auto Patcher-specific model list. Shown only as reference text
+    in a model-unavailable failure message -- never used to drive an
+    automatic or interactive substitution.
     """
     try:
         from core.model_registry import load_models
@@ -607,100 +506,40 @@ def _known_models_for(provider: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Provider credential / adapter resolution via OpenAnt's shared infrastructure
+# Adapter construction -- delegates entirely to OpenAnt's shared registry
 # ---------------------------------------------------------------------------
-
-
-def _resolve_provider_config(provider: str) -> ProviderConfig:
-    """Resolve credentials for `provider` using OpenAnt's shared config.
-
-    Precedence (highest first):
-    1. config.json's ``llm_providers[provider].api_key`` -- the same
-       ``~/.config/openant/config.json`` the seven-phase scan pipeline
-       reads, via ``utilities.llm.load_config_file`` /
-       ``utilities.llm.resolve_provider``. Reused as-is; no duplicate
-       parsing.
-    2. The provider's environment variable (``ANTHROPIC_API_KEY`` /
-       ``OPENAI_API_KEY``) -- preserved for backward compatibility with
-       existing headless/CI usage.
-    3. An interactive prompt (once per process, cached), when a TTY is
-       attached -- preserves the pre-migration UX.
-
-    Returns a ``ProviderConfig`` whose ``api_key`` is ``None`` if none of
-    the above produced one; callers must check for that and fail loudly
-    rather than attempting to build an adapter with no credential.
-    """
-    base_url = None
-    api_key = None
-    try:
-        cfg = resolve_provider(load_config_file(), provider)
-        api_key = cfg.api_key
-        base_url = cfg.base_url
-    except ConfigError:
-        # No llm_providers[provider] entry in config.json (and provider is
-        # not "anthropic", the one name resolve_provider() auto-synthesizes
-        # credential-free). Fall through to env / interactive prompt below.
-        pass
-
-    if api_key:
-        _cached_api_keys[provider] = api_key
-    else:
-        env_name = _ENV_KEY_NAME.get(provider)
-        api_key = _get_api_key_for(provider, env_name) if env_name else None
-
-    return ProviderConfig(name=provider, type=provider, api_key=api_key or None, base_url=base_url)
-
-
-def _get_api_key_for(p: str, env_name: str) -> Optional[str]:
-    """Env var / interactive-prompt fallback, cached per session.
-
-    Only consulted when config.json has no ``llm_providers[p].api_key`` --
-    see ``_resolve_provider_config``.
-    """
-    if p in _cached_api_keys:
-        return _cached_api_keys[p]
-    key = os.environ.get(env_name, "")
-    if not key:
-        try:
-            print(f"Enter {env_name}: ", file=sys.stderr, end="", flush=True)
-            key = input().strip()
-        except Exception:
-            key = ""
-    if key:
-        _cached_api_keys[p] = key
-    return key
-
-
-def _missing_key_message(provider: str) -> str:
-    env_name = _ENV_KEY_NAME.get(provider, "")
-    return (
-        f"LLM_PROVIDER={provider} is configured but no {_DISPLAY_NAME.get(provider, provider)} "
-        f"API key is available. Checked: config.json's llm_providers[{provider!r}].api_key, "
-        f"the {env_name} environment variable, and an interactive prompt. "
-        f"Set one of those, or set LLM_PROVIDER=mock to use mock mode."
-    )
 
 
 def _get_or_build_adapter(provider: str):
     """Build (once per process) or reuse the shared adapter for `provider`.
 
-    Mirrors PhaseRegistry's "one adapter per provider, built once, reused
-    across every call" lifecycle -- Auto Patcher's LLMClient is a single
-    shared client across all 8 stages, so one adapter instance per provider
-    per run is correct and avoids re-reading config.json / reconstructing
-    the SDK client on every stage call.
+    Delegates entirely to the shared `resolve_provider()` / `build_adapter()`
+    -- the SAME functions the seven-phase scan pipeline uses -- with no
+    Auto-Patcher-specific credential resolution layered in front. Auto
+    Patcher's LLMClient is a single shared client across all pipeline
+    stages, so one adapter instance per provider per run is correct and
+    avoids re-reading config.json / reconstructing the SDK client on every
+    stage call.
+
+    Any resolution failure (an undefined provider in config.json, or a
+    credential the provider's SDK still can't find) surfaces as a single
+    clear RuntimeError pointing at `openant setup llm` -- the identical
+    class of failure canonical OpenAnt commands raise for the same problem,
+    just re-worded for this call site.
     """
     if provider in _cached_adapters:
         return _cached_adapters[provider]
 
-    provider_config = _resolve_provider_config(provider)
-    if not provider_config.api_key:
-        raise RuntimeError(_missing_key_message(provider))
-
     try:
+        provider_config = resolve_provider(load_config_file(), provider)
         adapter = build_adapter(provider_config)
-    except LLMAuthError as exc:
-        raise RuntimeError(f"{_DISPLAY_NAME.get(provider, provider)} API call failed: {exc}") from exc
+    except LLMError as exc:
+        raise RuntimeError(
+            f"No usable credential for provider {provider!r} (resolved via "
+            f"your OpenAnt LLM configuration). Run `openant setup llm` to "
+            f"configure one, or set that provider's standard credential "
+            f"environment variable if its SDK supports it directly. ({exc})"
+        ) from exc
 
     _cached_adapters[provider] = adapter
     return adapter
@@ -711,7 +550,16 @@ def _get_or_build_adapter(provider: str):
 # ---------------------------------------------------------------------------
 
 
-def _print_model_failure(provider: str, model: str, reason: str) -> None:
+def _handle_model_unavailable(provider: str, model: str, reason: str) -> None:
+    """`model` was rejected by `provider` (LLMNotFoundError). Never
+    substitutes another model and never offers an interactive reselection
+    -- fails clearly, with the locally-known-models list shown as reference
+    only, and points at `openant setup llm` to reconfigure. Identical
+    behavior whether the run is interactive or not.
+
+    Raises:
+        ModelUnavailableError: always.
+    """
     print("", file=sys.stderr)
     print("The requested model could not be used:", file=sys.stderr)
     print("", file=sys.stderr)
@@ -720,86 +568,25 @@ def _print_model_failure(provider: str, model: str, reason: str) -> None:
     print(f"Reason: {reason}", file=sys.stderr)
     print("", file=sys.stderr)
 
-
-def _handle_model_unavailable(provider: str, model: str, reason: str, adapter, max_tokens: int, messages: list):
-    """`model` was rejected by `provider` (LLMNotFoundError). Never silently
-    substitutes another model -- either the user explicitly picks a working
-    alternative (interactive) or this raises ModelUnavailableError so the
-    caller aborts.
-
-    Returns:
-        (CompletionResult, actual_model) if an explicitly user-selected
-        alternative succeeded.
-
-    Raises:
-        ModelUnavailableError: non-interactive execution, or the user
-            declined/cancelled, or every reselection attempt also failed.
-    """
-    _print_model_failure(provider, model, reason)
-
     alternatives = [m for m in _known_models_for(provider) if m["id"] != model]
 
-    if not sys.stdin.isatty():
-        lines = [
-            f"Requested model {model!r} is unavailable for provider {provider!r}.",
-            f"Reason: {reason}",
-            "",
-        ]
-        if alternatives:
-            lines.append(
-                "Locally known models for this provider (from OpenAnt's model "
-                "registry -- NOT a live provider-confirmed availability check):"
-            )
-            lines += [f"  - {m['id']} ({m['status']})" for m in alternatives]
-            lines.append("")
-        lines.append(f"Rerun with: LLM_MODEL=<model> ... openant patch ...")
-        raise ModelUnavailableError("\n".join(lines))
-
-    # Interactive: only ever proceed with a model the user explicitly typed
-    # a selection for. Looping lets a second bad pick be corrected without
-    # re-running the whole command, but is bounded so a user who keeps
-    # picking rejected models doesn't spin forever.
-    current_model, current_reason = model, reason
-    for _attempt in range(_MAX_RESELECTION_ATTEMPTS):
-        if alternatives:
-            print(
-                "Locally known models for this provider (from OpenAnt's model "
-                "registry -- NOT a live provider-confirmed availability check):",
-                file=sys.stderr,
-            )
-            for idx, m in enumerate(alternatives, start=1):
-                print(f"{idx}) {m['id']} ({m['status']})", file=sys.stderr)
-        else:
-            print("No other locally known models for this provider.", file=sys.stderr)
-        print("Choose a number, or press Enter to abort: ", file=sys.stderr, end="", flush=True)
-        choice = input().strip()
-        if not choice:
-            raise ModelUnavailableError(
-                f"User declined to select an alternative model for provider "
-                f"{provider!r}; aborting the Auto Patcher run."
-            )
-        try:
-            selected = alternatives[int(choice) - 1]["id"]
-        except (ValueError, IndexError):
-            print("Invalid selection.", file=sys.stderr)
-            continue
-
-        print(f"Retrying with explicitly selected model: {selected}", file=sys.stderr)
-        try:
-            result = adapter.complete(model=selected, system=None, messages=messages, max_tokens=max_tokens)
-            _cached_model[provider] = selected
-            return result, selected
-        except LLMNotFoundError as exc:
-            current_model, current_reason = selected, str(exc)
-            _print_model_failure(provider, current_model, current_reason)
-            alternatives = [m for m in alternatives if m["id"] != selected]
-            continue
-
-    raise ModelUnavailableError(
-        f"Gave up after {_MAX_RESELECTION_ATTEMPTS} rejected model selections for "
-        f"provider {provider!r}; aborting the Auto Patcher run. Last attempted "
-        f"model: {current_model!r} ({current_reason})."
+    lines = [
+        f"Requested model {model!r} is unavailable for provider {provider!r}.",
+        f"Reason: {reason}",
+        "",
+    ]
+    if alternatives:
+        lines.append(
+            "Locally known models for this provider (from OpenAnt's model "
+            "registry -- NOT a live provider-confirmed availability check):"
+        )
+        lines += [f"  - {m['id']} ({m['status']})" for m in alternatives]
+        lines.append("")
+    lines.append(
+        "Update your OpenAnt LLM configuration (`openant setup llm`) to use "
+        "a different model."
     )
+    raise ModelUnavailableError("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -811,19 +598,16 @@ def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> s
     """Call an LLM and return a single text response.
 
     Live calls (provider != "mock") go through OpenAnt's shared adapter
-    layer (utilities.llm) -- see _resolve_provider_config /
-    _get_or_build_adapter. Mock mode bypasses that layer entirely.
+    layer (utilities.llm) -- see _get_or_build_adapter. Mock mode bypasses
+    that layer entirely.
 
     Model identity is never silently substituted: if the resolved model is
     rejected by the provider (LLMNotFoundError), this raises
-    ModelUnavailableError unless the caller is interactive and explicitly
-    picks a working alternative -- see _handle_model_unavailable. No other
-    live failure (auth, rate limit, connection, malformed response) ever
-    causes a fallback to mock or to a different provider/model; it is
-    raised so the caller aborts.
+    ModelUnavailableError -- see _handle_model_unavailable. No other live
+    failure (auth, rate limit, connection, malformed response) ever causes
+    a fallback to mock or to a different provider/model; it is raised so
+    the caller aborts.
     """
-    global _cached_model
-
     provider = _resolve_active_provider()
 
     if provider == "mock":
@@ -851,34 +635,34 @@ def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> s
     try:
         result = adapter.complete(model=model_to_use, system=None, messages=messages, max_tokens=resolved_max_tokens)
     except LLMNotFoundError as exc:
-        result, model_to_use = _handle_model_unavailable(
-            provider, model_to_use, str(exc), adapter, resolved_max_tokens, messages
-        )
+        _handle_model_unavailable(provider, model_to_use, str(exc))  # always raises
     except LLMError as exc:
         raise RuntimeError(f"{_DISPLAY_NAME.get(provider, provider)} API call failed: {exc}") from exc
+    except Exception as exc:
+        # Not every provider SDK raises a typed LLMError for a missing
+        # credential -- e.g. the Anthropic SDK constructs its client
+        # successfully with no key at all and only rejects the request
+        # (with a raw, un-typed exception) once a real completion is
+        # attempted. Wrap ANY other unexpected failure the same way, so a
+        # credential problem this deep still fails clearly instead of a
+        # raw SDK traceback -- never a fallback to mock or another model.
+        raise RuntimeError(
+            f"{_DISPLAY_NAME.get(provider, provider)} API call failed: "
+            f"{type(exc).__name__}: {exc}. If this is a missing-credential "
+            f"error, run `openant setup llm` to configure one, or set that "
+            f"provider's standard credential environment variable."
+        ) from exc
 
     # Record real usage/cost against OpenAnt's shared global tracker -- the
     # same TokenTracker.record_call() the seven-phase scan pipeline uses --
     # so a live run's cost shows up via core.tracking.get_usage() / step
-    # reports instead of always reading $0. This line is reached exactly
-    # once per call_llm() invocation: either the try block above succeeded
-    # directly, or it raised LLMNotFoundError and _handle_model_unavailable
-    # returned a successful reselected completion (any other outcome -- a
-    # non-LLMNotFoundError failure, or every reselection attempt failing --
-    # raises before reaching here, so nothing failed is ever recorded).
-    # `model_to_use` is whatever ACTUALLY executed -- the original request,
-    # or an explicitly user-picked alternative -- never the rejected model.
+    # reports instead of always reading $0.
     get_global_tracker().record_call(
         model=model_to_use,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         pricing=getattr(adapter, "pricing", {}).get(model_to_use),
     )
-
-    # _cached_model always reflects the model that ACTUALLY executed --
-    # core/patch.py's RunMetadata reads this for the Trust Report, so a
-    # reselection is truthfully recorded for every subsequent stage too.
-    _cached_model[provider] = model_to_use
 
     _call_metadata[stage] = {
         "provider": provider,

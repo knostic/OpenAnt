@@ -306,53 +306,6 @@ func (c *Config) LLMConfigExists(name string) bool {
 	return exists
 }
 
-// HasValidDefaultAnalyzeBinding reports whether the user has EXPLICITLY
-// configured a default llm-config (via “openant setup llm“) whose
-// "analyze" phase has a non-empty provider and model. Auto Patcher
-// inherits this binding when no LLM_PROVIDER/LLM_MODEL env var is set
-// (mirrors “utilities.autopatcher.llm_client._resolve_analyze_binding“
-// on the Python side) so a fully-configured user isn't asked to select a
-// provider on every “openant patch“ run -- see resolvePatchLLMEnv in
-// cmd/patch_llm.go.
-//
-// Deliberately does NOT treat an absent/unset “default_llm“ as valid --
-// that resolves to the built-in "openant-default" on the Python side, but
-// a user who has configured nothing at all should still see Go's existing
-// interactive provider menu (or non-interactive failure) rather than
-// being silently funneled into Anthropic-only credential prompting with
-// no provider choice. Mirrors LLMConfigExists's own "built-in doesn't
-// count as user-authored" rule.
-//
-// This is a structural check only (non-empty provider + model strings) --
-// it does NOT duplicate Python's full llm-config schema validation (all
-// seven phases, cross-referenced providers, etc.). Python remains the
-// sole resolution authority; this only decides whether Go should defer to
-// it instead of prompting/failing itself.
-func (c *Config) HasValidDefaultAnalyzeBinding() bool {
-	if c.raw == nil {
-		return false
-	}
-	name, ok := c.raw["default_llm"].(string)
-	if !ok || name == "" || name == "openant-default" {
-		return false
-	}
-	llmConfigs, ok := c.raw["llm_configs"].(map[string]any)
-	if !ok {
-		return false
-	}
-	cfg, ok := llmConfigs[name].(map[string]any)
-	if !ok {
-		return false
-	}
-	analyze, ok := cfg["analyze"].(map[string]any)
-	if !ok {
-		return false
-	}
-	provider, _ := analyze["provider"].(string)
-	model, _ := analyze["model"].(string)
-	return provider != "" && model != ""
-}
-
 // LLMConfigNames returns the names of user-authored llm-configs.
 // Used by the setup wizard's intro to show the user what they already
 // have. Does NOT include the built-in “openant-default“.

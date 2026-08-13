@@ -5,15 +5,16 @@ import pytest
 
 import utilities.autopatcher.llm_client as llm_client
 from utilities.autopatcher.llm_client import (
+    DEFAULT_MAX_TOKENS,
     LLMClient,
     ModelUnavailableError,
     call_llm,
     _mock_response,
 )
-from utilities.autopatcher.llm_config import DEFAULT_MAX_TOKENS
 from utilities.llm import (
     PHASES,
     CompletionResult,
+    ConfigError,
     ConfigFile,
     LLMConfig,
     LLMConnectionError,
@@ -33,14 +34,14 @@ from utilities.llm import (
 
 @pytest.fixture(autouse=True)
 def _isolate_shared_infra(monkeypatch):
-    # Default: "no config.json" -- falls through to env-var / interactive
-    # resolution, matching pre-migration test assumptions. Tests exercising
-    # config.json-sourced credentials override this explicitly.
+    # Default: "no config.json" -- resolves to the built-in openant-default
+    # (see _resolve_canonical_binding), matching a fresh, never-configured
+    # install. Tests exercising a user-authored llm-config override this
+    # explicitly via _config_with_default_llm.
     monkeypatch.setattr(llm_client, "load_config_file", lambda: empty_config())
     # Fresh session state per test -- these are module-globals meant to
     # persist across an entire real run/process, not across unrelated tests.
     monkeypatch.setattr(llm_client, "_cached_provider", None)
-    monkeypatch.setattr(llm_client, "_cached_api_keys", {})
     monkeypatch.setattr(llm_client, "_cached_model", {})
     monkeypatch.setattr(llm_client, "_cached_adapters", {})
     monkeypatch.setattr(llm_client, "_call_metadata", {})
@@ -84,8 +85,11 @@ def _make_full_llm_config(name, analyze_provider, analyze_model, filler_provider
 
 def _config_with_default_llm(name, analyze_provider, analyze_model, providers=None):
     """A ConfigFile whose default_llm points at a fully valid, explicitly
-    user-authored llm-config (never the built-in "openant-default", which
-    Auto Patcher deliberately never inherits from)."""
+    user-authored llm-config. Auto Patcher's canonical resolution
+    (_resolve_canonical_binding) reads default_llm exactly like every
+    other OpenAnt command -- there is no Auto-Patcher-specific exclusion
+    of the built-in "openant-default" anymore (see
+    test_openant_default_inherited_* below for that scenario)."""
     return ConfigFile(
         default_llm=name,
         llm_configs={name: _make_full_llm_config(name, analyze_provider, analyze_model)},
@@ -143,8 +147,22 @@ def _install_fake_adapter(monkeypatch, outcomes, captured_provider_config=None):
     return fake
 
 
+def _monkeypatch_known_models(monkeypatch, models):
+    """Force _known_models_for()'s source deterministically for tests."""
+    monkeypatch.setattr(
+        llm_client,
+        "_known_models_for",
+        lambda provider: [m for m in models if True],
+    )
+
+
 # ---------------------------------------------------------------------------
 # LLMClient.is_mock — must reflect the active LLM_PROVIDER, not just OPENAI_API_KEY
+#
+# This is a display-only helper (core/patch.py uses it to label the Trust
+# Report's "MOCK"/"LIVE" run mode) and is independent of real-provider
+# resolution -- it never selects anything itself, so LLM_PROVIDER's new
+# real-provider-selection restriction doesn't apply to it.
 # ---------------------------------------------------------------------------
 
 def test_is_mock_false_when_anthropic_provider(monkeypatch):
@@ -171,7 +189,7 @@ def test_is_mock_true_when_no_provider_no_key(monkeypatch):
 
 
 def test_is_mock_false_when_cached_provider_anthropic(monkeypatch):
-    # Simulates a session where the user already selected anthropic interactively.
+    # Simulates a session where the provider has already been resolved.
     monkeypatch.setattr(llm_client, "_cached_provider", "anthropic")
     client = LLMClient()
     assert not client.is_mock
@@ -200,41 +218,69 @@ def test_mock_provider_never_touches_shared_config(monkeypatch):
     call_llm("prompt")  # must not raise
 
 
+def test_llm_model_irrelevant_to_mock(monkeypatch):
+    """LLM_MODEL must not matter for an explicit mock run -- mock never
+    resolves a model at all."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_MODEL", "whatever")
+    res = call_llm("prompt")
+    assert res == _mock_response("prompt")
+
+
 # ---------------------------------------------------------------------------
-# Mock mode is permitted ONLY when explicitly selected as "mock". An unknown
-# or mistyped live provider must fail clearly -- never silently produce a
-# mock Trust Report indistinguishable from a real one.
+# LLM_PROVIDER / LLM_MODEL are no longer a supported way to select a real
+# provider or model. Any non-mock, non-empty value is a hard, clear
+# failure -- never silently ignored, never silently different from what a
+# caller asked for, and never a fallback to mock.
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_env_provider_never_falls_back_to_mock(monkeypatch):
+def test_llm_provider_real_value_fails_clearly(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+
+    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+        call_llm("prompt")
+
+
+def test_llm_provider_real_value_points_at_setup_llm(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+
+    with pytest.raises(RuntimeError, match="openant setup llm"):
+        call_llm("prompt")
+
+
+def test_llm_provider_typo_value_fails_the_same_way_as_a_real_one(monkeypatch):
+    """Any non-mock value fails identically -- there is no local whitelist
+    left to distinguish a typo from a real provider name."""
     monkeypatch.setenv("LLM_PROVIDER", "anthorpic")  # typo
 
-    with pytest.raises(RuntimeError, match="Unknown LLM provider 'anthorpic'"):
+    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
         call_llm("prompt")
 
 
-def test_unknown_env_provider_error_lists_supported_providers(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthorpic")
+def test_llm_provider_google_value_also_fails(monkeypatch):
+    """Google is a real, canonically-supported provider -- but LLM_PROVIDER
+    is still not how you select it for Auto Patcher; only OpenAnt's
+    canonical configuration does that (see test_google_* below)."""
+    monkeypatch.setenv("LLM_PROVIDER", "google")
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
         call_llm("prompt")
-    assert "anthropic, openai, mock" in str(excinfo.value)
 
 
-def test_unknown_env_provider_never_calls_mock_response(monkeypatch):
+def test_llm_provider_real_value_never_calls_mock_response(monkeypatch):
     calls = []
     monkeypatch.setattr(llm_client, "_mock_response", lambda prompt: calls.append(prompt) or "SHOULD NOT HAPPEN")
-    monkeypatch.setenv("LLM_PROVIDER", "google")  # a real other-scan-pipeline provider, unsupported here
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
 
-    with pytest.raises(RuntimeError, match="Unknown LLM provider 'google'"):
+    with pytest.raises(RuntimeError):
         call_llm("prompt")
 
     assert calls == []
 
 
-def test_unknown_env_provider_produces_no_mock_stderr_text(monkeypatch, capsys):
-    monkeypatch.setenv("LLM_PROVIDER", "anthorpic")
+def test_llm_provider_real_value_produces_no_mock_stderr_text(monkeypatch, capsys):
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
 
     with pytest.raises(RuntimeError):
         call_llm("prompt")
@@ -242,16 +288,58 @@ def test_unknown_env_provider_produces_no_mock_stderr_text(monkeypatch, capsys):
     assert "Using mock LLM" not in capsys.readouterr().err
 
 
-def test_interactive_invalid_menu_choice_never_falls_back_to_mock(monkeypatch):
-    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda: "9")  # not 1, 2, or 3
-    calls = []
-    monkeypatch.setattr(llm_client, "_mock_response", lambda prompt: calls.append(prompt) or "SHOULD NOT HAPPEN")
+def test_llm_provider_rejection_identical_interactive_and_non_interactive(monkeypatch):
+    """Interactive and non-interactive production runs must use the SAME
+    rule for LLM_PROVIDER -- there is no more menu/prompt to fall to."""
+    for is_tty in (True, False):
+        monkeypatch.setattr(llm_client, "_cached_provider", None)
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setattr(
+            "sys.stdin",
+            _FakeInteractiveStdin() if is_tty else _FakeNonInteractiveStdin(),
+        )
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input must never be called")),
+        )
 
-    with pytest.raises(RuntimeError, match="Invalid choice"):
+        with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+            call_llm("prompt")
+
+
+def test_llm_model_real_value_fails_clearly(monkeypatch):
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+    monkeypatch.setenv("LLM_MODEL", "claude-sonnet-4-6")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+
+    with pytest.raises(RuntimeError, match="LLM_MODEL"):
         call_llm("prompt")
 
-    assert calls == []
+
+def test_llm_model_real_value_points_at_setup_llm(monkeypatch):
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+    monkeypatch.setenv("LLM_MODEL", "claude-sonnet-4-6")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+
+    with pytest.raises(RuntimeError, match="openant setup llm"):
+        call_llm("prompt")
+
+
+def test_llm_model_real_value_never_overrides_configured_model(monkeypatch):
+    """The old override behavior must be gone, not just relabeled: the
+    adapter must never even be called with either model."""
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+    monkeypatch.setenv("LLM_MODEL", "claude-sonnet-4-6")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
+
+    with pytest.raises(RuntimeError, match="LLM_MODEL"):
+        call_llm("prompt")
+
+    assert fake.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -263,8 +351,8 @@ def test_interactive_invalid_menu_choice_never_falls_back_to_mock(monkeypatch):
 
 
 def test_anthropic_explicit_provider_raises_on_api_error(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
     _install_fake_adapter(monkeypatch, outcomes=[LLMConnectionError("simulated anthropic failure")])
 
@@ -273,128 +361,200 @@ def test_anthropic_explicit_provider_raises_on_api_error(monkeypatch):
 
 
 def test_openai_explicit_provider_raises_on_api_error(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "openai")
-    monkeypatch.setenv("LLM_MODEL", "gpt-test-model")
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    cf = _config_with_default_llm(
+        "test-config", "openai", "gpt-test-model",
+        providers={"openai": ProviderConfig(name="openai", type="openai", api_key="fake-key")},
+    )
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     _install_fake_adapter(monkeypatch, outcomes=[LLMConnectionError("simulated openai failure")])
 
     with pytest.raises(RuntimeError, match="OpenAI API call failed"):
         call_llm("prompt that triggers openai")
 
 
-def test_anthropic_explicit_provider_raises_on_missing_key(monkeypatch):
-    """LLM_PROVIDER=anthropic with no key anywhere must raise, not fall
-    back to mock. Non-interactive so the interactive prompt path can't
-    silently supply one either. LLM_MODEL is set so model resolution
-    succeeds and the credential check -- what this test is actually
-    about -- is what's being exercised."""
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
-    monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input called")))
+def test_anthropic_missing_credential_raises_clearly_never_mock(monkeypatch, capsys):
+    """No credential anywhere for the canonically-resolved anthropic
+    provider: must raise clearly, never fall back to mock. Exercises the
+    REAL shared build_adapter()/SDK path (not a faked adapter) so this
+    proves the actual missing-credential failure, not just a stand-in.
 
-    with pytest.raises(RuntimeError, match="no Anthropic API key is available"):
+    Unlike OpenAI/Google, the Anthropic SDK constructs its client
+    successfully even with no key at all (resolve_provider()'s own
+    synthesis leaves api_key=None, matching canonical behavior exactly)
+    and only rejects the request once a real completion is attempted --
+    so this surfaces as call_llm()'s own generic-exception wrapper around
+    adapter.complete(), not _get_or_build_adapter()'s construction-time
+    check. Still a clear RuntimeError, never a raw SDK traceback, never
+    mock."""
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+
+    with pytest.raises(RuntimeError, match="Anthropic API call failed"):
         call_llm("prompt with no anthropic key")
+    assert "mock" not in capsys.readouterr().err.lower()
 
 
-def test_openai_explicit_provider_raises_on_missing_key(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "openai")
-    monkeypatch.setenv("LLM_MODEL", "gpt-test-model")
-    monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input called")))
+def test_openai_missing_credential_raises_clearly_never_mock(monkeypatch, capsys):
+    """OpenAI has no anthropic-style auto-synthesis fallback in the shared
+    resolver -- with no llm_providers["openai"] entry at all, resolution
+    fails before ever reaching the adapter/SDK. Must raise clearly, never
+    fall back to mock."""
+    cf = _config_with_default_llm("test-config", "openai", "gpt-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
 
-    with pytest.raises(RuntimeError, match="no OpenAI API key is available"):
+    with pytest.raises(RuntimeError, match="No usable credential for provider 'openai'"):
         call_llm("prompt with no openai key")
-
-
-def test_missing_credentials_never_falls_back_to_mock(monkeypatch, capsys):
-    """A missing-credentials failure must be an exception, never a mock
-    response returned as if nothing were wrong."""
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
-    monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-
-    with pytest.raises(RuntimeError):
-        call_llm("prompt")
     assert "mock" not in capsys.readouterr().err.lower()
 
 
 # ---------------------------------------------------------------------------
-# Interactive prompt text must reach stderr, never stdout -- stdout is
-# reserved for the JSON envelope openant/cli.py writes, and Go's
-# python.Invoke parses it as pure JSON. The selected/typed value must still
-# flow through correctly regardless of which channel displays the prompt.
+# Credential resolution: matches canonical OpenAnt EXACTLY, no
+# Auto-Patcher-specific fallback tier layered above resolve_provider().
 # ---------------------------------------------------------------------------
 
-def test_provider_menu_prompt_text_goes_to_stderr_not_stdout(monkeypatch, capsys):
-    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda: "3")  # 3) Mock
 
-    res = call_llm("prompt")
-
-    assert res == _mock_response("prompt")
-    captured = capsys.readouterr()
-    assert "Choose (1/2/3): " in captured.err
-    assert "Choose (1/2/3): " not in captured.out
-
-
-def test_model_menu_prompt_text_goes_to_stderr_not_stdout(monkeypatch, capsys):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda: "1")  # first model in the menu
-
-    captured_cfg = {}
-    fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()], captured_provider_config=captured_cfg)
-
-    call_llm("prompt")
-
-    captured = capsys.readouterr()
-    assert "Select Anthropic model:" in captured.err
-    assert "Choose (1-" in captured.err
-    assert "Select Anthropic model:" not in captured.out
-    assert "Choose (1-" not in captured.out
-    # the typed choice ("1") actually selected a real model, not a fallback default
-    assert fake.calls[0]["model"]
-
-
-def test_api_key_prompt_text_goes_to_stderr_not_stdout(monkeypatch, capsys):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setattr(llm_client, "_cached_model", {"anthropic": "claude-haiku-4-5-20251001"})
-    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda: "sk-typed-key")
+def test_provider_api_key_from_config_json_is_used(monkeypatch):
+    cf = _config_with_default_llm(
+        "test-config", "anthropic", "claude-test-model",
+        providers={"anthropic": ProviderConfig(name="anthropic", type="anthropic", api_key="sk-from-config")},
+    )
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
 
     captured_cfg = {}
     _install_fake_adapter(monkeypatch, outcomes=[_completion_result()], captured_provider_config=captured_cfg)
 
     call_llm("prompt")
 
+    assert captured_cfg["value"].api_key == "sk-from-config"
+
+
+def test_config_json_key_takes_precedence_over_env_var(monkeypatch):
+    cf = _config_with_default_llm(
+        "test-config", "anthropic", "claude-test-model",
+        providers={"anthropic": ProviderConfig(name="anthropic", type="anthropic", api_key="sk-from-config")},
+    )
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
+
+    captured_cfg = {}
+    _install_fake_adapter(monkeypatch, outcomes=[_completion_result()], captured_provider_config=captured_cfg)
+
+    call_llm("prompt")
+
+    assert captured_cfg["value"].api_key == "sk-from-config"
+
+
+def test_anthropic_credential_resolution_succeeds_with_no_config_entry(monkeypatch):
+    """Anthropic's shared, canonical resolve_provider() synthesizes a
+    credential-less config (letting the SDK's own env lookup find
+    ANTHROPIC_API_KEY) even with zero llm_providers entries -- the SAME
+    behavior normal OpenAnt commands get, with no Auto-Patcher-specific
+    credential code involved."""
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+
+    captured_cfg = {}
+    _install_fake_adapter(monkeypatch, outcomes=[_completion_result()], captured_provider_config=captured_cfg)
+
+    call_llm("prompt")
+
+    assert captured_cfg["value"].api_key is None
+    assert captured_cfg["value"].name == "anthropic"
+
+
+def test_openai_credential_resolution_fails_with_no_config_entry_even_with_env_var(monkeypatch):
+    """Unlike Anthropic, canonical resolve_provider() has no auto-synthesis
+    fallback for OpenAI -- a bare OPENAI_API_KEY with zero llm_providers
+    entries now fails with the SAME ConfigError-driven failure normal
+    OpenAnt commands would raise for the same problem. This is a
+    DELIBERATE, intentional narrowing: Auto Patcher previously had its own
+    extra env-var fallback tier for exactly this case; that tier is now
+    deleted so credential behavior matches canonical OpenAnt exactly, not
+    a broader contract."""
+    cf = _config_with_default_llm("test-config", "openai", "gpt-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env-alone")
+
+    with pytest.raises(RuntimeError, match="No usable credential for provider 'openai'"):
+        call_llm("prompt")
+
+
+def test_openai_credential_resolution_succeeds_once_config_entry_exists(monkeypatch):
+    """Once a (possibly key-less) llm_providers["openai"] entry exists,
+    OpenAI's SDK-level env fallback becomes reachable -- same as any other
+    OpenAnt command; still no Auto-Patcher-specific code involved."""
+    cf = _config_with_default_llm(
+        "test-config", "openai", "gpt-test-model",
+        providers={"openai": ProviderConfig(name="openai", type="openai", api_key=None)},
+    )
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+
+    captured_cfg = {}
+    _install_fake_adapter(monkeypatch, outcomes=[_completion_result()], captured_provider_config=captured_cfg)
+
+    call_llm("prompt")
+
+    assert captured_cfg["value"].api_key is None
+    assert captured_cfg["value"].name == "openai"
+
+
+# ---------------------------------------------------------------------------
+# Interactive prompt text must reach stderr, never stdout -- stdout is
+# reserved for the JSON envelope openant/cli.py writes, and Go's
+# python.Invoke parses it as pure JSON.
+# ---------------------------------------------------------------------------
+
+def test_model_unavailable_prompt_text_goes_to_stderr_not_stdout(monkeypatch, capsys):
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    _install_fake_adapter(monkeypatch, outcomes=[LLMNotFoundError("model: claude-opus-4-6")])
+
+    with pytest.raises(ModelUnavailableError):
+        call_llm("prompt")
+
     captured = capsys.readouterr()
-    assert "Enter ANTHROPIC_API_KEY: " in captured.err
-    assert "Enter ANTHROPIC_API_KEY: " not in captured.out
-    # the typed value actually reached the adapter, not just the prompt
-    assert captured_cfg["value"].api_key == "sk-typed-key"
+    assert "The requested model could not be used" in captured.err
+    assert "The requested model could not be used" not in captured.out
 
 
-def test_non_interactive_unset_provider_fails_clearly_never_mock(monkeypatch, capsys):
-    """No LLM_PROVIDER, no config binding, non-interactive: must fail
-    clearly. There is no more "unset -> mock" default -- mock is
-    permitted ONLY when explicitly selected."""
+def test_non_interactive_unset_provider_uses_openant_default(monkeypatch, capsys):
+    """No config.json at all: falls back to the built-in openant-default,
+    exactly like every other OpenAnt command -- there is no more "unset ->
+    fail immediately" state for provider/model resolution itself. A run
+    can still fail later, on the missing credential (see
+    test_no_config_no_credential_fails_clearly_never_mock)."""
     monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input called")))
+    fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
 
-    with pytest.raises(RuntimeError, match="No LLM_PROVIDER is set"):
-        call_llm("no interactive")
+    call_llm("prompt")
+
+    assert fake.calls  # provider/model resolved successfully via openant-default
+    assert llm_client._cached_provider == "anthropic"
+
+
+def test_no_config_no_credential_fails_clearly_never_mock(monkeypatch, capsys):
+    """No config.json, no credential anywhere: openant-default still
+    resolves a provider+model (matching normal OpenAnt), but the run fails
+    clearly on the missing credential -- never mock. See
+    test_anthropic_missing_credential_raises_clearly_never_mock for why
+    this is Anthropic's "construction succeeds, request fails" shape
+    rather than a construction-time ConfigError/LLMAuthError."""
+    monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
+
+    with pytest.raises(RuntimeError, match="Anthropic API call failed"):
+        call_llm("prompt")
     assert "mock" not in capsys.readouterr().err.lower()
 
 
 # ---------------------------------------------------------------------------
 # Configurable max_tokens (LLM_MAX_TOKENS override + DEFAULT_MAX_TOKENS)
+# -- unaffected by the LLM_PROVIDER/LLM_MODEL removal; unrelated mechanism.
 # ---------------------------------------------------------------------------
 
 def test_anthropic_uses_default_max_tokens_when_env_unset(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
     fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
 
@@ -404,8 +564,8 @@ def test_anthropic_uses_default_max_tokens_when_env_unset(monkeypatch):
 
 
 def test_anthropic_honors_llm_max_tokens_override(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
     monkeypatch.setenv("LLM_MAX_TOKENS", "8000")
     fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
@@ -415,8 +575,8 @@ def test_anthropic_honors_llm_max_tokens_override(monkeypatch):
 
 
 def test_invalid_llm_max_tokens_falls_back_to_default(monkeypatch, capsys):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
     monkeypatch.setenv("LLM_MAX_TOKENS", "not-a-number")
     fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
@@ -427,9 +587,11 @@ def test_invalid_llm_max_tokens_falls_back_to_default(monkeypatch, capsys):
 
 
 def test_openai_receives_explicit_max_tokens(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "openai")
-    monkeypatch.setenv("LLM_MODEL", "gpt-test-model")
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    cf = _config_with_default_llm(
+        "test-config", "openai", "gpt-test-model",
+        providers={"openai": ProviderConfig(name="openai", type="openai", api_key="fake-key")},
+    )
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("LLM_MAX_TOKENS", "2048")
     fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
 
@@ -443,8 +605,8 @@ def test_openai_receives_explicit_max_tokens(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_anthropic_call_metadata_captures_max_tokens_stop_reason(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
     _install_fake_adapter(monkeypatch, outcomes=[_completion_result(stop_reason="max_tokens")])
 
@@ -455,9 +617,11 @@ def test_anthropic_call_metadata_captures_max_tokens_stop_reason(monkeypatch):
 
 
 def test_openai_call_metadata_captures_finish_reason(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "openai")
-    monkeypatch.setenv("LLM_MODEL", "gpt-test-model")
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    cf = _config_with_default_llm(
+        "test-config", "openai", "gpt-test-model",
+        providers={"openai": ProviderConfig(name="openai", type="openai", api_key="fake-key")},
+    )
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     _install_fake_adapter(monkeypatch, outcomes=[_completion_result(stop_reason="max_tokens")])
 
     call_llm("prompt", stage="patch_review")
@@ -518,13 +682,13 @@ def test_complete_default_stage_is_unknown_and_does_not_break(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # claude-opus-4-6 must reach the shared adapter exactly unchanged: not
-# replaced, not normalized, not rejected by an Auto Patcher-local whitelist.
+# replaced, not normalized, not rejected by any local check.
 # ---------------------------------------------------------------------------
 
 def test_opus_4_6_reaches_shared_adapter_unchanged(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
     fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
 
     call_llm("prompt")
@@ -532,19 +696,10 @@ def test_opus_4_6_reaches_shared_adapter_unchanged(monkeypatch):
     assert fake.calls[0]["model"] == "claude-opus-4-6"
 
 
-def test_opus_4_6_is_not_a_model_alias(monkeypatch):
-    """MODEL_ALIASES only maps two legacy 3.x names -- claude-opus-4-6 must
-    never be silently rewritten to a different id via that table."""
-    from utilities.autopatcher.llm_config import MODEL_ALIASES
-
-    assert "claude-opus-4-6" not in MODEL_ALIASES
-    assert "claude-opus-4-6" not in MODEL_ALIASES.values()
-
-
 def test_opus_4_6_metadata_records_actual_executed_model(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
     _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
 
     call_llm("prompt", stage="patch_generation")
@@ -553,12 +708,13 @@ def test_opus_4_6_metadata_records_actual_executed_model(monkeypatch):
     assert meta["patch_generation"]["model"] == "claude-opus-4-6"
 
 
-def test_opus_4_6_not_rejected_by_local_whitelist_even_if_unknown_status(monkeypatch):
+def test_opus_4_6_not_rejected_even_if_unknown_status(monkeypatch):
     """config/models.json marks claude-opus-4-6 status="unknown" (liveness
-    contested) -- that must never cause a local rejection or substitution."""
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    contested) -- that must never cause a rejection or substitution. There
+    is no local model whitelist left to reject it in the first place."""
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
     fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
 
     call_llm("prompt")
@@ -569,13 +725,15 @@ def test_opus_4_6_not_rejected_by_local_whitelist_even_if_unknown_status(monkeyp
 
 # ---------------------------------------------------------------------------
 # No silent fallback: an invalid/rejected model must never trigger a call
-# with Haiku, or with any other model the caller didn't explicitly choose.
+# with a different model than the one canonically configured, and never
+# offers an interactive reselection -- interactive and non-interactive
+# behave identically.
 # ---------------------------------------------------------------------------
 
-def test_invalid_model_non_interactive_never_calls_haiku(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+def test_invalid_model_never_calls_a_different_model(monkeypatch):
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-does-not-exist")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-does-not-exist")
     monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
     fake = _install_fake_adapter(
         monkeypatch, outcomes=[LLMNotFoundError("model: claude-does-not-exist")]
@@ -590,10 +748,10 @@ def test_invalid_model_non_interactive_never_calls_haiku(monkeypatch):
     assert called_models == ["claude-does-not-exist"]
 
 
-def test_provider_rejects_model_non_interactive_no_alternate_call(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+def test_provider_rejects_model_no_alternate_call(monkeypatch):
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
     monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
     fake = _install_fake_adapter(
         monkeypatch, outcomes=[LLMNotFoundError("model: claude-opus-4-6")]
@@ -602,23 +760,9 @@ def test_provider_rejects_model_non_interactive_no_alternate_call(monkeypatch):
     with pytest.raises(ModelUnavailableError):
         call_llm("prompt")
 
-    # Exactly the requested model was tried, once, and nothing else.
+    # Exactly the configured model was tried, once, and nothing else.
     assert len(fake.calls) == 1
     assert fake.calls[0]["model"] == "claude-opus-4-6"
-
-
-# ---------------------------------------------------------------------------
-# Interactive model failure UX
-# ---------------------------------------------------------------------------
-
-
-def _monkeypatch_known_models(monkeypatch, models):
-    """Force _known_models_for()'s source deterministically for tests."""
-    monkeypatch.setattr(
-        llm_client,
-        "_known_models_for",
-        lambda provider: [m for m in models if True],
-    )
 
 
 def test_known_models_for_uses_the_real_shared_model_registry():
@@ -648,63 +792,11 @@ def test_known_models_for_uses_the_real_shared_model_registry():
     assert llm_client._known_models_for("not-a-real-provider") == []
 
 
-def test_interactive_reselection_calls_selected_model_only_after_explicit_choice(monkeypatch, capsys):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+def test_model_unavailable_fails_clearly_directs_to_setup_llm(monkeypatch):
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
-    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
-    _monkeypatch_known_models(
-        monkeypatch,
-        [{"id": "claude-opus-4-8", "status": "current"}, {"id": "claude-sonnet-4-6", "status": "current"}],
-    )
-    monkeypatch.setattr("builtins.input", lambda: "1")  # pick claude-opus-4-8
-
-    fake = _install_fake_adapter(
-        monkeypatch,
-        outcomes=[LLMNotFoundError("model: claude-opus-4-6"), _completion_result()],
-    )
-
-    result = call_llm("prompt", stage="patch_generation")
-
-    assert isinstance(result, str)
-    assert len(fake.calls) == 2
-    assert fake.calls[0]["model"] == "claude-opus-4-6"  # original request tried first
-    assert fake.calls[1]["model"] == "claude-opus-4-8"  # only the explicit choice, never automatic
-
-    meta = llm_client.get_call_metadata()
-    assert meta["patch_generation"]["model"] == "claude-opus-4-8"
-
-    err = capsys.readouterr().err
-    assert "The requested model could not be used" in err
-    assert "Provider: Anthropic" in err
-    assert "Model: claude-opus-4-6" in err
-
-
-def test_user_cancels_reselection_aborts_run_with_no_alternate_call(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
-    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
-    _monkeypatch_known_models(monkeypatch, [{"id": "claude-opus-4-8", "status": "current"}])
-    monkeypatch.setattr("builtins.input", lambda: "")  # blank = decline/cancel
-
-    fake = _install_fake_adapter(
-        monkeypatch, outcomes=[LLMNotFoundError("model: claude-opus-4-6")]
-    )
-
-    with pytest.raises(ModelUnavailableError):
-        call_llm("prompt")
-
-    assert len(fake.calls) == 1  # no alternate call was ever made
-    assert fake.calls[0]["model"] == "claude-opus-4-6"
-
-
-def test_non_interactive_model_failure_never_prompts_never_falls_back(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
     monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input called")))
     _monkeypatch_known_models(
         monkeypatch,
         [{"id": "claude-opus-4-8", "status": "current"}, {"id": "claude-sonnet-4-6", "status": "current"}],
@@ -719,62 +811,38 @@ def test_non_interactive_model_failure_never_prompts_never_falls_back(monkeypatc
     message = str(excinfo.value)
     assert "claude-opus-4-6" in message
     assert "anthropic" in message
-    assert "claude-opus-4-8" in message  # available alternatives listed
-    assert "LLM_MODEL=" in message  # rerun instruction
+    assert "claude-opus-4-8" in message  # available alternatives listed as reference
+    assert "openant setup llm" in message
+    assert "LLM_MODEL" not in message  # never directs the user back to the removed override
     assert len(fake.calls) == 1  # never retried automatically
 
 
-# ---------------------------------------------------------------------------
-# Provider/API-key resolution precedence: config.json > env var > interactive.
-# ---------------------------------------------------------------------------
-
-
-def test_provider_api_key_from_config_json_is_used(monkeypatch):
-    from utilities.llm import ConfigFile
-
-    cf = ConfigFile(llm_providers={"anthropic": ProviderConfig(name="anthropic", type="anthropic", api_key="sk-from-config")})
+def test_model_unavailable_behavior_identical_interactive_and_non_interactive(monkeypatch):
+    """Model-unavailable behavior must not depend on TTY -- no more
+    interactive-vs-non-interactive branching, and no prompt is ever issued
+    either way."""
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
     monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
-    monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input called")))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    _monkeypatch_known_models(monkeypatch, [{"id": "claude-opus-4-8", "status": "current"}])
 
-    captured_cfg = {}
-    _install_fake_adapter(monkeypatch, outcomes=[_completion_result()], captured_provider_config=captured_cfg)
+    for is_tty in (True, False):
+        monkeypatch.setattr(llm_client, "_cached_provider", None)
+        monkeypatch.setattr(llm_client, "_cached_model", {})
+        monkeypatch.setattr(llm_client, "_cached_adapters", {})
+        monkeypatch.setattr(
+            "sys.stdin",
+            _FakeInteractiveStdin() if is_tty else _FakeNonInteractiveStdin(),
+        )
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input must never be called")),
+        )
+        _install_fake_adapter(monkeypatch, outcomes=[LLMNotFoundError("model: claude-opus-4-6")])
 
-    call_llm("prompt")
-
-    assert captured_cfg["value"].api_key == "sk-from-config"
-
-
-def test_config_json_key_takes_precedence_over_env_var(monkeypatch):
-    from utilities.llm import ConfigFile
-
-    cf = ConfigFile(llm_providers={"anthropic": ProviderConfig(name="anthropic", type="anthropic", api_key="sk-from-config")})
-    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
-
-    captured_cfg = {}
-    _install_fake_adapter(monkeypatch, outcomes=[_completion_result()], captured_provider_config=captured_cfg)
-
-    call_llm("prompt")
-
-    assert captured_cfg["value"].api_key == "sk-from-config"
-
-
-def test_env_credential_fallback_still_supported_when_no_config_entry(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
-
-    captured_cfg = {}
-    _install_fake_adapter(monkeypatch, outcomes=[_completion_result()], captured_provider_config=captured_cfg)
-
-    call_llm("prompt")
-
-    assert captured_cfg["value"].api_key == "sk-from-env"
+        with pytest.raises(ModelUnavailableError) as excinfo:
+            call_llm("prompt")
+        assert "claude-opus-4-6" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -795,9 +863,11 @@ def test_llm_client_module_does_not_construct_sdk_clients_directly():
 
 
 def test_openai_live_calls_flow_through_shared_openai_adapter(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "openai")
-    monkeypatch.setenv("LLM_MODEL", "gpt-test-model")
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-key")
+    cf = _config_with_default_llm(
+        "test-config", "openai", "gpt-test-model",
+        providers={"openai": ProviderConfig(name="openai", type="openai", api_key="fake-key")},
+    )
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result(text="hello")])
 
     result = call_llm("prompt")
@@ -808,8 +878,8 @@ def test_openai_live_calls_flow_through_shared_openai_adapter(monkeypatch):
 
 
 def test_anthropic_live_calls_flow_through_shared_anthropic_adapter(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
     fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result(text="hello")])
 
@@ -822,8 +892,8 @@ def test_anthropic_live_calls_flow_through_shared_anthropic_adapter(monkeypatch)
 
 def test_adapter_is_built_once_and_reused_across_calls(monkeypatch):
     """Mirrors PhaseRegistry's eager-build-once-reuse adapter lifecycle."""
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
     build_calls = []
 
@@ -847,8 +917,8 @@ def test_adapter_is_built_once_and_reused_across_calls(monkeypatch):
 
 
 def test_complete_preserves_system_and_user_concatenation(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-test-model")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
     fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
 
@@ -863,13 +933,14 @@ def test_complete_preserves_system_and_user_concatenation(monkeypatch):
 # ---------------------------------------------------------------------------
 # Config-only resolution: default_llm -> llm_configs[default_llm].analyze
 # -> {provider, model} -> llm_providers[provider] -> shared adapter, with NO
-# LLM_PROVIDER / LLM_MODEL / ANTHROPIC_API_KEY / OPENAI_API_KEY set at all.
+# LLM_PROVIDER / LLM_MODEL set at all. This is the ONLY real-provider
+# resolution path now -- not one scenario among several.
 # ---------------------------------------------------------------------------
 
 
 def test_config_only_resolution_no_env_vars_at_all(monkeypatch):
-    """Scenario 1: pure config-only resolution. Environment contains none
-    of LLM_PROVIDER/LLM_MODEL/ANTHROPIC_API_KEY/OPENAI_API_KEY. Provider,
+    """Pure config-only resolution. Environment contains none of
+    LLM_PROVIDER/LLM_MODEL/ANTHROPIC_API_KEY/OPENAI_API_KEY. Provider,
     model, AND credential all come from OpenAnt's shared config.json."""
     cf = _config_with_default_llm(
         "test-config", "anthropic", "claude-opus-4-6",
@@ -877,7 +948,6 @@ def test_config_only_resolution_no_env_vars_at_all(monkeypatch):
     )
     monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input called")))
 
     captured_cfg = {}
     fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()], captured_provider_config=captured_cfg)
@@ -892,8 +962,8 @@ def test_config_only_resolution_no_env_vars_at_all(monkeypatch):
 
 
 def test_config_only_resolution_passes_exact_opus_string_unchanged(monkeypatch):
-    """Scenario 2: config-only resolution must pass claude-opus-4-6
-    unchanged to the adapter -- not normalized, not substituted."""
+    """Config-only resolution must pass claude-opus-4-6 unchanged to the
+    adapter -- not normalized, not substituted."""
     cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
     monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
@@ -906,113 +976,25 @@ def test_config_only_resolution_passes_exact_opus_string_unchanged(monkeypatch):
     assert fake.calls[0]["model"] == "claude-opus-4-6"
 
 
-def test_explicit_model_overrides_configured_analyze_model(monkeypatch):
-    """Scenario 3: config says Anthropic/Opus-4-6; LLM_MODEL=Sonnet-4-6
-    overrides just the model -- provider still comes from config."""
-    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
-    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
-    monkeypatch.setenv("LLM_MODEL", "claude-sonnet-4-6")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-
-    fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
-
-    call_llm("prompt", stage="patch_generation")
-
-    assert fake.calls[0]["model"] == "claude-sonnet-4-6"
-    assert llm_client.get_call_metadata()["patch_generation"]["provider"] == "anthropic"
-
-
-def test_explicit_provider_matching_configured_analyze_provider_uses_its_model(monkeypatch):
-    """Scenario 4: explicit LLM_PROVIDER=anthropic, no LLM_MODEL, config
-    analyze is also Anthropic/Opus-4-6 -- the configured model is used."""
-    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
-    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-
-    fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
-
-    call_llm("prompt")
-
-    assert fake.calls[0]["model"] == "claude-opus-4-6"
-
-
-def test_explicit_provider_conflicting_with_configured_provider_never_combines_non_interactive(monkeypatch, capsys):
-    """Scenario 5 (non-interactive): config analyze is OpenAI/model-X;
-    LLM_PROVIDER=anthropic explicitly, no LLM_MODEL. Auto Patcher must NOT
-    reuse "model-X" with Anthropic -- must fail requiring an explicit
-    model."""
-    cf = _config_with_default_llm("test-config", "openai", "model-X")
-    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input called")))
-
-    fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
-
-    with pytest.raises(RuntimeError, match="No LLM_MODEL is set"):
-        call_llm("prompt")
-
-    assert fake.calls == []  # "model-X" (or anything else) was never called
-    err = capsys.readouterr().err
-    assert "provider 'openai'" in err
-    assert "not 'anthropic'" in err
-
-
-def test_explicit_provider_conflicting_with_configured_provider_interactive_requires_explicit_choice(monkeypatch):
-    """Scenario 5 (interactive): same mismatch, but interactive -- must
-    fall to the explicit model-selection menu rather than reusing model-X,
-    and only the user's typed choice is ever sent."""
-    cf = _config_with_default_llm("test-config", "openai", "model-X")
-    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda: "1")  # first Anthropic model in the menu
-
-    fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
-
-    call_llm("prompt")
-
-    assert fake.calls[0]["model"] != "model-X"
-    assert fake.calls[0]["model"]  # a real, explicitly-chosen Anthropic model
-
-
-def test_missing_default_llm_non_interactive_fails_clearly_never_mock(monkeypatch, capsys):
-    """Scenario 6 (non-interactive): default_llm names a config that
-    doesn't exist -- a broken/invalid reference, not "unset". Must fail
-    clearly, never mock."""
+def test_missing_default_llm_fails_clearly_never_mock(monkeypatch, capsys):
+    """default_llm names a config that doesn't exist -- a broken/invalid
+    reference, not "unset". Raises the SAME ConfigError canonical OpenAnt
+    commands raise for the identical problem; never mock."""
     cf = ConfigFile(default_llm="does-not-exist")
     monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input called")))
 
-    with pytest.raises(RuntimeError, match="No LLM_PROVIDER is set"):
+    with pytest.raises(ConfigError, match="does-not-exist"):
         call_llm("prompt")
     assert "mock" not in capsys.readouterr().err.lower()
 
 
-def test_missing_default_llm_interactive_falls_to_explicit_selection(monkeypatch):
-    """Scenario 6 (interactive): same broken reference, interactive --
-    falls to the existing explicit provider-selection menu."""
-    cf = ConfigFile(default_llm="does-not-exist")
-    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
-    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda: "3")  # Mock, explicitly chosen
-
-    res = call_llm("prompt")
-    assert res == _mock_response("prompt")
-
-
 def test_missing_analyze_binding_never_substitutes_another_phase(monkeypatch):
-    """Scenario 7: default_llm resolves, but its "analyze" phase binding
-    is unavailable (defensive guard -- LLMConfig's own schema normally
+    """default_llm resolves, but its "analyze" phase binding is
+    unavailable (defensive guard -- LLMConfig's own schema normally
     guarantees all 7 phases are present, but Auto Patcher must never
     silently reach for a DIFFERENT phase's binding, e.g. "verify", if this
-    ever happened). Same fail/select behavior as "no config at all"."""
+    ever happened)."""
     class _FakeLLMConfigMissingAnalyze:
         name = "test-config"
         phases = {}  # no "analyze" key
@@ -1020,47 +1002,48 @@ def test_missing_analyze_binding_never_substitutes_another_phase(monkeypatch):
     cf = ConfigFile(default_llm="test-config")
     monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setattr(llm_client, "resolve_llm_config", lambda c, name: _FakeLLMConfigMissingAnalyze())
-    monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input called")))
 
-    with pytest.raises(RuntimeError, match="No LLM_PROVIDER is set"):
+    with pytest.raises(RuntimeError, match="no usable 'analyze' phase binding"):
         call_llm("prompt")
 
 
-def test_no_config_model_and_no_llm_model_never_uses_old_default(monkeypatch):
-    """Scenario 8: no config model, no LLM_MODEL -- the old Auto Patcher
-    default (Haiku for anthropic) must never be silently selected. The
-    adapter must never even be called."""
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+# ---------------------------------------------------------------------------
+# openant-default is inherited exactly like every other OpenAnt command --
+# no Auto-Patcher-specific exclusion of it anymore.
+# ---------------------------------------------------------------------------
+
+
+def test_openant_default_inherited_when_credential_available(monkeypatch):
+    """No explicit default_llm configured (falls back to the built-in
+    openant-default), but a real ANTHROPIC_API_KEY is present -- Auto
+    Patcher must inherit openant-default's analyze binding and run,
+    exactly like every other OpenAnt command, with zero prompting. This is
+    exactly the experience a user who has only ever run
+    `openant set-api-key` (never `openant setup llm`) gets from `openant
+    scan` too."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setattr("sys.stdin", _FakeNonInteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("input called")))
     fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
 
-    with pytest.raises(RuntimeError, match="No LLM_MODEL is set"):
-        call_llm("prompt")
+    call_llm("prompt", stage="patch_generation")
 
-    assert fake.calls == []
-    assert "claude-haiku-4-5-20251001" not in str(fake.calls)
+    assert fake.calls  # a real call was made -- provider/model resolved successfully
+    meta = llm_client.get_call_metadata()
+    assert meta["patch_generation"]["provider"] == "anthropic"
 
 
-def test_full_explicit_env_override_wins_over_a_different_config_binding(monkeypatch):
-    """Scenario 10: existing LLM_PROVIDER/LLM_MODEL/API-key env usage must
-    keep working exactly as before, even when config.json has a
-    DIFFERENT, unrelated binding -- explicit env always wins outright."""
-    cf = _config_with_default_llm("test-config", "openai", "some-other-model")
-    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("LLM_MODEL", "claude-sonnet-4-6")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-env-key")
+def test_openant_default_analyze_model_reaches_adapter_unchanged(monkeypatch):
+    """The built-in openant-default's analyze model string reaches the
+    adapter exactly as OPENANT_DEFAULT defines it -- not normalized, not
+    substituted, not defaulted to some Auto-Patcher-specific model."""
+    from utilities.llm import get_builtin_default
 
-    captured_cfg = {}
-    fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()], captured_provider_config=captured_cfg)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result()])
 
     call_llm("prompt")
 
-    assert fake.calls[0]["model"] == "claude-sonnet-4-6"
-    assert captured_cfg["value"].api_key == "sk-env-key"
+    expected_model = get_builtin_default().phases["analyze"].model
+    assert fake.calls[0]["model"] == expected_model
 
 
 # ---------------------------------------------------------------------------
@@ -1079,9 +1062,9 @@ def test_full_explicit_env_override_wins_over_a_different_config_binding(monkeyp
 def test_live_completion_records_usage_in_global_tracker(monkeypatch):
     from utilities.llm_client import get_global_tracker
 
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-8")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-8")
     fake = _install_fake_adapter(
         monkeypatch, outcomes=[_completion_result(input_tokens=1000, output_tokens=500)]
     )
@@ -1106,9 +1089,9 @@ def test_live_completion_records_exactly_once(monkeypatch):
     (double-counted across the two live adapter.complete() call sites)."""
     from utilities.llm_client import get_global_tracker
 
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-sonnet-4-6")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-sonnet-4-6")
     _install_fake_adapter(monkeypatch, outcomes=[_completion_result(input_tokens=10, output_tokens=5)])
 
     call_llm("prompt", stage="stage_a")
@@ -1116,42 +1099,6 @@ def test_live_completion_records_exactly_once(monkeypatch):
 
     call_llm("prompt", stage="stage_b")
     assert get_global_tracker().get_totals()["total_calls"] == 2
-
-
-def test_reselected_model_records_usage_against_the_actual_alternate_model(monkeypatch):
-    """original model unavailable -> user explicitly picks an alternate ->
-    alternate succeeds: usage/cost must be recorded against the ALTERNATE
-    model and its pricing, never the originally rejected model."""
-    from utilities.llm_client import get_global_tracker
-
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
-    monkeypatch.setattr("sys.stdin", _FakeInteractiveStdin())
-    _monkeypatch_known_models(
-        monkeypatch,
-        [{"id": "claude-opus-4-8", "status": "current"}, {"id": "claude-sonnet-4-6", "status": "current"}],
-    )
-    monkeypatch.setattr("builtins.input", lambda: "1")  # pick claude-opus-4-8
-
-    fake = _install_fake_adapter(
-        monkeypatch,
-        outcomes=[
-            LLMNotFoundError("model: claude-opus-4-6"),
-            _completion_result(input_tokens=200, output_tokens=100),
-        ],
-    )
-    fake.pricing = {"claude-opus-4-8": {"input": 15.0, "output": 75.0}}
-
-    call_llm("prompt", stage="patch_generation")
-
-    totals = get_global_tracker().get_totals()
-    assert totals["total_calls"] == 1  # only the successful reselected call is recorded
-    call_record = get_global_tracker().get_summary()["calls"][-1]
-    assert call_record["model"] == "claude-opus-4-8"  # actual executed model, not the rejected one
-    expected_cost = (200 / 1_000_000) * 15.0 + (100 / 1_000_000) * 75.0
-    assert call_record["cost_usd"] == pytest.approx(expected_cost)
-    assert call_record["cost_usd"] > 0
 
 
 def test_mock_mode_never_records_paid_usage(monkeypatch):
@@ -1172,9 +1119,9 @@ def test_unpriced_model_still_records_tokens_with_zero_cost(monkeypatch, capsys)
     fabricated price."""
     from utilities.llm_client import get_global_tracker
 
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-6")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-6")
     fake = _install_fake_adapter(
         monkeypatch, outcomes=[_completion_result(input_tokens=1000, output_tokens=500)]
     )
@@ -1199,9 +1146,9 @@ def test_step_report_cost_delta_reflects_fake_live_auto_patcher_call(monkeypatch
     cost_usd field."""
     from core.step_report import step_context
 
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-opus-4-8")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
-    monkeypatch.setenv("LLM_MODEL", "claude-opus-4-8")
     fake = _install_fake_adapter(
         monkeypatch, outcomes=[_completion_result(input_tokens=1000, output_tokens=500)]
     )
@@ -1220,3 +1167,52 @@ def test_step_report_cost_delta_reflects_fake_live_auto_patcher_call(monkeypatch
     assert written["cost_usd"] == pytest.approx(expected_cost)
     assert written["token_usage"]["input_tokens"] == 1000
     assert written["token_usage"]["output_tokens"] == 500
+
+
+# ---------------------------------------------------------------------------
+# Google works through canonical OpenAnt configuration + the shared Google
+# adapter -- no Auto-Patcher-specific Google implementation anywhere.
+# ---------------------------------------------------------------------------
+
+
+def test_google_resolves_through_canonical_config_and_shared_adapter(monkeypatch):
+    cf = _config_with_default_llm(
+        "test-config", "google", "gemini-test-model",
+        providers={"google": ProviderConfig(name="google", type="google", api_key="fake-google-key")},
+    )
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+
+    captured_cfg = {}
+    fake = _install_fake_adapter(monkeypatch, outcomes=[_completion_result(text="hi from gemini")], captured_provider_config=captured_cfg)
+
+    result = call_llm("prompt")
+
+    assert result == "hi from gemini"
+    assert fake.calls[0]["model"] == "gemini-test-model"
+    assert captured_cfg["value"].name == "google"
+    assert captured_cfg["value"].api_key == "fake-google-key"
+    meta = llm_client.get_call_metadata()
+    assert meta["unknown"]["provider"] == "google"
+
+
+def test_google_credential_resolution_matches_openai_shape_not_anthropic(monkeypatch):
+    """Google has no anthropic-style auto-synthesis fallback either --
+    same shape as OpenAI, proving Auto Patcher applies no Google-specific
+    special-casing of its own."""
+    cf = _config_with_default_llm("test-config", "google", "gemini-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+    monkeypatch.setenv("GOOGLE_API_KEY", "sk-from-env-alone")
+
+    with pytest.raises(RuntimeError, match="No usable credential for provider 'google'"):
+        call_llm("prompt")
+
+
+def test_google_is_not_reachable_via_llm_provider_env(monkeypatch):
+    """Google is a real canonical provider, but Auto Patcher never adds it
+    (or any real provider) to a patch-specific selection mechanism --
+    LLM_PROVIDER=google still fails exactly like any other real-provider
+    value."""
+    monkeypatch.setenv("LLM_PROVIDER", "google")
+
+    with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+        call_llm("prompt")

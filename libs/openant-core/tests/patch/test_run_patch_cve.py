@@ -181,15 +181,30 @@ class TestRunPatchCveFetchFailures:
 
 
 class TestRunPatchCveRequiresLlmProvider:
-    def test_requires_llm_provider(self, tmp_path, monkeypatch):
+    def test_requires_resolvable_credential(self, tmp_path, monkeypatch):
+        """No credential anywhere for the canonically-resolved provider --
+        must fail clearly, before pipeline work (repo_root check + fetch
+        already happened). Uses OpenAI: canonical resolve_provider() has
+        no anthropic-style construction-time leniency for it, so this
+        failure is guaranteed to surface at the eager
+        _require_llm_provider() preflight rather than only deep inside the
+        pipeline's first real call_llm()."""
+        import utilities.autopatcher.llm_client as llm_client
+        from utilities.llm import PHASES, ConfigFile, LLMConfig, PhaseRef
+
+        phases = {p: PhaseRef(provider="openai", model="gpt-test-model") for p in PHASES}
+        cf = ConfigFile(default_llm="test-config", llm_configs={"test-config": LLMConfig(name="test-config", phases=phases)})
+
         monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
         repo_root = tmp_path / "repo"
         repo_root.mkdir()
 
         with _mock_fetch_cve_at_source() as mocked_fetch:
-            with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
+            with pytest.raises(RuntimeError, match="No usable credential for provider 'openai'"):
                 run_patch_cve("CVE-2021-12345", str(repo_root), str(tmp_path))
-        # repo_root check and fetch both happen before the LLM_PROVIDER
+        # repo_root check and fetch both happen before the credential
         # check inside the shared helper -- fetch_cve is still called here,
         # unlike the repo_root-invalid case above.
         mocked_fetch.assert_called_once()
