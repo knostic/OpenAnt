@@ -15,7 +15,6 @@ pre-existing gap is documented by `test_count_verdicts_drops_unrecognized_verdic
 below and is explicitly out of F13's scope.
 """
 import json
-import os
 import sys
 import tempfile
 from pathlib import Path
