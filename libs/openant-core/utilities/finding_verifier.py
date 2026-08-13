@@ -61,6 +61,7 @@ from prompts.verification_prompts import (
     get_verification_system_prompt,
     get_consistency_check_prompt
 )
+from core.verdict_taxonomy import FINDING_VERDICT_ORDER
 
 # Import application context type for type hints
 try:
@@ -211,6 +212,17 @@ def _resolve_stage1_finding(result: dict) -> str:
     ``inconclusive`` and dropped from the report.
     """
     return str(result.get("finding") or result.get("verdict") or "inconclusive").lower()
+
+
+def _more_severe(a: str, b: str) -> str:
+    """Return the more-severe of two verdicts per FINDING_VERDICT_ORDER
+    (index 0 = most severe). An unknown verdict ranks least-severe. Used to pick
+    the surfacing verdict on a self-contradictory finish so a vuln on EITHER side
+    is not dropped (FAM-REPORT-2)."""
+    def _rank(v: str) -> int:
+        v = str(v or "").strip().lower()
+        return FINDING_VERDICT_ORDER.index(v) if v in FINDING_VERDICT_ORDER else len(FINDING_VERDICT_ORDER)
+    return a if _rank(a) <= _rank(b) else b
 
 
 @dataclass
@@ -422,6 +434,15 @@ class FindingVerifier:
                 # sets result["finding"] = correct_finding, and the report
                 # filters on that field — using "inconclusive" here would drop
                 # a Stage-1 "vulnerable" from the report entirely.
+                # C(a): record spend on this degenerate exit too — the three sibling
+                # degenerate paths (finish, no-tool-calls, max-iterations) all record,
+                # this one alone did not, undercounting the unit's tokens/cost.
+                self.tracker.record_call(
+                    model=self.binding.model,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
+                )
                 return VerificationResult(
                     agree=False,
                     correct_finding=finding,
@@ -462,6 +483,29 @@ class FindingVerifier:
                                 content=json.dumps(outcome),
                             )
                         )
+
+            # A finish call on a turn the model TRUNCATED (stop_reason == "max_tokens")
+            # is not a trustworthy completed verdict: a well-formed
+            # finish(agree=False, "safe") from a cut-off turn would silently downgrade a
+            # Stage-1 vulnerable. Treat it as verification-incomplete (preserve the
+            # Stage-1 verdict for triage) — honoring the adapter's truncation signal
+            # (the responses/chat paths relabel abnormal terminations to "max_tokens")
+            # rather than reading a truncated reply as a clean verdict.
+            if finish_result and stop_reason == "max_tokens":
+                self.tracker.record_call(
+                    model=self.binding.model,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    pricing=lookup_pricing(self.binding),
+                )
+                return VerificationResult(
+                    agree=False,
+                    correct_finding=finding,
+                    explanation="Verification incomplete (finish call truncated at max_tokens)",
+                    iterations=iterations,
+                    total_tokens=total_input_tokens + total_output_tokens,
+                    incomplete=True,
+                )
 
             if finish_result:
                 self.tracker.record_call(
@@ -1037,15 +1081,38 @@ class FindingVerifier:
         # carry `agree` (True or False) is a real, completed verdict and stays
         # incomplete=False.
         agree_missing = "agree" not in finish_result
+        agree = finish_result.get("agree", False)
+        correct_finding = finish_result.get("correct_finding", original_finding)
+        incomplete = agree_missing
+
+        # FAM-REPORT-2: a self-contradictory finish — `agree=True` (claims to
+        # agree with Stage-1) while `correct_finding` diverges from the Stage-1
+        # verdict — is NOT a clean agreement. The `finish` schema declares the
+        # two fields independently (no cross-field constraint), so a model can
+        # emit it. Reading it as agreed leaves result["finding"] at the Stage-1
+        # verdict (the write-back consumers only propagate correct_finding on the
+        # disagree branch), so an UPGRADE contradiction (stage1=safe,
+        # correct_finding=vulnerable) silently DROPS the vuln at the reporter's
+        # disclosure filter. Surface it: treat as a disagreement toward the
+        # MORE-SEVERE verdict (so a vuln on either side is never dropped, and a
+        # downgrade cannot silence a real Stage-1 vuln) and flag incomplete so
+        # the reporter renders "unverified" (needs manual review), not "agreed".
+        # Mirrors this file's R4-7 fail-safe philosophy (abnormal signal ->
+        # surface, don't silently resolve).
+        if agree and str(correct_finding or "").strip().lower() != str(original_finding or "").strip().lower():
+            correct_finding = _more_severe(original_finding, correct_finding)
+            agree = False
+            incomplete = True
+
         return VerificationResult(
-            agree=finish_result.get("agree", False),
-            correct_finding=finish_result.get("correct_finding", original_finding),
+            agree=agree,
+            correct_finding=correct_finding,
             explanation=finish_result.get("explanation", ""),
             iterations=iterations,
             total_tokens=total_tokens,
             exploit_path=exploit_path,
             security_weakness=finish_result.get("security_weakness"),
-            incomplete=agree_missing,
+            incomplete=incomplete,
         )
 
     def _try_parse_text_response(

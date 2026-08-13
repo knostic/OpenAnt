@@ -84,3 +84,32 @@ def test_rate_limit_reports_to_global_limiter():
             max_tokens=8,
         )
     assert limiter.is_in_backoff(), "Google 429 must trigger global backoff (H1)"
+
+
+def test_present_candidate_with_empty_parts_raises_not_clean_end_turn():
+    # A candidate present with a clean STOP finish but NO usable parts (thinking-only
+    # or blank) must raise -- returning an empty end_turn reads as a clean, passing
+    # result for a security tool (silent false-negative). Mirrors the no-candidates
+    # guard and the Anthropic/OpenAI empty-content guards.
+    from types import SimpleNamespace
+    from utilities.llm import LLMResponseError
+    from utilities.llm.providers.google import _response_to_unified
+    cand = SimpleNamespace(finish_reason="STOP", content=SimpleNamespace(parts=[]))
+    resp = SimpleNamespace(candidates=[cand], usage_metadata=SimpleNamespace(
+        prompt_token_count=1, candidates_token_count=0, total_token_count=1))
+    with pytest.raises(LLMResponseError):
+        _response_to_unified(resp)
+
+
+def test_tool_use_only_candidate_is_valid_not_empty():
+    # Control: a function_call part with no text is a VALID response (content
+    # non-empty) and must NOT be caught by the empty-content guard.
+    from types import SimpleNamespace
+    from utilities.llm.providers.google import _response_to_unified
+    fc = SimpleNamespace(name="do_it", args={"x": 1}, id="g1")
+    part = SimpleNamespace(text=None, function_call=fc)
+    cand = SimpleNamespace(finish_reason="STOP", content=SimpleNamespace(parts=[part]))
+    resp = SimpleNamespace(candidates=[cand], usage_metadata=SimpleNamespace(
+        prompt_token_count=1, candidates_token_count=1, total_token_count=2))
+    result = _response_to_unified(resp)
+    assert result.content and result.stop_reason == "tool_use"

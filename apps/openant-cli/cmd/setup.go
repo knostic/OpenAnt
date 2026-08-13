@@ -54,7 +54,7 @@ var setupLLMPhases = []phaseSpec{
 // completed wizard config runs without further changes. The wizard
 // probes each provider+model pair against the real provider API
 // before saving, so a typo'd key or model ID surfaces immediately.
-var supportedProviderTypes = []string{"anthropic", "openai", "google"}
+var supportedProviderTypes = []string{"anthropic", "openai", "google", "bedrock", "openrouter"}
 
 // apiKeyHints maps a provider type to a one-line reminder shown right
 // before the wizard asks for the API key. Used to head off the common
@@ -65,7 +65,9 @@ var supportedProviderTypes = []string{"anthropic", "openai", "google"}
 // subscriptions); the map is keyed by provider so anthropic/google
 // can grow their own reminders later without touching the prompt loop.
 var apiKeyHints = map[string]string{
-	"openai": "Note: ChatGPT/Codex subscriptions do NOT include API access — get an API key at platform.openai.com (separate billing).",
+	"openai":     "Note: ChatGPT/Codex subscriptions do NOT include API access — get an API key at platform.openai.com (separate billing).",
+	"bedrock":    "Note: Bedrock uses the AWS credential chain, not an API key — leave the key BLANK and export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (+ AWS_REGION).",
+	"openrouter": "Note: create an OpenRouter API key at openrouter.ai/keys; the base URL defaults to https://openrouter.ai/api/v1.",
 }
 
 type phaseSpec struct {
@@ -523,6 +525,18 @@ func probeAllPhases(
 			probeErr = probeOpenAI(prov.APIKey, prov.BaseURL, ref.Model)
 		case "google":
 			probeErr = probeGoogle(prov.APIKey, prov.BaseURL, ref.Model)
+		case "bedrock":
+			// Bedrock authenticates via the AWS credential chain, not an API
+			// key, so there's nothing to probe here (a blank key is already
+			// SKIPPED above; this covers a non-blank value). The AWS creds are
+			// validated at scan start by the Python registry.
+			fmt.Fprintln(os.Stderr, "SKIPPED (AWS credentials)")
+			continue
+		case "openrouter":
+			// OpenRouter speaks the OpenAI wire API but on its own endpoint;
+			// probeOpenRouter defaults a blank base_url to openrouter.ai/api/v1
+			// (NOT api.openai.com) and appends /chat/completions correctly.
+			probeErr = probeOpenRouter(prov.APIKey, prov.BaseURL, ref.Model)
 		default:
 			fmt.Fprintln(os.Stderr, "SKIPPED")
 			return fmt.Errorf("provider type %q has no probe implementation yet", prov.Type)

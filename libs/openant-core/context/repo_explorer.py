@@ -38,6 +38,8 @@ from pathlib import Path
 
 from utilities.file_io import UnsafeRepoFile, read_repo_file
 from utilities.llm.adapter import (
+    LLMRefusalError,
+    LLMResponseError,
     Message,
     TextBlock,
     ToolDef,
@@ -48,6 +50,12 @@ from utilities.llm.adapter import (
 # Bounds. Chosen so a survey of a mid-sized repository completes in a few dollars
 # rather than tens, and so a pathological tree cannot run away.
 MAX_TURNS = 24
+# A blank/malformed turn (an adapter raises LLMResponseError -- e.g. an empty
+# completion, which every adapter guards) is treated as a transient: the survey
+# retries rather than aborting work already done. This many CONSECUTIVE blanks
+# are tolerated; the NEXT one re-raises, so a persistently-empty model fails
+# loudly after MAX_CONSECUTIVE_EMPTY_TURNS + 1 calls -- well short of MAX_TURNS.
+MAX_CONSECUTIVE_EMPTY_TURNS = 2
 MAX_FILE_BYTES = 40_000
 MAX_TOTAL_BYTES = 400_000
 MAX_LIST_ENTRIES = 300
@@ -267,15 +275,35 @@ def explore_repository(
     tools = [*EXPLORATION_TOOLS, finish_tool]
     messages = [Message(role="user", content=(TextBlock(text=task_prompt),))]
 
+    consecutive_empty = 0
     while budget.turns < MAX_TURNS:
         budget.turns += 1
-        response = binding.adapter.complete(
-            model=binding.model,
-            system=system_prompt,
-            messages=messages,
-            max_tokens=MAX_TOKENS_PER_TURN,
-            tools=tools,
-        )
+        try:
+            response = binding.adapter.complete(
+                model=binding.model,
+                system=system_prompt,
+                messages=messages,
+                max_tokens=MAX_TOKENS_PER_TURN,
+                tools=tools,
+            )
+        except LLMRefusalError:
+            # A deliberate refusal / content-filter is NOT transient: propagate it
+            # so a safety signal is never silently churned past. (Caught before the
+            # broader LLMResponseError below since it is a subclass.)
+            raise
+        except LLMResponseError:
+            # A structurally-bad turn -- most often an empty completion, also a
+            # missing usage block or malformed tool_use -- must not abort a survey
+            # that may already have read useful context. Retry the SAME messages
+            # (appending nothing keeps the user/assistant roles alternating). This
+            # helps a transient blank; a deterministic malformation just re-raises
+            # once the consecutive count exceeds the cap (bounded, well short of
+            # MAX_TURNS). A refusal is caught above and never reaches here.
+            consecutive_empty += 1
+            if consecutive_empty > MAX_CONSECUTIVE_EMPTY_TURNS:
+                raise
+            continue
+        consecutive_empty = 0
         assistant_content = tuple(response.content)
         results: list[ToolResultBlock] = []
 
@@ -283,6 +311,25 @@ def explore_repository(
             if not isinstance(block, ToolUseBlock):
                 continue
             if block.name == finish_tool.name:
+                # R3-A: a finish call on a turn TRUNCATED at the token cap
+                # (stop_reason=="max_tokens") may carry partial arguments — accepting
+                # it writes an under-scoped application-context / threat-model doc that
+                # every later scan trusts (silent coverage loss). Don't accept it.
+                # R4-1: but the Messages API requires a tool_result for every tool_use,
+                # so ANSWER this finish's tool_use with a retry nudge (rather than
+                # skipping it unanswered, which 400s the next turn) — the loop then
+                # asks for a complete finish and, failing that, exhausts MAX_TURNS and
+                # raises (a visible failure, not a silent partial). Mirrors the
+                # verifier + enhancer max_tokens gate.
+                if getattr(response, "stop_reason", None) == "max_tokens":
+                    results.append(ToolResultBlock(
+                        tool_use_id=block.id, name=block.name,
+                        content=json.dumps({
+                            "error": "Your finish call was cut off at the token limit; "
+                                     "reply again with a complete but more concise finish call."
+                        }),
+                    ))
+                    continue
                 return dict(block.input or {}), budget
             outcome = explorer.execute(block.name, block.input or {})
             results.append(ToolResultBlock(

@@ -40,6 +40,7 @@ _COMMENT_PREFIX = {
     "cpp": "//",
     "php": "//",
     "zig": "//",
+    "rust": "//",
 }
 
 _DEFAULT_PREFIX = "//"

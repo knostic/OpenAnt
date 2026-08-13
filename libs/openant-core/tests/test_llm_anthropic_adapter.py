@@ -180,9 +180,13 @@ class TestRequestTranslation:
 
 
 class TestResponseTranslation:
-    def test_unknown_stop_reason_normalised_to_end_turn(self):
-        # Future SDK adding a new stop reason must not crash the
-        # pipeline. The adapter falls back to "end_turn" defensively.
+    def test_unknown_stop_reason_treated_as_max_tokens(self):
+        # R2-C: a future/unknown/proxy stop_reason must not read as a clean
+        # end_turn — for a security tool that masks a refusal/abnormal
+        # termination as a finished completion. The adapter defaults it to
+        # "max_tokens" (a not-a-clean-finish signal), mirroring the OpenAI
+        # adapter. Known values (end_turn/max_tokens/tool_use/stop_sequence)
+        # keep their explicit mapping.
         adapter, _ = _stub_adapter(
             lambda **kw: _ok_response(stop_reason="future_invention")
         )
@@ -192,7 +196,7 @@ class TestResponseTranslation:
             messages=[Message(role="user", content=[TextBlock("hi")])],
             max_tokens=8,
         )
-        assert result.stop_reason == "end_turn"
+        assert result.stop_reason == "max_tokens"
 
     def test_tool_use_block_extracted_from_response(self):
         def respond(**kw):

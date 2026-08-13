@@ -85,7 +85,7 @@ _warned_block_kinds: set[str] = set()
 _warned_block_kinds_lock = threading.Lock()
 
 
-def _warn_unknown_block_kind(kind: str) -> None:
+def _warn_unknown_block_kind(kind: str, *, adapter: str = "AnthropicAdapter") -> None:
     """One-time stderr warning when the response carries a content-block
     kind the adapter doesn't translate, so a dropped block isn't silent."""
     should_warn = False
@@ -95,7 +95,7 @@ def _warn_unknown_block_kind(kind: str) -> None:
             should_warn = True
     if should_warn:
         sys.stderr.write(
-            f"warning: AnthropicAdapter received unknown content block "
+            f"warning: {adapter} received unknown content block "
             f"kind {kind!r}; dropping it. If the pipeline should consume "
             f"this, add a ContentBlock kind in utilities/llm/adapter.py "
             f"and translate it here.\n"
@@ -308,8 +308,15 @@ def _tool_to_anthropic(tool: ToolDef) -> dict[str, Any]:
     }
 
 
-def _response_to_unified(response: Any) -> CompletionResult:
-    """Translate an anthropic SDK ``Message`` object into our types."""
+def _response_to_unified(
+    response: Any, *, adapter: str = "AnthropicAdapter"
+) -> CompletionResult:
+    """Translate an anthropic SDK ``Message`` object into our types.
+
+    ``adapter`` labels error/warning text so a derivative adapter that reuses
+    this translation (e.g. Bedrock) attributes failures to itself, not to
+    ``AnthropicAdapter``.
+    """
     content_blocks: list[ContentBlock] = []
     for block in response.content:
         kind = getattr(block, "type", None)
@@ -330,7 +337,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
             # symptom isn't silent. For a security tool, a silently
             # dropped "refusal" paired with a benign stop_reason could
             # read as an empty success.
-            _warn_unknown_block_kind(str(kind))
+            _warn_unknown_block_kind(str(kind), adapter=adapter)
 
     # R4-5: a usage-less response (rare, but seen on some proxies and on
     # error-shaped 200s) must not AttributeError here — the downstream
@@ -343,7 +350,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
     # text). Anthropic reports this as ``stop_reason == "refusal"``.
     if raw_stop == _ANTHROPIC_REFUSAL_STOP_REASON:
         raise LLMRefusalError(
-            "Anthropic refused the request (stop_reason='refusal'); the "
+            f"{adapter} refused the request (stop_reason='refusal'); the "
             "model declined to answer for safety or policy reasons"
         )
 
@@ -358,7 +365,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
     # here because ``content_blocks`` is non-empty.
     if not content_blocks:
         raise LLMResponseError(
-            "Anthropic returned no usable content (empty completion); the "
+            f"{adapter} returned no usable content (empty completion); the "
             "request may have been filtered or the response was malformed"
         )
 
@@ -376,16 +383,20 @@ def _response_to_unified(response: Any) -> CompletionResult:
                 should_warn = True
         if should_warn:
             sys.stderr.write(
-                f"warning: AnthropicAdapter received unknown stop_reason "
-                f"{raw_stop!r}; normalising to 'end_turn'. Add this value "
-                f"to StopReason in utilities/llm/adapter.py and the "
+                f"warning: {adapter} received unknown stop_reason "
+                f"{raw_stop!r}; treating as 'max_tokens' (not a clean finish). "
+                f"Add this value to StopReason in utilities/llm/adapter.py and the "
                 f"_ANTHROPIC_STOP_REASONS table if it's a new SDK addition.\n"
             )
     return CompletionResult(
         content=content_blocks,
         input_tokens=getattr(usage, "input_tokens", 0),
         output_tokens=getattr(usage, "output_tokens", 0),
-        stop_reason=_ANTHROPIC_STOP_REASONS.get(raw_stop, "end_turn"),
+        # R2-C: an unknown/abnormal stop_reason defaults to "max_tokens" (not
+        # "end_turn") — as the warning above notes, treating a refusal/abnormal
+        # termination as end_turn masks false negatives. Known values (end_turn/
+        # max_tokens/tool_use/stop_sequence) use their explicit mapping.
+        stop_reason=_ANTHROPIC_STOP_REASONS.get(raw_stop, "max_tokens"),
         raw=response,
     )
 

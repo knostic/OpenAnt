@@ -172,6 +172,23 @@ def test_empty_choices_raises_llm_response_error():
         adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
 
 
+def test_empty_content_raises_llm_response_error():
+    # A choice with neither text nor tool calls is an empty completion: it must
+    # surface via the taxonomy, not read as a clean end_turn. Parity with the
+    # Responses path's no-usable-content guard and the Anthropic/Gemini adapters
+    # -- for a security tool an empty end_turn would read as a clean pass.
+    empty = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=None, tool_calls=None),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=0),
+    )
+    adapter, _ = _stub(lambda **kw: empty)
+    with pytest.raises(LLMResponseError):
+        adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
+
+
 # ---------------------------------------------------------------------------
 # L3 — pricing table carries current models so they don't report $0
 # ---------------------------------------------------------------------------
@@ -214,3 +231,440 @@ def test_complete_consults_limiter_before_request(monkeypatch):
     )
     adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
     assert seen["waited"], "complete() must call wait_if_needed before the request (H1)"
+
+
+# ===========================================================================
+# Responses API (/v1/responses) — gpt-5+ path
+# ===========================================================================
+
+from utilities.llm import LLMRefusalError, ToolDef, ToolResultBlock, ToolUseBlock
+from utilities.llm.providers.openai import (
+    _use_responses_api,
+    _is_reasoning_model,
+    _token_param,
+    _RESPONSES_MIN_OUTPUT_TOKENS,
+    _messages_to_responses,
+    _tool_to_responses,
+)
+
+G5 = "gpt-5.6"
+
+
+def _resp(*, status="completed", output=None, input_tokens=7, output_tokens=11,
+          incomplete_reason=None, error=None):
+    return SimpleNamespace(
+        status=status,
+        output=output or [],
+        usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens),
+        incomplete_details=(SimpleNamespace(reason=incomplete_reason)
+                            if incomplete_reason else None),
+        error=error,
+    )
+
+
+def _msg_item(*parts):
+    return SimpleNamespace(type="message", content=list(parts))
+
+
+def _text_part(text):
+    return SimpleNamespace(type="output_text", text=text)
+
+
+def _refusal_part(text):
+    return SimpleNamespace(type="refusal", refusal=text)
+
+
+def _fncall(*, call_id, name, arguments):
+    return SimpleNamespace(type="function_call", call_id=call_id, name=name, arguments=arguments)
+
+
+def _reasoning():
+    return SimpleNamespace(type="reasoning", encrypted_content="opaque")
+
+
+def _stub_resp(side_effect, *, use_responses_api=None):
+    client = MagicMock(spec=openai.OpenAI)
+    client.responses = MagicMock()
+    client.responses.create = MagicMock(side_effect=side_effect)
+    client.chat = MagicMock()
+    client.chat.completions = MagicMock()
+    client.chat.completions.create = MagicMock(side_effect=AssertionError(
+        "chat.completions must NOT be called on the responses path"))
+    return OpenAIAdapter(_client=client, use_responses_api=use_responses_api), client
+
+
+def _tools():
+    return [ToolDef(name="echo", description="Echo the text.",
+                    input_schema={"type": "object", "properties": {"text": {"type": "string"}},
+                                  "required": ["text"]})]
+
+
+# --- gate --------------------------------------------------------------------
+
+def test_gate_predicates_partition_models():
+    assert _use_responses_api("gpt-5.6", None) is True
+    assert _use_responses_api("gpt-5", None) is True
+    assert _use_responses_api("openai/gpt-6", None) is True
+    assert _use_responses_api("gpt-4o", None) is False
+    assert _use_responses_api("gpt-4o-mini", None) is False
+    assert _use_responses_api("o3", None) is False          # o-series stays on chat
+    # ctor override wins either way (base_url proxies)
+    assert _use_responses_api("gpt-4o", True) is True
+    assert _use_responses_api("gpt-5.6", False) is False
+
+
+def test_gpt5_chat_variants_chat_endpoint_but_completion_tokens():
+    # Live-verified (gpt-5.2-chat-latest): the gpt-5 chat variants reject the reasoning
+    # param, so they are served on Chat Completions (NOT /v1/responses) — but the gpt-5
+    # generation there requires max_completion_tokens (max_tokens 400s). So endpoint=chat,
+    # token-param/role = the reasoning-class shape (max_completion_tokens + developer).
+    for m in ("gpt-5-chat-latest", "gpt-5.2-chat-latest", "gpt-5-chat"):
+        assert _use_responses_api(m, None) is False
+        assert _is_reasoning_model(m) is True
+        assert _token_param(m) == "max_completion_tokens"
+
+
+def test_gpt5_search_variants_chat_endpoint_and_max_tokens():
+    # Live-verified (gpt-5-search-api): served on Chat Completions with max_tokens (accepts
+    # max_tokens, rejected by the Responses API) — like gpt-4o-search-preview. So endpoint=chat
+    # AND the plain-chat token shape (max_tokens + system), distinct from the chat variants.
+    for m in ("gpt-5-search-api", "gpt-5-search-api-2025-10-14"):
+        assert _use_responses_api(m, None) is False
+        assert _is_reasoning_model(m) is False
+        assert _token_param(m) == "max_tokens"
+
+
+def test_gpt5_reasoning_variants_stay_on_responses():
+    # guard the other side: real reasoning-family ids must NOT be excluded by the
+    # non-reasoning filter (no "-chat"/"-search" substring in them).
+    for m in ("gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-codex", "gpt-5-pro", "gpt-5.6-sol"):
+        assert _use_responses_api(m, None) is True
+        assert _is_reasoning_model(m) is True
+
+
+def test_gpt5_family_boundary_and_whitespace():
+    # C3: unrelated numbering (gpt-50) is not the gpt-5..gpt-9 family; ids are whitespace-trimmed.
+    assert _use_responses_api("gpt-50", None) is False
+    assert _use_responses_api("gpt-5 ", None) is True      # trailing space
+    assert _use_responses_api(" gpt-5", None) is True      # leading space
+    # real reasoning family still routes to responses and classifies as reasoning
+    assert _use_responses_api("gpt-5.6", None) is True
+    assert _use_responses_api("gpt-5-mini", None) is True
+    assert _is_reasoning_model("gpt-5-mini") is True
+
+
+def test_gpt5_routes_to_responses_not_chat():
+    adapter, client = _stub_resp(lambda **kw: _resp(output=[_msg_item(_text_part("hello"))]))
+    r = adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=4096)
+    client.responses.create.assert_called_once()
+    client.chat.completions.create.assert_not_called()
+    assert [b.text for b in r.content] == ["hello"]
+    assert r.stop_reason == "end_turn"
+    assert (r.input_tokens, r.output_tokens) == (7, 11)     # responses usage fields
+
+
+def test_gpt4o_stays_on_chat_not_responses():
+    client = MagicMock(spec=openai.OpenAI)
+    client.chat = MagicMock(); client.chat.completions = MagicMock()
+    client.chat.completions.create = MagicMock(side_effect=lambda **kw: _text_response())
+    client.responses = MagicMock()
+    client.responses.create = MagicMock(side_effect=AssertionError("gpt-4o must not use responses"))
+    adapter = OpenAIAdapter(_client=client)
+    adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
+    client.responses.create.assert_not_called()
+
+
+def test_override_forces_responses_for_gpt4o():
+    adapter, client = _stub_resp(lambda **kw: _resp(output=[_msg_item(_text_part("ok"))]),
+                                 use_responses_api=True)
+    adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
+    client.responses.create.assert_called_once()
+
+
+# --- request shape -----------------------------------------------------------
+
+def test_request_shape_floor_effort_store_instructions():
+    adapter, client = _stub_resp(lambda **kw: _resp(output=[_msg_item(_text_part("x"))]))
+    adapter.complete(model=G5, system="be careful", messages=_hi(), max_tokens=4096, tools=_tools())
+    kw = client.responses.create.call_args.kwargs
+    assert kw["max_output_tokens"] == _RESPONSES_MIN_OUTPUT_TOKENS   # floored up from 4096
+    assert kw["reasoning"] == {"effort": "medium"}
+    assert kw["store"] is False
+    assert kw["instructions"] == "be careful"
+    assert kw["tools"][0] == {"type": "function", "name": "echo",
+                              "description": "Echo the text.",
+                              "parameters": _tools()[0].input_schema, "strict": False}
+
+
+def test_tools_omitted_when_none():
+    # helpers.simple_text calls complete() with no tools; must not send tools=[]
+    adapter, client = _stub_resp(lambda **kw: _resp(output=[_msg_item(_text_part("x"))]))
+    adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert "tools" not in client.responses.create.call_args.kwargs
+
+
+def test_reasoning_effort_configurable():
+    adapter, client = _stub_resp(lambda **kw: _resp(output=[_msg_item(_text_part("x"))]))
+    adapter._reasoning_effort = "low"
+    adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert client.responses.create.call_args.kwargs["reasoning"] == {"effort": "low"}
+
+
+# --- tool round-trip (the agentic loop) --------------------------------------
+
+def test_tool_call_parsed_as_tooluseblock():
+    adapter, _ = _stub_resp(lambda **kw: _resp(
+        output=[_reasoning(), _fncall(call_id="call_1", name="echo", arguments='{"text":"hi"}')]))
+    r = adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8, tools=_tools())
+    assert r.stop_reason == "tool_use"
+    tus = [b for b in r.content if isinstance(b, ToolUseBlock)]
+    assert len(tus) == 1 and tus[0].id == "call_1" and tus[0].name == "echo"
+    assert tus[0].input == {"text": "hi"}
+
+
+def test_tool_result_roundtrips_to_function_call_output():
+    msgs = [
+        Message(role="user", content=[TextBlock("go")]),
+        Message(role="assistant", content=[ToolUseBlock(id="call_9", name="echo", input={"text": "hi"})]),
+        Message(role="user", content=[ToolResultBlock(tool_use_id="call_9", content="RESULT", name="echo")]),
+    ]
+    items = _messages_to_responses(msgs)
+    # ordering: user text, then assistant function_call, then function_call_output
+    fc = [i for i in items if i.get("type") == "function_call"]
+    fco = [i for i in items if i.get("type") == "function_call_output"]
+    assert fc and fc[0]["call_id"] == "call_9" and fc[0]["arguments"] == '{"text": "hi"}'
+    assert fco and fco[0]["call_id"] == "call_9" and fco[0]["output"] == "RESULT"
+
+
+def test_parallel_tool_calls():
+    adapter, _ = _stub_resp(lambda **kw: _resp(output=[
+        _fncall(call_id="c1", name="echo", arguments='{"text":"a"}'),
+        _fncall(call_id="c2", name="echo", arguments='{"text":"b"}'),
+    ]))
+    r = adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8, tools=_tools())
+    ids = [b.id for b in r.content if isinstance(b, ToolUseBlock)]
+    assert ids == ["c1", "c2"]
+
+
+def test_user_turn_orders_tool_output_before_text():
+    msgs = [Message(role="user", content=[
+        ToolResultBlock(tool_use_id="c1", content="R"), TextBlock("and now this")])]
+    items = _messages_to_responses(msgs)
+    assert items[0]["type"] == "function_call_output"
+    assert items[1]["role"] == "user"
+
+
+# --- safety guards (the silent-clean-pass failure modes) ---------------------
+
+def test_refusal_in_message_content_raises():
+    adapter, _ = _stub_resp(lambda **kw: _resp(output=[_msg_item(_refusal_part("nope"))]))
+    with pytest.raises(LLMRefusalError):
+        adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+
+
+def test_content_filter_incomplete_raises_refusal():
+    adapter, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason="content_filter",
+                                               output=[]))
+    with pytest.raises(LLMRefusalError):
+        adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+
+
+def test_empty_output_raises_response_error():
+    adapter, _ = _stub_resp(lambda **kw: _resp(output=[_reasoning()]))   # reasoning only, no content
+    with pytest.raises(LLMResponseError):
+        adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+
+
+def test_failed_status_raises_response_error():
+    adapter, _ = _stub_resp(lambda **kw: _resp(status="failed",
+                                               error=SimpleNamespace(message="boom"), output=[]))
+    with pytest.raises(LLMResponseError):
+        adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+
+
+def test_incomplete_max_tokens_sets_stop_reason():
+    adapter, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason="max_output_tokens",
+                                               output=[_msg_item(_text_part("partial"))]))
+    r = adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert r.stop_reason == "max_tokens"
+
+
+# --- BUG-2: abnormal status / unknown incomplete-reason must NOT read as a clean end_turn ----
+# A truncated/abnormal response carrying PARTIAL content must not be laundered into a clean
+# stop_reason="end_turn" (a silent false-negative for a SAST tool). It is relabelled "max_tokens"
+# (the honest "not a clean finish" signal) and a one-time stderr warning is emitted, mirroring the
+# chat path's unknown-finish_reason handling. Empty-content abnormal responses still RAISE.
+
+def test_incomplete_unknown_reason_with_partial_is_not_clean_end_turn():
+    # incomplete + reason absent (incomplete_details=None) + partial text
+    adapter, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason=None,
+                                               output=[_msg_item(_text_part("truncated: no issues fou"))]))
+    r = adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert r.stop_reason != "end_turn"          # must NOT launder to a clean finish
+    assert r.stop_reason == "max_tokens"
+    assert [b.text for b in r.content] == ["truncated: no issues fou"]   # content preserved
+
+
+def test_incomplete_other_reason_with_partial_is_not_clean_end_turn():
+    adapter, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason="other",
+                                               output=[_msg_item(_text_part("partial"))]))
+    r = adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert r.stop_reason == "max_tokens"
+
+
+def test_unknown_top_level_status_with_partial_is_not_clean_end_turn():
+    adapter, _ = _stub_resp(lambda **kw: _resp(status="in_progress",
+                                               output=[_msg_item(_text_part("looks clean"))]))
+    r = adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert r.stop_reason != "end_turn"
+    assert r.stop_reason == "max_tokens"
+
+
+def test_bug2_regression_guards_still_hold():
+    # (1) completed + text → clean end_turn (unchanged)
+    a1, _ = _stub_resp(lambda **kw: _resp(status="completed", output=[_msg_item(_text_part("done"))]))
+    assert a1.complete(model=G5, system=None, messages=_hi(), max_tokens=8).stop_reason == "end_turn"
+    # (2) incomplete + content_filter → refusal (unchanged)
+    a2, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason="content_filter", output=[]))
+    with pytest.raises(LLMRefusalError):
+        a2.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    # (3) failed → response error (unchanged)
+    a3, _ = _stub_resp(lambda **kw: _resp(status="failed", error=SimpleNamespace(message="boom"), output=[]))
+    with pytest.raises(LLMResponseError):
+        a3.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    # (4) incomplete + max_output_tokens + text → max_tokens (unchanged)
+    a4, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason="max_output_tokens",
+                                          output=[_msg_item(_text_part("partial"))]))
+    assert a4.complete(model=G5, system=None, messages=_hi(), max_tokens=8).stop_reason == "max_tokens"
+    # (5) abnormal status but EMPTY content → still RAISES (empty-content guard intact)
+    a5, _ = _stub_resp(lambda **kw: _resp(status="in_progress", output=[]))
+    with pytest.raises(LLMResponseError):
+        a5.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+
+
+# --- BUG-7: chat-path unknown finish_reason must not read as a clean end_turn ---
+# The chat-path analog of BUG-2: an unknown/proxy finish_reason (or a future OpenAI
+# value) carrying partial content is relabelled "max_tokens" (the honest not-a-clean-
+# finish signal) instead of a silent "end_turn". Known reasons are unchanged.
+
+def _chat_resp(*, content="hi", finish_reason="stop"):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None),
+                                 finish_reason=finish_reason)],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+    )
+
+
+def test_chat_unknown_finish_reason_is_not_clean_end_turn():
+    adapter, _ = _stub(lambda **kw: _chat_resp(content="truncated: no issues fou", finish_reason="abort"))
+    r = adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8)
+    assert r.stop_reason == "max_tokens"          # was a silent "end_turn"
+    assert [b.text for b in r.content] == ["truncated: no issues fou"]   # content preserved
+
+
+def test_chat_known_finish_reasons_unchanged():
+    # regression guard: BUG-7 changes ONLY the unknown-default; known reasons use their map.
+    for fr, expected in (("stop", "end_turn"), ("length", "max_tokens")):
+        adapter, _ = _stub(lambda fr=fr, **kw: _chat_resp(finish_reason=fr))
+        assert adapter.complete(model="gpt-4o", system=None, messages=_hi(), max_tokens=8).stop_reason == expected
+
+
+# --- validate gating ---------------------------------------------------------
+
+def test_validate_gpt5_uses_responses_endpoint():
+    adapter, client = _stub_resp(lambda **kw: _resp(output=[_msg_item(_text_part("OK"))]))
+    adapter.validate(G5)
+    client.responses.create.assert_called_once()
+    client.chat.completions.create.assert_not_called()
+    # BUG-1: the ping exercises the SAME reasoning effort complete() will send,
+    # so a model-rejected effort fails fast at init instead of 400-ing every unit.
+    assert client.responses.create.call_args.kwargs["reasoning"] == {"effort": "medium"}
+
+
+def test_validate_gpt5_fails_fast_on_model_rejected_effort():
+    # BUG-1: a model that rejects the configured reasoning effort must fail init,
+    # not pass validation and then 400 every single unit of the scan.
+    def reject_minimal(**kw):
+        if kw.get("reasoning", {}).get("effort") == "minimal":
+            raise openai.BadRequestError(
+                message="Unsupported value: 'minimal' is not supported for this model",
+                response=_fake_http(400), body=None)
+        return _resp(output=[_msg_item(_text_part("OK"))])
+    client = MagicMock(spec=openai.OpenAI)
+    client.responses = MagicMock(); client.responses.create = MagicMock(side_effect=reject_minimal)
+    client.chat = MagicMock(); client.chat.completions = MagicMock()
+    client.chat.completions.create = MagicMock(side_effect=AssertionError("must probe responses, not chat"))
+    adapter = OpenAIAdapter(_client=client, reasoning_effort="minimal")
+    with pytest.raises(LLMResponseError):
+        adapter.validate(G5)
+
+
+def test_validate_gpt4o_uses_chat_endpoint():
+    adapter, client = _stub(lambda **kw: _text_response())
+    adapter.validate("gpt-4o")
+    assert client.chat.completions.create.call_args.kwargs.get("max_tokens") == 1
+
+
+# --- error taxonomy parity on the responses path -----------------------------
+
+def test_responses_429_reports_to_global_limiter():
+    def boom(**kw):
+        raise openai.RateLimitError(message="slow", response=_fake_http(429, retry_after="5"), body=None)
+    adapter, _ = _stub_resp(boom)
+    limiter = get_rate_limiter()
+    with pytest.raises(LLMRateLimitError):
+        adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert limiter.is_in_backoff(), "responses 429 must trigger global backoff too"
+
+
+# ---------------------------------------------------------------------------
+# Coupling fix: gpt-5+ is reasoning-class, so a gpt-5 forced onto the CHAT
+# path (use_responses_api=False, a proxy escape hatch) must still get
+# max_completion_tokens + the developer role — not max_tokens + system,
+# which 400s a reasoning model. Endpoint choice and token-param/role choice
+# must agree. (judge ruling A)
+# ---------------------------------------------------------------------------
+
+
+def _stub_chat_forced(side_effect):
+    """A chat-path adapter with use_responses_api=False (forces gpt-5 to chat)."""
+    client = MagicMock(spec=openai.OpenAI)
+    client.chat = MagicMock()
+    client.chat.completions = MagicMock()
+    client.chat.completions.create = MagicMock(side_effect=side_effect)
+    return OpenAIAdapter(_client=client, use_responses_api=False), client
+
+
+@pytest.mark.parametrize("model", ["gpt-5", "gpt-5.6", "openai/gpt-6"])
+def test_gpt5_forced_to_chat_uses_max_completion_tokens(model):
+    adapter, client = _stub_chat_forced(lambda **kw: _text_response())
+    adapter.complete(model=model, system=None, messages=_hi(), max_tokens=64)
+    kw = client.chat.completions.create.call_args.kwargs
+    assert kw.get("max_completion_tokens") == 64, f"{model}: gpt-5 on chat needs max_completion_tokens"
+    assert "max_tokens" not in kw, f"{model}: gpt-5 rejects max_tokens"
+
+
+@pytest.mark.parametrize("model", ["gpt-5", "gpt-5.6", "openai/gpt-6"])
+def test_gpt5_forced_to_chat_routes_system_to_developer(model):
+    adapter, client = _stub_chat_forced(lambda **kw: _text_response())
+    adapter.complete(model=model, system="be careful", messages=_hi(), max_tokens=8)
+    roles = [m["role"] for m in client.chat.completions.create.call_args.kwargs["messages"]]
+    assert "developer" in roles, f"{model}: gpt-5 needs a developer role"
+    assert "system" not in roles, f"{model}: gpt-5 rejects the system role"
+
+
+@pytest.mark.parametrize("model", ["gpt-5", "gpt-6", "gpt-9", "openai/gpt-5.6", "gpt-5.6"])
+def test_gpt5_bare_and_prefixed_treated_as_reasoning(model):
+    assert _is_reasoning_model(model) is True
+
+
+@pytest.mark.parametrize("model", ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4-turbo"])
+def test_gpt4x_still_not_reasoning(model):
+    assert _is_reasoning_model(model) is False
+
+
+def test_gpt5_default_route_still_responses():
+    # No override: a gpt-5 still routes to /v1/responses (unchanged by the fix).
+    adapter, client = _stub_resp(lambda **kw: _resp(output=[_msg_item(_text_part("ok"))]))
+    adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=4096)
+    client.responses.create.assert_called_once()

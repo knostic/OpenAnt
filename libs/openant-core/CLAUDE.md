@@ -21,7 +21,7 @@ The symlink automatically picks up the new binary. Running `make install` would 
 
 # Project Context
 
-This is OpenAnt, a two-stage SAST tool using Claude for vulnerability analysis. Supports Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Zig, and Swift codebases with 4-level cost optimization.
+This is OpenAnt, a two-stage SAST tool using Claude for vulnerability analysis. Supports Python, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Zig, Swift, and Rust codebases with 4-level cost optimization.
 
 **Key files to read after context reset:**
 - `DOCUMENTATION.md` - **Start here** - Index of all documentation

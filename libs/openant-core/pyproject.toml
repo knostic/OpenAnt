@@ -5,10 +5,15 @@ description = "Two-stage SAST tool using Claude for vulnerability analysis"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=0.40.0",
-    # openai adapter sends ``max_completion_tokens`` (reasoning models),
-    # added to the SDK in 1.45.0.
-    "openai>=1.45.0",
+    # The ``[bedrock]`` extra pulls boto3, which ``anthropic.AnthropicBedrock``
+    # needs to resolve AWS credentials and SigV4-sign requests (the Bedrock
+    # adapter constructs fine without it, but a real call fails without boto3).
+    "anthropic[bedrock]>=0.40.0",
+    # openai adapter uses the Responses API (``client.responses.create`` with
+    # ``reasoning``/``max_output_tokens``/``store``) for the gpt-5+ path AND
+    # ``max_completion_tokens`` for o-series on Chat Completions. Both are 2.x
+    # SDK surface; pin the floor to a version that ships a stable Responses API.
+    "openai>=2.2.0",
     # google adapter uses keyword-only ``Part.from_text(text=...)`` and
     # ``HttpOptions(base_url=...)``, both stabilised in google-genai 1.0.0.
     "google-genai>=1.0.0",
@@ -24,6 +29,7 @@ dependencies = [
     "tree-sitter-php>=0.22.0",
     "tree-sitter-zig>=1.1.2",
     "tree-sitter-swift>=0.7.3",
+    "tree-sitter-rust>=0.21.0",
 ]
 
 [project.optional-dependencies]

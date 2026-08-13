@@ -28,7 +28,7 @@ flowchart TB
     subgraph py["Python engine — libs/openant-core"]
         cli["openant/cli.py<br/>argparse + cmd_* entry points"]
         scanner["core/scanner.py<br/>orchestration"]
-        parsers["parsers/&lt;lang&gt;/<br/>7 language front-ends"]
+        parsers["parsers/&lt;lang&gt;/<br/>9 language front-ends"]
         ctx["context/<br/>app context + threat model"]
         prompts["prompts/<br/>Stage 1 + Stage 2 prompt construction"]
         llm["utilities/llm/<br/>provider adapters, rate limit, cost"]

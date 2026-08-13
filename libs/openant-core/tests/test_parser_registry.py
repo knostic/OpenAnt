@@ -117,11 +117,17 @@ class TestUnsupportedLanguageError:
         for language in supported_languages():
             assert language in message
 
-    def test_rust_is_rejected(self, tmp_path):
-        """parsers/rust/ exists on disk but is dead (only __pycache__)."""
-        (tmp_path / "a.py").write_text("x")
-        with pytest.raises(ValueError, match="Unsupported language: rust"):
-            parse_repository(str(tmp_path), str(tmp_path / "out"), language="rust")
+    def test_rust_is_supported(self):
+        """Rust is now a registered subprocess parser, not a rejected language.
+
+        (Was `test_rust_is_rejected`, asserting parse_repository raised
+        "Unsupported language: rust" while parsers/rust/ was a dead stub.
+        Flipped when the parser was implemented and registered.)
+        """
+        assert "rust" in supported_languages()
+        # It resolves to the generic subprocess parser like every other
+        # non-Python language, without needing a hand-written dispatch alias.
+        assert callable(_parser_for("rust"))
 
 
 class TestSubprocessParserGuard:
