@@ -3326,6 +3326,189 @@ class TestOneHopDependencyExpansion:
 
 
 # ---------------------------------------------------------------------------
+# Resolved target-symbol files widen preferred_files
+#
+# The structural gap this closes: preferred_files (which bounds every usage/
+# consumer scan below) was seeded ONLY from strategy.target_files --
+# a field the Final Strategy LLM authors completely independently of
+# target_symbols (see generate_remediation_strategy's two separate
+# plan.get(...) reads). Category 1's own symbol resolution
+# (_resolve_symbol_details) never consulted preferred_files at all -- it
+# searches the whole repository index/constants table directly -- so a
+# symbol could resolve successfully while the file it lives in stayed
+# completely outside the usage scan's search boundary, hiding any function
+# in that same file that directly references it. This is NOT proven to be
+# the exact mechanism behind any specific historical run (no run logs were
+# inspected) -- it is a structural gap demonstrated directly against the
+# current implementation below.
+# ---------------------------------------------------------------------------
+
+class TestResolvedSymbolFileWidensPreferredFiles:
+    """Generic fixture (no urllib3/CVE-specific naming) reproducing the
+    structural gap end-to-end and proving the fix closes it, without adding
+    any constructor-specific rule: a plain function in the same file that
+    references the resolved symbol is found by the SAME existing, unmodified
+    _lookup_identifier_usages/_extract_strategy_identifiers mechanism --
+    only the file-scope boundary fed into it changed."""
+
+    def _context(self, tmp_path, usage_code, usage_label, start_line, end_line, gap=""):
+        """`gap` (default "", so every existing caller is unaffected) inserts
+        extra filler lines between the constant and the usage function --
+        same convention as TestOneHopDependencyExpansion._retry_style_context,
+        needed to keep the constant's own _DEFINITION_CONTEXT_LINES-padded
+        render window from bleeding into a deliberately UNRELATED function in
+        this otherwise tiny fixture (see the negative-control test below)."""
+        pkg_dir = tmp_path / "pkg"
+        pkg_dir.mkdir(exist_ok=True)
+        widget_py = pkg_dir / "widget.py"
+        widget_py.write_text(
+            f"class Widget:\n    CLASS_DEFAULT = \"MixedCase\"\n\n{gap}{usage_code}",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={
+                f"pkg/widget.py:{usage_label}": {
+                    "name": usage_label.rsplit(".", 1)[-1],
+                    "className": usage_label.rsplit(".", 1)[0] if "." in usage_label else None,
+                    "startLine": start_line, "endLine": end_line, "code": usage_code,
+                },
+            },
+            constants={
+                "pkg/widget.py": {
+                    "Widget.CLASS_DEFAULT": {
+                        "qualified_name": "Widget.CLASS_DEFAULT", "class_name": "Widget",
+                        "name": "CLASS_DEFAULT", "line": 2, "end_line": 2,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+        return context
+
+    # -- 1. Critical test: reproduce the structural gap directly, at the
+    # bounded primitive itself, independent of build_final_target_slice.
+    # This characterizes exactly what the pre-fix build_final_target_slice
+    # code path would have hit: a usage scan bounded to a file list that
+    # does not contain the resolved symbol's own file finds nothing, no
+    # matter how the identifier is spelled.
+    def test_bounded_usage_scan_misses_the_file_when_absent_from_scope(self, tmp_path):
+        init_code = (
+            "    def __init__(self, value=CLASS_DEFAULT):\n"
+            "        self.runtime_value = normalize(value)\n"
+        )
+        context = self._context(tmp_path, init_code, "Widget.__init__", 4, 5)
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_usages
+        # pkg/widget.py is deliberately NOT in the search scope here.
+        found = _lookup_identifier_usages("CLASS_DEFAULT", [], context)
+        assert found == []
+
+    # -- 2. End-to-end proof the fix closes it: verified target symbol
+    # resolves to pkg/widget.py; strategy.target_files and
+    # planner_evidence_files both omit it; strategy prose never repeats the
+    # symbol name either (so discovery cannot be attributed to prose
+    # extraction). The constructor's normalization is still surfaced.
+    def test_resolved_symbol_file_becomes_searchable_and_constructor_usage_is_surfaced(self, tmp_path):
+        init_code = (
+            "    def __init__(self, value=CLASS_DEFAULT):\n"
+            "        self.runtime_value = normalize(value)\n"
+        )
+        context = self._context(tmp_path, init_code, "Widget.__init__", 4, 5)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=[],  # deliberately does NOT name pkg/widget.py
+            target_symbols=["Widget.CLASS_DEFAULT"],
+            extended_mechanism="An unrelated narrative that never repeats the symbol name.",
+        )
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=[],
+        )
+
+        assert "Widget.CLASS_DEFAULT" in result.covered_target_symbols
+        assert "Widget.__init__" in result.rendered
+        assert "self.runtime_value = normalize(value)" in result.rendered
+        assert "Discovered consumer" in result.rendered
+
+    # -- 3. Generalization: a non-constructor function (a plain helper, not
+    # a class initializer) that directly references the resolved symbol is
+    # surfaced by the exact same mechanism. This proves the fix is
+    # "target-symbol file -> direct usages", not "class constant ->
+    # constructor".
+    def test_non_constructor_direct_usage_is_also_surfaced(self, tmp_path):
+        helper_code = (
+            "def normalize_widget(value=Widget.CLASS_DEFAULT):\n"
+            "    return normalize(value)\n"
+        )
+        context = self._context(tmp_path, helper_code, "normalize_widget", 4, 5)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=[], target_symbols=["Widget.CLASS_DEFAULT"],
+            extended_mechanism="An unrelated narrative that never repeats the symbol name.",
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=[])
+
+        assert "normalize_widget" in result.rendered
+        assert "return normalize(value)" in result.rendered
+
+    # -- 4. Negative control: resolving a class-scoped constant must NOT
+    # pull in an unrelated constructor in the same file that never
+    # references it. This is the explicit proof that no constructor-
+    # specific inclusion rule was added -- only the file-scope widening. A
+    # `gap` separates the constant from the unrelated __init__ so the
+    # constant's own _DEFINITION_CONTEXT_LINES padding (a pre-existing,
+    # unrelated mechanism) cannot incidentally sweep the unrelated function
+    # into the SAME "Target definition" block and produce a false pass.
+    def test_unrelated_constructor_in_same_file_is_not_pulled_in(self, tmp_path):
+        unrelated_init = (
+            "    def __init__(self, other_option=True):\n"
+            "        self.other_option = other_option\n"
+        )
+        gap = "\n".join(f"    # filler line {i}" for i in range(10)) + "\n"
+        context = self._context(
+            tmp_path, unrelated_init, "Widget.__init__",
+            start_line=4 + gap.count("\n"), end_line=5 + gap.count("\n"), gap=gap,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=[], target_symbols=["Widget.CLASS_DEFAULT"],
+            extended_mechanism="An unrelated narrative that never repeats the symbol name.",
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=[])
+
+        assert "Widget.CLASS_DEFAULT" in result.covered_target_symbols
+        assert "self.other_option = other_option" not in result.rendered
+        assert "Discovered consumer" not in result.rendered
+
+    # -- 5. Budget/ordering: widening preferred_files must not bypass the
+    # existing Final-Target Slice budget or category-commit ordering
+    # (extensive dedicated coverage already exists in
+    # TestBudgetBoundedness/TestCategoryPriorityAndOrdering -- this is only
+    # a lightweight check that this specific new file-scope path is subject
+    # to the same rules, not a duplicate of that coverage).
+    def test_widened_scope_still_respects_budget_and_ordering(self, tmp_path):
+        init_code = (
+            "    def __init__(self, value=CLASS_DEFAULT):\n"
+            "        self.runtime_value = normalize(value)\n"
+        )
+        context = self._context(tmp_path, init_code, "Widget.__init__", 4, 5)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, FINAL_TARGET_SLICE_MAX_CHARS
+        strategy = _make_strategy(
+            target_files=[], target_symbols=["Widget.CLASS_DEFAULT"],
+            extended_mechanism="An unrelated narrative that never repeats the symbol name.",
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=[])
+
+        assert len(result.rendered) < FINAL_TARGET_SLICE_MAX_CHARS
+        assert "Full file (last resort)" not in result.rendered
+        # Category 1 (exact definition) still committed ahead of the
+        # discovered-consumer window, exactly as for every other source.
+        assert result.rendered.index("Target definition") < result.rendered.index("Discovered consumer")
+
+
+# ---------------------------------------------------------------------------
 # Slice 1 -- Edit Readiness Gate
 # ---------------------------------------------------------------------------
 

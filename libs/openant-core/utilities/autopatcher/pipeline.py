@@ -3495,6 +3495,42 @@ def run(
             "exit_code": None, "stderr": "",
         }
 
+    # Deterministic context reconstruction — runs ONLY after the repaired
+    # patch has already failed the applicability check above, and ONLY
+    # before the applicability-aware LLM retry below. Recovers the specific
+    # failure mode repair_hunk_headers doesn't: a hunk that is already
+    # positionally/arithmetically correct but too context-thin for `git
+    # apply` (see diff_hunk_repair.reconstruct_hunk_context's docstring).
+    # On success, updates `patch`/`applicability_result` in place so the
+    # retry gate immediately below simply doesn't fire — no change to the
+    # retry logic itself. On refusal/failure, changes nothing; the retry
+    # gate runs exactly as it did before this feature existed.
+    _context_expansion = None
+    if applicability_result.get("applicable") is False and repo_root:
+        try:
+            from .diff_hunk_repair import reconstruct_hunk_context
+            from .patch_applicability import check_applicability as _check_applicability_for_expansion
+            _reconstructed_patch, _context_expansion = reconstruct_hunk_context(patch, repo_root)
+            if _context_expansion.succeeded:
+                patch = _reconstructed_patch
+                applicability_result = _check_applicability_for_expansion(patch, repo_root)
+                print(
+                    f"[pipeline] Deterministic context reconstruction succeeded: "
+                    f"{_context_expansion.hunks_expanded} hunk(s) expanded, "
+                    f"{_context_expansion.hunks_unchanged} already sufficient "
+                    f"— applicable={applicability_result.get('applicable')}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[pipeline] Deterministic context reconstruction did not apply "
+                    f"(reason={_context_expansion.skipped_reason}) — "
+                    f"falling through to applicability-aware retry.",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(f"[pipeline] Deterministic context reconstruction unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+
     # Applicability-aware retry — triggered only on applicable=False with a known repo_root
     original_patch = patch
     retry_patch = None

@@ -1,4 +1,4 @@
-from utilities.autopatcher.diff_parsing import DiffHunk, parse_diff
+from utilities.autopatcher.diff_parsing import DiffHunk, parse_diff, semantic_delta
 
 
 def test_empty_input_returns_no_files_or_hunks():
@@ -148,3 +148,58 @@ def test_dash_a_line_flushes_pending_hunk_before_next_file():
     assert file_hunks["a.py"][0].lines == ["+from a"]
     assert len(file_hunks["b.py"]) == 1
     assert file_hunks["b.py"][0].lines == ["+from b"]
+
+
+# ---------------------------------------------------------------------------
+# semantic_delta
+# ---------------------------------------------------------------------------
+
+class TestSemanticDelta:
+    def test_extracts_additions_and_removals_per_file_excludes_context(self):
+        diff = (
+            "--- a/a.py\n"
+            "+++ b/a.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " context line\n"
+            "-removed line\n"
+            "+added line\n"
+        )
+        delta = semantic_delta(diff)
+        assert delta == {"a.py": (["+added line"], ["-removed line"])}
+
+    def test_empty_for_pure_context_only_change_across_files(self):
+        # No real diff has zero +/- lines, but the function must not raise
+        # or invent entries for a file with none.
+        diff = "--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n context only\n"
+        assert semantic_delta(diff) == {"a.py": ([], [])}
+
+    def test_unaffected_by_context_or_header_differences(self):
+        """The core safety property: two diffs whose ONLY difference is
+        surrounding context/header metadata must report an identical
+        semantic delta."""
+        thin = (
+            "--- a/a.py\n+++ b/a.py\n@@ -5,2 +5,2 @@\n"
+            " ctx\n-old\n+new\n"
+        )
+        expanded = (
+            "--- a/a.py\n+++ b/a.py\n@@ -3,6 +3,6 @@\n"
+            " before2\n before1\n ctx\n-old\n+new\n after1\n"
+        )
+        assert semantic_delta(thin) == semantic_delta(expanded)
+
+    def test_detects_a_real_addition_difference(self):
+        a = "--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+        b = "--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,2 @@\n-old\n+new\n+extra\n"
+        assert semantic_delta(a) != semantic_delta(b)
+
+    def test_multi_hunk_multi_file_preserves_order(self):
+        diff = (
+            "--- a/a.py\n+++ b/a.py\n"
+            "@@ -1,1 +1,1 @@\n-a_old\n+a_new\n"
+            "@@ -10,1 +10,1 @@\n-a_old2\n+a_new2\n"
+            "--- a/b.py\n+++ b/b.py\n"
+            "@@ -1,1 +1,1 @@\n-b_old\n+b_new\n"
+        )
+        delta = semantic_delta(diff)
+        assert delta["a.py"] == (["+a_new", "+a_new2"], ["-a_old", "-a_old2"])
+        assert delta["b.py"] == (["+b_new"], ["-b_old"])

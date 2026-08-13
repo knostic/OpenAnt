@@ -1664,6 +1664,27 @@ def _build_final_target_slice_inner(
             covered_symbols.add(raw_symbol)
             covered_files.add(match.file)
 
+    # --- Invariant: every successfully resolved target symbol's own file
+    # must be searchable by the usage/consumer scans below (categories 2 and
+    # 3a). `preferred_files` was seeded above purely from the Final
+    # Strategy's own `target_files` list -- a separate, independently
+    # authored field from `target_symbols` (see generate_remediation_
+    # strategy's two distinct `plan.get(...)` reads) with no guarantee it
+    # names every verified symbol's actual file. Without this, a symbol can
+    # resolve correctly here (Category 1 searches the whole repository via
+    # _resolve_symbol_details, not preferred_files) while the function that
+    # consumes/normalizes it -- sitting in that same file -- stays invisible
+    # to every usage lookup below, which IS bounded to preferred_files by
+    # design (see _lookup_identifier_usages/_lookup_identifier_definition
+    # docstrings). This closes that gap deterministically, using only
+    # already-resolved data -- no new lookup, no repository-wide search, no
+    # new evidence category: it only widens the existing bounded scan's own
+    # file set to include what Category 1 already proved is relevant.
+    for match in symbol_matches.values():
+        if match.file not in seen_pf:
+            seen_pf.add(match.file)
+            preferred_files.append(match.file)
+
     # --- Category 2 (SUPPORTING-context role): definitions discovered
     # from strategy identifiers, for class-only/file-only targets or any
     # other mechanism-related identifier the strategy named that isn't

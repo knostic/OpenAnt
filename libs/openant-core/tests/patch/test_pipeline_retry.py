@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
@@ -56,6 +57,35 @@ _CLEAN_DIFF = """\
 +    # security fix
      pass
 ```"""
+
+
+def _sequential_then_repeat(first, rest):
+    """A check_applicability side_effect: `first` on the very first call,
+    `rest` on every call after that.
+
+    A fixed-length side_effect=[first, rest] list raises StopIteration on
+    any call beyond the second. Deterministic context reconstruction
+    (utilities.autopatcher.diff_hunk_repair.reconstruct_hunk_context) is a
+    new, real, additional consumer of check_applicability sitting between
+    the pipeline's own initial check and its retry-recheck below -- it can
+    make any number of extra scoping calls in between, depending on hunk
+    count, so these tests can no longer assume exactly two calls total.
+
+    Semantically this is still correct: the FIRST call is always the
+    pipeline's own initial check of the still-broken original patch (must
+    be `first` -- that's the precondition for entering the retry path at
+    all); every later call -- whether from reconstruction's own scoping of
+    that same still-broken patch, or the retry's final recheck of the
+    regenerated one -- correctly gets `rest`, matching each test's actual
+    intent ("the original fails, the retry-relevant outcome is `rest`").
+    """
+    calls = {"n": 0}
+
+    def _side_effect(*_args, **_kwargs):
+        calls["n"] += 1
+        return first if calls["n"] == 1 else rest
+
+    return _side_effect
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +335,7 @@ class TestRetryTriggered:
             mock.patch("utilities.autopatcher.pipeline.generate_patch",
                        side_effect=[_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
-                       side_effect=[first_app, retry_app]),
+                       side_effect=_sequential_then_repeat(first_app, retry_app)),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
             mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
@@ -324,7 +354,7 @@ class TestRetryTriggered:
             mock.patch("utilities.autopatcher.pipeline.generate_patch",
                        side_effect=[_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
-                       side_effect=[first_app, retry_app]),
+                       side_effect=_sequential_then_repeat(first_app, retry_app)),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
             mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
@@ -370,7 +400,7 @@ class TestRetryMultiFile:
             mock.patch("utilities.autopatcher.pipeline.generate_patch",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
-                       side_effect=[first_app, retry_app]),
+                       side_effect=_sequential_then_repeat(first_app, retry_app)),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
             mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
@@ -404,7 +434,7 @@ class TestRetryMultiFile:
             mock.patch("utilities.autopatcher.pipeline.generate_patch",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
-                       side_effect=[first_app, retry_app]),
+                       side_effect=_sequential_then_repeat(first_app, retry_app)),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
             mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
@@ -462,7 +492,7 @@ class TestRetryMultiFile:
             mock.patch("utilities.autopatcher.pipeline.generate_patch",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
-                       side_effect=[first_app, retry_app]),
+                       side_effect=_sequential_then_repeat(first_app, retry_app)),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
             mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
@@ -535,7 +565,7 @@ class TestRetryMultiFile:
             mock.patch("utilities.autopatcher.pipeline.generate_patch",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
-                       side_effect=[first_app, retry_app]),
+                       side_effect=_sequential_then_repeat(first_app, retry_app)),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
             mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
@@ -587,7 +617,7 @@ class TestRetryOutcomes:
             mock.patch("utilities.autopatcher.pipeline.generate_patch",
                        side_effect=[_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
-                       side_effect=[first_app, retry_app]),
+                       side_effect=_sequential_then_repeat(first_app, retry_app)),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
             mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
@@ -745,13 +775,16 @@ class TestRetryNoticeInReport:
                 "skipped_reason": None, "error": None,
             }
             gen_side_effect = [_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]
-            app_side_effect = [first_app, retry_app]
+            app_side_effect = _sequential_then_repeat(first_app, retry_app)
         else:
             clean_app = {
                 "applicable": True, "skipped": False, "stderr": "",
                 "exit_code": 0, "skipped_reason": None, "error": None,
             }
             gen_side_effect = [_CLEAN_DIFF]
+            # applicable is True on the very first (and, here, only) call --
+            # deterministic context reconstruction's own guard never fires
+            # when applicability already succeeded, so no extra calls occur.
             app_side_effect = [clean_app]
 
         with (
@@ -793,3 +826,167 @@ class TestRetryNoticeInReport:
         trust_idx = report.index("## Trust Signals")
         appendices_idx = report.index("## Appendices")
         assert applicability_idx < notice_idx < trust_idx < appendices_idx
+
+
+# ---------------------------------------------------------------------------
+# Deterministic context reconstruction — pipeline integration
+#
+# Proves the new deterministic step (diff_hunk_repair.reconstruct_hunk_context,
+# wired in between check_applicability and the retry gate above) actually
+# prevents the second LLM call when it can safely fix the patch, AND that
+# the existing retry — tested exhaustively above — is completely unaffected
+# when reconstruction can't. Only generate_patch (the LLM boundary) and the
+# surrounding review/challenge/scoring stages are mocked; check_applicability
+# is deliberately left real in the success test so the outcome is proven by
+# actual `git apply --check` against a real temporary repo, not a canned
+# dict. No LLM call, no network.
+# ---------------------------------------------------------------------------
+
+def _urllib3_retry_py_source() -> str:
+    lines = [f"# filler line {i}\n" for i in range(1, 187)]
+    lines.append("\n")
+    lines.append("    #: Default headers to be used for ``remove_headers_on_redirect``\n")
+    lines.append('    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])\n')
+    lines.append("\n")
+    lines.append("    #: Default maximum backoff time.\n")
+    lines.append("    DEFAULT_BACKOFF_MAX = 120\n")
+    return "".join(lines)
+
+
+# The exact urllib3 CVE-2023-43804 trace shape: a semantically correct edit
+# in a mechanically malformed (wrong counts, drifted start, context-thin)
+# hunk — the case that, before this feature, cost a full second LLM call.
+_URLLIB3_MALFORMED_DIFF = (
+    "```diff\n"
+    "--- a/src/urllib3/util/retry.py\n"
+    "+++ b/src/urllib3/util/retry.py\n"
+    "@@ -187,3 +187,3 @@\n"
+    "     #: Default headers to be used for ``remove_headers_on_redirect``\n"
+    '-    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])\n'
+    '+    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization"])\n'
+    "```"
+)
+
+
+def _init_real_git_repo(tmp_path: Path, files: dict) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, capture_output=True)
+    for relpath, content in files.items():
+        path = tmp_path / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, check=True)
+
+
+class TestDeterministicContextReconstructionSuccess:
+    """malformed-but-semantically-valid patch -> repair -> applicability
+    failure -> deterministic context reconstruction -> real git apply
+    succeeds -> generate_patch called exactly ONCE -> retry_attempted is
+    False."""
+
+    def _run(self, tmp_path):
+        _init_real_git_repo(tmp_path, {"src/urllib3/util/retry.py": _urllib3_retry_py_source()})
+        captured = {}
+        import utilities.autopatcher.pipeline as _pipeline_mod
+        original_build_report = _pipeline_mod._build_report
+
+        def capture(r):
+            captured["result"] = r
+            return original_build_report(r)
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+                       return_value=_URLLIB3_MALFORMED_DIFF) as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.pipeline._build_report", side_effect=capture),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("urllib3 vuln", api_key="", repo_root=str(tmp_path))
+        return captured["result"], mock_gen
+
+    def test_generate_patch_called_exactly_once(self, tmp_path):
+        _, mock_gen = self._run(tmp_path)
+        assert mock_gen.call_count == 1
+
+    def test_retry_not_attempted(self, tmp_path):
+        result, _ = self._run(tmp_path)
+        assert result.retry_attempted is False
+
+    def test_final_applicability_is_true(self, tmp_path):
+        result, _ = self._run(tmp_path)
+        assert result.applicability["applicable"] is True
+
+    def test_semantic_delta_identical_to_original_generated_patch(self, tmp_path):
+        from utilities.autopatcher.diff_parsing import semantic_delta
+        result, _ = self._run(tmp_path)
+        assert semantic_delta(_URLLIB3_MALFORMED_DIFF) == semantic_delta(result.patch)
+
+
+class TestDeterministicContextReconstructionFallbackPreservesRetry:
+    """The exact malformed-diff shape already covered above by
+    TestRetryTriggered/TestRetryOutcomes (old-side content absent from the
+    real file entirely) must, with deterministic reconstruction now wired
+    in ahead of the retry, still fall through to the SAME existing retry
+    behavior unchanged: reconstruction declines cleanly (no unique anchor
+    match), the existing applicability-aware retry fires, generate_patch is
+    called exactly TWICE, and retry_attempted is True — proving this
+    optimization never disables the safety net."""
+
+    def _run(self, tmp_path):
+        failed_file = "src/pip/_internal/download.py"
+        target = tmp_path / failed_file
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("import os\nimport sys\n", encoding="utf-8")
+
+        first_app = {
+            "applicable": False, "skipped": False, "stderr": _PIP_STDERR,
+            "exit_code": 1, "skipped_reason": None, "error": None,
+        }
+        retry_app = {
+            "applicable": True, "skipped": False, "stderr": "",
+            "exit_code": 0, "skipped_reason": None, "error": None,
+        }
+
+        captured = {}
+        import utilities.autopatcher.pipeline as _pipeline_mod
+        original_build_report = _pipeline_mod._build_report
+
+        def capture(r):
+            captured["result"] = r
+            return original_build_report(r)
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+                       side_effect=[_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]) as mock_gen,
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       side_effect=_sequential_then_repeat(first_app, retry_app)),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.pipeline._build_report", side_effect=capture),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("pip vuln", api_key="", repo_root=str(tmp_path))
+        return captured["result"], mock_gen
+
+    def test_generate_patch_called_exactly_twice(self, tmp_path):
+        _, mock_gen = self._run(tmp_path)
+        assert mock_gen.call_count == 2
+
+    def test_retry_attempted_is_true(self, tmp_path):
+        result, _ = self._run(tmp_path)
+        assert result.retry_attempted is True
+
+    def test_retry_still_succeeds(self, tmp_path):
+        result, _ = self._run(tmp_path)
+        assert result.retry_succeeded is True

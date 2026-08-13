@@ -104,3 +104,108 @@ class TestCalibrateFindings:
         assert "PATCH_MARKER" in user_message
         assert "FINDING_MARKER" in user_message
         assert "CONTEXT_MARKER" in user_message
+
+
+# ---------------------------------------------------------------------------
+# Prompt-contract coverage for the "Observed must show the specific claimed
+# state/behavior, including any intermediate transformation it depends on"
+# tightening.
+#
+# IMPORTANT SCOPE NOTE: no code change was made to finding_calibration.py's
+# classification logic in this pass -- classification remains entirely
+# LLM-judgment based on the prompt text. These tests therefore do NOT (and
+# cannot) prove an LLM will reason correctly about a missing transformation;
+# real reasoning quality can only be validated against a real LLM/real
+# trace. What IS deterministically testable and testable here:
+#   (a) the prompt file actually contains the tightened distinction (a
+#       direct content check on the real prompt file `calibrate_findings`
+#       reads, not a mock), and
+#   (b) the parsing/plumbing faithfully preserves whatever group an LLM
+#       following that contract would return -- i.e. correct classifications
+#       are not accidentally altered, dropped, or re-elevated by code
+#       downstream of the LLM call.
+# ---------------------------------------------------------------------------
+
+class TestPromptContractWording:
+    """Wording checks are done against whitespace-collapsed text -- the
+    prompt is hand-wrapped Markdown, so a phrase spanning a line break in
+    the source file must not produce a false failure here."""
+
+    def test_observed_definition_requires_the_specific_claimed_state(self):
+        """Observed must require the SPECIFIC claimed state/behavior to be
+        shown -- not merely an adjacent file/function/constant -- and must
+        explicitly call out an intermediate transformation/assignment/
+        normalization step as part of what has to be visible."""
+        from utilities.autopatcher.finding_calibration import _PROMPT_PATH
+        text = " ".join(_PROMPT_PATH.read_text(encoding="utf-8").split())
+        assert "specific state or behavior" in text
+        assert "transformation" in text
+        assert "normalization" in text
+
+    def test_hypothesis_definition_covers_an_unseen_reasoning_step(self):
+        """Hypothesis must explicitly cover the case where an intermediate
+        step in the reasoning chain (not just the whole file/function) is
+        unseen -- this is the exact gap a class-attribute-default-only claim
+        exploited (evidence showed the producer and the consumer, but not
+        the normalization connecting them)."""
+        from utilities.autopatcher.finding_calibration import _PROMPT_PATH
+        text = " ".join(_PROMPT_PATH.read_text(encoding="utf-8").split())
+        assert "reasoning chain" in text
+        assert "NOT directly shown" in text
+
+    def test_prompt_contract_does_not_mention_textual_overlap_heuristics(self):
+        """Explicit negative check: no textual-overlap/insufficiency-note
+        matching heuristic was introduced -- that was deliberately rejected
+        as brittle. The tightening is scoped to the Observed/Hypothesis
+        definition only."""
+        from utilities.autopatcher.finding_calibration import _PROMPT_PATH
+        text = _PROMPT_PATH.read_text(encoding="utf-8")
+        assert "overlap" not in text.lower()
+        assert "insufficien" not in text.lower()
+
+
+class TestCalibrationPassthroughMatchesPromptContract:
+    """Mocked-LLM tests. These simulate an LLM that DOES follow the
+    tightened prompt contract and assert calibrate_findings' own plumbing
+    (not LLM reasoning) preserves that classification unchanged in both
+    directions -- neither silently downgrading a well-supported Observed
+    finding nor silently upgrading an under-supported one."""
+
+    def test_missing_transformation_finding_labeled_hypothesis_passes_through_unchanged(self):
+        # Producer (class constant) + consumer (membership check) shown;
+        # the transformation/normalization step is NOT shown. A
+        # contract-following LLM must return Hypothesis for a runtime-
+        # consequence claim in this shape -- assert that classification is
+        # not altered by parsing.
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Group: Hypothesis\n"
+            "   Reworded: If the runtime value is not normalized the same way "
+            "it is compared, membership may fail.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch",
+            ["Membership check may fail against un-normalized entries."],
+            llm, code_context="producer constant + consumer loop shown, no transformation shown",
+        )
+        assert result[0]["group"] == "hypothesis"
+
+    def test_complete_evidence_finding_labeled_observed_passes_through_unchanged(self):
+        # Producer + the transformation/normalization step + consumer are
+        # all shown. A contract-following LLM may return Observed here --
+        # assert that classification is not downgraded by parsing. This is
+        # the "do not over-downgrade" check: no blanket rule was added that
+        # forces every finding to Hypothesis regardless of evidence
+        # completeness.
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "1. Group: Observed\n"
+            "   Reworded: The constructor normalizes values before assignment, "
+            "so membership comparison succeeds.\n"
+        )
+        result = calibrate_findings(
+            "vuln text", "patch",
+            ["The constructor normalizes the value before storing it."],
+            llm, code_context="producer constant + transformation + consumer loop all shown",
+        )
+        assert result[0]["group"] == "observed"

@@ -66,3 +66,39 @@ def parse_diff(diff: str) -> Tuple[List[str], Dict[str, List[DiffHunk]]]:
             cur_hunk.lines.append(line)
     flush()
     return changed_files, file_hunks
+
+
+def semantic_delta(patch: str) -> Dict[str, Tuple[List[str], List[str]]]:
+    """Return, per changed file, the ordered sequence of every '+' (addition)
+    and '-' (removal) line's raw content — the diff's complete semantic
+    delta, independent of hunk headers and unchanged (' '-prefixed) context
+    lines.
+
+    Built strictly on ``parse_diff``'s own output — no separate parser.
+    Two diffs with an identical ``semantic_delta()`` differ, if at all, only
+    in hunk metadata and/or context lines, never in what they actually add
+    or remove.
+
+    Used both as a production fail-closed safety gate
+    (``diff_hunk_repair.reconstruct_hunk_context``) and as the shared test
+    invariant proving deterministic context reconstruction never touches a
+    semantic addition/removal.
+
+    Safe against parse_diff's own "+++ "/"--- " body-line ambiguity (see
+    that function's F-36/F-41/F-45-style edge case) for this specific use:
+    that ambiguity only ever arises for an ADDED/REMOVED line whose own
+    content starts with "++ "/"-- " (marker + content forms "+++ "/"--- ");
+    a CONTEXT line's leading ' ' marker always shifts any such content one
+    character to the right, so it can never collide with that prefix check.
+    Since context reconstruction only ever inserts context lines, it can
+    never introduce this ambiguity — only pre-existing +/- lines could, and
+    this function reports them identically before and after either way.
+    """
+    _, file_hunks = parse_diff(patch)
+    return {
+        f: (
+            [l for h in hunks for l in h.lines if l.startswith("+") and not l.startswith("+++")],
+            [l for h in hunks for l in h.lines if l.startswith("-") and not l.startswith("---")],
+        )
+        for f, hunks in file_hunks.items()
+    }

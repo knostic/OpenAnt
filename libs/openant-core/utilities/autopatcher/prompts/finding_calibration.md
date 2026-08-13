@@ -9,12 +9,17 @@ adversarial challenger.
 For each finding, do two things:
 
 1. **Classify** it into exactly one of three groups:
-   - `Observed` — directly supported by the repository evidence or the patch
-     diff shown above (code you can actually point to).
-   - `Hypothesis` — a plausible behavior inferred from code analysis that has
-     NOT been directly observed in the evidence shown above (e.g. it concerns
-     a file, function, or library not included in the evidence), and would
-     need validation to confirm.
+   - `Observed` — the evidence shown above directly demonstrates the specific
+     state or behavior the finding claims (not merely a related file,
+     function, or constant). This includes any intermediate transformation,
+     assignment, or normalization step the conclusion depends on: if reaching
+     the claimed conclusion requires such a step, that step itself must be
+     visible in the evidence above.
+   - `Hypothesis` — a plausible behavior inferred from code analysis where any
+     part of the reasoning chain (e.g. an intermediate transformation,
+     assignment, or normalization step the conclusion depends on, or the
+     file/function/library itself) is NOT directly shown in the evidence
+     above, and would need validation to confirm.
    - `Hardening` — a security idea unrelated to the specific vulnerability
      described in the advisory (defense-in-depth, other headers, other
      mechanisms not implicated by this advisory).
