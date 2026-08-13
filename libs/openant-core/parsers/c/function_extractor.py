@@ -446,7 +446,17 @@ class FunctionExtractor:
                     if body_stripped and '(' in body_stripped:
                         # Extract the called function name
                         called = body_stripped.split('(')[0].strip()
-                        if called.isidentifier():
+                        # A function-like macro whose body's leading token is one
+                        # of its OWN formal parameters is parameter substitution,
+                        # not a real callee (`#define WRAP(g) g()`). Aliasing it
+                        # would fabricate a call edge to any repo function literally
+                        # named after that parameter.
+                        formal_params = {
+                            p.split()[-1].strip(" *")
+                            for p in params_text.strip("()").split(",")
+                            if p.strip()
+                        }
+                        if called.isidentifier() and called not in formal_params:
                             self.macro_aliases[macro_name] = called
 
             stack.extend(reversed(node.children))
