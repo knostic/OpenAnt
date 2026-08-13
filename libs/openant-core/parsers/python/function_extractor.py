@@ -211,7 +211,7 @@ class FunctionExtractor:
     # Constructors whose returned object is a route-registering router/app. A
     # module-level `name = <one of these>()` makes `@name.<verb>(...)` a route.
     _ROUTER_CTORS = frozenset({
-        "APIRouter", "FastAPI",          # FastAPI / Starlette
+        "APIRouter", "FastAPI", "Starlette",   # FastAPI / Starlette
         "Blueprint", "Flask",            # Flask
         "RouteTableDef",                 # aiohttp (`web.RouteTableDef()`)
     })
@@ -251,6 +251,21 @@ class FunctionExtractor:
                 for t in targets:
                     if isinstance(t, ast.Name):
                         names.add(t.id.lower())
+        # Alias propagation (B-FN-02): `r = <known router var>` makes `r` a
+        # router too. Fixpoint over simple Name = Name assignments whose RHS is
+        # already a router. Pure recall: a non-router RHS is never in `names`,
+        # so `r = cache` is not promoted.
+        changed = True
+        while changed:
+            changed = False
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Assign)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id.lower() in names):
+                    for t in node.targets:
+                        if isinstance(t, ast.Name) and t.id.lower() not in names:
+                            names.add(t.id.lower())
+                            changed = True
         return frozenset(names)
 
     def _router_vars_for(self, file_path: str, content: str) -> frozenset:
@@ -291,7 +306,7 @@ class FunctionExtractor:
         # (the silent reachability false-negative) WITHOUT the over-match a bare
         # `@\w+.<verb>(` regex causes (e.g. `@cache.get(...)` on a non-router object, which
         # would mislabel a cache helper as an attacker-facing route and mis-prime the LLM).
-        m = re.search(r'@(\w+)\.(get|post|put|delete|patch|options|head|websocket|route|api_route)\s*\(', dec_str)
+        m = re.search(r'@(\w+)\.(get|post|put|delete|patch|options|head|websocket_route|websocket|route|api_route)\s*\(', dec_str)
         if m and m.group(1) in getattr(self, '_active_router_vars', frozenset()):
             return 'route_handler'
         # F4 additive: aiohttp RouteTableDef — `routes = web.RouteTableDef()` then
