@@ -352,7 +352,7 @@ class FunctionExtractor:
                 # macro token_tree, so no function_item is emitted and its calls
                 # (e.g. `Frame::decode`) never reach the call graph. Emit a
                 # synthetic entry-point unit carrying the body as ordinary Rust.
-                if t == "macro_invocation" and self._is_fuzz_target_macro(child, source):
+                if t == "macro_invocation" and self._is_fuzz_target_macro(child, source, imports_local):
                     self._handle_fuzz_target(
                         child, source, file_path, functions, classes,
                         imports_local, cur_ctx, pending_attrs,
@@ -654,14 +654,50 @@ class FunctionExtractor:
             worklist.append((block, new_ctx))
 
     _FUZZ_MACRO_NAMES = ("fuzz_target",)
+    _AFL_FUZZ = ("afl", "fuzz")  # AFL's generic `fuzz!` — gated on the afl crate
 
-    def _is_fuzz_target_macro(self, node: Node, source: bytes) -> bool:
-        """True if `node` is a `fuzz_target!( .. )` macro invocation (bare or
-        path-qualified, e.g. `libfuzzer_sys::fuzz_target!`)."""
-        for child in node.children:
-            if child.type in ("identifier", "scoped_identifier"):
-                return _text(child, source).split("::")[-1] in self._FUZZ_MACRO_NAMES
-        return False
+    def _resolve_macro_origin(self, name: str, imports_local: List[dict]):
+        """Resolve a bare macro name through the file's `use` imports to its
+        ``(crate, real_macro_name)`` origin. Returns ``(None, name)`` when the
+        name is not imported (locally defined or prelude)."""
+        for imp in imports_local:
+            if imp.get("kind") != "use":
+                continue
+            local = imp.get("alias") or imp.get("leaf")
+            if local == name:
+                path = imp.get("path") or ""
+                crate = path.split("::")[0] if path else None
+                return crate, imp.get("leaf")
+        return None, name
+
+    def _is_fuzz_target_macro(self, node: Node, source: bytes,
+                              imports_local: List[dict]) -> bool:
+        """True if `node` is a fuzz-harness macro invocation.
+
+        Recognizes libFuzzer `fuzz_target!` (bare, path-qualified, or
+        import-aliased `use libfuzzer_sys::fuzz_target as ft; ft!(..)`) and AFL's
+        `fuzz!` (path-qualified `afl::fuzz!` or `use afl::fuzz; fuzz!(..)`). A
+        bare name is resolved THROUGH the file's `use` imports to its origin
+        crate + real macro name, so an alias to an unrelated macro
+        (`use evil::thing as fuzz_target`) and a bare `fuzz!` with no afl import
+        are NOT matched (path-resolution is the over-match guard). `fuzz_target`
+        is accepted from any crate (a distinctive libFuzzer name); the generic
+        `fuzz` is accepted only from the `afl` crate. macro_rules!-wrapped
+        harnesses are out of scope (a deliberate deferral: recognizing them
+        needs macro-definition scanning + expansion-shape handling)."""
+        ref = next((c for c in node.children
+                    if c.type in ("identifier", "scoped_identifier")), None)
+        if ref is None:
+            return False
+        text = _text(ref, source)
+        if "::" in text:
+            segs = text.split("::")
+            crate, macro_name = segs[0], segs[-1]
+        else:
+            crate, macro_name = self._resolve_macro_origin(text, imports_local)
+        if macro_name in self._FUZZ_MACRO_NAMES:
+            return True
+        return (crate, macro_name) == self._AFL_FUZZ
 
     def _handle_fuzz_target(
         self, node: Node, source: bytes, file_path: str,
