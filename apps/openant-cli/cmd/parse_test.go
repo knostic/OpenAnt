@@ -46,7 +46,7 @@ func TestBuildParsePyArgsLevelForwarding(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			args := buildParsePyArgs("/repo", "/out", "", "auto", tc.level, "", false)
+			args := buildParsePyArgs("/repo", "/out", "", "auto", tc.level, "", false, false)
 			gotLevel, gotValue := findFlag(args, "--level")
 			if gotLevel != tc.wantLevel {
 				t.Errorf("--level present = %v, want %v (argv=%v)", gotLevel, tc.wantLevel, args)
@@ -59,7 +59,7 @@ func TestBuildParsePyArgsLevelForwarding(t *testing.T) {
 }
 
 func TestBuildParsePyArgsBaseline(t *testing.T) {
-	args := buildParsePyArgs("/repo", "/out", "org-repo-abc1234", "python", "exploitable", "/tmp/manifest.json", false)
+	args := buildParsePyArgs("/repo", "/out", "org-repo-abc1234", "python", "exploitable", "/tmp/manifest.json", false, false)
 	want := []string{
 		"parse", "/repo",
 		"--output", "/out",
@@ -132,7 +132,7 @@ func TestParseCmdFreshFlagParses(t *testing.T) {
 }
 
 func TestParsePyArgsIncludesFreshWhenSet(t *testing.T) {
-	args := buildParsePyArgs("/some/repo", "/out", "", "auto", "reachable", "", true)
+	args := buildParsePyArgs("/some/repo", "/out", "", "auto", "reachable", "", true, false)
 
 	found, _ := findFlag(args, "--fresh")
 	if !found {
@@ -141,11 +141,22 @@ func TestParsePyArgsIncludesFreshWhenSet(t *testing.T) {
 }
 
 func TestParsePyArgsOmitsFreshWhenUnset(t *testing.T) {
-	args := buildParsePyArgs("/some/repo", "/out", "", "auto", "reachable", "", false)
+	args := buildParsePyArgs("/some/repo", "/out", "", "auto", "reachable", "", false, false)
 
 	found, _ := findFlag(args, "--fresh")
 	if found {
 		t.Errorf("did not expect --fresh in pyArgs when fresh=false, got %v", args)
+	}
+}
+
+func TestParsePyArgsLibraryModeForwarding(t *testing.T) {
+	on := buildParsePyArgs("/some/repo", "/out", "", "auto", "reachable", "", false, true)
+	if found, _ := findFlag(on, "--library-mode"); !found {
+		t.Errorf("expected --library-mode in pyArgs when libraryMode=true, got %v", on)
+	}
+	off := buildParsePyArgs("/some/repo", "/out", "", "auto", "reachable", "", false, false)
+	if found, _ := findFlag(off, "--library-mode"); found {
+		t.Errorf("did not expect --library-mode when libraryMode=false, got %v", off)
 	}
 }
 func TestParseCmdIsRegisteredOnRoot(t *testing.T) {

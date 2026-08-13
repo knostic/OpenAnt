@@ -42,6 +42,14 @@ class UnitGenerator:
         dataset_name = name or Path(self.repository).name
 
         for func_id, func_info in self.functions.items():
+            # Seed-only: a synthesized `fuzz_target!` harness seeds reachability
+            # (its decode callees are kept and analyzed), but the harness itself
+            # is instrumentation, not an analysis target — its lifted body is
+            # synthetic (references the dropped closure param) and would ship
+            # non-compiling code to Stage-1 and re-analyze the decoder. It stays
+            # in analyzer_output below so the call graph remains symmetric.
+            if func_info.get("synthetic_harness"):
+                continue
             unit = self._generate_unit(func_id, func_info)
             units.append(unit)
 

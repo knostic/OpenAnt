@@ -24,13 +24,14 @@ If no repository path is given, the active project is used (see: openant init).`
 }
 
 var (
-	parseOutput    string
-	parseLanguage  string
-	parseLevel     string
-	parseDiffBase  string
-	parsePR        int
-	parseDiffScope string
-	parseFresh     bool
+	parseOutput      string
+	parseLanguage    string
+	parseLevel       string
+	parseDiffBase    string
+	parsePR          int
+	parseDiffScope   string
+	parseFresh       bool
+	parseLibraryMode bool
 )
 
 func init() {
@@ -41,12 +42,13 @@ func init() {
 	parseCmd.Flags().IntVar(&parsePR, "pr", 0, "Incremental mode against a GitHub PR number (mutex with --diff-base)")
 	parseCmd.Flags().StringVar(&parseDiffScope, "diff-scope", "changed_functions", "Diff scope: changed_files, changed_functions, callers")
 	parseCmd.Flags().BoolVar(&parseFresh, "fresh", false, "Delete existing dataset.json and reparse from scratch (other artifacts preserved)")
+	parseCmd.Flags().BoolVar(&parseLibraryMode, "library-mode", false, "Seed the exported public API as reachability entry points, for a library whose public API is being dropped by the structural filter. Blunt: keeps most units — prefer letting fuzz/bin/route entry points seed reachability first.")
 }
 
 // buildParsePyArgs constructs the argv passed to the Python parse subcommand.
 // Extracted so tests can verify pass-through behavior without invoking the
 // full Python runtime.
-func buildParsePyArgs(repoPath, outputDir, datasetName, language, level, manifestPath string, fresh bool) []string {
+func buildParsePyArgs(repoPath, outputDir, datasetName, language, level, manifestPath string, fresh, libraryMode bool) []string {
 	pyArgs := []string{"parse", repoPath, "--output", outputDir}
 	if datasetName != "" {
 		pyArgs = append(pyArgs, "--name", datasetName)
@@ -62,6 +64,9 @@ func buildParsePyArgs(repoPath, outputDir, datasetName, language, level, manifes
 	}
 	if fresh {
 		pyArgs = append(pyArgs, "--fresh")
+	}
+	if libraryMode {
+		pyArgs = append(pyArgs, "--library-mode")
 	}
 	return pyArgs
 }
@@ -118,7 +123,7 @@ func runParse(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	pyArgs := buildParsePyArgs(repoPath, parseOutput, datasetName, parseLanguage, parseLevel, manifestPath, parseFresh)
+	pyArgs := buildParsePyArgs(repoPath, parseOutput, datasetName, parseLanguage, parseLevel, manifestPath, parseFresh, parseLibraryMode)
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, resolvedAPIKey())
 	if err != nil {
