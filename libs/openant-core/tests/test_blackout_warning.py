@@ -59,3 +59,37 @@ def test_library_mode_suppresses_warning():
 
 def test_empty_dataset_no_warning():
     assert blackout_warning(_details(), original_count=0, reachable_count=0) is None
+
+
+# --- S2: a synthetic fuzz harness must NOT count as a structural seed ---
+# The libFuzzer harness is lifted as unit_type=main (so it seeds the BFS) AND
+# tagged synthetic_harness=True. Its `unit_type:main` reason would otherwise
+# satisfy the structural count and silence the advisory for exactly the
+# fuzz-only-library blackout it is meant to catch. Exclusion keys on the FLAG,
+# never on unit_type (a real `main` has no flag and must stay structural).
+
+def test_synthetic_harness_seed_does_not_suppress_warning():
+    # Fuzz-only library: the ONLY seed is the synthetic harness (unit_type:main),
+    # 500 -> 20 (96% pruned) — the public API was dropped. Warning MUST fire.
+    details = {"h": {"reasons": ["unit_type:main"], "synthetic_harness": True}}
+    assert blackout_warning(details, original_count=500, reachable_count=20) is not None
+
+
+def test_synthetic_harness_plus_incidental_still_warns():
+    # Harness + a coincidental input_pattern seed — neither is a real structural
+    # entry point, so the blackout must still fire.
+    details = {
+        "h": {"reasons": ["unit_type:main"], "synthetic_harness": True},
+        "i": {"reasons": ["input_pattern:read"]},
+    }
+    assert blackout_warning(details, original_count=712, reachable_count=24) is not None
+
+
+def test_real_main_alongside_harness_still_suppresses():
+    # NEGATIVE CONTROL: a genuine `main` (no synthetic flag) IS structural, so a
+    # hybrid target (real bin + fuzz harness) must stay silent — #134 preserved.
+    details = {
+        "h": {"reasons": ["unit_type:main"], "synthetic_harness": True},
+        "m": {"reasons": ["unit_type:main"]},
+    }
+    assert blackout_warning(details, original_count=712, reachable_count=24) is None
