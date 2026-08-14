@@ -546,6 +546,7 @@ def scan_repository(
                                 extra_entry_points=scope_entry_points_to_units(
                                     llm_promoted_ids, lang_units
                                 ),
+                                library_mode=library_mode,
                             )
                             kept.extend(filtered.get("units", []))
 
