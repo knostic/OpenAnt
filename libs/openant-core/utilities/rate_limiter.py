@@ -219,6 +219,8 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     - connection: Network connectivity issues
     - timeout: Request timeout
     - api_status with 500+: Server errors (not client errors like 400)
+    - parse_error: Malformed (unparseable) LLM response; re-generating the
+      completion often yields well-formed output.
 
     Args:
         error_info: The error field from agent_context or similar.
@@ -232,8 +234,10 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     if isinstance(error_info, dict):
         error_type = error_info.get("type", "")
         
-        # Always retry these transient error types
-        if error_type in ("rate_limit", "connection", "timeout"):
+        # Always retry these transient error types. "parse_error" is a malformed
+        # LLM response (unparseable JSON): re-generating the completion often
+        # yields well-formed output, so it is treated as transient here.
+        if error_type in ("rate_limit", "connection", "timeout", "parse_error"):
             return True
         
         # Retry server errors (5xx), but not client errors (4xx)

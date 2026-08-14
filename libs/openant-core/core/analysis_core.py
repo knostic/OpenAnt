@@ -104,7 +104,12 @@ def parse_response(response: str) -> dict:
             "confidence": 0,
             "vulnerabilities": [],
             "reasoning": f"Failed to parse response: {str(e)}",
-            "raw_response": response[:500]
+            "raw_response": response[:500],
+            # Tag the failure so the detection retry pass (core/analyzer.py) can
+            # re-attempt it: a malformed model response is often transient, and
+            # without this key the ERROR carries error=None and is never retried
+            # in-run, permanently masking the unit's true verdict.
+            "error": {"type": "parse_error", "message": str(e)[:200]},
         }
 
 
