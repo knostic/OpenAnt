@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"html/template"
 	"strings"
+
+	"github.com/microcosm-cc/bluemonday"
 )
 
 // ReportData holds all pre-computed data needed to render the HTML overview report.
@@ -80,10 +82,33 @@ func (d ReportData) DiffRange() string {
 	return d.ShortBaseSHA() + ".." + d.ShortHeadSHA()
 }
 
-// SafeRemediation returns the remediation HTML as a template.HTML
-// so Go's html/template does not escape it.
+// remediationPolicy is a strict allowlist for the LLM-authored remediation
+// HTML. That text is generated from untrusted scanned-repo findings, so it is
+// treated as hostile: only inert formatting tags survive — no scripts, event
+// handlers, styles, images, SVG, forms, or embeds — and links may only be
+// http(s). Without this, a malicious repo could inject <script>/onerror into
+// the rendered report (served live by `openant serve` and by `report -f html`).
+var remediationPolicy = func() *bluemonday.Policy {
+	p := bluemonday.NewPolicy()
+	p.AllowElements(
+		"p", "br", "hr", "span", "blockquote",
+		"ul", "ol", "li",
+		"strong", "em", "b", "i", "u", "code", "pre", "kbd", "samp",
+		"h1", "h2", "h3", "h4", "h5", "h6",
+		"table", "thead", "tbody", "tr", "th", "td",
+	)
+	p.AllowAttrs("href").OnElements("a")
+	p.AllowURLSchemes("http", "https")
+	p.RequireNoReferrerOnLinks(true)
+	p.AddTargetBlankToFullyQualifiedLinks(true)
+	return p
+}()
+
+// SafeRemediation sanitizes the LLM-authored remediation HTML against a strict
+// allowlist, then returns it as template.HTML so html/template does not
+// re-escape the now-safe markup.
 func (d ReportData) SafeRemediation() template.HTML {
-	return template.HTML(d.RemediationHTML)
+	return template.HTML(remediationPolicy.Sanitize(d.RemediationHTML))
 }
 
 // FormatDuration returns TotalDurationS as a human-readable string
@@ -174,13 +199,13 @@ type ChartData struct {
 
 // FindingGroup holds findings grouped by verdict for collapsible sections.
 type FindingGroup struct {
-	Verdict       string          `json:"verdict"`
-	VerdictColor  string          `json:"verdict_color"`
-	Count         int             `json:"count"`
-	OpenByDefault bool            `json:"open_by_default"`
-	Findings      []Finding       `json:"findings"`
+	Verdict       string            `json:"verdict"`
+	VerdictColor  string            `json:"verdict_color"`
+	Count         int               `json:"count"`
+	OpenByDefault bool              `json:"open_by_default"`
+	Findings      []Finding         `json:"findings"`
 	Subgroups     []FindingSubgroup `json:"subgroups"`
-	HasSubgroups  bool            `json:"has_subgroups"`
+	HasSubgroups  bool              `json:"has_subgroups"`
 }
 
 // FindingSubgroup holds findings within a verdict group, sub-grouped by
