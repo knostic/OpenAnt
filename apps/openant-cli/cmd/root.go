@@ -137,6 +137,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&projectFlag, "project", "p", "", "Project to use (overrides active project, e.g. grafana/grafana)")
 
 	rootCmd.AddCommand(initCmd)
+	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(diffCmd)
 	rootCmd.AddCommand(parseCmd)

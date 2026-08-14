@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="csrf" content="{{.CSRF}}">
+<title>Knostic OpenAnt — Security Scanner</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #1a1a1a; min-height: 100vh; }
+  header { background: #0d1117; padding: 16px 32px; display: flex; align-items: center; gap: 12px; }
+  header h1 { color: #fff; font-size: 1.2rem; font-weight: 700; letter-spacing: -0.02em; }
+  header span { color: #8b949e; font-size: 0.85rem; }
+  .main { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+  .grid { display: grid; grid-template-columns: 1fr 340px; gap: 24px; margin-bottom: 32px; }
+  @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: #fff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 24px; }
+  .card h2 { font-size: 1rem; font-weight: 700; margin-bottom: 18px; color: #1a1a1a; }
+  label { display: block; font-size: 0.85rem; font-weight: 600; color: #444; margin-bottom: 5px; margin-top: 14px; }
+  label:first-of-type { margin-top: 0; }
+  input[type="text"], input[type="password"], select {
+    width: 100%; padding: 8px 10px; border: 1px solid #d0d7de; border-radius: 6px;
+    font-size: 0.9rem; background: #fff; color: #1a1a1a; outline: none;
+    transition: border-color 0.15s;
+  }
+  input:focus, select:focus { border-color: #0969da; box-shadow: 0 0 0 3px rgba(9,105,218,0.1); }
+  .hint { font-size: 0.78rem; color: #666; margin-top: 4px; }
+  .hint code { font-family: monospace; background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }
+  .checkrow { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .checkrow input[type="checkbox"] { width: 16px; height: 16px; accent-color: #1a1a1a; }
+  .checkrow label { margin: 0; font-weight: 400; color: #333; font-size: 0.875rem; }
+  .btn-primary {
+    display: block; width: 100%; margin-top: 20px; padding: 10px 16px;
+    background: #1a1a1a; color: #fff; border: none; border-radius: 6px;
+    font-size: 0.95rem; font-weight: 600; cursor: pointer; text-align: center;
+    transition: background 0.15s;
+  }
+  .btn-primary:hover { background: #333; }
+  .how-it-works ol { padding-left: 20px; }
+  .how-it-works li { font-size: 0.875rem; color: #444; margin-bottom: 8px; line-height: 1.5; }
+  .how-it-works li strong { color: #1a1a1a; }
+  .how-it-works .note { font-size: 0.8rem; color: #666; margin-top: 14px; padding: 10px; background: #f8f8f8; border-radius: 6px; border-left: 3px solid #d0d7de; }
+  .scans-section h2 { font-size: 1rem; font-weight: 700; margin-bottom: 14px; }
+  .scans-table { background: #fff; border: 1px solid #e1e4e8; border-radius: 8px; overflow: hidden; }
+  .scan-row { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid #f0f0f0; }
+  .scan-row:last-child { border-bottom: none; }
+  .scan-repo { font-family: monospace; font-size: 0.85rem; color: #1a1a1a; word-break: break-all; }
+  .scan-meta { font-size: 0.78rem; color: #888; margin-top: 2px; }
+  .scan-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+  .badge-running { background: #fff8c5; color: #9a6700; }
+  .badge-done    { background: #dafbe1; color: #1a7f37; }
+  .badge-error   { background: #ffebe9; color: #cf222e; }
+  .link-btn { font-size: 0.8rem; color: #0969da; text-decoration: none; padding: 3px 8px; border-radius: 4px; border: 1px solid #d0d7de; white-space: nowrap; }
+  .link-btn:hover { background: #f3f8ff; }
+  .delete-btn {
+    background: none; border: 1px solid #d0d7de; border-radius: 4px;
+    cursor: pointer; color: #888; padding: 3px 7px; font-size: 0.8rem;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .delete-btn:hover { color: #cf222e; border-color: #cf222e; }
+  .copy-btn {
+    background: none; border: none; cursor: pointer; color: #bbb; padding: 2px 4px;
+    line-height: 1; transition: color 0.15s; vertical-align: middle; flex-shrink: 0;
+    display: inline-flex; align-items: center;
+  }
+  .copy-btn:hover { color: #1a1a1a; }
+  .copy-btn.copied { color: #1a7f37; }
+  .scan-repo-wrap { display: flex; align-items: flex-start; gap: 4px; }
+  .empty-state { padding: 32px; text-align: center; color: #888; font-size: 0.9rem; }
+  .local-chip {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: 600;
+    background: #161b22; color: #8b949e; border: 1px solid #30363d; cursor: default;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Knostic OpenAnt</h1>
+  <span>LLM-powered security scanner</span>
+  <span class="local-chip" title="Only reachable from this machine (loopback); not exposed to your network.">🔒 Local only</span>
+</header>
+<div class="main">
+  <div class="grid">
+    <!-- New Scan Form -->
+    <div class="card">
+      <h2>New Scan</h2>
+      <form method="POST" action="/scan">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <label for="repo">Repository URL or local path</label>
+        <input type="text" id="repo" name="repo" required autofocus
+               placeholder="https://github.com/org/repo  or  /path/to/project">
+
+        <label>Languages to scan</label>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px 16px;margin:6px 0 4px;">
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" name="languages" value="go"> Go</label>
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" name="languages" value="python"> Python</label>
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" name="languages" value="javascript"> JavaScript</label>
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" name="languages" value="c"> C / C++</label>
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" name="languages" value="ruby"> Ruby</label>
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" name="languages" value="php"> PHP</label>
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" name="languages" value="rust"> Rust</label>
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" name="languages" value="swift"> Swift</label>
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" name="languages" value="zig"> Zig</label>
+        </div>
+        <div class="hint">Leave all unchecked to scan <strong>every detected language</strong> (a size threshold skips trivial single-file languages). Check specific languages to limit the scan to just those — lower cost and time.</div>
+
+        <label for="api_key">Anthropic API Key</label>
+        <input type="password" id="api_key" name="api_key"
+               placeholder="sk-ant-…">
+        {{if .HasAPIKey}}
+          <div class="hint">Leave blank to use the key configured in {{.APIKeySource}}.</div>
+        {{else}}
+          <div class="hint">Run <code>openant set-api-key &lt;key&gt;</code> to configure a key, or paste one here.</div>
+        {{end}}
+
+        <div class="checkrow">
+          <input type="checkbox" id="verify" name="verify" checked>
+          <label for="verify">Attacker simulation — Stage 2; probes whether findings are exploitable (--verify)</label>
+        </div>
+        <div class="checkrow">
+          <input type="checkbox" id="dynamic_test" name="dynamic_test">
+          <label for="dynamic_test">Dynamic testing — Docker-isolated; runs candidate exploits to confirm (--dynamic-test)</label>
+        </div>
+        <div class="checkrow">
+          <input type="checkbox" id="library_mode" name="library_mode">
+          <label for="library_mode">Library mode — analyze exported API surface (--library-mode; for libraries with no main/CLI/routes). Note: seeds the whole public API, so it can substantially increase analysis time and LLM cost on large libraries.</label>
+        </div>
+
+        <button type="submit" class="btn-primary">Start Scan</button>
+      </form>
+    </div>
+
+    <!-- How It Works -->
+    <div class="card how-it-works">
+      <h2>How It Works</h2>
+      <ol>
+        <li><strong>Parse</strong> — Extract functions and call graphs from the repository</li>
+        <li><strong>Enhance</strong> — Add security context to each code unit</li>
+        <li><strong>Analyze</strong> — Stage 1 LLM vulnerability detection</li>
+        <li><strong>Verify</strong> — Stage 2 attacker simulation to eliminate false positives</li>
+        <li><strong>Report</strong> — Generate interactive HTML vulnerability report</li>
+      </ol>
+      <div class="note">The server is loopback-only (127.0.0.1). Note: analysis sends source code to your configured LLM provider.</div>
+    </div>
+  </div>
+
+  <!-- Recent Scans -->
+  <div class="scans-section">
+    <h2>Recent Scans</h2>
+    <div class="scans-table" id="scans-list">
+      {{if .Jobs}}
+        {{range .Jobs}}
+        <div class="scan-row" id="row-{{.ID}}">
+          <div>
+            <div class="scan-repo-wrap">
+              <span class="scan-repo" title="{{.Repo}}">{{.Repo}}</span>
+              <button class="copy-btn" title="Copy URL/path" data-repo="{{.Repo}}" onclick="copyRepo(this)"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg></button>
+            </div>
+            <div class="scan-meta">{{.StartedAt}}</div>
+          </div>
+          <span class="badge badge-{{.Status}}">
+            {{if eq .Status "running"}}Running{{else if eq .Status "done"}}Done{{else}}Error{{end}}
+          </span>
+          <div class="scan-actions">
+            {{if eq .Status "running"}}
+              <a class="link-btn" href="/scan/{{.ID}}">View →</a>
+            {{else if eq .Status "done"}}
+              <a class="link-btn" href="/scan/{{.ID}}">Logs →</a>
+              {{if .HasSummary}}<a class="link-btn" href="/summary/{{.ID}}" target="_blank">Summary →</a>{{end}}
+              <a class="link-btn" href="/report/{{.ID}}" target="_blank">Report →</a>
+            {{else}}
+              <a class="link-btn" href="/scan/{{.ID}}">View →</a>
+            {{end}}
+            <button class="delete-btn" title="Delete" onclick="deleteScan('{{.ID}}')">🗑</button>
+          </div>
+        </div>
+        {{end}}
+      {{else}}
+        <div class="empty-state" id="empty-state">No scans yet. Submit a repo above to get started.</div>
+      {{end}}
+    </div>
+  </div>
+</div>
+
+<script>
+function copyRepo(btn) {
+  const text = btn.dataset.repo;
+  navigator.clipboard.writeText(text).then(function() {
+    btn.classList.add('copied');
+    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/></svg>';
+    setTimeout(function() {
+      btn.classList.remove('copied');
+      btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg>';
+    }, 1500);
+  });
+}
+
+function deleteScan(id) {
+  if (!confirm('Delete this scan and all its output?')) return;
+  const csrf = document.querySelector('meta[name="csrf"]').content;
+  fetch('/scan/' + id, { method: 'DELETE', headers: { 'X-CSRF-Token': csrf } }).then(r => {
+    if (r.ok || r.status === 204 || r.status === 404) {
+      const row = document.getElementById('row-' + id);
+      if (row) row.remove();
+      const list = document.getElementById('scans-list');
+      if (list && list.querySelectorAll('.scan-row').length === 0) {
+        list.innerHTML = '<div class="empty-state">No scans yet. Submit a repo above to get started.</div>';
+      }
+    }
+  });
+}
+</script>
+</body>
+</html>
