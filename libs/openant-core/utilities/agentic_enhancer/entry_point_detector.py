@@ -290,6 +290,12 @@ class EntryPointDetector:
                     'synthetic_harness': bool(
                         func_data.get('synthetic_harness')
                         or func_data.get('syntheticHarness')),
+                    # A build.rs / examples/ / benches/ `main` seeds the BFS
+                    # (unit_type=main) but is NOT the crate's runtime entry point;
+                    # tag it so the blackout advisory excludes it from the
+                    # structural count (the seed is kept).
+                    'non_runtime_main': _is_non_runtime_main(
+                        func_data.get('file_path') or func_data.get('filePath') or ''),
                 }
 
         return self.entry_points
@@ -449,6 +455,54 @@ def real_entry_point_ids(entry_points, functions):
 _STRUCTURAL_REASON_CATEGORIES = {"unit_type", "decorator", "name"}
 
 
+def _is_non_runtime_main(file_path: str) -> bool:
+    """True when a `main` in this file runs at build/example/bench time rather
+    than as the crate's deployed runtime entry point, so it must NOT count as a
+    structural entry point for the blackout advisory. The main is still SEEDED
+    (over-seeding is reachability-safe); only the advisory's structural count
+    excludes it. Mirrors the ``synthetic_harness`` exclusion, path-based on Cargo
+    conventions:
+
+      * a crate-root ``build.rs`` (compile-time build script), and
+      * ``examples/`` and ``benches/`` targets (auxiliary binaries that consume
+        the public API rather than being it).
+
+    A file UNDER ``src/`` is an ordinary module, never one of these targets, so
+    it is left alone (a ``src/build.rs`` module or ``src/examples/`` submodule
+    stays structural).
+
+    Scope note: this is a purely path-based check applied to every language's
+    functions (the detector is shared across all parsers), not gated to Rust.
+    ``build.rs`` is Rust-specific, but ``examples/`` and ``benches/`` are a
+    common cross-language layout for non-runtime auxiliary code, so treating a
+    top-level ``examples/``/``benches/`` main as non-structural is intended for
+    any language — a Go/Python ``examples/`` demo is a consumer of the API, not
+    its structural entry point. The effect is confined to the advisory string
+    (never seeding), so the worst case is the library-blackout advisory firing
+    for a project whose only entry lives under ``examples/`` — which is itself a
+    library-shaped project the advisory means to flag.
+
+    Documented residual limits: a build script renamed via Cargo's
+    ``build = "custom.rs"`` manifest key is not recognised; a non-crate-root file
+    literally named ``build.rs`` (e.g. ``scripts/build.rs``) is over-tagged
+    (advisory noise only); and — pre-existing, orthogonal to this change — the
+    advisory itself is written only to ``metadata.reachability_filter.warning``
+    and stderr, not the CLI JSON/exit envelope, so a correctly-fired warning is
+    not yet surfaced to a CI consumer. This is a conservative check: an
+    unknown/empty path returns False (counts structural, i.e. pre-fix
+    behaviour), never dropping a real structural seed.
+    """
+    if not file_path:
+        return False
+    parts = file_path.replace("\\", "/").split("/")
+    ancestors = parts[:-1]
+    if "src" in ancestors:
+        return False
+    if parts[-1] == "build.rs":
+        return True
+    return "examples" in ancestors or "benches" in ancestors
+
+
 def blackout_warning(entry_point_details, original_count, reachable_count,
                      library_mode=False, reduction_threshold=0.90):
     """Advisory string when a reachability result looks like a silent library
@@ -474,6 +528,7 @@ def blackout_warning(entry_point_details, original_count, reachable_count,
     structural = sum(
         1 for d in (entry_point_details or {}).values()
         if not d.get("synthetic_harness")
+        and not d.get("non_runtime_main")
         and any(r.split(":", 1)[0] in _STRUCTURAL_REASON_CATEGORIES
                 for r in d.get("reasons", []))
     )
