@@ -221,6 +221,11 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     - api_status with 500+: Server errors (not client errors like 400)
     - parse_error: Malformed (unparseable) LLM response; re-generating the
       completion often yields well-formed output.
+    - no usable content: an adapter's "... returned no usable content ..."
+      LLMResponseError (empty completion) — a transient thinking-truncation /
+      malformed reply, across anthropic/google/openai. Deterministic refusals
+      (LLMRefusalError, "refused the request") are NOT matched and stay
+      non-retryable.
 
     Args:
         error_info: The error field from agent_context or similar.
@@ -266,4 +271,33 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
         # "not implemented" and is deliberately excluded.
         "500", "502", "503", "504", "520", "522", "523", "524", "529",
         "overloaded",
+        # A provider adapter raises LLMResponseError on an empty completion (no
+        # text/tool block) — typically a thinking-block truncation or a
+        # malformed/overloaded reply, which re-generating usually recovers. The
+        # phrasing differs across adapters, so BOTH substrings are needed to cover
+        # every empty path without missing one:
+        #   "no usable content" — anthropic.py:368, google.py:453,
+        #                          openai.py:730 (Responses API "status=...")
+        #   "empty completion"  — anthropic.py:368 / google.py:453 (also carry
+        #                          it), openai.py:760 "no choices (empty
+        #                          completion)", openai.py:816 "empty completion
+        #                          (no text or tool calls)"
+        # The DETERMINISTIC content-filter case is a distinct exception
+        # (LLMRefusalError, "refused the request") and Gemini's deterministic
+        # prompt-block ("no candidates (prompt blocked...)") — neither contains
+        # either substring, so both stay non-retryable.
+        # NOTE (openant-kb CONC-C2): the empty-completion raise happens before the
+        # call is recorded, so each retry is a billed-but-unrecorded call — this
+        # trades a small billing under-report for verdict recovery. Bounded to the
+        # single detection retry pass.
+        # DELIBERATELY NOT matched: OpenRouter's finish_reason='error'
+        # (openrouter.py, "the completion is incomplete") is left to that adapter's
+        # original handling (surface as ERROR). Unlike the direct-provider empty
+        # completions above (unambiguously transient truncations), that channel is
+        # MIXED — it also carries deterministic output-moderation / token-limit
+        # failures — and OpenRouter's structured error.metadata.error_type (the
+        # signal needed to retry only transient subtypes) is discarded at the
+        # adapter, so a precise fix belongs in openrouter.py, not this term.
+        "no usable content",
+        "empty completion",
     ))
