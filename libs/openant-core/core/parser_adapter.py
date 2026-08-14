@@ -455,6 +455,7 @@ def apply_reachability_filter(
     EntryPointDetector = _epd.EntryPointDetector
     blackout_warning = _epd.blackout_warning
     library_seed_ids = _epd.library_seed_ids
+    real_entry_point_ids = _epd.real_entry_point_ids
     ReachabilityAnalyzer = _ra.ReachabilityAnalyzer
 
     call_graph_path = os.path.join(output_dir, "call_graph.json")
@@ -495,16 +496,20 @@ def apply_reachability_filter(
     # pass-through (keep all units, unfiltered) and record a loud warning so the
     # degraded result is never silent. Higher-level callers may still seed
     # ``extra_entry_points`` to get real filtering.
-    if not entry_points and original_count > 0:
+    real_eps = real_entry_point_ids(entry_points, functions)
+    if not real_eps and original_count > 0:
+        why = ("Only synthetic fuzz-harness entry points detected"
+               if entry_points else "No entry points detected")
         warning = (
-            "No entry points detected — reachability cannot seed a frontier. "
+            f"{why} — reachability cannot seed a real frontier. "
             "Returning all units unfiltered to avoid a silent blackout; "
-            f"'{processing_level}' filtering was NOT applied."
+            f"'{processing_level}' filtering was NOT applied. "
+            "Use --library-mode to seed the exported public API surface."
         )
         print(f"  [Warning] {warning}", file=sys.stderr)
         dataset.setdefault("metadata", {})["reachability_filter"] = {
             "original_units": original_count,
-            "entry_points": 0,
+            "entry_points": len(entry_points),
             "reachable_units": original_count,
             "filtered_out": 0,
             "reduction_percentage": 0,

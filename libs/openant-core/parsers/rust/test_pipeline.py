@@ -200,7 +200,7 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
     the Zig/PHP/Ruby/C parser pipelines for the identical shape).
     """
     try:
-        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector, blackout_warning, library_seed_ids
+        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector, blackout_warning, library_seed_ids, real_entry_point_ids
         from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
     except ImportError:
         print(
@@ -234,10 +234,7 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
     # would silently drop the un-reached public API. Hybrid targets that also ship
     # a real bin/route still have real seeds, so they filter normally. `--library-
     # mode` (which adds non-synthetic public-API seeds) also defeats the fallback.
-    real_entry_points = {
-        ep for ep in entry_points
-        if not functions.get(ep, {}).get("synthetic_harness")
-    }
+    real_entry_points = real_entry_point_ids(entry_points, functions)
     if not real_entry_points and functions:
         why = ("Only synthetic fuzz-harness entry points detected"
                if entry_points else "No entry points detected")

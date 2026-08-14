@@ -284,6 +284,12 @@ class EntryPointDetector:
                     'reasons': reasons,
                     'unit_type': _unit_type(func_data),
                     'name': func_data.get('name'),
+                    # A synthesized fuzz harness seeds the BFS (unit_type=main) but
+                    # is NOT a real structural entry point; record the tag so the
+                    # blackout advisory can exclude it from the structural count.
+                    'synthetic_harness': bool(
+                        func_data.get('synthetic_harness')
+                        or func_data.get('syntheticHarness')),
                 }
 
         return self.entry_points
@@ -413,6 +419,28 @@ def library_seed_ids(functions):
     return seeds
 
 
+def real_entry_point_ids(entry_points, functions):
+    """Entry-point ids that are REAL structural seeds — excludes synthesized
+    fuzz harnesses.
+
+    A libFuzzer ``fuzz_target!`` harness is lifted as an entry point with
+    ``unit_type=main`` (so it seeds the BFS) but it is NOT a program root: it is
+    tagged ``synthetic_harness=True``. When the ONLY seeds are synthetic
+    harnesses — a pure-library-plus-fuzz target whose real public API is often
+    macro-hidden from the call graph — the keep-all blackout net must still fire
+    instead of trusting the harness-only reachable set, which would silently drop
+    the un-reached exported surface. Shared by ``core.parser_adapter`` and the
+    rust pipeline so the two nets cannot drift. Both key casings are accepted
+    (subprocess pipelines normalize to camelCase while the on-disk call_graph is
+    snake_case), matching ``library_seed_ids``.
+    """
+    return {
+        ep for ep in entry_points
+        if not (functions.get(ep, {}).get("synthetic_harness")
+                or functions.get(ep, {}).get("syntheticHarness"))
+    }
+
+
 # Reason categories that indicate a STRUCTURAL entry point — a real route, program
 # main, CLI command, framework handler, or decorator-marked endpoint — as opposed
 # to an INCIDENTAL match (code merely contains an input-reading pattern). A result
@@ -445,8 +473,9 @@ def blackout_warning(entry_point_details, original_count, reachable_count,
     reduction = 1.0 - (reachable_count / original_count)
     structural = sum(
         1 for d in (entry_point_details or {}).values()
-        if any(r.split(":", 1)[0] in _STRUCTURAL_REASON_CATEGORIES
-               for r in d.get("reasons", []))
+        if not d.get("synthetic_harness")
+        and any(r.split(":", 1)[0] in _STRUCTURAL_REASON_CATEGORIES
+                for r in d.get("reasons", []))
     )
     if reduction >= reduction_threshold and structural == 0:
         return (f"Reachability kept {reachable_count} of {original_count} units "
