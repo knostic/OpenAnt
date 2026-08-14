@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -24,7 +26,41 @@ import (
 // wedging the CLI forever, which matters most for headless/automated
 // callers that cannot deliver a manual Ctrl+C. It is a package var so
 // tests can shrink it.
+//
+// 30m is enough for typical repos but a large one (hundreds of LLM units) can
+// legitimately run longer; when it does, the deadline kills the phase mid-run
+// and its output is discarded (downstream then cascades on the missing file).
+// resolveInvokeTimeout lets an operator raise the budget via
+// OPENANT_INVOKE_TIMEOUT without recompiling. Completed units are checkpointed,
+// so a re-run resumes; the env override lets a single run finish outright.
 var defaultInvokeTimeout = 30 * time.Minute
+
+// resolveInvokeTimeout returns the invoke deadline, honoring the
+// OPENANT_INVOKE_TIMEOUT env override. The value is either a Go duration
+// (e.g. "2h", "90m") or a bare positive integer interpreted as seconds. An
+// unset, empty, malformed, or non-positive value falls back to
+// defaultInvokeTimeout (a warning is printed for a non-empty invalid value).
+func resolveInvokeTimeout() time.Duration {
+	v := strings.TrimSpace(os.Getenv("OPENANT_INVOKE_TIMEOUT"))
+	if v == "" {
+		return defaultInvokeTimeout
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	// Bare integer = seconds. Guard the multiply: n*time.Second overflows int64
+	// for n beyond ~9.2e9 (≈292 years) and wraps NEGATIVE, which would make the
+	// deadline already-expired and kill the subprocess immediately — the exact
+	// failure this knob prevents. Such an absurd value falls back to the default.
+	if n, err := strconv.Atoi(v); err == nil && n > 0 &&
+		int64(n) <= int64(math.MaxInt64)/int64(time.Second) {
+		return time.Duration(n) * time.Second
+	}
+	fmt.Fprintf(os.Stderr,
+		"[openant] ignoring invalid OPENANT_INVOKE_TIMEOUT=%q; using default %v\n",
+		v, defaultInvokeTimeout)
+	return defaultInvokeTimeout
+}
 
 // InvokeResult holds the result of a Python CLI invocation.
 type InvokeResult struct {
@@ -52,7 +88,7 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	// CommandContext kills the process. This is the only recovery path for
 	// headless/automated callers, which never deliver the manual SIGINT the
 	// signal goroutine below relies on. Mirrors the pattern at cmd/docker.go.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultInvokeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), resolveInvokeTimeout())
 	defer cancel()
 	cmd := exec.CommandContext(ctx, pythonPath, cmdArgs...)
 
