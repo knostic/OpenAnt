@@ -97,7 +97,7 @@ class TestSimpleText:
             CompletionResult(content=[TextBlock("x")], input_tokens=1, output_tokens=1, stop_reason="end_turn")
         )
         simple_text(_binding(adapter), "p", tracker=TokenTracker())
-        assert adapter.calls[0]["max_tokens"] == 8192
+        assert adapter.calls[0]["max_tokens"] == 20000
 
         simple_text(_binding(adapter), "p", max_tokens=128, tracker=TokenTracker())
         assert adapter.calls[1]["max_tokens"] == 128

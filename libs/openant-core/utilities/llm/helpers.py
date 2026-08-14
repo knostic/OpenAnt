@@ -38,7 +38,15 @@ def simple_text(
     prompt: str,
     *,
     system: Optional[str] = None,
-    max_tokens: int = 8192,
+    # Thinking-era default. Claude-5 / Gemini-2.5+ / OpenAI o-series spend
+    # output budget on hidden reasoning; 8192 can be fully consumed by
+    # reasoning on a large unit, yielding a reasoning-only (empty) completion
+    # that the adapter drops -> hard "no usable content" error. 20000 is under
+    # the Anthropic non-streaming 10-min ceiling (32000 is rejected with a
+    # "Streaming is required" ValueError; 20000 is accepted) and is a CAP, not
+    # a floor on generation -- models still stop at end_turn on small prompts,
+    # so this does not raise cost for short answers.
+    max_tokens: int = 20000,
     tracker: Optional[TokenTracker] = None,
 ) -> str:
     """Send one user-prompt completion, return the concatenated text reply.
