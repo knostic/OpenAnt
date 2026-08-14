@@ -3,6 +3,21 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-08-14] — Configurable Python-subprocess timeout
+
+### Fixed
+
+- **The CLI's Python-subprocess timeout is now configurable via
+  `OPENANT_INVOKE_TIMEOUT`.** It was a hardcoded 30 minutes with no override, so a
+  large repo whose `analyze`/`enhance` phase legitimately ran longer was killed
+  mid-phase — the deadline closes the subprocess stdout pipe, so the in-flight
+  read returns `file already closed` and the phase's output is discarded, which
+  then cascades to a missing-file error in downstream phases. The timeout now
+  honors `OPENANT_INVOKE_TIMEOUT` (a Go duration like `2h`, or a bare integer of
+  seconds), defaulting to `30m` when unset or invalid. Completed units are already
+  checkpointed, so a re-run resumes; the override lets a single large run finish
+  outright.
+
 ## [2026-07-22] — Efficacy harness rescoped to a smoke test
 
 ### Changed
