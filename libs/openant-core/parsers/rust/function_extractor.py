@@ -307,6 +307,22 @@ class FunctionExtractor:
                     pending_attrs = []
                     continue
 
+                if t == "extern_crate_declaration":
+                    # `#[macro_use] extern crate afl;` (classic afl.rs form)
+                    # brings the crate's macros into bare scope. Record the crate
+                    # only when #[macro_use] is present (plain `extern crate` does
+                    # NOT scope the macros).
+                    if any("macro_use" in a for a in pending_attrs):
+                        cname = next((_text(c, source) for c in child.children
+                                      if c.type == "identifier"), None)
+                        if cname:
+                            imports_local.append({
+                                "kind": "extern_macro_use", "crate": cname,
+                                "leaf": None, "alias": None,
+                            })
+                    pending_attrs = []
+                    continue
+
                 if t == "mod_item":
                     self._handle_mod(
                         child, source, file_path, functions, classes,
@@ -352,7 +368,7 @@ class FunctionExtractor:
                 # macro token_tree, so no function_item is emitted and its calls
                 # (e.g. `Frame::decode`) never reach the call graph. Emit a
                 # synthetic entry-point unit carrying the body as ordinary Rust.
-                if t == "macro_invocation" and self._is_fuzz_target_macro(child, source):
+                if t == "macro_invocation" and self._is_fuzz_target_macro(child, source, imports_local):
                     self._handle_fuzz_target(
                         child, source, file_path, functions, classes,
                         imports_local, cur_ctx, pending_attrs,
@@ -654,13 +670,69 @@ class FunctionExtractor:
             worklist.append((block, new_ctx))
 
     _FUZZ_MACRO_NAMES = ("fuzz_target",)
+    _AFL_FUZZ = ("afl", "fuzz")  # AFL's generic `fuzz!` — gated on the afl crate
 
-    def _is_fuzz_target_macro(self, node: Node, source: bytes) -> bool:
-        """True if `node` is a `fuzz_target!( .. )` macro invocation (bare or
-        path-qualified, e.g. `libfuzzer_sys::fuzz_target!`)."""
-        for child in node.children:
-            if child.type in ("identifier", "scoped_identifier"):
-                return _text(child, source).split("::")[-1] in self._FUZZ_MACRO_NAMES
+    def _resolve_macro_origin(self, name: str, imports_local: List[dict]):
+        """Resolve a bare macro name through the file's `use` imports to its
+        ``(crate, real_macro_name)`` origin. Returns ``(None, name)`` when the
+        name is not imported (locally defined or prelude)."""
+        for imp in imports_local:
+            if imp.get("kind") != "use":
+                continue
+            local = imp.get("alias") or imp.get("leaf")
+            if local == name:
+                path = imp.get("path") or ""
+                crate = path.split("::")[0] if path else None
+                return crate, imp.get("leaf")
+        return None, name
+
+    def _is_fuzz_target_macro(self, node: Node, source: bytes,
+                              imports_local: List[dict]) -> bool:
+        """True if `node` is a fuzz-harness macro invocation.
+
+        Recognizes libFuzzer `fuzz_target!` (bare, path-qualified, or
+        import-aliased `use libfuzzer_sys::fuzz_target as ft; ft!(..)`) and AFL's
+        `fuzz!` (path-qualified `afl::fuzz!` or `use afl::fuzz; fuzz!(..)`). A
+        bare name is resolved THROUGH the file's `use` imports to its origin
+        crate + real macro name, so an alias to an unrelated macro
+        (`use evil::thing as fuzz_target`) and a bare `fuzz!` with no afl import
+        are NOT matched (path-resolution is the over-match guard). `fuzz_target`
+        is accepted from any crate (a distinctive libFuzzer name); the generic
+        `fuzz` is accepted only from the `afl` crate. macro_rules!-wrapped
+        harnesses are out of scope (a deliberate deferral: recognizing them
+        needs macro-definition scanning + expansion-shape handling)."""
+        ref = next((c for c in node.children
+                    if c.type in ("identifier", "scoped_identifier")), None)
+        if ref is None:
+            return False
+        text = _text(ref, source)
+        if "::" in text:
+            segs = text.split("::")
+            crate, macro_name = segs[0], segs[-1]
+        else:
+            crate, macro_name = self._resolve_macro_origin(text, imports_local)
+        if macro_name in self._FUZZ_MACRO_NAMES:
+            return True
+        if (crate, macro_name) == self._AFL_FUZZ:
+            return True
+        # AFL brought into bare macro scope via `#[macro_use] extern crate afl`
+        # or `use afl::*`: an otherwise-unresolved bare `fuzz!` is then afl's
+        # harness macro. Gated on afl provenance so a generic `fuzz!` in a file
+        # that doesn't scope afl's macros is NOT matched.
+        if (crate is None and macro_name == "fuzz"
+                and self._afl_in_macro_scope(imports_local)):
+            return True
+        return False
+
+    def _afl_in_macro_scope(self, imports_local: List[dict]) -> bool:
+        """True if the file brings AFL's macros into bare scope, via
+        ``#[macro_use] extern crate afl`` or a ``use afl::*`` glob."""
+        for imp in imports_local:
+            kind = imp.get("kind")
+            if kind == "extern_macro_use" and imp.get("crate") == "afl":
+                return True
+            if kind == "use_glob" and (imp.get("path") or "").split("::")[0] == "afl":
+                return True
         return False
 
     def _handle_fuzz_target(
@@ -845,7 +917,18 @@ class FunctionExtractor:
         if target is None:
             return
         for path_segs, leaf, alias in self._flatten_use_node(target, source, ()):
-            if leaf == "*" or not leaf:
+            if not leaf:
+                continue
+            if leaf == "*":
+                # A glob `use crate::*` is not resolvable to a specific symbol,
+                # but it DOES bring the crate's macros into bare scope — recorded
+                # (kind=use_glob) so fuzz-harness recognition can see `use afl::*`.
+                imports_local.append({
+                    "kind": "use_glob",
+                    "path": "::".join(path_segs),
+                    "leaf": None,
+                    "alias": None,
+                })
                 continue
             imports_local.append({
                 "kind": "use",
@@ -906,6 +989,20 @@ class FunctionExtractor:
                     results.extend(self._flatten_use_node(child, source, prefix))
             return results
         if t == "use_wildcard":
+            # `path::*` — recover the path prefix from the wildcard's own path
+            # child (e.g. `use afl::*` -> prefix ('afl',)) so a glob import records
+            # its crate. Previously the prefix was dropped (wildcards were skipped
+            # by the caller, so it never mattered).
+            path_child = next(
+                (c for c in node.children
+                 if c.type in ("identifier", "scoped_identifier",
+                               "crate", "self", "super")),
+                None,
+            )
+            if path_child is not None:
+                sub = self._flatten_use_node(path_child, source, prefix)
+                base = sub[0][0] if sub else prefix
+                return [(base, "*", None)]
             return [(prefix, "*", None)]
         return []
 
