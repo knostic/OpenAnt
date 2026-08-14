@@ -192,6 +192,22 @@ Or run the full pipeline in one command:
 openant scan --verify
 ```
 
+### Web UI
+
+`openant serve` starts a local web UI over the same scan pipeline: submit a
+repository URL or local path, watch the scan logs stream live, and read the HTML
+report, markdown summary, and disclosures — all from the browser.
+
+```bash
+openant serve                       # http://127.0.0.1:8080, opens your browser
+openant serve --addr 127.0.0.1:9000 # choose a port
+```
+
+The server binds to loopback only (it refuses any non-loopback `--addr`) and is
+intended for local single-user use. Scan outputs persist under
+`~/.openant/webui/` across restarts. Analysis still sends source code to your
+configured LLM provider, the same as the CLI.
+
 ### Working with multiple projects
 
 The pipeline operates on one project at a time. Running `openant init` sets the newly initialized project as the active one, so all subsequent commands target it by default.

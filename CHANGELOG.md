@@ -18,6 +18,17 @@ All notable changes to OpenAnt are documented in this file.
   checkpointed, so a re-run resumes; the override lets a single large run finish
   outright.
 
+## [2026-08-14] — Local web UI
+
+### Added
+
+- **`openant serve` — a local, loopback-only web UI for the scan pipeline.**
+  Submit a repository URL or local path from the browser, watch scan logs stream
+  live (SSE), and read the HTML report / markdown summary / disclosures. Binds
+  127.0.0.1 only (refuses a non-loopback `--addr`); outputs persist under
+  `~/.openant/webui/`. Original work by @sounil, reconciled onto master and
+  security-hardened. See the "Web UI" section in the README.
+
 ## [2026-07-22] — Efficacy harness rescoped to a smoke test
 
 ### Changed
