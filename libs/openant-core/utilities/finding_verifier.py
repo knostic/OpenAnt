@@ -61,7 +61,7 @@ from prompts.verification_prompts import (
     get_verification_system_prompt,
     get_consistency_check_prompt
 )
-from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+from core.verdict_taxonomy import DISCLOSURE_DROPPED, FINDING_VERDICT_ORDER
 
 # Import application context type for type hints
 try:
@@ -890,10 +890,19 @@ class FindingVerifier:
                                 continue
 
                             # F-KB-1b: a conclusively-exploitable finding must not be
-                            # silently downgraded to safe by pattern matching (mirror of
-                            # the conclusive-broken guard above).
+                            # silently downgraded to ANY disclosure-dropping verdict by
+                            # pattern matching (mirror of the conclusive-broken guard
+                            # above). The block-set MUST reference
+                            # core.verdict_taxonomy.DISCLOSURE_DROPPED directly rather
+                            # than a hardcoded {safe, protected}: the original guard
+                            # covered only {safe, protected} while DISCLOSURE_DROPPED also
+                            # contains {inconclusive, rejected}, so a downgrade to
+                            # inconclusive/rejected silently dropped the finding from
+                            # disclosure (an identical security false-negative) while
+                            # bypassing the guard. Referencing the canonical set keeps the
+                            # two from drifting apart again — that drift WAS the bug.
                             if (self._has_conclusive_exploitable_path(result)
-                                    and str(new_verdict or "").strip().lower() in ("safe", "protected")):
+                                    and str(new_verdict or "").strip().lower() in DISCLOSURE_DROPPED):
                                 self._log("warning",
                                           f"Blocked consistency downgrade of conclusively-exploitable {route_key} -> {new_verdict}",
                                           unit_id=route_key)
