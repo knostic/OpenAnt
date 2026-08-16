@@ -411,8 +411,9 @@ def scan_repository(
                     ctx.summary = {"skipped": True, "reason": str(e)}
                     # Record the crash like the enhance/verify/dynamic-test
                     # handlers do — otherwise the degraded scan (default threat
-                    # model) leaves no artifact record and the summary claims
-                    # "No steps were skipped".
+                    # model) is absent from result.skipped_steps / scan.report.json
+                    # / pipeline_output.json and the summary claims "No steps were
+                    # skipped" (only the per-step report + stderr carried it).
                     _record_skip(result, "app-context", "failed")
 
         collected_step_reports.append(_load_step_report(output_dir, "app-context"))
@@ -465,7 +466,12 @@ def scan_repository(
         }) as ctx:
             try:
                 dataset = read_json(active_dataset_path)
-            except (OSError, json.JSONDecodeError) as exc:
+            except Exception as exc:
+                # Broad like the other optional-stage crash handlers
+                # (app-context/enhance/verify/dynamic-test): read_json opens
+                # strict UTF-8, so a bad-encoding dataset raises
+                # UnicodeDecodeError (a ValueError, not OSError/JSONDecodeError)
+                # which previously escaped and aborted the whole scan.
                 print(f"  WARNING: failed to load dataset: {exc}", file=sys.stderr)
                 ctx.status = "skipped"
                 ctx.summary = {"skipped": True, "reason": str(exc)}

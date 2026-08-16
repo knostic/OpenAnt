@@ -367,3 +367,31 @@ def test_llm_reachability_crash_is_recorded_as_failed(monkeypatch, tmp_path):
     assert "llm-reachability" in result.skipped_steps, \
         "a crashed llm-reachability step was silently dropped from skipped_steps"
     assert result.skipped_step_reasons.get("llm-reachability") == "failed"
+
+
+def test_llm_reachability_non_oserror_crash_is_recorded(monkeypatch, tmp_path):
+    """read_json opens strict UTF-8, so a bad-encoding dataset raises
+    UnicodeDecodeError (a ValueError subclass) — NOT OSError/JSONDecodeError.
+    The handler must catch it (like the other 4 crash handlers' broad except),
+    record the skip, and let the scan complete — not abort the whole scan."""
+    _install_minimal_pipeline(monkeypatch)
+
+    _orig_read = scanner_mod.read_json
+
+    def _raise_unicode(path, *a, **k):
+        if "dataset" in str(path):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        return _orig_read(path, *a, **k)
+
+    monkeypatch.setattr(scanner_mod, "read_json", _raise_unicode)
+
+    out = tmp_path / "out"
+    result = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=False, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False, llm_reachability=True,
+    )
+    assert isinstance(result, ScanResult), \
+        "a non-OSError dataset crash aborted the whole scan"
+    assert "llm-reachability" in result.skipped_steps
+    assert result.skipped_step_reasons.get("llm-reachability") == "failed"
