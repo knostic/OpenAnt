@@ -299,6 +299,15 @@ def generate_html_report(
 ):
     """Generate the HTML report.
 
+    DEV-ONLY. This renderer interpolates ``remediation_html`` (untrusted, LLM-authored
+    from scanned-repo findings) RAW into the template — it is NOT XSS-safe on its own.
+    It is dead on every shipped path: production ``openant report -f html`` returns an
+    error and defers HTML rendering to the Go CLI, which sanitizes remediation HTML
+    through a bluemonday strict allowlist (apps/openant-cli/internal/report/types.go
+    ``SafeRemediation``). Only ``__main__``/tests reach this function. Do NOT re-wire it
+    into a live command without adding equivalent sanitization — see
+    tests/test_report_html_sink_is_dead.py, which guards this boundary.
+
     repository / diff are usually loaded from pipeline_output.json by the
     caller (see ``_load_pipeline_metadata``). When present, the header
     renders the repo identity and, for incremental scans, the

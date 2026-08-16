@@ -40,24 +40,82 @@ class DockerExecutionResult:
 
 
 def _sanitize_compose(content: str) -> str:
-    """Fix common LLM-generated docker-compose issues.
+    """Fix LLM-generated docker-compose issues AND enforce network isolation (F4).
 
-    - Removes obsolete `version:` key
-    - Replaces remote attacker server images with local build
+    The compose file is UNTRUSTED LLM output and is built+run (executed). Force every
+    network `internal: true` (no external egress) so an executing test cannot exfiltrate
+    at RUNTIME, while intra-network service-to-service (the attacker capture server at
+    `attacker:9999`, CWE-918 pattern) keeps working — an internal Docker network still
+    resolves + routes service names, it only loses the external gateway.
+
+    `internal: true` ALONE is bypassable, so this also, structurally (via PyYAML, not
+    regex — a hostile file defeats textual patching):
+      * strips every service `network_mode` (host/bridge would escape the internal net);
+      * drops host `ports:` publishes (incompatible with an internal net anyway);
+      * sets `internal: true` on every declared network AND injects an internal `default`
+        so a service that omits `networks:` (implicit default) is still contained.
+    Also removes obsolete `version:` and local-builds any remote attacker image.
+
+    RESIDUAL (documented, NOT closed here): `docker build`/`compose build` run untrusted
+    `RUN` steps with full egress, so build-time exfil/beaconing is still possible. The
+    build context is minimal (generated test files + one pre-staged source file, no host
+    secrets), and the exploit executes at RUNTIME where this policy applies — so runtime
+    isolation is worth it, but this whole change is sandbox HARDENING, not a vuln fix.
     """
-    # Remove version: line (obsolete in modern docker compose)
-    content = re.sub(r'^version:.*\n', '', content, flags=re.MULTILINE)
+    try:
+        import yaml
+        data = yaml.safe_load(content)
+        if not isinstance(data, dict):
+            raise ValueError("compose root is not a mapping")
+    except Exception:
+        # FAIL CLOSED. If PyYAML cannot parse+structure the compose we cannot prove
+        # network isolation — and `docker compose` (compose-go, a DIFFERENT YAML impl)
+        # might still parse+run the untrusted original with full egress. So we must NOT
+        # return the untrusted content (nor a regex-patched copy, which cannot reliably
+        # strip network_mode/external). Replace it with a refusing comment-only compose:
+        # `docker compose build` then fails ("no services") -> build_error -> the finding
+        # is recorded as ERROR and never executed. No egress. (We do not raise: the
+        # orchestrator calls run_single_container unwrapped, so a raise would abort the
+        # whole dynamic-test run instead of just this finding.)
+        return ("# openant: docker-compose could not be safely parsed/sanitized; "
+                "refusing to run it (fail-closed).\n")
 
-    # Replace any remote image references for attacker/capture services
-    # with local build from ./attacker-server
-    content = re.sub(
-        r'image:\s*[^\n]*attacker[^\n]*',
-        'build: ./attacker-server',
-        content,
-        flags=re.IGNORECASE,
-    )
+    data.pop("version", None)
 
-    return content
+    networks = data.get("networks")
+    if not isinstance(networks, dict):
+        networks = {}
+    for name, cfg in list(networks.items()):
+        cfg = cfg if isinstance(cfg, dict) else {}
+        # Drop `external`/`name`: an external network is one Compose does NOT create,
+        # so it attaches services to a PRE-EXISTING network by name (e.g. `bridge`,
+        # which has egress) and ignores our `internal: true`. Forcing Compose to
+        # create the network fresh is what makes `internal` actually apply.
+        cfg.pop("external", None)
+        cfg.pop("name", None)
+        cfg["internal"] = True
+        networks[name] = cfg
+    default = networks.get("default")
+    default = default if isinstance(default, dict) else {}
+    default.pop("external", None)
+    default.pop("name", None)
+    default["internal"] = True
+    networks["default"] = default
+    data["networks"] = networks
+
+    services = data.get("services")
+    if isinstance(services, dict):
+        for svc in services.values():
+            if not isinstance(svc, dict):
+                continue
+            svc.pop("network_mode", None)   # host/bridge escapes the internal network
+            svc.pop("ports", None)          # host publish incompatible with internal
+            img = svc.get("image")
+            if isinstance(img, str) and "attacker" in img.lower():
+                svc.pop("image", None)
+                svc["build"] = "./attacker-server"
+
+    return yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
 
 
 def _write_test_files(work_dir: str, generation: dict, source_file: str | None = None) -> None:
@@ -207,17 +265,18 @@ def _run_single(
         result.timed_out = timed_out
         return result
 
-    # Create isolated network
-    _run_command(["docker", "network", "create", network_name], timeout=10)
-
-    # Run with timeout, no host mounts, no privileged mode.
-    # tmpfs for /tmp (writable workspace) and /root (for build caches like
-    # ~/.cache/go-build that some test runners write to even at runtime).
+    # F4 hardening: a single-container test has NO sibling service, so it needs no
+    # network at all. `--network none` (loopback only, no gateway/DNS) is strictly
+    # stronger and simpler than an --internal network: an executing test derived from
+    # untrusted findings cannot exfiltrate at runtime, and in-container client->server
+    # tests still work over loopback. (No `docker network create` needed for this path.)
+    # RESIDUAL: build-time RUN egress is still open — see _sanitize_compose. Hardening,
+    # not a vuln fix. The multi-service path uses an internal compose network instead.
     stdout, stderr, code, timed_out = _run_command(
         [
             "docker", "run",
             "--rm",
-            "--network", network_name,
+            "--network", "none",
             "--memory", "512m",
             "--cpus", "1",
             "--read-only",
