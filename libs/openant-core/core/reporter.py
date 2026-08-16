@@ -245,6 +245,8 @@ def build_pipeline_output(
     context_source: str = "none",
     threat_model_sha256: str | None = None,
     threat_model_warnings: list | None = None,
+    skipped_steps: list | None = None,
+    skipped_step_reasons: dict | None = None,
 ) -> tuple[str, int]:
     """Build ``pipeline_output.json`` from analysis results.
 
@@ -452,7 +454,6 @@ def build_pipeline_output(
     # Compute costs and durations from step reports
     costs = {}
     durations = {}
-    skipped_steps = []
     if step_reports:
         for sr in step_reports:
             step = sr.get("step", "unknown")
@@ -460,6 +461,20 @@ def build_pipeline_output(
                 costs[step] = {"actual": sr["cost_usd"]}
             if sr.get("duration_seconds"):
                 durations[step] = sr["duration_seconds"]
+
+    # Populate skipped_steps from the authoritative ScanResult skip data. The
+    # reporter is otherwise blind to skips (it reads only cost/duration above),
+    # so pipeline_stats.skipped_steps was always [] — a crashed/skipped step
+    # (most importantly a non-aborting Stage-2 verify failure) then rendered in
+    # the human summary as "No steps were skipped", indistinguishable from a
+    # clean fully-verified scan. Report-fidelity only: per-finding disclosure is
+    # unchanged (unverified findings stay included, labeled stage2_verdict
+    # 'vulnerable' vs 'confirmed'); this does NOT gate disclosure.
+    _skip_reasons = skipped_step_reasons or {}
+    skipped_steps_detail = [
+        {"step": s, "reason": _skip_reasons.get(s, "")}
+        for s in (skipped_steps or [])
+    ]
 
     total_units = metrics.get("total", len(all_results))
 
@@ -542,7 +557,7 @@ def build_pipeline_output(
             "processing_level": processing_level,
             "costs": costs,
             "durations": durations,
-            "skipped_steps": skipped_steps,
+            "skipped_steps": skipped_steps_detail,
         },
         "results": {
             "vulnerable": metrics.get("vulnerable", 0) + metrics.get("bypassable", 0),
