@@ -49,7 +49,11 @@ def test_bounded_scan_is_fast_where_raw_is_quadratic():
     t = time.time()
     list(RUST_RE.finditer(bound_macro_scan_text(adversarial, context="test")[0]))
     bounded_dt = time.time() - t
-    assert bounded_dt < 1.0, f"bounded scan still slow: {bounded_dt:.2f}s"
+    # The bound must keep this near-instant; the UNBOUNDED regex on this payload
+    # ReDoS-hangs for minutes. A tight sub-second wall-clock flakes on loaded CI
+    # runners (observed 1.03-1.20s on macos/windows) without catching a real
+    # regression any better than a generous ceiling that a true ReDoS blows past.
+    assert bounded_dt < 5.0, f"bounded scan still slow: {bounded_dt:.2f}s (bound not applied?)"
 
 
 def test_rust_and_zig_regex_unchanged():

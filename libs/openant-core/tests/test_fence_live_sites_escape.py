@@ -201,14 +201,19 @@ def test_collapse_inline_has_a_single_home():
     core_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     offenders_oneline, offenders_inline = [], []
     for dp, _dn, files in os.walk(core_root):
-        if "/tests" in dp or "/.git" in dp or "__pycache__" in dp:
+        # Normalize separators: os.walk yields native separators, so a hardcoded
+        # "/tests" never matches on Windows (dp uses "\") and the tests/ dir is
+        # walked instead of skipped -> false offenders. (Same reason rel is
+        # normalized below so the prompts/_fence.py home exemption holds on Windows.)
+        dp_norm = dp.replace(os.sep, "/")
+        if "/tests" in dp_norm or "/.git" in dp_norm or "__pycache__" in dp_norm:
             continue
         for fn in files:
             if not fn.endswith(".py"):
                 continue
             p = os.path.join(dp, fn)
             txt = open(p, encoding="utf-8", errors="ignore").read()
-            rel = os.path.relpath(p, core_root)
+            rel = os.path.relpath(p, core_root).replace(os.sep, "/")
             if "def _oneline" in txt:
                 offenders_oneline.append(rel)
             # the raw inline collapse form, allowed ONLY inside _fence.py (the home)
