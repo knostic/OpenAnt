@@ -111,11 +111,18 @@ def _safe_leaf(name, default: str) -> str:
     basename is strictly correct and strips any traversal.
 
     Fail-closed WITHOUT raising: an unwrapped raise here would abort the whole
-    dynamic-test run (see _refuse_compose), so a hostile name degrades to a
+    dynamic-test run (see _refuse_compose), so a hostile value degrades to a
     harmless leaf (COPY mismatch -> NOT_REPRODUCED) rather than a host write.
+    A non-str value (JSON allows any type), a dot-segment ('.'/'..' -> a
+    directory, not a file), and a name colliding with a fixed staging path
+    (Dockerfile / docker-compose.yml / attacker-server) all degrade to `default`
+    so nothing downstream raises IsADirectoryError / FileExistsError / TypeError.
     """
-    leaf = os.path.basename(name or "")
-    return leaf or default
+    if not isinstance(name, str):
+        return default
+    leaf = os.path.basename(name)
+    _RESERVED = {"", ".", "..", "Dockerfile", "docker-compose.yml", "attacker-server"}
+    return default if leaf in _RESERVED else leaf
 
 
 def _harden_service(name: str, svc: dict) -> dict:
@@ -239,16 +246,20 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
     if source_file and os.path.isfile(source_file):
         shutil.copy2(source_file, os.path.join(work_dir, os.path.basename(source_file)))
 
+    # str() the content fields as a defense-in-depth belt: generate_test already
+    # rejects a non-str content field (test_generator validation), but coercing here
+    # too means a non-str value can never raise TypeError in f.write and abort the
+    # whole run — it degrades to a garbage build that fails safe (NOT_REPRODUCED).
     # Write Dockerfile
     with open_utf8(os.path.join(work_dir, "Dockerfile"), "w") as f:
-        f.write(generation["dockerfile"])
+        f.write(str(generation["dockerfile"]))
 
     # Write test script (confine the LLM-supplied name to a leaf inside work_dir)
     test_filename = _safe_leaf(generation.get("test_filename"), "test_exploit.py")
     test_path = os.path.join(work_dir, test_filename)
     os.makedirs(os.path.dirname(test_path), exist_ok=True)
     with open_utf8(test_path, "w") as f:
-        f.write(generation["test_script"])
+        f.write(str(generation["test_script"]))
 
     # Write requirements/dependencies file
     if generation.get("requirements"):
@@ -256,7 +267,7 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
         req_path = os.path.join(work_dir, req_filename)
         os.makedirs(os.path.dirname(req_path), exist_ok=True)
         with open_utf8(req_path, "w") as f:
-            f.write(generation["requirements"])
+            f.write(str(generation["requirements"]))
 
     # Copy attacker server if needed (before docker-compose so it's available)
     if generation.get("needs_attacker_server"):
