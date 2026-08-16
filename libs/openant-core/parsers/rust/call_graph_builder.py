@@ -80,6 +80,97 @@ _RUST_STR_LITERAL_RE = re.compile(
     r"|'(?:\\.|[^'\\])'"          # char literal
 )
 
+
+def _blank_rust_literals(text: str) -> str:
+    """Single-pass O(n) equivalent of ``_RUST_STR_LITERAL_RE.sub(" ", text)``.
+
+    The regex form is O(n^2) on an unterminated-``r#"`` flood (its ``(?:[^"]|"(?!#))*``
+    branch restarts at every position). This hand-written forward-cursor scanner blanks
+    the SAME four literal forms — collapsing each matched span to a single space, exactly
+    like ``re.sub(" ", ...)`` — with a monotonic index, so it is linear and cannot ReDoS.
+    Running it BEFORE the length budget (rather than the reverse) also restores the calls
+    that the bound-then-strip ordering dropped when a large literal pushed a real trailing
+    call past the cap. A differential test asserts byte-identical output vs the regex on a
+    real-code corpus (any divergence is a call-graph/reachability change and must fail).
+
+    Deliberately matches the regex's EXACT (incomplete) scope — 1-hash raw strings only,
+    no ``r##``/byte-string/``br`` forms — so the extracted call set is unchanged. Extending
+    it to more literal forms would remove real phantom edges but is a call-set change; see
+    residual-evasion.md (tracked as future work, alongside the token-tree-walk that would
+    retire this scanner entirely).
+    """
+    # An UNTERMINATED literal is left UNCHANGED, exactly like the regex: with no
+    # closing delimiter the corresponding alternative fails to match, so re.sub emits
+    # the single opening char and retries at the next position. Only a fully-terminated
+    # literal is collapsed to one space. (Getting this wrong would blank a stray trailing
+    # quote to EOF and drop real trailing calls — the divergence the differential caught.)
+    n = len(text)
+    out = []
+    i = 0
+    # Monotonic short-circuits keep the scan O(n): once we learn there is no `"#`
+    # (resp. no `"`) at/after some index, every LATER raw-string opener starts
+    # scanning even further right, so it is also unterminated -- return -1 without
+    # re-scanning to EOF. Without this, a repeated-`r#"` flood (no closing `"#`)
+    # calls find() to EOF from ~n/3 positions -> O(n^2) (a real ReDoS: measured
+    # ~1.8s at 240KB). The result is byte-identical to calling find() every time.
+    no_hashclose_from = None   # if set: no `"#` exists at/after this index
+    no_quote_from = None       # if set: no `"`  exists at/after this index
+    while i < n:
+        c = text[i]
+        # r#"..."#  (one hash, matching the regex's single-hash branch only)
+        if c == 'r' and text.startswith('r#"', i):
+            start = i + 3
+            if no_hashclose_from is not None and start >= no_hashclose_from:
+                close = -1
+            else:
+                close = text.find('"#', start)
+                if close == -1:
+                    no_hashclose_from = start
+            if close != -1:
+                out.append(' '); i = close + 2; continue
+            out.append(c); i += 1; continue                  # unterminated -> unchanged
+        # r"..."
+        if c == 'r' and text.startswith('r"', i):
+            start = i + 2
+            if no_quote_from is not None and start >= no_quote_from:
+                close = -1
+            else:
+                close = text.find('"', start)
+                if close == -1:
+                    no_quote_from = start
+            if close != -1:
+                out.append(' '); i = close + 1; continue
+            out.append(c); i += 1; continue                  # unterminated -> unchanged
+        # "..." — content is (?:\\.|[^"\\])*, where \\. is backslash + any NON-newline
+        # (re's '.' excludes '\n' without DOTALL, so \<newline> ends the group and the
+        # literal fails to match — must be replicated or the scanner over-consumes).
+        if c == '"':
+            j = i + 1
+            matched = False
+            while j < n:
+                cj = text[j]
+                if cj == '"':
+                    matched = True; break
+                if cj == '\\':
+                    if j + 1 < n and text[j + 1] != '\n':
+                        j += 2; continue
+                    break                                    # \\. fails -> group ends, no close
+                j += 1                                       # [^"\\]
+            if matched:
+                out.append(' '); i = j + 1; continue
+            out.append(c); i += 1; continue                  # unterminated -> unchanged
+        # '.' or '\.' char literal — NOT a lifetime ('a), label ('x:), or unterminated.
+        # The '\X' escape form also excludes \<newline> (same '.' rule as above).
+        if c == "'":
+            if i + 3 < n and text[i + 1] == '\\' and text[i + 2] != '\n' and text[i + 3] == "'":
+                out.append(' '); i += 4; continue            # '\X'
+            if i + 2 < n and text[i + 1] not in "'\\" and text[i + 2] == "'":
+                out.append(' '); i += 3; continue            # 'X'
+            out.append(c); i += 1; continue                  # lifetime/label/unterminated
+        out.append(c)
+        i += 1
+    return ''.join(out)
+
 RUST_BUILTINS = {
     # core::fmt / println-family macro names (recovered via token-tree scan,
     # so they can appear as bare "calls" and must be filtered like any std fn)
@@ -144,6 +235,11 @@ class CallGraphBuilder:
 
         self.call_graph: Dict[str, List[str]] = {}
         self.reverse_call_graph: Dict[str, List[str]] = {}
+        # Machine-readable record of macro bodies whose call-scan input was truncated by
+        # the ReDoS budget (scan_budget.py). A non-empty list means the call graph for
+        # those contexts is KNOWN-INCOMPLETE — downstream reachability should over-seed
+        # rather than trust the callee list. See residual-evasion.md.
+        self.scan_truncated: List[str] = []
 
     # -- public API (parity with sibling parsers) ----------------------------
 
@@ -198,6 +294,7 @@ class CallGraphBuilder:
             "imports": self.imports,
             "call_graph": self.call_graph,
             "reverse_call_graph": self.reverse_call_graph,
+            "scan_truncated": self.scan_truncated,
             "statistics": self.get_statistics(),
         }
 
@@ -423,6 +520,13 @@ class CallGraphBuilder:
         -- it cannot see argument structure -- so results feed the same
         bare/field/scoped resolution paths as the AST walk, with a conservative
         shape.
+
+        NOTE (2026-08-15): "opaque token tree" describes only how THIS scanner
+        treats the body, not the grammar. tree-sitter DOES lex the `token_tree`
+        into structured nodes (string_literal / identifier / nested token_tree),
+        so a node-walk could recover these calls without any regex or scan
+        budget. That rewrite is deferred (see residual-evasion.md R1/T); the
+        regex path is retained for now with a linear literal-stripper in front.
         """
         macro_name = None
         token_tree = None
@@ -434,8 +538,19 @@ class CallGraphBuilder:
         if macro_name not in _SCANNABLE_MACROS or token_tree is None:
             return
         text = self._text(token_tree, source)
-        # Blank literals so a call-shaped substring inside a string is not scanned.
-        text = _RUST_STR_LITERAL_RE.sub(" ", text)
+        # Blank literals FIRST, via the linear _blank_rust_literals (byte-identical to
+        # _RUST_STR_LITERAL_RE.sub but O(n), so it cannot ReDoS the way the regex did on an
+        # unterminated-raw-string flood). Stripping before the budget also collapses a large
+        # string literal to one space, so a real trailing call is no longer pushed past the
+        # cap -- fixing the recall regression the earlier bound-first ordering introduced.
+        text = _blank_rust_literals(text)
+        # THEN bound the stripped text for _MACRO_CALL_RE, which is still O(n^2) on an
+        # adversarial dotted/scoped chain with no trailing '('. This residual (a call after
+        # >8KB of non-literal token soup can be truncated) is tracked in residual-evasion.md.
+        from utilities.scan_budget import bound_macro_scan_text
+        text, _truncated = bound_macro_scan_text(text, context=f"rust macro {macro_name}")
+        if _truncated:
+            self.scan_truncated.append(f"rust macro {macro_name}")
         for match in _MACRO_CALL_RE.finditer(text):
             call_name = match.group(1)
             if "::" in call_name:
