@@ -660,10 +660,17 @@ def generate_application_context(
     if not sources:
         raise ValueError(f"No context sources found in {repo_path}")
 
-    # Format sources for prompt
+    # Format sources for prompt. `content` is a repo file (README, package
+    # manifest, ...) read from the SCANNED repo — untrusted. A bare ``` fence is
+    # escapable: a source file containing its own ``` line would break out and
+    # the remainder would be read as prompt-level instructions, steering the
+    # generated app-context (which then seeds every Stage-1 analysis prompt).
+    # Use a length-adaptive fence per source so the content stays inert data.
+    from prompts._fence import safe_code_fence
     sources_text = ""
     for name, content in sources.items():
-        sources_text += f"\n### {name}\n```\n{content}\n```\n"
+        _sf = safe_code_fence(content)
+        sources_text += f"\n### {name}\n{_sf}\n{content}\n{_sf}\n"
 
     # Call LLM via the adapter — provider+model are dictated by the
     # llm-config's ``app_context`` phase, not hardcoded here.

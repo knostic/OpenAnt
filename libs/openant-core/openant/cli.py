@@ -948,13 +948,35 @@ def cmd_report_data(args):
             if not actionable:
                 remediation_html = "<p>No vulnerabilities or security concerns found. All code units are either safe or properly protected.</p>"
             else:
+                # attack_vector and analysis are untrusted Stage-1/2 LLM output.
+                # Interpolated raw they could inject prompt instructions (or a
+                # fake `### Finding` header) into the remediation prompt. Fence
+                # each with a length-adaptive run so it stays inert data. (The
+                # remediation_html sink is also an XSS vector — HTML-escaping at
+                # the sink is a separate, deferred hardening; this closes the
+                # prompt-injection half.)
+                from prompts._fence import safe_code_fence, collapse_inline
                 findings_text = ""
                 for f in actionable:
+                    _av = f['attack_vector'] or 'Not specified'
+                    _an = f['analysis'][:500]
+                    _avf = safe_code_fence(_av)
+                    _anf = safe_code_fence(_an)
+                    # file/function derive from the (poisonable) route_key; collapse
+                    # newlines so they can't forge a `### Finding` header line.
+                    _file = collapse_inline(f['file'])
+                    _func = collapse_inline(f['function'])
                     findings_text += f"""
-### Finding #{f['number']}: {f['file']}:{f['function']}
+### Finding #{f['number']}: {_file}:{_func}
 - **Verdict**: {f['verdict']}
-- **Attack Vector**: {f['attack_vector'] or 'Not specified'}
-- **Analysis**: {f['analysis'][:500]}
+- **Attack Vector**:
+{_avf}
+{_av}
+{_avf}
+- **Analysis**:
+{_anf}
+{_an}
+{_anf}
 """
                 prompt = f"""Analyze these security findings and provide:
 

@@ -151,9 +151,22 @@ def _build_prompt(repo_path: Path) -> str:
     """Assemble the survey prompt from the repo's own signals."""
     from context.application_context import detect_entry_points, gather_context_sources
 
+    from prompts._fence import safe_code_fence
+
     sources = gather_context_sources(repo_path)
+
+    # `content` is a repo file from the SCANNED repo (untrusted). It was
+    # interpolated raw here with no fence at all, so a file could inject
+    # prompt-level instructions into the threat-model survey (whose output —
+    # not_a_vulnerability, vulnerability_criteria — seeds every Stage-1 prompt).
+    # Fence each truncated source with a length-adaptive run so it stays data.
+    def _render(name: str, content: str) -> str:
+        body = content[:4000]
+        sf = safe_code_fence(body)
+        return f"### {name}\n{sf}\n{body}\n{sf}"
+
     rendered = "\n\n".join(
-        f"### {name}\n{content[:4000]}" for name, content in sources.items()
+        _render(name, content) for name, content in sources.items()
     ) or "(no context files found)"
 
     try:
@@ -161,8 +174,14 @@ def _build_prompt(repo_path: Path) -> str:
     except Exception:  # noqa: BLE001 - survey signal only; never fail generation
         entry_points = "(entry-point detection unavailable)"
 
+    # entry_points embeds scanned file paths (untrusted) and is legitimately
+    # multi-line, so fence it (rather than collapse) — a path containing a newline
+    # could otherwise forge an instruction line, same class as the sources above.
+    _ef = safe_code_fence(entry_points)
+    entry_points_block = f"{_ef}\n{entry_points}\n{_ef}"
+
     return GENERATION_PROMPT.format(
-        name=Path(repo_path).name, sources=rendered, entry_points=entry_points
+        name=Path(repo_path).name, sources=rendered, entry_points=entry_points_block
     )
 
 
