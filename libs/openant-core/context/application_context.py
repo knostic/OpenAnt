@@ -784,37 +784,51 @@ def format_context_for_prompt(context: ApplicationContext) -> str:
     Returns:
         Formatted string for prompt injection.
     """
+    # The free-text fields below (purpose, intended_behaviors, not_a_vulnerability,
+    # security_model, trust_boundaries) are attacker-authored: a scanned repo can
+    # commit OPENANT.json / OPENANT.THREATMODEL.md, which is auto-loaded on every
+    # default scan. Each is spliced onto its own prompt line, so an embedded newline
+    # would forge a NEW instruction line (a fake "## SYSTEM DIRECTIVE" / extra
+    # "Do NOT flag" bullet) that steers this tool's own analyzer/verifier LLM into
+    # false negatives. Collapse every such value to a single inert line — the same
+    # discipline safe_code_fence/neutralize_boundaries already apply to source and
+    # file-boundary markers. application_type is collapsed too: __post_init__ skips the
+    # ApplicationType enum check when source=="manual" (a repo-committed OPENANT.json
+    # override), so it is attacker-controllable despite looking validated. type_info comes
+    # from the built-in registry (a dict lookup on application_type), so it is left raw.
+    from prompts._fence import collapse_inline
+
     type_info = context.get_type_info()
 
     lines = [
         "## Application Context",
         "",
-        f"**Application Type:** {context.application_type}",
+        f"**Application Type:** {collapse_inline(context.application_type)}",
     ]
 
     if type_info:
         lines.append(f"**Type Description:** {type_info.get('description', '')}")
         lines.append(f"**Attack Model:** {type_info.get('attack_model', '')}")
 
-    lines.append(f"**Purpose:** {context.purpose}")
+    lines.append(f"**Purpose:** {collapse_inline(context.purpose)}")
     lines.append("")
 
     if context.intended_behaviors:
         lines.append("**Intended Behaviors (these are FEATURES, not vulnerabilities):**")
         for behavior in context.intended_behaviors:
-            lines.append(f"- {behavior}")
+            lines.append(f"- {collapse_inline(behavior)}")
         lines.append("")
 
     if context.trust_boundaries:
         lines.append("**Trust Boundaries:**")
         for source, level in context.trust_boundaries.items():
-            lines.append(f"- {source}: {level}")
+            lines.append(f"- {collapse_inline(source)}: {collapse_inline(level)}")
         lines.append("")
 
     if context.not_a_vulnerability:
         lines.append("**Do NOT flag as vulnerable:**")
         for item in context.not_a_vulnerability:
-            lines.append(f"- {item}")
+            lines.append(f"- {collapse_inline(item)}")
         lines.append("")
 
     if context.suppress_local_only():
@@ -823,7 +837,7 @@ def format_context_for_prompt(context: ApplicationContext) -> str:
         lines.append("")
 
     if context.security_model:
-        lines.append(f"**Security Model:** {context.security_model}")
+        lines.append(f"**Security Model:** {collapse_inline(context.security_model)}")
         lines.append("")
 
     return "\n".join(lines)
