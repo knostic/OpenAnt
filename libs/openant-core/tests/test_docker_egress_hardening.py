@@ -160,6 +160,10 @@ def test_scrubbed_env_removes_provider_secrets_keeps_docker_essentials():
         "GITHUB_TOKEN": "ghs_x", "OPENAI_APIKEY": "sk-3", "KEY_PASSPHRASE": "pp",
         "SSH_KEY_PASSPHRASE": "pp2", "ANTHROPIC_AUTH": "auth", "SLACK_WEBHOOK": "https://hook",
         "DIGITALOCEAN_ACCESS_KEY": "do",
+        # DOCKER_*/COMPOSE_*/BUILDKIT_* families ALSO carry secrets — a broad prefix
+        # allow re-opened the leak (round-2 bug-hunt). These MUST be dropped.
+        "DOCKER_PASSWORD": "pw", "DOCKER_AUTH_CONFIG": '{"auths":{}}', "DOCKER_TOKEN": "t",
+        "DOCKER_HUB_PASSWORD": "h2", "COMPOSE_PASSWORD": "cp", "BUILDKIT_TOKEN": "bt",
     }
     for k, v in secrets.items():
         os.environ[k] = v

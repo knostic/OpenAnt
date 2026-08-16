@@ -310,16 +310,28 @@ _ENV_ALLOW_EXACT = frozenset({
     "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE",
     "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
-    "COLIMA_HOME",
+    "COLIMA_HOME", "SSH_AUTH_SOCK",  # ssh:// docker context needs the agent socket (a
+                                     # unix-socket PATH, not a secret interpolable into a build-arg)
+    # The BOUNDED set of real docker CLI knobs. NOT a `DOCKER_` prefix: that prefix
+    # re-admits DOCKER_PASSWORD / DOCKER_AUTH_CONFIG (a GitLab-CI registry-cred var) /
+    # DOCKER_TOKEN — the exact secret-by-name leak the allowlist exists to prevent.
+    "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_CERT_PATH",
+    "DOCKER_TLS_VERIFY", "DOCKER_API_VERSION", "DOCKER_BUILDKIT",
+    "DOCKER_DEFAULT_PLATFORM", "DOCKER_CLI_EXPERIMENTAL", "DOCKER_CONTENT_TRUST",
+    "BUILDKIT_HOST", "BUILDKIT_PROGRESS", "COMPOSE_PROJECT_NAME", "COMPOSE_FILE",
+    "COMPOSE_PROFILES", "COMPOSE_DOCKER_CLI_BUILD",
     # Windows essentials so docker.exe resolves on CI runners.
     "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA",
     "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
     "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
 })
-# Prefixes for families docker legitimately needs. Proxy vars may embed the user's OWN
-# proxy credential — that is the user's network config (needed to reach the daemon /
-# registry), not a provider API key, and dropping it would break builds behind a proxy.
-_ENV_ALLOW_PREFIXES = ("DOCKER_", "BUILDKIT_", "COMPOSE_", "CONTAINERD_", "LC_")
+# Only `LC_*` (locale) stays a prefix — it can never carry a provider secret. The
+# docker/compose/buildkit knobs are enumerated exactly above precisely because their
+# families ALSO contain credential-bearing names (DOCKER_PASSWORD/DOCKER_AUTH_CONFIG).
+_ENV_ALLOW_PREFIXES = ("LC_",)
+# Proxy vars may embed the user's OWN proxy credential — that is the user's network
+# config (needed to reach the daemon/registry), not a provider API key, and dropping
+# it would break builds behind a proxy.
 _ENV_ALLOW_SUFFIXES = ("_PROXY", "_proxy")
 _ENV_ALLOW_LOWER = frozenset({"no_proxy"})
 
