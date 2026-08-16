@@ -103,11 +103,22 @@ The system prompt in `test_generator.py` instructs Claude Sonnet to:
 
 CWE-specific guidance is injected via `_get_cwe_guidance()` for common CWE IDs (22, 78, 79, 89, 94, 134, 918, 200, 502).
 
-## Docker Compose Sanitization
+## Docker Compose Reconstruction
 
-`docker_executor._sanitize_compose()` post-processes LLM-generated compose files:
-- Strips `version:` lines (obsolete in modern Docker)
-- Replaces remote attacker image references with `build: ./attacker-server`
+`docker_executor._sanitize_compose()` treats the LLM-generated compose as untrusted and
+**reconstructs** it rather than patching it. Each declared service is rebuilt from a fixed
+key allowlist (`build`/`image`/`depends_on`/`command`/`entrypoint`/`environment`/`expose`/
+`working_dir`/`healthcheck`/`networks`) plus a fixed hardening set (`read_only`,
+`cap_drop: [ALL]`, `security_opt: [no-new-privileges]`, `pids_limit`, `mem_limit`, `cpus`,
+`tmpfs`), so every container-runtime attribute that could reach the host — `privileged`,
+`cap_add`, host `volumes`, `pid`/`ipc`/`network_mode`, `devices`, `security_opt`, `user`,
+`ports`, … — is dropped by omission. The service **set** is preserved (nothing silently
+dropped); every declared network is forced `internal: true`; the attacker image is
+local-built. Fails **closed** (a refusing comment-only compose) on unparseable YAML or a
+build context that escapes the work dir.
+
+Build-time `RUN` egress remains an accepted, documented residual (an egress-allowlisting
+build proxy is deferred).
 
 ## Retry Mechanism
 
