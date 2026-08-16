@@ -409,6 +409,11 @@ def scan_repository(
                     print("  Continuing without app context.", file=sys.stderr)
                     ctx.status = "skipped"
                     ctx.summary = {"skipped": True, "reason": str(e)}
+                    # Record the crash like the enhance/verify/dynamic-test
+                    # handlers do — otherwise the degraded scan (default threat
+                    # model) leaves no artifact record and the summary claims
+                    # "No steps were skipped".
+                    _record_skip(result, "app-context", "failed")
 
         collected_step_reports.append(_load_step_report(output_dir, "app-context"))
     elif generate_context:
@@ -464,6 +469,10 @@ def scan_repository(
                 print(f"  WARNING: failed to load dataset: {exc}", file=sys.stderr)
                 ctx.status = "skipped"
                 ctx.summary = {"skipped": True, "reason": str(exc)}
+                # Record the crash so the degraded reachability pass (no
+                # LLM-promoted entry points -> potential missed vulns) is
+                # visible in the artifacts, not only on CI-discarded stderr.
+                _record_skip(result, "llm-reachability", "failed")
                 dataset = None
 
             if dataset is not None:

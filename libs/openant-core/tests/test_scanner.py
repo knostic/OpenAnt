@@ -305,3 +305,65 @@ def test_skipped_step_reasons_serialized_in_scan_report(monkeypatch, tmp_path):
     # New disambiguated map present.
     assert "steps_skipped_reasons" in summary
     assert "verify" in summary["steps_skipped_reasons"]
+
+
+# ---------------------------------------------------------------------------
+# Crashed context steps must be RECORDED, not silently dropped.
+#
+# enhance/verify/dynamic-test crashes already call _record_skip(..., "failed").
+# app-context and llm-reachability crashes set ctx.status="skipped" but did NOT
+# _record_skip, so a degraded scan (wrong/absent threat model -> FP inflation;
+# no LLM-promoted entry points -> potential missed vulns) left ZERO record in
+# result.skipped_steps / scan.report.json / pipeline_output.json — the summary
+# then affirmatively claimed "No steps were skipped". These pin the invariant.
+# ---------------------------------------------------------------------------
+
+def test_app_context_crash_is_recorded_as_failed(monkeypatch, tmp_path):
+    """A crashed app-context step must land in result.skipped_steps (reason
+    'failed'), so the degraded (default-model) scan is visible in the artifacts,
+    not only on CI-discarded stderr."""
+    _install_minimal_pipeline(monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("app-context blew up")
+
+    monkeypatch.setattr(scanner_mod, "generate_application_context", _boom,
+                        raising=False)
+
+    out = tmp_path / "out"
+    result = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=True, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+    )
+    assert isinstance(result, ScanResult)
+    assert "app-context" in result.skipped_steps, \
+        "a crashed app-context step was silently dropped from skipped_steps"
+    assert result.skipped_step_reasons.get("app-context") == "failed"
+
+
+def test_llm_reachability_crash_is_recorded_as_failed(monkeypatch, tmp_path):
+    """A crashed llm-reachability dataset-load must land in result.skipped_steps
+    (reason 'failed') — same invariant. The crash silently disables the
+    LLM-promoted entry points (potential missed vulns) for an opt-in feature."""
+    _install_minimal_pipeline(monkeypatch)
+
+    _orig_read = scanner_mod.read_json
+
+    def _raise_on_dataset(path, *a, **k):
+        if "dataset" in str(path):
+            raise OSError("dataset unreadable")
+        return _orig_read(path, *a, **k)
+
+    monkeypatch.setattr(scanner_mod, "read_json", _raise_on_dataset)
+
+    out = tmp_path / "out"
+    result = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=False, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False, llm_reachability=True,
+    )
+    assert isinstance(result, ScanResult)
+    assert "llm-reachability" in result.skipped_steps, \
+        "a crashed llm-reachability step was silently dropped from skipped_steps"
+    assert result.skipped_step_reasons.get("llm-reachability") == "failed"
