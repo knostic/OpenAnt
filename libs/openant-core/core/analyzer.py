@@ -336,6 +336,83 @@ def _count_verdicts(results):
     return counts
 
 
+def _analyze_fingerprint(binding) -> dict:
+    """Build the analyze-phase backend-identity fingerprint.
+
+    The static system + user-analysis templates are rendered with
+    ``app_context=None`` (mandatory: the LLM-generated threat model is
+    non-deterministic per scan and must not enter the key). An unrenderable
+    template becomes a sentinel via ``render_template_texts`` → forces re-run
+    rather than a stale adoption.
+    """
+    from core.backend_identity import fingerprint_for_binding, render_template_texts
+    from prompts.vulnerability_analysis import get_system_prompt
+    from prompts.prompt_selector import get_analysis_prompt
+    texts = render_template_texts([
+        lambda: get_system_prompt(app_context=None),
+        lambda: get_analysis_prompt(code="", language="code", app_context=None),
+    ])
+    return fingerprint_for_binding(binding, texts)
+
+
+def _archive_stale_results(output_dir: str, current_fp: str) -> None:
+    """Preserve a prior scan's report before this run overwrites it.
+
+    If ``output_dir/results.json`` exists and was produced under a DIFFERENT
+    ``analyze_fingerprint``, rename it to ``results__<short-fp>.json`` (an
+    unstamped file → ``results__legacy.json``) so a re-scan with a different
+    model/config preserves the prior analyze report. The suffix is the SAME short
+    form as ``StepCheckpoint._archive_dir`` — the last ``:``-split segment, first 8
+    hex — so the ``sha256:`` prefix's colon never lands in a filename (a colon
+    breaks ``os.replace`` on Windows: the OSError is swallowed and a later run
+    overwrites the prior results.json, defeating the preservation promise).
+
+    Scope (named residual): this preserves the Stage-1 ``results.json`` only.
+    ``results_verified.json`` (Stage-2, and the file the serve/report layer
+    prefers) is NOT fingerprint-checked or archived here — a backend-swap re-scan
+    run without ``--verify`` leaves the prior verified file in place. That is
+    pre-existing base behaviour (base overwrote ``results.json`` unconditionally);
+    extending identity/preservation to ``results_verified.json`` is a follow-up.
+
+    Collision-safe: if the target archive name already exists (an A→B→A config
+    alternation, or two unstamped reports both → ``results__legacy.json``), a
+    ``-<n>`` suffix is appended rather than overwriting — mirroring
+    ``_archive_dir`` — so no prior report is ever destroyed. Best-effort: any error
+    leaves the file in place (preserve-not-destroy; never crash the scan).
+    """
+    results_path = os.path.join(output_dir, "results.json")
+    if not os.path.exists(results_path):
+        return
+    try:
+        prior = read_json(results_path)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return
+    if not isinstance(prior, dict):
+        return
+    old_fp = prior.get("analyze_fingerprint")
+    if old_fp == current_fp:
+        return
+    # Short, filesystem-safe suffix: drop the ``sha256:`` prefix (its colon is
+    # illegal in a Windows filename) and keep the first 8 hex chars. A machine
+    # stamp is always a str; a hand-corrupted non-string stamp must NOT crash the
+    # scan (the function's contract is best-effort) — treat it as unstamped.
+    suffix = old_fp.split(":")[-1][:8] if isinstance(old_fp, str) and old_fp else "legacy"
+    # Never clobber an existing archive (distinct prior report under the same
+    # short suffix): append -<n> until the name is free, as _archive_dir does.
+    base = os.path.join(output_dir, f"results__{suffix}")
+    archive = f"{base}.json"
+    n = 1
+    while os.path.exists(archive):
+        archive = f"{base}-{n}.json"
+        n += 1
+    try:
+        os.replace(results_path, archive)
+        print(f"[Analyze] Prior scan's results.json (fingerprint {suffix}) "
+              f"preserved as {os.path.basename(archive)}.", file=sys.stderr)
+    except OSError:
+        pass
+
+
 def run_analysis(
     dataset_path: str,
     output_dir: str,
@@ -411,6 +488,16 @@ def run_analysis(
         probe_registry_or_raise(registry)
     binding = registry.get("analyze")
     print(f"[Analyze] Provider: {binding.provider_name}, Model: {binding.model}", file=sys.stderr)
+
+    # I2 adopt gate: BEFORE loading any prior checkpoints, verify the backend
+    # identity that produced them matches the current one. A changed model /
+    # provider / adapter / static template archives the stale dir aside and
+    # forces a re-run rather than silently adopting another backend's verdicts.
+    # Run AFTER the checkpoint.dir override above.
+    analyze_fp = _analyze_fingerprint(binding)
+    checkpoint.sync_identity(analyze_fp)
+    # Preserve a prior scan's final report before this run overwrites it.
+    _archive_stale_results(output_dir, analyze_fp["key_digest"])
 
     # JSON corrector inherits the analyze binding so correction calls
     # route through the same provider+model.
@@ -619,6 +706,14 @@ def run_analysis(
         },
         "results": results,
         "code_by_route": code_by_route,
+        # Stamp the analyze-phase KEY digest so (a) a later re-scan with a
+        # different config archives this report instead of overwriting it, and
+        # (b) the verify phase can fold it into its own adopt-gate KEY — an
+        # analyze-model/provider/template swap regenerates this digest and
+        # thereby invalidates any verify checkpoints produced against the old
+        # analyze run (closes the verify-overwrite corruption). Deterministic +
+        # persisted → zero re-pay.
+        "analyze_fingerprint": analyze_fp["key_digest"],
     }
 
     write_json(results_path, experiment_result)

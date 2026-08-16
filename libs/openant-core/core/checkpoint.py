@@ -28,10 +28,17 @@ from datetime import datetime, timezone
 
 from utilities.safe_filename import safe_filename
 from utilities.file_io import read_json, write_json
+from core.backend_identity import FINGERPRINT_FILE
 from pathlib import Path
 
 
 SUMMARY_FILE = "_summary.json"
+
+# Sidecar files that live inside a checkpoint dir but are NOT per-unit results.
+# They must be excluded from every checkpoint counter (exists/count/status/load)
+# and from the Go DetectFallback scan, or a resume would over-count "completed"
+# units by the number of sidecars.
+_RESERVED_FILES = frozenset({SUMMARY_FILE, FINGERPRINT_FILE})
 
 
 class StepCheckpoint:
@@ -51,7 +58,7 @@ class StepCheckpoint:
         """True if a checkpoint directory exists with at least one unit file."""
         if not os.path.isdir(self.dir):
             return False
-        return any(f.endswith(".json") and f != SUMMARY_FILE
+        return any(f.endswith(".json") and f not in _RESERVED_FILES
                    for f in os.listdir(self.dir))
 
     def count(self) -> int:
@@ -59,7 +66,7 @@ class StepCheckpoint:
         if not os.path.isdir(self.dir):
             return 0
         return sum(1 for f in os.listdir(self.dir)
-                   if f.endswith(".json") and f != SUMMARY_FILE)
+                   if f.endswith(".json") and f not in _RESERVED_FILES)
 
     def ensure_dir(self):
         """Create the checkpoint directory if it doesn't exist."""
@@ -76,7 +83,7 @@ class StepCheckpoint:
             return results
 
         for filename in os.listdir(self.dir):
-            if not filename.endswith(".json"):
+            if not filename.endswith(".json") or filename in _RESERVED_FILES:
                 continue
             filepath = os.path.join(self.dir, filename)
             try:
@@ -131,6 +138,111 @@ class StepCheckpoint:
         filepath = os.path.join(self.dir, filename)
         data["id"] = unit_id  # ensure id is always present
         write_json(filepath, data)
+
+    # ------------------------------------------------------------------
+    # Backend-identity adopt gate (I2, minimal)
+    # ------------------------------------------------------------------
+
+    def sync_identity(self, fingerprint: dict, *, verbose: bool = True) -> dict:
+        """Gate checkpoint adoption on backend identity.
+
+        Call AFTER ``self.dir`` is finalized (respect any dir override, e.g.
+        the verifier's ``verify_checkpoints``) and BEFORE any ``load()`` — it
+        decides whether the prior checkpoints in this dir may be adopted by the
+        current backend, and if not it archives them aside and starts fresh.
+
+        Returns ``{"status", "archived_to", "warnings"}`` where status is one
+        of:
+
+          * ``new``    — no sidecar and no units: stamp and proceed.
+          * ``legacy`` — units present but no sidecar (a pre-feature dir): we
+            cannot verify identity, so ADOPT (never spuriously re-pay) and
+            stamp for next time.
+          * ``match``  — sidecar KEY digest equals the current one: adopt.
+          * ``reset``  — sidecar KEY mismatch OR a corrupt/unreadable sidecar:
+            archive the whole dir aside (preserve-not-destroy) and start fresh
+            so the new backend re-pays.
+
+        FAIL-CLOSED: a corrupt / unreadable sidecar is treated as ``reset``
+        (archive + re-run), NEVER adopt — an unverifiable identity must not
+        silently serve another backend's verdicts.
+        """
+        sidecar_path = os.path.join(self.dir, FINGERPRINT_FILE)
+        has_units = self.exists
+        warnings: list[str] = []
+
+        sidecar_present = os.path.isfile(sidecar_path)
+        existing = None
+        corrupt = False
+        if sidecar_present:
+            try:
+                existing = read_json(sidecar_path)
+                if not isinstance(existing, dict):
+                    corrupt = True
+            except (json.JSONDecodeError, OSError, ValueError):
+                corrupt = True
+
+        # Corrupt / unreadable sidecar → FAIL CLOSED (archive + re-run).
+        if corrupt:
+            archived_to = self._archive_dir(fingerprint.get("key_digest", ""))
+            os.makedirs(self.dir, exist_ok=True)
+            self._write_fingerprint(fingerprint)
+            msg = ("checkpoint identity sidecar was unreadable/corrupt; refusing "
+                   "to adopt possibly-stale checkpoints (fail-closed). Archived "
+                   f"to {archived_to}. Re-running this phase.")
+            warnings.append(msg)
+            if verbose:
+                print(f"[{self.step_name}] {msg}", file=sys.stderr)
+            return {"status": "reset", "archived_to": archived_to,
+                    "warnings": warnings}
+
+        # No sidecar recorded.
+        if not sidecar_present:
+            self._write_fingerprint(fingerprint)
+            status = "legacy" if has_units else "new"
+            if status == "legacy" and verbose:
+                print(f"[{self.step_name}] Adopting pre-existing checkpoints "
+                      f"with no identity stamp (legacy); stamping for next run.",
+                      file=sys.stderr)
+            return {"status": status, "archived_to": None, "warnings": warnings}
+
+        # KEY match → adopt (refresh the stamp).
+        if existing.get("key_digest") == fingerprint.get("key_digest"):
+            self._write_fingerprint(fingerprint)
+            return {"status": "match", "archived_to": None, "warnings": warnings}
+
+        # KEY mismatch → backend identity changed. Archive and reset.
+        archived_to = self._archive_dir(fingerprint.get("key_digest", ""))
+        os.makedirs(self.dir, exist_ok=True)
+        self._write_fingerprint(fingerprint)
+        msg = ("backend identity changed since last run; prior checkpoints were "
+               "NOT adopted (they would be a silent false-negative). Archived to "
+               f"{archived_to}. Re-running this phase.")
+        warnings.append(msg)
+        if verbose:
+            print(f"[{self.step_name}] {msg}", file=sys.stderr)
+        return {"status": "reset", "archived_to": archived_to,
+                "warnings": warnings}
+
+    def _write_fingerprint(self, fingerprint: dict) -> None:
+        self.ensure_dir()
+        payload = dict(fingerprint)
+        payload["written_at"] = (
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+        write_json(os.path.join(self.dir, FINGERPRINT_FILE), payload)
+
+    def _archive_dir(self, key_digest: str) -> str:
+        """Move the current checkpoint dir aside — never delete it."""
+        short = key_digest.split(":")[-1][:8] or "reset"
+        base = self.dir.rstrip("/")
+        dest = f"{base}.superseded-{short}"
+        n = 1
+        while os.path.exists(dest):
+            dest = f"{base}.superseded-{short}-{n}"
+            n += 1
+        shutil.move(self.dir, dest)
+        return dest
+
     def write_summary(
         self,
         total_units: int,
@@ -232,7 +344,7 @@ class StepCheckpoint:
         error_breakdown = {}
 
         for filename in os.listdir(checkpoint_dir):
-            if not filename.endswith(".json") or filename == SUMMARY_FILE:
+            if not filename.endswith(".json") or filename in _RESERVED_FILES:
                 continue
             filepath = os.path.join(checkpoint_dir, filename)
             try:

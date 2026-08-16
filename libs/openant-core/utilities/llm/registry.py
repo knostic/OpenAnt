@@ -205,6 +205,12 @@ class PhaseBinding:
     adapter: LLMAdapter
     model: str
     provider_name: str
+    # The provider's configured base_url (gateway/proxy endpoint), carried so the
+    # I2 backend-identity fingerprint can discriminate two configs that share a
+    # model+provider but route to different upstreams. ``None`` for default-config
+    # users (SDK default endpoint) → fingerprint unchanged, zero re-pay. Sanitized
+    # (userinfo/query/fragment stripped) before it ever enters the KEY / sidecar.
+    base_url: Optional[str] = None
 
 
 class PhaseRegistry:
@@ -327,6 +333,7 @@ def build_phase_registry(
             adapter=adapters[ref.provider],
             model=ref.model,
             provider_name=ref.provider,
+            base_url=unique_providers[ref.provider].base_url,
         )
 
     # Tool-support gating (plan §5): enhance + verify require an
