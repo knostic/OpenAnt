@@ -407,6 +407,7 @@ def scan_repository(
                     print(f"  WARNING: App context generation failed: {e}",
                           file=sys.stderr)
                     print("  Continuing without app context.", file=sys.stderr)
+                    ctx.status = "skipped"
                     ctx.summary = {"skipped": True, "reason": str(e)}
 
         collected_step_reports.append(_load_step_report(output_dir, "app-context"))
@@ -461,6 +462,7 @@ def scan_repository(
                 dataset = read_json(active_dataset_path)
             except (OSError, json.JSONDecodeError) as exc:
                 print(f"  WARNING: failed to load dataset: {exc}", file=sys.stderr)
+                ctx.status = "skipped"
                 ctx.summary = {"skipped": True, "reason": str(exc)}
                 dataset = None
 
@@ -663,6 +665,7 @@ def scan_repository(
             except Exception as e:
                 print(f"  WARNING: Enhancement failed: {e}", file=sys.stderr)
                 print("  Continuing with the un-enhanced dataset.", file=sys.stderr)
+                ctx.status = "skipped"
                 ctx.summary = {"skipped": True, "reason": str(e)}
                 _record_skip(result, "enhance", "failed")
 
@@ -796,6 +799,7 @@ def scan_repository(
             except Exception as e:
                 print(f"  WARNING: Verification failed: {e}", file=sys.stderr)
                 print("  Continuing with unverified Stage 1 results.", file=sys.stderr)
+                ctx.status = "skipped"
                 ctx.summary = {"skipped": True, "reason": str(e)}
                 _record_skip(result, "verify", "failed")
 
@@ -837,6 +841,13 @@ def scan_repository(
             context_source=result.context_source,
             threat_model_sha256=result.threat_model_sha256,
             threat_model_warnings=result.threat_model_warnings,
+            # Authoritative skip data so pipeline_output.json reflects real
+            # pipeline status (esp. a non-aborting verify failure) instead of
+            # always reporting "nothing skipped". At this point (Step 6) all
+            # pre-build skips incl. verify are already recorded; dynamic-test/
+            # report skips are recorded later and remain in scan.report.json.
+            skipped_steps=list(result.skipped_steps),
+            skipped_step_reasons=dict(result.skipped_step_reasons),
         )
 
         ctx.outputs = {"pipeline_output_path": pipeline_output_path}
@@ -890,6 +901,7 @@ def scan_repository(
                 except Exception as e:
                     print(f"  WARNING: Dynamic test failed: {e}", file=sys.stderr)
                     print("  Continuing without dynamic-test results.", file=sys.stderr)
+                    ctx.status = "skipped"
                     ctx.summary = {"skipped": True, "reason": str(e)}
                     _record_skip(result, "dynamic-test", "failed")
 
