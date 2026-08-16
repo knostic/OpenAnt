@@ -2,7 +2,7 @@ name: gitleaks
 on:
   push:
     branches: [master]
-  pull_request_target:
+  pull_request:
 jobs:
   scan:
     name: gitleaks
@@ -10,14 +10,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Fork PRs need pull_request_target so GITLEAKS_LICENSE is available
-      # (regular pull_request from a fork has no access to repo secrets).
-      # gitleaks-action@v2 rejects pull_request_target ("event is not yet
-      # supported"), so we run the gitleaks CLI directly. Pattern mirrors
-      # kirin_auto/.github/workflows/gitleaks.yaml.
-      #
-      # Safety with pull_request_target: explicitly check out the fork's HEAD
-      # SHA, drop persisted credentials, restrict permissions to contents:read.
+      # We run the open-source gitleaks CLI directly (not gitleaks-action@v2,
+      # which is the only thing that consumes GITLEAKS_LICENSE). The CLI needs
+      # no license and no repo secret, so plain `pull_request` is sufficient and
+      # avoids the privileged `pull_request_target` token alongside fork content.
       # Gitleaks only reads files — no fork code is executed.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4.2.2
         with:
@@ -34,7 +30,7 @@ jobs:
           FORCED: ${{ github.event.forced }}
         run: |
           NULL_SHA="0000000000000000000000000000000000000000"
-          if [ "$EVENT" = "pull_request_target" ]; then
+          if [ "$EVENT" = "pull_request" ]; then
             echo "log_opts=${BASE_SHA}..HEAD" >> "$GITHUB_OUTPUT"
           elif [ "$BEFORE_SHA" = "$NULL_SHA" ] || [ -z "$BEFORE_SHA" ] || [ "$FORCED" = "true" ]; then
             echo "log_opts=" >> "$GITHUB_OUTPUT"
@@ -54,7 +50,6 @@ jobs:
           gitleaks version
       - name: Run gitleaks
         env:
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
           LOG_OPTS: ${{ steps.range.outputs.log_opts }}
         run: |
           if [ -n "$LOG_OPTS" ]; then
