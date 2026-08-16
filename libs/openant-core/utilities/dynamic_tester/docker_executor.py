@@ -286,6 +286,28 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
             f.write(compose_content)
 
 
+# Env-var names whose VALUE is a host secret the docker build/run subprocess must
+# never carry. `docker compose` interpolates a `${VAR}` in an untrusted, LLM-authored
+# compose `build.args` from the subprocess env at BUILD time; the generated Dockerfile
+# `RUN` then has open build-time network egress (an accepted GHSA-98g5 residual that
+# assumed NO host secret was reachable at build time). Scrubbing these names closes the
+# exfil by construction — docker itself needs none of them.
+_SECRET_ENV_SUBSTRINGS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD",
+                          "CREDENTIAL", "PRIVATE_KEY", "SESSION")
+
+
+def _scrubbed_subprocess_env() -> dict:
+    """os.environ minus any provider secret, for the docker build/run subprocess.
+
+    Deny-list by name substring (not an allowlist) so docker keeps everything it
+    needs (PATH, HOME, DOCKER_HOST, DOCKER_CONFIG, proxy vars, …) while no
+    ``*_API_KEY`` / ``*_TOKEN`` / ``*_SECRET`` value can be interpolated into an
+    untrusted compose build-arg and exfiltrated over build-time egress.
+    """
+    return {k: v for k, v in os.environ.items()
+            if not any(s in k.upper() for s in _SECRET_ENV_SUBSTRINGS)}
+
+
 def _run_command(cmd: list[str], timeout: int, cwd: str = None) -> tuple[str, str, int, bool]:
     """Run a command with timeout. Returns (stdout, stderr, exit_code, timed_out)."""
     try:
@@ -295,6 +317,7 @@ def _run_command(cmd: list[str], timeout: int, cwd: str = None) -> tuple[str, st
             text=True,
             timeout=timeout,
             cwd=cwd,
+            env=_scrubbed_subprocess_env(),
         )
         return result.stdout, result.stderr, result.returncode, False
     except subprocess.TimeoutExpired:

@@ -135,3 +135,57 @@ def test_single_container_run_uses_network_none():
     # list form ["docker", "network", "create", ...] (quoted tokens), which the prose
     # comment ("no `docker network create` needed") does not contain.
     assert '"docker", "network", "create"' not in src
+
+
+# --- provider-secret exfil via compose build.args ${VAR} interpolation ---------
+
+def test_scrubbed_env_removes_provider_secrets_keeps_docker_essentials():
+    """The docker subprocess env must not carry provider API keys.
+
+    A compose `build.args` value like `${ANTHROPIC_API_KEY}` is interpolated by
+    docker compose from the host env at BUILD time and can be exfiltrated by the
+    LLM-authored Dockerfile's `RUN` over the still-open build-time network. The
+    build/run subprocess never needs any provider secret, so it runs with a
+    scrubbed env — closing the exfil by construction regardless of build.args.
+    """
+    import os
+    from utilities.dynamic_tester.docker_executor import _scrubbed_subprocess_env
+
+    os.environ["ANTHROPIC_API_KEY"] = "sk-should-not-leak"
+    os.environ["OPENAI_API_KEY"] = "sk-should-not-leak-2"
+    os.environ["SOME_SECRET_TOKEN"] = "leak3"
+    try:
+        env = _scrubbed_subprocess_env()
+        assert "ANTHROPIC_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert "SOME_SECRET_TOKEN" not in env
+        # docker still needs its essentials
+        assert "PATH" in env
+    finally:
+        for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SOME_SECRET_TOKEN"):
+            os.environ.pop(k, None)
+
+
+def test_run_command_passes_scrubbed_env(monkeypatch):
+    """_run_command must hand the scrubbed env to the subprocess (not inherit os.environ)."""
+    import os
+    from utilities.dynamic_tester import docker_executor
+
+    os.environ["ANTHROPIC_API_KEY"] = "sk-should-not-leak"
+    captured = {}
+
+    def fake_run_utf8(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        class R:
+            stdout, stderr, returncode = "", "", 0
+        return R()
+
+    monkeypatch.setattr(docker_executor, "run_utf8", fake_run_utf8)
+    try:
+        docker_executor._run_command(["docker", "version"], timeout=5)
+    finally:
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    assert captured["env"] is not None, "_run_command must pass an explicit env= (scrubbed)"
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
+    assert "PATH" in captured["env"]
