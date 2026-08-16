@@ -23,6 +23,18 @@ import (
 
 const summaryFile = "_summary.json"
 
+// fingerprintFile is the backend-identity sidecar (I2) the Python pipeline
+// writes into each checkpoint dir. Like _summary.json it is NOT a per-unit
+// result and must be excluded from the fallback count, or a resume would
+// over-count "completed" units by one.
+const fingerprintFile = "_fingerprint.json"
+
+// isSidecar reports whether a checkpoint-dir entry is a bookkeeping sidecar
+// (never a per-unit result) and so must not be counted as a completed unit.
+func isSidecar(name string) bool {
+	return name == summaryFile || name == fingerprintFile
+}
+
 // Summary represents the _summary.json written by Python pipeline steps.
 type Summary struct {
 	Step           string         `json:"step"`
@@ -131,7 +143,7 @@ func DetectFallback(scanDir, stepName string) *Info {
 
 	count := 0
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") && e.Name() != summaryFile {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") && !isSidecar(e.Name()) {
 			count++
 		}
 	}

@@ -155,6 +155,24 @@ def run_verification(
     verify_binding = registry.get("verify")
     print(f"[Verify] Provider: {verify_binding.provider_name}, Model: {verify_binding.model}", file=sys.stderr)
 
+    # I2 adopt gate. Runs AFTER the checkpoint.dir override above (line ~88 sets
+    # ``verify_checkpoints``, not the StepCheckpoint default) and BEFORE
+    # verify_batch's checkpoint.load(), so a backend swap archives the stale
+    # verify checkpoints aside instead of adopting them. The static verify
+    # system prompt is rendered with app_context=None. The producing analyze
+    # run's fingerprint is folded into verify's KEY: a verify checkpoint written
+    # against analyze run A is NOT adopted once results.json carries analyze run
+    # B (a model swap). This closes the finding where verify adopts a stale
+    # checkpoint and ``finding_verifier.py`` ``r["finding"] = cp_data["finding"]``
+    # overwrites the fresh Stage-1 verdict.
+    from core.backend_identity import fingerprint_for_binding, render_template_texts
+    from prompts.verification_prompts import get_verification_system_prompt
+    _verify_texts = render_template_texts(
+        [lambda: get_verification_system_prompt(None)])
+    checkpoint.sync_identity(fingerprint_for_binding(
+        verify_binding, _verify_texts,
+        extra_key={"analyze_fingerprint": experiment.get("analyze_fingerprint")}))
+
     # Run Stage 2 verification via verify_batch
     tracker = get_global_tracker()
     verifier = FindingVerifier(
