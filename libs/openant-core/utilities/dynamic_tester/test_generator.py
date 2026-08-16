@@ -141,20 +141,28 @@ def _build_finding_prompt(finding: dict, repo_info: dict) -> str:
     if isinstance(loc, dict) and loc.get("file"):
         source_basename = os.path.basename(loc["file"])
 
+    # Inline label fields are model-produced free text (name, cwe_name, the two
+    # verdicts) or repo-derived (name/type). Interpolated raw on their own line, a
+    # newline in any of them forges a FINDING/instruction line — and THIS prompt's
+    # output is EXECUTED (docker build/run), so injection here is the worst case.
+    # Collapse control chars so each stays one inert line. (Multi-line body fields —
+    # vulnerable_code/description/impact/steps — are length-adaptively FENCED below.)
+    from prompts._fence import collapse_inline
+
     parts = [
         f"Generate a dynamic exploit test for the following vulnerability.",
         "",
-        f"Repository: {repo_info.get('name', 'unknown')}",
-        f"Language: {language}",
-        f"Application Type: {repo_info.get('application_type', 'unknown')}",
+        f"Repository: {collapse_inline(repo_info.get('name', 'unknown'))}",
+        f"Language: {collapse_inline(language)}",
+        f"Application Type: {collapse_inline(repo_info.get('application_type', 'unknown'))}",
         "",
         "FINDING:",
-        f"  ID: {finding.get('id', 'unknown')}",
-        f"  Name: {finding.get('name', 'unknown')}",
-        f"  CWE: {finding.get('cwe_id', 0)} - {finding.get('cwe_name', 'Unknown')}",
+        f"  ID: {collapse_inline(finding.get('id', 'unknown'))}",
+        f"  Name: {collapse_inline(finding.get('name', 'unknown'))}",
+        f"  CWE: {finding.get('cwe_id', 0)} - {collapse_inline(finding.get('cwe_name', 'Unknown'))}",
         f"  Location: {json.dumps(loc, indent=4)}",
-        f"  Stage 1 Verdict: {finding.get('stage1_verdict', 'unknown')}",
-        f"  Stage 2 Verdict: {finding.get('stage2_verdict', 'unknown')}",
+        f"  Stage 1 Verdict: {collapse_inline(finding.get('stage1_verdict', 'unknown'))}",
+        f"  Stage 2 Verdict: {collapse_inline(finding.get('stage2_verdict', 'unknown'))}",
     ]
 
     if source_basename:
@@ -164,14 +172,28 @@ def _build_finding_prompt(finding: dict, repo_info: dict) -> str:
             f"  Your Dockerfile MUST use `COPY {source_basename} .` — the file is already there.",
         ])
 
+    # These four fields are UNTRUSTED: `vulnerable_code` is raw Stage-1/2 LLM
+    # output or a raw scanned-source excerpt; description/impact/steps are prior
+    # LLM output. They were interpolated raw, so a finding could inject prompt
+    # instructions into the test-generation prompt — and this prompt's output is
+    # EXECUTED (docker build/run). Length-adaptive fences keep them inert here;
+    # the structural mitigation (docker build --network=none / --internal test
+    # net) is tracked separately (fencing alone is partial for executed output).
+    from prompts._fence import safe_code_fence
+
+    def _fenced(label: str, value) -> list:
+        body = value if isinstance(value, str) else str(value)
+        sf = safe_code_fence(body)
+        return ["", f"  {label}:", f"{sf}", body, f"{sf}"]
+
     if finding.get("description"):
-        parts.extend(["", f"  Description: {finding['description']}"])
+        parts.extend(_fenced("Description", finding["description"]))
     if finding.get("vulnerable_code"):
-        parts.extend(["", f"  Vulnerable Code:\n{finding['vulnerable_code']}"])
+        parts.extend(_fenced("Vulnerable Code", finding["vulnerable_code"]))
     if finding.get("impact"):
-        parts.extend(["", f"  Impact: {finding['impact']}"])
+        parts.extend(_fenced("Impact", finding["impact"]))
     if finding.get("steps_to_reproduce"):
-        parts.extend(["", f"  Steps to Reproduce: {finding['steps_to_reproduce']}"])
+        parts.extend(_fenced("Steps to Reproduce", finding["steps_to_reproduce"]))
 
     # Add CWE-specific guidance
     cwe_id = finding.get("cwe_id", 0)
@@ -296,13 +318,26 @@ def regenerate_test(
     test_filename = previous_generation.get('test_filename', 'test_exploit.py')
     test_script = previous_generation.get('test_script', '')
 
+    # Each embed (prior LLM output + docker build/run stderr, all attacker-influenced)
+    # gets its OWN length-aware fence so a ``` line inside one cannot break out and
+    # inject prompt-level instructions into the regeneration call. Per-embed, not one
+    # global fence, since a single fence sized from one body fails to escape the others.
+    from prompts._fence import safe_code_fence
+    dockerfile_txt = previous_generation.get('dockerfile', '')
+    requirements_txt = previous_generation.get('requirements', '')
+    error_txt = error_message[:1500]
+    df_fence = safe_code_fence(dockerfile_txt)
+    req_fence = safe_code_fence(requirements_txt)
+    ts_fence = safe_code_fence(test_script)
+    err_fence = safe_code_fence(error_txt)
+
     retry_prompt = (
         f"{original_prompt}\n\n"
         f"IMPORTANT: A previous attempt to generate this test FAILED.\n\n"
-        f"Previous Dockerfile:\n```\n{previous_generation.get('dockerfile', '')}\n```\n\n"
-        f"Previous requirements:\n```\n{previous_generation.get('requirements', '')}\n```\n\n"
-        f"Previous test script ({test_filename}):\n```\n{test_script}\n```\n\n"
-        f"Error message:\n```\n{error_message[:1500]}\n```\n\n"
+        f"Previous Dockerfile:\n{df_fence}\n{dockerfile_txt}\n{df_fence}\n\n"
+        f"Previous requirements:\n{req_fence}\n{requirements_txt}\n{req_fence}\n\n"
+        f"Previous test script ({test_filename}):\n{ts_fence}\n{test_script}\n{ts_fence}\n\n"
+        f"Error message:\n{err_fence}\n{error_txt}\n{err_fence}\n\n"
         f"Fix the issue and regenerate. Common fixes:\n"
         f"- Missing directories: use `mkdir -p` before writing files\n"
         f"- Dependency conflicts: don't pin exact versions, use >= or no pin\n"

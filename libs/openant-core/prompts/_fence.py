@@ -37,3 +37,25 @@ def safe_code_fence(text: str) -> str:
     runs = re.findall(r"`+", text or "")
     longest = max((len(r) for r in runs), default=0)
     return "`" * max(3, longest + 1)
+
+
+def collapse_inline(value) -> str:
+    """Collapse an untrusted value to a single inert line for use as an INLINE
+    prompt LABEL (a header/metadata field, not a fenced block).
+
+    The companion to ``safe_code_fence``: multi-line untrusted content that is
+    interpolated on its own label line (a verdict, route_key, file:function, a
+    finding name) can forge a ``### Finding``/instruction line via an embedded
+    newline. ``str.splitlines()`` recognises the full set of line boundaries
+    (\\n \\r \\r\\n \\v \\f \\x1c-\\x1e \\x85 \\u2028 \\u2029) — a SUPERSET of
+    CommonMark's line endings — so joining on a single space guarantees the
+    result contains none of them. Centralised here so the fence/collapse pair
+    lives in one module and a future hardening (e.g. also stripping tabs)
+    reaches every call site at once, instead of drifting across ~10 copies.
+
+    Returns "" only for a genuinely empty value; a whitespace-only or non-string
+    value comes back as its single-line str() form (e.g. "   " -> "   ", None ->
+    "None") — inert for header-forgery either way. Callers that want a placeholder
+    keep their own ``or "unknown"`` (it will not fire for whitespace-only input).
+    """
+    return " ".join(str(value).splitlines())

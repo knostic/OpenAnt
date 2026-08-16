@@ -10,7 +10,7 @@ Supports optional application context to reduce false positives.
 from typing import TYPE_CHECKING
 
 from core.file_boundary import boundary_in_code, split_on_boundary
-from prompts._fence import safe_code_fence
+from prompts._fence import safe_code_fence, collapse_inline
 
 if TYPE_CHECKING:
     from context.application_context import ApplicationContext
@@ -197,9 +197,21 @@ Then the vulnerability is NOT EXPLOITABLE by you, because local users can alread
               "local access, it is NOT a vulnerability.")
     )
 
-    return f"""{app_context_section}Stage 1 claims this function is **{finding.upper()}**.
+    # `reasoning` is Stage-1 LLM output (untrusted). It was interpolated raw
+    # right beside the fenced code_section, so it could inject prompt-level
+    # instructions steering the verifier's verdict. Give it its own
+    # length-adaptive fence so it stays inert data.
+    _rf = _fence_for(str(reasoning))
+    # `finding` is also model-derived (analysis_core maps a non-enum finding
+    # through .upper(), so a newline survives). Collapse before .upper() so it
+    # can't forge an instruction line on this label line.
+    finding_label = collapse_inline(finding)
+    return f"""{app_context_section}Stage 1 claims this function is **{finding_label.upper()}**.
 
-Their reasoning: {reasoning}
+Their reasoning:
+{_rf}
+{reasoning}
+{_rf}
 
 {code_section}
 
@@ -229,13 +241,21 @@ def get_consistency_check_prompt(
     findings_text = ""
     for i, f in enumerate(findings, 1):
         code_snippet = code_samples.get(f.get("route_key", ""), "")[:500]
+        code_fence = _fence_for(code_snippet)
+        # route_key (scanned file:function) is an inline header label; collapse
+        # control chars so an embedded newline can't forge a `### Finding` /
+        # instruction line beside the (already fenced) code pattern.
+        rk_label = collapse_inline(f.get("route_key", "unknown")) or "unknown"
+        # `finding` is a model-derived verdict; collapse newlines so it can't forge
+        # a `### Finding`/instruction line beside the (fenced) code pattern.
+        verdict_label = collapse_inline(f.get("finding", "unknown")) or "unknown"
         findings_text += f"""
-### Finding {i}: {f.get('route_key', 'unknown')}
-- Current verdict: {f.get('finding', 'unknown')}
+### Finding {i}: {rk_label}
+- Current verdict: {verdict_label}
 - Code pattern:
-```
+{code_fence}
 {code_snippet}...
-```
+{code_fence}
 """
 
     return f"""These findings have similar code patterns. Should they have the same verdict?

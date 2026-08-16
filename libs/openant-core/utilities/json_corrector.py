@@ -61,6 +61,13 @@ def get_json_extraction_prompt(raw_response: str, schema: Optional[str] = None) 
 
     schema = schema or _VULN_SCHEMA
 
+    # raw_response is prior-stage malformed LLM output (untrusted; it echoes
+    # scanned source). It was delimited only by literal `---` lines, which a
+    # payload can trivially forge to inject instructions steering the re-emitted
+    # verdict JSON. Wrap it in a length-adaptive fence so it stays inert data.
+    from prompts._fence import safe_code_fence
+    _rf = safe_code_fence(raw_response)
+
     return f"""The following is a response from a security analysis pipeline that should have been JSON but wasn't properly formatted.
 
 Your task is to extract the structured data and return it as valid JSON.
@@ -69,9 +76,9 @@ The expected JSON schema is:
 {schema}
 
 Raw response to extract from:
----
+{_rf}
 {raw_response}
----
+{_rf}
 
 Return ONLY valid JSON matching the schema above. Preserve every field that is present in the raw response; do not invent values. If a required field cannot be determined, use the most conservative default for that field.
 
