@@ -141,6 +141,9 @@ class CallGraphBuilder:
         # Populated by build_call_graph(); read via the canonical API (export/get_statistics/...).
         self.call_graph: Dict[str, List[str]] = {}
         self.reverse_call_graph: Dict[str, List[str]] = {}
+        # Contexts whose fallback call-scan input was truncated by the ReDoS budget
+        # (scan_budget.py) — the call graph there is KNOWN-INCOMPLETE. See residual-evasion.md.
+        self.scan_truncated: List[str] = []
 
     def build_call_graph(self) -> None:
         """Build the bidirectional call graph, populating self.call_graph / self.reverse_call_graph.
@@ -209,6 +212,7 @@ class CallGraphBuilder:
             "imports": self.imports,
             "call_graph": self.call_graph,
             "reverse_call_graph": self.reverse_call_graph,
+            "scan_truncated": self.scan_truncated,
             "statistics": self.get_statistics(),
         }
 
@@ -538,6 +542,12 @@ class CallGraphBuilder:
         # Matches: foo(), bar.baz(), self.method()
         pattern = r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\("
 
+        # Bound the input to this O(n^2)-on-adversarial-input finditer scan (ReDoS guard);
+        # the pattern is unchanged, so the extracted call set is identical.
+        from utilities.scan_budget import bound_macro_scan_text
+        code, _truncated = bound_macro_scan_text(code, context="zig regex fallback")
+        if _truncated:
+            self.scan_truncated.append("zig regex fallback")
         for match in re.finditer(pattern, code):
             call_name = match.group(1)
             if "." in call_name:
