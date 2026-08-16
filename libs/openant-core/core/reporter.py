@@ -202,6 +202,36 @@ def _dedup_caller_callee(
 # Pipeline output builder
 # ---------------------------------------------------------------------------
 
+def _load_reachability_metadata(scan_dir: str) -> dict | None:
+    """Return the reachability-filter record for this scan, if one exists.
+
+    The parse step (``core/parser_adapter.apply_reachability_filter``) stamps
+    the true kept-unit count onto ``<scan_dir>/dataset.json`` under
+    ``metadata.reachability_filter``. The reporter reads it so
+    ``pipeline_stats.reachable_units`` reflects reality instead of assuming
+    every analyzed unit is reachable. Returns ``None`` when the dataset or the
+    record is absent/unreadable (an unfiltered scan, or a parser that recorded
+    none). NOTE: on a multi-language scan the merged ``dataset.json`` currently
+    carries only the first-parsed language's record (see ``dataset_merge`` /
+    BUG-2b); this reader surfaces that record and warns — full per-language
+    accounting is deferred to a follow-up.
+    """
+    dataset_path = os.path.join(scan_dir, "dataset.json")
+    if not os.path.exists(dataset_path):
+        return None
+    try:
+        dataset = read_json(dataset_path)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(dataset, dict):
+        return None
+    metadata = dataset.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    rf = metadata.get("reachability_filter")
+    return rf if isinstance(rf, dict) else None
+
+
 def build_pipeline_output(
     results_path: str,
     output_path: str,
@@ -433,6 +463,52 @@ def build_pipeline_output(
 
     total_units = metrics.get("total", len(all_results))
 
+    # F1: report the TRUE reachable count from the reachability filter's record
+    # (persisted to <scan_dir>/dataset.json by the parse step) instead of
+    # fabricating reachable_units = total_units. Surfacing original_units +
+    # the reduction makes the pruning visible (a report that showed only the
+    # kept count gave no hint units were pruned — the neqo misdiagnosis vector).
+    # When no record exists but a filtering level was requested, warn rather
+    # than silently assert full reachability (the free-function-parser /
+    # not-recorded blind spot); also surface any blackout warning the filter
+    # recorded (previously written to metadata only, with no report consumer).
+    _reach = _load_reachability_metadata(
+        os.path.dirname(os.path.abspath(results_path))
+    )
+    reachability_warnings: list[str] = []
+    reachability_filter_applied = _reach is not None
+    reachable_units = total_units
+    original_units = total_units
+    reachability_reduction_percentage = None
+    if _reach is not None:
+        if isinstance(_reach.get("reachable_units"), int):
+            reachable_units = _reach["reachable_units"]
+        if isinstance(_reach.get("original_units"), int):
+            original_units = _reach["original_units"]
+        if isinstance(_reach.get("reduction_percentage"), (int, float)):
+            reachability_reduction_percentage = _reach["reduction_percentage"]
+        _rf_warning = _reach.get("warning")
+        if isinstance(_rf_warning, str) and _rf_warning:
+            reachability_warnings.append(_rf_warning)
+    elif total_units > 0 and (processing_level or "").lower() not in ("", "all", "none"):
+        reachability_warnings.append(
+            f"Reachability filtering was requested (level={processing_level!r}) "
+            "but no reachability_filter record was found; reachable_units falls "
+            "back to total_units and may overstate reachability."
+        )
+
+    # reachable_units is a parse-stage count (units the filter kept); total_units
+    # is the analyze-stage total (which --limit / subset runs can truncate below
+    # the kept set). Guard the cross-stage case so the report never silently
+    # shows reachable_units > total_units without explanation.
+    if isinstance(reachable_units, int) and reachable_units > total_units:
+        reachability_warnings.append(
+            f"reachable_units ({reachable_units}) exceeds analyzed total_units "
+            f"({total_units}): analysis covered a subset of the reachable units "
+            "(e.g. --limit). reachable_units is the reachability filter's kept "
+            "count; units_analyzed reflects what was actually analyzed."
+        )
+
     pipeline_output = {
         "repository": {
             "name": repo_name or experiment.get("dataset", "unknown"),
@@ -455,7 +531,13 @@ def build_pipeline_output(
         "threat_model_warnings": list(threat_model_warnings or []),
         "pipeline_stats": {
             "total_units": total_units,
-            "reachable_units": total_units,
+            "reachable_units": reachable_units,
+            # Additive reachability provenance (all tolerated by the untyped
+            # pipeline_stats dict in report/schema.py):
+            "original_units": original_units,
+            "reachability_filter_applied": reachability_filter_applied,
+            "reachability_reduction_percentage": reachability_reduction_percentage,
+            "reachability_warnings": reachability_warnings,
             "units_analyzed": total_units - metrics.get("errors", 0),
             "processing_level": processing_level,
             "costs": costs,

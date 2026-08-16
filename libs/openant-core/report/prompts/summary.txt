@@ -30,6 +30,7 @@ OUTPUT FORMAT:
 - Parsed: {n} functions from {n} files
 - Total units: {pipeline_stats.total_units}
 - Reachable units: {pipeline_stats.reachable_units}
+- Reachability warnings: {pipeline_stats.reachability_warnings}
 - After CodeQL filter: {n} units
 - Analyzed in Stage 1: {n} units
 - Verified in Stage 2: {n} findings
@@ -103,7 +104,8 @@ INSTRUCTIONS:
   - When the scan was incremental, ALSO add a paragraph immediately after the metadata block:
     `> This is an incremental scan. Only the {diff.units_in_diff}/{diff.units_total_parsed} unit(s) overlapping changes between {diff.base_sha[:8]} and {diff.head_sha[:8]} were analyzed. Findings on unchanged units inherit the most recent prior verdict and are not re-examined here.`
 - Processing Level comes from pipeline_stats.processing_level; if null or missing, write "Not available"
-- Reachable units comes from pipeline_stats.reachable_units; total units from pipeline_stats.total_units
+- Reachable units comes from pipeline_stats.reachable_units; total units from pipeline_stats.total_units. When pipeline_stats.reachability_filter_applied is true, append " ({pipeline_stats.reachable_units} of {pipeline_stats.original_units} parsed, {pipeline_stats.reachability_reduction_percentage}% pruned by the reachability filter)" to the Reachable units line so the pruning is visible; when false, append " (reachability filtering not applied/recorded)"
+- Reachability warnings: iterate pipeline_stats.reachability_warnings; if non-empty, render each entry as its own bullet under the Reachable units line; if empty, OMIT the "Reachability warnings" line entirely
 - Per-Step Costs: iterate pipeline_stats.costs; compute totals by summing estimated and actual
 - Per-Step Durations: iterate pipeline_stats.durations; format seconds as "Xm Ys" (e.g., "2m 31s"); the "total" key is the overall duration
 - Skipped Steps: iterate pipeline_stats.skipped_steps; if the array is empty, write "No steps were skipped."
