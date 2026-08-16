@@ -16,6 +16,14 @@ from dataclasses import dataclass
 
 from utilities.llm_client import TokenTracker
 from utilities.llm import PhaseBinding, simple_text
+from core.verdict_taxonomy import DISCLOSURE_DROPPED
+
+# Uppercase mirror of the canonical disclosure-dropped set (this module compares
+# verdicts .upper()'d). Keyed off core.verdict_taxonomy so the guard's block-set
+# cannot drift from the partition — the same canonical-reference fix #243 applied to
+# the Stage-2 verifier, extended here to the Stage-1 consistency guard (#243 did not
+# touch Stage-1, so its guard still blocked only ->{SAFE,PROTECTED}).
+_DISCLOSURE_DROPPED_UPPER = frozenset(v.upper() for v in DISCLOSURE_DROPPED)
 
 
 MAX_TOKENS = 4096
@@ -235,7 +243,10 @@ def run_stage1_consistency_check(
                 for update in consistency_result.findings_updated:
                     route_key = update.get("route_key")
                     raw_should_be = update.get("should_be")
-                    new_verdict = raw_should_be.upper() if isinstance(raw_should_be, str) else ""
+                    # .strip() before .upper() so a whitespace-padded verdict cannot
+                    # bypass the downgrade guard (and get written verbatim as an invalid
+                    # verdict). new_verdict is unconstrained LLM `should_be` output.
+                    new_verdict = raw_should_be.strip().upper() if isinstance(raw_should_be, str) else ""
 
                     if not new_verdict:
                         continue
@@ -243,12 +254,21 @@ def run_stage1_consistency_check(
                     for result in results:
                         if result.get("route_key") == route_key:
                             old_verdict = result.get("verdict", "UNKNOWN")
-                            old_verdict_norm = old_verdict.upper() if isinstance(old_verdict, str) else ""
+                            old_verdict_norm = old_verdict.strip().upper() if isinstance(old_verdict, str) else ""
                             # F-KB-1a: pattern-consistency must not silently downgrade a
                             # surfaced Stage-1 finding to safe. At Stage 1 there is no
                             # per-finding exploit evidence, only pattern similarity (the
                             # weakest signal); block the downgrade and record it for audit.
-                            if old_verdict_norm in ("VULNERABLE", "BYPASSABLE") and new_verdict in ("SAFE", "PROTECTED"):
+                            # F-KB-1a (extends #243's canonical-set fix to Stage-1):
+                            # widen the BLOCK-set from the hardcoded {SAFE,PROTECTED} to the
+                            # full DISCLOSURE_DROPPED. A pattern-consistency (no-evidence)
+                            # downgrade of a surfaced VULNERABLE/BYPASSABLE finding to
+                            # INCONCLUSIVE or REJECTED drops it from disclosure just as
+                            # silently as ->SAFE — the identical false-negative #243 fixed
+                            # in the Stage-2 verifier but which still lived here at Stage-1.
+                            # Old-side kept at {VULNERABLE,BYPASSABLE} to match Stage-1's
+                            # existing scope and #243's non-over-block stance.
+                            if old_verdict_norm in ("VULNERABLE", "BYPASSABLE") and new_verdict in _DISCLOSURE_DROPPED_UPPER:
                                 result["stage1_consistency_downgrade_blocked"] = {
                                     "from": old_verdict,
                                     "proposed": new_verdict,
