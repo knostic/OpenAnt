@@ -1107,9 +1107,10 @@ def resolve_language_selection(args, counts: dict[str, int]):
     Kept as a standalone function so the flag semantics are testable without
     running a scan, and so `scan` and `parse` cannot drift apart.
 
-    `-l auto` (the default) deliberately still means "dominant language only".
-    Multi-language is opt-in via --languages / --all-languages, so no existing
-    invocation changes behaviour.
+    `-l auto` (the default) means every detected language above the size
+    threshold — not the dominant one (see ``_select_languages_for``). ``-l <lang>``
+    narrows to a single language, ``--languages`` to a named subset, and
+    ``--all-languages`` scans everything detected regardless of the threshold.
 
     Raises:
         ValueError: If an explicit `-l <lang>` is combined with a multi-language
