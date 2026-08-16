@@ -98,6 +98,26 @@ def _safe_build(build):
     raise ValueError("service has no usable build spec")
 
 
+def _safe_leaf(name, default: str) -> str:
+    """Confine an LLM-supplied staging filename to a bare leaf inside work_dir.
+
+    generation['test_filename'] / ['requirements_filename'] are LLM output
+    influenced by the scanned repo. Used raw as `os.path.join(work_dir, name)`
+    they let a `..`/absolute value escape work_dir and write to the HOST during
+    pre-container staging (the compose `build.context` analogue that _safe_build
+    already confines). The scaffold is flat by construction — the generation
+    schema's examples are plain basenames, Dockerfiles `COPY <basename> .` at
+    WORKDIR, and pip needs requirements.txt at the build-context root — so
+    basename is strictly correct and strips any traversal.
+
+    Fail-closed WITHOUT raising: an unwrapped raise here would abort the whole
+    dynamic-test run (see _refuse_compose), so a hostile name degrades to a
+    harmless leaf (COPY mismatch -> NOT_REPRODUCED) rather than a host write.
+    """
+    leaf = os.path.basename(name or "")
+    return leaf or default
+
+
 def _harden_service(name: str, svc: dict) -> dict:
     """Reconstruct ONE service from the allowlist + the fixed hardening set (C).
 
@@ -223,8 +243,8 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
     with open_utf8(os.path.join(work_dir, "Dockerfile"), "w") as f:
         f.write(generation["dockerfile"])
 
-    # Write test script
-    test_filename = generation.get("test_filename", "test_exploit.py")
+    # Write test script (confine the LLM-supplied name to a leaf inside work_dir)
+    test_filename = _safe_leaf(generation.get("test_filename"), "test_exploit.py")
     test_path = os.path.join(work_dir, test_filename)
     os.makedirs(os.path.dirname(test_path), exist_ok=True)
     with open_utf8(test_path, "w") as f:
@@ -232,7 +252,7 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
 
     # Write requirements/dependencies file
     if generation.get("requirements"):
-        req_filename = generation.get("requirements_filename", "requirements.txt")
+        req_filename = _safe_leaf(generation.get("requirements_filename"), "requirements.txt")
         req_path = os.path.join(work_dir, req_filename)
         os.makedirs(os.path.dirname(req_path), exist_ok=True)
         with open_utf8(req_path, "w") as f:

@@ -254,14 +254,21 @@ def run_dynamic_tests(
         print(f"  Generated (${generation_cost:.4f}). Running in Docker...",
               file=sys.stderr)
 
-        # Resolve the vulnerable source file for pre-staging.
+        # Resolve the vulnerable source file for pre-staging. location.file is an
+        # LLM-emitted field; a `..`/absolute value would make os.path.join escape
+        # repo_path and copy a HOST file into the Docker build context (read/exfil).
+        # Confine the resolved path under repo_path (realpath also blocks a repo
+        # symlink pointing outside); skip on escape — source_file stays None, the
+        # already-supported no-source path.
         source_file = None
         if repo_path:
             rel_path = finding.get("location", {}).get("file", "")
             if rel_path:
-                candidate = os.path.join(repo_path, rel_path)
-                if os.path.isfile(candidate):
-                    source_file = candidate
+                repo_root = os.path.realpath(repo_path)
+                resolved = os.path.realpath(os.path.join(repo_path, rel_path))
+                if ((resolved == repo_root or resolved.startswith(repo_root + os.sep))
+                        and os.path.isfile(resolved)):
+                    source_file = resolved
 
         # Step 2: Execute in Docker and retry on errors
         execution = run_single_container(generation, finding_id,

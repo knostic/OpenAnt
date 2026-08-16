@@ -255,3 +255,123 @@ def test_finding_prompt_includes_source_basename():
     assert "VulnerablePythonScript.py" in prompt, (
         "prompt must mention the staged source filename so the LLM references it in COPY"
     )
+
+
+# ---------------------------------------------------------------------------
+# Staging path-traversal confinement (host-write + host-read escapes)
+#
+# The generation dict is LLM output influenced by the scanned repo, and
+# finding.location.file is an LLM-emitted structured field. Neither may be
+# used as a filesystem path without confining it to the staging root:
+#   * generation['test_filename'] / ['requirements_filename'] are joined to
+#     work_dir and written -> a `..`/absolute name is a HOST-WRITE escape.
+#   * finding.location.file is joined to repo_path and copied into the build
+#     context -> a `..`/absolute value is a HOST-READ/exfil escape.
+# The staging happens on the host BEFORE any container runs, so the container
+# runtime hardening (#253) does not cover it.
+# ---------------------------------------------------------------------------
+
+def test_write_test_files_confines_traversal_test_filename(tmp_path):
+    """A `..`-traversal generation['test_filename'] must not write outside work_dir."""
+    from utilities.dynamic_tester.docker_executor import _write_test_files
+
+    work_dir = str(tmp_path / "work")
+    os.makedirs(work_dir)
+    escape_target = tmp_path / "PWNED_test.py"  # sibling of work_dir, outside it
+
+    generation = {
+        "dockerfile": "FROM python:3.11\nCMD echo hi",
+        "test_script": "print('pwn')",
+        "test_filename": "../PWNED_test.py",  # escapes work_dir
+    }
+    _write_test_files(work_dir, generation)
+
+    assert not escape_target.exists(), (
+        f"test_filename traversal escaped work_dir -> host-write at {escape_target}"
+    )
+    # Content is confined to a bare leaf inside work_dir.
+    assert (tmp_path / "work" / "PWNED_test.py").exists()
+
+
+def test_write_test_files_confines_absolute_requirements_filename(tmp_path):
+    """An absolute generation['requirements_filename'] must not write to a host path."""
+    from utilities.dynamic_tester.docker_executor import _write_test_files
+
+    work_dir = str(tmp_path / "work")
+    os.makedirs(work_dir)
+    escape_target = tmp_path / "PWNED_reqs.txt"
+
+    generation = {
+        "dockerfile": "FROM python:3.11\nCMD echo hi",
+        "test_script": "print('ok')",
+        "test_filename": "test_exploit.py",
+        "requirements": "flask",
+        "requirements_filename": str(escape_target),  # absolute path outside work_dir
+    }
+    _write_test_files(work_dir, generation)
+
+    assert not escape_target.exists(), (
+        f"requirements_filename absolute path escaped work_dir -> host-write at {escape_target}"
+    )
+
+
+def test_orchestrator_rejects_out_of_repo_source(tmp_path, monkeypatch):
+    """A `..`-traversal finding.location.file must not resolve OUTSIDE repo_path.
+
+    Otherwise a host file (secret) outside the scanned repo is copied into the
+    Docker build context and can be exfiltrated by the LLM-authored test script.
+    """
+    import json
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def vuln(): pass")
+    # A host secret OUTSIDE the repo the attacker tries to reach via traversal.
+    secret = tmp_path / "SECRET.txt"
+    secret.write_text("top-secret")
+
+    po = {
+        "repository": {"name": "test", "language": "python"},
+        "application_type": "web_app",
+        "findings": [{
+            "id": "VULN-001", "name": "t", "short_name": "vuln",
+            "location": {"file": "../SECRET.txt", "function": "x"},
+            "cwe_id": 79, "cwe_name": "XSS",
+            "stage1_verdict": "vulnerable", "stage2_verdict": "confirmed",
+        }],
+    }
+    po_path = tmp_path / "pipeline_output.json"
+    po_path.write_text(json.dumps(po))
+
+    captured = {}
+
+    def mock_generate_test(finding, repo_info, binding, tracker):
+        return {
+            "dockerfile": "FROM python:3.11\nCMD echo hi",
+            "test_script": "print('ok')",
+            "test_filename": "test_exploit.py",
+        }
+
+    def mock_run_single_container(generation, finding_id, source_file=None, **kwargs):
+        captured["source_file"] = source_file
+        from utilities.dynamic_tester.docker_executor import DockerExecutionResult
+        r = DockerExecutionResult()
+        r.stdout = '{"status": "CONFIRMED", "details": "t", "evidence": []}'
+        r.exit_code = 0
+        return r
+
+    monkeypatch.setattr("utilities.dynamic_tester.generate_test", mock_generate_test)
+    monkeypatch.setattr("utilities.dynamic_tester.run_single_container", mock_run_single_container)
+
+    from utilities.dynamic_tester import run_dynamic_tests
+    run_dynamic_tests(
+        pipeline_output_path=str(po_path),
+        output_dir=str(tmp_path / "out"),
+        max_retries=0,
+        repo_path=str(repo),
+        registry=_fake_registry(),
+    )
+
+    assert captured.get("source_file") is None, (
+        f"traversal location.file escaped repo_path -> host-read/exfil: {captured.get('source_file')!r}"
+    )
