@@ -328,7 +328,7 @@ def test_app_context_crash_is_recorded_as_failed(monkeypatch, tmp_path):
         raise RuntimeError("app-context blew up")
 
     monkeypatch.setattr(scanner_mod, "generate_application_context", _boom,
-                        raising=False)
+                        raising=True)
 
     out = tmp_path / "out"
     result = scanner_mod.scan_repository(
@@ -337,9 +337,17 @@ def test_app_context_crash_is_recorded_as_failed(monkeypatch, tmp_path):
         generate_report=False, dynamic_test=False,
     )
     assert isinstance(result, ScanResult)
+    # Pin that the injected generate-branch crash (not some other path / a real
+    # API failure) produced the skip: a real success would set "generated".
+    assert result.context_source == "none"
     assert "app-context" in result.skipped_steps, \
         "a crashed app-context step was silently dropped from skipped_steps"
     assert result.skipped_step_reasons.get("app-context") == "failed"
+    # ...and it must reach the machine-readable artifact, not just the object.
+    import json
+    summary = json.loads((out / "scan.report.json").read_text())["summary"]
+    assert "app-context" in summary["steps_skipped"]
+    assert summary["steps_skipped_reasons"].get("app-context") == "failed"
 
 
 def test_llm_reachability_crash_is_recorded_as_failed(monkeypatch, tmp_path):
@@ -367,6 +375,11 @@ def test_llm_reachability_crash_is_recorded_as_failed(monkeypatch, tmp_path):
     assert "llm-reachability" in result.skipped_steps, \
         "a crashed llm-reachability step was silently dropped from skipped_steps"
     assert result.skipped_step_reasons.get("llm-reachability") == "failed"
+    # ...and it must reach the machine-readable artifact, not just the object.
+    import json
+    summary = json.loads((out / "scan.report.json").read_text())["summary"]
+    assert "llm-reachability" in summary["steps_skipped"]
+    assert summary["steps_skipped_reasons"].get("llm-reachability") == "failed"
 
 
 def test_llm_reachability_non_oserror_crash_is_recorded(monkeypatch, tmp_path):
@@ -395,3 +408,42 @@ def test_llm_reachability_non_oserror_crash_is_recorded(monkeypatch, tmp_path):
         "a non-OSError dataset crash aborted the whole scan"
     assert "llm-reachability" in result.skipped_steps
     assert result.skipped_step_reasons.get("llm-reachability") == "failed"
+
+
+def test_llm_reachability_appctx_read_bad_encoding_does_not_abort(monkeypatch, tmp_path, capsys):
+    """The optional app_ctx_payload read inside the llm-reachability stage reads
+    a self-written application_context.json; a bad-encoding file raises
+    UnicodeDecodeError. That read is a defensive fallback (app_ctx_payload=None)
+    and must NOT abort the whole scan — same strict-UTF-8 hazard as the dataset
+    load directly above it."""
+    _install_minimal_pipeline(monkeypatch)
+
+    # Make app-context generation succeed so app_context_path is set + file written.
+    class _Ctx:
+        application_type = "web_app"
+
+    monkeypatch.setattr(scanner_mod, "generate_application_context",
+                        lambda *a, **k: _Ctx(), raising=True)
+    monkeypatch.setattr(scanner_mod, "save_context",
+                        lambda ctx, path: Path(path).write_text("{}"), raising=True)
+
+    _orig_read = scanner_mod.read_json
+
+    def _raise_on_appctx(path, *a, **k):
+        if "application_context" in str(path):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        return _orig_read(path, *a, **k)
+
+    monkeypatch.setattr(scanner_mod, "read_json", _raise_on_appctx)
+
+    out = tmp_path / "out"
+    result = scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(out),
+        generate_context=True, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False, llm_reachability=True,
+    )
+    assert isinstance(result, ScanResult), \
+        "a bad-encoding application_context.json read aborted the whole scan"
+    # The degradation must be visible on stderr, not silent (it lowers the
+    # reachability prompt's recall). Mirrors the dataset-load sibling's warning.
+    assert "could not read app context for reachability" in capsys.readouterr().err
