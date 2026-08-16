@@ -8,6 +8,8 @@ vulnerabilities from internal-only vulnerabilities.
 
 from typing import List, Optional
 
+from prompts._fence import safe_code_fence, collapse_inline
+
 
 # Input budget for the inlined unit code.
 # primary_code was previously inlined verbatim, so a large unit overflowed the
@@ -112,8 +114,13 @@ def get_user_prompt(
     Returns:
         Formatted prompt string
     """
-    deps_str = ", ".join(static_deps[:10]) if static_deps else "None identified"
-    callers_str = ", ".join(static_callers[:10]) if static_callers else "None identified"
+    # deps/callers/unit_id are scanned identifiers (untrusted in principle, same
+    # class as route_key). Collapse newlines for one-line inertness/consistency
+    # (defense-in-depth; an identifier with a newline is unlikely but not asserted
+    # impossible). unit_id is collapsed at its interpolation below.
+    deps_str = collapse_inline(", ".join(static_deps[:10])) if static_deps else "None identified"
+    callers_str = collapse_inline(", ".join(static_callers[:10])) if static_callers else "None identified"
+    unit_id = collapse_inline(unit_id)
 
     # Cap the inlined code so a large unit cannot overflow the model context.
     primary_code = _cap_primary_code(primary_code)
@@ -149,15 +156,16 @@ def get_user_prompt(
 """
     # else: reachable_from_entry is None, no reachability info available
 
+    code_fence = safe_code_fence(primary_code)
     return f"""## Code Unit to Analyze
 
 **ID:** `{unit_id}`
 **Type:** {unit_type}
 {reachability_section}
 ### Code (with static dependencies already included)
-```
+{code_fence}
 {primary_code}
-```
+{code_fence}
 
 ### Static Analysis Results
 **Functions this code calls:** {deps_str}
