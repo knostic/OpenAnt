@@ -172,3 +172,154 @@ def test_tm2_mixed_length_fences_extract_real_block():
             "purpose": "runs ```bash``` deploy", "impact_statement": "y"}
     mixed = "```json\nDECOY not closed with 3 ticks\n\n" + T.render_threat_model_md(data)
     assert T.parse_threat_model_md(mixed).get("purpose") == data["purpose"]
+
+
+def test_parse_response_prose_and_code_braces_before_json():
+    """A thinking-on model emits prose + a code snippet (with braces) before the
+    final JSON verdict. The naive find('{')/rfind('}') span mis-decodes; the
+    raw_decode scan must return the trailing assessment object, not ERROR."""
+    from core.analysis_core import parse_response
+    resp = (
+        "## Analysis\n"
+        "Here is the function:\n"
+        "```rust\nfn f() { if x == 0 { return; } }\n```\n"
+        "The `x == 0` case is guarded. Not exploitable.\n\n"
+        '{"finding": "safe", "confidence": 0.82, "cwe_id": 0, "reasoning": "guarded"}'
+    )
+    out = parse_response(resp)
+    assert out.get("verdict") == "SAFE", out
+
+
+def test_parse_response_ignores_trailing_non_verdict_json_block():
+    """A thinking-on model emits the verdict, THEN a remediation code block whose
+    body is itself valid JSON. The scan must return the VERDICT object, not the
+    trailing config dict. Keeping the last decodable dict unconditionally would
+    return the config (no verdict, no error) -- silently dropping the unit and
+    bypassing the parse_error retry tag. Requiring a verdict/finding key fixes it."""
+    from core.analysis_core import parse_response
+    resp = (
+        "## Security Analysis\n"
+        "The handler concatenates user input into the SQL string.\n\n"
+        '{"finding": "vulnerable", "confidence": 0.9, "cwe_id": 89, "reasoning": "x"}\n\n'
+        "### Recommended fix\n"
+        "```json\n"
+        '{"use_prepared_statements": true, "escape": "all"}\n'
+        "```\n"
+    )
+    out = parse_response(resp)
+    assert out.get("verdict") == "VULNERABLE", out
+
+
+def test_parse_response_no_verdict_dict_still_tagged_for_retry():
+    """When nothing decodable carries a verdict/finding key, parse_response must
+    fall through to the ERROR return WITH the parse_error tag, so #236's in-run
+    retry pass re-runs the unit instead of silently dropping it."""
+    from core.analysis_core import parse_response
+    resp = "Here is some config:\n```json\n{\"debug\": true, \"level\": 3}\n```\n"
+    out = parse_response(resp)
+    assert out.get("verdict") == "ERROR", out
+    assert out.get("error", {}).get("type") == "parse_error", out
+
+
+def test_parse_response_trailing_verdict_example_does_not_override_real_verdict():
+    """False-negative guard: a real VULNERABLE verdict followed by a trailing
+    'example: {SAFE}' block must NOT be silently downgraded to SAFE. Two
+    verdict-bearing objects are ambiguous, so parse_response must refuse to guess
+    and route to ERROR + retryable (never return SAFE)."""
+    from core.analysis_core import parse_response
+    from utilities.rate_limiter import is_retryable_error
+    resp = (
+        '{"verdict": "VULNERABLE", "confidence": 0.95, "cwe_id": 89}\n\n'
+        "For reference, a safe reply would look like:\n"
+        '{"verdict": "SAFE"}'
+    )
+    out = parse_response(resp)
+    assert out.get("verdict") != "SAFE", out          # never a false negative
+    assert out.get("verdict") == "ERROR", out
+    assert is_retryable_error(out.get("error")) is True, out
+
+
+def test_parse_response_malformed_outer_with_nested_example_is_not_false_negative():
+    """REGRESSION (bug-hunt 2026-08-15): a malformed OUTER verdict object (e.g. a
+    trailing comma — a very common LLM slip) that contains a nested example dict
+    with a verdict/finding key must NOT have the nested example recovered as THE
+    verdict. The real outer verdict is VULNERABLE; returning the nested SAFE is a
+    silent false negative in a SAST tool. Master returns ERROR+parse_error here
+    (→ JSONCorrector/#236 retry can recover the real verdict); PR-1 must not
+    regress that to SAFE. All three inputs carry a real VULNERABLE outer."""
+    from core.analysis_core import parse_response
+    bad_inputs = [
+        '{"verdict":"VULNERABLE", "note":{"finding":"safe"},}',              # trailing comma
+        "{'verdict': 'VULNERABLE', 'ex': {\"finding\": \"safe\"}}",          # single-quoted outer
+        '{"verdict":"VULNERABLE","cwe_id":89,"ex":{"finding":"safe"}, oops}',# junk tail
+    ]
+    for inp in bad_inputs:
+        out = parse_response(inp)
+        assert out.get("verdict") != "SAFE", f"FALSE NEGATIVE on {inp!r}: {out}"
+        # must be ERROR so analyze_unit's JSONCorrector/#236 retry fires (verdict in ERROR/None)
+        assert out.get("verdict") == "ERROR", f"expected ERROR (retryable) on {inp!r}: {out}"
+
+
+def test_parse_response_depth0_scan_full_matrix():
+    """PY-1 fix (depth-0 scan, sol-consulted): the full behavior matrix. Recover a
+    verdict ONLY when exactly one DEPTH-0 verdict object decodes; a nested object
+    inside a malformed outer must never be recovered (silent-FN guard)."""
+    from core.analysis_core import parse_response as p
+    # must-pass recoveries
+    assert p('## Analysis\n```rust\nfn f() { if x==0 { return; } }\n```\nGuarded.\n\n{"finding":"safe","cwe_id":0}').get("verdict") == "SAFE"
+    assert p('{"verdict":"SAFE","meta":{"x":1}}').get("verdict") == "SAFE"           # nested non-verdict not double-counted
+    assert p('{"verdict":"VULNERABLE","reasoning":"has a { brace in string"}').get("verdict") == "VULNERABLE"  # brace in string value
+    # ambiguous -> ERROR (both orders)
+    assert p('Example: {"verdict":"SAFE"} ... Actual: {"verdict":"VULNERABLE"}').get("verdict") == "ERROR"
+    assert p('Real: {"verdict":"VULNERABLE"} ... Example: {"verdict":"SAFE"}').get("verdict") == "ERROR"
+    # malformed-outer + nested example -> ERROR, never the nested SAFE (the regression)
+    for bad in ['{"verdict":"VULNERABLE", "note":{"finding":"safe"},}',
+                "{'verdict': 'VULNERABLE', 'ex': {\"finding\": \"safe\"}}",
+                '{"verdict":"VULNERABLE","cwe_id":89,"ex":{"finding":"safe"}, oops}']:
+        assert p(bad).get("verdict") == "ERROR", bad
+    # unbalanced brace in code before a real verdict -> safe-fail ERROR (depth never returns to 0)
+    assert p('```\ndef f(): return {  # oops unbalanced\n```\n{"finding":"safe"}').get("verdict") == "ERROR"
+    # truncated / no close -> ERROR
+    assert p('{"verdict":"VULNERABLE"').get("verdict") == "ERROR"
+    assert p('no json at all here').get("verdict") == "ERROR"
+
+
+def test_parse_response_malformed_real_beside_valid_example_sibling():
+    """PY-NEW-1 (round-2 bug hunt): a MALFORMED real verdict object sitting BESIDE
+    a well-formed example sibling must NOT recover the example. Only the clean
+    sibling decodes, but the malformed span still carries a verdict key -> ambiguous
+    -> ERROR (retryable), never the sibling's SAFE. Distinct from the nested case."""
+    from core.analysis_core import parse_response as p
+    for bad in [
+        'Actual analysis:\n{"verdict": "VULNERABLE", "confidence": 0.95,}\n\nFor reference the safe form:\n{"verdict": "SAFE"}',
+        'Result: {"verdict": "VULNERABLE" "cwe_id": 79}\nExample clean unit: {"verdict": "SAFE"}',
+    ]:
+        out = p(bad)
+        assert out.get("verdict") == "ERROR", (bad, out)
+
+
+def test_parse_response_top_level_array_does_not_crash():
+    """PY-2 (bug hunt): a top-level JSON ARRAY (array-of-findings) must not raise
+    TypeError from _normalize_result. It routes through the depth-0 scanner, which
+    recovers a lone verdict object inside the array."""
+    from core.analysis_core import parse_response as p
+    assert p('[{"verdict": "SAFE"}]').get("verdict") == "SAFE"
+    assert p('```json\n[{"verdict":"VULNERABLE"}]\n```').get("verdict") == "VULNERABLE"
+    # two verdicts in the array -> ambiguous -> ERROR, still no crash
+    assert p('[{"verdict":"SAFE"},{"verdict":"VULNERABLE"}]').get("verdict") == "ERROR"
+    # a non-object, non-recoverable top-level (scalar) -> ERROR, no crash
+    assert p('42').get("verdict") == "ERROR"
+
+
+def test_parse_response_verdict_shaped_preamble_prefers_retry_over_false_negative():
+    """ACCEPTED trade-off (round-3 bug hunt): when the preamble echoes verdict-SHAPED
+    broken JSON (e.g. analyzed code `{"verdict": v}`) beside a lone clean verdict, the
+    parser routes to ERROR+retryable rather than recover — the safe direction. It is a
+    recovery-rate cost (the in-run retry re-derives the verdict), NOT a wrong verdict,
+    and it is what prevents the PY-NEW-1 false negative (malformed real verdict beside a
+    clean example being returned as SAFE). Pinned so the trade-off is intentional."""
+    from core.analysis_core import parse_response as p
+    from utilities.rate_limiter import is_retryable_error
+    out = p('The sink builds {"verdict": v} dynamically.\nFinal: {"verdict":"VULNERABLE"}')
+    assert out.get("verdict") == "ERROR"                       # not a silently-wrong verdict
+    assert is_retryable_error(out.get("error")) is True        # self-heals via the in-run retry

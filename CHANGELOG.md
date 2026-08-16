@@ -3,6 +3,23 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-08-14] — Recover reasoning-only (empty-completion) analyze responses
+
+### Fixed
+
+- **A unit is no longer silently dropped when a thinking-on model spends its
+  whole token budget reasoning.** Claude-5-family models run adaptive thinking by
+  default; on a large unit the model could exhaust the 8192-token `simple_text`
+  budget on a thinking block and return no text, which errored the unit
+  permanently (a coverage loss — the unit never got a verdict). The default
+  `max_tokens` is raised to 20000 (under the non-streaming ceiling) so thinking
+  and the JSON verdict both fit, and `parse_response` now scans the response for
+  a lone verdict-bearing JSON object instead of spanning from the first prose/code
+  brace, so a verdict emitted after a prose-and-code preamble parses. When several
+  verdict objects appear (an example beside the real one) it stays an ERROR and is
+  retried rather than guessed. Complements the in-run ERROR-retry added the same
+  day: fewer units reach the retry path at all.
+
 ## [2026-08-14] — Configurable Python-subprocess timeout
 
 ### Fixed

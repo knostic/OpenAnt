@@ -85,32 +85,109 @@ def parse_response(response: str) -> dict:
 
     response = response.strip()
 
+    err = None
     try:
         result = json.loads(response)
-        return _normalize_result(result)
     except json.JSONDecodeError as e:
-        # Try to find JSON object in response
-        start = response.find("{")
-        end = response.rfind("}") + 1
-        if start >= 0 and end > start:
-            try:
-                result = json.loads(response[start:end])
-                return _normalize_result(result)
-            except json.JSONDecodeError:
-                pass
+        err = e
+    else:
+        if isinstance(result, dict):
+            return _normalize_result(result)
+        # Top-level JSON that is NOT an object (e.g. an array-of-findings
+        # `[{"verdict":...}]`) — do NOT hand a list to _normalize_result (it
+        # indexes by str keys -> TypeError -> uncaught, permanent coverage loss,
+        # PY-2). Fall through to the depth-0 scanner, which recovers a lone
+        # verdict object inside the array for free.
+    # Thinking-on models wrap the final JSON verdict in prose + code on BOTH
+    # sides. Scan for verdict objects at brace-DEPTH 0 only, tracking JSON-string
+    # state (with escapes) so braces inside string values -- or balanced code
+    # braces in the preamble -- don't offset the depth. Recovering only depth-0
+    # objects stops a nested example dict INSIDE a malformed outer verdict from
+    # being mistaken for the verdict.
+    #
+    # Recover a verdict ONLY when EXACTLY ONE depth-0 object decodes to a
+    # verdict-bearing dict AND no COMPETING verdict signal exists:
+    #  - several decoded verdict objects (example beside the real one, either
+    #    order) -> ambiguous -> ERROR+retry (never let a trailing example {SAFE}
+    #    override a real {VULNERABLE}); and
+    #  - a depth-0 span that FAILED to decode but still looks like a verdict
+    #    object (its text carries "verdict"/"finding") is a real verdict that
+    #    didn't parse (a common trailing-comma / missing-comma slip) sitting
+    #    beside a clean example -> also ambiguous -> ERROR+retry. Without this,
+    #    the malformed real VULNERABLE is dropped and the clean example SAFE is
+    #    returned: a silent SAST false negative (PY-NEW-1).
+    # If the scan ends mid-string, quote parity is untrustworthy -> don't guess.
+    # (Accepted residual, pre-existing in the prior find/rfind code: adversarial
+    # stray quotes in prose can still steer depth parity; the safe fallback is
+    # always ERROR->retry.)
+    decoder = json.JSONDecoder()
+    verdict_objs = []
+    malformed_verdict_spans = 0
+    depth = 0
+    in_string = False
+    escape = False
+    obj_start = None
+    for pos, ch in enumerate(response):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                obj_start = pos
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and obj_start is not None:
+                    # Decode the balanced depth-0 span in isolation: bounds the
+                    # JSONDecodeError position math to the span (avoids O(n^2) on
+                    # multi-MB responses, PY-NEW-2) and gives the span text for
+                    # the malformed-verdict check.
+                    span = response[obj_start:pos + 1]
+                    try:
+                        obj = decoder.decode(span)
+                        if isinstance(obj, dict) and ("verdict" in obj or "finding" in obj):
+                            verdict_objs.append(obj)
+                    except json.JSONDecodeError:
+                        # Count as a competing verdict only if the failed span
+                        # carries a verdict/finding KEY (quoted, single or double)
+                        # -- so a malformed real verdict triggers the ambiguity
+                        # guard, but a preamble code block that merely contains the
+                        # word "finding" does not over-reject to ERROR.
+                        # ACCEPTED TRADE-OFF: a preamble that echoes verdict-SHAPED
+                        # broken JSON (e.g. `{"verdict": v}` in analyzed code) also
+                        # counts, so a legit lone verdict beside it is sent to
+                        # ERROR+retry rather than recovered. That is a recovery-rate
+                        # cost, not a wrong verdict (the retry re-derives it) -- the
+                        # deliberate safe direction, chosen over risking the
+                        # PY-NEW-1 false negative (malformed real verdict beside a
+                        # clean example -> example returned as SAFE).
+                        if any(k in span for k in ('"verdict"', "'verdict'", '"finding"', "'finding'")):
+                            malformed_verdict_spans += 1
+                    obj_start = None
+    if not in_string and len(verdict_objs) == 1 and malformed_verdict_spans == 0:
+        return _normalize_result(verdict_objs[0])
 
-        return {
-            "verdict": "ERROR",
-            "confidence": 0,
-            "vulnerabilities": [],
-            "reasoning": f"Failed to parse response: {str(e)}",
-            "raw_response": response[:500],
-            # Tag the failure so the detection retry pass (core/analyzer.py) can
-            # re-attempt it: a malformed model response is often transient, and
-            # without this key the ERROR carries error=None and is never retried
-            # in-run, permanently masking the unit's true verdict.
-            "error": {"type": "parse_error", "message": str(e)[:200]},
-        }
+    detail = str(err) if err is not None else "top-level JSON is not an object"
+    return {
+        "verdict": "ERROR",
+        "confidence": 0,
+        "vulnerabilities": [],
+        "reasoning": f"Failed to parse response: {detail}",
+        "raw_response": response[:500],
+        # Tag the failure so the detection retry pass (core/analyzer.py) can
+        # re-attempt it: a malformed model response is often transient, and
+        # without this key the ERROR carries error=None and is never retried
+        # in-run, permanently masking the unit's true verdict.
+        "error": {"type": "parse_error", "message": detail[:200]},
+    }
 
 
 def analyze_unit(
