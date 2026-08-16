@@ -39,28 +39,130 @@ class DockerExecutionResult:
         return self.build_error is None and not self.timed_out
 
 
+# Per-service compose keys we KEEP when reconstructing an untrusted compose. This is an
+# ALLOWLIST, not a blocklist: every container-runtime attribute that could grant host
+# access — privileged, cap_add, pid/ipc/uts/userns:host, security_opt, devices,
+# device_cgroup_rules, cgroup_parent, volumes/host binds (incl /var/run/docker.sock),
+# network_mode, ports, user, sysctls, group_add, extra_hosts, dns, env_file, extends,
+# secrets, configs, … — is DROPPED by omission and replaced with the fixed hardening set
+# in `_harden_service`. A blocklist is non-terminating (network_mode was one round's
+# miss); an allowlist contains the NEXT unknown key by default.
+# An ORDERED tuple (not a set): the reconstruction iterates it to build each service,
+# so a set's hash-randomized order would make the emitted compose non-deterministic.
+_SVC_ALLOWLIST = (
+    "build", "image", "depends_on", "command", "entrypoint",
+    "environment", "expose", "working_dir", "healthcheck", "networks",
+)
+
+
+def _refuse_compose(reason: str) -> str:
+    """A services-less (comment-only) compose: `docker compose build`/`up` create ZERO
+    containers (verified), so the untrusted definition never executes and the finding is
+    recorded non-CONFIRMED (fail-closed, no egress). Note `docker compose build` on an
+    empty compose exits 0 ("empty compose file") rather than erroring — safety comes from
+    "no services => nothing runs", not from a build failure. We do not raise — the
+    orchestrator calls run_single_container unwrapped, so a raise would
+    abort the whole dynamic-test run instead of just this finding."""
+    return f"# openant: {reason}; refusing to run it (fail-closed).\n"
+
+
+def _safe_build(build):
+    """Return a build spec confined to the work_dir, or raise if it escapes it.
+
+    A compose `build.context` of `/`, `..`, or an absolute path would make
+    `docker build` read HOST paths into the image. Only `.`/`./<sub>` (no `..`,
+    not absolute) is allowed; `build.dockerfile` is confined the same way.
+    """
+    def _confined(p) -> bool:
+        return (isinstance(p, str) and not p.startswith("/")
+                and ".." not in p.replace("\\", "/").split("/"))
+
+    if isinstance(build, str):
+        if not _confined(build):
+            raise ValueError(f"unsafe build context: {build!r}")
+        return build
+    if isinstance(build, dict):
+        ctx = build.get("context", ".")
+        if not _confined(ctx):
+            raise ValueError(f"unsafe build context: {ctx!r}")
+        out = {"context": ctx}
+        df = build.get("dockerfile")
+        if df is not None:
+            if not _confined(df):
+                raise ValueError(f"unsafe dockerfile path: {df!r}")
+            out["dockerfile"] = df
+        args = build.get("args")
+        if isinstance(args, (dict, list)):
+            out["args"] = args
+        return out
+    raise ValueError("service has no usable build spec")
+
+
+def _harden_service(name: str, svc: dict) -> dict:
+    """Reconstruct ONE service from the allowlist + the fixed hardening set (C).
+
+    Runtime-privilege keys are dropped by omission (allowlist). No `user`: the container
+    runs as its image default (root) with a writable HOME via the /root tmpfs — dropping
+    `user` avoids the read-only-`$HOME` breakage that flips HOME-cache-writing tests to
+    ERROR, while cap_drop ALL + no-new-privileges + read_only + the internal-only network
+    still prevent privilege escalation and host access.
+    """
+    out = {k: svc[k] for k in _SVC_ALLOWLIST if k in svc}
+
+    # Attacker capture sidecar: a remote "attacker" image is replaced by the bundled,
+    # OpenAnt-owned build context (preserves the prior behaviour).
+    img = out.get("image")
+    if isinstance(img, str) and "attacker" in img.lower():
+        out.pop("image", None)
+        out["build"] = "./attacker-server"
+
+    if "build" in out:
+        out["build"] = _safe_build(out["build"])
+    if "build" not in out and "image" not in out:
+        raise ValueError(f"service {name!r} declares neither a safe build nor an image")
+
+    # Service network membership is preserved (from the allowlist) and every declared
+    # network is forced `internal: true` at the doc level below, so service-name
+    # resolution (test -> attacker:9999) keeps working with no external gateway.
+
+    # (C) fixed per-service hardening — applied uniformly to EVERY service, attacker
+    # sidecar included (it keeps captures in memory, so read_only is safe; :9999 > 1024
+    # so cap_drop ALL does not break its bind).
+    out["read_only"] = True
+    out["cap_drop"] = ["ALL"]
+    out["security_opt"] = ["no-new-privileges:true"]
+    out["pids_limit"] = 256
+    out["mem_limit"] = "512m"
+    out["cpus"] = 1.0
+    # Writable scratch + a writable HOME (=/root, image default user) on the RO rootfs.
+    out["tmpfs"] = ["/tmp", "/root"]
+    return out
+
+
 def _sanitize_compose(content: str) -> str:
-    """Fix LLM-generated docker-compose issues AND enforce network isolation (F4).
+    """RECONSTRUCT an untrusted LLM/target-influenced docker-compose from an allowlist.
 
-    The compose file is UNTRUSTED LLM output and is built+run (executed). Force every
-    network `internal: true` (no external egress) so an executing test cannot exfiltrate
-    at RUNTIME, while intra-network service-to-service (the attacker capture server at
-    `attacker:9999`, CWE-918 pattern) keeps working — an internal Docker network still
-    resolves + routes service names, it only loses the external gateway.
+    The compose is UNTRUSTED and is built+run (executed). Rather than blocklist the
+    dangerous keys (non-terminating — network_mode was one round's miss, then
+    privileged/cap_add/volumes/pid/ipc/security_opt/devices), this DISCARDS the LLM's
+    per-service runtime attributes entirely and rebuilds each declared service from a
+    fixed allowlist (`_SVC_ALLOWLIST`) + a fixed hardening set (`_harden_service`): no
+    privileged, no added caps (cap_drop ALL), no host mounts/volumes, no host namespaces,
+    no devices, no host network, no `ports` publish, read-only rootfs, no-new-privileges,
+    pids/mem/cpu caps — on an `internal: true` network with no external gateway.
 
-    `internal: true` ALONE is bypassable, so this also, structurally (via PyYAML, not
-    regex — a hostile file defeats textual patching):
-      * strips every service `network_mode` (host/bridge would escape the internal net);
-      * drops host `ports:` publishes (incompatible with an internal net anyway);
-      * sets `internal: true` on every declared network AND injects an internal `default`
-        so a service that omits `networks:` (implicit default) is still contained.
-    Also removes obsolete `version:` and local-builds any remote attacker image.
+    The SERVICE SET is preserved (test + attacker capture server + any extra service the
+    generation legitimately needs, e.g. a DB for a SQLi test), so a multi-service test is
+    not silently dropped; each service is reconstructed re-hardened.
 
-    RESIDUAL (documented, NOT closed here): `docker build`/`compose build` run untrusted
-    `RUN` steps with full egress, so build-time exfil/beaconing is still possible. The
-    build context is minimal (generated test files + one pre-staged source file, no host
-    secrets), and the exploit executes at RUNTIME where this policy applies — so runtime
-    isolation is worth it, but this whole change is sandbox HARDENING, not a vuln fix.
+    Fails CLOSED (returns a refusing comment-only compose) on unparseable YAML, a build
+    context that escapes the work dir, or a service with neither a safe build nor an image.
+
+    RESIDUAL (documented, NOT closed here): build-time `RUN` egress — `docker build`
+    still runs the generated Dockerfile's RUN steps with network (an egress-allowlisting
+    build proxy is deferred, an accepted residual). This change is RUNTIME sandbox
+    hardening that makes the code enforce its stated "no host volume mounts or privileged
+    mode" contract.
     """
     try:
         import yaml
@@ -68,54 +170,39 @@ def _sanitize_compose(content: str) -> str:
         if not isinstance(data, dict):
             raise ValueError("compose root is not a mapping")
     except Exception:
-        # FAIL CLOSED. If PyYAML cannot parse+structure the compose we cannot prove
-        # network isolation — and `docker compose` (compose-go, a DIFFERENT YAML impl)
-        # might still parse+run the untrusted original with full egress. So we must NOT
-        # return the untrusted content (nor a regex-patched copy, which cannot reliably
-        # strip network_mode/external). Replace it with a refusing comment-only compose:
-        # `docker compose build` then fails ("no services") -> build_error -> the finding
-        # is recorded as ERROR and never executed. No egress. (We do not raise: the
-        # orchestrator calls run_single_container unwrapped, so a raise would abort the
-        # whole dynamic-test run instead of just this finding.)
-        return ("# openant: docker-compose could not be safely parsed/sanitized; "
-                "refusing to run it (fail-closed).\n")
+        return _refuse_compose("docker-compose could not be parsed")
 
-    data.pop("version", None)
+    services_in = data.get("services")
+    if not isinstance(services_in, dict) or not services_in:
+        return _refuse_compose("docker-compose declares no services")
 
-    networks = data.get("networks")
-    if not isinstance(networks, dict):
-        networks = {}
-    for name, cfg in list(networks.items()):
-        cfg = cfg if isinstance(cfg, dict) else {}
-        # Drop `external`/`name`: an external network is one Compose does NOT create,
-        # so it attaches services to a PRE-EXISTING network by name (e.g. `bridge`,
-        # which has egress) and ignores our `internal: true`. Forcing Compose to
-        # create the network fresh is what makes `internal` actually apply.
-        cfg.pop("external", None)
-        cfg.pop("name", None)
-        cfg["internal"] = True
-        networks[name] = cfg
-    default = networks.get("default")
-    default = default if isinstance(default, dict) else {}
-    default.pop("external", None)
-    default.pop("name", None)
-    default["internal"] = True
-    networks["default"] = default
-    data["networks"] = networks
-
-    services = data.get("services")
-    if isinstance(services, dict):
-        for svc in services.values():
+    services_out = {}
+    try:
+        for name, svc in services_in.items():
             if not isinstance(svc, dict):
-                continue
-            svc.pop("network_mode", None)   # host/bridge escapes the internal network
-            svc.pop("ports", None)          # host publish incompatible with internal
-            img = svc.get("image")
-            if isinstance(img, str) and "attacker" in img.lower():
-                svc.pop("image", None)
-                svc["build"] = "./attacker-server"
+                raise ValueError(f"service {name!r} is not a mapping")
+            services_out[name] = _harden_service(name, svc)
+    except Exception as exc:
+        return _refuse_compose(f"docker-compose could not be safely reconstructed ({exc})")
 
-    return yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
+    # Rebuild the networks: every DECLARED network is forced `internal: true` with
+    # `external`/`name` stripped (an external net attaches services to a pre-existing,
+    # egress-capable net by name and ignores `internal`), plus an injected internal
+    # `default` so a service that omits `networks:` is still contained. Named top-level
+    # `volumes:`/`secrets:`/`configs:`/`version:` are dropped by omission (services can
+    # no longer reference them — host-bind `volumes:` were stripped per-service above).
+    networks_in = data.get("networks")
+    networks_out = {}
+    if isinstance(networks_in, dict):
+        for net_name, cfg in networks_in.items():
+            cfg = cfg if isinstance(cfg, dict) else {}
+            cfg = {k: v for k, v in cfg.items() if k not in ("external", "name")}
+            cfg["internal"] = True
+            networks_out[net_name] = cfg
+    networks_out["default"] = {"internal": True}
+
+    out = {"services": services_out, "networks": networks_out}
+    return yaml.safe_dump(out, default_flow_style=False, sort_keys=False)
 
 
 def _write_test_files(work_dir: str, generation: dict, source_file: str | None = None) -> None:
@@ -279,10 +366,16 @@ def _run_single(
             "--network", "none",
             "--memory", "512m",
             "--cpus", "1",
+            "--pids-limit", "256",
+            "--cap-drop", "ALL",
             "--read-only",
             "--tmpfs", "/tmp:size=256m",
             "--tmpfs", "/root:size=128m",
             "--security-opt", "no-new-privileges",
+            # No --user: the container runs as its image default (root) with a writable
+            # HOME via the /root tmpfs above. cap_drop ALL + no-new-privileges + read_only
+            # + --network none contain it; a non-root --user on a read-only rootfs would
+            # instead move $HOME to an unwritable `/` and flip HOME-cache tests to ERROR.
             image_tag,
         ],
         timeout=container_timeout,

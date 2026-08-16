@@ -184,15 +184,22 @@ All debug output must go to stderr. The result collector looks for the last vali
 
 All containers run with strict isolation:
 
-- **Read-only filesystem** (`--read-only`) with `/tmp` as a writable tmpfs
+- **Read-only filesystem** (`--read-only`) with `/tmp` and `/root` as writable tmpfs
 - **No privilege escalation** (`--security-opt no-new-privileges`)
+- **All capabilities dropped** (`--cap-drop ALL`)
+- **PID limit** — 256 (`--pids-limit`)
 - **Memory limit** — 512 MB (`--memory 512m`)
 - **CPU limit** — 1 CPU (`--cpus 1`)
-- **Isolated network** — each test gets its own Docker network
-- **No host volume mounts** — containers cannot access the host filesystem
+- **Isolated network** — single-container tests run with `--network none`; multi-service
+  tests run on an `internal: true` Docker network (no external gateway)
+- **No host volume mounts / no privileged mode** — enforced, not assumed: an untrusted
+  multi-service `docker-compose` is *reconstructed* from an allowlist (see below), so
+  `privileged`, `cap_add`, host `volumes`, `pid`/`ipc`/`network_mode`, `devices`, etc.
+  cannot reach the runtime
 - **Timeouts** — 120s for execution, 300s for builds
 
-Multi-service tests (e.g., those needing the attacker capture server) use Docker Compose with a bridge network.
+Multi-service tests (e.g., those needing the attacker capture server) use Docker Compose
+on an internal network, with each service reconstructed and hardened identically.
 
 ## Attacker Capture Server
 
