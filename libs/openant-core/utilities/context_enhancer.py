@@ -157,6 +157,7 @@ def get_context_enhancement_prompt(
         static_callers: Callers identified by static analysis
         context_functions: Other functions in the same file
     """
+    from prompts._fence import safe_code_fence
     deps_list = "\n".join(f"- {d}" for d in static_deps) if static_deps else "- None identified"
     callers_list = "\n".join(f"- {c}" for c in static_callers) if static_callers else "- None identified"
 
@@ -168,7 +169,8 @@ def get_context_enhancement_prompt(
             code_preview = f.get('code', '')[:200]
             if len(f.get('code', '')) > 200:
                 code_preview += '...'
-            context_section += f"```javascript\n{code_preview}\n```\n\n"
+            _pf = safe_code_fence(code_preview)
+            context_section += f"{_pf}javascript\n{code_preview}\n{_pf}\n\n"
     else:
         context_section = "## Other Functions in Same File\nNo other functions in file.\n"
 
@@ -180,9 +182,9 @@ def get_context_enhancement_prompt(
 **Type:** {unit_type}
 {f'**Class:** {class_name}' if class_name else ''}
 
-```javascript
+{safe_code_fence(function_code)}javascript
 {function_code}
-```
+{safe_code_fence(function_code)}
 
 ## Static Analysis Results
 **Already identified dependencies (functions called):**

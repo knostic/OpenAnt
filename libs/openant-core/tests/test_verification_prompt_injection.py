@@ -113,14 +113,23 @@ def test_opening_fence_exceeds_longest_backtick_run_in_content():
     longest_run = max(len(m) for m in re.findall(r"`+", MALICIOUS_CODE))
     assert longest_run == 3
 
-    # Find the fence the prompt actually opened the code block with.
-    opening_fences = re.findall(r"^(`{3,})", prompt, flags=re.MULTILINE)
-    assert opening_fences, "expected at least one code fence in the prompt"
-    # Every fence used to wrap untrusted content must exceed the content's
-    # longest run. The code fence(s) appear right after the TARGET marker.
-    code_fence = opening_fences[0]
+    # Locate the fence that opens the block wrapping the malicious CODE
+    # specifically. (Other untrusted fields — e.g. `reasoning` — are now fenced
+    # too, each with its own length-adaptive run sized to ITS content; the first
+    # fence in the prompt is no longer guaranteed to be the code fence.) The code
+    # fence is the fence line immediately preceding the code's first line.
+    lines = prompt.splitlines()
+    code_marker = "def handler(req):"
+    code_fence = None
+    for idx, line in enumerate(lines):
+        if line.startswith(code_marker) and idx > 0:
+            m = re.match(r"^(`{3,})$", lines[idx - 1])
+            assert m, f"expected a bare code fence directly above the code, got {lines[idx-1]!r}"
+            code_fence = m.group(1)
+            break
+    assert code_fence is not None, "malicious code block not found in prompt"
     assert len(code_fence) > longest_run, (
-        f"opening fence {code_fence!r} (len {len(code_fence)}) must be longer "
+        f"code fence {code_fence!r} (len {len(code_fence)}) must be longer "
         f"than the longest backtick run in content (len {longest_run})"
     )
 
