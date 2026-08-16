@@ -389,6 +389,13 @@ def test_safe_leaf_never_raises_and_confines():
     # non-str (JSON allows any type) -> default, never raises (M1)
     for bad in (123, ["x"], {"a": 1}, None, True):
         assert _safe_leaf(bad, "d.py") == "d.py"
+    # embedded NUL / control chars: a str that survives basename+reserved but makes
+    # open()/os.path.join raise ValueError("embedded null byte") -> must degrade,
+    # not raise (would abort the whole run). Also proves the leaf is openable.
+    for bad in ("exploit\x00.py", "a\x1fb.py", "x\x7f.py", "\x00"):
+        leaf = _safe_leaf(bad, "d.py")
+        import os as _os
+        _os.path.join("/tmp", leaf)  # must not raise ValueError: embedded null byte
     # dot-segments resolve to a directory, not a file -> default (M2)
     for bad in ("..", ".", "a/b/..", "", "x/"):
         assert _safe_leaf(bad, "d.py") == "d.py"

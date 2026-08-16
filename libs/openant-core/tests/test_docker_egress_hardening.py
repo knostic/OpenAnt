@@ -151,18 +151,44 @@ def test_scrubbed_env_removes_provider_secrets_keeps_docker_essentials():
     import os
     from utilities.dynamic_tester.docker_executor import _scrubbed_subprocess_env
 
-    os.environ["ANTHROPIC_API_KEY"] = "sk-should-not-leak"
-    os.environ["OPENAI_API_KEY"] = "sk-should-not-leak-2"
-    os.environ["SOME_SECRET_TOKEN"] = "leak3"
+    # An ALLOWLIST must drop a secret regardless of its NAME convention — the
+    # denylist-substring approach missed all of these (ACCESS_KEY without API_KEY,
+    # APIKEY without underscore, PASSPHRASE, bare AUTH, PAT, WEBHOOK).
+    secrets = {
+        "ANTHROPIC_API_KEY": "sk-1", "OPENAI_API_KEY": "sk-2", "SOME_SECRET_TOKEN": "s3",
+        "AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "s4", "GH_PAT": "ghp_x",
+        "GITHUB_TOKEN": "ghs_x", "OPENAI_APIKEY": "sk-3", "KEY_PASSPHRASE": "pp",
+        "SSH_KEY_PASSPHRASE": "pp2", "ANTHROPIC_AUTH": "auth", "SLACK_WEBHOOK": "https://hook",
+        "DIGITALOCEAN_ACCESS_KEY": "do",
+    }
+    for k, v in secrets.items():
+        os.environ[k] = v
     try:
         env = _scrubbed_subprocess_env()
-        assert "ANTHROPIC_API_KEY" not in env
-        assert "OPENAI_API_KEY" not in env
-        assert "SOME_SECRET_TOKEN" not in env
+        for k in secrets:
+            assert k not in env, f"secret leaked into docker subprocess env: {k}"
         # docker still needs its essentials
         assert "PATH" in env
     finally:
-        for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SOME_SECRET_TOKEN"):
+        for k in secrets:
+            os.environ.pop(k, None)
+
+
+def test_scrubbed_env_keeps_docker_essentials_and_proxy():
+    """The allowlist must keep the vars docker legitimately needs."""
+    import os
+    from utilities.dynamic_tester.docker_executor import _scrubbed_subprocess_env
+
+    keep = {"DOCKER_HOST": "unix:///x", "DOCKER_CONFIG": "/c", "HTTPS_PROXY": "http://p",
+            "no_proxy": "localhost", "LC_ALL": "C"}
+    for k, v in keep.items():
+        os.environ[k] = v
+    try:
+        env = _scrubbed_subprocess_env()
+        for k in keep:
+            assert k in env, f"docker-essential var was dropped: {k}"
+    finally:
+        for k in keep:
             os.environ.pop(k, None)
 
 

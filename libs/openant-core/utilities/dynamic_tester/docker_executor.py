@@ -120,6 +120,13 @@ def _safe_leaf(name, default: str) -> str:
     """
     if not isinstance(name, str):
         return default
+    # A NUL (or other control char) is a str that survives basename and the
+    # reserved check, but open()/os.path.join raise ValueError("embedded null
+    # byte") — an unwrapped raise here would abort the whole run (the exact
+    # fail-closed contract this helper exists to keep). Reject any name carrying a
+    # control character (0x00-0x1f, 0x7f) and degrade to the default leaf.
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in name):
+        return default
     leaf = os.path.basename(name)
     _RESERVED = {"", ".", "..", "Dockerfile", "docker-compose.yml", "attacker-server"}
     return default if leaf in _RESERVED else leaf
@@ -286,26 +293,53 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
             f.write(compose_content)
 
 
-# Env-var names whose VALUE is a host secret the docker build/run subprocess must
-# never carry. `docker compose` interpolates a `${VAR}` in an untrusted, LLM-authored
-# compose `build.args` from the subprocess env at BUILD time; the generated Dockerfile
-# `RUN` then has open build-time network egress (an accepted GHSA-98g5 residual that
-# assumed NO host secret was reachable at build time). Scrubbing these names closes the
-# exfil by construction — docker itself needs none of them.
-_SECRET_ENV_SUBSTRINGS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD",
-                          "CREDENTIAL", "PRIVATE_KEY", "SESSION")
+# The env the docker build/run subprocess is ALLOWED to see. `docker compose`
+# interpolates a `${VAR}` in an untrusted, LLM-authored compose `build.args` from the
+# subprocess env at BUILD time; the generated Dockerfile `RUN` then has open build-time
+# network egress (an accepted GHSA-98g5 residual that assumed NO host secret was
+# reachable at build time). An ALLOWLIST (not a deny-list) closes the exfil BY
+# CONSTRUCTION: a provider secret with any name (ANTHROPIC_API_KEY, GH_PAT,
+# AWS_ACCESS_KEY_ID, *_APIKEY, *_PASSPHRASE, *_AUTH, SLACK_WEBHOOK, …) is dropped by
+# default because it is not on the list, so no new secret-name convention can leak.
+# Docker's own needs are a bounded, well-known set. Tradeoff: a private base image
+# pulled via a cloud credential-helper that reads secrets from ENV (e.g. AWS_* for
+# ecr-login) will fail — use a prior `docker login` (writes config.json; DOCKER_CONFIG
+# is allowed) instead. Public base images and pre-authenticated config.json are unaffected.
+_ENV_ALLOW_EXACT = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "PWD", "TZ", "HOSTNAME",
+    "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE",
+    "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+    "COLIMA_HOME",
+    # Windows essentials so docker.exe resolves on CI runners.
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA",
+    "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+})
+# Prefixes for families docker legitimately needs. Proxy vars may embed the user's OWN
+# proxy credential — that is the user's network config (needed to reach the daemon /
+# registry), not a provider API key, and dropping it would break builds behind a proxy.
+_ENV_ALLOW_PREFIXES = ("DOCKER_", "BUILDKIT_", "COMPOSE_", "CONTAINERD_", "LC_")
+_ENV_ALLOW_SUFFIXES = ("_PROXY", "_proxy")
+_ENV_ALLOW_LOWER = frozenset({"no_proxy"})
 
 
 def _scrubbed_subprocess_env() -> dict:
-    """os.environ minus any provider secret, for the docker build/run subprocess.
+    """os.environ filtered to a docker-essentials ALLOWLIST for the build/run subprocess.
 
-    Deny-list by name substring (not an allowlist) so docker keeps everything it
-    needs (PATH, HOME, DOCKER_HOST, DOCKER_CONFIG, proxy vars, …) while no
-    ``*_API_KEY`` / ``*_TOKEN`` / ``*_SECRET`` value can be interpolated into an
-    untrusted compose build-arg and exfiltrated over build-time egress.
+    Everything not explicitly allowed (every ``*_API_KEY`` / ``*_TOKEN`` / ``*_SECRET``
+    / ``*_AUTH`` / ``*_PAT`` / arbitrary secret) is dropped, so no host secret can be
+    interpolated into an untrusted compose build-arg and exfiltrated over build-time
+    egress — regardless of the secret's name.
     """
-    return {k: v for k, v in os.environ.items()
-            if not any(s in k.upper() for s in _SECRET_ENV_SUBSTRINGS)}
+    def _allowed(name: str) -> bool:
+        up = name.upper()
+        return (up in _ENV_ALLOW_EXACT
+                or name in _ENV_ALLOW_LOWER
+                or any(up.startswith(p) for p in _ENV_ALLOW_PREFIXES)
+                or any(name.endswith(s) for s in _ENV_ALLOW_SUFFIXES))
+
+    return {k: v for k, v in os.environ.items() if _allowed(k)}
 
 
 def _run_command(cmd: list[str], timeout: int, cwd: str = None) -> tuple[str, str, int, bool]:
