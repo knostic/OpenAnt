@@ -26,7 +26,6 @@ Formats:
   summary      Narrative security overview (uses LLM)
   html         Interactive HTML report with charts and filters
   csv          Spreadsheet export of all findings
-  sarif        SARIF 2.1.0 log for GitHub Code Scanning / GitLab SAST upload
 
 If no results path is given, the active project's results_verified.json is used.
 Python owns default output paths — you only need -o to override.
@@ -52,7 +51,7 @@ var (
 func init() {
 	reportCmd.Flags().StringVarP(&reportOutput, "output", "o", "", "Output path (default: derived from format)")
 	reportCmd.Flags().StringVar(&reportDataset, "dataset", "", "Path to dataset JSON (for html/csv)")
-	reportCmd.Flags().StringVarP(&reportFormat, "format", "f", "", "Report format: disclosure, summary, html, csv, sarif")
+	reportCmd.Flags().StringVarP(&reportFormat, "format", "f", "", "Report format: disclosure, summary, html, csv")
 	reportCmd.Flags().StringVar(&reportPipelineOutput, "pipeline-output", "", "Path to pipeline_output.json (for summary/disclosure)")
 	reportCmd.Flags().StringVar(&reportRepoName, "repo-name", "", "Repository name (used when auto-building pipeline_output)")
 	reportCmd.Flags().StringVar(&reportExtraDest, "copy-to", "", "Copy reports to an additional location")
@@ -216,31 +215,6 @@ func runReport(cmd *cobra.Command, args []string) {
 				output.PrintReportSummary(data)
 			}
 			allResults = append(allResults, data)
-		} else if fmt == "sarif" {
-			// SARIF reports use the Go renderer for the same reason HTML
-			// does: it's a deterministic data transformation, not an
-			// LLM-generated narrative, so there's no need to round-trip
-			// through Python.
-			outputPath := reportOutput
-			if outputPath == "" {
-				resultsDir := filepath.Dir(resultsPath)
-				outputPath = filepath.Join(resultsDir, "final-reports", "report.sarif")
-			}
-
-			if err := runSARIFReport(rt, resultsPath, outputPath); err != nil {
-				output.PrintError("sarif: " + err.Error())
-				exitCode = 2
-				continue
-			}
-
-			data := map[string]any{
-				"output_path": outputPath,
-				"format":      "sarif",
-			}
-			if !jsonOutput {
-				output.PrintReportSummary(data)
-			}
-			allResults = append(allResults, data)
 		} else {
 			// Other formats delegate to Python
 			pyArgs := buildReportArgs(resultsPath, fmt)
@@ -290,7 +264,6 @@ func promptFormats() ([]string, error) {
 					huh.NewOption("Summary — narrative security overview written by AI ($)", "summary"),
 					huh.NewOption("HTML — interactive report with charts and filters", "html"),
 					huh.NewOption("CSV — spreadsheet export of all findings", "csv"),
-					huh.NewOption("SARIF — GitHub Code Scanning / GitLab SAST upload", "sarif"),
 				).
 				Value(&selected),
 		),
@@ -372,48 +345,6 @@ func runHTMLReport(rt *python.RuntimeInfo, resultsPath string, outputPath string
 		return fmt.Errorf("failed to render reskin HTML: %w", err)
 	}
 
-	return nil
-}
-
-// runSARIFReport generates a SARIF 2.1.0 log using the Go renderer. Like
-// runHTMLReport, it asks Python's report-data subcommand for pre-computed
-// data, then transforms it deterministically here. Driver version is wired
-// to the CLI's `version` (set via -ldflags at build time).
-func runSARIFReport(rt *python.RuntimeInfo, resultsPath string, outputPath string) error {
-	pyArgs := []string{"report-data", resultsPath}
-	if reportDataset != "" {
-		pyArgs = append(pyArgs, "--dataset", reportDataset)
-	}
-
-	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, resolvedAPIKey())
-	if err != nil {
-		return fmt.Errorf("report-data failed: %w", err)
-	}
-	if result.Envelope.Status != "success" {
-		msg := "report-data returned error"
-		if len(result.Envelope.Errors) > 0 {
-			msg = result.Envelope.Errors[0]
-		}
-		return fmt.Errorf("%s", msg)
-	}
-
-	dataBytes, err := json.Marshal(result.Envelope.Data)
-	if err != nil {
-		return fmt.Errorf("failed to marshal report data: %w", err)
-	}
-
-	var reportData report.ReportData
-	if err := json.Unmarshal(dataBytes, &reportData); err != nil {
-		return fmt.Errorf("failed to parse report data: %w", err)
-	}
-
-	opts := report.SARIFOptions{
-		ToolVersion:    version,
-		InformationURI: "https://github.com/knostic/OpenAnt",
-	}
-	if err := report.GenerateSARIF(reportData, outputPath, opts); err != nil {
-		return fmt.Errorf("failed to render SARIF: %w", err)
-	}
 	return nil
 }
 
