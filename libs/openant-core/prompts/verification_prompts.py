@@ -69,24 +69,29 @@ def _format_builtin_app_context_for_verification(app_context: "ApplicationContex
     Returns:
         Formatted string for prompt injection.
     """
+    # Attacker-authored fields (from a repo-committed OPENANT.json/THREATMODEL) spliced
+    # onto their own line in the Stage-2 VERIFIER prompt — collapse each so an embedded
+    # newline cannot forge a directive/verdict line that steers the verifier to drop a
+    # real finding. application_type is collapsed too: __post_init__ skips the enum check
+    # for source=="manual" (a repo-committed OPENANT.json), so it is attacker-controllable.
     lines = [
         "## Application Context",
         "",
-        f"**Application Type:** {app_context.application_type}",
-        f"**Purpose:** {app_context.purpose}",
+        f"**Application Type:** {collapse_inline(app_context.application_type)}",
+        f"**Purpose:** {collapse_inline(app_context.purpose)}",
         "",
     ]
 
     if app_context.intended_behaviors:
         lines.append("**Intended Behaviors (these are FEATURES, not vulnerabilities):**")
         for behavior in app_context.intended_behaviors[:5]:  # Limit for verification prompt
-            lines.append(f"- {behavior}")
+            lines.append(f"- {collapse_inline(behavior)}")
         lines.append("")
 
     if app_context.not_a_vulnerability:
         lines.append("**Do NOT flag as vulnerable:**")
         for item in app_context.not_a_vulnerability[:5]:  # Limit for verification prompt
-            lines.append(f"- {item}")
+            lines.append(f"- {collapse_inline(item)}")
         lines.append("")
 
     if app_context.suppress_local_only():
