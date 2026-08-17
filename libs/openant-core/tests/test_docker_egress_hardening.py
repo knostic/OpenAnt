@@ -189,8 +189,11 @@ def test_scrubbed_env_keeps_docker_essentials_and_proxy():
         os.environ[k] = v
     try:
         env = _scrubbed_subprocess_env()
+        # Windows os.environ is case-insensitive and normalizes keys to upper-case
+        # (so "no_proxy" comes back as "NO_PROXY"); compare case-insensitively.
+        env_upper = {kk.upper() for kk in env}
         for k in keep:
-            assert k in env, f"docker-essential var was dropped: {k}"
+            assert k.upper() in env_upper, f"docker-essential var was dropped: {k}"
     finally:
         for k in keep:
             os.environ.pop(k, None)
