@@ -76,15 +76,15 @@ Code that HANDLES dangerous patterns is often a SECURITY CONTROL:
    - Look for validation/sanitization in called code
    - A function may delegate security to its callees (e.g., service-layer auth)
    - For `this.someService.method()` patterns, search for the method name definition
+   - A control found in a callee reduces severity ONLY if it PROVABLY guards the
+     tainted path; when unsure, keep EXPLOITABLE — never hide a reachable sink (over-seed)
 
 5. **Apply Classification Logic**
    ```
    Has dangerous sink?
    ├─ No  → NEUTRAL or SECURITY_CONTROL
    └─ Yes → Is reachable from entry point?
-            ├─ Yes → Are there security controls in called functions?
-            │        ├─ Yes → May be SECURITY_CONTROL or lower severity
-            │        └─ No  → EXPLOITABLE
+            ├─ Yes → EXPLOITABLE
             └─ No  → VULNERABLE_INTERNAL
    ```
 
@@ -199,11 +199,12 @@ def get_user_prompt(
    - If this is an entry point or reachable from one: vulnerabilities are EXPLOITABLE
    - If not reachable: vulnerabilities are VULNERABLE_INTERNAL
 
-4. **Trace forward**: Check called functions for authorization, validation, or security controls.
-   A function may delegate security to its service layer.
+4. **Trace forward**: Check called functions for authorization, validation, or security controls
+   for context. A callee control reduces severity ONLY if it provably guards the tainted path;
+   when unsure, keep EXPLOITABLE — never hide a reachable sink (over-seed).
 
 5. **Classify the code**:
-   - **EXPLOITABLE**: Dangerous ops + user input can reach them + no security controls in callees
+   - **EXPLOITABLE**: Dangerous ops + user input can reach them
    - **VULNERABLE_INTERNAL**: Dangerous ops but no user input path
    - **SECURITY_CONTROL**: Defensive code (validators, sanitizers)
    - **NEUTRAL**: No security relevance
