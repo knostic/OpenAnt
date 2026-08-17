@@ -301,10 +301,18 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
 # CONSTRUCTION: a provider secret with any name (ANTHROPIC_API_KEY, GH_PAT,
 # AWS_ACCESS_KEY_ID, *_APIKEY, *_PASSPHRASE, *_AUTH, SLACK_WEBHOOK, …) is dropped by
 # default because it is not on the list, so no new secret-name convention can leak.
-# Docker's own needs are a bounded, well-known set. Tradeoff: a private base image
-# pulled via a cloud credential-helper that reads secrets from ENV (e.g. AWS_* for
-# ecr-login) will fail — use a prior `docker login` (writes config.json; DOCKER_CONFIG
-# is allowed) instead. Public base images and pre-authenticated config.json are unaffected.
+# Docker's own needs are a bounded, well-known set. Tradeoff: any build that needs a
+# host secret from ENV at build time fails — a private BASE IMAGE via a cloud
+# credential-helper (AWS_* for ecr-login), or a private BUILD DEPENDENCY fetched by a
+# RUN step (GITHUB_TOKEN for `go mod download` of a GOPRIVATE module, NPM_TOKEN, a
+# credentialed PIP_INDEX_URL, …). Such a generated repro fails to build and is recorded
+# as status=ERROR (result_collector.py) — VISIBLE and retried, NOT a silent
+# NOT_REPRODUCED, so the static verdict is preserved and only the dynamic confirmation is
+# missed (the safe side for a SAST tool). Private base images have a workaround (a prior
+# `docker login` writes config.json; DOCKER_CONFIG is allowed); a private build-time
+# dependency does not (the RUN-step token cannot be supplied without re-opening the
+# build-arg exfil this scrub closes) — an accepted coverage limit. Public base images and
+# public dependencies are unaffected.
 _ENV_ALLOW_EXACT = frozenset({
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "PWD", "TZ", "HOSTNAME",
     "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE",
