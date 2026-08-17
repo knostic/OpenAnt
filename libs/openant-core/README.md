@@ -141,7 +141,7 @@ python -m context.generate_context /path/to/repo
 python -m context.generate_context --list-types        # Show supported types
 ```
 
-When using a project (`openant init`), `analyze` and `verify` auto-discover the generated context — no need to pass `--app-context`.
+Under a project (`openant init`), the Go CLI auto-fills `--app-context` for `analyze`/`verify` from the project scan directory (operator-owned under `~/.openant/`, where `generate-context` writes it) — never from the scanned repo itself, so a repo-supplied file can't silently suppress findings. Without a project, pass it explicitly with `--app-context /path/to/application_context.json`.
 
 ### Manual Override
 

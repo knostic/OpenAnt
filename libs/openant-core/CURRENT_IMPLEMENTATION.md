@@ -236,8 +236,9 @@ python -m context.generate_context /path/to/repo
 # List supported types
 python -m context.generate_context --list-types
 
-# Context is saved to application_context.json in the scan/dataset directory
-# analyze and verify auto-discover it when using a project
+# Context is saved to application_context.json in the current directory
+# Under a project, the Go CLI auto-fills --app-context from the project scan dir
+# (operator-owned, never the scanned repo); otherwise pass --app-context explicitly
 ```
 
 **Generated Context Structure:**

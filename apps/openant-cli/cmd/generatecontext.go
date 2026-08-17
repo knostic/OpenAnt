@@ -35,7 +35,7 @@ var (
 )
 
 func init() {
-	generateContextCmd.Flags().StringVarP(&gcOutput, "output", "o", "", "Output path (default: <scan-dir>/application_context.json or <repo>/application_context.json)")
+	generateContextCmd.Flags().StringVarP(&gcOutput, "output", "o", "", "Output path (default: <scan-dir>/application_context.json in a project, else ./application_context.json — never the scanned repo)")
 	generateContextCmd.Flags().BoolVar(&gcForce, "force", false, "Force regeneration, ignoring OPENANT.md override files")
 	generateContextCmd.Flags().BoolVar(&gcShowPrompt, "show-prompt", false, "Include formatted prompt text in output")
 }

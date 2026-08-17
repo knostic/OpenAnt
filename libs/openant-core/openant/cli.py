@@ -40,20 +40,6 @@ def _output_json(data: dict):
     sys.stdout.write("\n")
 
 
-def _find_app_context(*candidate_dirs: str) -> str | None:
-    """Search candidate directories for application_context.json.
-
-    Returns the first existing path, or None.
-    """
-    for d in candidate_dirs:
-        if not d:
-            continue
-        path = os.path.join(d, "application_context.json")
-        if os.path.isfile(path):
-            return path
-    return None
-
-
 def _load_step_reports(directory: str) -> list[dict]:
     """Load all {step}.report.json files from a directory.
 
@@ -303,8 +289,17 @@ def cmd_generate_context(args):
     )
     from core.schemas import success, error
     from core.step_report import step_context
+    from utilities.llm import (
+        build_phase_registry,
+        load_config_file,
+        probe_registry_or_raise,
+        resolve_llm_config,
+    )
 
-    output_path = args.output or os.path.join(args.repo, "application_context.json")
+    # Default output to the CWD, NOT the scanned repo root: writing the context
+    # into the checkout would let a later scan silently auto-load it as
+    # finding-suppression config. Suppression must be an explicit operator act.
+    output_path = args.output or os.path.join(os.getcwd(), "application_context.json")
     output_dir = os.path.dirname(os.path.abspath(output_path))
 
     try:
@@ -312,10 +307,25 @@ def cmd_generate_context(args):
             "repo_path": os.path.abspath(args.repo),
             "force": args.force,
         }) as ctx:
+            # generate_application_context requires a PhaseBinding for the
+            # app_context phase (model + adapter live in the binding, not
+            # caller-side). Same registry idiom as the threat-model command.
+            cf = load_config_file()
+            registry = build_phase_registry(
+                cf, resolve_llm_config(cf, getattr(args, "llm_config", None))
+            )
+            probe_registry_or_raise(registry)
             app_context = generate_application_context(
                 Path(args.repo),
+                registry.get("app_context"),
                 force_regenerate=args.force,
             )
+            # generate_application_context returns None when the LLM yields an
+            # incomplete context; surface a clear message instead of letting
+            # save_context(None) raise an opaque asdict() error.
+            if app_context is None:
+                _output_json(error("Could not generate application context (LLM returned an incomplete result)."))
+                return 2
             save_context(app_context, Path(output_path))
 
             ctx.summary = {
@@ -419,17 +429,10 @@ def cmd_analyze(args):
 
     exploitable_filter = "all" if args.exploitable_all else ("strict" if args.exploitable_only else None)
 
-    # Auto-discover application context if not explicitly provided
+    # Application context is used ONLY when the operator passes it explicitly.
+    # Auto-discovering it from the scanned repo (or stale output dirs) would let
+    # repo-supplied config silently suppress findings — an explicit act only.
     app_context_path = args.app_context
-    if not app_context_path:
-        app_context_path = _find_app_context(
-            output_dir,
-            args.repo_path,
-            os.path.dirname(os.path.abspath(args.dataset)),
-        )
-        if app_context_path:
-            print(f"[Analyze] Auto-discovered application context: {app_context_path}",
-                  file=sys.stderr)
 
     try:
         with step_context("analyze", output_dir, inputs={
@@ -531,17 +534,9 @@ def cmd_verify(args):
 
     output_dir = args.output or tempfile.mkdtemp(prefix="open_ant_verify_")
 
-    # Auto-discover application context if not explicitly provided
+    # Application context is used ONLY when the operator passes it explicitly
+    # (see the analyze command for the rationale — no silent auto-discovery).
     app_context_path = args.app_context
-    if not app_context_path:
-        app_context_path = _find_app_context(
-            output_dir,
-            args.repo_path,
-            os.path.dirname(os.path.abspath(args.results)),
-        )
-        if app_context_path:
-            print(f"[Verify] Auto-discovered application context: {app_context_path}",
-                  file=sys.stderr)
 
     try:
         with step_context("verify", output_dir, inputs={
@@ -1543,11 +1538,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gc_p.add_argument("repo", help="Path to repository")
     gc_p.add_argument("--output", "-o",
-                       help="Output path (default: <repo>/application_context.json)")
+                       help="Output path (default: ./application_context.json in the "
+                            "current directory — never written into the scanned repo)")
     gc_p.add_argument("--force", action="store_true",
                        help="Force regeneration, ignoring OPENANT.md override files")
     gc_p.add_argument("--show-prompt", action="store_true",
                        help="Include formatted prompt text in output")
+    gc_p.add_argument(
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config in ~/.config/openant/config.json. "
+            "Defaults to the file's default_llm."
+        ),
+    )
     gc_p.set_defaults(func=cmd_generate_context)
 
     # ---------------------------------------------------------------
