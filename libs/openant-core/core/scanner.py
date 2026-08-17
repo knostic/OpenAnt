@@ -409,6 +409,12 @@ def scan_repository(
                     print("  Continuing without app context.", file=sys.stderr)
                     ctx.status = "skipped"
                     ctx.summary = {"skipped": True, "reason": str(e)}
+                    # Record the crash like the enhance/verify/dynamic-test
+                    # handlers do — otherwise the degraded scan (default threat
+                    # model) is absent from result.skipped_steps / scan.report.json
+                    # / pipeline_output.json and the summary claims "No steps were
+                    # skipped" (only the per-step report + stderr carried it).
+                    _record_skip(result, "app-context", "failed")
 
         collected_step_reports.append(_load_step_report(output_dir, "app-context"))
     elif generate_context:
@@ -460,10 +466,22 @@ def scan_repository(
         }) as ctx:
             try:
                 dataset = read_json(active_dataset_path)
-            except (OSError, json.JSONDecodeError) as exc:
+            except Exception as exc:
+                # Broaden beyond (OSError, json.JSONDecodeError): read_json opens
+                # strict UTF-8, so a bad-encoding dataset raises UnicodeDecodeError
+                # (a ValueError) which previously escaped and aborted the whole
+                # scan. NOTE: this guards only the dataset READ. The stage's LLM
+                # call (analyze_reachability, below) is NOT wrapped here, so a
+                # provider error there still aborts the scan — a separate gap
+                # tracked as a follow-up (wrap the whole stage body like
+                # enhance/verify do).
                 print(f"  WARNING: failed to load dataset: {exc}", file=sys.stderr)
                 ctx.status = "skipped"
                 ctx.summary = {"skipped": True, "reason": str(exc)}
+                # Record the crash so the degraded reachability pass (no
+                # LLM-promoted entry points -> potential missed vulns) is
+                # visible in the artifacts, not only on CI-discarded stderr.
+                _record_skip(result, "llm-reachability", "failed")
                 dataset = None
 
             if dataset is not None:
@@ -471,7 +489,21 @@ def scan_repository(
                 if app_context_path and os.path.exists(app_context_path):
                     try:
                         app_ctx_payload = read_json(app_context_path)
-                    except (OSError, json.JSONDecodeError):
+                    except Exception as exc:
+                        # Broad like the dataset load above: this optional
+                        # app-context read must never abort the scan. read_json
+                        # opens strict UTF-8, so a bad-encoding self-written file
+                        # raises UnicodeDecodeError (not OSError/JSONDecodeError);
+                        # a missing payload just means the reachability prompt
+                        # runs without the extra app-context hint. Warn (like the
+                        # dataset-load sibling) so this recall-affecting
+                        # degradation is visible, not silent.
+                        print(
+                            f"  WARNING: could not read app context for "
+                            f"reachability ({exc}); continuing without the "
+                            f"app-context hint.",
+                            file=sys.stderr,
+                        )
                         app_ctx_payload = None
 
                 # --limit governs the analyze stage, not how many units the
