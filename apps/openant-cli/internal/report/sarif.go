@@ -236,14 +236,19 @@ func fingerprintFor(f Finding, verdict string) string {
 }
 
 // sarifLevelForVerdict maps an OpenAnt verdict to a SARIF result.level.
-// Vulnerable + bypassable surface as `error`; inconclusive/unclear as
-// `warning`; everything else (safe, protected, etc.) as `note` so they
-// don't pollute Code-Scanning alert lists.
+// Vulnerable + bypassable surface as `error`. Inconclusive AND `error` (a
+// disclosure-eligible analysis failure — see core/verdict_taxonomy.py
+// PRODUCER_VERDICTS/DISCLOSURE_ELIGIBLE) surface as `warning` so they stay
+// VISIBLE in Code Scanning's default view rather than silently vanishing;
+// `unclear` (a non-taxonomy value) stays `warning` too — an out-of-taxonomy
+// verdict is an anomaly that must be seen, never hidden (over-seed safety).
+// Everything else (safe, protected, etc.) is `note` so it doesn't pollute
+// alert lists.
 func sarifLevelForVerdict(v string) string {
 	switch v {
 	case "vulnerable", "bypassable":
 		return "error"
-	case "inconclusive", "unclear":
+	case "inconclusive", "unclear", "error":
 		return "warning"
 	default:
 		return "note"

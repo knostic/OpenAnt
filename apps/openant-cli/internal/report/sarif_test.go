@@ -267,3 +267,25 @@ func TestSARIFURI_StripsLeadingDotSlashAndNormalizesBackslashes(t *testing.T) {
 		}
 	}
 }
+
+// "error" is a real producer verdict (core/verdict_taxonomy.py: it is in
+// PRODUCER_VERDICTS and DISCLOSURE_ELIGIBLE — a disclosure-eligible analysis
+// failure surfaced so it stays on the manual-triage radar). It must map to a
+// VISIBLE SARIF level, not "note" (which GitHub Code Scanning filters from the
+// default view), or the failure silently vanishes. This fix is additive — it
+// only makes "error" visible and changes no other verdict's level.
+func TestSarifLevelForVerdict_ErrorAndTaxonomy(t *testing.T) {
+	cases := map[string]string{
+		"vulnerable":   "error",
+		"bypassable":   "error",
+		"inconclusive": "warning",
+		"error":        "warning", // disclosure-eligible; must stay visible
+		"safe":         "note",
+		"protected":    "note",
+	}
+	for verdict, want := range cases {
+		if got := sarifLevelForVerdict(verdict); got != want {
+			t.Errorf("sarifLevelForVerdict(%q): got %q, want %q", verdict, got, want)
+		}
+	}
+}
