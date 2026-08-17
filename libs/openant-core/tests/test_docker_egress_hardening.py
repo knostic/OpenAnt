@@ -135,3 +135,90 @@ def test_single_container_run_uses_network_none():
     # list form ["docker", "network", "create", ...] (quoted tokens), which the prose
     # comment ("no `docker network create` needed") does not contain.
     assert '"docker", "network", "create"' not in src
+
+
+# --- provider-secret exfil via compose build.args ${VAR} interpolation ---------
+
+def test_scrubbed_env_removes_provider_secrets_keeps_docker_essentials():
+    """The docker subprocess env must not carry provider API keys.
+
+    A compose `build.args` value like `${ANTHROPIC_API_KEY}` is interpolated by
+    docker compose from the host env at BUILD time and can be exfiltrated by the
+    LLM-authored Dockerfile's `RUN` over the still-open build-time network. The
+    build/run subprocess never needs any provider secret, so it runs with a
+    scrubbed env — closing the exfil by construction regardless of build.args.
+    """
+    import os
+    from utilities.dynamic_tester.docker_executor import _scrubbed_subprocess_env
+
+    # An ALLOWLIST must drop a secret regardless of its NAME convention — the
+    # denylist-substring approach missed all of these (ACCESS_KEY without API_KEY,
+    # APIKEY without underscore, PASSPHRASE, bare AUTH, PAT, WEBHOOK).
+    secrets = {
+        "ANTHROPIC_API_KEY": "sk-1", "OPENAI_API_KEY": "sk-2", "SOME_SECRET_TOKEN": "s3",
+        "AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "s4", "GH_PAT": "ghp_x",
+        "GITHUB_TOKEN": "ghs_x", "OPENAI_APIKEY": "sk-3", "KEY_PASSPHRASE": "pp",
+        "SSH_KEY_PASSPHRASE": "pp2", "ANTHROPIC_AUTH": "auth", "SLACK_WEBHOOK": "https://hook",
+        "DIGITALOCEAN_ACCESS_KEY": "do",
+        # DOCKER_*/COMPOSE_*/BUILDKIT_* families ALSO carry secrets — a broad prefix
+        # allow re-opened the leak (round-2 bug-hunt). These MUST be dropped.
+        "DOCKER_PASSWORD": "pw", "DOCKER_AUTH_CONFIG": '{"auths":{}}', "DOCKER_TOKEN": "t",
+        "DOCKER_HUB_PASSWORD": "h2", "COMPOSE_PASSWORD": "cp", "BUILDKIT_TOKEN": "bt",
+    }
+    for k, v in secrets.items():
+        os.environ[k] = v
+    try:
+        env = _scrubbed_subprocess_env()
+        for k in secrets:
+            assert k not in env, f"secret leaked into docker subprocess env: {k}"
+        # docker still needs its essentials
+        assert "PATH" in env
+    finally:
+        for k in secrets:
+            os.environ.pop(k, None)
+
+
+def test_scrubbed_env_keeps_docker_essentials_and_proxy():
+    """The allowlist must keep the vars docker legitimately needs."""
+    import os
+    from utilities.dynamic_tester.docker_executor import _scrubbed_subprocess_env
+
+    keep = {"DOCKER_HOST": "unix:///x", "DOCKER_CONFIG": "/c", "HTTPS_PROXY": "http://p",
+            "no_proxy": "localhost", "LC_ALL": "C"}
+    for k, v in keep.items():
+        os.environ[k] = v
+    try:
+        env = _scrubbed_subprocess_env()
+        # Windows os.environ is case-insensitive and normalizes keys to upper-case
+        # (so "no_proxy" comes back as "NO_PROXY"); compare case-insensitively.
+        env_upper = {kk.upper() for kk in env}
+        for k in keep:
+            assert k.upper() in env_upper, f"docker-essential var was dropped: {k}"
+    finally:
+        for k in keep:
+            os.environ.pop(k, None)
+
+
+def test_run_command_passes_scrubbed_env(monkeypatch):
+    """_run_command must hand the scrubbed env to the subprocess (not inherit os.environ)."""
+    import os
+    from utilities.dynamic_tester import docker_executor
+
+    os.environ["ANTHROPIC_API_KEY"] = "sk-should-not-leak"
+    captured = {}
+
+    def fake_run_utf8(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        class R:
+            stdout, stderr, returncode = "", "", 0
+        return R()
+
+    monkeypatch.setattr(docker_executor, "run_utf8", fake_run_utf8)
+    try:
+        docker_executor._run_command(["docker", "version"], timeout=5)
+    finally:
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    assert captured["env"] is not None, "_run_command must pass an explicit env= (scrubbed)"
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
+    assert "PATH" in captured["env"]

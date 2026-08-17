@@ -255,3 +255,271 @@ def test_finding_prompt_includes_source_basename():
     assert "VulnerablePythonScript.py" in prompt, (
         "prompt must mention the staged source filename so the LLM references it in COPY"
     )
+
+
+# ---------------------------------------------------------------------------
+# Staging path-traversal confinement (host-write + host-read escapes)
+#
+# The generation dict is LLM output influenced by the scanned repo, and
+# finding.location.file is an LLM-emitted structured field. Neither may be
+# used as a filesystem path without confining it to the staging root:
+#   * generation['test_filename'] / ['requirements_filename'] are joined to
+#     work_dir and written -> a `..`/absolute name is a HOST-WRITE escape.
+#   * finding.location.file is joined to repo_path and copied into the build
+#     context -> a `..`/absolute value is a HOST-READ/exfil escape.
+# The staging happens on the host BEFORE any container runs, so the container
+# runtime hardening (#253) does not cover it.
+# ---------------------------------------------------------------------------
+
+def test_write_test_files_confines_traversal_test_filename(tmp_path):
+    """A `..`-traversal generation['test_filename'] must not write outside work_dir."""
+    from utilities.dynamic_tester.docker_executor import _write_test_files
+
+    work_dir = str(tmp_path / "work")
+    os.makedirs(work_dir)
+    escape_target = tmp_path / "PWNED_test.py"  # sibling of work_dir, outside it
+
+    generation = {
+        "dockerfile": "FROM python:3.11\nCMD echo hi",
+        "test_script": "print('pwn')",
+        "test_filename": "../PWNED_test.py",  # escapes work_dir
+    }
+    _write_test_files(work_dir, generation)
+
+    assert not escape_target.exists(), (
+        f"test_filename traversal escaped work_dir -> host-write at {escape_target}"
+    )
+    # Content is confined to a bare leaf inside work_dir.
+    assert (tmp_path / "work" / "PWNED_test.py").exists()
+
+
+def test_write_test_files_confines_absolute_requirements_filename(tmp_path):
+    """An absolute generation['requirements_filename'] must not write to a host path."""
+    from utilities.dynamic_tester.docker_executor import _write_test_files
+
+    work_dir = str(tmp_path / "work")
+    os.makedirs(work_dir)
+    escape_target = tmp_path / "PWNED_reqs.txt"
+
+    generation = {
+        "dockerfile": "FROM python:3.11\nCMD echo hi",
+        "test_script": "print('ok')",
+        "test_filename": "test_exploit.py",
+        "requirements": "flask",
+        "requirements_filename": str(escape_target),  # absolute path outside work_dir
+    }
+    _write_test_files(work_dir, generation)
+
+    assert not escape_target.exists(), (
+        f"requirements_filename absolute path escaped work_dir -> host-write at {escape_target}"
+    )
+
+
+def test_orchestrator_rejects_out_of_repo_source(tmp_path, monkeypatch):
+    """A `..`-traversal finding.location.file must not resolve OUTSIDE repo_path.
+
+    Otherwise a host file (secret) outside the scanned repo is copied into the
+    Docker build context and can be exfiltrated by the LLM-authored test script.
+    """
+    import json
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def vuln(): pass")
+    # A host secret OUTSIDE the repo the attacker tries to reach via traversal.
+    secret = tmp_path / "SECRET.txt"
+    secret.write_text("top-secret")
+
+    po = {
+        "repository": {"name": "test", "language": "python"},
+        "application_type": "web_app",
+        "findings": [{
+            "id": "VULN-001", "name": "t", "short_name": "vuln",
+            "location": {"file": "../SECRET.txt", "function": "x"},
+            "cwe_id": 79, "cwe_name": "XSS",
+            "stage1_verdict": "vulnerable", "stage2_verdict": "confirmed",
+        }],
+    }
+    po_path = tmp_path / "pipeline_output.json"
+    po_path.write_text(json.dumps(po))
+
+    captured = {}
+
+    def mock_generate_test(finding, repo_info, binding, tracker):
+        return {
+            "dockerfile": "FROM python:3.11\nCMD echo hi",
+            "test_script": "print('ok')",
+            "test_filename": "test_exploit.py",
+        }
+
+    def mock_run_single_container(generation, finding_id, source_file=None, **kwargs):
+        captured["source_file"] = source_file
+        from utilities.dynamic_tester.docker_executor import DockerExecutionResult
+        r = DockerExecutionResult()
+        r.stdout = '{"status": "CONFIRMED", "details": "t", "evidence": []}'
+        r.exit_code = 0
+        return r
+
+    monkeypatch.setattr("utilities.dynamic_tester.generate_test", mock_generate_test)
+    monkeypatch.setattr("utilities.dynamic_tester.run_single_container", mock_run_single_container)
+
+    from utilities.dynamic_tester import run_dynamic_tests
+    run_dynamic_tests(
+        pipeline_output_path=str(po_path),
+        output_dir=str(tmp_path / "out"),
+        max_retries=0,
+        repo_path=str(repo),
+        registry=_fake_registry(),
+    )
+
+    assert captured.get("source_file") is None, (
+        f"traversal location.file escaped repo_path -> host-read/exfil: {captured.get('source_file')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# No-raise invariant: staging must NOT raise into the orchestrator (an unwrapped
+# raise aborts the WHOLE dynamic-test run, not one finding — docker_executor.py
+# _refuse_compose). The confinement fix touches exactly the untrusted fields that
+# can also carry a wrong TYPE / dot-segment / reserved-name collision.
+# ---------------------------------------------------------------------------
+
+def test_safe_leaf_never_raises_and_confines():
+    from utilities.dynamic_tester.docker_executor import _safe_leaf
+    # non-str (JSON allows any type) -> default, never raises (M1)
+    for bad in (123, ["x"], {"a": 1}, None, True):
+        assert _safe_leaf(bad, "d.py") == "d.py"
+    # embedded NUL / control chars: a str that survives basename+reserved but makes
+    # open()/os.path.join raise ValueError("embedded null byte") -> must degrade,
+    # not raise (would abort the whole run). Also proves the leaf is openable.
+    for bad in ("exploit\x00.py", "a\x1fb.py", "x\x7f.py", "\x00"):
+        leaf = _safe_leaf(bad, "d.py")
+        import os as _os
+        _os.path.join("/tmp", leaf)  # must not raise ValueError: embedded null byte
+    # dot-segments resolve to a directory, not a file -> default (M2)
+    for bad in ("..", ".", "a/b/..", "", "x/"):
+        assert _safe_leaf(bad, "d.py") == "d.py"
+    # collision with a fixed staging path -> default (M6)
+    for bad in ("Dockerfile", "docker-compose.yml", "attacker-server"):
+        assert _safe_leaf(bad, "d.py") == "d.py"
+    # traversal still strips to the bare leaf; normal names pass through
+    assert _safe_leaf("../../etc/passwd", "d.py") == "passwd"
+    assert _safe_leaf("test_exploit.py", "d.py") == "test_exploit.py"
+
+
+@pytest.mark.parametrize("gen_over", [
+    {"test_filename": 123},                       # M1 non-str name
+    {"test_filename": ".."},                       # M2 dot-segment
+    {"test_filename": "attacker-server", "needs_attacker_server": True},  # M6 collision
+    {"dockerfile": 123},                           # M3 non-str content
+    {"test_script": ["x"]},                        # M3 non-str content
+    {"requirements": ["flask"], "requirements_filename": 99},  # M1+M3
+])
+def test_write_test_files_never_raises_on_hostile_fields(tmp_path, gen_over):
+    """No hostile generation field may raise out of _write_test_files."""
+    from utilities.dynamic_tester.docker_executor import _write_test_files
+    work_dir = str(tmp_path / "work")
+    os.makedirs(work_dir)
+    generation = {"dockerfile": "FROM python:3.11\nCMD echo hi",
+                  "test_script": "print('ok')", "test_filename": "test_exploit.py"}
+    generation.update(gen_over)
+    _write_test_files(work_dir, generation)  # must not raise
+
+
+@pytest.mark.parametrize("location", [None, "astring", 123, {"file": 123}, {"file": ["x"]}, {}])
+def test_orchestrator_never_raises_on_bad_location(tmp_path, monkeypatch, location):
+    """A non-dict location or non-str location.file must not raise (M4/M5); source_file None."""
+    import json
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def vuln(): pass")
+
+    po = {
+        "repository": {"name": "test", "language": "python"},
+        "application_type": "web_app",
+        "findings": [{
+            "id": "VULN-001", "name": "t", "short_name": "vuln",
+            "location": location,
+            "cwe_id": 79, "cwe_name": "XSS",
+            "stage1_verdict": "vulnerable", "stage2_verdict": "confirmed",
+        }],
+    }
+    po_path = tmp_path / "pipeline_output.json"
+    po_path.write_text(json.dumps(po))
+
+    captured = {}
+
+    def mock_generate_test(finding, repo_info, binding, tracker):
+        return {"dockerfile": "FROM python:3.11\nCMD echo hi",
+                "test_script": "print('ok')", "test_filename": "test_exploit.py"}
+
+    def mock_run_single_container(generation, finding_id, source_file=None, **kwargs):
+        captured["source_file"] = source_file
+        from utilities.dynamic_tester.docker_executor import DockerExecutionResult
+        r = DockerExecutionResult()
+        r.stdout = '{"status": "CONFIRMED", "details": "t", "evidence": []}'
+        r.exit_code = 0
+        return r
+
+    monkeypatch.setattr("utilities.dynamic_tester.generate_test", mock_generate_test)
+    monkeypatch.setattr("utilities.dynamic_tester.run_single_container", mock_run_single_container)
+
+    from utilities.dynamic_tester import run_dynamic_tests
+    run_dynamic_tests(  # must not raise
+        pipeline_output_path=str(po_path),
+        output_dir=str(tmp_path / "out"),
+        max_retries=0,
+        repo_path=str(repo),
+        registry=_fake_registry(),
+    )
+    assert captured.get("source_file") is None
+
+
+def test_orchestrator_coerces_nonstr_finding_id(tmp_path, monkeypatch):
+    """A non-str finding.id must be coerced to str at the boundary, else
+    run_single_container's finding_id.lower() (and checkpoint's safe_filename)
+    raise and abort the whole run."""
+    import json
+
+    po = {
+        "repository": {"name": "test", "language": "python"},
+        "application_type": "web_app",
+        "findings": [{
+            "id": 12345,  # non-str id
+            "name": "t", "short_name": "vuln",
+            "location": {"file": "app.py", "function": "x"},
+            "cwe_id": 79, "cwe_name": "XSS",
+            "stage1_verdict": "vulnerable", "stage2_verdict": "confirmed",
+        }],
+    }
+    po_path = tmp_path / "pipeline_output.json"
+    po_path.write_text(json.dumps(po))
+
+    captured = {}
+
+    def mock_generate_test(finding, repo_info, binding, tracker):
+        return {"dockerfile": "FROM python:3.11\nCMD echo hi",
+                "test_script": "print('ok')", "test_filename": "test_exploit.py"}
+
+    def mock_run_single_container(generation, finding_id, source_file=None, **kwargs):
+        captured["finding_id"] = finding_id
+        from utilities.dynamic_tester.docker_executor import DockerExecutionResult
+        r = DockerExecutionResult()
+        r.stdout = '{"status": "CONFIRMED", "details": "t", "evidence": []}'
+        r.exit_code = 0
+        return r
+
+    monkeypatch.setattr("utilities.dynamic_tester.generate_test", mock_generate_test)
+    monkeypatch.setattr("utilities.dynamic_tester.run_single_container", mock_run_single_container)
+
+    from utilities.dynamic_tester import run_dynamic_tests
+    run_dynamic_tests(  # must not raise
+        pipeline_output_path=str(po_path),
+        output_dir=str(tmp_path / "out"),
+        max_retries=0,
+        registry=_fake_registry(),
+    )
+    assert isinstance(captured.get("finding_id"), str), (
+        f"finding_id not coerced to str: {captured.get('finding_id')!r}"
+    )

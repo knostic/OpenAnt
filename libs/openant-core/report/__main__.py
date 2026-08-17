@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -100,7 +101,10 @@ def cmd_disclosures(args):
         print(f"Generating disclosure for {finding['short_name']}...")
         disclosure, _usage = generate_disclosure(finding, product_name, report_binding)
 
-        safe_name = finding["short_name"].replace(" ", "_").upper()
+        # Coerce to str, fall back to id, and basename so a null/typed/traversal
+        # short_name can't crash disclosure generation (mirrors report/generator.py).
+        safe_name = (os.path.basename(str(finding.get("short_name") or finding.get("id") or "finding"))
+                     or "finding").replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
         with open_utf8(output_dir / filename, "w") as f:
             f.write(disclosure)

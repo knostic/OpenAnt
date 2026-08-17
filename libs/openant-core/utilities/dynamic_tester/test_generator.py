@@ -131,14 +131,15 @@ def _build_finding_prompt(finding: dict, repo_info: dict) -> str:
     # vocabularies ("javascript" vs the "node" base image) and conflating them
     # tells the model the wrong language for the code it is writing a test
     # against. Template selection is resolve_docker_template's job.
-    loc_for_lang = finding.get("location", {})
-    finding_file = loc_for_lang.get("file", "") if isinstance(loc_for_lang, dict) else ""
+    loc_for_lang = finding.get("location")
+    _ff = loc_for_lang.get("file") if isinstance(loc_for_lang, dict) else None
+    finding_file = _ff if isinstance(_ff, str) else ""  # location.file may be non-str (JSON)
     language = language_for_path(finding_file) or repo_info.get("language") or "unknown"
 
     # Derive the staged source filename so the LLM can reference it in COPY.
     source_basename = ""
-    loc = finding.get("location", {})
-    if isinstance(loc, dict) and loc.get("file"):
+    loc = finding.get("location")
+    if isinstance(loc, dict) and isinstance(loc.get("file"), str) and loc["file"]:
         source_basename = os.path.basename(loc["file"])
 
     # Inline label fields are model-produced free text (name, cwe_name, the two
@@ -286,6 +287,13 @@ def generate_test(
     required = ["dockerfile", "test_script", "test_filename"]
     if not all(k in parsed for k in required):
         return None
+    # Every staging field the executor writes or joins must be a str — a non-str
+    # (JSON allows any type) would raise in _write_test_files and abort the whole
+    # dynamic-test run. Degrade a malformed generation to the None (NOT_REPRODUCED) path.
+    _STR_FIELDS = ("dockerfile", "test_script", "test_filename",
+                   "requirements", "requirements_filename", "docker_compose")
+    if any(k in parsed and not isinstance(parsed[k], str) for k in _STR_FIELDS):
+        return None
 
     return parsed
 
@@ -357,6 +365,13 @@ def regenerate_test(
 
     required = ["dockerfile", "test_script", "test_filename"]
     if not all(k in parsed for k in required):
+        return None
+    # Every staging field the executor writes or joins must be a str — a non-str
+    # (JSON allows any type) would raise in _write_test_files and abort the whole
+    # dynamic-test run. Degrade a malformed generation to the None (NOT_REPRODUCED) path.
+    _STR_FIELDS = ("dockerfile", "test_script", "test_filename",
+                   "requirements", "requirements_filename", "docker_compose")
+    if any(k in parsed and not isinstance(parsed[k], str) for k in _STR_FIELDS):
         return None
 
     return parsed

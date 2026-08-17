@@ -98,6 +98,40 @@ def _safe_build(build):
     raise ValueError("service has no usable build spec")
 
 
+def _safe_leaf(name, default: str) -> str:
+    """Confine an LLM-supplied staging filename to a bare leaf inside work_dir.
+
+    generation['test_filename'] / ['requirements_filename'] are LLM output
+    influenced by the scanned repo. Used raw as `os.path.join(work_dir, name)`
+    they let a `..`/absolute value escape work_dir and write to the HOST during
+    pre-container staging (the compose `build.context` analogue that _safe_build
+    already confines). The scaffold is flat by construction — the generation
+    schema's examples are plain basenames, Dockerfiles `COPY <basename> .` at
+    WORKDIR, and pip needs requirements.txt at the build-context root — so
+    basename is strictly correct and strips any traversal.
+
+    Fail-closed WITHOUT raising: an unwrapped raise here would abort the whole
+    dynamic-test run (see _refuse_compose), so a hostile value degrades to a
+    harmless leaf (COPY mismatch -> NOT_REPRODUCED) rather than a host write.
+    A non-str value (JSON allows any type), a dot-segment ('.'/'..' -> a
+    directory, not a file), and a name colliding with a fixed staging path
+    (Dockerfile / docker-compose.yml / attacker-server) all degrade to `default`
+    so nothing downstream raises IsADirectoryError / FileExistsError / TypeError.
+    """
+    if not isinstance(name, str):
+        return default
+    # A NUL (or other control char) is a str that survives basename and the
+    # reserved check, but open()/os.path.join raise ValueError("embedded null
+    # byte") — an unwrapped raise here would abort the whole run (the exact
+    # fail-closed contract this helper exists to keep). Reject any name carrying a
+    # control character (0x00-0x1f, 0x7f) and degrade to the default leaf.
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in name):
+        return default
+    leaf = os.path.basename(name)
+    _RESERVED = {"", ".", "..", "Dockerfile", "docker-compose.yml", "attacker-server"}
+    return default if leaf in _RESERVED else leaf
+
+
 def _harden_service(name: str, svc: dict) -> dict:
     """Reconstruct ONE service from the allowlist + the fixed hardening set (C).
 
@@ -219,24 +253,28 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
     if source_file and os.path.isfile(source_file):
         shutil.copy2(source_file, os.path.join(work_dir, os.path.basename(source_file)))
 
+    # str() the content fields as a defense-in-depth belt: generate_test already
+    # rejects a non-str content field (test_generator validation), but coercing here
+    # too means a non-str value can never raise TypeError in f.write and abort the
+    # whole run — it degrades to a garbage build that fails safe (NOT_REPRODUCED).
     # Write Dockerfile
     with open_utf8(os.path.join(work_dir, "Dockerfile"), "w") as f:
-        f.write(generation["dockerfile"])
+        f.write(str(generation["dockerfile"]))
 
-    # Write test script
-    test_filename = generation.get("test_filename", "test_exploit.py")
+    # Write test script (confine the LLM-supplied name to a leaf inside work_dir)
+    test_filename = _safe_leaf(generation.get("test_filename"), "test_exploit.py")
     test_path = os.path.join(work_dir, test_filename)
     os.makedirs(os.path.dirname(test_path), exist_ok=True)
     with open_utf8(test_path, "w") as f:
-        f.write(generation["test_script"])
+        f.write(str(generation["test_script"]))
 
     # Write requirements/dependencies file
     if generation.get("requirements"):
-        req_filename = generation.get("requirements_filename", "requirements.txt")
+        req_filename = _safe_leaf(generation.get("requirements_filename"), "requirements.txt")
         req_path = os.path.join(work_dir, req_filename)
         os.makedirs(os.path.dirname(req_path), exist_ok=True)
         with open_utf8(req_path, "w") as f:
-            f.write(generation["requirements"])
+            f.write(str(generation["requirements"]))
 
     # Copy attacker server if needed (before docker-compose so it's available)
     if generation.get("needs_attacker_server"):
@@ -255,6 +293,75 @@ def _write_test_files(work_dir: str, generation: dict, source_file: str | None =
             f.write(compose_content)
 
 
+# The env the docker build/run subprocess is ALLOWED to see. `docker compose`
+# interpolates a `${VAR}` in an untrusted, LLM-authored compose `build.args` from the
+# subprocess env at BUILD time; the generated Dockerfile `RUN` then has open build-time
+# network egress (an accepted GHSA-98g5 residual that assumed NO host secret was
+# reachable at build time). An ALLOWLIST (not a deny-list) closes the exfil BY
+# CONSTRUCTION: a provider secret with any name (ANTHROPIC_API_KEY, GH_PAT,
+# AWS_ACCESS_KEY_ID, *_APIKEY, *_PASSPHRASE, *_AUTH, SLACK_WEBHOOK, …) is dropped by
+# default because it is not on the list, so no new secret-name convention can leak.
+# Docker's own needs are a bounded, well-known set. Tradeoff: any build that needs a
+# host secret from ENV at build time fails — a private BASE IMAGE via a cloud
+# credential-helper (AWS_* for ecr-login), or a private BUILD DEPENDENCY fetched by a
+# RUN step (GITHUB_TOKEN for `go mod download` of a GOPRIVATE module, NPM_TOKEN, a
+# credentialed PIP_INDEX_URL, …). Such a generated repro fails to build and is recorded
+# as status=ERROR (result_collector.py) — VISIBLE and retried, NOT a silent
+# NOT_REPRODUCED, so the static verdict is preserved and only the dynamic confirmation is
+# missed (the safe side for a SAST tool). Private base images have a workaround (a prior
+# `docker login` writes config.json; DOCKER_CONFIG is allowed); a private build-time
+# dependency does not (the RUN-step token cannot be supplied without re-opening the
+# build-arg exfil this scrub closes) — an accepted coverage limit. Public base images and
+# public dependencies are unaffected.
+_ENV_ALLOW_EXACT = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "PWD", "TZ", "HOSTNAME",
+    "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE",
+    "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+    "COLIMA_HOME", "SSH_AUTH_SOCK",  # ssh:// docker context needs the agent socket (a
+                                     # unix-socket PATH, not a secret interpolable into a build-arg)
+    # The BOUNDED set of real docker CLI knobs. NOT a `DOCKER_` prefix: that prefix
+    # re-admits DOCKER_PASSWORD / DOCKER_AUTH_CONFIG (a GitLab-CI registry-cred var) /
+    # DOCKER_TOKEN — the exact secret-by-name leak the allowlist exists to prevent.
+    "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_CERT_PATH",
+    "DOCKER_TLS_VERIFY", "DOCKER_API_VERSION", "DOCKER_BUILDKIT",
+    "DOCKER_DEFAULT_PLATFORM", "DOCKER_CLI_EXPERIMENTAL", "DOCKER_CONTENT_TRUST",
+    "BUILDKIT_HOST", "BUILDKIT_PROGRESS", "COMPOSE_PROJECT_NAME", "COMPOSE_FILE",
+    "COMPOSE_PROFILES", "COMPOSE_DOCKER_CLI_BUILD",
+    # Windows essentials so docker.exe resolves on CI runners.
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA",
+    "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+})
+# Only `LC_*` (locale) stays a prefix — it can never carry a provider secret. The
+# docker/compose/buildkit knobs are enumerated exactly above precisely because their
+# families ALSO contain credential-bearing names (DOCKER_PASSWORD/DOCKER_AUTH_CONFIG).
+_ENV_ALLOW_PREFIXES = ("LC_",)
+# Proxy vars may embed the user's OWN proxy credential — that is the user's network
+# config (needed to reach the daemon/registry), not a provider API key, and dropping
+# it would break builds behind a proxy.
+_ENV_ALLOW_SUFFIXES = ("_PROXY", "_proxy")
+_ENV_ALLOW_LOWER = frozenset({"no_proxy"})
+
+
+def _scrubbed_subprocess_env() -> dict:
+    """os.environ filtered to a docker-essentials ALLOWLIST for the build/run subprocess.
+
+    Everything not explicitly allowed (every ``*_API_KEY`` / ``*_TOKEN`` / ``*_SECRET``
+    / ``*_AUTH`` / ``*_PAT`` / arbitrary secret) is dropped, so no host secret can be
+    interpolated into an untrusted compose build-arg and exfiltrated over build-time
+    egress — regardless of the secret's name.
+    """
+    def _allowed(name: str) -> bool:
+        up = name.upper()
+        return (up in _ENV_ALLOW_EXACT
+                or name in _ENV_ALLOW_LOWER
+                or any(up.startswith(p) for p in _ENV_ALLOW_PREFIXES)
+                or any(name.endswith(s) for s in _ENV_ALLOW_SUFFIXES))
+
+    return {k: v for k, v in os.environ.items() if _allowed(k)}
+
+
 def _run_command(cmd: list[str], timeout: int, cwd: str = None) -> tuple[str, str, int, bool]:
     """Run a command with timeout. Returns (stdout, stderr, exit_code, timed_out)."""
     try:
@@ -264,6 +371,7 @@ def _run_command(cmd: list[str], timeout: int, cwd: str = None) -> tuple[str, st
             text=True,
             timeout=timeout,
             cwd=cwd,
+            env=_scrubbed_subprocess_env(),
         )
         return result.stdout, result.stderr, result.returncode, False
     except subprocess.TimeoutExpired:

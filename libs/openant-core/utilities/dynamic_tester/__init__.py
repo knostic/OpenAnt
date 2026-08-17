@@ -181,7 +181,10 @@ def run_dynamic_tests(
 
     try:
       for i, finding in enumerate(findings):
-        finding_id = finding.get("id", f"FINDING-{i+1}")
+        # str() at the boundary: id is repo/JSON-derived and may be non-str; it flows
+        # to run_single_container's finding_id.lower() and checkpoint's safe_filename,
+        # both of which would raise on a non-str and abort the whole run.
+        finding_id = str(finding.get("id", f"FINDING-{i+1}"))
 
         # Skip already-checkpointed findings, but ONLY if they succeeded.
         # Errored findings fall through to fresh test generation + Docker run,
@@ -217,8 +220,9 @@ def run_dynamic_tests(
         # Placed AFTER the checkpoint hit: a finding CONFIRMED by an
         # earlier run must keep that verdict on resume, not be downgraded
         # to SKIPPED and lose its exploit evidence.
-        _loc = finding.get("location", {})
-        _file = _loc.get("file", "") if isinstance(_loc, dict) else ""
+        _loc = finding.get("location")
+        _file = _loc.get("file") if isinstance(_loc, dict) else None
+        _file = _file if isinstance(_file, str) else ""  # location.file may be non-str (JSON)
         _skip, _reason = should_skip_for_language(_file, repo_info.get("language"))
         if _skip:
             print(f"\n[{i+1}/{total}] SKIPPED {finding_id}: {_reason}", file=sys.stderr)
@@ -254,14 +258,26 @@ def run_dynamic_tests(
         print(f"  Generated (${generation_cost:.4f}). Running in Docker...",
               file=sys.stderr)
 
-        # Resolve the vulnerable source file for pre-staging.
+        # Resolve the vulnerable source file for pre-staging. location.file is a
+        # DETERMINISTIC repo-derived path (reporter.py sets it to route_key.split(":")[0],
+        # the parser's repo-relative path of the unit) — repo-author-controlled, and in a
+        # standalone run the findings JSON is fully caller-supplied. A `..`/absolute value,
+        # or an in-repo symlink pointing outside, would make the copy escape repo_path and
+        # read a HOST file into the Docker build context (read/exfil). Confine the resolved
+        # path under repo_path (realpath also blocks the symlink case); skip on escape —
+        # source_file stays None, the already-supported no-source path. Guard the types too:
+        # `location` may be a non-dict and `file` a non-str (JSON), which must not raise
+        # (an unwrapped raise aborts the whole run — see docker_executor._refuse_compose).
         source_file = None
         if repo_path:
-            rel_path = finding.get("location", {}).get("file", "")
-            if rel_path:
-                candidate = os.path.join(repo_path, rel_path)
-                if os.path.isfile(candidate):
-                    source_file = candidate
+            _loc = finding.get("location")
+            rel_path = _loc.get("file", "") if isinstance(_loc, dict) else ""
+            if isinstance(rel_path, str) and rel_path:
+                repo_root = os.path.realpath(repo_path)
+                resolved = os.path.realpath(os.path.join(repo_path, rel_path))
+                if ((resolved == repo_root or resolved.startswith(repo_root + os.sep))
+                        and os.path.isfile(resolved)):
+                    source_file = resolved
 
         # Step 2: Execute in Docker and retry on errors
         execution = run_single_container(generation, finding_id,
