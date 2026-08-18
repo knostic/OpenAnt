@@ -548,6 +548,13 @@ def scan_repository(
                         )
                         kept: list[dict] = []
                         unfilterable: dict[str, int] = {}
+                        # Per-language reachability_filter stats, aggregated back
+                        # onto the rebuilt dataset below. Without this the rebuild
+                        # at `dataset = {**dataset, "units": kept}` carried the
+                        # ORIGINAL (pre-LLM) metadata, so the reporter rendered
+                        # "reachability filtering not applied" on a scan that DID
+                        # prune via the LLM-seeded re-filter.
+                        refilter_by_language: dict[str, dict] = {}
 
                         for lang, lang_units in partitions.items():
                             lang_dir = cg_dirs.get(lang)
@@ -583,8 +590,83 @@ def scan_repository(
                                 library_mode=library_mode,
                             )
                             kept.extend(filtered.get("units", []))
+                            _rf = (filtered.get("metadata") or {}).get(
+                                "reachability_filter"
+                            )
+                            if _rf:
+                                refilter_by_language[lang or "unknown"] = _rf
 
-                        dataset = {**dataset, "units": kept}
+                        # Rebuild the dataset, aggregating the per-language filter
+                        # stats into metadata so the reporter reads a real record
+                        # instead of the stale pre-LLM one. Unfilterable languages
+                        # (no call graph) are folded in as pass-throughs so the
+                        # aggregate reconciles with len(kept).
+                        _new_md = dict(dataset.get("metadata") or {})
+                        # Only stamp a record when a real per-language filter ran.
+                        # If every language was unfilterable (no call graph), the
+                        # units passed through untouched, so leaving no record —
+                        # the honest "not applied" signal — is correct; a "0%
+                        # reduction" record would falsely claim filtering happened.
+                        if refilter_by_language:
+                            _per_lang = dict(refilter_by_language)
+                            _unfiltered = 0
+                            for _lang, _cnt in unfilterable.items():
+                                _unfiltered += _cnt
+                                _per_lang[_lang] = {
+                                    "original_units": _cnt,
+                                    "entry_points": 0,
+                                    "reachable_units": _cnt,
+                                    "filtered_out": 0,
+                                    "reduction_percentage": 0,
+                                    "unfilterable": True,
+                                }
+                            _orig = sum(
+                                r.get("original_units", 0) for r in _per_lang.values()
+                            )
+                            _reach = sum(
+                                r.get("reachable_units", 0) for r in _per_lang.values()
+                            )
+                            _agg = {
+                                "original_units": _orig,
+                                "entry_points": sum(
+                                    r.get("entry_points", 0) for r in _per_lang.values()
+                                ),
+                                "reachable_units": _reach,
+                                "filtered_out": _orig - _reach,
+                                # Units that flowed through unfiltered (no call
+                                # graph for their language) — folded into the
+                                # totals above but surfaced explicitly so the
+                                # record never silently claims they were filtered.
+                                "unfiltered_units": _unfiltered,
+                                "reduction_percentage": (
+                                    round((1 - _reach / _orig) * 100, 1)
+                                    if _orig
+                                    else 0
+                                ),
+                                "per_language": _per_lang,
+                            }
+                            # Lift any per-language advisory (e.g. an empty-seed
+                            # blackout — a language that flowed through unfiltered
+                            # because it had no real entry points) to the top
+                            # level, where the reporter reads it (reporter.py:505).
+                            # Without this the record reads "filter applied, N%
+                            # reduction" while hiding that a language blacked out —
+                            # the exact fidelity gap this record exists to close.
+                            _warnings = [
+                                f"{_lang}: {_r['warning']}"
+                                for _lang, _r in _per_lang.items()
+                                if _r.get("warning")
+                            ]
+                            if _warnings:
+                                _agg["warning"] = "; ".join(_warnings)
+                            _new_md["reachability_filter"] = _agg
+                        else:
+                            # No real filter ran (every language unfilterable):
+                            # honour the "not applied" contract by clearing any
+                            # record inherited from an upstream merge, so a stale
+                            # record can never misdescribe the passed-through units.
+                            _new_md.pop("reachability_filter", None)
+                        dataset = {**dataset, "units": kept, "metadata": _new_md}
                         post_filter_count = len(kept)
                         result.units_count = post_filter_count
                         refilter_supported = True
