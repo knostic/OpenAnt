@@ -9,7 +9,6 @@ OUTPUT FORMAT:
 
 **Product:** {product_name}
 **Type:** CWE-{cwe_id} ({cwe_name})
-**Affected:** {affected_versions}
 
 ## Summary
 

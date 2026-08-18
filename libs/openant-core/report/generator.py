@@ -227,6 +227,42 @@ def generate_summary_report(
     )
 
 
+# #210: the only verdicts Stage-2 attacker simulation positively adjudicated.
+# Every OTHER DISCLOSURE_ELIGIBLE verdict — unverified (Stage-2 attempted but
+# incomplete), and vulnerable / bypassable / error (per the taxonomy these
+# arise ONLY on the no-Stage-2 path, core/verdict_taxonomy.py + reporter.py's
+# verdict reducer) — is NOT Stage-2-confirmed. `bypassable` especially must not
+# read as confirmed: it is a bare Stage-1 finding verdict, so stamping it
+# "CONFIRMED by Stage-2" would be the exact false-confirmation this banner
+# exists to remove. Such findings are still disclosed (over-seed safety),
+# labeled UNVERIFIED.
+_STAGE2_CONFIRMED = frozenset({"confirmed", "agreed"})
+
+
+def _disclosure_verdict_header(vulnerability_data: dict) -> str:
+    """Deterministic, server-stamped verification banner for a disclosure.
+
+    Lets a reader distinguish an attacker-simulation-confirmed finding from a
+    not-yet-confirmed one without trusting the LLM to render the "Verified via
+    ..." line (dropped in most documents), and stamps the real file/function
+    location the "{affected_versions}" prompt field never carries.
+    """
+    verdict = str(vulnerability_data.get("stage2_verdict") or "").lower()
+    if verdict in _STAGE2_CONFIRMED:
+        status = f"CONFIRMED by Stage-2 attacker simulation ({verdict})"
+    else:  # unverified / vulnerable / bypassable / error / anything else eligible
+        status = (
+            "UNVERIFIED — not confirmed by Stage-2 attacker simulation "
+            f"({verdict or 'unknown'})"
+        )
+    lines = [f"> **Verification:** {status}"]
+    loc = vulnerability_data.get("location")
+    if isinstance(loc, dict) and (loc.get("file") or loc.get("function")):
+        where = ":".join(str(x) for x in (loc.get("file"), loc.get("function")) if x)
+        lines.append(f"> **Location:** {where}")
+    return "\n".join(lines) + "\n\n"
+
+
 def _splice_code_section(llm_output: str, code_section: str) -> str:
     """Insert the verbatim code block into the LLM-generated disclosure.
 
@@ -312,6 +348,13 @@ def generate_disclosure(
         b.text for b in result.content if isinstance(b, TextBlock)
     )
     final_output = _splice_code_section(llm_output, code_section)
+    # #210: stamp the verification status + location deterministically from the
+    # server-truth stage2_verdict, the same way the vulnerable code is spliced
+    # in above. The prompt otherwise asks the LLM to render "Verified via ..."
+    # (dropped in most documents) and an "{affected_versions}" field that is
+    # never populated — so an unadjudicated Stage-1 candidate reads identically
+    # to an attacker-simulation-confirmed finding.
+    final_output = _disclosure_verdict_header(vulnerability_data) + final_output
 
     return final_output, _extract_usage(
         result.input_tokens,
