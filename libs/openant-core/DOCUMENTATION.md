@@ -221,7 +221,8 @@ For AI assistants working on the code, here are the key source files:
 | File | Purpose |
 |------|---------|
 | `context/application_context.py` | Context detection & formatting |
-| `context/generate_context.py` | CLI for context generation |
+| `context/generate_context.py` | Python module CLI for context generation |
+| `openant/cli.py` (`generate-context`) | Primary CLI command (`openant generate-context`) |
 
 ### Report Generator
 

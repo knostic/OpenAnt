@@ -131,15 +131,17 @@ OpenAnt generates application context to understand what type of application is 
 ### Generate Context
 
 ```bash
-# Generate context for a repository
+# Generate context via CLI (recommended)
+openant generate-context /path/to/repo
+openant generate-context /path/to/repo --show-prompt  # Include prompt format
+openant generate-context --force                       # Skip OPENANT.md override
+
+# Generate context via Python module
 python -m context.generate_context /path/to/repo
-
-# View formatted prompt output
-python -m context.generate_context /path/to/repo --show-prompt
-
-# List supported types
-python -m context.generate_context --list-types
+python -m context.generate_context --list-types        # Show supported types
 ```
+
+Under a project (`openant init`), the Go CLI auto-fills `--app-context` for `analyze`/`verify` from the project scan directory (operator-owned under `~/.openant/`, where `generate-context` writes it) — never from the scanned repo itself, so a repo-supplied file can't silently suppress findings. Without a project, pass it explicitly with `--app-context /path/to/application_context.json`.
 
 ### Manual Override
 

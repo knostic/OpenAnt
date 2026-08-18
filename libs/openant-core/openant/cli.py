@@ -5,6 +5,7 @@ OpenAnt CLI — Unified command-line interface for vulnerability analysis.
 Commands:
     openant scan /path/to/repo --output /tmp/results
     openant parse /path/to/repo --output /tmp/results
+    openant generate-context /path/to/repo -o /tmp/results/application_context.json
     openant enhance dataset.json --analyzer-output ao.json --repo-path /repo -o enhanced.json
     openant analyze dataset.json --output /tmp/results
     openant verify results.json --analyzer-output ao.json --output /tmp/results
@@ -278,6 +279,81 @@ def cmd_parse(args):
         return 2
 
 
+def cmd_generate_context(args):
+    """Generate application security context for a repository."""
+    from pathlib import Path
+    from context.application_context import (
+        generate_application_context,
+        save_context,
+        format_context_for_prompt,
+    )
+    from core.schemas import success, error
+    from core.step_report import step_context
+    from utilities.llm import (
+        build_phase_registry,
+        load_config_file,
+        probe_registry_or_raise,
+        resolve_llm_config,
+    )
+
+    # Default output to the CWD, NOT the scanned repo root: writing the context
+    # into the checkout would let a later scan silently auto-load it as
+    # finding-suppression config. Suppression must be an explicit operator act.
+    output_path = args.output or os.path.join(os.getcwd(), "application_context.json")
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+
+    try:
+        with step_context("generate-context", output_dir, inputs={
+            "repo_path": os.path.abspath(args.repo),
+            "force": args.force,
+        }) as ctx:
+            # generate_application_context requires a PhaseBinding for the
+            # app_context phase (model + adapter live in the binding, not
+            # caller-side). Same registry idiom as the threat-model command.
+            cf = load_config_file()
+            registry = build_phase_registry(
+                cf, resolve_llm_config(cf, getattr(args, "llm_config", None))
+            )
+            probe_registry_or_raise(registry)
+            app_context = generate_application_context(
+                Path(args.repo),
+                registry.get("app_context"),
+                force_regenerate=args.force,
+            )
+            # generate_application_context returns None when the LLM yields an
+            # incomplete context; surface a clear message instead of letting
+            # save_context(None) raise an opaque asdict() error.
+            if app_context is None:
+                _output_json(error("Could not generate application context (LLM returned an incomplete result)."))
+                return 2
+            save_context(app_context, Path(output_path))
+
+            ctx.summary = {
+                "application_type": app_context.application_type,
+                "confidence": app_context.confidence,
+                "source": app_context.source,
+            }
+            ctx.outputs = {"app_context_path": os.path.abspath(output_path)}
+
+        result = {
+            "app_context_path": os.path.abspath(output_path),
+            "application_type": app_context.application_type,
+            "purpose": app_context.purpose,
+            "confidence": app_context.confidence,
+            "source": app_context.source,
+        }
+
+        if args.show_prompt:
+            result["prompt_format"] = format_context_for_prompt(app_context)
+
+        _output_json(success(result))
+        return 0
+
+    except Exception as e:
+        _output_json(error(str(e)))
+        return 2
+
+
 def cmd_enhance(args):
     """Enhance a dataset with security context."""
     from core.enhancer import enhance_dataset
@@ -353,6 +429,11 @@ def cmd_analyze(args):
 
     exploitable_filter = "all" if args.exploitable_all else ("strict" if args.exploitable_only else None)
 
+    # Application context is used ONLY when the operator passes it explicitly.
+    # Auto-discovering it from the scanned repo (or stale output dirs) would let
+    # repo-supplied config silently suppress findings — an explicit act only.
+    app_context_path = args.app_context
+
     try:
         with step_context("analyze", output_dir, inputs={
             "dataset_path": os.path.abspath(args.dataset),
@@ -364,7 +445,7 @@ def cmd_analyze(args):
                 dataset_path=args.dataset,
                 output_dir=output_dir,
                 analyzer_output_path=args.analyzer_output,
-                app_context_path=args.app_context,
+                app_context_path=app_context_path,
                 repo_path=args.repo_path,
                 limit=args.limit,
                 llm_config_name=args.llm_config,
@@ -405,7 +486,7 @@ def cmd_analyze(args):
                         results_path=result.results_path,
                         output_dir=output_dir,
                         analyzer_output_path=args.analyzer_output,
-                        app_context_path=args.app_context,
+                        app_context_path=app_context_path,
                         repo_path=args.repo_path,
                         workers=args.workers,
                         backoff_seconds=args.backoff,
@@ -453,18 +534,22 @@ def cmd_verify(args):
 
     output_dir = args.output or tempfile.mkdtemp(prefix="open_ant_verify_")
 
+    # Application context is used ONLY when the operator passes it explicitly
+    # (see the analyze command for the rationale — no silent auto-discovery).
+    app_context_path = args.app_context
+
     try:
         with step_context("verify", output_dir, inputs={
             "results_path": os.path.abspath(args.results),
             "analyzer_output_path": os.path.abspath(args.analyzer_output),
-            "app_context_path": os.path.abspath(args.app_context) if args.app_context else None,
+            "app_context_path": os.path.abspath(app_context_path) if app_context_path else None,
             "repo_path": os.path.abspath(args.repo_path) if args.repo_path else None,
         }) as ctx:
             result = run_verification(
                 results_path=args.results,
                 output_dir=output_dir,
                 analyzer_output_path=args.analyzer_output,
-                app_context_path=args.app_context,
+                app_context_path=app_context_path,
                 repo_path=args.repo_path,
                 workers=args.workers,
                 checkpoint_path=getattr(args, "checkpoint", None),
@@ -1443,6 +1528,31 @@ def build_parser() -> argparse.ArgumentParser:
     parse_p.add_argument("--fresh", action="store_true",
                          help="Delete existing dataset.json and reparse from scratch (default: reuse existing units; other artifacts preserved)")
     parse_p.set_defaults(func=cmd_parse)
+
+    # ---------------------------------------------------------------
+    # generate-context — generate application security context
+    # ---------------------------------------------------------------
+    gc_p = subparsers.add_parser(
+        "generate-context",
+        help="Generate application security context for a repository",
+    )
+    gc_p.add_argument("repo", help="Path to repository")
+    gc_p.add_argument("--output", "-o",
+                       help="Output path (default: ./application_context.json in the "
+                            "current directory — never written into the scanned repo)")
+    gc_p.add_argument("--force", action="store_true",
+                       help="Force regeneration, ignoring OPENANT.md override files")
+    gc_p.add_argument("--show-prompt", action="store_true",
+                       help="Include formatted prompt text in output")
+    gc_p.add_argument(
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config in ~/.config/openant/config.json. "
+            "Defaults to the file's default_llm."
+        ),
+    )
+    gc_p.set_defaults(func=cmd_generate_context)
 
     # ---------------------------------------------------------------
     # enhance — add security context to a dataset

@@ -31,16 +31,17 @@ Stage 1: Detect potential vulnerabilities via code analysis
 Stage 2: Simulate an attacker to eliminate false positives
 
 Commands:
-  scan          Full pipeline: parse → enhance → detect → verify → report
-  diff          Scan only code changed vs a base ref or GitHub PR
-  parse         Extract code units from a repository
-  enhance       Add security context to a parsed dataset
-  analyze       Run Stage 1 vulnerability detection
-  verify        Run Stage 2 attacker simulation
-  build-output  Assemble pipeline_output.json from verified results
-  dynamic-test  Docker-isolated exploit testing
-  report        Generate reports from analysis results
-  config        Manage CLI configuration (API key, etc.)`,
+  scan              Full pipeline: parse → enhance → detect → verify → report
+  diff              Scan only code changed vs a base ref or GitHub PR
+  parse             Extract code units from a repository
+  generate-context  Generate application security context
+  enhance           Add security context to a parsed dataset
+  analyze           Run Stage 1 vulnerability detection
+  verify            Run Stage 2 attacker simulation
+  build-output      Assemble pipeline_output.json from verified results
+  dynamic-test      Docker-isolated exploit testing
+  report            Generate reports from analysis results
+  config            Manage CLI configuration (API key, etc.)`,
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
@@ -141,6 +142,7 @@ func init() {
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(diffCmd)
 	rootCmd.AddCommand(parseCmd)
+	rootCmd.AddCommand(generateContextCmd)
 	rootCmd.AddCommand(enhanceCmd)
 	rootCmd.AddCommand(analyzeCmd)
 	rootCmd.AddCommand(verifyCmd)
