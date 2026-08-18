@@ -60,6 +60,9 @@ class ProgressReporter:
         self.tracker = tracker
         self.start_time = time.monotonic()
         self.completed = completed
+        # Units restored from a checkpoint: they consumed no session time, so
+        # they must be excluded from the per-unit rate (#218).
+        self._initial_completed = completed
         self._lock = threading.Lock()
         self._last_cost = self._get_cost()  # snapshot for per-unit delta
 
@@ -81,10 +84,17 @@ class ProgressReporter:
         return totals.get("total_cost_usd", 0.0)
 
     def _estimate_remaining(self, elapsed: float) -> str:
-        """Estimate time remaining based on average per-unit time."""
-        if self.completed == 0:
+        """Estimate time remaining based on average per-unit time.
+
+        The rate is measured over units processed IN THIS SESSION only. Units
+        restored from a checkpoint (``_initial_completed``) consumed none of
+        ``elapsed``, so dividing session-elapsed by the cumulative count made a
+        resumed run's ETA wildly optimistic (~25x on the reported run, #218).
+        """
+        session_done = self.completed - self._initial_completed
+        if session_done <= 0:
             return "~?"
-        avg = elapsed / self.completed
+        avg = elapsed / session_done
         # Floor at 0: retries can double-count `completed` past `total`, which would otherwise
         # make remaining_units negative and render the ETA as a negative duration.
         remaining_units = max(0, self.total - self.completed)
