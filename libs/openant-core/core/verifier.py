@@ -75,6 +75,9 @@ def run_verification(
     Returns:
         VerifyResult with paths, counts, and usage info.
     """
+    # #214: snapshot cumulative usage at phase start so the "Stage 2" summary
+    # below reports this phase's delta, not every prior phase's total.
+    _phase_baseline = tracking.get_usage()
     os.makedirs(output_dir, exist_ok=True)
 
     # Configure global rate limiter
@@ -230,7 +233,7 @@ def run_verification(
     # Checkpoints are preserved as a permanent artifact alongside results
     # (final summary with phase="done" is written inside verify_batch).
 
-    tracking.log_usage("Stage 2")
+    tracking.log_usage("Stage 2", _phase_baseline)
 
     # Merge verified results back into the full result set
     verified_ids = {r.get("unit_id") or r.get("route_key") for r in verified_results}

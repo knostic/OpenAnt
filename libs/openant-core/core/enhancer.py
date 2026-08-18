@@ -61,6 +61,9 @@ def enhance_dataset(
     Returns:
         EnhanceResult with output path, stats, and usage.
     """
+    # #214: snapshot cumulative usage at phase start so the "Enhance" summary
+    # below reports this phase's delta, not the prior phases' total.
+    _phase_baseline = tracking.get_usage()
     # Configure global rate limiter
     configure_rate_limiter(backoff_seconds=float(backoff_seconds))
 
@@ -171,7 +174,7 @@ def enhance_dataset(
     if error_count:
         print(f"[Enhance] Errors: {error_count} ({error_summary})", file=sys.stderr)
 
-    tracking.log_usage("Enhance")
+    tracking.log_usage("Enhance", _phase_baseline)
 
     usage = tracking.get_usage()
 
