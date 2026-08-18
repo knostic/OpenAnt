@@ -103,6 +103,15 @@ TOOL_DEFINITIONS = [
         }
     },
     {
+        "name": "get_static_dependencies",
+        "description": "Get the statically-analyzed dependencies (functions called) and callers for the unit being analyzed. Returns resolved function IDs that can be read with read_function. Use this first to understand what the code calls and to trace into service methods for auth/validation checks.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
         "name": "finish",
         "description": "Complete the analysis and return the final result. Call this when you have gathered enough context to understand the code's intent and security implications.",
         "input_schema": {
@@ -165,6 +174,13 @@ class ToolExecutor:
             index: RepositoryIndex instance for searching
         """
         self.index = index
+        self._unit_static_deps: list[str] = []
+        self._unit_static_callers: list[str] = []
+
+    def set_unit_context(self, static_deps: list[str], static_callers: list[str]):
+        """Set static dependency data for the current unit being analyzed."""
+        self._unit_static_deps = static_deps or []
+        self._unit_static_callers = static_callers or []
 
     def execute(self, tool_name: str, tool_input: dict) -> dict:
         """
@@ -188,6 +204,8 @@ class ToolExecutor:
                 return self._list_functions(tool_input)
             elif tool_name == "read_file_section":
                 return self._read_file_section(tool_input)
+            elif tool_name == "get_static_dependencies":
+                return self._get_static_dependencies(tool_input)
             elif tool_name == "finish":
                 return self._finish(tool_input)
             else:
@@ -313,6 +331,24 @@ class ToolExecutor:
             "start_line": start_line,
             "end_line": end_line,
             "content": content
+        }
+
+    def _get_static_dependencies(self, input: dict) -> dict:
+        """Get resolved static dependencies and callers for the current unit."""
+        resolved_deps = self.index.resolve_dependencies(self._unit_static_deps)
+        resolved_callers = self.index.resolve_dependencies(self._unit_static_callers)
+
+        return {
+            "dependencies": {
+                "raw": self._unit_static_deps[:20],
+                "resolved": resolved_deps[:20],
+                "count": len(self._unit_static_deps)
+            },
+            "callers": {
+                "raw": self._unit_static_callers[:20],
+                "resolved": resolved_callers[:20],
+                "count": len(self._unit_static_callers)
+            }
         }
 
     def _finish(self, input: dict) -> dict:

@@ -216,6 +216,9 @@ class ContextAgent:
                 entry_point_path = self.reachability.get_entry_point_path(unit_id)
                 reaching_entry_point = self.reachability.get_reaching_entry_point(unit_id)
 
+        # Set static deps on tool executor for get_static_dependencies tool
+        self.tool_executor.set_unit_context(static_deps, static_callers)
+
         # Build initial prompt with reachability info
         user_prompt = get_user_prompt(
             unit_id=unit_id,
