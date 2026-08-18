@@ -203,6 +203,20 @@ def generate_summary_report(
     )
 
     text = "\n".join(b.text for b in result.content if isinstance(b, TextBlock))
+    # #209: refuse to bless an empty summary. An empty/whitespace completion
+    # (e.g. the Claude-5 thinking/empty-completion path) otherwise produces a
+    # summary-free SUMMARY_REPORT.md that the report step records as
+    # status=success with summary_path in its outputs — asserting a deliverable
+    # it never produced. Guard the raw LLM output HERE, before the deterministic
+    # provenance banner is prepended: on a threat-model scan the banner is
+    # non-empty, so a guard on the banner+text combination would miss exactly
+    # this case. Raising here also covers the standalone `python -m report
+    # summary` path, which calls this producer directly.
+    if not text.strip():
+        raise RuntimeError(
+            "summary report generation returned empty output; refusing to write "
+            "a summary-free SUMMARY_REPORT.md and report success"
+        )
     # Prepend the provenance banner deterministically (see helper docstring).
     text = _context_provenance_header(pipeline_data) + text
     return text, _extract_usage(
