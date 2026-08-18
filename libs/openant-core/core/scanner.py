@@ -213,6 +213,12 @@ def scan_repository(
 
     def _step_label(name: str) -> str:
         nonlocal step_num
+        # #219: a "Skipping ..." notice is not a performed step; the denominator
+        # (_count_steps) counts only steps that RUN, so numbering skips too
+        # pushed the numerator past the total (e.g. the report step printed as
+        # [8/7]). Render skips without a step number.
+        if name.startswith("Skipping"):
+            return f"  - {name}"
         step_num += 1
         return f"[{step_num}/{total_steps}] {name}"
 
