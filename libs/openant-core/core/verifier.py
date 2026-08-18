@@ -200,7 +200,10 @@ def run_verification(
         )
 
     def _on_restored(count: int):
-        progress.completed = count
+        # #218: rebase BOTH the counter and the session baseline, else the
+        # restored units dilute the per-unit rate (Enhance/Verify learn the
+        # restored count here, not via the `completed=` constructor arg).
+        progress.mark_restored(count)
 
     try:
         verified_results = verifier.verify_batch(

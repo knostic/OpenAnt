@@ -83,6 +83,28 @@ class ProgressReporter:
         totals = self.tracker.get_totals()
         return totals.get("total_cost_usd", 0.0)
 
+    def mark_restored(self, count: int) -> None:
+        """Rebase progress to a checkpoint-restored count AFTER construction.
+
+        The Detect phase passes ``completed=`` at construction, but Enhance and
+        Verify learn their restored count later via a callback. Set BOTH the
+        live counter and the session baseline, so restored units are excluded
+        from the per-unit rate exactly as ``completed=`` does — the callback
+        path previously set only ``completed`` and left the rate diluted (#218).
+        """
+        with self._lock:
+            self.completed = count
+            self._initial_completed = count
+
+    def _session_done(self) -> int:
+        """Units processed in THIS session (excludes checkpoint-restored units).
+
+        Every rate/average divides session ``elapsed`` by this, never the
+        cumulative ``completed`` — the restored units consumed no session time,
+        so cumulative division dilutes the per-unit rate on a resumed run (#218).
+        """
+        return self.completed - self._initial_completed
+
     def _estimate_remaining(self, elapsed: float) -> str:
         """Estimate time remaining based on average per-unit time.
 
@@ -91,7 +113,7 @@ class ProgressReporter:
         ``elapsed``, so dividing session-elapsed by the cumulative count made a
         resumed run's ETA wildly optimistic (~25x on the reported run, #218).
         """
-        session_done = self.completed - self._initial_completed
+        session_done = self._session_done()
         if session_done <= 0:
             return "~?"
         avg = elapsed / session_done
@@ -155,7 +177,8 @@ class ProgressReporter:
     def _print_summary(self, elapsed: float, cost: float) -> None:
         """Print a highlighted summary line."""
         pct = (self.completed / self.total) * 100
-        avg = elapsed / self.completed if self.completed else 0
+        session_done = self._session_done()
+        avg = elapsed / session_done if session_done > 0 else 0
         eta = self._estimate_remaining(elapsed)
 
         line = (
@@ -174,7 +197,8 @@ class ProgressReporter:
         with self._lock:
             elapsed = time.monotonic() - self.start_time
             cost = self._get_cost()
-            avg = elapsed / self.completed if self.completed else 0
+            session_done = self._session_done()
+            avg = elapsed / session_done if session_done > 0 else 0
 
             line = (
                 f"[{self.step_name}] Done: "
