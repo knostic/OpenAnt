@@ -9,22 +9,33 @@ import (
 	"github.com/knostic/open-ant-cli/internal/output"
 )
 
-// diffOpts collects the three diff-mode flags that scan/parse/diff all share.
+// diffOpts collects the diff-mode flags that scan/parse/diff all share.
 type diffOpts struct {
 	base   string
 	pr     int
+	staged bool
 	scope  string
 }
 
 // isSet reports whether any diff flag was provided.
 func (o diffOpts) isSet() bool {
-	return o.base != "" || o.pr > 0
+	return o.base != "" || o.pr > 0 || o.staged
 }
 
 // validate enforces flag rules common to all entry points.
 func (o diffOpts) validate() error {
-	if o.base != "" && o.pr > 0 {
-		return fmt.Errorf("--diff-base and --pr are mutually exclusive")
+	set := 0
+	if o.base != "" {
+		set++
+	}
+	if o.pr > 0 {
+		set++
+	}
+	if o.staged {
+		set++
+	}
+	if set > 1 {
+		return fmt.Errorf("--diff-base, --pr, and --staged are mutually exclusive")
 	}
 	if o.isSet() {
 		if o.scope == "" {
@@ -60,21 +71,30 @@ func prepareDiffManifest(repoPath, outputDir string, opts diffOpts) (string, err
 		return "", fmt.Errorf("create output dir %s: %w", outputDir, err)
 	}
 
-	baseRef := opts.base
-	if opts.pr > 0 {
-		fetched, err := git.FetchPR(repoPath, opts.pr, nil)
+	var m *git.Manifest
+	if opts.staged {
+		built, err := git.BuildStagedManifest(repoPath, opts.scope)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("build staged diff manifest: %w", err)
 		}
-		baseRef = fetched
-		if !quiet {
-			fmt.Fprintf(os.Stderr, "PR #%d: base=%s (fetched and checked out pr-head)\n", opts.pr, baseRef)
+		m = built
+	} else {
+		baseRef := opts.base
+		if opts.pr > 0 {
+			fetched, err := git.FetchPR(repoPath, opts.pr, nil)
+			if err != nil {
+				return "", err
+			}
+			baseRef = fetched
+			if !quiet {
+				fmt.Fprintf(os.Stderr, "PR #%d: base=%s (fetched and checked out pr-head)\n", opts.pr, baseRef)
+			}
 		}
-	}
-
-	m, err := git.BuildManifest(repoPath, baseRef, opts.scope, opts.pr)
-	if err != nil {
-		return "", fmt.Errorf("build diff manifest: %w", err)
+		built, err := git.BuildManifest(repoPath, baseRef, opts.scope, opts.pr)
+		if err != nil {
+			return "", fmt.Errorf("build diff manifest: %w", err)
+		}
+		m = built
 	}
 
 	manifestPath := filepath.Join(outputDir, "diff_manifest.json")
@@ -83,8 +103,13 @@ func prepareDiffManifest(repoPath, outputDir string, opts diffOpts) (string, err
 	}
 
 	if !quiet {
-		output.PrintKeyValue("Diff base", fmt.Sprintf("%s (%s)", m.BaseRef, shortSHA(m.BaseSHA)))
-		output.PrintKeyValue("Diff head", shortSHA(m.HeadSHA))
+		if m.BaseRef == git.StagedRef {
+			output.PrintKeyValue("Diff base", fmt.Sprintf("HEAD (%s)", shortSHA(m.BaseSHA)))
+			output.PrintKeyValue("Diff head", "index (staged)")
+		} else {
+			output.PrintKeyValue("Diff base", fmt.Sprintf("%s (%s)", m.BaseRef, shortSHA(m.BaseSHA)))
+			output.PrintKeyValue("Diff head", shortSHA(m.HeadSHA))
+		}
 		output.PrintKeyValue("Diff scope", m.Scope)
 		output.PrintKeyValue("Changed files", fmt.Sprintf("%d", len(m.ChangedFiles)))
 	}
