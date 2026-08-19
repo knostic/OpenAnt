@@ -462,6 +462,9 @@ def run_analysis(
     Returns:
         AnalyzeResult with results path, metrics, and usage.
     """
+    # #214: snapshot cumulative usage at phase start so the "Stage 1" summary
+    # below reports this phase's delta, not the prior phases' total.
+    _phase_baseline = tracking.get_usage()
     os.makedirs(output_dir, exist_ok=True)
 
     # Configure global rate limiter
@@ -670,7 +673,7 @@ def run_analysis(
                              _summary_error_breakdown, phase="done",
                              usage=_usage_dict())
 
-    tracking.log_usage("Stage 1")
+    tracking.log_usage("Stage 1", _phase_baseline)
 
     # Compute verdict counts from results
     counts = _count_verdicts(results)

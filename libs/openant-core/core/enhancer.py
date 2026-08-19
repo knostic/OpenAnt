@@ -61,6 +61,9 @@ def enhance_dataset(
     Returns:
         EnhanceResult with output path, stats, and usage.
     """
+    # #214: snapshot cumulative usage at phase start so the "Enhance" summary
+    # below reports this phase's delta, not the prior phases' total.
+    _phase_baseline = tracking.get_usage()
     # Configure global rate limiter
     configure_rate_limiter(backoff_seconds=float(backoff_seconds))
 
@@ -112,7 +115,10 @@ def enhance_dataset(
         )
 
     def _on_restored(count: int):
-        progress.completed = count
+        # #218: rebase BOTH the counter and the session baseline, else the
+        # restored units dilute the per-unit rate (Enhance/Verify learn the
+        # restored count here, not via the `completed=` constructor arg).
+        progress.mark_restored(count)
 
     # Run enhancement
     if mode == "agentic":
@@ -134,6 +140,7 @@ def enhance_dataset(
             progress_callback=_on_unit_done,
             workers=workers,
             checkpoint_path=checkpoint_path,
+            restored_callback=_on_restored,
         )
     else:
         raise ValueError(f"Unknown enhancement mode: {mode}. Use 'agentic' or 'single-shot'.")
@@ -171,7 +178,7 @@ def enhance_dataset(
     if error_count:
         print(f"[Enhance] Errors: {error_count} ({error_summary})", file=sys.stderr)
 
-    tracking.log_usage("Enhance")
+    tracking.log_usage("Enhance", _phase_baseline)
 
     usage = tracking.get_usage()
 

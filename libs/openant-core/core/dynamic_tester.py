@@ -43,6 +43,9 @@ def run_tests(
         RuntimeError: If Docker is not available.
         FileNotFoundError: If pipeline_output_path doesn't exist.
     """
+    # #214: snapshot cumulative usage at phase start so the "Dynamic Test"
+    # summary below reports this phase's delta, not the prior phases' total.
+    _phase_baseline = tracking.get_usage()
     # Check Docker availability
     if not shutil.which("docker"):
         raise RuntimeError(
@@ -124,7 +127,7 @@ def run_tests(
     if not os.path.exists(results_md_path):
         results_md_path = None
 
-    tracking.log_usage("Dynamic Test")
+    tracking.log_usage("Dynamic Test", _phase_baseline)
 
     print(f"\n[Dynamic Test] Results: {confirmed} confirmed, "
           f"{not_reproduced} not reproduced, {blocked} blocked, "
