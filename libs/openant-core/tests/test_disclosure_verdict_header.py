@@ -14,8 +14,6 @@ the adapter stubbed (the LLM output carries NO verification prose), so the marke
 must come from the deterministic header, not the model. Fully offline ($0).
 """
 
-import pytest
-
 import report.generator as gen
 
 
