@@ -378,6 +378,7 @@ class ContextEnhancer:
         progress_callback: Optional[Callable] = None,
         workers: int = 10,
         checkpoint_path: str = None,
+        restored_callback: Optional[Callable] = None,
     ) -> dict:
         """
         Enhance all units in a dataset (single-shot mode).
@@ -397,6 +398,9 @@ class ContextEnhancer:
             workers: Number of parallel workers (default: 10).
             checkpoint_path: Path to a checkpoint directory (enables resume).
                 When None, no checkpoints are written (prior behavior).
+            restored_callback: Optional callback(count) invoked once with the
+                number of units restored from a checkpoint, so the progress
+                reporter can exclude them from the session rate (#218).
 
         Returns:
             Enhanced dataset
@@ -442,6 +446,11 @@ class ContextEnhancer:
                 self._log("info",
                           f"Restored {len(processed_ids)} already-processed units from checkpoints",
                           units=len(processed_ids))
+                # #218: rebase the progress reporter's session baseline so the
+                # restored units are excluded from the per-unit rate — the
+                # single-shot resume path needs this exactly as the agentic one.
+                if restored_callback:
+                    restored_callback(len(processed_ids))
 
         self._log("info", f"Enhancing {total} units with LLM context (single-shot mode)", units=total)
         self._log("info", f"Provider: {self.binding.provider_name}, Model: {self.binding.model}")

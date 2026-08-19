@@ -140,6 +140,7 @@ def enhance_dataset(
             progress_callback=_on_unit_done,
             workers=workers,
             checkpoint_path=checkpoint_path,
+            restored_callback=_on_restored,
         )
     else:
         raise ValueError(f"Unknown enhancement mode: {mode}. Use 'agentic' or 'single-shot'.")
