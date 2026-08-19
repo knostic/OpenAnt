@@ -18,17 +18,16 @@ over. Fully offline ($0).
 import pytest
 
 import report.generator as gen
-from utilities.llm import TextBlock  # the real block type the generator filters on
 
 
 class _Result:
-    def __init__(self, text):
+    def __init__(self, block, has_text):
         # REAL TextBlock — the generator joins only `isinstance(b, TextBlock)`
         # blocks, so a fake block would be skipped and every case would look
-        # empty (a vacuous pass). Use the real type.
-        self.content = (TextBlock(text),)
+        # empty (a vacuous pass).
+        self.content = (block,)
         self.input_tokens = 10
-        self.output_tokens = 0 if not text else 5
+        self.output_tokens = 5 if has_text else 0
         self.stop_reason = "end_turn"
 
 
@@ -36,8 +35,17 @@ class _Adapter:
     def __init__(self, text):
         self._text = text
 
-    def complete(self, *a, **k):
-        return _Result(self._text)
+    def complete(self, *, model, system, messages, max_tokens, tools=None):
+        # Match the real keyword-only adapter signature so a wrong call fails
+        # loudly, and resolve TextBlock at CALL TIME exactly as the generator
+        # does (its `from utilities.llm import TextBlock` is inside the function).
+        # A module-top import would bind a stale class if another test reimports
+        # utilities.llm.adapter (several stub sys.modules["anthropic"]), and the
+        # generator's isinstance(b, TextBlock) filter would then reject our block
+        # and read the summary as empty.
+        from utilities.llm import TextBlock
+
+        return _Result(TextBlock(self._text), bool(self._text))
 
 
 class _Binding:

@@ -17,12 +17,11 @@ must come from the deterministic header, not the model. Fully offline ($0).
 import pytest
 
 import report.generator as gen
-from utilities.llm import TextBlock
 
 
 class _Result:
-    def __init__(self, text):
-        self.content = (TextBlock(text),)
+    def __init__(self, block):
+        self.content = (block,)
         self.input_tokens = 10
         self.output_tokens = 5
         self.stop_reason = "end_turn"
@@ -32,8 +31,14 @@ class _Adapter:
     def __init__(self, text):
         self._text = text
 
-    def complete(self, *a, **k):
-        return _Result(self._text)
+    def complete(self, *, model, system, messages, max_tokens, tools=None):
+        # Match the real keyword-only adapter signature, and resolve TextBlock at
+        # CALL TIME as the generator does — a module-top import would bind a stale
+        # class if another test reimports utilities.llm.adapter, and the
+        # generator's isinstance(b, TextBlock) filter would then read empty.
+        from utilities.llm import TextBlock
+
+        return _Result(TextBlock(self._text))
 
 
 class _Binding:
