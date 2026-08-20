@@ -462,6 +462,179 @@ class TestClassQualifiedSymbolResolution:
 
 
 # ---------------------------------------------------------------------------
+# _resolve_symbol_details() -- deterministic identifier fallback (Fix A)
+#
+# Regression shape: a JavaScript function declared INSIDE another
+# function's body (e.g. `module.exports = function (...) { function
+# setKey (...) { ... } }`) is real, verified repository source that the
+# upstream analyzer's structured function index never captured -- so
+# RepositoryIndex.search_by_name("setKey") finds nothing even though a
+# sibling top-level function (hasKey) resolves normally. Without a
+# fallback this gets dropped as "unverified target_symbol removed" and
+# the pipeline ends in "NO PATCH PRODUCED" despite the source existing.
+# ---------------------------------------------------------------------------
+
+# A reduced version of the real minimist/CVE-2021-44906 structural shape:
+# setKey nested inside the exported function expression (not indexed by
+# the fake analyzer below), hasKey top-level (indexed normally).
+_NESTED_JS_FIXTURE = """module.exports = function (args, opts) {
+    var flags = {};
+
+    function setKey (obj, keys, value) {
+        var o = obj;
+        for (var i = 0; i < keys.length - 1; i++) {
+            var key = keys[i];
+            if (key === '__proto__') return;
+            o = o[key];
+        }
+        var key = keys[keys.length - 1];
+        if (key === '__proto__') return;
+        o[key] = value;
+    }
+
+    setKey(flags, ['a'], 1);
+
+    return flags;
+};
+
+function hasKey (obj, keys) {
+    var o = obj;
+    keys.forEach(function (key) {
+        o = (o[key] || {});
+    });
+    return true;
+}
+"""
+
+
+class TestDeterministicIdentifierFallback:
+    def test_nested_function_not_structurally_indexed_is_recovered(self, tmp_path):
+        # hasKey is indexed by the fake analyzer output below; setKey
+        # (nested inside the exported function expression) deliberately
+        # is not -- reproducing the exact structural gap from the real
+        # minimist regression.
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(
+            functions={"index.js:hasKey": {"name": "hasKey", "startLine": 21, "endLine": 27}},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"])
+        assert match is not None
+        assert match.file == "index.js"
+
+        lines = _NESTED_JS_FIXTURE.splitlines()
+        window = "\n".join(lines[match.line - 1:match.end_line])
+        assert "function setKey" in window
+        assert window.count("__proto__") == 2  # both existing guards recovered
+        assert "function hasKey" not in window  # hasKey never mistakenly selected
+
+    def test_bounded_window_does_not_inject_whole_file(self, tmp_path):
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(
+            functions={"index.js:hasKey": {"name": "hasKey", "startLine": 21, "endLine": 27}},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"])
+        assert match is not None
+        total_lines = len(_NESTED_JS_FIXTURE.splitlines())
+        window_size = match.end_line - match.line + 1
+        assert window_size < total_lines
+
+    def test_top_level_symbol_already_resolved_fallback_not_used(self, tmp_path):
+        # hasKey resolves through the normal structured lookup -- the
+        # exact indexed span must come back unchanged, proving the
+        # fallback never even ran for it.
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(
+            functions={"index.js:hasKey": {"name": "hasKey", "startLine": 21, "endLine": 27}},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("hasKey", tmp_path, context, verified_files=["index.js"])
+        assert match is not None
+        assert match.kind == "function"
+        assert match.func_id == "index.js:hasKey"
+        assert (match.line, match.end_line) == (21, 27)  # the indexed span, not a synthesized window
+
+    def test_identifier_in_comment_plus_one_real_declaration_prefers_declaration(self, tmp_path):
+        (tmp_path / "index.js").write_text(
+            "// setKey is called below to store a value\n"
+            "function setKey (obj, key, value) {\n"
+            "    obj[key] = value;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"])
+        assert match is not None
+        assert match.line == 2  # the real declaration, never the comment mention on line 1
+
+    def test_two_ambiguous_declarations_fail_closed(self, tmp_path):
+        (tmp_path / "index.js").write_text(
+            "function setKey (obj, key, value) { obj[key] = value; }\n"
+            "\n"
+            "function setKey (obj, key, value) { obj[key] = value; }\n",
+            encoding="utf-8",
+        )
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        assert _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"]) is None
+
+    def test_identifier_not_found_fails_closed(self, tmp_path):
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        assert _resolve_symbol_details("neverDefined", tmp_path, context, verified_files=["index.js"]) is None
+
+    def test_identifier_only_in_other_file_is_not_used(self, tmp_path):
+        # setKey only exists in other.js -- index.js (the ONLY verified
+        # file passed) has no such identifier at all. The fallback must
+        # not reach into other.js just because it happens to be on disk.
+        (tmp_path / "index.js").write_text(
+            "function hasKey(obj, key) { return key in obj; }\n", encoding="utf-8",
+        )
+        (tmp_path / "other.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        assert _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"]) is None
+
+    def test_unverified_target_file_forbids_fallback(self, tmp_path):
+        # Same repository, same identifier -- but the caller passes no
+        # verified_files at all (simulating a target file that never
+        # independently verified). No verified_files -> no fallback,
+        # matching every existing caller's exact prior behavior.
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        assert _resolve_symbol_details("setKey", tmp_path, context) is None
+
+    def test_no_llm_parameter_anywhere_in_the_fallback(self, tmp_path):
+        import inspect
+        from utilities.autopatcher.remediation_planner import (
+            _resolve_symbol_details, _deterministic_identifier_fallback,
+        )
+
+        assert "llm" not in inspect.signature(_resolve_symbol_details).parameters
+        assert "llm" not in inspect.signature(_deterministic_identifier_fallback).parameters
+
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        match = _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"])
+        assert match is not None  # succeeds with no LLM involved anywhere
+
+
+# ---------------------------------------------------------------------------
 # build_planner_candidates() -- the adapter into RepositoryCandidate shape
 # ---------------------------------------------------------------------------
 
@@ -1224,7 +1397,7 @@ class TestPipelineWiring:
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
             mock.patch("utilities.autopatcher.remediation_planner.generate_remediation_plan",
                        return_value=plan_result),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value="```diff\n--- a/f.py\n+++ b/f.py\n```"),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
@@ -1338,7 +1511,7 @@ class TestPipelineWiring:
             mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
             mock.patch("utilities.autopatcher.remediation_planner.generate_remediation_plan", return_value=plan_result),
             mock.patch("utilities.autopatcher.candidate_enrichment.build_investigation_context", return_value=context),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
@@ -1884,7 +2057,7 @@ class TestFullPipelineCallCountAndOrdering:
 
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
@@ -2658,6 +2831,87 @@ class TestSliceFailureSafety:
         assert result.warning_text
 
 
+class TestMinimistNestedFunctionRegression:
+    """End-to-end (no pipeline, no LLM) reproduction of the real
+    minimist/CVE-2021-44906 regression: a Final Strategy naming a
+    verified target file (index.js) and a target symbol (setKey) that
+    only resolves via the deterministic fallback -- all the way through
+    to the Edit Readiness Gate, without ever hitting Slice 2/3
+    (deterministic/guided acquisition)."""
+
+    def _context(self, tmp_path):
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        return _make_context(
+            functions={"index.js:hasKey": {"name": "hasKey", "startLine": 21, "endLine": 27}},
+            repo_path=tmp_path,
+        )
+
+    def test_final_strategy_keeps_setkey_instead_of_dropping_it(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import _verify_strategy_targets
+        context = self._context(tmp_path)
+
+        kept_files, kept_symbols, warnings = _verify_strategy_targets(
+            ["index.js"], ["setKey"], tmp_path, context,
+        )
+        assert kept_files == ["index.js"]
+        assert kept_symbols == ["setKey"]
+        assert warnings == []  # no "unverified target_symbol removed: setKey"
+
+    def test_final_target_slice_covers_setkey_with_bounded_window_not_full_file(self, tmp_path):
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        strategy = _make_strategy(target_files=["index.js"], target_symbols=["setKey"])
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert result.covered_target_symbols == ["setKey"]
+        assert result.uncovered_target_symbols == []
+        assert result.coverage_complete is True
+        assert result.rendered.count("__proto__") == 2  # both existing guards present
+        # Bounded -- not a whole-file fallback: hasKey's own body must not
+        # be pulled in just because it shares setKey's file.
+        assert "function hasKey" not in result.rendered
+
+    def test_edit_readiness_reached_without_guided_acquisition(self, tmp_path):
+        # This is exactly the gate pipeline.py checks (edit_source_ready)
+        # before ever calling run_deterministic_acquisition / Slice 3's
+        # run_guided_acquisition -- True here means neither runs, so no
+        # (duplicate or otherwise) guided_context_request LLM call is made.
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+        )
+
+        strategy = _make_strategy(target_files=["index.js"], target_symbols=["setKey"])
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        intended_edits = build_intended_edits(strategy, slice_result)
+        readiness = check_edit_readiness(intended_edits, slice_result)
+
+        assert readiness.edit_source_ready is True
+        assert readiness.unready_edits == []
+        assert [e.symbol for e in readiness.ready_edits] == ["setKey"]
+
+    def test_no_patch_regression_removed(self, tmp_path):
+        # The regression's own end state: with the fallback, the Final
+        # Strategy's setKey survives verification, the slice covers it,
+        # and readiness is reached -- so Patch Generation is reachable
+        # instead of the pipeline stopping at "NO PATCH PRODUCED".
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import (
+            _verify_strategy_targets, build_final_target_slice,
+            build_intended_edits, check_edit_readiness,
+        )
+
+        kept_files, kept_symbols, warnings = _verify_strategy_targets(
+            ["index.js"], ["setKey"], tmp_path, context,
+        )
+        strategy = _make_strategy(target_files=kept_files, target_symbols=kept_symbols)
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        readiness = check_edit_readiness(build_intended_edits(strategy, slice_result), slice_result)
+
+        assert readiness.edit_source_ready is True  # Patch Generation is now reachable
+
+
 class TestExistingSectionsUnaffected:
     def test_planner_evidence_unchanged_shape(self, tmp_path):
         # build_planner_evidence's own contract (heading, disclaimer,
@@ -2707,7 +2961,7 @@ class TestPipelineContextOrderingWithSlice:
 
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
@@ -2771,7 +3025,7 @@ class TestPipelineContextOrderingWithSlice:
             mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
             mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice",
                        return_value=zero_coverage_result),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
@@ -2827,7 +3081,7 @@ class TestPipelineContextOrderingWithSlice:
             mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
             mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice",
                        return_value=zero_coverage_result),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
@@ -3829,7 +4083,7 @@ class TestEditReadinessGatesPatchGeneration:
             mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
             mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice",
                        return_value=slice_result),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value="```diff\n--- a/f.py\n+++ b/f.py\n```") as mock_gen,
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
@@ -5129,12 +5383,15 @@ class TestGuidedAcquisitionBoundsAndStopping:
         assert result.readiness.edit_source_ready is True
         assert llm.complete.call_count == 1
 
-    def test_max_rounds_are_enforced(self, tmp_path):
-        """Test 17. A request that never resolves stays unready every
-        round -- the loop must still terminate at
-        MAX_GUIDED_ACQUISITION_ROUNDS, never looping indefinitely, and
-        must call the LLM exactly that many times (never more)."""
-        from utilities.autopatcher import remediation_planner as rp
+    def test_zero_progress_round_stops_before_next_llm_call(self, tmp_path):
+        """Test 17 (updated for the loop/duplicate-request guard). A
+        request that never resolves stays unready every round -- but a
+        round that achieves ZERO readiness improvement across all of its
+        own attempts must stop the loop BEFORE the next round's LLM call,
+        rather than spending the full MAX_GUIDED_ACQUISITION_ROUNDS
+        budget on rounds that provably cannot help (this is the real
+        urllib3 CVE-2023-43804 regression shape: two guided rounds asking
+        for an equivalent unresolvable symbol before giving up)."""
         from utilities.autopatcher.remediation_planner import (
             IntendedEdit, check_edit_readiness, run_guided_acquisition,
         )
@@ -5151,44 +5408,158 @@ class TestGuidedAcquisitionBoundsAndStopping:
         }]})
         result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
 
-        assert result.rounds_used == rp.MAX_GUIDED_ACQUISITION_ROUNDS
-        assert llm.complete.call_count == rp.MAX_GUIDED_ACQUISITION_ROUNDS
+        assert result.rounds_used == 1
+        assert llm.complete.call_count == 1
         assert result.readiness.edit_source_ready is False
 
-    def test_request_count_limits_are_enforced(self, tmp_path):
-        """Test 18: MAX_CONTEXT_REQUESTS_PER_ROUND and
-        MAX_CONTEXT_REQUESTS_PER_EDIT are both enforced."""
+    def test_max_rounds_still_enforced_when_progress_continues(self, tmp_path):
+        """The early-stop-on-zero-progress guard must never shortcut a
+        genuinely productive sequence of rounds: when round 1 resolves ONE
+        of two unready edits (real, non-duplicate progress) but readiness
+        is still incomplete, round 2 still fires -- and the loop still
+        terminates at MAX_GUIDED_ACQUISITION_ROUNDS (never a third round),
+        preserving the pre-existing hard bound."""
         from utilities.autopatcher import remediation_planner as rp
         from utilities.autopatcher.remediation_planner import (
             IntendedEdit, check_edit_readiness, run_guided_acquisition,
         )
-        (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
-        context = _make_context(repo_path=tmp_path)
-        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:NoSuchSymbol"])
-        edit = IntendedEdit(file="mod.py", symbol="mod.py:NoSuchSymbol")
+        (tmp_path / "a.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("x = 1\n", encoding="utf-8")
+        context = _make_context(constants={
+            "a.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["a.py", "b.py"], target_symbols=["a.py:CONST_A", "b.py:NoSuchSymbol"],
+        )
+        edits = [IntendedEdit(file="a.py", symbol="a.py:CONST_A"), IntendedEdit(file="b.py", symbol="b.py:NoSuchSymbol")]
         initial_slice = _make_slice_result()
-        initial_readiness = check_edit_readiness([edit], initial_slice)
+        initial_readiness = check_edit_readiness(edits, initial_slice)
 
-        # 3 requests offered in one round; only MAX_CONTEXT_REQUESTS_PER_ROUND (2) attempted.
-        llm = _guided_llm({"context_requests": [
-            {"request_type": "symbol_definition", "file_hint": "mod.py", "symbol": "mod.py:NoSuchSymbol", "identifier": None, "reason": "1"},
-            {"request_type": "symbol_definition", "file_hint": "mod.py", "symbol": "mod.py:NoSuchSymbol", "identifier": None, "reason": "2"},
-            {"request_type": "symbol_definition", "file_hint": "mod.py", "symbol": "mod.py:NoSuchSymbol", "identifier": None, "reason": "3"},
-        ]})
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "a.py", "symbol": "a.py:CONST_A", "identifier": None, "reason": "round1"},
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "round1"},
+            ]}),
+            # Round 2 asks about b.py again with a DIFFERENT symbol name --
+            # not a duplicate of round 1's own request -- so this proves
+            # the round cap itself, independent of the duplicate guard.
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:AlsoNoSuchSymbol", "identifier": None, "reason": "round2"},
+            ]}),
+        ]
         result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
-        round_1_attempts = [a for a in result.attempts if a.round == 1]
-        assert len(round_1_attempts) == rp.MAX_CONTEXT_REQUESTS_PER_ROUND
+
+        assert llm.complete.call_count == 2
+        assert result.rounds_used == rp.MAX_GUIDED_ACQUISITION_ROUNDS
+        assert result.readiness.edit_source_ready is False  # b.py's edit never resolves
+
+    def test_duplicate_request_is_not_reissued(self, tmp_path):
+        """Test: an exact-duplicate request (same request_type, same
+        symbol, same attributed edit) across rounds is recorded as
+        "duplicate_request" and never re-resolved -- proven by forcing a
+        third, unrelated edit to keep the loop alive for round 2 without
+        relying on the zero-progress early stop."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "a.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("x = 1\n", encoding="utf-8")
+        context = _make_context(constants={
+            "a.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["a.py", "b.py"], target_symbols=["a.py:CONST_A", "b.py:NoSuchSymbol"],
+        )
+        edits = [IntendedEdit(file="a.py", symbol="a.py:CONST_A"), IntendedEdit(file="b.py", symbol="b.py:NoSuchSymbol")]
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness(edits, initial_slice)
+
+        # Round 1 resolves a.py (keeps the loop alive) and asks the exact
+        # same unresolvable b.py request round 2 will repeat verbatim.
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "a.py", "symbol": "a.py:CONST_A", "identifier": None, "reason": "round1"},
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "round1"},
+            ]}),
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "round2-verbatim-repeat"},
+            ]}),
+        ]
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+
+        round_2_attempts = [a for a in result.attempts if a.round == 2]
+        assert len(round_2_attempts) == 1
+        assert round_2_attempts[0].failure_reason == "duplicate_request"
+        assert round_2_attempts[0].verified is False
+
+    def test_request_count_limits_are_enforced(self, tmp_path):
+        """Test 18: MAX_CONTEXT_REQUESTS_PER_ROUND and
+        MAX_CONTEXT_REQUESTS_PER_EDIT are both enforced.
+
+        Restructured for the loop/duplicate-request guard: a second edit
+        (a.py:CONST_A) resolves in round 1 so round 2 legitimately fires
+        (not shortcut by the zero-progress early stop), and every
+        b.py:NoSuchSymbol request across both rounds uses a DISTINCT
+        symbol name so the duplicate-request guard never masks the
+        per-edit/per-round caps this test is actually about."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, run_guided_acquisition,
+        )
+        (tmp_path / "a.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("x = 1\n", encoding="utf-8")
+        context = _make_context(constants={
+            "a.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(
+            target_files=["a.py", "b.py"], target_symbols=["a.py:CONST_A", "b.py:NoSuchSymbol"],
+        )
+        edits = [IntendedEdit(file="a.py", symbol="a.py:CONST_A"), IntendedEdit(file="b.py", symbol="b.py:NoSuchSymbol")]
+        initial_slice = _make_slice_result()
+        initial_readiness = check_edit_readiness(edits, initial_slice)
+
+        # Every b.py request below must share the bare name "NoSuchSymbol"
+        # (so _attribute_guided_request's bare-name match attributes each
+        # one to the same b.py edit) while differing in literal `symbol`
+        # text (so the duplicate-request guard -- keyed on that literal
+        # text -- never masks the per-edit/per-round caps this test is
+        # actually about).
+        llm = mock.MagicMock()
+        llm.complete.side_effect = [
+            # Round 1: 2 requests, both attempted -- a.py resolves (keeps
+            # the loop alive), b.py's bare-name guess fails.
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "a.py", "symbol": "a.py:CONST_A", "identifier": None, "reason": "1"},
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "NoSuchSymbol", "identifier": None, "reason": "2"},
+            ]}),
+            # Round 2: 3 requests offered for b.py -- only
+            # MAX_CONTEXT_REQUESTS_PER_ROUND (2) are even attempted (W
+            # truncated, never recorded); of those, only 1 more fits under
+            # MAX_CONTEXT_REQUESTS_PER_EDIT (b.py already used 1 slot in
+            # round 1), so the second (Z) is rejected with
+            # "context_request_limit_reached".
+            json.dumps({"context_requests": [
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "3"},
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "4"},
+                {"request_type": "symbol_definition", "file_hint": "b.py", "symbol": "b.py:NoSuchSymbol", "identifier": None, "reason": "5"},
+            ]}),
+        ]
+        result = run_guided_acquisition(strategy, "vuln", llm, str(tmp_path), context, initial_slice, initial_readiness)
+
+        round_2_attempts = [a for a in result.attempts if a.round == 2]
+        assert len(round_2_attempts) == rp.MAX_CONTEXT_REQUESTS_PER_ROUND  # W truncated, never recorded
 
         # Across all rounds, at most MAX_CONTEXT_REQUESTS_PER_EDIT attempts
-        # are ever actually PROCESSED (not immediately rejected for
-        # already being at the per-edit cap) for the same edit -- 2
-        # rounds * 2/round = 4 offered total for the one edit; cap is 2,
-        # so the other 2 must be rejected with "context_request_limit_reached".
-        processed_for_edit = [
+        # for b.py's edit are ever actually PROCESSED (not immediately
+        # rejected for already being at the per-edit cap).
+        processed_for_b = [
             a for a in result.attempts
-            if a.request.intended_edit is not None and a.failure_reason != "context_request_limit_reached"
+            if a.request.intended_edit is not None and a.request.intended_edit.file == "b.py"
+            and a.failure_reason != "context_request_limit_reached"
         ]
-        assert len(processed_for_edit) <= rp.MAX_CONTEXT_REQUESTS_PER_EDIT
+        assert len(processed_for_b) == rp.MAX_CONTEXT_REQUESTS_PER_EDIT
         assert any(a.failure_reason == "context_request_limit_reached" for a in result.attempts)
 
     def test_source_character_limits_are_enforced(self, tmp_path, monkeypatch):
@@ -5282,7 +5653,16 @@ class TestGuidedAcquisitionCallDiscipline:
 
     def test_planner_and_final_strategy_not_rerun(self, tmp_path):
         """Test 23. Exactly one remediation_planning and one
-        remediation_strategy call, no matter how many guided rounds ran."""
+        remediation_strategy call, no matter how many guided rounds ran.
+
+        This harness's mocked guided-context response is always an empty
+        request list ("{}" -- see _side_effect's default branch), so
+        round 1 records zero attempts and therefore achieves zero
+        readiness improvement -- the loop/duplicate-request guard's
+        zero-progress early stop means round 2 is correctly never
+        attempted here (1 guided_context_request call, not
+        MAX_GUIDED_ACQUISITION_ROUNDS); the bound is still an upper bound,
+        never exceeded, which is this test's actual invariant."""
         stage_calls: list = []
         unready_result = mock.MagicMock(
             rendered="## Final-Target Remediation Slice\n\nsome unrelated content\n",
@@ -5298,7 +5678,7 @@ class TestGuidedAcquisitionCallDiscipline:
         assert stage_calls.count("remediation_planning") == 1
         assert stage_calls.count("remediation_strategy") == 1
         from utilities.autopatcher import remediation_planner as rp
-        assert stage_calls.count("guided_context_request") == rp.MAX_GUIDED_ACQUISITION_ROUNDS
+        assert 1 <= stage_calls.count("guided_context_request") <= rp.MAX_GUIDED_ACQUISITION_ROUNDS
 
 
 class TestGuidedAcquisitionRecommendationPolicyUnaffected:
@@ -5351,3 +5731,276 @@ class TestGuidedAcquisitionTraceArtifact:
         assert "requests" in doc["guided_acquisition"]
         assert "verification_results" in doc["guided_acquisition"]
         assert doc["patch_generation_skipped"] is True
+
+
+# ---------------------------------------------------------------------------
+# Bounded target-file fallback (Root Cause A fix): a Final Strategy target
+# whose specific symbol never resolves (deterministically, or through
+# guided acquisition) must not, by itself, force "no patch" when that
+# file's own whole-file source was already deterministically rendered
+# (build_final_target_slice's category 5). Generic fixtures throughout --
+# a class __init__ parameter / instance attribute name that never resolves
+# as a function/class/constant definition, exactly the general shape of
+# the real urllib3 CVE-2023-43804 regression (Retry.remove_headers_on_
+# redirect), without hard-coding urllib3 itself.
+# ---------------------------------------------------------------------------
+
+def _unresolvable_symbol_repo(tmp_path):
+    """A tiny repo where the Final Strategy's own target_symbol names a
+    real file but an identifier that can never resolve via
+    _resolve_symbol_details/RepositoryIndex (it's a constructor parameter
+    / instance-attribute name, not a symbol or constant definition) -- the
+    file itself is real, verified, and small enough to be fully rendered
+    by category 5's full-file fallback."""
+    (tmp_path / "config.py").write_text(
+        "class Settings:\n"
+        "    def __init__(self, allowed_headers=None):\n"
+        "        self.allowed_headers = allowed_headers or DEFAULT_ALLOWED_HEADERS\n"
+        "\n"
+        "DEFAULT_ALLOWED_HEADERS = frozenset(['Authorization'])\n",
+        encoding="utf-8",
+    )
+    return _make_context(repo_path=tmp_path), _make_strategy(
+        target_files=["config.py"], target_symbols=["config.py:Settings.allowed_headers"],
+    )
+
+
+class TestCheckEditReadinessFullFileFallbackForSymbols:
+    """check_edit_readiness's allow_full_file_fallback_for_symbols param,
+    unit-level."""
+
+    def test_default_false_preserves_existing_unresolved_symbol_behavior(self, tmp_path):
+        """Test 1 (source acquisition): default behavior (every existing
+        caller) is completely unchanged -- an unresolved symbol stays
+        unready even when the file has a full-file fallback."""
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+        )
+        context, strategy = _unresolvable_symbol_repo(tmp_path)
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        edits = build_intended_edits(strategy, slice_result)
+
+        readiness = check_edit_readiness(edits, slice_result)
+        assert readiness.edit_source_ready is False
+        assert readiness.unready_edits[0].reason == "unresolved_symbol"
+
+    def test_verified_target_file_plus_resolvable_exact_symbol_unaffected(self, tmp_path):
+        """Test 1 (source acquisition), positive case: a symbol that DOES
+        resolve is unaffected by this parameter either way -- current
+        successful behavior is unchanged."""
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+        )
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        context = _make_context(constants={
+            "mod.py": {"CONST_A": {"qualified_name": "CONST_A", "class_name": None, "name": "CONST_A", "line": 1, "end_line": 1}},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:CONST_A"])
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        edits = build_intended_edits(strategy, slice_result)
+
+        for flag in (False, True):
+            readiness = check_edit_readiness(edits, slice_result, allow_full_file_fallback_for_symbols=flag)
+            assert readiness.edit_source_ready is True
+            assert readiness.ready_edits[0].symbol == "mod.py:CONST_A"
+
+    def test_allow_full_file_fallback_marks_unresolved_symbol_ready(self, tmp_path):
+        """Test 2 + Test 10 (source acquisition): the exact urllib3
+        failure shape, generically -- file target known, a
+        Retry.remove_headers_on_redirect-style symbol never resolves, but
+        the verified target file's own already-rendered full-file source
+        is enough for the flag to mark the edit ready."""
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+        )
+        context, strategy = _unresolvable_symbol_repo(tmp_path)
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        edits = build_intended_edits(strategy, slice_result)
+
+        readiness = check_edit_readiness(edits, slice_result, allow_full_file_fallback_for_symbols=True)
+        assert readiness.edit_source_ready is True
+        assert readiness.ready_edits[0].file == "config.py"
+
+    def test_fallback_never_marks_ready_a_file_with_no_full_file_coverage(self, tmp_path):
+        """Test 6 + Test 7 (source acquisition): the flag can never
+        fabricate readiness for a file that was never actually rendered
+        (e.g. category 5 itself failed/was skipped) -- it only ever
+        re-reads full_file_fallback_covered/identifier_definition_covered,
+        which are fixed entirely by the Final Strategy's own verified
+        target_files, never by anything an LLM merely proposed."""
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, check_edit_readiness, _EMPTY_SLICE_RESULT,
+        )
+        edit = IntendedEdit(file="config.py", symbol="config.py:Settings.allowed_headers")
+        # A slice result where nothing was ever covered for this file --
+        # simulates the fallback itself failing (e.g. file too large, or
+        # read failure).
+        readiness = check_edit_readiness([edit], _EMPTY_SLICE_RESULT, allow_full_file_fallback_for_symbols=True)
+        assert readiness.edit_source_ready is False
+        assert readiness.unready_edits[0].reason == "unresolved_symbol"
+
+    def test_fallback_ignores_llm_proposed_file_not_in_target_files(self, tmp_path):
+        """Test 7 (source acquisition): full_file_fallback_covered is
+        populated ONLY from the Final Strategy's own verified
+        target_files (see build_final_target_slice's category 5) -- an
+        edit naming a file that was never one of those targets can never
+        be marked ready by this flag, no matter what."""
+        from utilities.autopatcher.remediation_planner import IntendedEdit, check_edit_readiness
+        from utilities.autopatcher.remediation_planner import FinalTargetSliceResult
+        slice_result = FinalTargetSliceResult(
+            rendered="", covered_target_files=[], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=[],
+            coverage_complete=True, has_any_coverage=False, warning_text="",
+            resolved_target_symbols=[], full_file_fallback_covered=["config.py"],
+            edit_target_budget_exhausted=False, resolved_symbol_files={},
+            identifier_definition_covered=[],
+        )
+        edit = IntendedEdit(file="an_llm_invented_file.py", symbol="an_llm_invented_file.py:Whatever")
+        readiness = check_edit_readiness([edit], slice_result, allow_full_file_fallback_for_symbols=True)
+        assert readiness.edit_source_ready is False
+
+
+class TestPipelineBoundedTargetFileFallback:
+    """Pipeline-level (Test 4, 5, 6, 10 -- source acquisition): the
+    generic urllib3-shape regression, exercised through real
+    pipeline.run() wiring. Mirrors TestEditReadinessGatesPatchGeneration's
+    own pattern (mock build_final_target_slice's return value; run()
+    exercises everything else for real), additionally mocking
+    build_intended_edits so a genuinely symbol-having, unresolved
+    IntendedEdit reaches check_edit_readiness -- _verify_strategy_targets'
+    real behavior always drops an unresolved target_symbol when no
+    investigation_output_dir is given (see that class's own docstrings),
+    which would otherwise only ever exercise the FILE-ONLY fallback path
+    that already existed before this fix, never the new one."""
+
+    # Conforms to _unresolvable_symbol_repo's real file content (verified
+    # with a real `git apply --check`) so this exercises the FULL pipeline
+    # -- including Slice 4's Patch Target Conformance -- end to end,
+    # rather than stopping short at a synthetic non-conforming diff.
+    _PATCH_DIFF = (
+        "```diff\n--- a/config.py\n+++ b/config.py\n@@ -3,3 +3,3 @@\n"
+        "         self.allowed_headers = allowed_headers or DEFAULT_ALLOWED_HEADERS\n"
+        " \n"
+        "-DEFAULT_ALLOWED_HEADERS = frozenset(['Authorization'])\n"
+        "+DEFAULT_ALLOWED_HEADERS = frozenset(['Authorization', 'Cookie'])\n"
+        "```"
+    )
+
+    @staticmethod
+    def _slice_result(full_file_fallback_covered):
+        return mock.MagicMock(
+            rendered="## Final-Target Remediation Slice\n\nDEFAULT_ALLOWED_HEADERS = frozenset(['Authorization'])\n",
+            warning_text="", coverage_complete=False, has_any_coverage=True,
+            covered_target_files=["config.py"], covered_target_symbols=[],
+            uncovered_target_files=[], uncovered_target_symbols=["config.py:Settings.allowed_headers"],
+            resolved_target_symbols=[], full_file_fallback_covered=full_file_fallback_covered,
+            identifier_definition_covered=[], edit_target_budget_exhausted=False,
+            resolved_symbol_files={},
+        )
+
+    @staticmethod
+    def _edits():
+        from utilities.autopatcher.remediation_planner import IntendedEdit
+        return [IntendedEdit(file="config.py", symbol="config.py:Settings.allowed_headers")]
+
+    @staticmethod
+    def _side_effect(stage_calls, patch_diff):
+        def side_effect(system_prompt, user_message, stage="unknown"):
+            stage_calls.append(stage)
+            if stage == "remediation_planning":
+                return json.dumps({
+                    "remediation_mechanism": "restrict allowed headers", "target_files": ["config.py"],
+                    "target_symbols": [], "security_invariant": "stub", "required_edits": [],
+                    "approaches_to_avoid": [], "explicit_unknowns": [],
+                })
+            if stage == "remediation_strategy":
+                return json.dumps({
+                    "extended_mechanism": "Settings.allowed_headers", "target_files": ["config.py"],
+                    "target_symbols": ["config.py:Settings.allowed_headers"],
+                    "required_edits": ["stub edit"], "rejected_targets": [],
+                    "security_invariant": "stub", "insufficient_evidence": [],
+                })
+            if stage == "guided_context_request":
+                # No requests -- the symbol genuinely does not exist as a
+                # definition, so guided acquisition (real code, real
+                # attribution/resolution) can never help either.
+                return "{}"
+            return patch_diff
+        return side_effect
+
+    def _run(self, tmp_path, stage_calls, slice_result, patch_diff=None):
+        patch_diff = patch_diff or self._PATCH_DIFF
+        mock_llm = mock.MagicMock()
+        mock_llm.complete.side_effect = self._side_effect(stage_calls, patch_diff)
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
+            mock.patch("utilities.autopatcher.remediation_planner.build_final_target_slice",
+                       return_value=slice_result),
+            mock.patch("utilities.autopatcher.remediation_planner.build_intended_edits",
+                       return_value=self._edits()),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       side_effect=lambda *a, **kw: patch_diff) as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value={"applicable": True, "skipped": False, "stderr": "",
+                                     "exit_code": 0, "skipped_reason": None, "error": None}),
+        ):
+            from utilities.autopatcher.pipeline import run
+            report = run("some vulnerability", api_key="", repo_root=str(tmp_path))
+        return mock_gen, report
+
+    def test_fallback_succeeds_patch_generation_receives_verified_source(self, tmp_path):
+        """Test 5 + Test 10 (source acquisition): the symbol never
+        resolves (deterministically, or through guided acquisition), but
+        the file's own full-file-fallback source was already rendered --
+        the bounded fallback marks the edit ready and Patch Generation is
+        reached with that verified source in its code_context."""
+        # Whether the specific mocked patch this test's Patch Generator
+        # stub returns then survives Slice 4's own, unrelated Patch
+        # Target Conformance gate is out of this task's scope (that gate
+        # concerns a DIFFERENT question -- does the generated patch edit
+        # what Edit Readiness actually approved -- and has its own
+        # existing test coverage elsewhere); this test's own claim is
+        # narrower and already fully proven below: Patch Generation is
+        # reached at all, and with the fallback's verified source.
+        _unresolvable_symbol_repo(tmp_path)
+        stage_calls: list = []
+        mock_gen, report = self._run(tmp_path, stage_calls, self._slice_result(["config.py"]))
+        assert mock_gen.called
+        _args, kwargs = mock_gen.call_args
+        code_context = kwargs.get("code_context") or (_args[2] if len(_args) > 2 else "")
+        assert "DEFAULT_ALLOWED_HEADERS" in code_context
+
+    def test_fallback_fails_pipeline_ends_no_patch_cleanly(self, tmp_path):
+        """Test 6 (source acquisition): when the file was never actually
+        covered by the full-file fallback either (full_file_fallback_
+        covered stays empty -- e.g. the file was too large, or a read
+        failure), the bounded fallback correctly finds nothing to use and
+        the pipeline ends NO PATCH cleanly -- no exception, no malformed
+        report, Patch Generation never called."""
+        _unresolvable_symbol_repo(tmp_path)
+        stage_calls: list = []
+        mock_gen, report = self._run(tmp_path, stage_calls, self._slice_result([]))
+        assert not mock_gen.called
+        assert "NO PATCH PRODUCED" in report
+
+    def test_no_repeated_llm_loop_before_fallback(self, tmp_path):
+        """Test 4 + Test 8 (source acquisition): guided acquisition stops
+        early once it has made zero progress (see the loop/duplicate-
+        request guard) rather than exhausting every round before the
+        bounded fallback takes over -- at most
+        MAX_GUIDED_ACQUISITION_ROUNDS guided_context_request calls,
+        never more."""
+        from utilities.autopatcher import remediation_planner as rp
+        _unresolvable_symbol_repo(tmp_path)
+        stage_calls: list = []
+        self._run(tmp_path, stage_calls, self._slice_result(["config.py"]))
+        assert stage_calls.count("guided_context_request") <= rp.MAX_GUIDED_ACQUISITION_ROUNDS
+        assert stage_calls.count("guided_context_request") >= 1
+        assert stage_calls.count("remediation_planning") == 1
+        assert stage_calls.count("remediation_strategy") == 1

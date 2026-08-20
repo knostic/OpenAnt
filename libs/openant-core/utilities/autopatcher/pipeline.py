@@ -17,7 +17,7 @@ from .confidence_scorer import score_confidence
 from .finding_calibration import calibrate_findings
 from .llm_client import LLMClient, ModelUnavailableError
 from .patch_challenger import challenge_patch
-from .patch_generator import generate_patch
+from .patch_generator import generate_patch, generate_patch_raw, classify_patch_response
 from .patch_reviewer import review_patch
 from .testing_support import discover_tests, tests_for_file, score_test_support
 from .test_suggester import extract_findings, suggest_tests
@@ -720,13 +720,21 @@ def _build_known_findings(classified_challenger: dict, finding_calibration: list
 
     This reuses the four categories _classify_challenger already computes
     (confirmed_defect / plausible_risk / validation_gap / generic) — no new
-    classification, no change to the counts _compute_trust_signals and
-    _build_recommendation_v1 read.
+    classification.
 
-      confirmed_defect  -> potential_remaining_risks   (presented as heuristic
-                           adversarial-review concerns, not confirmed facts,
-                           since the challenger is LLM analysis, not
-                           deterministic verification)
+      confirmed_defect  -> calibration-aware: stays in potential_remaining_
+                           risks only if calibration is missing (fail-closed
+                           default -- calibration didn't run, failed, or
+                           omitted this finding) or calibrated "Observed";
+                           a calibrated "Hypothesis" moves to
+                           validation_hypotheses and "Hardening" moves to
+                           future_hardening_ideas. This is the single
+                           authoritative post-calibration defect count: a
+                           finding calibration downgraded must not still
+                           read as a confirmed defect anywhere downstream
+                           (repair gate, Trust Signals, Recommendation) —
+                           see should_auto_repair/accept_repair below and
+                           _build_report's use of this function's output.
       validation_gap    -> validation_gaps             ("things we did not verify")
       plausible_risk,
       generic           -> split three ways by the finding_calibration stage
@@ -735,10 +743,13 @@ def _build_known_findings(classified_challenger: dict, finding_calibration: list
 
     finding_calibration is the (optional) output of
     finding_calibration.calibrate_findings — a list of {"original", "group",
-    "reworded"} dicts covering the plausible_risk/generic findings. When a
-    finding has no matching calibration entry (calibration wasn't run, or
-    failed, or omitted this specific finding), it falls back to a
-    conservative default rather than being dropped: plausible_risk ->
+    "reworded"} dicts. Historically this covered only the plausible_risk/
+    generic findings; it may now also cover confirmed_defect findings (see
+    pipeline.run()'s repair loop). When a finding has no matching
+    calibration entry (calibration wasn't run, or failed, or omitted this
+    specific finding), it falls back to a conservative default rather than
+    being dropped: confirmed_defect stays a confirmed defect (fail-closed —
+    uncertainty must never look like clearance), plausible_risk ->
     Validation Hypotheses (already a hedge), generic -> Future Hardening
     Ideas (already a suggestion) — the same mapping this project used before
     calibration existed, so a calibration failure degrades to prior behavior
@@ -753,22 +764,52 @@ def _build_known_findings(classified_challenger: dict, finding_calibration: list
         + list(classified_challenger.get("classified_potential_issues") or [])
     )
 
-    potential_remaining_risks = [f["text"] for f in all_findings if f["category"] == "confirmed_defect"]
-
-    validation_gaps: list[str] = []
-    for f in all_findings:
-        if f["category"] == "validation_gap" and len(validation_gaps) < 3:
-            validation_gaps.append(f["text"])
-
     calibration_by_original = {
         entry.get("original"): entry for entry in (finding_calibration or [])
     }
 
+    potential_remaining_risks: list[str] = []
+    validation_gaps: list[str] = []
     observed_implementation_notes: list[str] = []
     validation_hypotheses: list[str] = []
     future_hardening_ideas: list[str] = []
 
     for f in all_findings:
+        if f["category"] == "validation_gap":
+            if len(validation_gaps) < 3:
+                validation_gaps.append(f["text"])
+            continue
+
+        if f["category"] == "confirmed_defect":
+            # This is the report-facing (caution-biased) fail-closed default:
+            # a confirmed_defect finding with NO calibration entry stays
+            # displayed as a confirmed defect, since we cannot say it was
+            # cleared. This is intentionally NOT the same threshold
+            # should_auto_repair/accept_repair use to authorize a mutation
+            # (they require an *explicit* "observed" entry, and treat a
+            # missing entry as insufficient to act on) -- reporting caution
+            # and mutation permission are different questions with
+            # different safe defaults; see the "Deterministic repair gate"
+            # section below for that distinction spelled out.
+            entry = calibration_by_original.get(f["text"])
+            if entry is None:
+                potential_remaining_risks.append(f["text"])
+                continue
+            group = entry.get("group")
+            text = entry.get("reworded") or f["text"]
+            if group == "observed":
+                potential_remaining_risks.append(text)
+            elif group == "hardening":
+                future_hardening_ideas.append(text)
+            else:
+                # "hypothesis", or any unparseable/unexpected group value --
+                # calibrate_findings itself already defaults an unparseable
+                # group to "hypothesis" (its own most epistemically humble
+                # fallback), so this mirrors that choice rather than
+                # inventing a new one.
+                validation_hypotheses.append(text)
+            continue
+
         if f["category"] not in ("plausible_risk", "generic"):
             continue
         entry = calibration_by_original.get(f["text"])
@@ -793,6 +834,120 @@ def _build_known_findings(classified_challenger: dict, finding_calibration: list
         "validation_hypotheses": validation_hypotheses,
         "future_hardening_ideas": future_hardening_ideas,
     }
+
+
+# ---------------------------------------------------------------------------
+# Deterministic repair gate
+#
+# should_auto_repair / accept_repair are pure functions: no LLM calls, no
+# prose inspection, structured input only (already-computed classification +
+# calibration dicts). This is deterministic *policy evaluation* over that
+# input, not deterministic *end-to-end authorization* -- one of the inputs
+# (Finding Calibration's group label) is itself LLM-derived, so the overall
+# authorization outcome can still vary across otherwise-identical runs if
+# Calibration returns a different group for the same finding. What these
+# functions guarantee is narrower and still real: given fixed classification
+# + calibration input, the decision is always the same.
+#
+# Note this uses a DIFFERENT, stricter threshold than _build_known_findings'
+# report-facing "potential_remaining_risks" bucket. _build_known_findings
+# fails closed toward caution for the reader: a confirmed_defect finding
+# with no calibration entry stays displayed as a defect, since silently
+# clearing it would be worse than over-flagging it. The gates below fail
+# closed toward inaction for mutation: a confirmed_defect finding with no
+# calibration entry must NOT authorize (or accept) a mutation, since acting
+# on unverified evidence is worse than not acting. Both defaults are
+# "uncertainty never helps the riskier outcome" -- they just disagree on
+# which outcome (flag it / mutate it) is the riskier one for their own
+# question, so they intentionally use two different thresholds over the
+# same underlying calibration data rather than one shared one.
+# ---------------------------------------------------------------------------
+
+
+def _confirmed_defect_calibration_entries(
+    classified_challenger: dict, finding_calibration: list[dict] | None
+) -> list[tuple[str, dict | None]]:
+    """(finding_text, calibration_entry_or_None) for every raw
+    confirmed_defect finding in classified_challenger.
+
+    The single lookup should_auto_repair and accept_repair both key off of,
+    so "which calibration entry belongs to which confirmed_defect finding"
+    is decided in exactly one place.
+    """
+    calibration_by_original = {
+        entry.get("original"): entry for entry in (finding_calibration or [])
+    }
+    all_findings = (
+        list(classified_challenger.get("classified_edge_cases") or [])
+        + list(classified_challenger.get("classified_potential_issues") or [])
+    )
+    return [
+        (f["text"], calibration_by_original.get(f["text"]))
+        for f in all_findings
+        if f["category"] == "confirmed_defect"
+    ]
+
+
+def should_auto_repair(
+    classified_challenger: dict,
+    finding_calibration: list[dict] | None,
+    applicable: bool,
+) -> bool:
+    """v1 repair-authorization gate.
+
+    Automatic repair is allowed only when ALL of:
+      1. the current patch applies
+      2. at least one finding is raw-classified confirmed_defect
+      3. that SAME finding has an explicit Finding Calibration entry whose
+         group is "observed"
+
+    Anything else must NOT authorize a mutation: a finding calibrated
+    Hypothesis or Hardening, a validation_gap (never considered here at
+    all), a confirmed_defect finding calibration produced no entry for
+    (missing calibration for that finding), or calibration failing
+    outright (finding_calibration is None/empty) -- none of these satisfy
+    condition 3, so none authorize repair. Uncertainty may increase report
+    caution (see _build_known_findings) but must never increase permission
+    to mutate code.
+    """
+    if not applicable or not finding_calibration:
+        return False
+    for _text, entry in _confirmed_defect_calibration_entries(classified_challenger, finding_calibration):
+        if entry is not None and entry.get("group") == "observed":
+            return True
+    return False
+
+
+def accept_repair(
+    classified_challenger_v2: dict,
+    finding_calibration_v2: list[dict] | None,
+    applicable: bool,
+) -> bool:
+    """v2 acceptance gate -- symmetric with should_auto_repair, applied to
+    the repaired patch's own (freshly re-challenged, freshly calibrated)
+    finding state instead of the pre-repair state.
+
+    v2 replaces v1 only when v2 applies AND, for every raw confirmed_defect
+    finding v2's own Challenger raised, calibration explicitly places it
+    outside "observed" (Hypothesis or Hardening). If v2 has no raw
+    confirmed_defect finding at all, there is nothing to gate on and v2 is
+    accepted on applicability alone (unchanged from the pre-calibration
+    zero-tolerance check this replaces). Anything else -- v2 does not
+    apply, a confirmed_defect finding has no calibration entry at all
+    (cannot verify it was cleared), or a confirmed_defect finding
+    explicitly calibrates "observed" -- rejects v2 and leaves v1 in place:
+    fail closed, preserving the safer prior state, at most once, never a
+    second repair attempt.
+    """
+    if not applicable:
+        return False
+    entries = _confirmed_defect_calibration_entries(classified_challenger_v2, finding_calibration_v2)
+    if not entries:
+        return True
+    for _text, entry in entries:
+        if entry is None or entry.get("group") == "observed":
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -984,9 +1139,17 @@ def _compute_trust_signals(
     elif risk_count > 0 or gap_count > 0:
         total = risk_count + gap_count
         cov_val = "Medium"
+        # Release-polish: labeled "before evidence calibration" because this
+        # total (plausible_risk_count + validation_gap_count) is the raw
+        # Challenger classification — some of these same findings are later
+        # split by finding_calibration into Observed/Hypothesis/Hardening
+        # for Review Results, so this number and the calibrated
+        # decision-relevant count shown in Recommendation legitimately
+        # differ; see _describe_decision_relevant_findings.
         cov_notes = (
-            f"{total} review finding(s) · no deterministic blocker identified — "
-            "none rose to a confirmed, high-confidence defect during adversarial review"
+            f"{total} raw review concern(s) recorded before evidence calibration — "
+            "no deterministic blocker identified; none rose to a confirmed, "
+            "high-confidence defect during adversarial review"
         )
     else:
         cov_val = "High"
@@ -1068,6 +1231,57 @@ _POSITIVE_IMPROVEMENT = frozenset({"High", "Medium"})
 _POSITIVE_SAFETY = frozenset({"Low Risk", "Medium Risk"})
 _BLOCKING_INTEGRITY = frozenset({"Does Not Apply", "Critical Issues"})
 
+# Release-polish (report explainability): human-readable label for each of
+# I3's three positive-whitelist axes, and that axis's own whitelist, keyed
+# identically. Used only to name — in the Recommendation `reason` — which
+# already-computed Trust Signal(s) failed I3, and to quote that signal's own
+# `notes`. Never changes which axis is checked (these ARE the exact three
+# frozensets I3 itself tests, not new ones) and never reads Review Results.
+_GATE_AXIS_LABELS = {
+    "patch_integrity": "Patch integrity",
+    "security_improvement": "Security improvement",
+    "deployment_safety": "Deployment risk",
+}
+_POSITIVE_SETS_BY_AXIS = {
+    "patch_integrity": _POSITIVE_INTEGRITY,
+    "security_improvement": _POSITIVE_IMPROVEMENT,
+    "deployment_safety": _POSITIVE_SAFETY,
+}
+
+
+def _describe_unmet_gates(signals: dict) -> str:
+    """One sentence per I3 axis whose current value is not in that axis's
+    own positive whitelist, reusing that axis's already-computed `notes`.
+
+    Deterministic and mechanical: iterates the exact three axes I3 checks,
+    in a fixed order, and does nothing beyond a membership test against the
+    same frozensets I3 itself uses — it never inspects Review Results, never
+    picks "the most important finding", and never introduces a new signal
+    or heuristic. Returns "" when every I3 axis is already positive (not
+    expected for a non-Green decision, but never raises if it happens).
+    """
+    sentences: list[str] = []
+    for axis in ("patch_integrity", "security_improvement", "deployment_safety"):
+        value = signals[axis]["value"]
+        if value in _POSITIVE_SETS_BY_AXIS[axis]:
+            continue
+        label = _GATE_AXIS_LABELS[axis]
+        notes = (signals[axis].get("notes") or "").strip().rstrip(".")
+        if notes:
+            # Lowercase only a genuine sentence-initial capital, not an
+            # acronym/all-caps lead word (e.g. "HIGH impact surface" or
+            # "MEDIUM: unused_import" must stay as-is).
+            first_word = notes.split(" ", 1)[0]
+            is_acronym_lead = len(first_word) > 1 and first_word.isupper()
+            if notes[:1].isupper() and not is_acronym_lead:
+                notes_lc = notes[0].lower() + notes[1:]
+            else:
+                notes_lc = notes
+            sentences.append(f"{label} could not be verified because {notes_lc}.")
+        else:
+            sentences.append(f"{label} could not be verified.")
+    return " ".join(sentences)
+
 
 def _build_recommendation_v1(
     signals: dict,
@@ -1097,6 +1311,14 @@ def _build_recommendation_v1(
            claim as verified-clean).
       I5 → everything else (including Unknown/Not Verified on either axis)
            falls through to Manual Review Required.
+
+    Release-polish (report explainability): every branch's `reason` may
+    append one sentence naming the specific Trust Signal(s) that gated it —
+    the Misaligned/still_vulnerable branches cite `remediation_alignment`'s
+    own notes directly (that is the signal that triggered them); every
+    branch reached after the I3 check cites whichever of I3's three axes
+    were not positive, via `_describe_unmet_gates`. This only changes
+    `reason` text — `decision` is computed identically to before this note.
     """
     integrity = signals["patch_integrity"]["value"]
     improvement = signals["security_improvement"]["value"]
@@ -1104,27 +1326,30 @@ def _build_recommendation_v1(
     safety = signals["deployment_safety"]["value"]
 
     if integrity in _BLOCKING_INTEGRITY:  # I4
-        return {
-            "decision": "Do Not Apply",
-            "reason": "Patch has critical issues or does not apply to the target repository.",
-        }
+        reason = "Patch has critical issues or does not apply to the target repository."
+        notes = (signals["patch_integrity"].get("notes") or "").strip().rstrip(".")
+        if notes:
+            reason += f" Patch integrity: {notes}."
+        return {"decision": "Do Not Apply", "reason": reason}
     if alignment == "Misaligned":  # I5
-        return {
-            "decision": "Manual Review Required",
-            "reason": (
-                "Adversarial review flagged findings classified as high-confidence risk "
-                "indicators; this is unresolved heuristic evidence, not a verified exploit — "
-                "manual review is required before deployment."
-            ),
-        }
+        reason = (
+            "Adversarial review flagged findings classified as high-confidence risk "
+            "indicators; this is unresolved heuristic evidence, not a verified exploit — "
+            "manual review is required before deployment."
+        )
+        notes = (signals["remediation_alignment"].get("notes") or "").strip().rstrip(".")
+        if notes:
+            reason += f" Remediation alignment: {notes}."
+        return {"decision": "Manual Review Required", "reason": reason}
     if still_vulnerable and defect_count == 0:  # I5
-        return {
-            "decision": "Manual Review Required",
-            "reason": (
-                "Challenger flagged unverified risks but found no confirmed exploit path; "
-                "see Review Results below before deploying."
-            ),
-        }
+        reason = (
+            "Challenger flagged unverified risks but found no confirmed exploit path; "
+            "see Review Results below before deploying."
+        )
+        notes = (signals["remediation_alignment"].get("notes") or "").strip().rstrip(".")
+        if notes:
+            reason += f" Remediation alignment: {notes}."
+        return {"decision": "Manual Review Required", "reason": reason}
     if (
         integrity in _POSITIVE_INTEGRITY
         and improvement in _POSITIVE_IMPROVEMENT
@@ -1137,20 +1362,25 @@ def _build_recommendation_v1(
                 "Run the listed validation actions before deployment."
             ),
         }
+    # Every branch below is reached only because the I3 whitelist above
+    # failed on at least one axis — name exactly which one(s) fired it, from
+    # the same evidence I3 itself already checked. Presentation only: never
+    # affects which branch below fires.
+    unmet = _describe_unmet_gates(signals)
     if improvement == "Low" and safety == "Low Risk":
-        return {
-            "decision": "Deploy With Caution",
-            "reason": "Patch provides limited or uncertain security improvement. Manual security review recommended.",
-        }
+        reason = "Patch provides limited or uncertain security improvement. Manual security review recommended."
+        if unmet:
+            reason += f" {unmet}"
+        return {"decision": "Deploy With Caution", "reason": reason}
     if safety == "High Risk":  # I5
-        return {
-            "decision": "Manual Review Required",
-            "reason": "Change has high deployment risk; regression testing across affected callers required.",
-        }
-    return {  # I5 / I6: catch-all for Unknown/Not Verified and any other inconclusive state
-        "decision": "Manual Review Required",
-        "reason": "Patch requires manual security review before deployment.",
-    }
+        reason = "Change has high deployment risk; regression testing across affected callers required."
+        if unmet:
+            reason += f" {unmet}"
+        return {"decision": "Manual Review Required", "reason": reason}
+    reason = "Patch requires manual security review before deployment."  # I5 / I6 catch-all
+    if unmet:
+        reason += f" {unmet}"
+    return {"decision": "Manual Review Required", "reason": reason}
 
 
 # ---------------------------------------------------------------------------
@@ -1204,6 +1434,45 @@ def _decision_relevant_finding_count(known_findings: dict) -> int:
     )
 
 
+# Release-polish: category label (singular noun) for each key
+# _decision_relevant_finding_count sums, in the same fixed order used
+# everywhere this aggregate is described. "Observed fact" is deliberately
+# a certainty label, not a severity one — Observed Facts entries may be
+# reassuring, neutral, or concerning (see _render_known_findings) — so this
+# breakdown never says "open" or "remaining" and never implies every counted
+# item is an unresolved defect.
+_DECISION_RELEVANT_CATEGORY_LABELS = [
+    ("potential_remaining_risks", "flagged risk"),
+    ("validation_gaps", "validation gap"),
+    ("observed_implementation_notes", "observed fact"),
+    ("validation_hypotheses", "validation question"),
+]
+
+
+def _describe_decision_relevant_findings(known_findings: dict) -> str:
+    """Category-labeled description of the same aggregate
+    `_decision_relevant_finding_count` counts (identical four keys,
+    identical exclusion of future_hardening_ideas — see that function's own
+    docstring for why). Presentation only: does not change the aggregate
+    count, only how it is described, and reclassifies nothing. Reads as a
+    neutral inventory ("N item(s) to weigh: ...") with a breakdown, not as a
+    defect count, since some categories (e.g. observed facts) are evidence
+    of certainty, not of an unresolved problem. Returns "" when the
+    aggregate is zero.
+    """
+    parts: list[str] = []
+    total = 0
+    for key, noun in _DECISION_RELEVANT_CATEGORY_LABELS:
+        count = len(known_findings.get(key) or [])
+        if count:
+            parts.append(f"{count} {noun}" + ("s" if count != 1 else ""))
+            total += count
+    if not parts:
+        return ""
+    item_noun = "item" if total == 1 else "items"
+    return f"{total} {item_noun} to weigh: " + " · ".join(parts)
+
+
 def _check_recommendation_consistency(signals: dict, decision: str, known_findings: dict) -> list[str]:
     """Surface already-displayed evidence that a top-tier recommendation does
     not acknowledge on its own.
@@ -1240,14 +1509,14 @@ def _check_recommendation_consistency(signals: dict, decision: str, known_findin
             )
         )
 
-    decision_relevant_count = _decision_relevant_finding_count(known_findings)
-    if decision_relevant_count > 0:
+    decision_relevant_summary = _describe_decision_relevant_findings(known_findings)
+    if decision_relevant_summary:
         caveats.append(
             _build_consistency_caveat(
                 "This recommendation's adversarial coverage is heuristic, not deterministically "
                 "confirmed — see Review Results below for the validation questions and remaining "
                 "uncertainties",
-                f"{decision_relevant_count} decision-relevant finding(s) remain open",
+                decision_relevant_summary,
             )
         )
 
@@ -1295,28 +1564,29 @@ def _render_top_action_line(validation_actions: list[dict] | None) -> str:
 
 def _render_manual_review_scope_note(decision: str, known_findings: dict) -> str:
     """Presentation-only scope note for Manual Review Required: surfaces the
-    same decision-relevant finding count `_check_recommendation_consistency`
+    same decision-relevant finding breakdown `_check_recommendation_consistency`
     already computes for the top two decisions (see
-    `_decision_relevant_finding_count`), so a reader triaging Manual Review
-    Required doesn't have to scroll to Review Results just to learn whether
-    one item or several are open.
+    `_describe_decision_relevant_findings`), so a reader triaging Manual
+    Review Required doesn't have to scroll to Review Results just to learn
+    what's behind the count.
 
     Deliberately NOT the "Evidence check" caveat mechanism, and deliberately
     different wording from it: that mechanism exists to flag that a
     CONFIDENT-sounding recommendation may be undercut by evidence the reader
     hasn't seen yet. Manual Review Required already reads as cautious — this
-    is scope information, not a warning, and never describes the open items
-    as defects. Returns "" when the decision isn't Manual Review Required or
-    when the count is zero (nothing to add beyond the reason already shown).
+    is scope information, not a warning. It describes the aggregate with a
+    category breakdown rather than a single "N remain open" number, since
+    some categories (observed facts) are evidence of certainty, not
+    necessarily of an unresolved defect. Returns "" when the decision isn't
+    Manual Review Required or when the aggregate is zero (nothing to add
+    beyond the reason already shown).
     """
     if decision != "Manual Review Required":
         return ""
-    count = _decision_relevant_finding_count(known_findings)
-    if count == 0:
+    summary = _describe_decision_relevant_findings(known_findings)
+    if not summary:
         return ""
-    noun = "item" if count == 1 else "items"
-    verb = "remains" if count == 1 else "remain"
-    return f"\n{count} decision-relevant review {noun} {verb} open — see Review Results below for details.\n"
+    return f"\n{summary} — see Review Results below for details.\n"
 
 
 def _render_recommendation_block(
@@ -1395,10 +1665,18 @@ def _render_known_findings(findings: dict) -> str:
         lines.append("")
 
     if observed:
-        lines.append("### Confirmed Observations\n")
+        # Release-polish rename: "Observed" is an evidence-status axis
+        # (directly backed by repository/diff evidence vs. inferred), not a
+        # severity or polarity axis — an observed fact can be reassuring,
+        # neutral, or concerning. "Confirmed Observations" read, to a
+        # skimmer, like a list of confirmed problems; nothing here is
+        # reclassified, only relabeled.
+        lines.append("### Observed Facts\n")
         lines.append(
             "*Directly backed by the repository evidence or patch diff shown "
-            "to the reviewer — not merely inferred.*\n"
+            "to the reviewer — not merely inferred. This describes evidence "
+            "status, not severity: an observed fact may be reassuring, "
+            "neutral, or concerning — read each one in context.*\n"
         )
         for o in observed:
             lines.append(f"- {o}")
@@ -1779,6 +2057,14 @@ def _render_repair_notice(result: PipelineResult) -> str:
     real, re-challenge-derived number when `repair_rechallenged` is True — it
     is otherwise an untouched default and must never be printed as if it were
     a finding.
+
+    Acceptance (repair_succeeded) is now decided by accept_repair against
+    calibration-aware findings, not by repair_defect_count == 0 alone — a
+    repair can be accepted with a nonzero raw repair_defect_count if every
+    such finding calibrated away from Observed. The success branch below
+    says "0 calibration-confirmed defect(s)", which is true by construction
+    whenever repair_succeeded is True, rather than a raw count that could
+    otherwise contradict the calibrated outcome.
     """
     if not result.repair_attempted:
         return ""
@@ -1786,7 +2072,8 @@ def _render_repair_notice(result: PipelineResult) -> str:
         return (
             f"\n> **Auto-repaired:** Original patch had "
             f"{result.original_challenger_defect_count} confirmed defect(s). "
-            f"A repair was generated and accepted — re-challenge found 0 confirmed defect(s).\n"
+            f"A repair was generated and accepted — re-challenge found 0 "
+            f"calibration-confirmed defect(s).\n"
         )
     if result.repair_rechallenged:
         return (
@@ -1891,7 +2178,19 @@ def _build_report(result: PipelineResult) -> str:
             adv_parts_early.append(f"- {p}")
     adv_text_early = "\n".join(adv_parts_early).strip()
     findings_early = extract_findings(adv_text_early) if adv_text_early else []
-    suggestions = suggest_tests(findings_early, behavior=behavior) if (findings_early or behavior) else []
+    # Release-polish: behavior_summary's generic fallback ("application
+    # logic" / "normal flow" / "edge-case handling") carries no
+    # patch-specific signal — suppress ONLY the behavior-derived suggested
+    # tests it would otherwise generate (test_normal_flow /
+    # test_edge_case_handling) by not passing `behavior` through when
+    # `is_generic` is set. Challenger-finding-derived suggestions
+    # (`findings_early`) are untouched; specific (non-generic) behavior
+    # summaries are untouched.
+    _behavior_for_tests = None if (behavior or {}).get("is_generic") else behavior
+    suggestions = (
+        suggest_tests(findings_early, behavior=_behavior_for_tests)
+        if (findings_early or _behavior_for_tests) else []
+    )
 
     # F-01: no Path.cwd() fallback — when no repository root was provided,
     # this repository-dependent signal is skipped entirely rather than
@@ -2046,7 +2345,11 @@ def _build_report(result: PipelineResult) -> str:
 
         # If a behavior summary is provided, ensure a single behavior-driven
         # validation action is prepended. Keep this minimal and deterministic.
-        if behavior:
+        # Release-polish: suppressed when behavior_summary reports its
+        # generic fallback (`is_generic`) — "Validate behavior: normal flow,
+        # edge-case handling" carries no patch-specific signal in that case.
+        # Specific (non-generic) behavior summaries are unaffected.
+        if behavior and not behavior.get("is_generic"):
             try:
                 pbs = behavior.get("primary_behaviors") or []
                 # comma-separated first 4 primary behaviors
@@ -2079,8 +2382,27 @@ def _build_report(result: PipelineResult) -> str:
     # -----------------------
     classified_challenger = _classify_challenger(challenger)
     impact_level_str = _resolve_impact_level(result.impact)  # I2
+    # Calibration-aware authoritative finding state, computed before Trust
+    # Signals/Recommendation so both read the SAME post-calibration defect
+    # count the report itself renders under "Potential Remaining Risks" —
+    # see _build_known_findings. A raw confirmed_defect finding that Finding
+    # Calibration downgraded to Hypothesis/Hardening must never still be
+    # counted as a confirmed defect here; only its calibration_by_original
+    # lookup (fail-closed if missing) decides that, not the raw classifier
+    # count alone.
+    known_findings = _build_known_findings(classified_challenger, result.finding_calibration)
+    calibrated_defect_count = len(known_findings["potential_remaining_risks"])
     signals = _compute_trust_signals(
-        result.hygiene, result.applicability, classified_challenger, rating, impact_level_str
+        result.hygiene,
+        result.applicability,
+        # Only confirmed_defect_count is overridden -- plausible_risk_count/
+        # validation_gap_count intentionally stay the raw, pre-calibration
+        # figures that already back coverage_confidence's separately
+        # labeled "before evidence calibration" count (release-polish
+        # decision; see that signal's own notes).
+        {**classified_challenger, "confirmed_defect_count": calibrated_defect_count},
+        rating,
+        impact_level_str,
     )
     # Evidence Sufficiency Gate (Phase 1) -- merged in as a NEW key, separate
     # from _compute_trust_signals itself, so that function's own six-signal
@@ -2095,7 +2417,7 @@ def _build_report(result: PipelineResult) -> str:
     trust_rec = _build_recommendation_v1(
         signals,
         still_vulnerable=classified_challenger.get("still_vulnerable", False),
-        defect_count=classified_challenger.get("confirmed_defect_count", 0),
+        defect_count=calibrated_defect_count,
     )
     # Demo polish: surface the already-computed decision on stdout the moment
     # it's known. Reuses the existing decision->emoji mapping (Hero Banner) —
@@ -2111,7 +2433,7 @@ def _build_report(result: PipelineResult) -> str:
     else:
         print(f"[pipeline] Recommendation:\n{_DECISION_CARD_EMOJI.get(trust_rec['decision'], '⚪')} {trust_rec['decision']}", file=sys.stderr)
     security_gain = _extract_security_gain(review_sections.get("explanation", ""))
-    known_findings = _build_known_findings(classified_challenger, result.finding_calibration)
+    # known_findings already computed above (calibration-aware, feeds signals/trust_rec).
     # Gate the Trust Signals table's forward pointer on the same finding
     # categories that back remediation_alignment/coverage_confidence
     # (risks/hypotheses/observed/gaps) — Future Hardening Ideas isn't
@@ -2141,8 +2463,22 @@ def _build_report(result: PipelineResult) -> str:
             scope_note=manual_review_scope_note,
             top_action_line=top_action_line,
         )
-    trust_signals_block = _render_trust_signals_table(signals, known_findings_rendered=known_findings_relevant)
-    known_findings_block = _render_known_findings(known_findings)
+    if no_patch:
+        # Same execution-outcome rationale as decision_card/recommendation_
+        # block above: with no final candidate patch, `challenger` is {}
+        # (no Challenger call was ever made -- see the no-candidate-patch
+        # early stop in run()) and `signals`/`known_findings` above are
+        # therefore derived from that empty state, not from genuine
+        # adversarial review. Rendering them would show a misleadingly
+        # confident Trust Signals table (e.g. remediation_alignment=
+        # "Aligned" / "Adversarial review confirms fix approach") and an
+        # empty "## Review Results" section that never ran. Neither
+        # section is meaningful without a patch to have reviewed.
+        trust_signals_block = ""
+        known_findings_block = ""
+    else:
+        trust_signals_block = _render_trust_signals_table(signals, known_findings_rendered=known_findings_relevant)
+        known_findings_block = _render_known_findings(known_findings)
     validation_actions_block = _render_validation_actions_section(validation_actions, trust_rec["decision"])
     primary_refs_block = _render_primary_references(_extract_primary_references(result.vulnerability_text))
 
@@ -2251,29 +2587,39 @@ def _build_report(result: PipelineResult) -> str:
     # disclaimer states the epistemic status of this whole section once,
     # rather than requiring per-sentence hedging of LLM-generated prose this
     # pipeline cannot rewrite without a new semantic classifier.
-    report += "---\n\n## Explanation\n\n"
-    report += (
-        "*This explanation reflects the reviewer LLM's analysis of the advisory, "
-        "diff, and any injected code context — not independent execution or "
-        "testing against the target repository.*\n\n"
-    )
-    explanation_text = review_sections["explanation"]
-    if security_gain:
-        report += f"**Security gain:** {security_gain}\n\n"
-        # security_gain is extracted verbatim from this same explanation
-        # text (see _extract_security_gain) — drop that one copy from the
-        # body so the sentence isn't shown twice.
-        if security_gain in explanation_text:
-            explanation_text = explanation_text.replace(security_gain, "", 1)
-            explanation_text = re.sub(r"^[ \t]+", "", explanation_text, flags=re.MULTILINE)
-            # Rendering-only fix: when the stripped sentence was the entire
-            # body of a numbered/bulleted list item, removing it leaves a
-            # bare marker behind (e.g. a dangling "1." with nothing after
-            # it). Drop such now-empty marker lines — a list marker with no
-            # body is never meaningful output, regardless of why it emptied.
-            explanation_text = re.sub(r"^[ \t]*(?:\d+\.|[-*])[ \t]*\n", "", explanation_text, flags=re.MULTILINE)
-            explanation_text = re.sub(r"\n{3,}", "\n\n", explanation_text).strip()
-    report += f"""{explanation_text}
+    #
+    # Suppressed entirely for no_patch: review_sections comes solely from
+    # result.review, which the Patch Reviewer never produced for this run
+    # (see the no-candidate-patch early stop in run()) -- rendering this
+    # heading with empty/fallback body text would still read as "patch-
+    # review prose" the reader might mistake for a real, if brief, review.
+    if not no_patch:
+        report += "---\n\n## Explanation\n\n"
+        report += (
+            "*This explanation reflects the reviewer LLM's analysis of the advisory, "
+            "diff, and any injected code context — not independent execution or "
+            "testing against the target repository. Any statement that a fix "
+            "\"matches\" or \"aligns with\" an upstream release reflects the "
+            "model's own prior knowledge, not a fetched or independently verified "
+            "upstream comparison.*\n\n"
+        )
+        explanation_text = review_sections["explanation"]
+        if security_gain:
+            report += f"**Security gain:** {security_gain}\n\n"
+            # security_gain is extracted verbatim from this same explanation
+            # text (see _extract_security_gain) — drop that one copy from the
+            # body so the sentence isn't shown twice.
+            if security_gain in explanation_text:
+                explanation_text = explanation_text.replace(security_gain, "", 1)
+                explanation_text = re.sub(r"^[ \t]+", "", explanation_text, flags=re.MULTILINE)
+                # Rendering-only fix: when the stripped sentence was the entire
+                # body of a numbered/bulleted list item, removing it leaves a
+                # bare marker behind (e.g. a dangling "1." with nothing after
+                # it). Drop such now-empty marker lines — a list marker with no
+                # body is never meaningful output, regardless of why it emptied.
+                explanation_text = re.sub(r"^[ \t]*(?:\d+\.|[-*])[ \t]*\n", "", explanation_text, flags=re.MULTILINE)
+                explanation_text = re.sub(r"\n{3,}", "\n\n", explanation_text).strip()
+        report += f"""{explanation_text}
 
 """
 
@@ -2447,20 +2793,24 @@ def _build_report(result: PipelineResult) -> str:
             pass
 
     # Affected areas — a distinct reviewer-LLM output field, not duplicated
-    # elsewhere in the report.
-    report += f"""
+    # elsewhere in the report. Suppressed for no_patch -- same rationale as
+    # §7 Explanation above: review_sections has nothing genuine to show.
+    if not no_patch:
+        report += f"""
 ### Affected areas
 
 {review_sections["affected_areas"]}
 """
 
-    # Reviewer Notes — reviewer-specific advice not captured by Explanation,
-    # Validation Actions, or Known Findings. Moved into Appendices: it is
-    # supplementary, not part of the core "understand this in 30 seconds" flow.
-    report += f"""
+        # Reviewer Notes — reviewer-specific advice not captured by Explanation,
+        # Validation Actions, or Known Findings. Moved into Appendices: it is
+        # supplementary, not part of the core "understand this in 30 seconds" flow.
+        report += f"""
 ### Reviewer Notes
 
-*Reviewer-LLM guidance, not independently verified evidence.*
+*Reviewer-LLM guidance, not independently verified evidence. Any reference \
+to an upstream fix, release, or version number reflects the model's own \
+prior knowledge, not evidence this pipeline fetched or verified.*
 
 {review_sections["validation_notes"]}
 """
@@ -2570,6 +2920,113 @@ def _build_retry_hint(stderr: str, failed_file: str) -> str:
         "Keep the same fix logic; only update the surrounding context lines "
         "to match the actual code exactly."
     )
+
+
+# ---------------------------------------------------------------------------
+# Patch Generator response-contract enforcement
+#
+# Orchestration only — classification itself (classify_patch_response) is
+# pure and lives in patch_generator.py; this is the decision, made here and
+# only here, about whether a contract violation warrants one bounded retry.
+# generate_patch()/generate_patch_raw() never retry internally; this
+# function is what may make a second LLM call, and it is capped at exactly
+# one. Deliberately NOT wired into every generate_patch() call site — see
+# the two call sites below that use it (initial generation, applicability-
+# aware retry) and their own comments for why those two and not the other
+# two (Slice 4 Post-Patch Recovery regeneration, Challenger-repair loop).
+# ---------------------------------------------------------------------------
+
+_CONTRACT_VIOLATION_RETRY_HINT = (
+    "Your previous response violated the required output format: it must contain "
+    "exactly one fenced ```diff block and nothing else — no prose, no explanation, "
+    "no alternative patches, no self-correction. Output ONLY your single, final, "
+    "best patch as one ```diff fenced block. Nothing before it, nothing after it."
+)
+
+_CONTRACT_RETRY_STAGE = "patch_generation_contract_retry"
+
+
+def _generate_patch_with_contract_check(
+    vulnerability_text: str,
+    llm,
+    code_context: str = "",
+    retry_hint: str = "",
+) -> "tuple[str, str, int]":
+    """Make one Patch Generator call, classify it, and — ONLY for
+    status == "contract_violation" (2+ candidate diff blocks, or one block
+    with non-whitespace prose around it) — make exactly one further call
+    with an explicit contract-violation hint before giving up. Never loops;
+    at most 2 LLM calls total.
+
+    "no_diff" and "malformed_fence" are passed through unretried — neither
+    is a formatting problem a stricter instruction would fix (see
+    classify_patch_response's own docstring for why).
+
+    The retry call is traced under stage="patch_generation_contract_retry"
+    (see generate_patch_raw's `stage` parameter) so a future trace shows
+    e.g. "003_patch_generation" followed by
+    "004_patch_generation_contract_retry" — never two indistinguishable
+    "patch_generation" entries.
+
+    Returns (patch, final_status, llm_calls_made):
+      patch          -- the single valid diff when final_status == "valid".
+                        When no retry ran (first response already valid or
+                        already "no_diff"/"malformed_fence"), the exact
+                        same value generate_patch() has always returned for
+                        that status (raw.strip() for "no_diff", "" for
+                        "malformed_fence"). When a retry DID run and its
+                        response is still not "valid" (including a retry
+                        that itself comes back "no_diff"), `patch` is
+                        always "" — never the retry's raw.strip() text —
+                        because both call sites below decide "keep the
+                        original patch" / "skip validation" partly by
+                        checking `patch` truthiness, and a contract-
+                        violation retry's leftover prose must never be
+                        mistaken for a candidate to validate.
+      final_status   -- "valid" | "no_diff" | "malformed_fence" |
+                        "contract_violation" — the LAST classification
+                        produced (i.e. the retry's, when a retry ran).
+                        Callers should prefer this over `patch == ""` to
+                        distinguish "no usable patch because the response
+                        was invalid" from any other empty-patch reason —
+                        see the two call sites below.
+      llm_calls_made -- 1 or 2, for observability/tests.
+    """
+    raw = generate_patch_raw(vulnerability_text, llm, code_context=code_context, retry_hint=retry_hint)
+    result = classify_patch_response(raw)
+    if result.status != "contract_violation":
+        return result.diff, result.status, 1
+
+    print(
+        f"[pipeline] Patch Generator response violated the output contract "
+        f"({result.block_count} candidate diff block(s) and/or surrounding prose) "
+        "— retrying once with an explicit contract reminder …",
+        file=sys.stderr,
+    )
+    combined_hint = (retry_hint + "\n\n" if retry_hint else "") + _CONTRACT_VIOLATION_RETRY_HINT
+    retry_raw = generate_patch_raw(
+        vulnerability_text, llm, code_context=code_context, retry_hint=combined_hint,
+        stage=_CONTRACT_RETRY_STAGE,
+    )
+    retry_result = classify_patch_response(retry_raw)
+    if retry_result.status == "valid":
+        print("[pipeline] Contract-violation retry succeeded — single valid diff produced.", file=sys.stderr)
+        return retry_result.diff, retry_result.status, 2
+
+    # Anything other than "valid" after the one bounded retry fails closed
+    # uniformly — including "no_diff": once the model has been explicitly
+    # told to output ONLY one diff block and still doesn't produce one,
+    # that response's text must not leak into `patch` as if it were an
+    # ordinary candidate either (both call sites below decide "keep
+    # original"/"skip validation" partly by checking `patch` truthiness,
+    # not only `final_status` — so `diff` must actually BE "" here, not
+    # merely be labelled non-"valid").
+    print(
+        f"[pipeline] Contract-violation retry still invalid (status={retry_result.status}) "
+        "— failing closed.",
+        file=sys.stderr,
+    )
+    return "", retry_result.status, 2
 
 
 # ---------------------------------------------------------------------------
@@ -3041,6 +3498,40 @@ def run(
                         file=sys.stderr,
                     )
 
+            # Bounded target-file fallback: a known-verified Final Strategy
+            # target file whose specific symbol never resolved (through
+            # Slice 2's deterministic retries or Slice 3's guided
+            # acquisition above) must not, by itself, force "no patch" --
+            # not when that file's own whole-file source was ALREADY
+            # rendered into the slice as a matter of course (category 5 of
+            # build_final_target_slice, computed the very first time this
+            # file became a target). This re-derives readiness from data
+            # already computed above -- no new file read, no new
+            # resolution, no LLM call -- via check_edit_readiness's own
+            # existing full_file_fallback_covered/identifier_definition_
+            # covered signals, which are themselves fixed by the Final
+            # Strategy's own verified target_files before this ever runs,
+            # so an unverified/LLM-invented file can never qualify. Applied
+            # exactly once, only here, only after guided acquisition has
+            # already been exhausted -- every earlier readiness check
+            # above (Slice 1/2/3) keeps its own exact, stricter semantics
+            # unchanged.
+            _target_file_fallback_used = False
+            if not _edit_readiness.edit_source_ready:
+                _fallback_readiness = check_edit_readiness(
+                    _intended_edits, _slice_result, allow_full_file_fallback_for_symbols=True,
+                )
+                if _fallback_readiness.edit_source_ready:
+                    _target_file_fallback_used = True
+                    print(
+                        "[pipeline] Target-file source fallback: symbol-level acquisition never "
+                        "resolved, but the Final Strategy's own verified target file(s) "
+                        f"{sorted(_slice_result.full_file_fallback_covered)} were already rendered "
+                        "in full -- Patch Generation will proceed using that source.",
+                        file=sys.stderr,
+                    )
+                _edit_readiness = _fallback_readiness
+
             if os.environ.get("AUTOPATCHER_DEBUG"):
                 try:
                     import datetime as _dt
@@ -3137,6 +3628,7 @@ def run(
                         "deterministic_acquisition": _deterministic_doc,
                         "readiness_after_deterministic_acquisition": _readiness_doc(_readiness_after_deterministic),
                         "guided_acquisition": _guided_doc,
+                        "target_file_fallback_used": _target_file_fallback_used,
                         "final_edit_readiness": _readiness_doc(_edit_readiness),
                         "patch_generation_skipped": not _edit_readiness.edit_source_ready,
                         # Best-effort only -- see ContextBudgetController.to_trace_dict();
@@ -3177,12 +3669,48 @@ def run(
     ]
     code_context = "\n\n".join(_ctx_parts)
 
+    # _patch_validation_skip_reason distinguishes, for observability, WHY
+    # patch/hunk-repair/hygiene/applicability validation is being skipped —
+    # never conflated into a single generic flag. Both reasons converge on
+    # the same downstream behavior (validation machinery never runs; the
+    # already-existing empty-patch/no_patch execution outcome renders), but
+    # the reason itself must stay legible: "no verified final-target
+    # source" (Recommendation-Policy-relevant evidence gap) is a materially
+    # different situation from "the model's response was structurally
+    # invalid" (an LLM output-contract failure) — see the module-level
+    # correction this section implements: an invalid Patch Generator
+    # response must fail closed BEFORE hunk repair/hygiene/git apply
+    # --check/applicability-aware retry, not merely collapse to "" and let
+    # "" flow through that machinery as if it were an ordinary empty patch.
+    _patch_validation_skip_reason: str | None = None
+    _patch_generation_status: str | None = None  # set only when generation actually ran
     if _skip_patch_generation:
         print("[pipeline] Step 1/4 – Patch Generation skipped (no verified final-target source).", file=sys.stderr)
         patch = ""
+        _patch_validation_skip_reason = "no verified final-target source"
     else:
         print("[pipeline] Step 1/4 – Generating patch …", file=sys.stderr)
-        patch = generate_patch(vulnerability_text, llm, code_context=code_context)
+        patch, _patch_generation_status, _patch_generation_llm_calls = _generate_patch_with_contract_check(
+            vulnerability_text, llm, code_context=code_context,
+        )
+        # Only a contract-violation retry that STILL isn't valid (2 calls
+        # made, final status not "valid") gets the new skip-validation
+        # treatment. A first response that's already "no_diff" or
+        # "malformed_fence" (1 call, no retry attempted) is deliberately
+        # UNCHANGED from pre-existing behavior — those two states are out
+        # of this task's scope; only "contract_violation" is new, and it
+        # only ever reaches this point after its own bounded retry (see
+        # _generate_patch_with_contract_check).
+        if _patch_generation_llm_calls == 2 and _patch_generation_status != "valid":
+            _patch_validation_skip_reason = (
+                f"Patch Generator response invalid (status={_patch_generation_status}) "
+                f"after bounded contract regeneration ({_patch_generation_llm_calls} call(s))"
+            )
+            print(
+                f"[pipeline] Step 1/4 – {_patch_validation_skip_reason} — "
+                "treating as no patch produced; skipping hunk repair/hygiene/applicability.",
+                file=sys.stderr,
+            )
 
     # Hunk header repair — recompute @@ counts from body, and (with repo_root)
     # relocate a drifted old-side line number by content; never blocks the pipeline
@@ -3194,19 +3722,20 @@ def run(
     # describes the patch that's actually being reported on, never a
     # superseded earlier attempt.
     _final_repair_meta = None
-    try:
-        from .diff_hunk_repair import repair_hunk_headers
-        patch, _repair_meta = repair_hunk_headers(patch, repo_root=repo_root)
-        _final_repair_meta = _repair_meta
-        if _repair_meta.normalization_applied:
-            print(
-                f"[pipeline] Hunk headers repaired: "
-                f"{_repair_meta.hunks_rewritten} hunk(s) in "
-                f"{_repair_meta.files_rewritten} file(s)"
-                f" ({_repair_meta.hunks_relocated} relocated by content)"
-            , file=sys.stderr)
-    except Exception:
-        pass
+    if _patch_validation_skip_reason is None:
+        try:
+            from .diff_hunk_repair import repair_hunk_headers
+            patch, _repair_meta = repair_hunk_headers(patch, repo_root=repo_root)
+            _final_repair_meta = _repair_meta
+            if _repair_meta.normalization_applied:
+                print(
+                    f"[pipeline] Hunk headers repaired: "
+                    f"{_repair_meta.hunks_rewritten} hunk(s) in "
+                    f"{_repair_meta.files_rewritten} file(s)"
+                    f" ({_repair_meta.hunks_relocated} relocated by content)"
+                , file=sys.stderr)
+        except Exception:
+            pass
 
     # Candidate 1 relocation telemetry — observability only. Independently
     # recomputes both a WITHOUT-relocation and a WITH-relocation variant of
@@ -3477,23 +4006,42 @@ def run(
         except Exception:
             pass
 
-    # Patch hygiene — deterministic, best-effort, never blocks the pipeline
-    try:
-        from .patch_hygiene import check_patch
-        hygiene_findings = check_patch(patch)
-    except Exception:
+    # Patch hygiene — deterministic, best-effort, never blocks the pipeline.
+    # Skipped (not merely no-op'd on "") when _patch_validation_skip_reason
+    # is set: an invalid Patch Generator response must never reach this —
+    # or the applicability/retry machinery below — as if it were an
+    # ordinary empty candidate. See the reason captured at Step 1/4 above.
+    if _patch_validation_skip_reason is not None:
         hygiene_findings = []
+    else:
+        try:
+            from .patch_hygiene import check_patch
+            hygiene_findings = check_patch(patch)
+        except Exception:
+            hygiene_findings = []
 
-    # Patch applicability — git apply --check, read-only, best-effort
-    try:
-        from .patch_applicability import check_applicability
-        applicability_result = check_applicability(patch, repo_root)
-    except Exception:
+    # Patch applicability — git apply --check, read-only, best-effort.
+    # Same skip as hygiene above: `applicable` is explicitly None (never
+    # False) so the deterministic-context-reconstruction and applicability-
+    # aware-retry blocks below — both gated on `applicable is False` — stay
+    # naturally, correctly inert for this reason, with no changes needed to
+    # either block's own logic.
+    if _patch_validation_skip_reason is not None:
         applicability_result = {
-            "applicable": None, "skipped": False, "skipped_reason": None,
-            "error": "applicability check failed unexpectedly",
-            "exit_code": None, "stderr": "",
+            "applicable": None, "skipped": True,
+            "skipped_reason": _patch_validation_skip_reason,
+            "error": None, "exit_code": None, "stderr": "",
         }
+    else:
+        try:
+            from .patch_applicability import check_applicability
+            applicability_result = check_applicability(patch, repo_root)
+        except Exception:
+            applicability_result = {
+                "applicable": None, "skipped": False, "skipped_reason": None,
+                "error": "applicability check failed unexpectedly",
+                "exit_code": None, "stderr": "",
+            }
 
     # Deterministic context reconstruction — runs ONLY after the repaired
     # patch has already failed the applicability check above, and ONLY
@@ -3597,13 +4145,33 @@ def run(
                         )
                     retry_attempted = True
                     hint = _build_retry_hint(stderr, failed_file)
-                    r_patch_raw = generate_patch(
+                    # Same contract check as the initial generation call
+                    # (Step 1/4 above) — a contract-violating regeneration
+                    # response must behave like "the applicability retry
+                    # failed to produce a usable replacement", never like
+                    # "here is an empty candidate to validate". r_patch_raw
+                    # is already "" for "malformed_fence" and for
+                    # "contract_violation" that's still invalid after its
+                    # own bounded retry, so the pre-existing falsy check
+                    # below already keeps the original patch and never
+                    # calls repair_hunk_headers/check_patch/
+                    # check_applicability on it — no separate branch
+                    # needed. "no_diff" (a genuinely empty/non-fenced
+                    # response) is unchanged from before this fix.
+                    r_patch_raw, r_status, r_llm_calls = _generate_patch_with_contract_check(
                         vulnerability_text, llm,
                         code_context=actual_content,
                         retry_hint=hint,
                     )
                     if not r_patch_raw or not r_patch_raw.strip():
-                        print("[pipeline] Retry produced an empty patch; keeping original.", file=sys.stderr)
+                        if r_status in ("malformed_fence", "contract_violation"):
+                            print(
+                                f"[pipeline] Retry's Patch Generator response was invalid "
+                                f"(status={r_status}, {r_llm_calls} call(s)) — keeping original.",
+                                file=sys.stderr,
+                            )
+                        else:
+                            print("[pipeline] Retry produced an empty patch; keeping original.", file=sys.stderr)
                     else:
                         _r_repair_meta = None
                         try:
@@ -3651,7 +4219,10 @@ def run(
     _post_patch_coverage: "CoverageResult | None" = None
     _post_patch_ctx = ""
     _investigated_patch: str | None = None
-    if repo_root and _pre_patch_anchors:
+    # No candidate patch -- there is no "post-patch" state to investigate;
+    # skip entirely rather than evaluate an isolated copy against an empty
+    # diff (see the no-candidate-patch early stop below, which this joins).
+    if patch and patch.strip() and repo_root and _pre_patch_anchors:
         try:
             from .patch_workspace import temporary_repo_copy
             from .patch_applicability import apply_patch
@@ -3708,11 +4279,45 @@ def run(
 
     challenger_context = code_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else "")
 
-    print("[pipeline] Step 2/4 – Challenging patch …", file=sys.stderr)
-    challenger = challenge_patch(vulnerability_text, patch, llm, code_context=challenger_context)
+    # No-candidate-patch early stop: once Patch Generation has definitively
+    # ended without a valid candidate, every remaining patch-dependent
+    # review stage (Challenger, the Challenger-driven repair loop, Finding
+    # Calibration, the Patch Reviewer, and Confidence Scorer below) must
+    # not run against an empty diff -- there is nothing to challenge,
+    # calibrate, review, or score, and doing so previously produced
+    # internally contradictory output (e.g. "Still vulnerable: No" /
+    # "Adversarial review confirms fix approach" with no patch at all).
+    # `challenger = {}` alone is sufficient to also correctly skip the
+    # repair loop and Finding Calibration below WITHOUT any change to
+    # either's own decision logic: _classify_challenger({}) yields
+    # confirmed_defect_count == 0 and empty classified-finding lists, and
+    # both the repair loop's trigger and the calibration-input filter
+    # already key off exactly those derived values.
+    if patch and patch.strip():
+        print("[pipeline] Step 2/4 – Challenging patch …", file=sys.stderr)
+        challenger = challenge_patch(vulnerability_text, patch, llm, code_context=challenger_context)
+    else:
+        print(
+            "[pipeline] Step 2/4 – Challenging patch skipped (no candidate patch was produced).",
+            file=sys.stderr,
+        )
+        challenger = {}
 
     # Phase C: Challenger-driven repair loop.
-    # Fires once when the patch applies cleanly but has confirmed security defects.
+    #
+    # Flow: Patch v1 -> Challenger v1 -> raw classification -> Finding
+    # Calibration v1 -> deterministic repair gate (should_auto_repair) ->
+    # optional Repair v2 -> deterministic applicability/hygiene checks ->
+    # Challenger v2 -> Finding Calibration v2 -> deterministic accept/reject
+    # (accept_repair) -> continue.
+    #
+    # Calibration is deliberately run here, early, rather than only after
+    # this block (as before) -- but ONLY when there is at least one raw
+    # confirmed_defect finding to gate on. When there are none
+    # (_orig_defect_count == 0, the common case), this block does nothing
+    # and calibration runs exactly once, later, at its original position
+    # and cost (see the "Finding calibration" block below) -- no extra LLM
+    # call is added for the all-clear path.
     _repair_classified = _classify_challenger(challenger)
     _orig_defect_count = _repair_classified["confirmed_defect_count"]
 
@@ -3722,70 +4327,133 @@ def run(
     repair_challenger_result: dict | None = None
     repair_defect_count = 0
     repair_rechallenged = False
+    finding_calibration: list[dict] | None = None
 
-    if (
-        applicability_result.get("applicable") is True
-        and _orig_defect_count > 0
-    ):
-        try:
-            repair_attempted = True
-            _confirmed_texts = [
-                f["text"]
-                for f in (
-                    _repair_classified["classified_edge_cases"]
-                    + _repair_classified["classified_potential_issues"]
-                )
-                if f["category"] == "confirmed_defect"
-            ]
-            print(
-                f"[pipeline] Repair loop – {_orig_defect_count} confirmed defect(s) found; "
-                "attempting one repair …"
-            , file=sys.stderr)
-            _r_hint = _build_repair_hint(_confirmed_texts)
-            _r_raw = generate_patch(
-                vulnerability_text, llm,
-                code_context=code_context,
-                retry_hint=_r_hint,
+    if _orig_defect_count > 0:
+        # Finding Calibration v1: widened to include confirmed_defect
+        # findings (not just plausible_risk/generic) so the repair gate
+        # below reads calibration-aware state, not the raw regex
+        # classification alone. Best-effort: a failure leaves
+        # _calibration_v1 as None, which _build_known_findings treats as
+        # "no calibration entry" -- fail-closed, every confirmed_defect
+        # finding stays classified as a defect, and should_auto_repair
+        # therefore still may authorize repair on the raw evidence (see
+        # its own docstring) rather than silently clearing.
+        _calibration_inputs_v1 = [
+            f["text"]
+            for f in (
+                _repair_classified["classified_edge_cases"]
+                + _repair_classified["classified_potential_issues"]
             )
-            _repair_loop_meta = None
+            if f["category"] in ("confirmed_defect", "plausible_risk", "generic")
+        ]
+        _post_patch_evidence_current_v1 = (
+            _post_patch_observations is not None and patch == _investigated_patch
+        )
+        _calibration_v1: list[dict] | None = None
+        try:
+            _calibration_v1 = calibrate_findings(
+                vulnerability_text, patch, _calibration_inputs_v1, llm,
+                code_context=(challenger_context if _post_patch_evidence_current_v1 else code_context),
+            )
+        except Exception as _exc:
+            print(f"[pipeline] Finding calibration (v1) failed (non-fatal): {_exc}", file=sys.stderr)
+        _known_findings_v1 = _build_known_findings(_repair_classified, _calibration_v1)
+        # This IS the final calibration unless repair is both authorized
+        # and later accepted below (see accept_repair branch, which
+        # overwrites this with _calibration_v2).
+        finding_calibration = _calibration_v1
+
+        if should_auto_repair(_repair_classified, _calibration_v1, applicability_result.get("applicable") is True):
             try:
-                from .diff_hunk_repair import repair_hunk_headers
-                _r_raw, _repair_loop_meta = repair_hunk_headers(_r_raw, repo_root=repo_root)
-            except Exception:
-                pass
-            _r_hygiene: list = []
-            try:
-                from .patch_hygiene import check_patch
-                _r_hygiene = check_patch(_r_raw)
-            except Exception:
-                pass
-            from .patch_applicability import check_applicability as _check_app
-            _r_app = _check_app(_r_raw, repo_root)
-            repair_patch_content = _r_raw
-            if _r_app.get("applicable") is True:
-                _r_challenger = challenge_patch(vulnerability_text, _r_raw, llm, code_context=code_context)
-                _r_classified = _classify_challenger(_r_challenger)
-                repair_defect_count = _r_classified["confirmed_defect_count"]
-                repair_rechallenged = True
-                repair_challenger_result = _r_challenger
-                if repair_defect_count == 0:
-                    repair_succeeded = True
-                    patch = _r_raw
-                    challenger = _r_challenger
-                    hygiene_findings = _r_hygiene
-                    applicability_result = _r_app
-                    if _repair_loop_meta is not None:
-                        _final_repair_meta = _repair_loop_meta
-                    print("[pipeline] Repair succeeded – 0 confirmed defects after re-challenge.", file=sys.stderr)
+                repair_attempted = True
+                _confirmed_texts = [
+                    f["text"]
+                    for f in (
+                        _repair_classified["classified_edge_cases"]
+                        + _repair_classified["classified_potential_issues"]
+                    )
+                    if f["category"] == "confirmed_defect"
+                ]
+                print(
+                    f"[pipeline] Repair loop – "
+                    f"{len(_known_findings_v1['potential_remaining_risks'])} calibration-confirmed "
+                    "defect(s) found; attempting one repair …"
+                , file=sys.stderr)
+                _r_hint = _build_repair_hint(_confirmed_texts)
+                _r_raw = generate_patch(
+                    vulnerability_text, llm,
+                    code_context=code_context,
+                    retry_hint=_r_hint,
+                )
+                _repair_loop_meta = None
+                try:
+                    from .diff_hunk_repair import repair_hunk_headers
+                    _r_raw, _repair_loop_meta = repair_hunk_headers(_r_raw, repo_root=repo_root)
+                except Exception:
+                    pass
+                _r_hygiene: list = []
+                try:
+                    from .patch_hygiene import check_patch
+                    _r_hygiene = check_patch(_r_raw)
+                except Exception:
+                    pass
+                from .patch_applicability import check_applicability as _check_app
+                _r_app = _check_app(_r_raw, repo_root)
+                repair_patch_content = _r_raw
+                _r_applicable = _r_app.get("applicable") is True
+                if _r_applicable:
+                    _r_challenger = challenge_patch(vulnerability_text, _r_raw, llm, code_context=code_context)
+                    _r_classified = _classify_challenger(_r_challenger)
+                    repair_defect_count = _r_classified["confirmed_defect_count"]
+                    repair_rechallenged = True
+                    repair_challenger_result = _r_challenger
+
+                    # Finding Calibration v2: freshly grounded on the
+                    # repaired patch and its own re-challenge -- v1's
+                    # calibration is never reused for v2's decision.
+                    _calibration_inputs_v2 = [
+                        f["text"]
+                        for f in (
+                            _r_classified["classified_edge_cases"]
+                            + _r_classified["classified_potential_issues"]
+                        )
+                        if f["category"] in ("confirmed_defect", "plausible_risk", "generic")
+                    ]
+                    _calibration_v2: list[dict] | None = None
+                    try:
+                        if _calibration_inputs_v2:
+                            _calibration_v2 = calibrate_findings(
+                                vulnerability_text, _r_raw, _calibration_inputs_v2, llm,
+                                code_context=code_context,
+                            )
+                    except Exception as _exc:
+                        print(f"[pipeline] Finding calibration (v2) failed (non-fatal): {_exc}", file=sys.stderr)
+                    _known_findings_v2 = _build_known_findings(_r_classified, _calibration_v2)
+
+                    if accept_repair(_r_classified, _calibration_v2, _r_applicable):
+                        repair_succeeded = True
+                        patch = _r_raw
+                        challenger = _r_challenger
+                        hygiene_findings = _r_hygiene
+                        applicability_result = _r_app
+                        finding_calibration = _calibration_v2
+                        if _repair_loop_meta is not None:
+                            _final_repair_meta = _repair_loop_meta
+                        print(
+                            "[pipeline] Repair succeeded – 0 calibration-confirmed defects "
+                            "after re-challenge.", file=sys.stderr
+                        )
+                    else:
+                        print(
+                            f"[pipeline] Repair rejected – "
+                            f"{len(_known_findings_v2['potential_remaining_risks'])} calibration-confirmed "
+                            "defect(s) remain; keeping original."
+                        , file=sys.stderr)
                 else:
-                    print(
-                        f"[pipeline] Repair rejected – {repair_defect_count} confirmed defect(s) "
-                        "remain; keeping original."
-                    , file=sys.stderr)
-            else:
-                print("[pipeline] Repair patch does not apply; keeping original.", file=sys.stderr)
-        except Exception as exc:
-            print(f"[pipeline] Repair loop failed unexpectedly: {exc}", file=sys.stderr)
+                    print("[pipeline] Repair patch does not apply; keeping original.", file=sys.stderr)
+            except Exception as exc:
+                print(f"[pipeline] Repair loop failed unexpectedly: {exc}", file=sys.stderr)
 
     # Evidence Sufficiency Gate (Phase 1) -- a deterministic Trust Signal,
     # computed here because everything above (the retry and challenger-repair
@@ -3838,33 +4506,57 @@ def run(
     # any failure leaves finding_calibration as None, and report rendering
     # falls back to the uncalibrated classifier text rather than losing
     # findings or crashing the run.
-    _final_classified = _classify_challenger(challenger)
-    _calibration_inputs = [
-        f["text"]
-        for f in (
-            _final_classified["classified_edge_cases"]
-            + _final_classified["classified_potential_issues"]
-        )
-        if f["category"] in ("plausible_risk", "generic")
-    ]
-    finding_calibration: list[dict] | None = None
-    if _calibration_inputs:
-        try:
-            finding_calibration = calibrate_findings(
-                vulnerability_text, patch, _calibration_inputs, llm,
-                code_context=(challenger_context if _post_patch_evidence_current else code_context),
+    #
+    # Only runs when the repair block above did NOT already compute the
+    # authoritative calibration (i.e. _orig_defect_count was 0 -- no raw
+    # confirmed_defect finding existed, so `challenger`/`patch` are still
+    # exactly what they were before the repair block, and this is
+    # identical to the pre-existing, unwidened plausible_risk/generic-only
+    # call). This is what keeps the common all-clear case free of any
+    # extra LLM call.
+    if finding_calibration is None:
+        _final_classified = _classify_challenger(challenger)
+        _calibration_inputs = [
+            f["text"]
+            for f in (
+                _final_classified["classified_edge_cases"]
+                + _final_classified["classified_potential_issues"]
             )
-        except Exception as _exc:
-            print(f"[pipeline] Finding calibration failed (non-fatal): {_exc}", file=sys.stderr)
+            if f["category"] in ("plausible_risk", "generic")
+        ]
+        if _calibration_inputs:
+            try:
+                finding_calibration = calibrate_findings(
+                    vulnerability_text, patch, _calibration_inputs, llm,
+                    code_context=(challenger_context if _post_patch_evidence_current else code_context),
+                )
+            except Exception as _exc:
+                print(f"[pipeline] Finding calibration failed (non-fatal): {_exc}", file=sys.stderr)
 
-    print("[pipeline] Step 3/4 – Reviewing patch …", file=sys.stderr)
-    review = review_patch(vulnerability_text, patch, llm)
+    # No-candidate-patch early stop (continued -- see the Challenger gate
+    # above): the Patch Reviewer and Confidence Scorer are equally
+    # patch-dependent and must not fabricate a review/score for a diff
+    # that does not exist.
+    if patch and patch.strip():
+        print("[pipeline] Step 3/4 – Reviewing patch …", file=sys.stderr)
+        review = review_patch(vulnerability_text, patch, llm)
 
-    print("[pipeline] Step 4/4 – Evaluating Trust Signals…", file=sys.stderr)
-    score_text = score_confidence(
-        vulnerability_text, patch, review, llm,
-        code_context=(challenger_context if _post_patch_evidence_current else code_context),
-    )
+        print("[pipeline] Step 4/4 – Evaluating Trust Signals…", file=sys.stderr)
+        score_text = score_confidence(
+            vulnerability_text, patch, review, llm,
+            code_context=(challenger_context if _post_patch_evidence_current else code_context),
+        )
+    else:
+        print(
+            "[pipeline] Step 3/4 – Reviewing patch skipped (no candidate patch was produced).",
+            file=sys.stderr,
+        )
+        print(
+            "[pipeline] Step 4/4 – Evaluating Trust Signals skipped (no candidate patch was produced).",
+            file=sys.stderr,
+        )
+        review = ""
+        score_text = ""
 
     # Adjust the numeric score based on adversarial challenger results
     orig_score_str = _extract_score(score_text)

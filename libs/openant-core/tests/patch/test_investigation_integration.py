@@ -50,18 +50,28 @@ def _write_auth_repo(root: Path) -> None:
 
 
 def _capture_generate_patch():
-    """Patch pipeline.generate_patch to record (vulnerability_text,
+    """Patch pipeline.generate_patch_raw to record (vulnerability_text,
     code_context) while still delegating to the real (mock-LLM)
     implementation, mirroring test_pipeline.py's TestPipelineCodeContext
-    convention."""
+    convention.
+
+    Release: response-contract enforcement moved the initial generation
+    call site (Site 1, what this helper's callers all exercise) from
+    generate_patch() to _generate_patch_with_contract_check() ->
+    generate_patch_raw() (both defined in pipeline.py) -- generate_patch()
+    itself is defined in patch_generator.py and resolves its own internal
+    generate_patch_raw() call against THAT module's namespace, so patching
+    "pipeline.generate_patch" no longer intercepts Site 1 at all; this now
+    patches the actual entry point Site 1 uses.
+    """
     captured: list[dict] = []
-    original = _pg_mod.generate_patch
+    original = _pg_mod.generate_patch_raw
 
-    def _capturing(vtext, llm, code_context="", retry_hint=""):
+    def _capturing(vtext, llm, code_context="", retry_hint="", stage="patch_generation"):
         captured.append({"vulnerability_text": vtext, "code_context": code_context})
-        return original(vtext, llm, code_context=code_context, retry_hint=retry_hint)
+        return original(vtext, llm, code_context=code_context, retry_hint=retry_hint, stage=stage)
 
-    return mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=_capturing), captured
+    return mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", side_effect=_capturing), captured
 
 
 class TestInvestigationRunsOnce:

@@ -447,6 +447,24 @@ class TestSinkMatchDeferred:
         obs = evaluate_anchors([anchor], None)[0]
         assert obs.status == "unresolved"
 
+    def test_details_are_user_facing_not_implementation_internal(self):
+        """Release-polish (Decision 6): the customer-facing note must not
+        leak implementation-internal identifiers/phrasing (Anchor,
+        evaluate_anchors(), vuln_class, anchor-derivation time, future
+        evaluation path) while still preserving uncertainty -- it must not
+        read as a completed or successful check."""
+        from utilities.autopatcher.post_patch_evaluation import evaluate_anchors
+
+        anchor = _sink_match_anchor()
+        obs = evaluate_anchors([anchor], None)[0]
+        for jargon in (
+            "vuln_class", "Anchor", "evaluate_anchors()",
+            "anchor-derivation", "future evaluation path",
+        ):
+            assert jargon not in obs.details
+        assert obs.status == "unresolved"
+        assert "not independently re-checked" in obs.details
+
 
 # ---------------------------------------------------------------------------
 # Missing context

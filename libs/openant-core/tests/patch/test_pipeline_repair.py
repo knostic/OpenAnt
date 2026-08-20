@@ -79,7 +79,24 @@ _APPLICABILITY_SKIPPED = {
 }
 
 
-def _capture_result(tmp_path, *, patches_gen, patches_app, patches_chall, repo_root=None):
+def _calibrate_all_observed(vulnerability_text, patch, findings, llm, code_context=""):
+    """Default Finding Calibration mock for this module: labels every
+    finding it's given "Observed". Since should_auto_repair/accept_repair
+    now require an EXPLICIT "observed" calibration entry before a raw
+    confirmed_defect finding can authorize or accept a mutation (see
+    pipeline.py), this reproduces -- for every test in this module that is
+    not specifically exercising the calibration gate itself -- the same
+    repair-triggering behavior this module tested before that gate
+    existed: repair fires whenever a raw confirmed_defect finding is
+    present and the patch applies. Tests that DO exercise the gate itself
+    (TestDeterministicRepairGate below) pass their own
+    calibration_side_effect explicitly instead of relying on this default.
+    """
+    return [{"original": f, "group": "observed", "reworded": f} for f in findings]
+
+
+def _capture_result(tmp_path, *, patches_gen, patches_app, patches_chall, repo_root=None,
+                     calibration_side_effect=None):
     """Run pipeline.run() with controlled mocks and capture the PipelineResult."""
     captured = {}
     import utilities.autopatcher.pipeline as _pipeline_mod
@@ -89,9 +106,21 @@ def _capture_result(tmp_path, *, patches_gen, patches_app, patches_chall, repo_r
         captured["result"] = r
         return orig_build(r)
 
+    # Release: response-contract enforcement moved the initial generation
+    # call site (Site 1) from generate_patch() to
+    # _generate_patch_with_contract_check() -> generate_patch_raw() (both
+    # defined in pipeline.py); the Challenger-repair loop (Site 4, what
+    # this test module exercises) still calls generate_patch() directly
+    # (patch_generator.py), unchanged. patches_gen[0] is always the Site 1
+    # response (every caller of this helper passes it first) -- mocking
+    # generate_patch_raw with it, and generate_patch with the REMAINING
+    # items, preserves every existing call's exact meaning: Site 1 always
+    # sees patches_gen[0], and Site 4's repair call sees patches_gen[1:] in
+    # the same order as before.
     with (
         mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
-        mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=patches_gen) as _mock_gen,
+        mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", return_value=patches_gen[0]),
+        mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=patches_gen[1:]) as _mock_gen,
         mock.patch("utilities.autopatcher.patch_applicability.check_applicability", side_effect=patches_app),
         mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok review"),
         mock.patch("utilities.autopatcher.pipeline.challenge_patch", side_effect=patches_chall) as _mock_chall,
@@ -99,6 +128,8 @@ def _capture_result(tmp_path, *, patches_gen, patches_app, patches_chall, repo_r
         mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
         mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
         mock.patch("utilities.autopatcher.pipeline._build_report", side_effect=_capture),
+        mock.patch("utilities.autopatcher.pipeline.calibrate_findings",
+                   side_effect=calibration_side_effect or _calibrate_all_observed) as _mock_calibrate,
     ):
         mock_llm_cls.return_value = mock.MagicMock()
         from utilities.autopatcher.pipeline import run
@@ -236,7 +267,7 @@ class TestRepairNotTriggered:
             patches_chall=[_CHALLENGER_CLEAN],
         )
         assert result.repair_attempted is False
-        assert mock_gen.call_count == 1
+        assert mock_gen.call_count == 0  # Site 4 (repair) never fires; Site 1 is now generate_patch_raw
         assert mock_chall.call_count == 1
 
     def test_no_repair_when_plausible_risk_only(self, tmp_path):
@@ -247,7 +278,7 @@ class TestRepairNotTriggered:
             patches_chall=[_CHALLENGER_RISK_ONLY],
         )
         assert result.repair_attempted is False
-        assert mock_gen.call_count == 1
+        assert mock_gen.call_count == 0  # Site 4 (repair) never fires; Site 1 is now generate_patch_raw
 
     def test_no_repair_when_applicable_false(self, tmp_path):
         # Patch doesn't apply — repair must not fire (applicability retry handles this)
@@ -258,7 +289,7 @@ class TestRepairNotTriggered:
             patches_chall=[_CHALLENGER_WITH_DEFECT],
         )
         assert result.repair_attempted is False
-        assert mock_gen.call_count == 1
+        assert mock_gen.call_count == 0  # Site 4 (repair) never fires; Site 1 is now generate_patch_raw
 
     def test_no_repair_when_applicable_none(self, tmp_path):
         result, mock_gen, mock_chall = _capture_result(
@@ -268,7 +299,7 @@ class TestRepairNotTriggered:
             patches_chall=[_CHALLENGER_WITH_DEFECT],
         )
         assert result.repair_attempted is False
-        assert mock_gen.call_count == 1
+        assert mock_gen.call_count == 0  # Site 4 (repair) never fires; Site 1 is now generate_patch_raw
 
     def test_urllib3_analog_passes_through_unchanged(self, tmp_path):
         # urllib3 pattern: applicable, no confirmed defects → single generate, single challenge
@@ -281,7 +312,7 @@ class TestRepairNotTriggered:
         assert result.repair_attempted is False
         assert result.repair_succeeded is False
         assert result.repair_patch is None
-        assert mock_gen.call_count == 1
+        assert mock_gen.call_count == 0  # Site 4 (repair) never fires; Site 1 is now generate_patch_raw
         assert mock_chall.call_count == 1
 
 
@@ -293,6 +324,12 @@ class TestRepairTriggered:
     """Repair fires when applicable=True and confirmed_defect_count > 0."""
 
     def test_repair_calls_generate_patch_twice(self, tmp_path):
+        """Release: response-contract enforcement moved the initial
+        generation call site (Site 1) to generate_patch_raw() (mocked via
+        patches_gen[0], see _capture_result) -- `mock_gen` here now
+        reflects only the repair loop's own generate_patch() call (Site 4),
+        so "twice" is: once for Site 1 (implicit, via patches_gen[0]) and
+        once here for the repair call."""
         result, mock_gen, mock_chall = _capture_result(
             tmp_path,
             patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
@@ -300,7 +337,7 @@ class TestRepairTriggered:
             patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_CLEAN],
         )
         assert result.repair_attempted is True
-        assert mock_gen.call_count == 2
+        assert mock_gen.call_count == 1
 
     def test_repair_calls_challenge_patch_twice(self, tmp_path):
         result, mock_gen, mock_chall = _capture_result(
@@ -312,13 +349,16 @@ class TestRepairTriggered:
         assert mock_chall.call_count == 2
 
     def test_repair_hint_passed_to_second_generate_call(self, tmp_path):
+        """`mock_gen` now reflects only the repair loop's own call (Site 4)
+        -- see test_repair_calls_generate_patch_twice -- so it is the FIRST
+        (and only) recorded call here, not the second."""
         result, mock_gen, mock_chall = _capture_result(
             tmp_path,
             patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
             patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
             patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_CLEAN],
         )
-        _args, kwargs = mock_gen.call_args_list[1]
+        _args, kwargs = mock_gen.call_args_list[0]
         hint = kwargs.get("retry_hint") or (len(_args) > 3 and _args[3]) or ""
         assert "bypass" in hint.lower()
 
@@ -329,7 +369,7 @@ class TestRepairTriggered:
             patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
             patches_chall=[_CHALLENGER_MIXED, _CHALLENGER_CLEAN],
         )
-        _args, kwargs = mock_gen.call_args_list[1]
+        _args, kwargs = mock_gen.call_args_list[0]
         hint = kwargs.get("retry_hint") or (len(_args) > 3 and _args[3]) or ""
         # confirmed defect text is in the hint
         assert "bypass" in hint.lower()
@@ -392,7 +432,8 @@ class TestRepairOutcomes:
         """When repair is accepted, review_patch must be called with the repair diff."""
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
-            mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=[_CLEAN_DIFF, _REPAIR_DIFF]),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", return_value=_CLEAN_DIFF),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=[_REPAIR_DIFF]),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
                        side_effect=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN]),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok") as mock_review,
@@ -401,6 +442,7 @@ class TestRepairOutcomes:
             mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="Confidence score: 0.8"),
             mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
             mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.pipeline.calibrate_findings", side_effect=_calibrate_all_observed),
         ):
             mock_llm_cls.return_value = mock.MagicMock()
             from utilities.autopatcher.pipeline import run
@@ -534,10 +576,15 @@ class TestRepairMetadata:
 # ---------------------------------------------------------------------------
 
 class TestRepairReport:
-    def _run_and_get_report(self, tmp_path, patches_gen, patches_app, patches_chall):
+    def _run_and_get_report(self, tmp_path, patches_gen, patches_app, patches_chall,
+                             calibration_side_effect=None):
+        # patches_gen[0] is always the Site 1 response (see _capture_result's
+        # comment above) -- mocked via generate_patch_raw; generate_patch
+        # itself now only serves the Site 4 repair call, if any.
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
-            mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=patches_gen),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", return_value=patches_gen[0]),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=patches_gen[1:]),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability", side_effect=patches_app),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="**Explanation**\nok\n"
                        "**Affected areas**\nok\n**Validation notes**\nok"),
@@ -545,6 +592,8 @@ class TestRepairReport:
             mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="Confidence score: 0.8"),
             mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
             mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.pipeline.calibrate_findings",
+                       side_effect=calibration_side_effect or _calibrate_all_observed),
         ):
             mock_llm_cls.return_value = mock.MagicMock()
             from utilities.autopatcher.pipeline import run
@@ -602,3 +651,393 @@ class TestRepairReport:
             patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_CLEAN],
         )
         assert "1 confirmed defect" in report
+
+
+# ---------------------------------------------------------------------------
+# Deterministic repair gate -- should_auto_repair / accept_repair
+#
+# Flow: Patch v1 -> Challenger v1 -> raw classification -> Finding
+# Calibration v1 -> should_auto_repair -> optional Repair v2 -> deterministic
+# applicability/hygiene -> Challenger v2 -> Finding Calibration v2 ->
+# accept_repair -> continue. Both gate functions are pure: no LLM calls, no
+# prose inspection, structured input only.
+# ---------------------------------------------------------------------------
+
+_BYPASS_TEXT = "An attacker can bypass this check via path traversal"
+_BYPASS_CHALLENGER = {
+    "still_vulnerable": False,
+    "edge_cases": [_BYPASS_TEXT],
+    "potential_issues": [],
+    "summary": "one confirmed defect",
+}
+
+
+def _observed(text: str) -> dict:
+    return {"original": text, "group": "observed", "reworded": text}
+
+
+def _hypothesis(text: str) -> dict:
+    return {"original": text, "group": "hypothesis", "reworded": text}
+
+
+def _hardening(text: str) -> dict:
+    return {"original": text, "group": "hardening", "reworded": text}
+
+
+class TestShouldAutoRepair:
+    """Unit tests for should_auto_repair — condition 1 (applicable) AND
+    condition 2 (raw confirmed_defect) AND condition 3 (that SAME finding
+    explicitly calibrated "observed") must ALL hold; anything else denies."""
+
+    def _classified(self, challenger=None):
+        from utilities.autopatcher.pipeline import _classify_challenger
+        return _classify_challenger(challenger or _BYPASS_CHALLENGER)
+
+    def test_no_repair_when_calibrated_hypothesis(self):
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        assert should_auto_repair(classified, [_hypothesis(_BYPASS_TEXT)], True) is False
+
+    def test_no_repair_when_calibrated_hardening(self):
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        assert should_auto_repair(classified, [_hardening(_BYPASS_TEXT)], True) is False
+
+    def test_no_repair_when_calibration_is_none(self):
+        """Calibration did not run or failed outright -- must not fall back
+        to authorizing repair on the raw regex classification alone."""
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        assert should_auto_repair(classified, None, True) is False
+
+    def test_no_repair_when_calibration_is_empty_list(self):
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        assert should_auto_repair(classified, [], True) is False
+
+    def test_no_repair_when_calibration_omits_this_specific_finding(self):
+        """Calibration ran (non-empty) but has no entry for THIS
+        confirmed_defect finding -- missing must not be treated as cleared."""
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        other = _observed("a completely unrelated finding")
+        assert should_auto_repair(classified, [other], True) is False
+
+    def test_repair_authorized_when_observed_and_applicable(self):
+        """Genuine repair authorization: all three conditions hold."""
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        assert should_auto_repair(classified, [_observed(_BYPASS_TEXT)], True) is True
+
+    def test_no_repair_when_observed_but_not_applicable(self):
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        assert should_auto_repair(classified, [_observed(_BYPASS_TEXT)], False) is False
+
+    def test_no_repair_when_no_raw_confirmed_defect(self):
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified(_CHALLENGER_CLEAN)
+        assert should_auto_repair(classified, [], True) is False
+
+    def test_still_vulnerable_no_with_defect_shaped_wording_calibrated_hypothesis(self):
+        """Real urllib3 CVE-2023-43804 regression shape: Challenger reports
+        'Still vulnerable: No' yet phrases findings with defect-shaped
+        wording ("could bypass", "does not address") that the raw regex
+        classifier tags confirmed_defect. When Calibration labels those
+        Hypothesis, repair must not fire."""
+        from utilities.autopatcher.pipeline import should_auto_repair, _classify_challenger
+        challenger = {
+            "still_vulnerable": False,
+            "edge_cases": [
+                "Redirects handled at the Retry level rather than PoolManager could bypass the loop"
+            ],
+            "potential_issues": [
+                "The patch does not address Cookie leakage via higher-level wrappers"
+            ],
+            "summary": "still_vulnerable: No, but heuristically defect-shaped wording present",
+        }
+        classified = _classify_challenger(challenger)
+        assert classified["confirmed_defect_count"] > 0  # raw regex tags these confirmed_defect
+        assert classified.get("still_vulnerable") is False
+        defect_texts = [
+            f["text"]
+            for f in classified["classified_edge_cases"] + classified["classified_potential_issues"]
+            if f["category"] == "confirmed_defect"
+        ]
+        calibration = [_hypothesis(t) for t in defect_texts]
+        assert should_auto_repair(classified, calibration, True) is False
+
+    def test_same_semantic_concern_different_wording_same_group_same_decision(self):
+        """Two differently-worded confirmed_defect findings that calibrate
+        to the SAME group must produce the SAME should_auto_repair decision."""
+        from utilities.autopatcher.pipeline import should_auto_repair, _classify_challenger
+        wordings = [
+            "An attacker can bypass this check via path traversal",
+            "A determined attacker could bypass this validation using a different encoding",
+        ]
+        decisions = set()
+        for wording in wordings:
+            classified = _classify_challenger({
+                "still_vulnerable": False, "edge_cases": [wording],
+                "potential_issues": [], "summary": "...",
+            })
+            assert classified["confirmed_defect_count"] == 1
+            decisions.add(should_auto_repair(classified, [_hypothesis(wording)], True))
+        assert decisions == {False}
+
+
+class TestAcceptRepair:
+    """Unit tests for accept_repair — the v2 acceptance gate. Symmetric with
+    should_auto_repair but applied to v2's own finding state, and fails
+    closed (rejects, preserving v1) under exactly the same uncertainty that
+    should_auto_repair fails closed on (denying authorization) for v1."""
+
+    def _classified(self, challenger):
+        from utilities.autopatcher.pipeline import _classify_challenger
+        return _classify_challenger(challenger)
+
+    def test_accept_when_applicable_and_no_raw_confirmed_defect(self):
+        from utilities.autopatcher.pipeline import accept_repair
+        classified = self._classified(_CHALLENGER_CLEAN)
+        assert accept_repair(classified, None, True) is True
+
+    def test_reject_when_not_applicable(self):
+        from utilities.autopatcher.pipeline import accept_repair
+        classified = self._classified(_CHALLENGER_CLEAN)
+        assert accept_repair(classified, None, False) is False
+
+    def test_accept_when_confirmed_defect_calibrates_away_from_observed(self):
+        """v2 applies and has no calibration-confirmed remaining defect."""
+        from utilities.autopatcher.pipeline import accept_repair
+        classified = self._classified(_BYPASS_CHALLENGER)
+        assert accept_repair(classified, [_hypothesis(_BYPASS_TEXT)], True) is True
+
+    def test_reject_when_confirmed_defect_calibrates_observed(self):
+        """v2 retains (or introduces) a calibration-confirmed defect ->
+        reject v2, preserve v1."""
+        from utilities.autopatcher.pipeline import accept_repair
+        classified = self._classified(_BYPASS_CHALLENGER)
+        assert accept_repair(classified, [_observed(_BYPASS_TEXT)], True) is False
+
+    def test_reject_when_calibration_v2_fails(self):
+        """calibration v2 failure (None) with a raw confirmed_defect present
+        -> cannot verify it was cleared -> reject v2, preserve v1."""
+        from utilities.autopatcher.pipeline import accept_repair
+        classified = self._classified(_BYPASS_CHALLENGER)
+        assert accept_repair(classified, None, True) is False
+
+    def test_reject_when_calibration_v2_omits_the_finding(self):
+        from utilities.autopatcher.pipeline import accept_repair
+        classified = self._classified(_BYPASS_CHALLENGER)
+        other = _observed("a completely unrelated finding")
+        assert accept_repair(classified, [other], True) is False
+
+
+class TestRepairGateEndToEnd:
+    """pipeline.run() coverage for the deterministic repair gate: same
+    scenarios as TestShouldAutoRepair/TestAcceptRepair, exercised through
+    the full pipeline with calibrate_findings mocked per-scenario."""
+
+    @staticmethod
+    def _calibrate_group(group):
+        def _side_effect(vulnerability_text, patch, findings, llm, code_context=""):
+            return [{"original": f, "group": group, "reworded": f} for f in findings]
+        return _side_effect
+
+    def test_no_repair_when_calibration_downgrades_to_hypothesis(self, tmp_path):
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_DEFECT],
+            calibration_side_effect=self._calibrate_group("hypothesis"),
+        )
+        assert result.repair_attempted is False
+        # No-repair path: neither a second generate_patch nor a second
+        # challenge_patch call ever happens.
+        assert mock_gen.call_count == 0
+        assert mock_chall.call_count == 1
+
+    def test_no_repair_when_calibration_downgrades_to_hardening(self, tmp_path):
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_DEFECT],
+            calibration_side_effect=self._calibrate_group("hardening"),
+        )
+        assert result.repair_attempted is False
+        assert mock_gen.call_count == 0
+
+    def test_no_repair_when_calibration_raises(self, tmp_path):
+        def _raise(*a, **kw):
+            raise RuntimeError("calibration backend unavailable")
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_DEFECT],
+            calibration_side_effect=_raise,
+        )
+        assert result.repair_attempted is False
+        assert mock_gen.call_count == 0
+
+    def test_genuine_repair_authorization_fires_exactly_once(self, tmp_path):
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_CLEAN],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_attempted is True
+        assert mock_gen.call_count == 1
+        assert mock_chall.call_count == 2  # v1 + v2, never a third
+
+    def test_v2_clean_is_accepted(self, tmp_path):
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_CLEAN],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_succeeded is True
+        assert "repaired" in result.patch
+
+    def test_v2_retains_calibrated_defect_rejects_v2_preserves_v1(self, tmp_path):
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_WITH_DEFECT],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_succeeded is False
+        assert "repaired" not in result.patch
+        # No v3: still exactly one repair-generation call despite rejection.
+        assert mock_gen.call_count == 1
+
+    def test_v2_introduces_new_calibrated_defect_rejects_v2_preserves_v1(self, tmp_path):
+        """v2's own Challenger raises a brand-new (differently-worded)
+        confirmed_defect that calibrates Observed -- must reject v2 and
+        preserve v1, never generate a v3."""
+        new_defect_challenger = {
+            "still_vulnerable": False,
+            "edge_cases": ["A separate attacker can bypass a completely different validation"],
+            "potential_issues": [], "summary": "new defect introduced by v2",
+        }
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_DEFECT, new_defect_challenger],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_succeeded is False
+        assert "repaired" not in result.patch
+        assert mock_gen.call_count == 1
+        assert mock_chall.call_count == 2
+
+    def test_v2_calibration_failure_rejects_v2_preserves_v1(self, tmp_path):
+        """v1 calibration succeeds (authorizing repair), but v2's own
+        calibration call fails outright -- v2 must be rejected (cannot
+        verify it was cleared) and v1 preserved, never a v3."""
+        calls = {"n": 0}
+
+        def _side_effect(vulnerability_text, patch, findings, llm, code_context=""):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [{"original": f, "group": "observed", "reworded": f} for f in findings]
+            raise RuntimeError("calibration v2 unavailable")
+
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_WITH_DEFECT],
+            calibration_side_effect=_side_effect,
+        )
+        assert result.repair_succeeded is False
+        assert "repaired" not in result.patch
+        assert mock_gen.call_count == 1  # still exactly one repair attempt, no v3
+
+    def test_calibrated_downgrade_not_counted_as_confirmed_defect_downstream(self, tmp_path):
+        """A raw confirmed_defect finding that calibrates Hypothesis must
+        not still read as a confirmed defect anywhere downstream: the raw
+        classifier count is still reported as telemetry (unchanged), but
+        the authoritative post-calibration finding state
+        (_build_known_findings, which Trust Signals/Recommendation in
+        _build_report now derive their defect_count from) must show zero
+        remaining risks for it."""
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_DEFECT],
+            calibration_side_effect=self._calibrate_group("hypothesis"),
+        )
+        # Raw pre-calibration telemetry is unchanged.
+        assert result.original_challenger_defect_count == 1
+        # The authoritative, calibration-aware representation must not
+        # still show it as a confirmed defect.
+        from utilities.autopatcher.pipeline import _build_known_findings, _classify_challenger
+        classified = _classify_challenger(result.challenger)
+        known = _build_known_findings(classified, result.finding_calibration)
+        assert known["potential_remaining_risks"] == []
+        assert any("bypass" in h for h in known["validation_hypotheses"])
+
+
+class TestNoUnnecessaryCalibrationCall:
+    """When there is no raw confirmed_defect finding to gate on, the repair
+    block must not add an extra calibrate_findings() call -- calibration
+    still runs at most once, at its original position and cost."""
+
+    def test_no_calibration_call_at_all_when_challenger_fully_clean(self, tmp_path):
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", return_value=_CLEAN_DIFF),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch") as mock_gen,
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value=_APPLICABILITY_CLEAN),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value=_CHALLENGER_CLEAN),
+            mock.patch("utilities.autopatcher.pipeline.calibrate_findings",
+                       side_effect=_calibrate_all_observed) as mock_calibrate,
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="Confidence score: 0.8"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+        ):
+            mock_llm_cls.return_value = mock.MagicMock()
+            from utilities.autopatcher.pipeline import run
+            run("test vuln", api_key="", repo_root=str(tmp_path))
+            mock_calibrate.assert_not_called()
+            mock_gen.assert_not_called()
+
+    def test_single_calibration_call_when_raw_defect_present_but_downgraded(self, tmp_path):
+        """A raw confirmed_defect finding exists (so the early, widened
+        calibration call DOES run -- it's the only one that can gate the
+        repair decision), but the old, later plausible_risk/generic-only
+        call must not ALSO run afterward -- exactly one calibration call
+        total, not two."""
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", return_value=_CLEAN_DIFF),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch") as mock_gen,
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       return_value=_APPLICABILITY_CLEAN),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value=_CHALLENGER_WITH_DEFECT),
+            mock.patch(
+                "utilities.autopatcher.pipeline.calibrate_findings",
+                side_effect=TestRepairGateEndToEnd._calibrate_group("hypothesis"),
+            ) as mock_calibrate,
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="Confidence score: 0.8"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+        ):
+            mock_llm_cls.return_value = mock.MagicMock()
+            from utilities.autopatcher.pipeline import run
+            run("test vuln", api_key="", repo_root=str(tmp_path))
+            assert mock_calibrate.call_count == 1
+            mock_gen.assert_not_called()

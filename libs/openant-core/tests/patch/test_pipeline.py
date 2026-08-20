@@ -998,7 +998,7 @@ class TestRecommendationConsistencyReport:
         rec_block = report[rec_idx:explanation_idx]
 
         assert "**Manual Review Required**" in rec_block
-        assert "1 decision-relevant review item remains open" in rec_block
+        assert "1 item to weigh: 1 validation gap" in rec_block
         assert "see Review Results below" in rec_block
         assert "Evidence check" not in rec_block
         assert "adversarial coverage is heuristic" not in rec_block
@@ -1072,6 +1072,230 @@ class TestRecommendationConsistencyReport:
         assert "**Do Not Apply**" in report
         assert "This recommendation currently has no automated test coverage" not in report
         assert "adversarial coverage is heuristic" not in report
+
+
+# ---------------------------------------------------------------------------
+# Release-polish report behaviors (report explainability pass)
+# ---------------------------------------------------------------------------
+
+class TestReleasePolishReportBehaviors:
+    """Report-level regression coverage for the Trust Report polish pass:
+    signal-specific Recommendation reasons, Observed Facts relabeling,
+    upstream-provenance disclaimers, and generic-behavior-fallback
+    suppression. Builds PipelineResult directly and calls _build_report()
+    — no LLM calls, fully deterministic."""
+
+    GENERIC_BEHAVIOR = {
+        "function": "foo",
+        "file": "mod.py",
+        "summary": "This patch likely affects application logic in mod.py.",
+        "primary_behaviors": ["normal flow", "edge-case handling"],
+        "is_generic": True,
+    }
+    SPECIFIC_BEHAVIOR = {
+        "function": "authenticate",
+        "file": "app/auth.py",
+        "summary": "This patch likely affects authentication in app/auth.py.",
+        "primary_behaviors": ["valid login", "invalid login"],
+        "is_generic": False,
+    }
+
+    def _kwargs(self, tmp_path, challenger, behavior):
+        return dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch=(
+                "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n"
+                " def foo():\n-    return 1\n+    return 2\n"
+            ),
+            review=(
+                "**Explanation:**\n"
+                "This matches the upstream fix released in version 2.0.5.\n\n"
+                "**Affected areas:**\n"
+                "- mod.py\n\n"
+                "**Validation notes:**\n"
+                "- This aligns with the accepted upstream remediation.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger=challenger,
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            behavior=behavior,
+            repo_root=tmp_path,
+            detected_language="python",
+        )
+
+    # --- Decision 8: generic behavior fallback suppression ---
+
+    def test_generic_behavior_suppresses_validate_behavior_action(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        challenger = {
+            "still_vulnerable": False,
+            "edge_cases": ["custom configurations may not benefit from this change"],
+            "potential_issues": [],
+            "summary": "",
+        }
+        result = PipelineResult(**self._kwargs(tmp_path, challenger, self.GENERIC_BEHAVIOR))
+        report = _build_report(result)
+
+        va_idx = report.find("## Validation Actions")
+        rr_idx = report.find("## Review Results")
+        va_block = report[va_idx:rr_idx]
+        assert "Validate behavior" not in va_block
+
+        st_idx = report.find("### Suggested Tests")
+        st_block = report[st_idx:]
+        assert "test_normal_flow" not in st_block
+        assert "test_edge_case_handling" not in st_block
+        # Challenger-derived suggestions must still render unchanged.
+        assert "custom configurations may not benefit from this change" in st_block
+
+    def test_specific_behavior_keeps_validate_behavior_action(self, tmp_path):
+        """Non-generic behavior summaries must render exactly as before."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        challenger = {"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""}
+        result = PipelineResult(**self._kwargs(tmp_path, challenger, self.SPECIFIC_BEHAVIOR))
+        report = _build_report(result)
+
+        va_idx = report.find("## Validation Actions")
+        rr_idx = report.find("## Review Results")
+        va_block = report[va_idx:rr_idx]
+        assert "Validate behavior" in va_block
+        assert "valid login" in va_block or "invalid login" in va_block
+
+    def test_no_behavior_summary_is_unaffected(self, tmp_path):
+        """behavior=None (analyzer raised, or no patch) must keep working
+        exactly as before — no AttributeError on a None behavior dict."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        challenger = {"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""}
+        result = PipelineResult(**self._kwargs(tmp_path, challenger, None))
+        report = _build_report(result)
+        assert "## Validation Actions" in report or True  # must not raise
+
+    # --- Decision 7: upstream-provenance disclaimer ---
+
+    def test_explanation_disclaimer_flags_upstream_prior_knowledge(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        challenger = {"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""}
+        result = PipelineResult(**self._kwargs(tmp_path, challenger, self.SPECIFIC_BEHAVIOR))
+        report = _build_report(result)
+
+        idx = report.find("## Explanation")
+        block = report[idx:idx + 500]
+        assert "model's own prior knowledge" in block
+        assert "not a fetched or independently verified upstream comparison" in block
+
+    def test_reviewer_notes_disclaimer_flags_upstream_prior_knowledge(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        challenger = {"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""}
+        result = PipelineResult(**self._kwargs(tmp_path, challenger, self.SPECIFIC_BEHAVIOR))
+        report = _build_report(result)
+
+        idx = report.find("### Reviewer Notes")
+        block = report[idx:idx + 400]
+        assert "not independently verified evidence" in block
+        assert "model's own prior knowledge" in block
+        # Must not duplicate Explanation's own disclaimer phrase.
+        assert "not independent execution or testing against the target repository" not in block
+
+    # --- Decision 5: Observed Facts relabel ---
+
+    def test_observed_facts_heading_renders_in_full_report(self, tmp_path):
+        """A challenger finding calibrated to group="observed" must render
+        under "### Observed Facts" (never the old "Confirmed Observations"
+        wording) at the full-report level, with the epistemic-axis subtitle."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        finding_text = "Case-insensitive matching may not handle all header variants"
+        challenger = {
+            "still_vulnerable": False,
+            "edge_cases": [finding_text],
+            "potential_issues": [],
+            "summary": "",
+        }
+        kwargs = self._kwargs(tmp_path, challenger, self.SPECIFIC_BEHAVIOR)
+        kwargs["finding_calibration"] = [{
+            "original": finding_text,
+            "group": "observed",
+            "reworded": "Header comparison is case-insensitive across the variants shown in the diff.",
+        }]
+        result = PipelineResult(**kwargs)
+        report = _build_report(result)
+
+        assert "### Observed Facts" in report
+        assert "### Confirmed Observations" not in report
+        assert "may be reassuring, neutral, or concerning" in report
+        assert "Header comparison is case-insensitive across the variants shown in the diff." in report
+
+    # --- Decision 2 / minimist causality: Manual Review Required reason ---
+
+    def test_manual_review_reason_names_deployment_safety_not_review_results(self, tmp_path):
+        """Report-level version of the minimist case: no repo-language
+        support for Impact Surface must produce a Recommendation reason
+        naming deployment risk, not a Review Results finding."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        challenger = {
+            "still_vulnerable": False,
+            "edge_cases": ["legitimate keys named `constructor` are now silently dropped"],
+            "potential_issues": [],
+            "summary": "",
+        }
+        kwargs = self._kwargs(tmp_path, challenger, self.SPECIFIC_BEHAVIOR)
+        kwargs["detected_language"] = "javascript"
+        # Real minimist-shaped impact result: language guardrail explicitly
+        # marks Impact Surface not_applicable (not a swallowed exception).
+        kwargs["impact"] = {
+            "impact_level": "not_applicable",
+            "changed_files": ["index.js"],
+            "affected_files": [],
+            "impact_summary": (
+                "Not Applicable — language not supported by this signal yet "
+                "(detected: javascript)."
+            ),
+            "recommendations": [],
+            "usage_matches": [],
+        }
+        result = PipelineResult(**kwargs)
+        report = _build_report(result)
+
+        rec_idx = report.find("## Recommendation")
+        explanation_idx = report.find("## Explanation")
+        rec_block = report[rec_idx:explanation_idx]
+
+        assert "**Manual Review Required**" in rec_block
+        assert "Deployment risk could not be verified" in rec_block
+        assert "constructor" not in rec_block
+
+    def test_no_patch_produced_report_unaffected(self, tmp_path):
+        """Release polish must not touch the no_patch execution-outcome
+        path — it is computed one level above Recommendation Policy."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        challenger = {"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""}
+        kwargs = self._kwargs(tmp_path, challenger, self.GENERIC_BEHAVIOR)
+        kwargs["patch"] = ""
+        result = PipelineResult(**kwargs)
+        report = _build_report(result)
+        assert "NO PATCH PRODUCED" in report
+
+    def test_green_decision_reason_unaffected(self, tmp_path):
+        """Deploy After Validation's reason text must stay byte-identical —
+        the I3 whitelist branch is never enriched (nothing is unmet)."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_mod.py").write_text("def test_foo(): pass\n", encoding="utf-8")
+        challenger = {"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""}
+        result = PipelineResult(**self._kwargs(tmp_path, challenger, self.SPECIFIC_BEHAVIOR))
+        report = _build_report(result)
+        assert "**Deploy After Validation**" in report
+        assert (
+            "Patch addresses the attack vector described by the advisory and applies cleanly. "
+            "Run the listed validation actions before deployment."
+        ) in report
 
 
 # ---------------------------------------------------------------------------
@@ -1301,7 +1525,15 @@ _FIXTURE_ADVISORY = {
 class TestPipelineCodeContext:
     def test_pipeline_passes_nonempty_code_context_when_repo_has_match(self, tmp_path):
         """When repo_root contains a file matching the vulnerability, pipeline
-        should pass a non-empty code_context into generate_patch()."""
+        should pass a non-empty code_context into the Patch Generator.
+
+        Release: response-contract enforcement moved the initial
+        generation call site from generate_patch() to
+        _generate_patch_with_contract_check(), which itself calls
+        generate_patch_raw() (not generate_patch()) — this now spies on
+        generate_patch_raw, the actual entry point that receives
+        code_context, while still exercising the real (mock) LLM call
+        underneath."""
         from utilities.autopatcher.pipeline import run
         from unittest import mock as _mock
         import utilities.autopatcher.patch_generator as _pg
@@ -1318,16 +1550,16 @@ class TestPipelineCodeContext:
 
         vuln_text = (EXAMPLES_DIR / "vulnerability.md").read_text(encoding="utf-8")
         captured: list[str] = []
-        _original = _pg.generate_patch
+        _original = _pg.generate_patch_raw
 
-        def _capturing(vtext, llm, code_context=""):
+        def _capturing(vtext, llm, code_context="", retry_hint="", stage="patch_generation"):
             captured.append(code_context)
-            return _original(vtext, llm)  # use real (mock) implementation
+            return _original(vtext, llm, code_context=code_context, retry_hint=retry_hint, stage=stage)
 
-        with _mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=_capturing):
+        with _mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", side_effect=_capturing):
             run(vulnerability_text=vuln_text, api_key="", repo_root=str(tmp_path))
 
-        assert captured, "generate_patch was never called"
+        assert captured, "generate_patch_raw was never called"
         assert captured[0] != "", (
             "Expected non-empty code_context when repo contains app/auth.py"
         )

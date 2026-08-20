@@ -2,8 +2,18 @@
 Patch generator stage.
 
 Loads the patch_generator prompt, builds a user message from the vulnerability
-description, calls the LLM, and extracts the first clean unified diff block
-from the response.
+description, calls the LLM, and classifies/extracts a clean unified diff block
+from the response against the response contract stated in
+prompts/patch_generator.md ("exactly one fenced diff block, nothing else").
+
+Response classification (classify_patch_response) is pure and deterministic
+-- no LLM calls, no I/O -- and is kept separate from LLM orchestration on
+purpose: a bounded contract-violation retry is a decision about WHETHER to
+call the model again, which belongs to a caller (pipeline.py), not to this
+module. generate_patch() itself still makes exactly one LLM call, same as
+before; generate_patch_raw() is the lower-level primitive a caller can use
+directly when it needs to inspect the classification before deciding what to
+do next (see pipeline.py's _generate_patch_with_contract_check).
 """
 
 from __future__ import annotations
@@ -12,6 +22,7 @@ import datetime
 import os
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 from .llm_client import LLMClient
 
@@ -39,78 +50,189 @@ def _matching_close(line: str, fence_char: str, fence_len: int) -> bool:
     return bool(m) and len(m.group(1)) >= fence_len
 
 
-def _find_fenced_diff_block(raw: str) -> str | None:
-    """Scan raw for the first ```/~~~-fenced diff/patch/udiff block.
+class PatchResponseClassification(NamedTuple):
+    """Deterministic classification of one raw Patch Generator LLM response
+    against the response contract stated in prompts/patch_generator.md
+    ("Output one fenced code block tagged diff... Nothing else. No
+    alternative patches."). Pure -- no LLM calls, no I/O.
 
-    Returns the body text between a recognised opener and its matching
-    closer. Returns None if no recognised opener exists at all, if a
-    recognised opener is found but never properly closed before EOF, OR if
-    a second recognised opener appears before the first one's closer —
-    these cases are deliberately not distinguished here; the caller decides
-    what None means in each case.
+    status:
+      "valid"              -- exactly one well-formed fenced diff/patch/udiff
+                               block, with only whitespace (if anything)
+                               before and after it. `diff` is the body,
+                               normalised to a ```diff fence.
+      "no_diff"            -- no recognised fenced opener anywhere in the
+                               response. `diff` is raw.strip() -- the
+                               response may be a genuine unfenced diff, or
+                               plain prose (e.g. an honest "no patch is
+                               possible"); downstream repair/hygiene/
+                               applicability already sorts this out
+                               naturally, and retrying a genuine non-answer
+                               as if it were a formatting problem risks
+                               pressuring a fabricated diff out of a model
+                               that had nothing to add. Never retried by
+                               callers -- see pipeline.py's
+                               _generate_patch_with_contract_check.
+      "malformed_fence"    -- a recognised opener exists but is never
+                               validly closed: EOF reached with no matching
+                               closer, or a second recognised opener appears
+                               before the first block's own closer. `diff`
+                               is "" -- this is a stronger signal of broken
+                               structured output than "no_diff", and a
+                               stricter format instruction would not fix a
+                               truncated response. Never retried.
+      "contract_violation" -- one or more well-formed blocks exist, but the
+                               response is not "exactly one clean block with
+                               only whitespace around it": either 2+
+                               complete blocks (`block_count` > 1 -- e.g.
+                               alternative candidates), or exactly one block
+                               with non-whitespace text before and/or after
+                               it. `diff` is "" -- callers must not treat
+                               any candidate body as a patch. This is the
+                               ONLY status eligible for a bounded,
+                               orchestration-level regeneration retry.
 
-    The second case is safe to detect this way (rather than skipping to, or
-    merging with, the second block) because a genuine diff/patch/udiff
-    fence-marker line reproduced as unified-diff hunk content must carry a
-    unified-diff prefix (' ', '+', '-', or '\\') and therefore can never
-    match the opener pattern at column 0 — so any column-0 opener seen while
-    still scanning for the first block's closer can only be a second,
-    independent fenced block, never legitimate content of the first.
+    block_count: number of well-formed, independently-closed blocks found
+                 (0 for "no_diff" and "malformed_fence").
     """
+    status: str
+    diff: str
+    block_count: int
+
+
+def classify_patch_response(raw: str) -> PatchResponseClassification:
+    """Classify a raw Patch Generator response — see
+    PatchResponseClassification for the four possible states.
+
+    Reuses _OPEN_FENCE_RE/_matching_close (the same column-0, diff-prefix-
+    aware fence detection _extract_diff_block has always used) but, unlike
+    a single-block scan, keeps scanning after each well-formed block's
+    closer instead of returning immediately — so a second (or third)
+    complete block is counted rather than silently discarded. A recognised
+    opener that never validly closes (EOF, or a second opener appearing
+    before ITS OWN closer) still fails the whole response closed as
+    "malformed_fence", exactly as before: this is not "close enough" and is
+    never merged with, or skipped in favour of, any other block.
+    """
+    if not raw:
+        return PatchResponseClassification("no_diff", raw or "", 0)
+
     lines = raw.splitlines(keepends=True)
-    for i, line in enumerate(lines):
-        m = _OPEN_FENCE_RE.match(line.rstrip("\r\n"))
+    n = len(lines)
+    blocks: list[tuple[int, int, list[str]]] = []  # (opener_idx, closer_idx, body_lines)
+    i = 0
+    while i < n:
+        m = _OPEN_FENCE_RE.match(lines[i].rstrip("\r\n"))
         if not m:
+            i += 1
             continue
         fence_run = m.group(1)
         fence_char = fence_run[0]
         fence_len = len(fence_run)
         body_lines: list[str] = []
-        for j in range(i + 1, len(lines)):
+        closer_idx: int | None = None
+        j = i + 1
+        while j < n:
             candidate = lines[j].rstrip("\r\n")
             if _matching_close(lines[j], fence_char, fence_len):
-                return "".join(body_lines)
+                closer_idx = j
+                break
             if _OPEN_FENCE_RE.match(candidate):
-                # A second recognised opener before the first block's closer
-                # — the first block is malformed, not "close enough".
-                return None
+                # A second recognised opener before this block's own closer
+                # — this block is malformed, not "close enough" — and
+                # invalidates the whole response, regardless of any earlier
+                # well-formed block already collected.
+                return PatchResponseClassification("malformed_fence", "", 0)
             body_lines.append(lines[j])
-        # Recognised opener reached EOF with no matching closer.
-        return None
-    return None
+            j += 1
+        if closer_idx is None:
+            # Recognised opener reached EOF with no matching closer.
+            return PatchResponseClassification("malformed_fence", "", 0)
+        blocks.append((i, closer_idx, body_lines))
+        i = closer_idx + 1
+
+    if not blocks:
+        return PatchResponseClassification("no_diff", raw.strip(), 0)
+
+    if len(blocks) > 1:
+        return PatchResponseClassification("contract_violation", "", len(blocks))
+
+    opener_idx, closer_idx, body_lines = blocks[0]
+    prefix = "".join(lines[:opener_idx])
+    suffix = "".join(lines[closer_idx + 1:])
+    if prefix.strip() or suffix.strip():
+        return PatchResponseClassification("contract_violation", "", 1)
+
+    return PatchResponseClassification("valid", "```diff\n" + "".join(body_lines) + "```", 1)
 
 
 def _extract_diff_block(raw: str) -> str:
-    """Return the first fenced diff/patch/udiff block found in raw.
+    """Return the single valid fenced diff/patch/udiff block found in raw,
+    normalised to a ```diff fence — or "" / raw.strip() for every other
+    classification (see classify_patch_response, which this now delegates
+    to). Kept as a thin wrapper for backward compatibility with existing
+    callers/tests; classify_patch_response is the source of truth.
 
-    The block is normalised to a ```diff fence.
-
-    - No recognised fenced opener at all: falls back to raw.strip() (the
-      response is presumably a raw, unfenced diff or plain prose).
-    - A recognised opener with a valid closer: returns the body between
-      them, normalised to a ```diff fence.
-    - A recognised opener with NO valid closer before EOF, OR a second
-      recognised opener appearing before the first one's closer
-      (malformed/truncated structured output): returns "" rather than
-      raw.strip(). This is deliberate and load-bearing, not a stylistic
-      choice — repair_hunk_headers and patch_applicability._strip_fences
-      both unconditionally strip a leading fence-marker line with no check
-      that it was ever closed, so
-      handing back raw.strip() here would let those stages silently launder
-      truncated-but-syntactically-consistent content into something that
-      reports as applicable. An empty string is a no-op in every downstream
-      stage (repair_hunk_headers, check_patch, check_applicability all
-      special-case falsy/blank input), so it can never be repaired into a
-      false "applicable" result.
+    Behavior for "no_diff" and "malformed_fence" is byte-identical to
+    before this function existed in terms of classification (raw.strip()
+    and "" respectively). Behavior for what classify_patch_response calls
+    "contract_violation" previously returned the FIRST candidate block
+    silently — that was the actual bug this change fixes; it now returns
+    "" like any other invalid response, never an arbitrarily-selected
+    candidate.
     """
-    if not raw:
-        return raw or ""
-    body = _find_fenced_diff_block(raw)
-    if body is not None:
-        return "```diff\n" + body + "```"
-    if any(_OPEN_FENCE_RE.match(line.rstrip("\r\n")) for line in raw.splitlines()):
-        return ""
-    return raw.strip()
+    return classify_patch_response(raw).diff
+
+
+def generate_patch_raw(
+    vulnerability_text: str,
+    llm: LLMClient,
+    code_context: str = "",
+    retry_hint: str = "",
+    stage: str = "patch_generation",
+) -> str:
+    """
+    Make exactly one Patch Generator LLM call and return its raw text,
+    unclassified. This is generate_patch()'s own body minus the final
+    classification/extraction step -- factored out so a caller that needs
+    to inspect the classification before deciding what to do next (e.g.
+    pipeline.py's bounded contract-violation retry) can do so without
+    duplicating the prompt-assembly logic below, and without generate_patch
+    itself losing the "makes exactly one call" property.
+
+    Parameters
+    ----------
+    vulnerability_text, llm, code_context, retry_hint:
+        Same meaning as generate_patch().
+    stage:
+        The `stage` label passed to llm.complete() — purely an observability
+        tag for the LLM call tracer (see llm_client.LLMClient.complete);
+        it never affects the request or the returned text. Defaults to
+        "patch_generation" (identical to generate_patch()'s hardcoded
+        value, so every pre-existing caller is unaffected). A caller
+        making a second, related call — e.g. a contract-violation retry —
+        should pass a distinct value (e.g. "patch_generation_contract_retry")
+        so the two calls remain distinguishable in a trace.
+
+    Returns
+    -------
+    str
+        The raw, unclassified LLM response text.
+    """
+    system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
+    user_message = "## Vulnerability report\n\n" + vulnerability_text
+    if code_context:
+        user_message += "\n\n## Repository code context\n\n" + code_context
+    if retry_hint:
+        user_message += "\n\n## Retry instruction\n\n" + retry_hint
+
+    if os.environ.get("AUTOPATCHER_DEBUG"):
+        _debug_dir = Path("reports") / "debug"
+        _debug_dir.mkdir(parents=True, exist_ok=True)
+        _ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        (_debug_dir / f"prompt_{_ts}.txt").write_text(user_message, encoding="utf-8")
+
+    return llm.complete(system_prompt, user_message, stage=stage)
 
 
 def generate_patch(
@@ -140,23 +262,15 @@ def generate_patch(
     Returns
     -------
     str
-        The first valid unified diff block extracted from the LLM response,
-        the raw response stripped if no fenced block is found, or "" if a
-        recognised fence was opened but never closed (see
-        ``_extract_diff_block``).
+        The single valid unified diff block extracted from the LLM
+        response; the raw response stripped if no fenced block is found;
+        or "" if the response was structurally invalid — a fence opened
+        but never validly closed, OR the response contained more than one
+        candidate diff block, OR a single block with non-whitespace prose
+        around it (see classify_patch_response). Still exactly one LLM
+        call — no retry logic lives here; see pipeline.py's
+        _generate_patch_with_contract_check for the bounded
+        contract-violation retry built on top of generate_patch_raw().
     """
-    system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
-    user_message = "## Vulnerability report\n\n" + vulnerability_text
-    if code_context:
-        user_message += "\n\n## Repository code context\n\n" + code_context
-    if retry_hint:
-        user_message += "\n\n## Retry instruction\n\n" + retry_hint
-
-    if os.environ.get("AUTOPATCHER_DEBUG"):
-        _debug_dir = Path("reports") / "debug"
-        _debug_dir.mkdir(parents=True, exist_ok=True)
-        _ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-        (_debug_dir / f"prompt_{_ts}.txt").write_text(user_message, encoding="utf-8")
-
-    raw = llm.complete(system_prompt, user_message, stage="patch_generation")
-    return _extract_diff_block(raw)
+    raw = generate_patch_raw(vulnerability_text, llm, code_context=code_context, retry_hint=retry_hint)
+    return classify_patch_response(raw).diff

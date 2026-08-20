@@ -72,3 +72,28 @@ def test_behavior_fallback(tmp_path):
     assert r["function"] == ""
     assert r["file"] == "utils/misc.py"
     assert isinstance(r["primary_behaviors"], list)
+    # Release-polish: no purpose keyword matched -> explicit generic marker,
+    # used downstream to suppress boilerplate Validation Actions/Suggested
+    # Tests derived only from this fallback.
+    assert r["is_generic"] is True
+
+
+def test_behavior_auth_case_is_not_generic(tmp_path):
+    """Specific (non-fallback) purpose branches must report is_generic=False
+    so their behavior-derived content keeps rendering unchanged."""
+    repo = tmp_path / "repo_auth2"
+    repo.mkdir()
+    auth = repo / "app" / "auth.py"
+    write_file(auth, "def authenticate(username, password):\n    return db.query(username)\n")
+
+    diff = """+++ b/app/auth.py
+@@ -1,1 +1,3 @@
++def authenticate(username, password):
++    return db.query(username)
+"""
+
+    ctx = TargetRepoContext(repo)
+    ba = BehaviorAnalyzer()
+    r = ba.analyze(diff, repo_context=ctx)
+
+    assert r["is_generic"] is False

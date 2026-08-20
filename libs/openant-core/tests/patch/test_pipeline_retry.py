@@ -260,7 +260,7 @@ class TestRetryNotTriggered:
     def _run_with_mock(self, applicability_return, repo_root=None, vuln="test vuln"):
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
-            mock.patch("utilities.autopatcher.pipeline.generate_patch", return_value=_CLEAN_DIFF) as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", return_value=_CLEAN_DIFF) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability", return_value=applicability_return),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok review"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
@@ -332,7 +332,7 @@ class TestRetryTriggered:
         first_app, retry_app = self._setup_mocks(tmp_path, retry_applicable=True)
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
                        side_effect=_sequential_then_repeat(first_app, retry_app)),
@@ -351,7 +351,7 @@ class TestRetryTriggered:
         first_app, retry_app = self._setup_mocks(tmp_path, retry_applicable=True)
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
                        side_effect=_sequential_then_repeat(first_app, retry_app)),
@@ -397,7 +397,7 @@ class TestRetryMultiFile:
         first_app, retry_app = self._setup_mocks(retry_applicable=True)
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
                        side_effect=_sequential_then_repeat(first_app, retry_app)),
@@ -431,7 +431,7 @@ class TestRetryMultiFile:
         first_app, retry_app = self._setup_mocks(retry_applicable=True)
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
                        side_effect=_sequential_then_repeat(first_app, retry_app)),
@@ -456,7 +456,7 @@ class TestRetryMultiFile:
         first_app, _retry_app = self._setup_mocks(retry_applicable=True)
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value=_CLEAN_DIFF) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
                        return_value=first_app),
@@ -489,7 +489,7 @@ class TestRetryMultiFile:
         first_app, retry_app = self._setup_mocks(retry_applicable=True)
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
                        side_effect=_sequential_then_repeat(first_app, retry_app)),
@@ -527,7 +527,7 @@ class TestRetryMultiFile:
         first_app, _retry_app = self._setup_mocks(retry_applicable=True)
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value=_CLEAN_DIFF) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
                        return_value=first_app),
@@ -562,7 +562,7 @@ class TestRetryMultiFile:
 
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_CLEAN_DIFF, _CLEAN_DIFF]),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
                        side_effect=_sequential_then_repeat(first_app, retry_app)),
@@ -614,7 +614,7 @@ class TestRetryOutcomes:
 
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
                        side_effect=_sequential_then_repeat(first_app, retry_app)),
@@ -683,7 +683,7 @@ class TestRetryMetadata:
 
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch", return_value=_CLEAN_DIFF),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", return_value=_CLEAN_DIFF),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability", return_value=app),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
@@ -789,7 +789,7 @@ class TestRetryNoticeInReport:
 
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=gen_side_effect),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", side_effect=gen_side_effect),
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability", side_effect=app_side_effect),
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
@@ -898,7 +898,7 @@ class TestDeterministicContextReconstructionSuccess:
 
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        return_value=_URLLIB3_MALFORMED_DIFF) as mock_gen,
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
@@ -964,7 +964,7 @@ class TestDeterministicContextReconstructionFallbackPreservesRetry:
 
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-            mock.patch("utilities.autopatcher.pipeline.generate_patch",
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
                        side_effect=[_PIP_DIFF_ORIG, _PIP_DIFF_RETRY]) as mock_gen,
             mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
                        side_effect=_sequential_then_repeat(first_app, retry_app)),

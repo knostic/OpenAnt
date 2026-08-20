@@ -260,7 +260,157 @@ class _SymbolMatch(NamedTuple):
     func_id: "str | None"  # set only when kind == "function"
 
 
-def _resolve_symbol_details(raw: str, repo_root: Path, context) -> "_SymbolMatch | None":
+# ---------------------------------------------------------------------------
+# Deterministic identifier fallback -- final-target readiness only.
+#
+# The structured lookups above (RepositoryIndex.search_by_name, the
+# constants table) are only as complete as the upstream repository
+# analyzer's own function/constant index. A construct that analyzer
+# doesn't index at all (observed: a JavaScript function declared inside
+# another function's body, e.g. `module.exports = function (...) {
+# function setKey (...) { ... } }`) can have exact, real source sitting in
+# an already-verified file while still resolving to nothing through
+# either lookup -- indistinguishable, from this module's point of view,
+# from a genuinely-hallucinated symbol name unless something else steps
+# in. This fallback is that something else: given the exact identifier
+# name and the small set of files the CALLER has already independently
+# verified (never a wider search), it looks for the identifier directly
+# in that verified file text -- no LLM call, no new language grammar, no
+# fuzzy matching, and it fails closed (returns None) the moment the
+# result would be ambiguous rather than ever guessing.
+# ---------------------------------------------------------------------------
+
+_FALLBACK_FIXED_WINDOW_LINES = 40
+"""Half-window (lines) around a fallback-recovered identifier when no
+balanced block could be found -- generous enough to usually still contain
+a short-to-medium function, but bounded, never the whole file."""
+
+_FALLBACK_MAX_BLOCK_SCAN = 400
+"""Safety cap on how many lines _bounded_declaration_block will scan
+forward counting brace depth -- bounds the cost of a pathological or
+unbalanced input; the fixed-window fallback below takes over past this."""
+
+_FALLBACK_DECLARATION_RE_PARTS = (
+    r"^[ \t]*(?:export[ \t]+)?function[ \t]+{name}[ \t]*\(",
+    r"^[ \t]*def[ \t]+{name}[ \t]*\(",
+    r"^[ \t]*class[ \t]+{name}\b",
+    r"^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+{name}\b",
+)
+"""A small, fixed set of already-common declaration shapes -- deliberately
+not a language grammar. Matched literally against real file text, never
+against a fabricated one."""
+
+
+def _bounded_declaration_block(lines: "list[str]", decl_line0: int) -> int:
+    """Best-effort 0-indexed end line for the declaration starting at
+    `decl_line0`, found by counting brace depth from that line forward
+    (never a real parser -- no tokenizing of strings/comments, so a brace
+    inside one can occasionally mis-count; bounded by
+    _FALLBACK_MAX_BLOCK_SCAN so a mis-count can never scan past a small,
+    fixed limit). Returns `decl_line0` unchanged if no `{` is ever seen or
+    the depth never returns to zero within the scan limit -- the caller
+    then falls back to a fixed-size window instead of trusting an
+    unresolved brace count."""
+    limit = min(len(lines), decl_line0 + _FALLBACK_MAX_BLOCK_SCAN)
+    depth = 0
+    opened = False
+    for i in range(decl_line0, limit):
+        for ch in lines[i]:
+            if ch == "{":
+                depth += 1
+                opened = True
+            elif ch == "}":
+                depth -= 1
+        if opened and depth <= 0:
+            return i
+    return decl_line0
+
+
+def _deterministic_identifier_fallback(
+    name: str, candidate_files: "list[str]", repo_root: Path,
+) -> "_SymbolMatch | None":
+    """Deterministic, file-scoped recovery for a target identifier whose
+    exact name is known but the structured lookups in
+    _resolve_symbol_details could not resolve it. Searches ONLY
+    `candidate_files` -- every one of which the caller has already
+    independently verified against the real repository -- never a wider
+    repository scan, and never a location proposed only by an LLM.
+
+    Two tiers, in that order, each accepted only when it is unambiguous
+    across every candidate file combined:
+      1. An exact declaration-like match (_FALLBACK_DECLARATION_RE_PARTS).
+      2. Only if NO declaration-like match exists anywhere: an exact
+         token-boundary occurrence of `name` (this tier is intentionally
+         weaker, so it never runs when a real declaration was found).
+    More than one match at whichever tier is checked -- or none at all --
+    fails closed (returns None); this never picks an arbitrary first hit.
+
+    Returns a bounded source window (the balanced-brace block itself when
+    one can be found, otherwise a fixed-size padded window around the
+    declaration line), never the whole file -- kind="constant" so the
+    existing bounded line-range reader (_read_symbol_source's constant
+    branch) can render it without needing a func_id the upstream analyzer
+    never assigned. Deliberately returns the block's OWN exact bounds
+    with no extra padding baked in here: every existing caller that
+    reads a "constant"-kind match's source already applies its own
+    _DEFINITION_CONTEXT_LINES padding on top (see _read_symbol_source) --
+    adding a second, independent pad here would stack, needlessly
+    widening the window (and, in a tightly-packed file, risk reaching a
+    neighboring declaration this fallback was never asked to include)."""
+    if not name or not candidate_files:
+        return None
+
+    escaped = re.escape(name)
+    declaration_pattern = re.compile(
+        "|".join(part.format(name=escaped) for part in _FALLBACK_DECLARATION_RE_PARTS),
+        re.MULTILINE,
+    )
+    token_pattern = re.compile(r"\b" + escaped + r"\b")
+
+    file_texts: "dict[str, str]" = {}
+    declaration_hits: "list[tuple[str, int]]" = []  # (file, 0-indexed line)
+    token_hits: "list[tuple[str, int]]" = []
+    for f in candidate_files:
+        try:
+            text = (Path(repo_root) / f).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        file_texts[f] = text
+        for m in declaration_pattern.finditer(text):
+            declaration_hits.append((f, text.count("\n", 0, m.start())))
+        for m in token_pattern.finditer(text):
+            token_hits.append((f, text.count("\n", 0, m.start())))
+
+    if len(declaration_hits) > 1:
+        return None  # ambiguous declaration -- fail closed, never guess
+    if declaration_hits:
+        chosen = declaration_hits[0]
+    elif len(token_hits) == 1:
+        chosen = token_hits[0]
+    else:
+        return None  # zero or ambiguous token occurrences -- fail closed
+
+    file, line0 = chosen
+    text = file_texts[file]
+    lines = text.splitlines()
+    n_lines = len(lines)
+    if n_lines == 0:
+        return None
+
+    block_end0 = _bounded_declaration_block(lines, line0)
+    if block_end0 > line0:
+        start_line = line0 + 1
+        end_line = min(n_lines, block_end0 + 1)
+    else:
+        start_line = max(1, line0 + 1 - _FALLBACK_FIXED_WINDOW_LINES)
+        end_line = min(n_lines, line0 + 1 + _FALLBACK_FIXED_WINDOW_LINES)
+
+    return _SymbolMatch(file=file, label=name, kind="constant", line=start_line, end_line=end_line, func_id=None)
+
+
+def _resolve_symbol_details(
+    raw: str, repo_root: Path, context, verified_files: "list[str] | None" = None,
+) -> "_SymbolMatch | None":
     """Resolve one Planner-proposed symbol string using only existing
     lookups -- RepositoryIndex.search_by_name for functions, the
     already-built constants table for module/class-level constants.
@@ -277,7 +427,15 @@ def _resolve_symbol_details(raw: str, repo_root: Path, context) -> "_SymbolMatch
     accepted silently, under the ORIGINALLY PROPOSED label, even when it
     belongs to a different class entirely. A proposal with no class
     qualifier (a bare function name) is unaffected -- bare-name matching
-    behaves exactly as before."""
+    behaves exactly as before.
+
+    `verified_files`, when given by the caller, is that caller's OWN
+    already-independently-verified file set (e.g. a Final Strategy's own
+    re-verified target_files) -- used ONLY by the deterministic fallback
+    below, after both structured lookups above have already been tried
+    and found nothing. Omitted (the default) preserves every existing
+    caller's exact prior behavior, including returning None for a symbol
+    the structured lookups can't resolve."""
     if not isinstance(raw, str) or not raw.strip():
         return None
     if context is None:
@@ -320,6 +478,16 @@ def _resolve_symbol_details(raw: str, repo_root: Path, context) -> "_SymbolMatch
                         file=f, label=name, kind="constant",
                         line=line, end_line=record.get("end_line"), func_id=None,
                     )
+
+    # Neither structured lookup resolved it. If an explicit file hint was
+    # given and verified, the fallback is scoped to exactly that one file
+    # (an explicit, already-confirmed hint always wins over the caller's
+    # broader verified set); otherwise it's scoped to the caller's own
+    # verified_files, if any -- never a wider repository search, and never
+    # run at all when the caller didn't independently verify anything.
+    fallback_files = [verified_file] if verified_file else list(verified_files or ())
+    if fallback_files:
+        return _deterministic_identifier_fallback(bare_name, fallback_files, repo_root)
 
     return None
 
@@ -768,7 +936,17 @@ def _verify_strategy_targets(
     Planner's proposals -- no second implementation, no broader policy
     engine. Returns (kept_files, kept_symbols, warnings); an item that
     doesn't verify is dropped and recorded in `warnings`, never silently
-    lost and never allowed to abort the call."""
+    lost and never allowed to abort the call.
+
+    Symbol verification also passes `kept_files` (this call's own
+    already-verified files, built above, first) into
+    _resolve_symbol_details as `verified_files` -- so a symbol the
+    structured lookup can't resolve (e.g. a nested function the upstream
+    analyzer never indexed) still gets a deterministic, file-scoped
+    identifier fallback against exactly those already-verified files
+    before being dropped as unverified. Never widens which files are
+    searched: kept_files is the same set _verify_file already confirmed
+    real, nothing added and nothing else considered."""
     warnings: "list[str]" = []
     kept_files: "list[str]" = []
     root = Path(repo_root) if repo_root else None
@@ -785,7 +963,10 @@ def _verify_strategy_targets(
     kept_symbols: "list[str]" = []
     seen_symbols: set = set()
     for raw in raw_symbols:
-        match = _resolve_symbol_details(raw, root, context) if root is not None else None
+        match = (
+            _resolve_symbol_details(raw, root, context, verified_files=kept_files)
+            if root is not None else None
+        )
         if match is not None and raw not in seen_symbols:
             seen_symbols.add(raw)
             kept_symbols.append(raw)
@@ -1639,9 +1820,17 @@ def _build_final_target_slice_inner(
     # supporting-context block (one-hop / category 2 / category 3a /
     # category 5) is committed anywhere below until every edit-target
     # candidate in categories 1, 3b, and 4 has already had its turn.
+    #
+    # `verified_files=strategy.target_files` lets a target symbol the
+    # structured lookup still can't resolve (already re-tried once in
+    # _verify_strategy_targets, since a symbol string here may have been
+    # proposed for a different strategy than the one that ran there --
+    # e.g. Slice 2's narrowly-scoped re-invocation) fall back to the same
+    # deterministic, file-scoped identifier recovery -- never a wider
+    # search than the Final Strategy's own already-verified target_files.
     symbol_matches: "dict[str, object]" = {}
     for raw_symbol in strategy.target_symbols:
-        match = _resolve_symbol_details(raw_symbol, root, context)
+        match = _resolve_symbol_details(raw_symbol, root, context, verified_files=strategy.target_files)
         if match is None:
             continue
         symbol_matches[raw_symbol] = match
@@ -2125,7 +2314,8 @@ EDIT_READINESS_REASONS = (
 
 
 def check_edit_readiness(
-    intended_edits: "list[IntendedEdit]", slice_result: FinalTargetSliceResult
+    intended_edits: "list[IntendedEdit]", slice_result: FinalTargetSliceResult,
+    *, allow_full_file_fallback_for_symbols: bool = False,
 ) -> EditReadinessResult:
     """Deterministically decide, per intended edit, whether the Final-
     Target Remediation Slice already gave Patch Generation patch-ready,
@@ -2177,6 +2367,24 @@ def check_edit_readiness(
         count as covering it.
 
     "source_not_patch_ready" is never produced -- see EDIT_READINESS_REASONS.
+
+    `allow_full_file_fallback_for_symbols=False` (the default, and every
+    existing caller) preserves this exact behavior unchanged: a
+    symbol-having edit's readiness is decided purely by whether ITS OWN
+    symbol resolved, never by the file-level full_file_fallback_covered/
+    identifier_definition_covered signals the file-only branch already
+    uses. When True (used by exactly one caller -- pipeline.run()'s
+    bounded target-file fallback, applied only once, only after guided
+    acquisition has already been exhausted), a symbol-having edit whose
+    own symbol never resolved MAY still be marked ready if its file is
+    already in full_file_fallback_covered/identifier_definition_covered --
+    i.e. the SAME already-verified, already-rendered whole-file (or exact
+    identifier) source a file-only edit could always use. This never reads
+    a new file, never trusts an LLM-proposed location, and never widens
+    which files qualify: full_file_fallback_covered/
+    identifier_definition_covered are themselves fixed by
+    build_final_target_slice() from the Final Strategy's own verified
+    target_files, before this function ever runs.
     """
     strategy_ready = bool(intended_edits)
     ready: "list[ReadyEdit]" = []
@@ -2191,6 +2399,12 @@ def check_edit_readiness(
         if edit.symbol is not None:
             if edit.symbol in slice_result.covered_target_symbols:
                 ready.append(ReadyEdit(edit=edit, role="edit_target", file=edit.file or "", symbol=edit.symbol))
+                continue
+            if allow_full_file_fallback_for_symbols and edit.file is not None and (
+                edit.file in slice_result.full_file_fallback_covered
+                or edit.file in slice_result.identifier_definition_covered
+            ):
+                ready.append(ReadyEdit(edit=edit, role="edit_target", file=edit.file, symbol=edit.symbol))
                 continue
             if edit.symbol not in slice_result.resolved_target_symbols:
                 reason = "unresolved_symbol"
@@ -2704,7 +2918,16 @@ GUIDED_REQUEST_FAILURE_REASONS = (
     "context_request_limit_reached",
     "target_budget_exhausted",
     "missing_target_source",
+    "duplicate_request",
 )
+""""duplicate_request" (added alongside the loop/duplicate-request guard in
+run_guided_acquisition): a request whose (request_type, symbol-or-
+identifier, attributed edit) exactly repeats an earlier request already
+attempted for that same edit. Recognizing this is pure bookkeeping over
+already-attempted tuples -- _resolve_guided_symbol/_resolve_guided_identifier
+are pure functions of their own inputs, so re-running either against the
+exact same inputs could only ever reproduce the exact same failure. Skipping
+that redundant resolution never changes which requests succeed."""
 """The full reason vocabulary GuidedRetrievalAttempt.failure_reason draws
 from -- every rejection below sets exactly one of these, never a freeform
 string, so a caller can rely on the vocabulary being closed.
@@ -3182,6 +3405,22 @@ def run_guided_acquisition(
     the SAME hard total Slice 1/2 already enforce, never a separate
     allowance. Stops immediately once every intended edit is ready.
 
+    Loop/duplicate-request guard: a request whose (request_type, symbol-
+    or-identifier, attributed edit) tuple exactly repeats one already
+    attempted (in this round or an earlier one) is never re-resolved --
+    recorded with failure_reason "duplicate_request" instead. And if a
+    round's own attempts collectively improved NO edit's readiness at all
+    (every GuidedRetrievalAttempt in that round has readiness_improved=
+    False), the NEXT round's guided_context_request LLM call is skipped
+    entirely -- the loop stops there rather than spending another round
+    asking the model for (at best) the same or an equally unresolvable
+    target again. Both checks are purely mechanical (an exact-tuple
+    membership test; an already-computed boolean), never a semantic-
+    similarity judgment about whether two differently-worded requests
+    "mean the same thing" -- MAX_GUIDED_ACQUISITION_ROUNDS stays the same
+    hard ceiling either way, this only lets the loop exit earlier when it
+    already has enough evidence to know continuing is pointless.
+
     check_edit_readiness (itself unmodified) is what actually decides
     whether a retrieved block satisfies its attributed edit -- a
     consumer/usage window or a different symbol's own supporting content
@@ -3216,6 +3455,18 @@ def run_guided_acquisition(
     attempts: "list[GuidedRetrievalAttempt]" = []
     requests_per_edit: dict = {}
     rounds_used = 0
+    # Loop/duplicate-request guard: every (request_type, symbol-or-
+    # identifier, attributed edit) tuple already attempted, across ALL
+    # rounds so far -- an exact repeat is never re-resolved (see
+    # "duplicate_request" in GUIDED_REQUEST_FAILURE_REASONS). A round that
+    # achieved zero readiness improvement across every one of its own
+    # attempts stops the loop before the NEXT round's LLM call -- "the
+    # model asked and none of it moved anything forward" is itself a
+    # deterministic, already-computed signal (readiness_improved), never a
+    # semantic-similarity judgment -- so this never needs to guess whether
+    # two differently-worded requests "mean the same thing".
+    _attempted_signatures: set = set()
+    _previous_round_improved = True
 
     def _record(round_num, request, schema_valid, verified, failure_reason, match=None,
                 start=None, end=None, kind=None, chars=0, improved=False) -> None:
@@ -3231,7 +3482,16 @@ def run_guided_acquisition(
     for round_num in range(1, MAX_GUIDED_ACQUISITION_ROUNDS + 1):
         if current_readiness.edit_source_ready or not current_readiness.unready_edits:
             break
+        if round_num > 1 and not _previous_round_improved:
+            # The previous round's own attempts improved nothing -- another
+            # LLM round trip against the same still-unready edits would, at
+            # best, ask for the same (or an equally unresolvable) target
+            # again. Stop here rather than spend another guided_context_
+            # request call; the caller's bounded target-file fallback (if
+            # any) takes over from whatever this function already returns.
+            break
         rounds_used = round_num
+        _this_round_improved = False
 
         raw_requests = generate_guided_context_requests(
             strategy, vulnerability_text, llm, current_readiness, current_slice, deterministic_attempts,
@@ -3256,6 +3516,16 @@ def run_guided_acquisition(
                 _record(round_num, request, True, False, "context_request_limit_reached")
                 continue
             requests_per_edit[attributed_edit] = requests_per_edit.get(attributed_edit, 0) + 1
+
+            _signature = (
+                request.request_type,
+                (request.symbol or request.identifier or "").strip().lower(),
+                attributed_edit,
+            )
+            if _signature in _attempted_signatures:
+                _record(round_num, request, True, False, "duplicate_request")
+                continue
+            _attempted_signatures.add(_signature)
 
             verified_file = None
             if request.file_hint:
@@ -3361,8 +3631,10 @@ def run_guided_acquisition(
                 None if improved else (single_readiness.unready_edits[0].reason if single_readiness.unready_edits else None),
                 match=match, start=start, end=end, kind=kind, chars=len(addition.rendered), improved=improved,
             )
+            _this_round_improved = _this_round_improved or improved
 
         current_readiness = check_edit_readiness(readiness.intended_edits, current_slice)
+        _previous_round_improved = _this_round_improved
 
     return GuidedAcquisitionResult(
         slice_result=current_slice, readiness=current_readiness, attempts=attempts, rounds_used=rounds_used,

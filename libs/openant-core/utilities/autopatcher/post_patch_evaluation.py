@@ -259,10 +259,8 @@ def _evaluate_constant_value(anchor: Anchor, context: InvestigationContext) -> A
 
 
 _SINK_MATCH_DEFERRED_NOTE = (
-    "sink_match evaluation deferred: vuln_class is not captured on the "
-    "Anchor and evaluate_anchors() does not accept it as an input; "
-    "closing this gap requires either capturing vuln_class at "
-    "anchor-derivation time or a dedicated future evaluation path."
+    "Sink-level re-verification is deferred for this vulnerability class, "
+    "so this element was not independently re-checked after the patch."
 )
 
 

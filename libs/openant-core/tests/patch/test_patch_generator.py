@@ -190,6 +190,204 @@ _UNCLOSED_FIRST_THEN_VALID_SECOND_DIFF = (
     "```\n"
 )
 
+# --- Full-contract-enforcement fixtures (release: response-contract
+# enforcement -- prose before/after a single otherwise-valid block is now a
+# contract violation, not silently stripped) ---
+
+_PROSE_BEFORE_ONLY = """\
+The vulnerability is in retry.py. Here is the minimal fix:
+
+```diff
+--- a/src/urllib3/util/retry.py
++++ b/src/urllib3/util/retry.py
+@@ -187,7 +187,7 @@
+-    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])
++    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization"])
+```"""
+
+_PROSE_AFTER_ONLY = """\
+```diff
+--- a/src/urllib3/util/retry.py
++++ b/src/urllib3/util/retry.py
+@@ -187,7 +187,7 @@
+-    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])
++    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization"])
+```
+
+Let me know if you need a more defensive approach."""
+
+_THREE_ALTERNATIVES = """\
+Option A — minimal fix:
+
+```diff
+--- a/src/urllib3/util/retry.py
++++ b/src/urllib3/util/retry.py
+@@ -187,7 +187,7 @@
+-    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])
++    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization"])
+```
+
+Option B — more defensive:
+
+```diff
+--- a/src/urllib3/util/retry.py
++++ b/src/urllib3/util/retry.py
+@@ -187,7 +187,7 @@
+-    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])
++    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization", "X-Csrf-Token"])
+```
+
+Wait, let me reconsider — option C:
+
+```diff
+--- a/src/urllib3/util/retry.py
++++ b/src/urllib3/util/retry.py
+@@ -187,7 +187,7 @@
+-    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])
++    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization", "Set-Cookie"])
+```"""
+
+# Whitespace-only before/after the fence (blank lines, trailing newline) must
+# remain valid -- "surrounding whitespace is allowed" is explicit in the
+# response contract.
+_WHITESPACE_ONLY_SURROUNDING_DIFF = (
+    "\n\n"
+    "```diff\n"
+    "--- a/f.py\n"
+    "+++ b/f.py\n"
+    "@@ -1,1 +1,1 @@\n"
+    "-old\n"
+    "+new\n"
+    "```"
+    "\n   \n"
+)
+
+# --- Real regression fixtures: the CVE-2023-43804 / urllib3 traced run
+# (see docs/investigation for the full root-cause writeup). Copied in
+# verbatim from the traced run's 003_patch_generation.response.txt and
+# 004_patch_generation.response.txt so the test suite has no dependency on
+# /tmp. Both are genuine LLM output: the model itself produced the correct
+# Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT fix in each case, as a LATER
+# block than the one that used to be silently selected -- these fixtures
+# exist to prove the parser never selects any candidate from either
+# response, not to assert which candidate "should" win.
+
+_TRACE_003_RESPONSE = """\
+```diff
+--- a/src/urllib3/connectionpool.py
++++ b/src/urllib3/connectionpool.py
+@@ -871,6 +871,8 @@
+             retries = retries.increment(method, url, response=response, _pool=self)
+             retries.sleep_for_retry(response)
+             log.debug("Redirect %s -> %s", url, redirect_location)
++            if retries.remove_headers_on_redirect:
++                new_headers = {k.lower(): v for k, v in headers.items()}
+             return self.urlopen(
+                 method,
+                 redirect_location,
+```
+
+Given the actual redirect header-stripping mechanism is not in the verified evidence, the correct minimal fix is to add `Cookie` to the default set of headers removed on redirect:
+
+```diff
+--- a/src/urllib3/util/retry.py
++++ b/src/urllib3/util/retry.py
+@@ -184,7 +184,7 @@
+         RETRY_AFTER_STATUS_CODES.
+     \"\"\"
+
+-    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])
++    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization"])
+
+     #: Default headers to be used for ``remove_headers_on_redirect``
+     DEFAULT_ALLOWED_METHODS = frozenset(
+```"""
+
+_TRACE_004_RESPONSE = """\
+```diff
+--- a/src/urllib3/connectionpool.py
++++ b/src/urllib3/connectionpool.py
+@@ -940,6 +940,15 @@
+         # Handle redirect?
+         redirect_location = redirect and response.get_redirect_location()
+         if redirect_location:
+             if response.status == 303:
+                 method = "GET"
+
++                # Change the body and headers for a GET request.
++                # https://datatracker.ietf.org/doc/html/rfc9110#section-15.4.4
++                body = None
++                headers = HTTPHeaderDict(headers)._prepare_for_method_change()
++
+             try:
+                 retries = retries.increment(method, url, response=response, _pool=self)
+             except MaxRetryError:
+                 if retries.raise_on_redirect:
+                     response.drain_conn()
+                     raise
+                 return response
+```
+
+Wait, that changes unrelated logic. Let me reconsider the actual fix for CVE-2023-43804.
+
+```diff
+--- a/src/urllib3/connectionpool.py
++++ b/src/urllib3/connectionpool.py
+@@ -871,10 +871,20 @@
+         # Handle redirect?
+         redirect_location = redirect and response.get_redirect_location()
+         if redirect_location:
+             if response.status == 303:
+                 method = "GET"
+
++            # Strip headers marked as unsafe to forward to the redirected location.
++            # Check remove_headers_on_redirect to avoid a potential network call within
++            # conn.request() where the same headers are sent to another host.
++            retries = retries or self.retries
++            if retries.remove_headers_on_redirect and not is_same_host(
++                redirect_location
++            ):
++                new_headers = {
++                    k: v
++                    for k, v in (headers or {}).items()
++                    if k.lower() not in retries.remove_headers_on_redirect
++                }
++                headers = new_headers
++
+             try:
+                 retries = retries.increment(method, url, response=response, _pool=self)
+             except MaxRetryError:
+```
+
+The above uses an undefined `is_same_host`. Here is the correct minimal patch:
+
+```diff
+--- a/src/urllib3/connectionpool.py
++++ b/src/urllib3/connectionpool.py
+@@ -871,6 +871,20 @@
+         redirect_location = redirect and response.get_redirect_location()
+         if redirect_location:
+             if response.status == 303:
+                 method = "GET"
+
++            # Strip headers marked as unsafe to forward to the redirected location.
++            # Check remove_headers_on_redirect to avoid a potential network call within
++            # conn.request() where the same headers are sent to another host.
++            if retries.remove_headers_on_redirect:
++                new_headers = {
++                    k: v
++                    for k, v in (headers or {}).items()
++                    if k.lower() not in retries.remove_headers_on_redirect
++                }
++                redirect_url = urljoin(url, redirect_location)
++                if urlparse(url).netloc != urlparse(redirect_url).netloc:
++                    headers = new_headers
++
+             try:
+                 retries = retries.increment(method, url, response=response, _pool=self)
+             except MaxRetryError:
+```"""
+
 
 # ---------------------------------------------------------------------------
 # Tests for _extract_diff_block
@@ -203,27 +401,24 @@ class TestExtractDiffBlock:
         assert result.strip().endswith("```")
         assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in result
 
-    def test_prose_preamble_stripped(self):
+    def test_prose_preamble_and_postamble_is_now_a_contract_violation(self):
+        """Release: response-contract enforcement. _PROSE_PREAMBLE has real
+        prose on both sides of an otherwise-valid single diff — previously
+        silently stripped, now correctly a contract violation (the prompt
+        contract requires "no prose... before or after the block")."""
         from utilities.autopatcher.patch_generator import _extract_diff_block
         result = _extract_diff_block(_PROSE_PREAMBLE)
-        assert result.startswith("```diff\n")
-        assert "The vulnerability" not in result
-        assert "Let me know" not in result
-        assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in result
+        assert result == ""
 
-    def test_prose_postamble_stripped(self):
-        from utilities.autopatcher.patch_generator import _extract_diff_block
-        result = _extract_diff_block(_PROSE_PREAMBLE)
-        assert "Let me know" not in result
-
-    def test_first_of_two_alternatives_returned(self):
+    def test_two_diff_alternatives_is_contract_violation(self):
+        """Release: response-contract enforcement. This used to assert the
+        first of two alternatives was silently returned — that was the
+        actual bug (see the traced urllib3 CVE-2023-43804 regression). A
+        multi-candidate response must now be rejected outright, never
+        resolved by picking one."""
         from utilities.autopatcher.patch_generator import _extract_diff_block
         result = _extract_diff_block(_TWO_ALTERNATIVES)
-        assert result.count("```diff") == 1
-        assert "Option A" not in result
-        assert "Option B" not in result
-        assert "X-Csrf-Token" not in result
-        assert '"Cookie", "Authorization"' in result
+        assert result == ""
 
     def test_multi_file_diff_preserved(self):
         from utilities.autopatcher.patch_generator import _extract_diff_block
@@ -258,11 +453,134 @@ class TestExtractDiffBlock:
         assert result.startswith("```diff\n")
         assert "+new" in result
 
-    def test_output_always_starts_with_diff_fence(self):
+    def test_valid_single_diff_always_starts_with_diff_fence(self):
+        """_PROSE_PREAMBLE and _TWO_ALTERNATIVES removed from this list —
+        release: response-contract enforcement — neither classifies as
+        "valid" anymore (see test_prose_preamble_and_postamble_is_now_a_
+        contract_violation / test_two_diff_alternatives_is_contract_violation)."""
         from utilities.autopatcher.patch_generator import _extract_diff_block
-        for raw in (_CLEAN_DIFF, _PROSE_PREAMBLE, _TWO_ALTERNATIVES, _PATCH_TAG):
+        for raw in (_CLEAN_DIFF, _PATCH_TAG, _WHITESPACE_ONLY_SURROUNDING_DIFF):
             result = _extract_diff_block(raw)
             assert result.startswith("```diff\n"), f"Failed for input starting: {raw[:40]!r}"
+
+
+# ---------------------------------------------------------------------------
+# classify_patch_response — full response-contract enforcement.
+#
+# Required cases A-I from the release plan: exactly one fenced diff block,
+# no prose before, no prose after, no alternatives; surrounding whitespace
+# allowed; malformed/no-diff keep their pre-existing, separately-tested
+# semantics (see TestExtractDiffBlock / TestExtractDiffBlockNestedFences
+# above, unchanged).
+# ---------------------------------------------------------------------------
+
+class TestClassifyPatchResponse:
+    def test_a_one_valid_diff_only(self):
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response(_CLEAN_DIFF)
+        assert result.status == "valid"
+        assert result.block_count == 1
+        assert result.diff.startswith("```diff\n")
+        assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in result.diff
+
+    def test_b_prose_before_one_diff_is_contract_violation(self):
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response(_PROSE_BEFORE_ONLY)
+        assert result.status == "contract_violation"
+        assert result.block_count == 1
+        assert result.diff == ""
+
+    def test_c_prose_after_one_diff_is_contract_violation(self):
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response(_PROSE_AFTER_ONLY)
+        assert result.status == "contract_violation"
+        assert result.block_count == 1
+        assert result.diff == ""
+
+    def test_d_two_complete_diff_blocks_is_contract_violation(self):
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response(_TWO_ALTERNATIVES)
+        assert result.status == "contract_violation"
+        assert result.block_count == 2
+        assert result.diff == ""
+
+    def test_e_three_complete_diff_blocks_is_contract_violation(self):
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response(_THREE_ALTERNATIVES)
+        assert result.status == "contract_violation"
+        assert result.block_count == 3
+        assert result.diff == ""
+
+    def test_f_malformed_nested_fence_is_malformed_not_contract_violation(self):
+        """Malformed/truncated structured output is a distinct state from
+        "contract violation" — it was never eligible for the bounded retry
+        (see _generate_patch_with_contract_check) and keeps its
+        pre-existing, separately-tested "" fail-closed behavior."""
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response(_UNCLOSED_FIRST_THEN_VALID_SECOND_DIFF)
+        assert result.status == "malformed_fence"
+        assert result.block_count == 0
+        assert result.diff == ""
+
+    def test_g_no_diff_preserves_its_own_distinct_state(self):
+        """"no_diff" (the model wrote plain prose, no fence at all) is
+        deliberately NOT a "contract_violation" and is never retried by
+        _generate_patch_with_contract_check — it may be an honest "no
+        automated patch is possible" answer, and retrying it as if it were
+        a formatting problem risks pressuring a fabricated diff out of a
+        model that had nothing to add. Behavior (raw.strip() passthrough)
+        is byte-identical to before this change."""
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response(_NO_DIFF_BLOCK)
+        assert result.status == "no_diff"
+        assert result.block_count == 0
+        assert result.diff == _NO_DIFF_BLOCK.strip()
+
+    def test_h_real_trace_003_is_contract_violation_not_first_block(self):
+        """The actual CVE-2023-43804 / urllib3 traced regression, call 1.
+        The model's SECOND block is the correct Retry fix — this asserts
+        only that the response is rejected outright, never that a
+        particular candidate "should" win."""
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response(_TRACE_003_RESPONSE)
+        assert result.status == "contract_violation"
+        assert result.block_count == 2
+        assert result.diff == ""
+
+    def test_i_real_trace_004_is_contract_violation_not_first_block(self):
+        """Same traced regression, call 2 (the applicability-aware retry
+        response) — three candidates including one the model itself
+        disavows ("Wait, that changes unrelated logic..."). Must still be
+        rejected outright, never resolved to any one of the three."""
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response(_TRACE_004_RESPONSE)
+        assert result.status == "contract_violation"
+        assert result.block_count == 3
+        assert result.diff == ""
+
+    def test_whitespace_only_surrounding_a_single_diff_is_valid(self):
+        """Explicit requirement: surrounding whitespace (blank lines,
+        trailing newline) must remain valid — only non-whitespace prose is
+        a violation."""
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response(_WHITESPACE_ONLY_SURROUNDING_DIFF)
+        assert result.status == "valid"
+        assert result.block_count == 1
+
+    def test_multi_file_single_block_diff_remains_valid(self):
+        """A single fence containing multiple --- a/ / +++ b/ file
+        sections is still exactly ONE fenced block — must not be confused
+        with "multiple diff blocks"."""
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response(_MULTI_FILE_DIFF)
+        assert result.status == "valid"
+        assert result.block_count == 1
+
+    def test_empty_response_is_no_diff(self):
+        from utilities.autopatcher.patch_generator import classify_patch_response
+        result = classify_patch_response("")
+        assert result.status == "no_diff"
+        assert result.diff == ""
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +644,14 @@ class TestExtractDiffBlockNestedFences:
 # ---------------------------------------------------------------------------
 
 class TestGeneratePatchExtraction:
-    def test_extracts_diff_from_messy_response(self):
+    def test_messy_response_with_prose_is_contract_violation(self):
+        """Release: response-contract enforcement. Prose before AND after
+        the single diff block used to be silently stripped — this is now a
+        contract violation. generate_patch() makes exactly one LLM call and
+        never retries internally (see pipeline.py's
+        _generate_patch_with_contract_check for the bounded retry that
+        lives one level up), so this must return "" outright, not a
+        cleaned-up diff."""
         from utilities.autopatcher.patch_generator import generate_patch
         messy = (
             "I'll fix this by adding Cookie to the frozenset:\n\n"
@@ -342,9 +667,8 @@ class TestGeneratePatchExtraction:
         llm = mock.MagicMock()
         llm.complete.return_value = messy
         result = generate_patch("some vuln", llm)
-        assert result.startswith("```diff\n")
-        assert "Alternatively" not in result
-        assert result.count("```diff") == 1
+        assert result == ""
+        assert llm.complete.call_count == 1
 
     def test_fallback_when_no_fenced_block(self):
         from utilities.autopatcher.patch_generator import generate_patch

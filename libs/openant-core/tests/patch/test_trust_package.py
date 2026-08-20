@@ -977,6 +977,132 @@ class TestRecommendationV1:
         assert rec["decision"] == "Deploy After Validation"
 
 
+class TestDescribeUnmetGates:
+    """Unit tests for the mechanical, deterministic helper that names which
+    I3 axis (patch_integrity / security_improvement / deployment_safety)
+    failed its own positive whitelist (release polish, Decision 2). Reuses
+    only already-computed signal values/notes; never reads Review Results;
+    never picks 'the most important finding'."""
+
+    def test_all_positive_returns_empty(self):
+        from utilities.autopatcher.pipeline import _describe_unmet_gates
+        signals = _signals_full()
+        assert _describe_unmet_gates(signals) == ""
+
+    def test_names_the_single_failing_axis(self):
+        """The minimist case: everything else positive, only deployment_safety
+        (impact analysis unsupported for this language) is not verified."""
+        from utilities.autopatcher.pipeline import _describe_unmet_gates
+        signals = _signals_full(
+            deployment_safety={
+                "value": "Not Verified", "label": "? Not Verified",
+                "notes": "Impact analysis is not supported for this language yet",
+            }
+        )
+        result = _describe_unmet_gates(signals)
+        assert "Deployment risk could not be verified" in result
+        assert "impact analysis is not supported for this language yet" in result
+        # Only the failing axis is named — integrity/improvement are positive.
+        assert "Patch integrity" not in result
+        assert "Security improvement" not in result
+
+    def test_names_multiple_failing_axes(self):
+        from utilities.autopatcher.pipeline import _describe_unmet_gates
+        signals = _signals_full(
+            patch_integrity={"value": "Minor Issues", "label": "Minor Issues", "notes": "MEDIUM: unused import"},
+            security_improvement={"value": "Low", "label": "Low", "notes": "1 review finding(s) flagged"},
+        )
+        result = _describe_unmet_gates(signals)
+        assert "Patch integrity could not be verified because" in result
+        assert "Security improvement could not be verified because" in result
+
+    def test_empty_notes_falls_back_to_terse_sentence(self):
+        from utilities.autopatcher.pipeline import _describe_unmet_gates
+        signals = _signals_for(safety="Not Verified")
+        # _signals_for sets notes="" for every key.
+        assert _describe_unmet_gates(signals) == "Deployment risk could not be verified."
+
+
+class TestRecommendationReasonNamesActualSignal:
+    """Release-polish (Decision 2): non-Green Recommendation reasons must
+    name the actual Trust Signal/policy gate that produced the decision,
+    using only already-computed signal values/notes. The decision itself
+    must be unaffected."""
+
+    def test_minimist_shaped_case_names_deployment_safety_not_behavior_change(self):
+        """The report-polish case this task is anchored on: still_vulnerable
+        is False and there is no confirmed defect (as in the real minimist
+        run), so Manual Review Required is reached only via the I3 catch-all
+        — the actual gate is deployment_safety=Not Verified (JS impact
+        analysis unsupported), not any Review Results finding. The reason
+        must say so, and must not mention Review Results content."""
+        signals = _signals_full(
+            deployment_safety={
+                "value": "Not Verified", "label": "? Not Verified",
+                "notes": "Impact analysis is not supported for this language yet",
+            }
+        )
+        rec = _build_recommendation_v1(signals, still_vulnerable=False, defect_count=0)
+        assert rec["decision"] == "Manual Review Required"
+        assert "impact analysis is not supported for this language yet" in rec["reason"].lower()
+        assert "constructor" not in rec["reason"].lower()
+        assert "prototype" not in rec["reason"].lower()
+
+    def test_do_not_apply_reason_cites_patch_integrity_notes(self):
+        signals = _signals_full(
+            patch_integrity={"value": "Does Not Apply", "label": "✗ Does Not Apply", "notes": "rejected by git apply"}
+        )
+        rec = _build_recommendation_v1(signals)
+        assert rec["decision"] == "Do Not Apply"
+        assert "rejected by git apply" in rec["reason"]
+
+    def test_misaligned_reason_cites_remediation_alignment_notes(self):
+        signals = _signals_full(
+            remediation_alignment={
+                "value": "Misaligned", "label": "✗ Misaligned",
+                "notes": "Confirmed alternate exploit path identified",
+            }
+        )
+        rec = _build_recommendation_v1(signals)
+        assert rec["decision"] == "Manual Review Required"
+        assert "Confirmed alternate exploit path identified" in rec["reason"]
+
+    def test_still_vulnerable_reason_cites_remediation_alignment_notes(self):
+        signals = _signals_full(
+            remediation_alignment={
+                "value": "Likely Aligned", "label": "Likely Aligned",
+                "notes": "Correct mechanism · runtime verification pending",
+            }
+        )
+        rec = _build_recommendation_v1(signals, still_vulnerable=True, defect_count=0)
+        assert rec["decision"] == "Manual Review Required"
+        assert "Correct mechanism" in rec["reason"]
+
+    def test_high_risk_reason_cites_deployment_safety_notes(self):
+        signals = _signals_full(
+            deployment_safety={"value": "High Risk", "label": "✗ High Risk", "notes": "HIGH impact surface"}
+        )
+        rec = _build_recommendation_v1(signals)
+        assert rec["decision"] == "Manual Review Required"
+        assert "HIGH impact surface" in rec["reason"]
+
+    def test_decision_unchanged_across_all_signals_full_variants(self):
+        """Reason enrichment must never change which branch fires. Sweep a
+        representative set of signals dicts and confirm decisions match the
+        pre-existing policy exactly (same expectations as
+        TestRecommendationPolicyBoundaries, re-expressed via _signals_full)."""
+        cases = [
+            (_signals_full(), "Deploy After Validation"),
+            (_signals_full(patch_integrity={"value": "Does Not Apply", "label": "x", "notes": ""}), "Do Not Apply"),
+            (_signals_full(remediation_alignment={"value": "Misaligned", "label": "x", "notes": ""}), "Manual Review Required"),
+            (_signals_full(deployment_safety={"value": "Not Verified", "label": "x", "notes": ""}), "Manual Review Required"),
+            (_signals_full(deployment_safety={"value": "High Risk", "label": "x", "notes": ""}), "Manual Review Required"),
+            (_signals_full(security_improvement={"value": "Low", "label": "x", "notes": ""}), "Deploy With Caution"),
+        ]
+        for signals, expected in cases:
+            assert _build_recommendation_v1(signals)["decision"] == expected
+
+
 # ---------------------------------------------------------------------------
 # Recommendation Policy boundary table — every row is traceable to one of
 # I1-I6 (see the Recommendation Policy Invariants block in pipeline.py,
@@ -1352,7 +1478,7 @@ class TestRenderKnownFindings:
         assert "## Review Results" in block
         assert "### Potential Remaining Risks" in block
         assert "### Validation Gaps" in block
-        assert "### Confirmed Observations" in block
+        assert "### Observed Facts" in block
         assert "### Validation Questions" in block
         assert "### Future Improvements" in block
         assert "r1" in block and "g1" in block and "o1" in block and "h1" in block and "f1" in block
@@ -1367,8 +1493,16 @@ class TestRenderKnownFindings:
 
     def test_observed_implementation_notes_labeled_as_repository_backed(self):
         block = _render_known_findings(self._findings(observed=["h.lower() normalizes casing"]))
-        assert "### Confirmed Observations" in block
+        assert "### Observed Facts" in block
         assert "repository evidence" in block.lower()
+
+    def test_observed_facts_subtitle_clarifies_evidence_status_not_polarity(self):
+        """Release-polish: 'Observed' is an evidence-status axis (directly
+        backed by evidence vs. inferred), not a severity/polarity axis — the
+        subtitle must say so explicitly so a skimmer doesn't read every
+        bullet under this heading as a confirmed problem."""
+        block = _render_known_findings(self._findings(observed=["legitimate keys named `constructor` are now silently dropped"]))
+        assert "may be reassuring, neutral, or concerning" in block.lower()
 
     def test_validation_hypotheses_labeled_as_unconfirmed(self):
         """Correction: hypotheses must read as conditional reasoning, not
@@ -1393,7 +1527,7 @@ class TestRenderKnownFindings:
         block = _render_known_findings(self._findings(gaps=["g1"]))
         assert "### Validation Gaps" in block
         assert "### Potential Remaining Risks" not in block
-        assert "### Confirmed Observations" not in block
+        assert "### Observed Facts" not in block
         assert "### Validation Questions" not in block
         assert "### Future Improvements" not in block
 
@@ -1513,14 +1647,24 @@ class TestRecommendationConsistency:
         findings = self._known_findings(hypotheses=2, hardening=7)
         caveats = _check_recommendation_consistency(signals, "Deploy After Validation", findings)
         assert len(caveats) == 1
-        assert "2 decision-relevant finding(s)" in caveats[0]
+        assert "2 items to weigh: 2 validation questions" in caveats[0]
         assert "7" not in caveats[0]
 
     def test_confirmed_risks_and_gaps_also_count_as_decision_relevant(self):
         signals = self._signals(test_availability="Tests Available")
         findings = self._known_findings(risks=1, gaps=1, observed=1)
         caveats = _check_recommendation_consistency(signals, "Deploy After Validation", findings)
-        assert "3 decision-relevant finding(s)" in caveats[0]
+        assert "3 items to weigh: 1 flagged risk · 1 validation gap · 1 observed fact" in caveats[0]
+
+    def test_decision_relevant_summary_never_says_open_or_remain(self):
+        """Release-polish: observed_implementation_notes may be reassuring,
+        neutral, or concerning -- the aggregate must not be described with
+        language implying every counted item is an unresolved defect."""
+        signals = self._signals(test_availability="Tests Available")
+        findings = self._known_findings(observed=2, hypotheses=1)
+        caveats = _check_recommendation_consistency(signals, "Deploy After Validation", findings)
+        assert "remain open" not in caveats[0].lower()
+        assert "3 items to weigh" in caveats[0]
 
     # --- Both conditions at once ---
 
@@ -1581,6 +1725,66 @@ class TestDecisionRelevantFindingCount:
     def test_missing_keys_default_to_empty(self):
         from utilities.autopatcher.pipeline import _decision_relevant_finding_count
         assert _decision_relevant_finding_count({}) == 0
+
+
+class TestDescribeDecisionRelevantFindings:
+    """Unit tests for the category-breakdown presentation helper introduced
+    to replace the bare 'N decision-relevant finding(s) remain open' wording
+    (release polish, Decision 4). Must describe exactly the same aggregate
+    _decision_relevant_finding_count counts -- same four keys, same
+    exclusion of future_hardening_ideas -- never reclassifying any finding,
+    and never implying every counted item is an unresolved defect."""
+
+    def test_empty_returns_empty_string(self):
+        from utilities.autopatcher.pipeline import _describe_decision_relevant_findings
+        assert _describe_decision_relevant_findings({}) == ""
+
+    def test_excludes_future_hardening_ideas(self):
+        from utilities.autopatcher.pipeline import _describe_decision_relevant_findings
+        findings = {"future_hardening_ideas": ["a", "b", "c"]}
+        assert _describe_decision_relevant_findings(findings) == ""
+
+    def test_single_category_breakdown(self):
+        from utilities.autopatcher.pipeline import _describe_decision_relevant_findings
+        findings = {"validation_hypotheses": ["h1", "h2"]}
+        summary = _describe_decision_relevant_findings(findings)
+        assert summary == "2 items to weigh: 2 validation questions"
+
+    def test_multi_category_breakdown_matches_total(self):
+        from utilities.autopatcher.pipeline import (
+            _describe_decision_relevant_findings,
+            _decision_relevant_finding_count,
+        )
+        findings = {
+            "potential_remaining_risks": ["r"],
+            "validation_gaps": ["g"],
+            "observed_implementation_notes": ["o1", "o2"],
+            "validation_hypotheses": ["h"],
+            "future_hardening_ideas": ["ignored", "ignored2"],
+        }
+        summary = _describe_decision_relevant_findings(findings)
+        total = _decision_relevant_finding_count(findings)
+        assert summary == (
+            f"{total} items to weigh: 1 flagged risk · 1 validation gap · "
+            "2 observed facts · 1 validation question"
+        )
+
+    def test_singular_wording_for_count_of_one(self):
+        from utilities.autopatcher.pipeline import _describe_decision_relevant_findings
+        summary = _describe_decision_relevant_findings({"validation_gaps": ["g"]})
+        assert summary == "1 item to weigh: 1 validation gap"
+
+    def test_never_uses_open_or_remain_language(self):
+        """The whole point of this helper: mixed observed/hypothesis/gap
+        aggregates must not read as 'N findings remain open'."""
+        from utilities.autopatcher.pipeline import _describe_decision_relevant_findings
+        findings = {
+            "observed_implementation_notes": ["reassuring fact", "concerning fact"],
+            "validation_hypotheses": ["question"],
+        }
+        summary = _describe_decision_relevant_findings(findings)
+        assert "open" not in summary.lower()
+        assert "remain" not in summary.lower()
 
 
 # ---------------------------------------------------------------------------

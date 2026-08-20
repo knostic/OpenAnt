@@ -1485,9 +1485,24 @@ class TestSlice4PipelineIntegration:
             stage_calls, patch_calls, bad_patch, good_patch, planning_target_files=planning_target_files,
         )
 
+        # Release: response-contract enforcement moved the initial
+        # generation call site (Site 1) from generate_patch() to
+        # _generate_patch_with_contract_check() -> generate_patch_raw()
+        # (both defined in pipeline.py); Post-Patch Recovery's own
+        # regeneration call (Site 3, what this test class exercises)
+        # still calls generate_patch() directly (patch_generator.py),
+        # unchanged. bad_patch is always Site 1's response and good_patch
+        # is always Site 3's regeneration response in every caller of this
+        # helper -- split into two single-purpose side effects (both still
+        # appending to the same shared `patch_calls` list) rather than one
+        # call-count-based function serving both.
+        def _gen_patch_raw_side_effect(vulnerability_text, llm, code_context="", retry_hint="", stage="patch_generation"):
+            patch_calls.append(retry_hint)
+            return bad_patch
+
         def _gen_patch_side_effect(vulnerability_text, llm, code_context="", retry_hint=""):
             patch_calls.append(retry_hint)
-            return bad_patch if len(patch_calls) == 1 else good_patch
+            return good_patch
 
         # run() returns only the rendered Markdown report -- capture the
         # actual PipelineResult by wrapping the real _build_report (which
@@ -1501,6 +1516,7 @@ class TestSlice4PipelineIntegration:
 
         with (
             mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", side_effect=_gen_patch_raw_side_effect),
             mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=_gen_patch_side_effect) as mock_gen,
             mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok") as mock_review,
             mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}) as mock_challenge,
@@ -1530,7 +1546,7 @@ class TestSlice4PipelineIntegration:
             tmp_path, bad_patch, good_patch, planning_target_files=["mod.py", "other.py"],
         )
 
-        assert mock_gen.call_count == 2  # Test 17: exactly one additional call
+        assert mock_gen.call_count == 1  # Test 17: exactly one additional call
         assert result.patch_target_conformance is not None
         assert result.patch_target_conformance.all_conformant is True
         assert mock_review.called  # existing downstream stages still ran
@@ -1553,7 +1569,7 @@ class TestSlice4PipelineIntegration:
             tmp_path, bad_patch, good_patch, planning_target_files=["mod.py", "other.py"],
         )
 
-        assert mock_gen.call_count == 2
+        assert mock_gen.call_count == 1
         assert result.patch_target_conformance is not None
         assert result.patch_target_conformance.all_conformant is True
         assert not result.patch_target_conformance.unexpected_files
@@ -1586,7 +1602,7 @@ class TestSlice4PipelineIntegration:
 
         # Regeneration is never attempted -- recovery fails closed at the
         # eligibility gate, before generate_patch's one bounded retry call.
-        assert mock_gen.call_count == 1
+        assert mock_gen.call_count == 0
         assert result.post_patch_recovery is not None
         assert any(
             a.file == "invented.py" and a.success is False and a.failure_reason == "not_recovery_eligible"
@@ -1625,7 +1641,7 @@ class TestSlice4PipelineIntegration:
         result, _stage_calls, patch_calls, mock_gen, _mock_review, _mock_challenge = self._run(
             tmp_path, bad_patch, still_bad_patch, planning_target_files=["mod.py", "other.py"],
         )
-        assert mock_gen.call_count == 2
+        assert mock_gen.call_count == 1
         assert result.patch is None or result.patch == ""
 
     def test_regenerated_patch_with_new_unexpected_file_fails_closed(self, tmp_path):
@@ -1643,7 +1659,7 @@ class TestSlice4PipelineIntegration:
         result, _stage_calls, _patch_calls, mock_gen, _mock_review, _mock_challenge = self._run(
             tmp_path, bad_patch, another_bad_patch, planning_target_files=["mod.py", "other.py"],
         )
-        assert mock_gen.call_count == 2
+        assert mock_gen.call_count == 1
         assert result.patch is None or result.patch == ""
 
     def test_empty_regenerated_diff_fails_closed(self, tmp_path):
@@ -1658,7 +1674,7 @@ class TestSlice4PipelineIntegration:
         result, _stage_calls, _patch_calls, mock_gen, _mock_review, _mock_challenge = self._run(
             tmp_path, bad_patch, "", planning_target_files=["mod.py", "other.py"],
         )
-        assert mock_gen.call_count == 2
+        assert mock_gen.call_count == 1
         assert result.patch is None or result.patch == ""
 
     def test_recommendation_policy_unchanged(self):

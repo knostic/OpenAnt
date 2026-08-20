@@ -118,15 +118,34 @@ def _run_pipeline(
 
     def _calibrate_side_effect(*a, **kw):
         calls["calibrate"].append(kw.get("code_context", ""))
-        return None
+        # should_auto_repair/accept_repair now require an explicit
+        # "observed" calibration entry before a raw confirmed_defect
+        # finding can authorize or accept a mutation -- returning "observed"
+        # for every finding here reproduces, for this module's fixtures,
+        # the same repair-triggering behavior tested before that gate
+        # existed (this file is about Post-Patch Investigation evidence
+        # wiring, not the calibration gate itself; see
+        # TestDeterministicRepairGate in test_pipeline_repair.py for that).
+        findings = a[2] if len(a) > 2 else []
+        return [{"original": f, "group": "observed", "reworded": f} for f in findings]
 
     def _score_side_effect(*a, **kw):
         calls["score"].append(kw.get("code_context", ""))
         return "Confidence score: 0.8"
 
+    # Release: response-contract enforcement moved the initial generation
+    # call site (Site 1) from generate_patch() to
+    # _generate_patch_with_contract_check() -> generate_patch_raw() (both
+    # defined in pipeline.py); the Challenger-repair loop (Site 4, exercised
+    # by some tests here) still calls generate_patch() directly
+    # (patch_generator.py), unchanged. patches_gen[0] is always the Site 1
+    # response in every caller of this helper -- mocking generate_patch_raw
+    # with it, and generate_patch with the REMAINING items, preserves every
+    # existing call's exact meaning.
     patchers = [
         mock.patch("utilities.autopatcher.pipeline.LLMClient"),
-        mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=patches_gen),
+        mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", return_value=patches_gen[0]),
+        mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=patches_gen[1:]),
         mock.patch("utilities.autopatcher.patch_applicability.check_applicability", return_value=_APPLICABILITY_CLEAN),
         mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok review"),
         mock.patch("utilities.autopatcher.pipeline.challenge_patch", side_effect=_challenge_side_effect),
