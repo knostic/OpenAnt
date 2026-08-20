@@ -2536,6 +2536,236 @@ class TestDefinitionAndUsageLookupVerification:
         assert found is None
 
 
+# ---------------------------------------------------------------------------
+# Category 2 target-identity boundary (pygeoapi CVE-2026-42351 regression)
+#
+# Regression shape: a Final Strategy verifies and scopes to
+# "filesystem.py:FileSystemProvider.get_data_path", explicitly REJECTING
+# "azure_.py:AzureBlobStorageProvider.get_data_path" as out of scope. Both
+# files still end up in the Final-Target Slice's own `preferred_files` (the
+# Planner's original, broader proposal, kept for OTHER strategy-derived
+# identifiers' supporting evidence -- see build_final_target_slice's own
+# docstring). _extract_strategy_identifiers always adds a qualified target
+# symbol's own bare suffix ("get_data_path") as a plain strategy term, and
+# category 2 (_lookup_identifier_definition) resolves strategy terms with no
+# class-qualifier check of its own -- so, before the fix, whichever file's
+# search_definitions() hit came back first (analyzer-order, not
+# target-order) silently satisfied the term, even a REJECTED file's own
+# unrelated class. This produced a real observed "Target definition:
+# azure_.py:get_data_path" block for a Strategy that never approved it.
+# ---------------------------------------------------------------------------
+
+def _pygeoapi_shaped_context(tmp_path):
+    (tmp_path / "filesystem.py").write_text(
+        "class FileSystemProvider:\n"
+        "    def get_data_path(self, dirpath):\n"
+        "        return TARGET_SOURCE\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "azure_.py").write_text(
+        "class AzureBlobStorageProvider:\n"
+        "    def get_data_path(self, dirpath):\n"
+        "        return OTHER_SOURCE\n",
+        encoding="utf-8",
+    )
+    return _make_context(
+        functions={
+            # Analyzer (by_name) order deliberately puts azure_.py's match
+            # FIRST -- reproducing the real run's observed ordering, so a
+            # test that happened to pass only by accidental dict order
+            # would be a false negative.
+            "azure_.py:AzureBlobStorageProvider.get_data_path": {
+                "name": "get_data_path", "className": "AzureBlobStorageProvider",
+                "startLine": 2, "endLine": 3,
+                "code": "    def get_data_path(self, dirpath):\n        return OTHER_SOURCE\n",
+            },
+            "filesystem.py:FileSystemProvider.get_data_path": {
+                "name": "get_data_path", "className": "FileSystemProvider",
+                "startLine": 2, "endLine": 3,
+                "code": "    def get_data_path(self, dirpath):\n        return TARGET_SOURCE\n",
+            },
+        },
+        repo_path=tmp_path,
+    )
+
+
+class TestQualifiedTargetIdentityBoundary:
+    def test_target_identity_by_bare_name_built_from_resolved_matches(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            _SymbolMatch, _target_identity_by_bare_name,
+        )
+        symbol_matches = {
+            "FileSystemProvider.get_data_path": _SymbolMatch(
+                file="filesystem.py", label="FileSystemProvider.get_data_path",
+                kind="function", line=2, end_line=3,
+                func_id="filesystem.py:FileSystemProvider.get_data_path",
+            ),
+        }
+        identity = _target_identity_by_bare_name(symbol_matches)
+        assert identity == {"get_data_path": {("filesystem.py", "FileSystemProvider")}}
+
+    def test_category2_lookup_rejects_cross_file_cross_class_bare_match(self, tmp_path):
+        # The exact bug shape, isolated to _lookup_identifier_definition
+        # itself: with target_identity supplied, azure_.py's own
+        # get_data_path must never satisfy a lookup that is really asking
+        # for FileSystemProvider's.
+        context = _pygeoapi_shaped_context(tmp_path)
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_definition
+
+        target_identity = {"get_data_path": {("filesystem.py", "FileSystemProvider")}}
+        found = _lookup_identifier_definition(
+            "get_data_path", ["filesystem.py", "azure_.py"], context,
+            target_identity=target_identity,
+        )
+        assert found is not None
+        assert found.file == "filesystem.py"
+
+    def test_category2_lookup_without_identity_map_unaffected(self, tmp_path):
+        # target_identity=None (the default) is the exact prior behavior --
+        # every existing caller that doesn't pass it must see no change.
+        context = _pygeoapi_shaped_context(tmp_path)
+        from utilities.autopatcher.remediation_planner import _lookup_identifier_definition
+
+        found = _lookup_identifier_definition("get_data_path", ["filesystem.py", "azure_.py"], context)
+        assert found is not None  # unchanged: still resolves to *a* match
+
+    def test_final_target_slice_never_renders_rejected_file_as_target_definition(self, tmp_path):
+        # End-to-end through build_final_target_slice, exactly reproducing
+        # the pygeoapi shape: Final Strategy verified only filesystem.py /
+        # FileSystemProvider.get_data_path; azure_.py is still passed as
+        # planner_evidence_files (the Planner's own broader, since-rejected
+        # proposal) -- it must never be able to satisfy the target.
+        #
+        # Note: azure_.py's OWN get_data_path can still legitimately appear
+        # elsewhere in `rendered` as a "Discovered consumer" (category 3a's
+        # plain usage scan trivially self-matches any function whose own
+        # `def name(...)` line contains the search term -- true for ANY
+        # same-named sibling, independent of this fix, and already
+        # excluded from target authority by design -- see
+        # _edit_target_source_for_file's own docstring). What must never
+        # happen is azure_.py satisfying the actual EDIT-TARGET role, so
+        # assertions use the exact same extraction
+        # check_patch_target_conformance itself relies on.
+        context = _pygeoapi_shaped_context(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, _edit_target_source_for_file
+
+        strategy = _make_strategy(
+            target_files=["filesystem.py"],
+            target_symbols=["FileSystemProvider.get_data_path"],
+            required_edits=["Validate get_data_path's resolved path stays inside self.data."],
+        )
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["filesystem.py", "azure_.py"],
+        )
+
+        assert "Target definition: `azure_.py" not in result.rendered
+        filesystem_target_source = _edit_target_source_for_file(result.rendered, "filesystem.py")
+        assert "TARGET_SOURCE" in filesystem_target_source
+        assert "OTHER_SOURCE" not in filesystem_target_source
+        assert _edit_target_source_for_file(result.rendered, "azure_.py") == ""
+        assert "filesystem.py" in result.covered_target_files
+        assert "FileSystemProvider.get_data_path" in result.covered_target_symbols
+
+    def test_same_bare_method_two_classes_same_file_qualified_target_selects_correct_class(self, tmp_path):
+        (tmp_path / "mixed.py").write_text(
+            "class A:\n"
+            "    def get_data_path(self):\n"
+            "        return A_SOURCE\n"
+            "\n"
+            "class B:\n"
+            "    def get_data_path(self):\n"
+            "        return B_SOURCE\n",
+            encoding="utf-8",
+        )
+        context = _make_context(functions={
+            "mixed.py:A.get_data_path": {
+                "name": "get_data_path", "className": "A", "startLine": 2, "endLine": 3,
+                "code": "    def get_data_path(self):\n        return A_SOURCE\n",
+            },
+            "mixed.py:B.get_data_path": {
+                "name": "get_data_path", "className": "B", "startLine": 6, "endLine": 7,
+                "code": "    def get_data_path(self):\n        return B_SOURCE\n",
+            },
+        }, repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice, _edit_target_source_for_file
+
+        strategy = _make_strategy(
+            target_files=["mixed.py"], target_symbols=["B.get_data_path"],
+            required_edits=["Fix get_data_path in B."],
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=["mixed.py"])
+
+        mixed_target_source = _edit_target_source_for_file(result.rendered, "mixed.py")
+        assert "B_SOURCE" in mixed_target_source
+        assert "A_SOURCE" not in mixed_target_source
+
+    def test_ambiguous_class_identity_fails_closed_not_wrong_attribution(self, tmp_path):
+        # Neither candidate has className metadata at all (the analyzer
+        # never tracked it for this language/shape) -- a qualified proposal
+        # must fail closed, never silently accept an unproven class.
+        (tmp_path / "a.py").write_text("def get_data_path():\n    return A_SOURCE\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("def get_data_path():\n    return B_SOURCE\n", encoding="utf-8")
+        context = _make_context(functions={
+            "a.py:get_data_path": {"name": "get_data_path", "startLine": 1, "endLine": 2},
+            "b.py:get_data_path": {"name": "get_data_path", "startLine": 1, "endLine": 2},
+        }, repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol
+
+        assert _resolve_symbol("SomeClass.get_data_path", tmp_path, context) is None
+
+    def test_candidate_in_rejected_file_cannot_satisfy_readiness(self, tmp_path):
+        # check_edit_readiness must not be fooled either: with the fix,
+        # category 2 no longer manufactures a false "covered" signal for
+        # filesystem.py's target out of azure_.py's own source, and the
+        # actual FileSystemProvider.get_data_path definition (small enough
+        # here to fit category 4's compact-render cap) is what satisfies
+        # readiness.
+        context = _pygeoapi_shaped_context(tmp_path)
+        from utilities.autopatcher.remediation_planner import (
+            build_final_target_slice, build_intended_edits, check_edit_readiness,
+        )
+
+        strategy = _make_strategy(
+            target_files=["filesystem.py"], target_symbols=["FileSystemProvider.get_data_path"],
+        )
+        slice_result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["filesystem.py", "azure_.py"],
+        )
+        edits = build_intended_edits(strategy, slice_result)
+        readiness = check_edit_readiness(edits, slice_result)
+
+        assert readiness.edit_source_ready is True
+        assert readiness.ready_edits[0].file == "filesystem.py"
+
+
+class TestNoInvertedSourceRanges:
+    def test_offset_past_declared_span_never_renders_inverted_range(self, tmp_path):
+        # Reproduces the exact real-world shape from a pygeoapi run: an
+        # analyzer-reported synthetic "__module__" entry whose own `code`
+        # text (40 lines) is longer than its declared startLine/endLine
+        # span (30-40, 11 lines) -- a real observed analyzer-side
+        # inconsistency, not something this module controls. Before the
+        # fix, a term matching near the end of that longer `code` text
+        # produced a literal "(lines 51-40)" (start > end) in rendered
+        # output; the fix drops the offending window instead of emitting
+        # it.
+        lines = [f"# line_{i}\n" for i in range(36)] + ["marker_term\n"] + ["# tail\n"] * 3
+        assert len(lines) == 40  # matches the real observed code/span mismatch exactly
+        code = "".join(lines)
+        (tmp_path / "mod.py").write_text("x = 1\n" * 50, encoding="utf-8")
+        context = _make_context(functions={
+            "mod.py:__module__": {"name": "__module__", "startLine": 30, "endLine": 40, "code": code},
+        }, repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        strategy = _make_strategy(target_files=["mod.py"], extended_mechanism="marker_term")
+        result = build_final_target_slice(strategy, str(tmp_path), context, planner_evidence_files=["mod.py"])
+
+        for start_s, end_s in re.findall(r"lines (\d+)[–-](\d+)", result.rendered):
+            assert int(start_s) <= int(end_s), f"invalid source range: lines {start_s}-{end_s}"
+        assert "__module__" not in result.rendered  # the only offending window was correctly dropped
+
+
 class TestFocusedWindows:
     def test_windows_include_exact_line_numbers(self, tmp_path):
         (tmp_path / "consumer.py").write_text(

@@ -1273,8 +1273,48 @@ class _IdentifierMatch(NamedTuple):
     func_id: "str | None"
 
 
+def _target_identity_by_bare_name(symbol_matches: "dict[str, object]") -> "dict[str, set]":
+    """Maps each ALREADY-RESOLVED Final Strategy target symbol's own bare
+    (rightmost, class-unqualified) name to the set of (file, class-qualifier)
+    identities it actually resolved to -- built purely from `symbol_matches`
+    (category 1's own `_resolve_symbol_details` output, the SAME
+    class-qualifier-checked resolution used to build categories 1/3b/4), no
+    new resolution pass.
+
+    Used only to stop `_lookup_identifier_definition` (category 2 -- a bare,
+    class-unqualified lookup by design, see its own docstring) from letting
+    a same-named declaration in an UNRELATED file/class satisfy a
+    strategy-derived term that is itself just the bare suffix of one of
+    these already-uniquely-identified targets (see
+    _extract_strategy_identifiers, which always adds a qualified target
+    symbol's own bare suffix as a plain term). Without this, a term like
+    "get_data_path" -- added because the real target is
+    "FileSystemProvider.get_data_path" -- could resolve, via category 2's
+    otherwise class-blind search, to an unrelated same-named method on a
+    different class in a different file (observed directly: a real pygeoapi
+    run's Final-Target Slice rendered "Target definition:
+    azure_.py:get_data_path" for a Strategy that had already verified and
+    scoped to "filesystem.py:FileSystemProvider.get_data_path", with
+    azure_.py's own AzureBlobStorageProvider.get_data_path explicitly
+    REJECTED by that same Strategy) -- even though azure_.py is present in
+    `preferred_files` on purpose, for OTHER strategy-derived identifiers'
+    supporting-evidence lookups.
+
+    A bare name absent from this map (never the bare suffix of any resolved
+    qualified target symbol -- e.g. a mechanism identifier like
+    "os.path.realpath", or a target symbol that was itself proposed bare)
+    is entirely unaffected -- category 2's pre-existing, class-blind
+    behavior is preserved exactly for it."""
+    identity: "dict[str, set]" = {}
+    for match in symbol_matches.values():
+        bare = match.label.rsplit(".", 1)[-1]
+        identity.setdefault(bare, set()).add((match.file, _class_of_label(match.label)))
+    return identity
+
+
 def _lookup_identifier_definition(
-    identifier: str, preferred_files: "list[str]", context
+    identifier: str, preferred_files: "list[str]", context,
+    target_identity: "dict[str, set] | None" = None,
 ) -> "_IdentifierMatch | None":
     """Constants first (RepositoryIndex has no concept of a constant at
     all -- only InvestigationContext.constants does), then function/method
@@ -1287,7 +1327,17 @@ def _lookup_identifier_definition(
     _resolve_symbol_details' own class-qualifier check; this lookup accepts
     the SAME residual ambiguity `search_definitions()` itself has for a
     bare, class-unqualified strategy term, bounded by staying inside
-    preferred_files rather than the whole repository)."""
+    preferred_files rather than the whole repository) -- UNLESS
+    `target_identity` (see _target_identity_by_bare_name) proves this exact
+    bare identifier IS one of the Final Strategy's own already-resolved
+    qualified target symbols: then a function candidate must match one of
+    that identifier's own known (file, class) identities, never merely be
+    IN preferred_files -- this is what stops a same-named method on a
+    different, unrelated (possibly explicitly rejected) class/file from
+    satisfying what is actually a specific target's own identity.
+    `target_identity=None` (the default, and the one existing caller scoped
+    to a single already-verified file) preserves this exact prior
+    behavior."""
     constants = getattr(context, "constants", None) or {}
     for f in preferred_files:
         for qualified_name, record in constants.get(f, {}).items():
@@ -1299,6 +1349,8 @@ def _lookup_identifier_definition(
                         line=line, end_line=record.get("end_line"), func_id=None,
                     )
 
+    allowed_identities = (target_identity or {}).get(identifier)
+
     index = getattr(context, "index", None)
     if index is not None:
         for match in index.search_definitions(identifier):
@@ -1306,6 +1358,8 @@ def _lookup_identifier_definition(
             candidate_file = _file_part(func_id)
             if candidate_file not in preferred_files:
                 continue
+            if allowed_identities is not None and (candidate_file, match.get("className")) not in allowed_identities:
+                continue  # a different target's own identity -- never a bare-name substitute
             line = match.get("startLine")
             if line is not None:
                 return _IdentifierMatch(
@@ -1522,7 +1576,14 @@ def _render_usage_window_block(path: str, label: str, ranges: "list[tuple[int, i
     single consumer function -- reads each window's exact text via the
     existing read_file_section, never hand-reconstructed source. Two
     non-contiguous windows from the same function are separated by an
-    explicit omitted-region marker rather than concatenated silently."""
+    explicit omitted-region marker rather than concatenated silently.
+
+    `ranges=[]` (every offset's window fell outside its own enclosing
+    unit's declared span -- see _windows_for's own inverted-range guard)
+    renders nothing, same as "no usage found here", rather than indexing
+    into an empty list."""
+    if not ranges:
+        return None
     index = getattr(context, "index", None)
     if index is None:
         return None
@@ -1882,8 +1943,9 @@ def _build_final_target_slice_inner(
     # original position; the actual commit happens far below, after every
     # edit-target candidate (categories 1, 3b, 4) has already been tried.
     category2_candidates: "list[tuple[str, str]]" = []  # (rendered_text, file)
+    target_identity = _target_identity_by_bare_name(symbol_matches)
     for term in strategy_terms:
-        found = _lookup_identifier_definition(term, preferred_files, context)
+        found = _lookup_identifier_definition(term, preferred_files, context, target_identity=target_identity)
         if found is None:
             continue
         key = (found.file, found.line, found.end_line)
@@ -1915,11 +1977,22 @@ def _build_final_target_slice_inner(
     # consumer/usage scan, unrelated to any specific verified target --
     # supporting-context role) only with whatever budget remains.
     def _windows_for(fn_start: int, fn_end: int, offsets: "list[int]") -> "list[tuple[int, int]]":
-        raw_ranges = [
-            (max(fn_start, fn_start + off - _USAGE_WINDOW_LINES),
-             min(fn_end, fn_start + off + _USAGE_WINDOW_LINES))
-            for off in offsets
-        ]
+        raw_ranges = []
+        for off in offsets:
+            start = max(fn_start, fn_start + off - _USAGE_WINDOW_LINES)
+            end = min(fn_end, fn_start + off + _USAGE_WINDOW_LINES)
+            if start > end:
+                # An offset past the enclosing unit's own declared span --
+                # observed directly from a real analyzer inconsistency (a
+                # module-level `code` blob longer than its own startLine/
+                # endLine span, e.g. "lines 51-40"). fn_end already caps
+                # `end`, but nothing caps `start` against it, so a large
+                # enough offset can push start past end on its own.
+                # Skipping here means this fallback data shape never
+                # emits an inverted range downstream, rather than
+                # papering over it with a second, silent clamp.
+                continue
+            raw_ranges.append((start, end))
         return _merge_line_windows(raw_ranges)
 
     category3_candidates: "list[tuple[str, str, str, object]]" = []  # (rendered_text, file, label, raw_symbol_or_None)
