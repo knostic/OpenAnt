@@ -1106,6 +1106,64 @@ class TestRenderPostPatchInvestigation:
         assert "discovered from patch diff" not in unchanged_section
 
 
+class TestCoverageSectionLanguageAwareWording:
+    """Report-polish Batch A, fix #4: when Anchor Coverage finds zero
+    attributable elements, the reason must distinguish "genuinely
+    cosmetic/no-op Python diff" from "this signal doesn't support the
+    detected language" -- reusing the same "Not Applicable" pattern
+    Impact Surface already uses for the latter case. `language=None`
+    (the default) preserves prior behavior for callers that don't pass
+    it."""
+
+    def test_python_zero_attributed_keeps_cosmetic_wording(self):
+        from utilities.autopatcher.post_patch_evaluation import CoverageResult, render_post_patch_investigation
+
+        coverage = CoverageResult(total=0, covered=(), uncovered=(), unattributed=0)
+        rendered = render_post_patch_investigation([], coverage, language="python")
+        assert "cosmetic-only diff" in rendered
+        assert "Not Applicable" not in rendered
+
+    def test_no_language_passed_keeps_cosmetic_wording(self):
+        """Backward compatibility: existing callers that don't pass
+        `language` at all must see unchanged output."""
+        from utilities.autopatcher.post_patch_evaluation import CoverageResult, render_post_patch_investigation
+
+        coverage = CoverageResult(total=0, covered=(), uncovered=(), unattributed=0)
+        rendered = render_post_patch_investigation([], coverage)
+        assert "cosmetic-only diff" in rendered
+
+    def test_javascript_zero_attributed_says_not_applicable(self):
+        from utilities.autopatcher.post_patch_evaluation import CoverageResult, render_post_patch_investigation
+
+        coverage = CoverageResult(total=0, covered=(), uncovered=(), unattributed=0)
+        rendered = render_post_patch_investigation([], coverage, language="javascript")
+        assert "Not Applicable" in rendered
+        assert "detected: javascript" in rendered
+        assert "cosmetic-only diff" not in rendered
+        # Must not claim/imply the diff was evaluated and found trivial.
+        assert "not evidence the diff is cosmetic or unchanged" in rendered
+
+    def test_c_zero_attributed_says_not_applicable(self):
+        from utilities.autopatcher.post_patch_evaluation import CoverageResult, render_post_patch_investigation
+
+        coverage = CoverageResult(total=0, covered=(), uncovered=(), unattributed=0)
+        rendered = render_post_patch_investigation([], coverage, language="c")
+        assert "Not Applicable" in rendered
+        assert "detected: c" in rendered
+        assert "cosmetic-only diff" not in rendered
+
+    def test_unattributed_hunks_wording_unaffected_by_language(self):
+        """The "unattributed hunks" branch is a different, already-honest
+        code path (a Python file that failed to relocate/parse) -- it must
+        not be swapped for the language-guard wording."""
+        from utilities.autopatcher.post_patch_evaluation import CoverageResult, render_post_patch_investigation
+
+        coverage = CoverageResult(total=0, covered=(), uncovered=(), unattributed=3)
+        rendered = render_post_patch_investigation([], coverage, language="javascript")
+        assert "3 hunk(s) unattributed" in rendered
+        assert "Not Applicable" not in rendered
+
+
 # ---------------------------------------------------------------------------
 # Release-polish change #2: human-readable Anchor values in Changed
 # ---------------------------------------------------------------------------

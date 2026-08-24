@@ -1298,6 +1298,130 @@ class TestReleasePolishReportBehaviors:
         ) in report
 
 
+class TestSuggestedTestsAndTestSupportLanguageAware:
+    """Report-polish Batch A, fixes #5 and #6: Suggested Tests must not
+    fabricate a `.py` path for a non-Python repo, and Test Support must
+    not present its Python-only test count as if the repo had been
+    exhaustively searched when the detected language isn't Python.
+    Builds PipelineResult directly and calls _build_report() — no LLM
+    calls, fully deterministic."""
+
+    def _kwargs(self, tmp_path, *, language, patch_file, edge_case):
+        return dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch=(
+                f"--- a/{patch_file}\n+++ b/{patch_file}\n@@ -1,3 +1,3 @@\n"
+                " unchanged\n-old\n+new\n"
+            ),
+            review=(
+                "**Explanation:**\nThe patch fixes the issue.\n\n"
+                f"**Affected areas:**\n- {patch_file}\n\n"
+                "**Validation notes:**\n- Add tests.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={
+                "still_vulnerable": False,
+                "edge_cases": [edge_case],
+                "potential_issues": [],
+                "summary": "",
+            },
+            impact={
+                "impact_level": "low" if language == "python" else "not_applicable",
+                "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            behavior=None,
+            repo_root=tmp_path,
+            detected_language=language,
+        )
+
+    # --- Fix #5: Suggested Tests ---
+
+    def test_suggested_tests_python_keeps_py_path(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._kwargs(
+            tmp_path, language="python", patch_file="mod.py",
+            edge_case="input validation is missing on the new branch",
+        )
+        report = _build_report(PipelineResult(**kwargs))
+        st_block = report[report.find("### Suggested Tests"):]
+        assert "tests/suggested/" in st_block
+        assert ".py" in st_block
+
+    def test_suggested_tests_javascript_omits_fabricated_py_path(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._kwargs(
+            tmp_path, language="javascript", patch_file="index.js",
+            edge_case="prototype pollution guard may miss nested aliases",
+        )
+        report = _build_report(PipelineResult(**kwargs))
+        st_block = report[report.find("### Suggested Tests"):]
+        assert "tests/suggested/" not in st_block
+        assert ".py" not in st_block
+        assert "no target path suggested" in st_block
+        assert "javascript" in st_block
+        # Omission is only of the fabricated path -- the finding itself
+        # must still be shown.
+        assert "prototype pollution guard may miss nested aliases" in st_block
+
+    def test_suggested_tests_c_omits_fabricated_py_path(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._kwargs(
+            tmp_path, language="c", patch_file="lib/transfer.c",
+            edge_case="redirect target scheme comparison is case sensitive",
+        )
+        report = _build_report(PipelineResult(**kwargs))
+        st_block = report[report.find("### Suggested Tests"):]
+        assert "tests/suggested/" not in st_block
+        assert ".py" not in st_block
+        assert "no target path suggested" in st_block
+        assert "c" in st_block  # language name rendered somewhere
+
+    # --- Fix #6: Test Support ---
+
+    def test_test_support_python_keeps_total_count(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        (tmp_path / "test_mod.py").write_text("def test_x(): pass\n", encoding="utf-8")
+        kwargs = self._kwargs(
+            tmp_path, language="python", patch_file="mod.py",
+            edge_case="edge case needing a test",
+        )
+        report = _build_report(PipelineResult(**kwargs))
+        ts_block = report[report.find("### Test Support"): report.find("### Test Support") + 400]
+        assert "Total test files found: 1" in ts_block
+
+    def test_test_support_javascript_does_not_imply_zero_tests(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._kwargs(
+            tmp_path, language="javascript", patch_file="index.js",
+            edge_case="edge case needing a test",
+        )
+        report = _build_report(PipelineResult(**kwargs))
+        ts_block = report[report.find("### Test Support"): report.find("### Test Support") + 500]
+        assert "Total test files found:" not in ts_block
+        assert "not evaluated" in ts_block
+        assert "javascript" in ts_block
+        assert "Rating: Not Applicable" in ts_block
+        assert "test discovery does not yet support this language" in ts_block
+
+    def test_test_support_c_does_not_imply_zero_tests(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._kwargs(
+            tmp_path, language="c", patch_file="lib/transfer.c",
+            edge_case="edge case needing a test",
+        )
+        report = _build_report(PipelineResult(**kwargs))
+        ts_block = report[report.find("### Test Support"): report.find("### Test Support") + 500]
+        assert "Total test files found:" not in ts_block
+        assert "not evaluated" in ts_block
+        assert "Rating: Not Applicable" in ts_block
+
+
 # ---------------------------------------------------------------------------
 # pipeline helpers
 # ---------------------------------------------------------------------------
@@ -1333,6 +1457,169 @@ class TestPipelineHelpers:
         assert "vulnerable" in sections["explanation"]
         assert "auth.py" in sections["affected_areas"]
         assert "payload" in sections["validation_notes"]
+
+    def test_split_review_preserves_bold_subheading_in_body(self):
+        # Regression: a bolded subheading immediately after a section
+        # header used to have its opening "**" stripped by the old
+        # body-cleanup regex, producing a dangling closing marker like
+        # "Why the original code was vulnerable**".
+        from utilities.autopatcher.pipeline import _split_review
+        review = textwrap.dedent("""\
+            **Explanation**
+            **Why the original code was vulnerable**
+            The code failed to validate input.
+
+            **Affected areas**
+            - app/auth.py
+
+            **Validation notes**
+            - Test with payload Y.
+        """)
+        sections = _split_review(review)
+        assert sections["explanation"].startswith(
+            "**Why the original code was vulnerable**"
+        )
+        # Bug reproduction: the buggy version returned a body starting
+        # with "Why the original code was vulnerable**" -- opening marker
+        # stripped, closing marker left dangling.
+        assert not sections["explanation"].startswith("Why the original code")
+
+    def test_split_review_heading_form_still_supported(self):
+        from utilities.autopatcher.pipeline import _split_review
+        review = textwrap.dedent("""\
+            ### Explanation
+            The code was vulnerable because of X.
+
+            ### Affected areas
+            - app/auth.py
+
+            ### Validation notes
+            - Test with payload Y.
+        """)
+        sections = _split_review(review)
+        assert "vulnerable" in sections["explanation"]
+        assert "auth.py" in sections["affected_areas"]
+        assert "payload" in sections["validation_notes"]
+
+    def test_split_review_prose_mention_is_not_mistaken_for_header(self):
+        # "Validation notes" appears inline, mid-sentence, inside the
+        # Explanation body -- it must not be treated as a new section
+        # boundary, and the real "Validation notes" section below must not
+        # be merged with (or overwritten by) that sentence.
+        from utilities.autopatcher.pipeline import _split_review
+        review = textwrap.dedent("""\
+            ### Explanation
+            This fix touches Validation notes for callers as well.
+
+            ### Affected areas
+            - foo.py
+
+            ### Validation notes
+            - Run tests.
+        """)
+        sections = _split_review(review)
+        assert "touches Validation notes for callers" in sections["explanation"]
+        assert sections["validation_notes"].strip() == "- Run tests."
+
+    # -- short_reason() / _truncate_reason() ---------------------------
+    # Regression coverage for two baseline bugs: (1) splitting on the
+    # first literal "." anywhere (not just a real sentence end) truncated
+    # text mid-word/mid-backtick whenever the finding text contained an
+    # early "." inside a path, abbreviation, or code span; (2) the final
+    # 120-char cap was a hard slice with no word-boundary or ellipsis.
+
+    def test_short_reason_empty_string(self):
+        from utilities.autopatcher.pipeline import short_reason
+        assert short_reason("") == ""
+        assert short_reason(None) == ""
+
+    def test_short_reason_short_text_unchanged(self):
+        from utilities.autopatcher.pipeline import short_reason
+        text = "Cross-origin redirect handled only in PoolManager"
+        assert short_reason(text) == text
+
+    def test_short_reason_does_not_split_on_path_dot(self):
+        # Regression: "Symlinks inside `.git/refs` still allow escape..."
+        # used to be cut immediately after the backtick because
+        # text.split(".", 1)[0] stopped at the "." inside ".git".
+        from utilities.autopatcher.pipeline import short_reason
+        text = "Symlinks inside `.git/refs` still allow escape if only string checks used."
+        result = short_reason(text)
+        # Trailing "." is trimmed by design (short_reason always strips
+        # trailing "., " -- with or without truncation); the point of this
+        # regression test is that nothing is cut *before* that.
+        assert result == "Symlinks inside `.git/refs` still allow escape if only string checks used"
+        assert not result.endswith("`")
+
+    def test_short_reason_does_not_split_on_abbreviation_dot(self):
+        # Regression: "dirpath without leading '/' (e.g. 'collection')..."
+        # used to be cut right after "(e" because of the period in "e.g.".
+        from utilities.autopatcher.pipeline import short_reason
+        text = "dirpath without leading '/' (e.g. 'collection') changes prior concatenation semantics"
+        result = short_reason(text)
+        assert not result.endswith("(e")
+        assert "'collection'" in result
+
+    def test_short_reason_truncates_long_text_with_ellipsis(self):
+        from utilities.autopatcher.pipeline import short_reason
+        text = "word " * 40  # no sentence-ending punctuation, well over 120 chars
+        result = short_reason(text)
+        assert len(result) <= 120
+        assert result.endswith("...")
+
+    def test_short_reason_no_mid_word_truncation(self):
+        from utilities.autopatcher.pipeline import short_reason
+        text = (
+            "A very long adversarial finding description that keeps going "
+            "well past the compact reason budget without any early period "
+            "to stop at so it must be cut back to a real word boundary"
+        )
+        result = short_reason(text)
+        assert result.endswith("...")
+        core = result[: -len("...")]
+        source_words = set(text.split(" "))
+        for word in core.split(" "):
+            if word:
+                assert word in source_words
+
+    def test_short_reason_avoids_dangling_backtick(self):
+        from utilities.autopatcher.pipeline import short_reason
+        # A backtick-quoted path placed right at the truncation boundary.
+        text = "prefix " * 20 + "`some/long/path/that/pushes/past/the/limit`" + " more text " * 5
+        result = short_reason(text)
+        assert result.count("`") % 2 == 0
+
+    # -- normalize_title_from_text() ------------------------------------
+    # Regression coverage: keyword matching used to be plain substring
+    # (`"token" in text`), so "version tokens" false-matched "token" and
+    # produced "Review authentication flow" for an unrelated ReDoS finding.
+
+    def test_title_version_tokens_does_not_match_auth(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        text = "Long strings of interleaved spaces and version tokens (e.g. 1.2.3 1.2.3)"
+        title = normalize_title_from_text(text)
+        assert title != "Review authentication flow"
+
+    def test_title_genuine_auth_token_still_matches(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        text = "The auth token is not validated before being trusted"
+        assert normalize_title_from_text(text) == "Review authentication flow"
+
+    def test_title_author_does_not_match_auth(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        text = "The author of this module did not document the edge case"
+        assert normalize_title_from_text(text) != "Review authentication flow"
+
+    def test_title_database_word_does_not_falsely_match_db_fragment(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        # "db" must not match as a bare substring of an unrelated word.
+        text = "The adb-style logging wrapper leaks stack traces"
+        assert normalize_title_from_text(text) != "Verify database driver compatibility"
+
+    def test_title_genuine_db_finding_still_matches(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        text = "The db driver placeholder style differs across dialects"
+        assert normalize_title_from_text(text) == "Verify database driver compatibility"
 
     def test_build_recommendation_helper(self):
         from utilities.autopatcher.pipeline import build_recommendation

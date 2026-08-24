@@ -212,6 +212,24 @@ def _extract_summary(vulnerability_text: str) -> str:
     return "No summary available."
 
 
+# Matches ONLY a line that consists entirely of one of the three expected
+# reviewer section headers (Markdown heading form `### Explanation` or bold
+# form `**Explanation**` / `**Explanation:**` / `**Explanation**:`), anchored
+# to the start and end of the line. Anchoring to a whole line means a header
+# word appearing inside ordinary prose (e.g. "...see Validation notes
+# above...") is never mistaken for a new section boundary, and the header
+# match itself consumes any trailing colon/closing "**" decoration, so
+# nothing from the header leaks into (and has to be stripped back out of)
+# the section body that follows -- which is what previously ate the opening
+# "**" of a legitimate bold subheading in the body.
+_REVIEW_SECTION_HEADER_RE = re.compile(
+    r"^[ \t]*(?:#{1,3}[ \t]*|\*\*[ \t]*)"
+    r"(Explanation|Affected areas|Validation notes)"
+    r"[ \t]*:?[ \t]*(?:\*\*)?[ \t]*:?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def _split_review(review: str) -> dict[str, str]:
     """
     Split the review text into its three expected sections.
@@ -225,18 +243,13 @@ def _split_review(review: str) -> dict[str, str]:
         "validation_notes": "",
     }
 
-    # Match section headers (### Explanation, **Explanation**, etc.)
-    pattern = re.compile(
-        r"(?:#{1,3}\s*|\*\*)(Explanation|Affected areas|Validation notes)(?:\*\*)?[:\s]*",
-        re.IGNORECASE,
-    )
-    parts = pattern.split(review)
+    parts = _REVIEW_SECTION_HEADER_RE.split(review)
 
     # parts = [pre_text, header1, body1, header2, body2, ...]
     i = 1
     while i < len(parts) - 1:
         header = parts[i].lower().replace(" ", "_")
-        body = re.sub(r"^\*{1,2}\s*", "", parts[i + 1]).strip()
+        body = parts[i + 1].strip()
         if "explanation" in header:
             sections["explanation"] = body
         elif "affected" in header:
@@ -251,6 +264,107 @@ def _split_review(review: str) -> dict[str, str]:
         sections = {k: full for k in sections}
 
     return sections
+
+
+def _truncate_reason(text: str, limit: int = 120, *, ellipsis: str = "...") -> str:
+    """Cap `text` at `limit` characters without cutting a word in half.
+
+    Returns the (punctuation-trimmed) text unchanged if it already fits.
+    When truncation is needed, backs off to the last word boundary within
+    the budget, then -- if that still leaves an unmatched opening Markdown
+    delimiter (a lone backtick or `**`) -- backs off further to before that
+    delimiter, and appends `ellipsis` so the reader can tell content was
+    omitted.
+    """
+    trimmed = (text or "").rstrip("., ")
+    if len(trimmed) <= limit:
+        return trimmed
+    budget = max(limit - len(ellipsis), 0)
+    cut = trimmed[:budget]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    cut = cut.rstrip("., ")
+    for delim in ("`", "**"):
+        if cut.count(delim) % 2:
+            cut = cut.rsplit(delim, 1)[0].rstrip("., ")
+    if not cut:
+        cut = trimmed[:budget].rstrip("., ")
+    return cut + ellipsis
+
+
+# Abbreviations whose trailing "." must not be mistaken for a sentence end
+# when picking a compact reason sentence out of a longer finding string
+# (see short_reason() below) -- e.g. "dirpath ... (e.g. 'collection')"
+# must not be cut at "(e.g." just because that period happens to be
+# followed by whitespace.
+_REASON_ABBREVIATIONS = ("e.g.", "i.e.", "etc.", "vs.", "cf.", "approx.")
+
+
+def _find_reason_sentence_end(text: str) -> "re.Match[str] | None":
+    """Find the first period/!/? that ends a real sentence in `text`: one
+    followed by whitespace or end-of-string, and that isn't the trailing
+    period of a known abbreviation. Returns None if no such boundary
+    exists (the caller then falls back to the whole text)."""
+    for m in re.finditer(r"[.!?](?=\s|$)", text):
+        prefix = text[: m.end()].lower()
+        if any(prefix.endswith(abbr) for abbr in _REASON_ABBREVIATIONS):
+            continue
+        return m
+    return None
+
+
+def short_reason(text: str) -> str:
+    """Compact a raw finding/reason string down to one short sentence.
+
+    A period/!/? only ends the sentence when followed by whitespace or
+    end-of-string AND isn't the trailing period of a known abbreviation
+    (see _find_reason_sentence_end) -- so a literal "." inside a path,
+    backtick span, or abbreviation (e.g. `.git`, "e.g.") is not mistaken
+    for the end of the sentence. The previous naive
+    `text.split(".", 1)[0]` cut on the first literal period anywhere,
+    which is what produced truncations like "Symlinks inside `" (cut
+    inside `` `.git/refs` ``) and "dirpath without leading '/' (e" (cut
+    inside "e.g.").
+    """
+    if not text:
+        return ""
+    stripped = text.strip()
+    match = _find_reason_sentence_end(stripped)
+    s = stripped[: match.end()] if match else stripped
+    s = re.sub(r"\s+", " ", s).strip()
+    return _truncate_reason(s, 120)
+
+
+# Word-boundary-matched keyword groups used by normalize_title_from_text()'s
+# coarse title guess below. Word-boundary (not plain substring) matching so
+# a fragment inside an unrelated word/plural can't trigger the wrong
+# domain -- e.g. "version tokens" must not match "token" the way a bare
+# `"token" in text` check would, and "author"/"database" must not match
+# "auth"/"db".
+_TITLE_DB_KEYWORDS_RE = re.compile(r"\b(?:db|driver|placeholder)\b", re.IGNORECASE)
+_TITLE_ENCODING_KEYWORDS_RE = re.compile(r"\b(?:unicode|encoding|binary)\b", re.IGNORECASE)
+_TITLE_AUTH_KEYWORDS_RE = re.compile(
+    r"\b(?:auth|authenticate|login|token|access|permission)\b", re.IGNORECASE
+)
+
+
+def normalize_title_from_text(t: str) -> str:
+    """Guess a short, human-facing action title from a raw finding string.
+
+    This is a coarse, deterministic guess, not a semantic classifier --
+    when none of the keyword groups match, it falls back to a generic
+    "Add targeted tests for <topic>" title built from the finding text
+    itself.
+    """
+    lt = (t or "").lower()
+    if _TITLE_DB_KEYWORDS_RE.search(lt):
+        return "Verify database driver compatibility"
+    if _TITLE_ENCODING_KEYWORDS_RE.search(lt):
+        return "Validate input handling edge cases"
+    if _TITLE_AUTH_KEYWORDS_RE.search(lt):
+        return "Review authentication flow"
+    parts = (t or "").split()
+    return "Add targeted tests for " + " ".join(parts[:3])
 
 
 def enhance_findings_with_impact(challenger: dict, impact_report: dict | None) -> None:
@@ -2229,23 +2343,10 @@ def _build_report(result: PipelineResult) -> str:
         """
         actions: list[dict] = []
 
-        def short_reason(text: str) -> str:
-            if not text:
-                return ""
-            s = text.split(".", 1)[0].strip()
-            s = re.sub(r"\s+", " ", s)
-            return s[:120].rstrip("., ")
-
-        def normalize_title_from_text(t: str) -> str:
-            lt = (t or "").lower()
-            if any(k in lt for k in ("db", "driver", "placeholder")):
-                return "Verify database driver compatibility"
-            if any(k in lt for k in ("unicode", "encoding", "binary")):
-                return "Validate input handling edge cases"
-            if any(k in lt for k in ("auth", "authenticate", "login", "token", "access", "permission")):
-                return "Review authentication flow"
-            parts = (t or "").split()
-            return "Add targeted tests for " + " ".join(parts[:3])
+        # short_reason() / normalize_title_from_text() are module-level
+        # helpers (see above) -- resolved here via normal enclosing-scope
+        # lookup, not redefined locally, so they stay independently
+        # unit-testable.
 
         impact_level = (impact.get("impact_level") if impact else "low")
         impact_level = (impact_level or "low").lower()
@@ -2291,7 +2392,7 @@ def _build_report(result: PipelineResult) -> str:
         if impact_level == "high" and not any(a["priority"] == "HIGH" for a in actions):
             imp_sum = short_reason(impact.get("impact_summary", "")) if impact else "High-impact change."
             title = "Review impacted flows"
-            reason = ("High-impact: " + imp_sum)[:120]
+            reason = _truncate_reason("High-impact: " + imp_sum, 120)
             actions.append({"priority": "HIGH", "title": title, "reason": reason, "next_step": "Perform a targeted code review of affected flows."})
 
         rank_map = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
@@ -2664,7 +2765,9 @@ def _build_report(result: PipelineResult) -> str:
         )
     else:
         report += "---\n\n" + render_post_patch_investigation(
-            result.post_patch_observations, result.post_patch_coverage
+            result.post_patch_observations,
+            result.post_patch_coverage,
+            language=_report_language,
         ) + "\n"
 
     # §10: Impact Surface
@@ -2745,13 +2848,29 @@ def _build_report(result: PipelineResult) -> str:
             "*Not evaluated — no repository root was provided.*\n\n"
         )
     else:
+        if _report_language == "python":
+            counts_line = f"- Total test files found: {total_tests_found}\n"
+        else:
+            # total_tests_found comes from a Python-only `test_*.py` /
+            # `*_test.py` glob (see discover_tests()), unconditionally, so
+            # for a non-Python repo it reflects "how many files happen to
+            # match Python's test-naming convention" (typically 0), not
+            # "how many tests this repository has." Rendering that number
+            # here reads as an exhaustive search result; state plainly
+            # that discovery wasn't evaluated for this language instead
+            # (see Language Coverage below for the full explanation).
+            counts_line = (
+                "- Test discovery: not evaluated — detection only "
+                "recognizes Python's `test_*.py` / `*_test.py` "
+                f"convention; detected language: {_report_language}.\n"
+            )
         test_support_md = (
             "\n### Test Support\n\n"
             "*This section reports existing repository tests, not behavioral "
             "validation of the proposed patch.*\n\n"
             f"- Target file: {target_file_display}\n"
-            f"- Total test files found: {total_tests_found}\n"
-            f"- Rating: {rating}\n"
+            + counts_line
+            + f"- Rating: {rating}\n"
             "\n#### Matching tests\n"
         )
         if matches:
@@ -2761,6 +2880,8 @@ def _build_report(result: PipelineResult) -> str:
             for m in matches:
                 prox_label = m['proximity'] if m['proximity'] != 'repo' else 'repo (context)'
                 test_support_md += f"- {m['path']} — {prox_label} — {m['reason']}\n"
+        elif _report_language != "python":
+            test_support_md += "- Not evaluated — test discovery does not yet support this language.\n"
         else:
             test_support_md += "- No matching tests found.\n"
     report += test_support_md
@@ -2843,8 +2964,22 @@ prior knowledge, not evidence this pipeline fetched or verified.*
         for s in suggestions:
             test_name = s.get("name")
             s_reason = s.get("reason")
-            suggested_file = f"tests/suggested/{test_name}.py"
-            suggested_md += f"- **{test_name}** — {suggested_file}\n"
+            if _report_language == "python":
+                suggested_md += f"- **{test_name}** — tests/suggested/{test_name}.py\n"
+            else:
+                # The generated name/skeleton this suggestion is based on
+                # is Python-shaped regardless of repo language (see
+                # test_suggester.py) -- for a non-Python repo, rendering a
+                # fabricated `tests/suggested/<name>.py` path would claim
+                # a target file that has no relationship to this
+                # language's actual test layout. Show the concept/name and
+                # reason only; inventing an extension/path here would be
+                # fake precision, not a real suggestion.
+                suggested_md += (
+                    f"- **{test_name}** — no target path suggested "
+                    f"(test-file generation does not yet support "
+                    f"{_report_language})\n"
+                )
             suggested_md += f"  Based on finding: \"{s_reason}\"\n"
     report += suggested_md
 

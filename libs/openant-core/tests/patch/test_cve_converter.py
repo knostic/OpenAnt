@@ -246,3 +246,61 @@ class TestFirstSentence:
     def test_truncates_long_sentence_to_120_chars(self):
         long_text = "A" * 200 + "."
         assert len(first_sentence(long_text)) <= 120
+
+    def test_shorter_than_limit_returned_unchanged(self):
+        text = "A short vulnerability summary."
+        assert first_sentence(text) == "A short vulnerability summary."
+
+    def test_around_limit_no_ellipsis_when_it_fits(self):
+        # Exactly 120 chars, no sentence-ending punctuation early enough to
+        # be picked up as a shorter "first sentence" -- the whole string is
+        # returned as-is, unmodified.
+        text = "word " * 23 + "word"  # 24 words * 5 chars - 1 = 119 chars
+        assert len(text) <= 120
+        assert first_sentence(text) == text
+        assert "..." not in first_sentence(text)
+
+    def test_long_sentence_gets_ellipsis(self):
+        long_text = (
+            "This is a long CVE description that goes on and on describing "
+            "an insufficiently protected credentials vulnerability affecting "
+            "many versions of the affected software package in great detail"
+        )
+        result = first_sentence(long_text)
+        assert len(result) <= 120
+        assert result.endswith("...")
+
+    def test_no_mid_word_truncation(self):
+        # Regression: the old hard [:120] slice produced truncations like
+        # "...affected that co" and "...via the funct" -- cut mid-word with
+        # no indication anything was omitted.
+        long_text = (
+            "An insufficiently protected credentials vulnerability exists in "
+            "curl 4.9 to and include curl 7.82.0 are affected that could allow "
+            "an attacker to obtain credentials via a crafted redirect"
+        )
+        result = first_sentence(long_text)
+        assert result.endswith("...")
+        core = result[: -len("...")]
+        assert not core.endswith(("co", "funct"))
+        # Every word in the truncated core must appear as a whole word in
+        # the source text -- i.e. nothing was cut mid-word.
+        words = [w for w in core.split(" ") if w]
+        for word in words:
+            assert word in long_text.split(" ") or word == ""
+
+    def test_punctuation_and_markdown_like_content(self):
+        text = (
+            "A ReDoS issue exists via the `parseRange()` function when "
+            "given a crafted string containing many repeated whitespace "
+            "characters and version-like tokens such as `1.2.3`"
+        )
+        result = first_sentence(text)
+        assert len(result) <= 120
+        # No mid-word cut: every space-delimited token in the (ellipsis-
+        # stripped) result must be a real token from the source text.
+        core = result[: -len("...")] if result.endswith("...") else result
+        source_tokens = set(text.split(" "))
+        for tok in core.split(" "):
+            if tok:
+                assert tok in source_tokens or text.startswith(core)

@@ -151,13 +151,41 @@ def _extract_references(cve: dict) -> list[str]:
     return refs
 
 
+def _truncate_at_word_boundary(text: str, limit: int, *, ellipsis: str = "...") -> str:
+    """Cap `text` at `limit` characters without cutting a word in half.
+
+    Returns `text` unchanged if it already fits. When truncation is
+    required, backs off to the last whitespace boundary within the budget
+    and appends `ellipsis` so the reader can tell the text was shortened.
+    Falls back to a hard slice only when there is no word boundary to back
+    off to (e.g. one unbroken token longer than the limit).
+    """
+    if len(text) <= limit:
+        return text
+    budget = max(limit - len(ellipsis), 0)
+    cut = text[:budget]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    cut = cut.rstrip()
+    if not cut:
+        cut = text[:budget]
+    return cut + ellipsis
+
+
 def first_sentence(text: str) -> str:
-    """Return the first sentence of text, truncated to 120 chars."""
+    """Return the first sentence of text, truncated to at most 120 chars.
+
+    Truncation never cuts mid-word: when the sentence (or the whole text,
+    if no sentence-ending punctuation is found) exceeds the limit, it is
+    cut back to the last word boundary and an ellipsis is appended so the
+    reader can tell the summary was shortened. Short summaries are
+    returned unchanged.
+    """
     if not text:
         return ""
     match = re.search(r"^(.*?[.!?])(\s|$)", text.strip())
     sentence = match.group(1) if match else text.strip()
-    return sentence[:120].rstrip()
+    return _truncate_at_word_boundary(sentence, 120).rstrip()
 
 
 def _clean(text: str) -> str:

@@ -608,7 +608,9 @@ def derive_patch_touched_anchors(
 _COVERAGE_MAX_LIST_ITEMS = 5
 
 
-def _render_coverage_section(coverage: "CoverageResult | None") -> str:
+def _render_coverage_section(
+    coverage: "CoverageResult | None", *, language: str | None = None
+) -> str:
     if coverage is None:
         return (
             "\n### Anchor Coverage\n\n"
@@ -622,6 +624,21 @@ def _render_coverage_section(coverage: "CoverageResult | None") -> str:
     if total == 0:
         if coverage.unattributed:
             body = f"No semantic elements could be attributed to this diff ({coverage.unattributed} hunk(s) unattributed).\n"
+        elif language is not None and language != "python":
+            # Anchor attribution is Python-AST-based (see
+            # _resolve_patch_touched_elements' `.py`/`.pyi` filter) -- a
+            # non-Python diff always produces zero elements here regardless
+            # of how substantial its actual changes are. Reusing the
+            # Python "cosmetic-only diff" wording for that case would
+            # falsely imply the diff was evaluated and found trivial, so
+            # this uses the same "Not Applicable" pattern already used by
+            # Impact Surface for the same underlying reason.
+            body = (
+                f"Not Applicable — language not supported by this signal yet "
+                f"(detected: {language}). Anchor attribution only supports "
+                "Python source, so this is not evidence the diff is "
+                "cosmetic or unchanged.\n"
+            )
         else:
             body = "No hunks required attribution (cosmetic-only diff, or no Python files changed).\n"
         return "\n### Anchor Coverage\n\n" + body
@@ -812,10 +829,17 @@ def render_post_patch_investigation(
     coverage: "CoverageResult | None" = None,
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
+    language: str | None = None,
 ) -> str:
     """Render a list[AnchorObservation] into one deterministic Markdown
     block, starting with a top-level ``## Post-Patch Investigation``
     heading.
+
+    ``language`` is the already-detected repository language (see
+    ``language_support.detect_language``), passed through unchanged to
+    ``_render_coverage_section`` -- this function does not re-detect
+    anything. Defaults to ``None`` (treated as Python) to preserve prior
+    behavior for callers that don't pass it.
 
     Never mutates `observations`. No LLM calls, no I/O, no parsing.
     An optional ``coverage`` (see ``compute_coverage()``) renders as an
@@ -840,7 +864,9 @@ def render_post_patch_investigation(
     exceed it.
     """
     header = _HEADING + "\n\n" + _PREAMBLE + "\n"
-    coverage_section = _render_coverage_section(coverage) if coverage is not None else ""
+    coverage_section = (
+        _render_coverage_section(coverage, language=language) if coverage is not None else ""
+    )
 
     if not observations:
         rendered = header + coverage_section + "\nNo anchors were available to re-evaluate.\n"
