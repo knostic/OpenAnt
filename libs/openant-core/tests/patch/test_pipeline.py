@@ -1422,6 +1422,639 @@ class TestSuggestedTestsAndTestSupportLanguageAware:
         assert "Rating: Not Applicable" in ts_block
 
 
+class TestReportPolishBatchCTestSupport:
+    """Report Polish Batch C: Test Support rendering keeps same-file/
+    same-module matches in full (repository-relative), collapses generic
+    `repo`-proximity matches to a count, and never touches discovery
+    (discover_tests/tests_for_file) or scoring (score_test_support)
+    themselves — this class only exercises the render output built from
+    real files on disk under `tmp_path` (== repo_root), same as the
+    pre-existing Batch A test class above."""
+
+    def _kwargs(self, tmp_path, *, patch_file="mod.py"):
+        return dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch=(
+                f"--- a/{patch_file}\n+++ b/{patch_file}\n@@ -1,3 +1,3 @@\n"
+                " unchanged\n-old\n+new\n"
+            ),
+            review=(
+                "**Explanation:**\nThe patch fixes the issue.\n\n"
+                f"**Affected areas:**\n- {patch_file}\n\n"
+                "**Validation notes:**\n- Add tests.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={
+                "still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": "",
+            },
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            behavior=None,
+            repo_root=tmp_path,
+            detected_language="python",
+        )
+
+    @staticmethod
+    def _test_support_block(report: str) -> str:
+        idx = report.find("### Test Support")
+        end = report.find("### Behavior Summary")
+        if end == -1:
+            end = report.find("### Affected areas")
+        return report[idx: end if end != -1 else len(report)]
+
+    def test_same_file_matches_render_in_full(self, tmp_path):
+        """A same-file match must always render, in full, never collapsed."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_mod.py").write_text("def test_x(): pass\n", encoding="utf-8")
+        report = _build_report(PipelineResult(**self._kwargs(tmp_path)))
+        block = self._test_support_block(report)
+        assert "same-file" in block
+        assert "test_mod.py" in block
+
+    def test_same_module_matches_remain_visible(self, tmp_path):
+        """A same-module match (imports the patched module) must render in
+        full alongside any generic repo tests, never collapsed into the
+        broader-repository count."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_uses_mod.py").write_text(
+            "from mod import thing\n\ndef test_uses_mod(): pass\n", encoding="utf-8",
+        )
+        for i in range(5):
+            (tmp_path / "tests" / f"test_unrelated_{i}.py").write_text(
+                "def test_unrelated(): pass\n", encoding="utf-8",
+            )
+        report = _build_report(PipelineResult(**self._kwargs(tmp_path)))
+        block = self._test_support_block(report)
+        assert "same-module" in block
+        assert "test_uses_mod.py" in block
+        assert "Broader repository tests: 5 additional" in block
+
+    def test_large_generic_repo_test_list_collapses_to_count(self, tmp_path):
+        """The dominant real-world complaint (pip: 64 matches, 62 of them
+        generic `repo` tests) — a large generic-only list collapses to one
+        count line, no per-file listing."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        (tmp_path / "tests").mkdir()
+        for i in range(40):
+            (tmp_path / "tests" / f"test_generic_{i}.py").write_text(
+                "def test_generic(): pass\n", encoding="utf-8",
+            )
+        report = _build_report(PipelineResult(**self._kwargs(tmp_path)))
+        block = self._test_support_block(report)
+        assert "No tests directly matched the patched file/module." in block
+        assert "Broader repository tests: 40 additional" in block
+        # None of the 40 generic filenames are individually listed.
+        assert "test_generic_0.py" not in block
+        assert "test_generic_39.py" not in block
+
+    def test_mixed_same_file_same_module_and_repo_tests(self, tmp_path):
+        """Same-file + same-module + a large generic bucket together: both
+        direct matches stay fully visible, only the generic bucket
+        collapses, and the count is exact."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_mod.py").write_text("def test_x(): pass\n", encoding="utf-8")
+        (tmp_path / "tests" / "test_uses_mod.py").write_text(
+            "from mod import thing\n\ndef test_uses_mod(): pass\n", encoding="utf-8",
+        )
+        for i in range(10):
+            (tmp_path / "tests" / f"test_generic_{i}.py").write_text(
+                "def test_generic(): pass\n", encoding="utf-8",
+            )
+        report = _build_report(PipelineResult(**self._kwargs(tmp_path)))
+        block = self._test_support_block(report)
+        assert "test_mod.py" in block and "same-file" in block
+        assert "test_uses_mod.py" in block and "same-module" in block
+        assert "Broader repository tests: 10 additional" in block
+        assert "No tests directly matched" not in block  # direct matches DO exist
+        for i in range(10):
+            assert f"test_generic_{i}.py" not in block
+
+    def test_repository_relative_path_rendering(self, tmp_path):
+        """Paths render repository-relative, not as the absolute
+        filesystem path under tmp_path."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        (tmp_path / "tests" / "nested").mkdir(parents=True)
+        (tmp_path / "tests" / "nested" / "test_mod.py").write_text(
+            "def test_x(): pass\n", encoding="utf-8",
+        )
+        report = _build_report(PipelineResult(**self._kwargs(tmp_path)))
+        block = self._test_support_block(report)
+        assert "tests/nested/test_mod.py" in block
+        assert str(tmp_path) not in block
+
+    def test_unsupported_language_test_support_unchanged(self, tmp_path):
+        """Test Support rendering for an unsupported language is untouched
+        by the same-file/same-module/broader-repo grouping — it never
+        reaches that branch at all (matches is always empty for a
+        non-Python `_report_language`)."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._kwargs(tmp_path, patch_file="index.js")
+        kwargs["detected_language"] = "javascript"
+        report = _build_report(PipelineResult(**kwargs))
+        block = self._test_support_block(report)
+        assert "Rating: Not Applicable" in block
+        assert "Not evaluated — test discovery does not yet support this language." in block
+        assert "Broader repository tests" not in block
+
+    def test_empty_test_support_section_still_renders(self, tmp_path):
+        """No repo_root and (separately) a repo_root with zero matches must
+        both keep rendering their existing, unchanged messages."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._kwargs(tmp_path)
+        kwargs["repo_root"] = None
+        report = _build_report(PipelineResult(**kwargs))
+        assert "*Not evaluated — no repository root was provided.*" in report
+
+        report2 = _build_report(PipelineResult(**self._kwargs(tmp_path)))
+        block2 = self._test_support_block(report2)
+        assert "No matching tests found." in block2
+        assert "Broader repository tests" not in block2
+
+
+class TestRelativeTestPathHelper:
+    """Direct unit coverage for `_relative_test_path` — presentation only,
+    never mutates the underlying stored path/provenance (the caller always
+    still has the original `m['path']` available)."""
+
+    def test_path_inside_repo_root(self, tmp_path):
+        from utilities.autopatcher.pipeline import _relative_test_path
+        p = tmp_path / "tests" / "test_mod.py"
+        assert _relative_test_path(str(p), tmp_path) == "tests/test_mod.py"
+
+    def test_path_equal_to_repo_root(self, tmp_path):
+        from utilities.autopatcher.pipeline import _relative_test_path
+        assert _relative_test_path(str(tmp_path), tmp_path) == "."
+
+    def test_path_outside_repo_root_falls_back_to_original(self, tmp_path):
+        from utilities.autopatcher.pipeline import _relative_test_path
+        other_root = tmp_path / "unrelated_repo"
+        outside_path = tmp_path / "other" / "test_x.py"
+        result = _relative_test_path(str(outside_path), other_root)
+        assert result == str(outside_path)
+
+    def test_missing_repo_root_returns_original_path(self):
+        from utilities.autopatcher.pipeline import _relative_test_path
+        assert _relative_test_path("/abs/test_x.py", None) == "/abs/test_x.py"
+
+    def test_invalid_repo_root_falls_back_safely(self):
+        """A repo_root that can't even be turned into a Path must never
+        raise — the original path is preserved instead."""
+        from utilities.autopatcher.pipeline import _relative_test_path
+        assert _relative_test_path("/abs/test_x.py", 12345) == "/abs/test_x.py"
+
+    def test_relative_input_path_returned_unchanged(self, tmp_path):
+        """tests_for_file always returns an absolute path in practice; a
+        non-absolute input is passed through unchanged rather than
+        resolved against the process cwd (which could accidentally land
+        inside repo_root and produce a misleading relative path)."""
+        from utilities.autopatcher.pipeline import _relative_test_path
+        assert _relative_test_path("relative/test_x.py", tmp_path) == "relative/test_x.py"
+
+
+class TestReportPolishBatchCBehaviorSummary:
+    """Report Polish Batch C: Behavior Summary's Appendix rendering now
+    reads `behavior["is_generic"]` (already computed by behavior_summary.py,
+    already used elsewhere in this module) to suppress only the boilerplate
+    "normal flow" / "edge-case handling" bullet list — behavior extraction/
+    classification itself is untouched."""
+
+    GENERIC_BEHAVIOR = {
+        "function": "", "file": "internal/re.js",
+        "summary": "This patch likely affects application logic in internal/re.js.",
+        "primary_behaviors": ["normal flow", "edge-case handling"],
+        "is_generic": True,
+    }
+    SPECIFIC_BEHAVIOR = {
+        "function": "authenticate", "file": "app/auth.py",
+        "summary": "This patch likely affects authentication in app/auth.py.",
+        "primary_behaviors": ["valid login", "invalid login"],
+        "is_generic": False,
+    }
+
+    def _kwargs(self, tmp_path, behavior):
+        return dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch="--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 2\n",
+            review=(
+                "**Explanation:**\nThe patch fixes the issue.\n\n"
+                "**Affected areas:**\n- mod.py\n\n"
+                "**Validation notes:**\n- Add tests.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""},
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            behavior=behavior,
+            repo_root=tmp_path,
+            detected_language="python",
+        )
+
+    def test_generic_behavior_suppresses_boilerplate_list_but_keeps_concrete_sentence(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        report = _build_report(PipelineResult(**self._kwargs(tmp_path, self.GENERIC_BEHAVIOR)))
+        idx = report.find("### Behavior Summary")
+        end = report.find("### Affected areas")
+        block = report[idx: end if end != -1 else len(report)]
+        assert "normal flow" not in block
+        assert "edge-case handling" not in block
+        assert "Primary behaviors to validate:" not in block
+        # Concrete file information is preserved.
+        assert "internal/re.js" in block
+
+    def test_concrete_behavior_summary_unchanged(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        report = _build_report(PipelineResult(**self._kwargs(tmp_path, self.SPECIFIC_BEHAVIOR)))
+        idx = report.find("### Behavior Summary")
+        end = report.find("### Affected areas")
+        block = report[idx: end if end != -1 else len(report)]
+        assert "Primary behaviors to validate:" in block
+        assert "valid login" in block
+        assert "invalid login" in block
+        assert "authenticate" in block
+
+
+class TestReportPolishBatchCTrustSignals:
+    """Report Polish Batch C: the primary Trust Signals table no longer
+    restates the raw, pre-calibration Challenger concern count — only the
+    render layer changes; `_compute_trust_signals` itself (and therefore
+    `signals["coverage_confidence"]["notes"]`, read directly by anything
+    else that wants the raw count) is untouched."""
+
+    def _kwargs(self, tmp_path):
+        return dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch="--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 2\n",
+            review=(
+                "**Explanation:**\nThe patch fixes the issue.\n\n"
+                "**Affected areas:**\n- mod.py\n\n"
+                "**Validation notes:**\n- Add tests.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={
+                "still_vulnerable": False,
+                "edge_cases": ["custom configurations may not benefit from this change"],
+                "potential_issues": ["interaction with nested prototype chains is untested"],
+                "summary": "",
+            },
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            behavior=None,
+            repo_root=tmp_path,
+            detected_language="python",
+        )
+
+    def test_raw_review_concern_count_absent_from_primary_trust_signals(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        report = _build_report(PipelineResult(**self._kwargs(tmp_path)))
+        ts_idx = report.find("## Trust Signals")
+        rec_idx = report.find("## Recommendation")
+        ts_block = report[ts_idx:rec_idx]
+        assert "raw review concern" not in ts_block
+        assert "before evidence calibration" not in ts_block
+        # The calibration-relevant remainder must still be present.
+        assert "no deterministic blocker identified" in ts_block.lower()
+        assert "Review Results section below" in ts_block
+
+    def test_calibrated_review_results_still_present(self, tmp_path):
+        """The raw-count de-emphasis in Trust Signals must not remove or
+        alter the calibrated Review Results section itself."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._kwargs(tmp_path)
+        kwargs["finding_calibration"] = [{
+            "original": "custom configurations may not benefit from this change",
+            "group": "hypothesis",
+            "reworded": "Whether custom configurations remain compatible needs validation.",
+        }]
+        report = _build_report(PipelineResult(**kwargs))
+        assert "### Validation Gaps" in report
+        assert "interaction with nested prototype chains is untested" in report
+        assert "### Validation Questions" in report
+        assert "Whether custom configurations remain compatible needs validation." in report
+
+    def test_compute_trust_signals_notes_unchanged(self, tmp_path):
+        """The underlying computation (read directly by anything that
+        wants the raw count for debugging/provenance) is byte-for-byte
+        unchanged — only the render layer de-emphasizes it."""
+        from utilities.autopatcher.pipeline import _compute_trust_signals, _classify_challenger
+        challenger = {
+            "still_vulnerable": False,
+            "edge_cases": ["custom configurations may not benefit from this change"],
+            "potential_issues": ["interaction with nested prototype chains is untested"],
+        }
+        classified = _classify_challenger(challenger)
+        signals = _compute_trust_signals(
+            [], {"applicable": True, "stderr": ""}, classified, "None", "low",
+        )
+        assert "raw review concern(s) recorded before evidence calibration" in signals["coverage_confidence"]["notes"]
+
+
+class TestReportPolishBatchCSeparators:
+    """Report Polish Batch C: the duplicate '---\\n\\n---' seen in real
+    reports (e.g. curl, CVE-2022-27774) is caused by the reviewer LLM's own
+    trailing horizontal-rule divider leaking through `_split_review`'s
+    header-based split, colliding with the report template's own '---'
+    immediately before the next heading. Fixed at that exact boundary
+    (`_split_review` / `_strip_trailing_hr`), not with a global regex over
+    the assembled report."""
+
+    def test_split_review_strips_trailing_separator_from_explanation(self):
+        from utilities.autopatcher.pipeline import _split_review
+        review = textwrap.dedent("""\
+            ### Explanation
+            The fix is correct.
+
+            ---
+
+            ### Affected areas
+            - mod.py
+
+            ### Validation notes
+            - Add tests.
+        """)
+        sections = _split_review(review)
+        assert sections["explanation"] == "The fix is correct."
+        assert not sections["explanation"].endswith("---")
+
+    def test_split_review_strips_trailing_separator_from_last_section(self):
+        """A trailing divider with no further header after it (the model's
+        own sign-off) is stripped the same way."""
+        from utilities.autopatcher.pipeline import _split_review
+        review = textwrap.dedent("""\
+            ### Explanation
+            The fix is correct.
+
+            ### Affected areas
+            - mod.py
+
+            ### Validation notes
+            - Add tests.
+
+            ---
+        """)
+        sections = _split_review(review)
+        assert sections["validation_notes"] == "- Add tests."
+
+    def test_build_report_does_not_duplicate_separator_after_explanation(self, tmp_path):
+        """End-to-end reproduction of the real curl-shaped report: a
+        trailing '---' inside the reviewer's own Explanation text must not
+        produce a visible '---\\n\\n---' in the assembled report."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch="--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 2\n",
+            review=(
+                "### Explanation\n"
+                "The fix is correct.\n\n"
+                "---\n\n"
+                "### Affected areas\n- mod.py\n\n"
+                "### Validation notes\n- Add tests.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""},
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            behavior=None,
+            repo_root=tmp_path,
+            detected_language="python",
+        )
+        report = _build_report(result)
+        assert "---\n\n---" not in report
+        assert "---\n---" not in report
+
+    def test_legitimate_trailing_content_is_not_a_bare_rule_and_is_preserved(self):
+        """A line that merely CONTAINS dashes (not exclusively dashes) is
+        never mistaken for a horizontal rule."""
+        from utilities.autopatcher.pipeline import _split_review
+        review = textwrap.dedent("""\
+            ### Explanation
+            The fix reduces the attack surface --- see CVE-2022-1 for context.
+
+            ### Affected areas
+            - mod.py
+
+            ### Validation notes
+            - Add tests.
+        """)
+        sections = _split_review(review)
+        assert sections["explanation"] == (
+            "The fix reduces the attack surface --- see CVE-2022-1 for context."
+        )
+
+    def test_legitimate_midbody_separator_is_preserved(self):
+        """A '---' used as a divider INSIDE a section body (not as its
+        trailing line) is real reviewer content, not a boundary artifact,
+        and must survive."""
+        from utilities.autopatcher.pipeline import _split_review
+        review = textwrap.dedent("""\
+            ### Explanation
+            First point.
+
+            ---
+
+            Second point, after the model's own mid-body divider.
+
+            ### Affected areas
+            - mod.py
+
+            ### Validation notes
+            - Add tests.
+        """)
+        sections = _split_review(review)
+        assert "First point." in sections["explanation"]
+        assert "---" in sections["explanation"]
+        assert "Second point, after the model's own mid-body divider." in sections["explanation"]
+
+    def test_legitimate_table_separator_row_is_preserved(self):
+        """A Markdown table separator row ('|---|---|') is never mistaken
+        for a horizontal rule — it contains '|', not just dashes."""
+        from utilities.autopatcher.pipeline import _split_review
+        review = textwrap.dedent("""\
+            ### Explanation
+            | Before | After |
+            |---|---|
+            | old | new |
+
+            ### Affected areas
+            - mod.py
+
+            ### Validation notes
+            - Add tests.
+        """)
+        sections = _split_review(review)
+        assert "|---|---|" in sections["explanation"]
+
+    def test_legitimate_code_fence_content_is_preserved(self):
+        """A '---' inside a fenced code block, not itself the final line
+        of the body, is real content and must survive."""
+        from utilities.autopatcher.pipeline import _split_review
+        review = textwrap.dedent("""\
+            ### Explanation
+            ```diff
+            -foo
+            ---
+            +bar
+            ```
+            That diff snippet is illustrative only.
+
+            ### Affected areas
+            - mod.py
+
+            ### Validation notes
+            - Add tests.
+        """)
+        sections = _split_review(review)
+        assert "```diff" in sections["explanation"]
+        assert "-foo" in sections["explanation"]
+        assert "That diff snippet is illustrative only." in sections["explanation"]
+
+    def test_unrelated_content_and_whitespace_unchanged(self):
+        """A section with no trailing rule is byte-for-byte unaffected."""
+        from utilities.autopatcher.pipeline import _split_review
+        review = textwrap.dedent("""\
+            ### Explanation
+            Line one.
+            Line two.
+
+            ### Affected areas
+            - mod.py
+
+            ### Validation notes
+            - Add tests.
+        """)
+        sections = _split_review(review)
+        assert sections["explanation"] == "Line one.\nLine two."
+
+
+class TestReportPolishBatchCSemanticInvariants:
+    """Report Polish Batch C changes rendering only. This proves the
+    decision-computing paths Batch C must never touch -- recommendation
+    decision/reason, Validation Action membership/priority, Top Action,
+    calibrated Review Results, and Test Support's own score/status --
+    still produce the expected output, using one rich fixture that
+    exercises all of them together (HIGH impact, a same-file test match, a
+    calibrated hypothesis finding, an always-validation-gap finding, and a
+    non-generic behavior summary)."""
+
+    FINDING_TEXT = "custom configurations may not benefit from this change"
+    GAP_TEXT = "interaction with nested prototype chains is untested"
+
+    def _kwargs(self, tmp_path):
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_mod.py").write_text("def test_x(): pass\n", encoding="utf-8")
+        return dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch="--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 2\n",
+            review=(
+                "**Explanation:**\nThe patch fixes the issue.\n\n"
+                "**Affected areas:**\n- mod.py\n\n"
+                "**Validation notes:**\n- Add tests.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={
+                "still_vulnerable": False,
+                "edge_cases": [self.FINDING_TEXT],
+                "potential_issues": [self.GAP_TEXT],
+                "summary": "",
+            },
+            impact={
+                "impact_level": "high", "changed_files": ["mod.py"],
+                "affected_files": ["a.py", "b.py"],
+                "impact_summary": "widely used", "recommendations": ["review"],
+                "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            behavior={
+                "function": "authenticate", "file": "app/auth.py",
+                "summary": "This patch likely affects authentication in app/auth.py.",
+                "primary_behaviors": ["valid login", "invalid login"],
+                "is_generic": False,
+            },
+            repo_root=tmp_path,
+            detected_language="python",
+            finding_calibration=[{
+                "original": self.FINDING_TEXT,
+                "group": "hypothesis",
+                "reworded": "Whether custom configurations remain compatible needs validation.",
+            }],
+        )
+
+    def test_recommendation_validation_actions_review_results_and_test_support_unchanged(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._kwargs(tmp_path))
+        report = _build_report(result)
+
+        # Recommendation: HIGH impact forces Manual Review Required via the
+        # deployment_safety gate, independent of Batch C's rendering changes.
+        rec_idx = report.find("## Recommendation")
+        expl_idx = report.find("## Explanation")
+        rec_block = report[rec_idx:expl_idx]
+        assert "**Manual Review Required**" in rec_block
+        assert "Change has high deployment risk; regression testing across affected callers required." in rec_block
+        assert "**Top action:**" in rec_block
+
+        # Validation Actions: exactly 3 items (cap unchanged), HIGH items
+        # present for the two challenger findings, plus the behavior-driven
+        # action for the non-generic behavior summary.
+        va_idx = report.find("## Validation Actions")
+        rr_idx = report.find("## Review Results")
+        va_block = report[va_idx:rr_idx]
+        assert va_block.count("**[") == 3
+        assert va_block.count("**[HIGH]**") == 2
+        assert va_block.count("**[MEDIUM]**") == 1
+        assert "authenticate" in va_block or "valid login" in va_block or "invalid login" in va_block
+
+        # Review Results: the always-validation-gap finding stays a gap; the
+        # calibrated "hypothesis" finding renders under Validation Questions
+        # with its reworded calibration text.
+        assert "### Validation Gaps" in report
+        assert self.GAP_TEXT in report
+        assert "### Validation Questions" in report
+        assert "Whether custom configurations remain compatible needs validation." in report
+
+        # Test Support: score/status unchanged, same-file match still shown.
+        ts_idx = report.find("### Test Support")
+        ts_end = report.find("### Behavior Summary")
+        ts_block = report[ts_idx:ts_end]
+        assert "Rating: Good" in ts_block
+        assert "test_mod.py" in ts_block
+        assert "same-file" in ts_block
+
+
 # ---------------------------------------------------------------------------
 # pipeline helpers
 # ---------------------------------------------------------------------------

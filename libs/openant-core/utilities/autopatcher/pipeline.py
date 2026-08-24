@@ -247,6 +247,36 @@ _REVIEW_SECTION_HEADER_RE = re.compile(
 )
 
 
+_HR_LINE_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$")
+
+
+def _strip_trailing_hr(body: str) -> str:
+    """Strip a trailing standalone Markdown horizontal-rule line from a
+    parsed reviewer section body (see `_split_review`).
+
+    Report Polish Batch C: the reviewer LLM sometimes ends a section with
+    its own "---" divider before the next section header in its raw
+    response. `_split_review`'s header-based split has no way to tell that
+    divider apart from real body text, so it becomes the trailing line of
+    that section's body -- and the report's own template then renders ITS
+    OWN "---" immediately before the next heading, producing a visible
+    duplicate ("---\n\n---\n\n## Validation Actions").
+
+    Only ever removes a line that is EXCLUSIVELY "-"/"*"/"_" characters
+    (CommonMark's thematic-break syntax) -- never a Markdown table
+    separator row (contains "|"), never a fenced code block's closing
+    ```` ``` ```` (backticks, not dashes) -- and only when it is the
+    section's own TRAILING line (working backward from the end, stopping
+    at the first line that isn't blank and isn't a bare rule). A rule
+    appearing mid-body, or inside a still-open code block that isn't the
+    literal last line, is never touched.
+    """
+    lines = body.splitlines()
+    while lines and (lines[-1].strip() == "" or _HR_LINE_RE.match(lines[-1])):
+        lines.pop()
+    return "\n".join(lines)
+
+
 def _split_review(review: str) -> dict[str, str]:
     """
     Split the review text into its three expected sections.
@@ -266,7 +296,7 @@ def _split_review(review: str) -> dict[str, str]:
     i = 1
     while i < len(parts) - 1:
         header = parts[i].lower().replace(" ", "_")
-        body = parts[i + 1].strip()
+        body = _strip_trailing_hr(parts[i + 1].strip())
         if "explanation" in header:
             sections["explanation"] = body
         elif "affected" in header:
@@ -2152,6 +2182,23 @@ _TRUST_SIGNALS_V2_ROWS = [
     }, None),
 ]
 
+# Report Polish Batch C: the "N raw review concern(s) recorded before
+# evidence calibration" clause is internal pipeline detail (the raw,
+# pre-calibration Challenger count) that overstates risk when it sits in
+# the PRIMARY Trust Signals table next to five other rows that are all
+# decision-relevant summaries. `_compute_trust_signals`'s own computation
+# of this text -- and therefore `signals["coverage_confidence"]["notes"]`
+# itself, unchanged, still readable by tests/other callers that want the
+# raw count -- is left byte-for-byte alone; only this table's rendered
+# cell drops the leading clause, keeping the calibration-relevant
+# remainder ("no deterministic blocker identified; ..."). No new storage:
+# the full count is still exactly where it always was, just not restated
+# in the primary table's Notes cell.
+_RAW_REVIEW_CONCERN_PREFIX_RE = re.compile(
+    r"^\d+ raw review concern\(s\) recorded before evidence calibration — "
+)
+
+
 def _render_trust_signals_table(signals: dict, known_findings_rendered: bool = True) -> str:
     """Render the Trust Signals table (includes its own leading rule).
 
@@ -2189,6 +2236,11 @@ def _render_trust_signals_table(signals: dict, known_findings_rendered: bool = T
         value = sig["value"]
         status = status_map.get(value, "? Not verified")
         notes = sig["notes"].rstrip()
+        if key == "coverage_confidence":
+            de_emphasized = _RAW_REVIEW_CONCERN_PREFIX_RE.sub("", notes)
+            if de_emphasized != notes and de_emphasized:
+                de_emphasized = de_emphasized[0].upper() + de_emphasized[1:]
+            notes = de_emphasized
         effective_target = target_section
         if target_section == "Review Results" and not known_findings_rendered:
             effective_target = None
@@ -2493,6 +2545,32 @@ def _render_retry_notice(result: PipelineResult) -> str:
         "> - Applicability-aware retry was attempted.\n"
         f"> - Outcome: {outcome}"
     )
+
+
+def _relative_test_path(path_str: str, repo_root: "Path | None") -> str:
+    """Render a Test Support match path repository-relative when possible.
+
+    Report Polish Batch C: presentation only -- `testing_support.
+    tests_for_file` always returns an absolute path (`str(t.resolve())`);
+    this never mutates that stored value, it only changes what the report
+    prints for it. Falls back to the original absolute `path_str`
+    unchanged whenever `repo_root` is missing/invalid, or the path does
+    not actually resolve to something inside it (never invents a relative
+    path in that case -- reproducibility/debugging must still be able to
+    find the real file).
+    """
+    if not repo_root:
+        return path_str
+    try:
+        root = Path(repo_root).resolve()
+        p = Path(path_str)
+        if not p.is_absolute():
+            return path_str
+        rel = p.resolve().relative_to(root)
+        rel_str = rel.as_posix()
+        return rel_str if rel_str not in ("", ".") else "."
+    except Exception:
+        return path_str
 
 
 def _build_report(result: PipelineResult) -> str:
@@ -3336,12 +3414,30 @@ def _build_report(result: PipelineResult) -> str:
             "\n#### Matching tests\n"
         )
         if matches:
-            has_direct = any(m.get("proximity") in ("same-file", "same-module") for m in matches)
-            if not has_direct:
+            # Report Polish Batch C: same-file/same-module matches are the
+            # module's own direct evidence and always render in full,
+            # repository-relative. Generic `repo`-proximity matches (a
+            # match's own filesystem/content matching -- see testing_
+            # support.tests_for_file -- is untouched) are real evidence
+            # that broader tests exist, but individually listing dozens of
+            # them (observed: 64 for pip, 56 for pygeoapi) is noise, not
+            # signal -- collapsed to a single count instead. This only
+            # changes how the already-discovered `matches` list is
+            # grouped/rendered; discovery and scoring (`rating` above) are
+            # untouched.
+            direct_matches = [m for m in matches if m.get("proximity") in ("same-file", "same-module")]
+            broader_matches = [m for m in matches if m.get("proximity") not in ("same-file", "same-module")]
+            if not direct_matches:
                 test_support_md += "- No tests directly matched the patched file/module.\n"
-            for m in matches:
-                prox_label = m['proximity'] if m['proximity'] != 'repo' else 'repo (context)'
-                test_support_md += f"- {m['path']} — {prox_label} — {m['reason']}\n"
+            for m in direct_matches:
+                rel_path = _relative_test_path(m['path'], ts_root)
+                test_support_md += f"- {rel_path} — {m['proximity']} — {m['reason']}\n"
+            if broader_matches:
+                test_support_md += (
+                    f"- Broader repository tests: {len(broader_matches)} additional "
+                    "test file(s) detected elsewhere in the repository (not directly "
+                    "related to the patched module; not listed individually).\n"
+                )
         elif _report_language != "python":
             test_support_md += "- Not evaluated — test discovery does not yet support this language.\n"
         else:
@@ -3366,11 +3462,24 @@ def _build_report(result: PipelineResult) -> str:
             if func and bfile:
                 report += f"This patch appears to modify `{func}` in `{bfile}`.\n\n"
             report += behavior.get("summary", "") + "\n\n"
-            pbs = behavior.get("primary_behaviors") or []
-            if pbs:
-                report += "Primary behaviors to validate:\n"
-                for p in pbs:
-                    report += f"- {p}\n"
+            # Report Polish Batch C: behavior_summary's generic fallback
+            # ("normal flow" / "edge-case handling", set only when no
+            # purpose keyword matched -- see behavior_summary.py's
+            # `is_generic`) carries no patch-specific signal. This flag is
+            # already used to suppress the equivalent Validation Actions /
+            # Suggested Tests behavior-driven items (see build_validation_
+            # plan and the `suggestions` hoist above); this applies the
+            # same gate here, where it was previously not read at all, so
+            # the fixed two-item list rendered unconditionally. The
+            # concrete `func`/`bfile` sentence and `summary` line above are
+            # untouched either way -- only this boilerplate bullet list is
+            # gated.
+            if not behavior.get("is_generic"):
+                pbs = behavior.get("primary_behaviors") or []
+                if pbs:
+                    report += "Primary behaviors to validate:\n"
+                    for p in pbs:
+                        report += f"- {p}\n"
             report += "\n"
         except Exception:
             pass
