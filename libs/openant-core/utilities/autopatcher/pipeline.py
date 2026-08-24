@@ -191,6 +191,23 @@ class PipelineResult:
     # conformance/recovery itself never ran).
     patch_target_conformance: "object | None" = None
     post_patch_recovery: "object | None" = None
+    # Report Polish Batch B (post-review fix): the Final Remediation
+    # Strategy's own `security_invariant` field (see remediation_planner.
+    # RemediationStrategyResult) -- the model's own one-sentence statement
+    # of the security property this specific fix restores, produced from
+    # the already-verified repository/Planner evidence given to that call.
+    # This is LLM-derived remediation guidance, NOT deterministic evidence
+    # -- it is reused here from a call the pipeline already makes (when it
+    # makes one at all), so reading it adds no new LLM call, but the value
+    # itself carries the same LLM-authorship caveats as every other
+    # reviewer-LLM-derived report text (Explanation, Reviewer Notes, etc.).
+    # None whenever the Final Strategy never ran (no verified Planner
+    # evidence to reason over), failed, or the model left the field null/
+    # omitted it. Read only by build_validation_plan's behavior-driven
+    # action for report PRESENTATION -- never by _compute_trust_signals or
+    # _build_recommendation_v1; not a Recommendation Policy signal, matching
+    # every other observability-only field in this dataclass.
+    security_invariant: "str | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -347,24 +364,147 @@ _TITLE_AUTH_KEYWORDS_RE = re.compile(
     r"\b(?:auth|authenticate|login|token|access|permission)\b", re.IGNORECASE
 )
 
+# Report Polish Batch B: a bare identifier with no natural-language spaces --
+# e.g. a generated test-function slug like "test_nested_paths_like_a_
+# constructor" -- carries no reader-facing meaning as a title. Word-shaped
+# (letters/digits joined by underscores only); a genuine finding sentence
+# always has at least one space, so this can never false-match real prose.
+_TITLE_SLUG_LIKE_RE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)+$", re.IGNORECASE)
+
+# Leading label noise sometimes present on a raw finding/topic string before
+# it reaches title-building (e.g. from a heading-scoped extraction) -- strip
+# it so it doesn't become part of the title itself.
+_TITLE_NOISE_PREFIX_RE = re.compile(
+    r"^(?:edge case|potential issue|finding|issue|note|observation)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+
+# A finding sentence that already reads as an instruction (starts with one of
+# these) is used as-is rather than wrapped in another "Verify ...".
+_TITLE_IMPERATIVE_LEAD_RE = re.compile(
+    r"^(?:verify|check|confirm|validate|ensure|review|add|test|investigate)\b",
+    re.IGNORECASE,
+)
+
+_TITLE_GENERIC_FALLBACK = "Add targeted validation for the identified behavior"
+
+
+def _build_generic_sentence_title(raw: str) -> str:
+    """Build a concise imperative validation title directly from `raw`'s own
+    human-readable sentence (via `short_reason`), with no domain keyword
+    classification -- the shared tail end of `normalize_title_from_text`
+    (used after its keyword groups miss) and the whole of
+    `normalize_security_invariant_title` (which never runs those keyword
+    checks at all; see that function's own docstring for why).
+
+    A slug-shaped or otherwise unusable input falls back to
+    `_TITLE_GENERIC_FALLBACK` rather than ever surfacing that identifier
+    verbatim.
+    """
+    cleaned = _TITLE_NOISE_PREFIX_RE.sub("", raw).strip()
+    if not cleaned or _TITLE_SLUG_LIKE_RE.match(cleaned):
+        return _TITLE_GENERIC_FALLBACK
+
+    sentence = short_reason(cleaned)
+    if not sentence or _TITLE_SLUG_LIKE_RE.match(sentence):
+        return _TITLE_GENERIC_FALLBACK
+
+    if _TITLE_IMPERATIVE_LEAD_RE.match(sentence):
+        title = sentence
+    else:
+        # Lowercase only a genuine sentence-initial capital, not an
+        # acronym/all-caps lead word -- same rule _describe_unmet_gates
+        # already uses, reused here rather than reinvented.
+        first_word = sentence.split(" ", 1)[0]
+        is_acronym_lead = len(first_word) > 1 and first_word.isupper()
+        if sentence[:1].isupper() and not is_acronym_lead:
+            body = sentence[0].lower() + sentence[1:]
+        else:
+            body = sentence
+        title = f"Verify {body}"
+
+    return _truncate_reason(title, 90)
+
 
 def normalize_title_from_text(t: str) -> str:
     """Guess a short, human-facing action title from a raw finding string.
 
-    This is a coarse, deterministic guess, not a semantic classifier --
-    when none of the keyword groups match, it falls back to a generic
-    "Add targeted tests for <topic>" title built from the finding text
-    itself.
+    This is a coarse, deterministic guess, not a semantic classifier: no LLM
+    call, no embeddings. When none of the keyword groups below match, it
+    builds a concise imperative validation label from the finding's own
+    human-readable sentence (via `_build_generic_sentence_title`) instead of
+    the old "Add targeted tests for <first 3 words>" template -- that
+    template produced "Add targeted tests for test_nested_paths_like_a_
+    constructor" whenever the caller passed a generated test-function slug
+    (no spaces, so "first 3 words" was the whole slug).
     """
-    lt = (t or "").lower()
+    raw = (t or "").strip()
+    lt = raw.lower()
     if _TITLE_DB_KEYWORDS_RE.search(lt):
         return "Verify database driver compatibility"
     if _TITLE_ENCODING_KEYWORDS_RE.search(lt):
         return "Validate input handling edge cases"
     if _TITLE_AUTH_KEYWORDS_RE.search(lt):
         return "Review authentication flow"
-    parts = (t or "").split()
-    return "Add targeted tests for " + " ".join(parts[:3])
+    return _build_generic_sentence_title(raw)
+
+
+def normalize_security_invariant_title(t: str) -> str:
+    """Build a title for a security-invariant-derived Validation Action
+    (see build_validation_plan's behavior-driven action block) WITHOUT
+    running `normalize_title_from_text`'s domain keyword classification.
+
+    A concrete security_invariant already carries the semantic meaning a
+    title needs -- classifying it into a generic domain bucket can only
+    lose information, and worse, can silently mismatch it: the auth
+    keyword group's `access`/`permission`/`token` are common, generic
+    words in a path-containment or prototype-integrity invariant (e.g.
+    "...must remain strictly within the configured provider root...
+    preventing unauthorized *access*..."), not evidence the invariant is
+    actually about authentication. That false match previously turned a
+    filesystem-containment invariant's title into "Review authentication
+    flow" -- a real regression this function exists to prevent. Reuses the
+    exact same generic-sentence construction `normalize_title_from_text`
+    already falls back to (`_build_generic_sentence_title`) -- no new
+    truncation/cleanup logic, no LLM call, no new classifier.
+    """
+    return _build_generic_sentence_title((t or "").strip())
+
+
+def _legacy_action_bucket_for_finding(text: str) -> str:
+    """The PRE-Batch-B Validation Action cap bucket that `text` would have
+    produced, reproduced WITHOUT depending on today's (Batch B) display
+    title -- so `build_validation_plan`'s per-type cap stays legacy-
+    equivalent even as `normalize_title_from_text`'s own wording keeps
+    improving.
+
+    Before Batch B, a finding's cap bucket was whatever
+    `action_type_from_title(normalize_title_from_text(text))` produced.
+    `normalize_title_from_text`'s three keyword branches (db/encoding/auth)
+    are unchanged by Batch B, so their bucket is reproduced directly here
+    from the same regexes, on the same raw `text`, rather than re-deriving
+    it from a title string:
+      - db keyword    -> old title "Verify database driver compatibility"
+                         -> old bucket "verify" (contains "verify")
+      - encoding kw    -> old title "Validate input handling edge cases"
+                         -> old bucket "verify" (contains "validate")
+      - auth keyword   -> old title "Review authentication flow"
+                         -> old bucket "review" (contains "review")
+    Any other text fell to the OLD generic fallback -- literally
+    `"Add targeted tests for " + " ".join(parts[:3])` -- which
+    unconditionally contained "tests" regardless of what `text` actually
+    was (including empty/slug-shaped text). That unconditional case is
+    reproduced as the `"test"` default below. This is not a new
+    taxonomy -- it is the same four-bucket vocabulary
+    `action_type_from_title` already used, computed from evidence instead
+    of from a rendered string.
+    """
+    lt = (text or "").lower()
+    if _TITLE_DB_KEYWORDS_RE.search(lt) or _TITLE_ENCODING_KEYWORDS_RE.search(lt):
+        return "verify"
+    if _TITLE_AUTH_KEYWORDS_RE.search(lt):
+        return "review"
+    return "test"
 
 
 def enhance_findings_with_impact(challenger: dict, impact_report: dict | None) -> None:
@@ -607,6 +747,63 @@ def _classify_challenger(challenger: dict) -> dict:
     result["plausible_risk_count"] = sum(1 for f in all_classified if f["category"] == "plausible_risk")
     result["validation_gap_count"] = sum(1 for f in all_classified if f["category"] == "validation_gap")
     return result
+
+
+# Report Polish Batch B: deterministic tie-breaker for Validation Actions
+# that share the same HIGH/MEDIUM/LOW priority -- ranks the action that most
+# directly validates the vulnerability's own core security behavior ahead of
+# a speculative secondary edge case. Reuses two pieces of structured
+# evidence the pipeline already computes for other purposes -- finding
+# calibration's Observed/Hypothesis/Hardening group (see
+# finding_calibration.py, already read this way by _build_known_findings)
+# and _classify_finding's confirmed_defect/validation_gap/plausible_risk/
+# generic category -- rather than any new keyword-similarity guess. Neither
+# mapping is new classification logic: both are the exact groups/categories
+# those two existing, already-committed mechanisms already produce.
+#
+# Post-review note: a real-CVE regression once surfaced a genuine issue here
+# -- calibration's "observed" group is evidence CONFIDENCE ("this is a
+# confirmed fact"), not VALIDATION IMPORTANCE ("this still needs to be
+# checked"), and an already-resolved observed fact could outrank a
+# genuinely open "hypothesis" question for Top Action. A fix that globally
+# reordered this mapping (hypothesis above observed) was tried and reverted
+# -- that still used evidence-confidence classification as a proxy for
+# validation importance, just inverted, which is too broad a policy change
+# for this report-polish batch. The actual product requirement -- the
+# vulnerability's core security behavior must win Top Action -- is instead
+# met by `result.security_invariant` (see the behavior-driven action below):
+# when a concrete security invariant is available, it is unconditionally
+# prepended ahead of every action ranked here, including an "observed"-
+# calibrated one. This mapping's ONLY remaining job is secondary/tie-break
+# ordering among the actions that were never displaced by that primary
+# action; general observed-vs-hypothesis relevance/deduplication among
+# those secondary actions is deferred to a later batch.
+_DIRECTNESS_BY_CALIBRATION_GROUP = {"observed": 3, "hypothesis": 2, "hardening": 1}
+_DIRECTNESS_BY_CLASSIFIER_CATEGORY = {
+    "confirmed_defect": 3, "validation_gap": 3, "plausible_risk": 2, "generic": 1,
+}
+
+
+def _finding_directness_tier(text: str, calibration_by_original: dict) -> int:
+    """How directly `text` (a raw finding/topic string) validates the
+    vulnerability's core security behavior, as 3 (most direct) / 2
+    (contextual) / 1 (most speculative) -- used only to break ties between
+    Validation Actions that already share the same priority; never changes
+    priority, count, or content.
+
+    Prefers an existing finding_calibration verdict (an LLM classification
+    that already ran elsewhere in the pipeline, if it ran at all) when this
+    exact finding text has one -- calibration is evidence-quality-aware in a
+    way the coarser deterministic classifier alone is not. Falls back to
+    `_classify_finding`'s own category when there is no calibration entry
+    for this text (calibration didn't run, or this text isn't an exact match
+    for one of its inputs -- e.g. it came from a Suggested Test's re-derived
+    topic rather than the original challenger finding string verbatim).
+    """
+    entry = calibration_by_original.get(text)
+    if entry is not None:
+        return _DIRECTNESS_BY_CALIBRATION_GROUP.get(entry.get("group"), 2)
+    return _DIRECTNESS_BY_CLASSIFIER_CATEGORY.get(_classify_finding(text), 1)
 
 
 def _extract_security_gain(explanation: str) -> str:
@@ -1433,6 +1630,17 @@ def _build_recommendation_v1(
     branch reached after the I3 check cites whichever of I3's three axes
     were not positive, via `_describe_unmet_gates`. This only changes
     `reason` text — `decision` is computed identically to before this note.
+
+    Report Polish Batch B: every branch that returns "Manual Review
+    Required" also sets a `"why"` key -- one short, already-derived phrase
+    naming the SAME signal that branch itself just used to decide, for the
+    report's "Why manual review" line (see `_render_why_manual_review_line`).
+    This is presentation only: computed inline, in the exact branch that
+    already fired, from the exact `signals`/`unmet` values that branch
+    already reads -- never a second, independent inference, and never read
+    by any other branch or by `decision` itself. Branches that return a
+    different decision do not set `"why"` (that renderer only ever looks at
+    it for "Manual Review Required" and would ignore it regardless).
     """
     integrity = signals["patch_integrity"]["value"]
     improvement = signals["security_improvement"]["value"]
@@ -1454,7 +1662,10 @@ def _build_recommendation_v1(
         notes = (signals["remediation_alignment"].get("notes") or "").strip().rstrip(".")
         if notes:
             reason += f" Remediation alignment: {notes}."
-        return {"decision": "Manual Review Required", "reason": reason}
+        why = "adversarial review flagged high-confidence risk indicators that remain unresolved"
+        if notes:
+            why += f" ({notes})"
+        return {"decision": "Manual Review Required", "reason": reason, "why": why}
     if still_vulnerable and defect_count == 0:  # I5
         reason = (
             "Challenger flagged unverified risks but found no confirmed exploit path; "
@@ -1463,7 +1674,11 @@ def _build_recommendation_v1(
         notes = (signals["remediation_alignment"].get("notes") or "").strip().rstrip(".")
         if notes:
             reason += f" Remediation alignment: {notes}."
-        return {"decision": "Manual Review Required", "reason": reason}
+        why = (
+            "the patch's effectiveness against the vulnerability has not been confirmed — "
+            "adversarial review flagged risks that remain unverified"
+        )
+        return {"decision": "Manual Review Required", "reason": reason, "why": why}
     if (
         integrity in _POSITIVE_INTEGRITY
         and improvement in _POSITIVE_IMPROVEMENT
@@ -1490,11 +1705,22 @@ def _build_recommendation_v1(
         reason = "Change has high deployment risk; regression testing across affected callers required."
         if unmet:
             reason += f" {unmet}"
-        return {"decision": "Manual Review Required", "reason": reason}
+        saf_notes = (signals["deployment_safety"].get("notes") or "").strip().rstrip(".")
+        why = "the change affects a high-impact surface; regression validation across affected callers is required"
+        if saf_notes:
+            why += f" ({saf_notes})"
+        return {"decision": "Manual Review Required", "reason": reason, "why": why}
     reason = "Patch requires manual security review before deployment."  # I5 / I6 catch-all
     if unmet:
         reason += f" {unmet}"
-    return {"decision": "Manual Review Required", "reason": reason}
+    # `unmet` already names exactly which already-computed signal(s) are not
+    # positive (e.g. "Deployment risk could not be verified because impact
+    # analysis is not supported for this language yet.") -- reused verbatim
+    # as the dominant reason rather than re-derived, so a language-support
+    # gap (or any other unmet axis) reads the same way here as it already
+    # does in `reason` above.
+    why = unmet if unmet else "the available deterministic signals were insufficient to support a confident recommendation"
+    return {"decision": "Manual Review Required", "reason": reason, "why": why}
 
 
 # ---------------------------------------------------------------------------
@@ -1644,21 +1870,37 @@ _ACTION_PRIORITY_RANK = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
 
 def _select_top_action(validation_actions: list[dict] | None) -> "dict | None":
-    """Return the highest-priority item already in `validation_actions`, or
-    None when the list is empty.
+    """Return the Top Action from `validation_actions`, or None when the
+    list is empty.
 
     Presentation only — does not reorder, filter, or recompute
     `validation_actions` itself (build_validation_plan's own order,
-    priority, and count are untouched). This exists because index [0] is
-    not reliably the highest-priority entry: build_validation_plan
-    unconditionally prepends a MEDIUM-priority behavior-driven action ahead
-    of any HIGH-priority item already present (see its own "behavior"
-    block), so a naive `validation_actions[0]` can under-represent the true
-    top priority. `max()` returns the first item on a tie, so display order
-    for same-priority items still matches the list's own existing order.
+    priority, and count are untouched).
+
+    Top Action answers a different question than priority does: "what
+    should the reviewer validate first to prove the patch addresses the
+    vulnerability?" -- not "how important is this concern?". When
+    build_validation_plan successfully built a security-invariant-derived
+    action (tagged `is_security_invariant_action` at construction -- see
+    that block), it IS that answer by definition and is returned directly,
+    regardless of its own (unchanged, still MEDIUM) priority. This is an
+    explicit reference to an action build_validation_plan itself already
+    marked, never a rediscovery via title text or any other fuzzy match.
+
+    Otherwise, falls back to the original selection: the highest-priority
+    item, ties going to whichever appears first. This exists because index
+    [0] is not reliably the highest-priority entry: build_validation_plan
+    unconditionally prepends its behavior-driven action ahead of any
+    HIGH-priority item already present, so a naive `validation_actions[0]`
+    can under-represent the true top priority. `max()` returns the first
+    item on a tie, so display order for same-priority items still matches
+    the list's own existing order.
     """
     if not validation_actions:
         return None
+    for action in validation_actions:
+        if action.get("is_security_invariant_action"):
+            return action
     return max(validation_actions, key=lambda a: _ACTION_PRIORITY_RANK.get(a.get("priority"), 0))
 
 
@@ -1703,11 +1945,35 @@ def _render_manual_review_scope_note(decision: str, known_findings: dict) -> str
     return f"\n{summary} — see Review Results below for details.\n"
 
 
+def _render_why_manual_review_line(recommendation: dict) -> str:
+    """Render a concise "Why manual review" line for Manual Review Required
+    only. Returns "" for every other decision (Deploy After Validation,
+    Deploy With Caution, Do Not Apply) -- those already read as either
+    confident or unambiguously blocked, and Do Not Apply's own `reason` is
+    already the single deterministic blocker with nothing left to
+    disambiguate.
+
+    Report Polish Batch B: `recommendation["why"]` is set only by
+    `_build_recommendation_v1`'s own Manual Review Required branches, each
+    inline in the exact branch that already decided the outcome (see that
+    function's docstring) -- this renderer adds no inference of its own,
+    only formatting and safe truncation (reusing `_truncate_reason`, the
+    same Batch A helper the rest of this module already uses for this).
+    """
+    if recommendation.get("decision") != "Manual Review Required":
+        return ""
+    why = (recommendation.get("why") or "").strip()
+    if not why:
+        return ""
+    return f"\n**Why manual review:** {_truncate_reason(why, 220)}.\n"
+
+
 def _render_recommendation_block(
     recommendation: dict,
     caveats: list[str] | None = None,
     scope_note: str = "",
     top_action_line: str = "",
+    why_line: str = "",
 ) -> str:
     """Render just the Recommendation section (no leading rule — the caller's
     preceding block is expected to end with one, matching prior layout)."""
@@ -1715,6 +1981,9 @@ def _render_recommendation_block(
     lines.append("## Recommendation\n")
     lines.append(f"**{recommendation['decision']}**\n")
     lines.append(f"{recommendation['reason']}\n")
+
+    if why_line:
+        lines.append(why_line)
 
     if top_action_line:
         lines.append(top_action_line)
@@ -2340,6 +2609,36 @@ def _build_report(result: PipelineResult) -> str:
         """Build up to 3 deterministic validation actions.
 
         Returns list of action dicts: {priority,title,reason,next_step}
+
+        Report Polish Batch B (post-review fix, round 2): every action dict
+        also carries an explicit `"cap_bucket"` -- one of "test"/"verify"/
+        "review"/"other" -- assigned at construction time, never inferred
+        from the action's human-readable `title`. This is what the per-type
+        cap a few lines down groups and dedups by.
+
+        Round 1 of this fix assigned `cap_bucket` from provenance alone
+        (Suggested Tests -> "test", adversarial -> "verify"), which
+        stopped titles from moving actions between buckets, but it was a
+        NEW bucket split -- pre-Batch-B, both loops could land in the same
+        bucket (their old titles were usually both "Add targeted tests for
+        ..."), so this changed which actions survived the cap in some
+        shapes (e.g. an extra "Increase targeted test coverage" could
+        newly appear in a single-finding, weak-test-coverage report). That
+        is a membership change and is out of scope for this batch.
+
+        Round 2 (this version) instead computes `cap_bucket` from
+        `_legacy_action_bucket_for_finding` -- the exact bucket
+        `action_type_from_title(normalize_title_from_text(text))` would
+        have produced on frozen pre-Batch-B `HEAD`, using each branch's own
+        historical input (the Suggested-Tests loop's old topic precedence
+        was `name` before `reason`; the adversarial loop always used the
+        raw finding text) -- so the cap is legacy-equivalent, not a new
+        taxonomy. The three fixed-title branches below (test-support
+        candidate, HIGH-impact fallback, behavior-driven action, no-anchor
+        fallback) keep their own hardcoded bucket, since Batch B never
+        touched those titles and their old bucket is simply whatever
+        `action_type_from_title` already produced for that unchanged
+        string.
         """
         actions: list[dict] = []
 
@@ -2358,9 +2657,28 @@ def _build_report(result: PipelineResult) -> str:
                 return "MEDIUM"
             return "LOW"
 
-        # Suggested tests -> up to 2
+        # Report Polish Batch B: already-computed finding_calibration (LLM
+        # classification that already ran, if it ran at all -- see
+        # finding_calibration.py) keyed by its own raw finding text, exactly
+        # as _build_known_findings already does. Used below only to break
+        # ties between same-priority actions by how directly each one
+        # validates the vulnerability's core security behavior -- never to
+        # add, remove, or reprioritize an action, and never a second call
+        # into finding_calibration itself.
+        calibration_by_original = {
+            entry.get("original"): entry for entry in (result.finding_calibration or [])
+        }
+
+        # Suggested tests -> up to 2. `cap_bucket` reproduces the bucket the
+        # PRE-Batch-B topic (`name` preferred over `reason` -- the old
+        # precedence, kept here ONLY for this legacy-bucket lookup, not for
+        # `title` itself) would have produced. In practice this is always
+        # "test": a generated test-function slug (e.g. "test_the_auth_
+        # token_is_not_validated") never contains a `\b`-bounded keyword
+        # match (the whole slug is one underscore-joined word), so it always
+        # fell to the old generic "Add targeted tests for <slug>" fallback.
         for s in (suggestions or [])[:2]:
-            topic = s.get("name") or s.get("reason", "")
+            topic = s.get("reason") or s.get("name") or ""
             title = normalize_title_from_text(topic)
             reason = short_reason(s.get("reason", "Suggested test")) or "Add targeted tests."
             base_medium = False
@@ -2368,9 +2686,19 @@ def _build_report(result: PipelineResult) -> str:
                 base_medium = True
             if rating == "None":
                 base_medium = True
-            actions.append({"priority": compute_priority(base_medium), "title": title, "reason": reason, "next_step": "Add targeted tests for the identified behavior."})
+            legacy_topic = s.get("name") or s.get("reason") or ""
+            actions.append({
+                "priority": compute_priority(base_medium), "title": title, "reason": reason,
+                "next_step": "Add targeted tests for the identified behavior.",
+                "_directness": _finding_directness_tier(s.get("reason") or "", calibration_by_original),
+                "cap_bucket": _legacy_action_bucket_for_finding(legacy_topic),
+            })
 
-        # Adversarial items -> up to 2
+        # Adversarial items -> up to 2. `cap_bucket` reproduces the bucket
+        # the PRE-Batch-B title (built from this same raw finding text)
+        # would have produced -- e.g. an auth-flavored finding legacy-
+        # buckets as "review" here, exactly as it did on HEAD, even though
+        # its Batch-B `title` is unrelated to that bucket.
         adv_items = []
         if challenger:
             adv_items.extend(challenger.get("edge_cases", []) or [])
@@ -2378,43 +2706,85 @@ def _build_report(result: PipelineResult) -> str:
         for item in adv_items[:2]:
             title = normalize_title_from_text(item)
             reason = short_reason(item) or "Adversarial finding requires validation."
-            actions.append({"priority": compute_priority(True), "title": title, "reason": reason, "next_step": "Validate the finding via focused unit tests or manual review."})
+            actions.append({
+                "priority": compute_priority(True), "title": title, "reason": reason,
+                "next_step": "Validate the finding via focused unit tests or manual review.",
+                "_directness": _finding_directness_tier(item, calibration_by_original),
+                "cap_bucket": _legacy_action_bucket_for_finding(item),
+            })
 
-        # Test support candidate -> max 1
+        # Test support candidate -> max 1. Not derived from a specific
+        # finding -- a general coverage gap, not a claim about the
+        # vulnerability's own behavior -- so it takes the lowest (most
+        # speculative) directness tier. `cap_bucket` is hardcoded to match
+        # exactly what action_type_from_title used to derive from each of
+        # these two fixed, Batch-B-untouched titles ("test" for the
+        # coverage-rating wording, "other" for the no-tests-found wording).
         if rating != "Good":
             if rating == "None":
                 reason = "No directly matching unit tests found for the patched module."
+                ts_title = "Improve validation coverage"
+                ts_cap_bucket = "other"
             else:
                 reason = f"Test support rating: {rating}."
-            actions.append({"priority": compute_priority(True if rating == "None" else False), "title": ("Improve validation coverage" if rating == "None" else "Increase targeted test coverage"), "reason": short_reason(reason), "next_step": "Add targeted tests exercising the patched behavior."})
+                ts_title = "Increase targeted test coverage"
+                ts_cap_bucket = "test"
+            actions.append({
+                "priority": compute_priority(True if rating == "None" else False),
+                "title": ts_title,
+                "reason": short_reason(reason), "next_step": "Add targeted tests exercising the patched behavior.",
+                "_directness": 1,
+                "cap_bucket": ts_cap_bucket,
+            })
 
-        # Ensure a HIGH action exists for high impact
+        # Ensure a HIGH action exists for high impact. Concrete and
+        # deterministic (impact analysis already flagged this surface), so
+        # it ranks above generic/speculative items but below an action that
+        # directly validates the vulnerability's own core behavior.
+        # `cap_bucket` is hardcoded "review" to match what
+        # action_type_from_title used to derive from this fixed,
+        # Batch-B-untouched title.
         if impact_level == "high" and not any(a["priority"] == "HIGH" for a in actions):
             imp_sum = short_reason(impact.get("impact_summary", "")) if impact else "High-impact change."
             title = "Review impacted flows"
             reason = _truncate_reason("High-impact: " + imp_sum, 120)
-            actions.append({"priority": "HIGH", "title": title, "reason": reason, "next_step": "Perform a targeted code review of affected flows."})
+            actions.append({
+                "priority": "HIGH", "title": title, "reason": reason,
+                "next_step": "Perform a targeted code review of affected flows.",
+                "_directness": 2,
+                "cap_bucket": "review",
+            })
 
+        # Post-review fix (round 2): WHICH actions survive the per-type cap
+        # (membership) is decided using ONLY priority, in the same
+        # insertion order build_validation_plan has always used -- this is
+        # the exact ordering pre-Batch-B `HEAD` used before capping, now
+        # that `cap_bucket` is also legacy-equivalent (see docstring above).
+        # Directness must NOT influence this step: sorting the *candidates*
+        # by directness before capping would let two duplicate
+        # representations of the SAME (more direct) finding -- one from
+        # Suggested Tests, one from the adversarial loop, a pre-existing,
+        # out-of-scope-to-fix duplication -- crowd out a DIFFERENT finding's
+        # only representation, changing membership. Directness is applied
+        # below, only to reorder whichever actions already survived.
         rank_map = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
-        actions_sorted = sorted(actions, key=lambda a: (-rank_map.get(a["priority"], 1)))
+        actions_sorted_for_cap = sorted(actions, key=lambda a: (-rank_map.get(a["priority"], 1),))
 
         final: list[dict] = []
         type_counts = {"test": 0, "verify": 0, "review": 0, "other": 0}
 
-        def action_type_from_title(t: str) -> str:
-            lt = (t or "").lower()
-            if "test" in lt:
-                return "test"
-            if any(k in lt for k in ("verify", "validate")):
-                return "verify"
-            if any(k in lt for k in ("review", "investigate")):
-                return "review"
-            return "other"
-
-        for a in actions_sorted:
+        # The per-type cap reads each action's own explicit, legacy-
+        # equivalent `cap_bucket` (set at construction above), never
+        # derived from the display title. `.get(..., "other")` is a
+        # defensive default only -- every branch above already sets
+        # `cap_bucket` explicitly, so this never actually falls back in
+        # practice; it exists solely so a future construction site that
+        # forgets to set it degrades to the least-privileged bucket instead
+        # of raising.
+        for a in actions_sorted_for_cap:
             if len(final) >= 3:
                 break
-            atype = action_type_from_title(a["title"])
+            atype = a.get("cap_bucket", "other")
             if type_counts.get(atype, 0) >= 2:
                 continue
             final.append(a)
@@ -2425,7 +2795,28 @@ def _build_report(result: PipelineResult) -> str:
             no_suggestions = not (suggestions or [])
             no_adversarial = not (challenger and (challenger.get("edge_cases") or challenger.get("potential_issues")))
             if no_suggestions and no_adversarial and rating == "Good":
-                final = [{"priority": "LOW", "title": "Perform quick manual review", "reason": "No automated anchors available; brief manual inspection advised.", "next_step": "Manually review the changed logic and adjacent call sites."}]
+                final = [{
+                    "priority": "LOW", "title": "Perform quick manual review",
+                    "reason": "No automated anchors available; brief manual inspection advised.",
+                    "next_step": "Manually review the changed logic and adjacent call sites.",
+                    "cap_bucket": "review",
+                }]
+
+        # Report Polish Batch B: NOW that membership is finalized (exactly
+        # legacy-equivalent, above), reorder the survivors -- and only the
+        # survivors -- so that within the same HIGH/MEDIUM/LOW priority
+        # tier, the action that most directly validates the vulnerability's
+        # core security behavior displays first (e.g. a direct confirmed/
+        # validation-gap finding, or a calibrated "observed" finding, ahead
+        # of a speculative edge case). `sorted` is stable, so ties (same
+        # priority AND same directness) keep whichever order the legacy cap
+        # selection above already produced. This changes DISPLAY order
+        # only -- it can never add, drop, or reprioritize an action, since
+        # it operates on the fixed-membership `final` list, not on `actions`.
+        final = sorted(
+            final,
+            key=lambda a: (-rank_map.get(a.get("priority"), 1), -a.get("_directness", 1)),
+        )
 
         for a in final:
             a["reason"] = short_reason(a.get("reason", ""))
@@ -2444,19 +2835,88 @@ def _build_report(result: PipelineResult) -> str:
         for a in final:
             a["next_step"] = specific_next_step(a.get("title"), a.get("next_step"))
 
-        # If a behavior summary is provided, ensure a single behavior-driven
-        # validation action is prepended. Keep this minimal and deterministic.
+        # If a behavior summary is provided, OR the pipeline's own Final
+        # Remediation Strategy already identified a concrete security
+        # invariant, ensure a single behavior-driven validation action is
+        # prepended. Keep this minimal and deterministic.
+        #
         # Release-polish: suppressed when behavior_summary reports its
         # generic fallback (`is_generic`) — "Validate behavior: normal flow,
         # edge-case handling" carries no patch-specific signal in that case.
         # Specific (non-generic) behavior summaries are unaffected.
-        if behavior and not behavior.get("is_generic"):
+        #
+        # Post-review fix (real-CVE regression): behavior_summary.py is a
+        # tiny file/function-name keyword classifier (auth/validate/db/api)
+        # that falls to its generic fallback for most real vulnerabilities
+        # -- none of a `Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT` constant
+        # change, a `setKey` traversal guard, or a `get_data_path` path
+        # check match its narrow keyword buckets -- so this action almost
+        # never fired where it mattered most, and Top Action defaulted to
+        # whichever adversarial/Suggested-Tests item happened to rank
+        # first: often a secondary edge case (header casing, a legitimate-
+        # key compatibility concern) rather than the vulnerability's own
+        # core security behavior. `result.security_invariant` -- the Final
+        # Remediation Strategy's own one-sentence statement of the security
+        # property this fix restores (see remediation_planner.
+        # RemediationStrategyResult) -- is LLM-derived remediation guidance
+        # produced from already-verified repository/Planner evidence, NOT
+        # deterministic evidence itself; it is reused here from a call the
+        # pipeline already makes when it makes one at all (no new LLM call,
+        # no re-analysis of the CVE), purely for report presentation, and
+        # is preferred here when present since it names the actual
+        # vulnerability-specific invariant instead of a coarse file/
+        # function-name keyword guess. Falls back to the existing behavior-
+        # summary path, unchanged, when no security invariant is available
+        # -- this never adds a second, independent action source; it is the
+        # same single "Validate behavior" slot, now with a better content
+        # source when one exists. Never consumed by _compute_trust_signals,
+        # _build_recommendation_v1, applicability, repair, or patch
+        # generation -- see PipelineResult.security_invariant's own comment.
+        _security_invariant = (result.security_invariant or "").strip()
+        if _security_invariant or (behavior and not behavior.get("is_generic")):
             try:
-                pbs = behavior.get("primary_behaviors") or []
-                # comma-separated first 4 primary behaviors
-                next_step = "Verify: " + ", ".join(pbs[:4]) if pbs else "Verify: (behavior validation)"
-                beh_reason = short_reason(behavior.get("summary", ""))
-                beh_action = {"priority": "MEDIUM", "title": "Validate behavior", "reason": beh_reason, "next_step": next_step}
+                if _security_invariant:
+                    # normalize_security_invariant_title, NOT
+                    # normalize_title_from_text: a security invariant
+                    # already carries its own semantic meaning and must
+                    # not be run through domain keyword classification
+                    # (see that function's own docstring for the exact
+                    # false-match regression this avoids).
+                    title = normalize_security_invariant_title(_security_invariant)
+                    beh_reason = short_reason(_security_invariant)
+                    next_step = f"Verify: {short_reason(_security_invariant)}"
+                else:
+                    pbs = behavior.get("primary_behaviors") or []
+                    # comma-separated first 4 primary behaviors
+                    next_step = "Verify: " + ", ".join(pbs[:4]) if pbs else "Verify: (behavior validation)"
+                    beh_reason = short_reason(behavior.get("summary", ""))
+                    title = "Validate behavior"
+                # Directness 3: this action is built directly from the
+                # patch's own extracted remediation behavior (or, when
+                # available, the Final Strategy's own security invariant)
+                # -- the most direct available validation of the
+                # vulnerability's core security behavior. Unused here (this
+                # action is prepended unconditionally, not sorted by
+                # _finding_directness_tier), kept only so its tier reads
+                # consistently alongside the other actions' tiers.
+                beh_action = {
+                    "priority": "MEDIUM", "title": title, "reason": beh_reason,
+                    "next_step": next_step, "_directness": 3, "cap_bucket": "verify",
+                }
+                if _security_invariant:
+                    # Post-review fix: Top Action ("what should the
+                    # reviewer validate first?") is a different question
+                    # from priority ("how important is this concern?").
+                    # This explicit marker -- set here, at the one place
+                    # that knows this action came from a concrete security
+                    # invariant -- is _select_top_action's sole source of
+                    # truth for overriding its priority-based selection.
+                    # Never inferred later from title text or any other
+                    # fuzzy match. Priority itself stays "MEDIUM", exactly
+                    # as computed above; this key affects Top Action
+                    # selection only, never ranking, membership, cap
+                    # behavior, reason, or next_step.
+                    beh_action["is_security_invariant_action"] = True
                 # Prepend but keep final limited to 3 actions by trimming the end
                 final = [beh_action] + final
                 if len(final) > 3:
@@ -2547,6 +3007,7 @@ def _build_report(result: PipelineResult) -> str:
     )
     consistency_caveats = _check_recommendation_consistency(signals, trust_rec["decision"], known_findings)
     manual_review_scope_note = _render_manual_review_scope_note(trust_rec["decision"], known_findings)
+    why_manual_review_line = _render_why_manual_review_line(trust_rec)
     top_action_line = _render_top_action_line(validation_actions)
     if no_patch:
         # Execution outcome, not a Recommendation Policy presentation --
@@ -2563,6 +3024,7 @@ def _build_report(result: PipelineResult) -> str:
             caveats=consistency_caveats,
             scope_note=manual_review_scope_note,
             top_action_line=top_action_line,
+            why_line=why_manual_review_line,
         )
     if no_patch:
         # Same execution-outcome rationale as decision_card/recommendation_
@@ -4819,5 +5281,6 @@ def run(
         guided_acquisition=_guided_acquisition,
         patch_target_conformance=_patch_target_conformance,
         post_patch_recovery=_post_patch_recovery,
+        security_invariant=(_strategy_result.security_invariant if _strategy_result else None),
     )
     return _build_report(result)

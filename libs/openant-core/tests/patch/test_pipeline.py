@@ -2431,3 +2431,1428 @@ class TestNoPatchProducedOutcome:
             decision in captured.err
             for decision in ("Deploy After Validation", "Deploy With Caution", "Manual Review Required", "Do Not Apply")
         )
+
+
+# ---------------------------------------------------------------------------
+# Report Polish Batch B
+#
+# Part 1 -- human-readable Validation Action / Top Action titles (no more
+#           generated test-function slugs like "test_nested_paths_like_a_
+#           constructor" leaking into a reader-facing title).
+# Part 2 -- an explicit, deterministic "Why manual review" line, derived
+#           only from signals that already caused the Manual Review Required
+#           decision.
+# Part 3 -- Validation Action prioritization: within the same HIGH/MEDIUM/
+#           LOW priority tier, the action that most directly validates the
+#           vulnerability's own core security behavior ranks ahead of a
+#           speculative secondary edge case.
+#
+# None of this changes recommendation decisions, thresholds, Challenger
+# semantics, Finding Calibration classification, repair authorization,
+# patch applicability/generation, or confidence scoring -- see the
+# per-scenario assertions on `decision` below.
+# ---------------------------------------------------------------------------
+
+
+class TestHumanReadableActionTitles:
+    """Part 1: normalize_title_from_text() must never surface a generated
+    test-function slug, and should instead build a concise, human-readable
+    validation title from the finding's own sentence."""
+
+    def test_generated_test_slug_never_surfaces_as_title(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        # Exactly the shape test_suggester._safe_name() produces: no spaces,
+        # word-joined by underscores -- the old fallback
+        # ("Add targeted tests for " + first 3 "words") treated this whole
+        # slug as a single word and echoed it verbatim.
+        slug = "test_nested_paths_like_a_constructor"
+        title = normalize_title_from_text(slug)
+        assert slug not in title
+        assert "test_" not in title
+
+    def test_another_generated_slug_never_surfaces(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        slug = "test_users_passing_a_custom_remove_headers_on"
+        title = normalize_title_from_text(slug)
+        assert slug not in title
+        assert "test_" not in title
+
+    def test_no_patch_produced_slug_never_surfaces(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        slug = "test_no_patch_was_actually_produced"
+        title = normalize_title_from_text(slug)
+        assert slug not in title
+        assert "test_" not in title
+
+    def test_finding_sentence_produces_concise_human_title(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        title = normalize_title_from_text("Nested constructor.prototype paths remain exploitable")
+        assert "test_" not in title
+        assert title.lower().startswith(("verify", "check", "confirm", "validate", "ensure", "review"))
+        # The finding's own concrete subject should survive into the title,
+        # not be replaced by a generic placeholder.
+        assert "constructor.prototype" in title
+
+    def test_custom_header_finding_produces_prose_not_slug(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        title = normalize_title_from_text(
+            "Users passing a custom remove_headers_on_redirect callback may "
+            "still leak the Cookie header on same-origin redirects"
+        )
+        assert "test_" not in title
+        assert " " in title  # prose, not a single joined identifier
+
+    def test_legitimate_code_identifier_not_mangled(self):
+        """A real code identifier that is genuinely part of the finding's
+        own evidence (not a generated slug) must survive in the title
+        untouched -- only bare, all-underscore, space-free strings are
+        treated as unusable slugs."""
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        title = normalize_title_from_text(
+            "The get_query_param helper does not sanitize the redirect target"
+        )
+        assert "get_query_param" in title
+
+    def test_long_finding_truncates_cleanly(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        long_finding = (
+            "The remediation for the cross-origin redirect handling remains "
+            "incomplete because a long chain of intermediate proxies and "
+            "load balancers can each independently rewrite the Host header "
+            "before the application ever sees the request, which means the "
+            "check added by this patch may not observe the same value an "
+            "attacker actually sent"
+        )
+        title = normalize_title_from_text(long_finding)
+        assert len(title) <= 90
+        # Safe truncation (Batch A's _truncate_reason): no dangling markdown
+        # delimiter, cut at a word boundary.
+        assert title.count("`") % 2 == 0
+        assert not title.endswith(" ")
+
+    def test_empty_or_whitespace_falls_back_to_generic_phrase(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text, _TITLE_GENERIC_FALLBACK
+        assert normalize_title_from_text("") == _TITLE_GENERIC_FALLBACK
+        assert normalize_title_from_text("   ") == _TITLE_GENERIC_FALLBACK
+        assert normalize_title_from_text("test_only_a_slug") == _TITLE_GENERIC_FALLBACK
+
+    def test_keyword_groups_still_take_priority(self):
+        """Batch A's word-boundary keyword groups (db/encoding/auth) are
+        unchanged by this batch -- they still short-circuit before the new
+        generic sentence-based title logic runs."""
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        assert normalize_title_from_text("The db driver placeholder style differs across dialects") == \
+            "Verify database driver compatibility"
+        assert normalize_title_from_text("The auth token is not validated before being trusted") == \
+            "Review authentication flow"
+
+
+class TestSecurityInvariantTitleNormalization:
+    """Post-review fix (real-CVE regression, pygeoapi): a security-invariant
+    Validation Action's title must never be run through
+    normalize_title_from_text's domain keyword classification (auth/db/
+    encoding). Root cause: `_TITLE_AUTH_KEYWORDS_RE` includes the generic
+    words "access"/"permission"/"token" -- common vocabulary in a path-
+    containment or prototype-integrity invariant (e.g. "...preventing
+    unauthorized access to files outside the collection scope"), not
+    evidence the invariant is actually about authentication. That false
+    match previously turned a filesystem-containment invariant's title
+    into "Review authentication flow".
+
+    normalize_title_from_text itself is intentionally NOT touched here --
+    its keyword groups remain exactly as before for every other caller
+    (Suggested Tests, adversarial findings); see
+    TestHumanReadableActionTitles above, still green. Only
+    normalize_security_invariant_title (a new, narrow entry point used
+    solely for security_invariant) skips that classification.
+    """
+
+    def test_1_filesystem_containment_invariant_not_classified_as_auth(self):
+        from utilities.autopatcher.pipeline import normalize_title_from_text, normalize_security_invariant_title
+
+        invariant = (
+            "The absolute resolved filesystem path derived from the untrusted "
+            "dirpath/urlpath must remain strictly within the configured provider "
+            "root, preventing unauthorized access to files outside the collection scope."
+        )
+
+        # Proves the exact false match this fix corrects: the generic
+        # normalizer really does mis-fire on this text (via the "access"
+        # keyword), which is exactly why the security-invariant path must
+        # not reuse it.
+        assert normalize_title_from_text(invariant) == "Review authentication flow"
+
+        title = normalize_security_invariant_title(invariant)
+        assert "authentication" not in title.lower(), title
+        assert any(word in title.lower() for word in ("path", "filesystem", "root")), title
+
+    def test_2_cookie_redirect_invariant_keeps_its_own_semantics(self):
+        from utilities.autopatcher.pipeline import normalize_security_invariant_title
+
+        invariant = "A caller-supplied Cookie must not be forwarded on a cross-origin redirect"
+        title = normalize_security_invariant_title(invariant)
+
+        assert "cookie" in title.lower(), title
+        assert "redirect" in title.lower(), title
+        assert "authentication" not in title.lower(), title
+
+    def test_3_prototype_pollution_invariant_keeps_its_own_semantics(self):
+        from utilities.autopatcher.pipeline import normalize_security_invariant_title
+
+        invariant = "Attacker-controlled argv must not modify Object.prototype via constructor or prototype keys"
+        title = normalize_security_invariant_title(invariant)
+
+        assert "prototype" in title.lower(), title
+        assert "authentication" not in title.lower(), title
+        assert "database" not in title.lower(), title
+
+    def test_4_generic_words_do_not_trigger_unrelated_domain_remap(self):
+        """Invariants containing "untrusted"/"trusted"/"token"/"tokens" in
+        an ordinary, non-authentication sense must not be remapped to the
+        auth domain merely by substring/keyword presence."""
+        from utilities.autopatcher.pipeline import normalize_security_invariant_title
+
+        cases = [
+            "Input derived from an untrusted client must not traverse outside the configured root",
+            "A value supplied by a trusted internal caller must still be re-validated before use",
+            "Version tokens embedded in the query string must not alter the resolved file path",
+            "Path tokens containing '..' must be rejected before path resolution",
+        ]
+        for invariant in cases:
+            title = normalize_security_invariant_title(invariant)
+            assert "authentication" not in title.lower(), (invariant, title)
+            assert "database" not in title.lower(), (invariant, title)
+
+    def test_5_long_invariant_truncates_cleanly(self):
+        from utilities.autopatcher.pipeline import normalize_security_invariant_title
+
+        long_invariant = (
+            "The absolute resolved filesystem path derived from a combination of "
+            "the configured provider root and the untrusted, request-supplied "
+            "dirpath and urlpath segments must remain strictly contained within "
+            "that configured provider root directory at all times, regardless of "
+            "how many levels of parent-directory traversal or symlink indirection "
+            "an attacker attempts to use to escape that boundary"
+        )
+        title = normalize_security_invariant_title(long_invariant)
+
+        assert len(title) <= 90
+        assert title.count("`") % 2 == 0
+        assert not title.endswith(" ")
+
+    def test_6_existing_keyword_title_tests_untouched(self):
+        """Sanity: normalize_title_from_text's own keyword groups (used by
+        every non-security-invariant caller) are completely unaffected by
+        the new normalize_security_invariant_title entry point."""
+        from utilities.autopatcher.pipeline import normalize_title_from_text
+        assert normalize_title_from_text("The db driver placeholder style differs across dialects") == \
+            "Verify database driver compatibility"
+        assert normalize_title_from_text("The auth token is not validated before being trusted") == \
+            "Review authentication flow"
+        assert normalize_title_from_text("Unicode and binary username inputs are mishandled") == \
+            "Validate input handling edge cases"
+
+
+class TestHumanReadableActionTitlesReport:
+    """Part 1, report-level: a real Suggested-Test-derived Validation Action
+    must not expose its generated test-function slug as the title -- the
+    root cause was `topic = s.get("name") or s.get("reason", "")` preferring
+    the always-populated slug over the human-readable finding text."""
+
+    def _base_kwargs(self, tmp_path, **overrides):
+        kwargs = dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch=(
+                "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n"
+                " def foo():\n-    return 1\n+    return 2\n"
+            ),
+            review=(
+                "**Explanation:**\nThe code was vulnerable because of X.\n\n"
+                "**Affected areas:**\n- mod.py\n\n"
+                "**Validation notes:**\n- Test with payload Y.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={
+                "still_vulnerable": False,
+                "edge_cases": [
+                    "Users configuring a custom header-removal policy on redirect may "
+                    "not have the session cookie stripped, unlike the default policy"
+                ],
+                "potential_issues": [],
+                "summary": "",
+            },
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            repo_root=None,
+            detected_language="python",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_no_generated_slug_in_validation_actions(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs(tmp_path))
+        report = _build_report(result)
+
+        va_idx = report.find("## Validation Actions")
+        next_section = report.find("\n## ", va_idx + 1)
+        va_block = report[va_idx:next_section if next_section != -1 else None]
+
+        assert "test_" not in va_block, va_block
+        assert "custom header-removal policy" in va_block.lower() or "cookie" in va_block.lower()
+
+
+class TestWhyManualReview:
+    """Part 2: a concise, deterministic "Why manual review" line, derived
+    only from signals that already caused the existing Manual Review
+    Required decision -- never a second recommendation engine, and never
+    changing green/red outcomes."""
+
+    def _base_kwargs(self, tmp_path, **overrides):
+        kwargs = dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch=(
+                "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n"
+                " def foo():\n-    return 1\n+    return 2\n"
+            ),
+            review=(
+                "**Explanation:**\nThe code was vulnerable because of X.\n\n"
+                "**Affected areas:**\n- mod.py\n\n"
+                "**Validation notes:**\n- Test with payload Y.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={"still_vulnerable": False, "edge_cases": [], "potential_issues": [], "summary": ""},
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            repo_root=tmp_path,
+            detected_language="python",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def _recommendation_block(self, report):
+        rec_idx = report.find("## Recommendation")
+        explanation_idx = report.find("## Explanation")
+        return report[rec_idx:explanation_idx if explanation_idx != -1 else None]
+
+    def test_unsupported_language_signal_explained(self, tmp_path):
+        """minimist-representative: deterministic impact/test signals are
+        unavailable for the repository's language. Manual Review's
+        explanation must say so, and the decision itself must be unchanged
+        by this batch (Manual Review Required, via the existing I3/catch-all
+        path -- see _build_recommendation_v1)."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._base_kwargs(
+            tmp_path,
+            impact={
+                "impact_level": "not_applicable", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            detected_language="javascript",
+        )
+        result = PipelineResult(**kwargs)
+        report = _build_report(result)
+        rec_block = self._recommendation_block(report)
+
+        assert "**Manual Review Required**" in rec_block
+        assert "**Why manual review:**" in rec_block
+        assert "not supported for this language" in rec_block
+
+    def test_high_impact_surface_explained(self, tmp_path):
+        """pygeoapi-representative: high impact surface / caller coverage
+        drives Manual Review. Decision must land on the existing
+        safety == "High Risk" branch, unchanged by this batch."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._base_kwargs(
+            tmp_path,
+            impact={
+                "impact_level": "high", "changed_files": [], "affected_files": [],
+                "impact_summary": "Touches a widely-used entry point.",
+                "recommendations": [], "usage_matches": [],
+            },
+        )
+        result = PipelineResult(**kwargs)
+        report = _build_report(result)
+        rec_block = self._recommendation_block(report)
+
+        assert "**Manual Review Required**" in rec_block
+        assert "**Why manual review:**" in rec_block
+        assert "high-impact surface" in rec_block.lower()
+
+    def test_still_unresolved_effectiveness_explained(self, tmp_path):
+        """node-semver-representative: the patch's effectiveness against the
+        vulnerability remains uncertain (still_vulnerable, no confirmed
+        defect). Decision must land on the existing still_vulnerable/
+        defect_count==0 branch, unchanged by this batch."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._base_kwargs(
+            tmp_path,
+            challenger={
+                "still_vulnerable": True,
+                "edge_cases": ["Cannot verify this without running the full test suite"],
+                "potential_issues": [],
+                "summary": "",
+            },
+        )
+        result = PipelineResult(**kwargs)
+        report = _build_report(result)
+        rec_block = self._recommendation_block(report)
+
+        assert "**Manual Review Required**" in rec_block
+        assert "**Why manual review:**" in rec_block
+        assert "effectiveness" in rec_block.lower() or "has not been confirmed" in rec_block.lower()
+
+    def test_green_recommendation_has_no_why_manual_review_text(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs(tmp_path))
+        report = _build_report(result)
+        rec_block = self._recommendation_block(report)
+
+        assert "**Deploy After Validation**" in rec_block
+        assert "Why manual review" not in rec_block
+
+    def test_red_recommendation_has_no_why_manual_review_text(self, tmp_path):
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._base_kwargs(
+            tmp_path,
+            applicability={
+                "applicable": False, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "patch does not apply",
+            },
+        )
+        result = PipelineResult(**kwargs)
+        report = _build_report(result)
+        rec_block = self._recommendation_block(report)
+
+        assert "**Do Not Apply**" in rec_block
+        assert "Why manual review" not in rec_block
+
+    def test_recommendation_decision_identical_across_all_scenarios(self, tmp_path, monkeypatch):
+        """The single most important invariant of Part 2: adding the "Why
+        manual review" line must never change which decision
+        _build_recommendation_v1 returns. Verified here by comparing the
+        decision produced with and without _render_why_manual_review_line
+        wired in (simulated by stubbing it out) for every scenario above."""
+        from utilities.autopatcher import pipeline as pl
+
+        scenarios = [
+            self._base_kwargs(
+                tmp_path,
+                impact={"impact_level": "not_applicable", "changed_files": [], "affected_files": [],
+                        "impact_summary": "", "recommendations": [], "usage_matches": []},
+                detected_language="javascript",
+            ),
+            self._base_kwargs(
+                tmp_path,
+                impact={"impact_level": "high", "changed_files": [], "affected_files": [],
+                        "impact_summary": "", "recommendations": [], "usage_matches": []},
+            ),
+            self._base_kwargs(
+                tmp_path,
+                challenger={"still_vulnerable": True, "edge_cases": ["Cannot verify this without running tests"],
+                            "potential_issues": [], "summary": ""},
+            ),
+            self._base_kwargs(tmp_path),  # green
+            self._base_kwargs(
+                tmp_path,
+                applicability={"applicable": False, "skipped": False, "skipped_reason": None,
+                                "error": None, "stderr": "patch does not apply"},
+            ),  # red
+        ]
+
+        for kwargs in scenarios:
+            result = pl.PipelineResult(**kwargs)
+            report_with = pl._build_report(result)
+            decision_with = next(
+                d for d in ("Deploy After Validation", "Deploy With Caution", "Manual Review Required", "Do Not Apply")
+                if f"**{d}**" in report_with
+            )
+
+            monkeypatch.setattr(pl, "_render_why_manual_review_line", lambda rec: "")
+            report_without = pl._build_report(result)
+            decision_without = next(
+                d for d in ("Deploy After Validation", "Deploy With Caution", "Manual Review Required", "Do Not Apply")
+                if f"**{d}**" in report_without
+            )
+            monkeypatch.undo()
+
+            assert decision_with == decision_without
+
+
+class TestValidationActionDirectness:
+    """Part 3: _finding_directness_tier() unit coverage -- the deterministic
+    tie-breaker used to rank a direct/confirmed core-security-behavior
+    finding ahead of a speculative one within the same priority tier."""
+
+    def test_calibrated_observed_outranks_hypothesis(self):
+        """Original Batch B semantics, preserved: calibration's "observed"
+        group ranks above "hypothesis" for this secondary-action tiebreaker.
+
+        Post-review note: a real-CVE regression showed this can let an
+        already-resolved observed fact outrank a genuinely open question
+        for Top Action in some cases -- but the fix for that is
+        `security_invariant` (see TestSecurityInvariantTopAction), which
+        unconditionally prepends the vulnerability's core security behavior
+        ahead of every action ranked here, not a global inversion of this
+        mapping. A prior attempt to fix it by globally reversing this
+        ranking (hypothesis above observed) was reverted: it still used
+        evidence-confidence classification as a proxy for validation
+        importance, just inverted, which is too broad a policy change for
+        this report-polish batch. General observed-vs-hypothesis relevance
+        among secondary (non-Top-Action) findings remains deferred to a
+        later batch."""
+        from utilities.autopatcher.pipeline import _finding_directness_tier
+        calibration = {
+            "the core check": {"original": "the core check", "group": "observed", "reworded": "x"},
+            "an edge case": {"original": "an edge case", "group": "hypothesis", "reworded": "y"},
+        }
+        assert _finding_directness_tier("the core check", calibration) > \
+            _finding_directness_tier("an edge case", calibration)
+
+    def test_calibrated_hardening_is_least_direct(self):
+        from utilities.autopatcher.pipeline import _finding_directness_tier
+        calibration = {
+            "polish idea": {"original": "polish idea", "group": "hardening", "reworded": "z"},
+        }
+        assert _finding_directness_tier("polish idea", calibration) < \
+            _finding_directness_tier("unrelated text with no calibration entry", calibration)
+
+    def test_uncalibrated_confirmed_defect_outranks_plausible_risk(self):
+        """No calibration entry at all -- falls back to _classify_finding's
+        own category. A finding phrased as still-exploitable (confirmed_
+        defect) must outrank a scoped/limited concern (plausible_risk)."""
+        from utilities.autopatcher.pipeline import _finding_directness_tier
+        direct = "The redirect handling remains exploitable across origins"
+        speculative = "If users configure a custom retry override, that configuration path is not exercised by the existing suite"
+        assert _finding_directness_tier(direct, {}) > _finding_directness_tier(speculative, {})
+
+    def test_uncalibrated_generic_is_least_direct(self):
+        from utilities.autopatcher.pipeline import _finding_directness_tier
+        generic = "Consider adding documentation for the new option"
+        direct = "The redirect handling remains exploitable across origins"
+        assert _finding_directness_tier(generic, {}) < _finding_directness_tier(direct, {})
+
+
+class TestValidationActionPrioritizationReport:
+    """Part 3, report-level: within the same priority tier, the Validation
+    Action validating the vulnerability's own core security behavior must
+    rank ahead of a speculative secondary edge case -- urllib3/minimist-
+    representative (generic fixtures, not tied to a specific CVE)."""
+
+    DIRECT_FINDING = "The redirect handling remains exploitable when headers are stripped across origins"
+    SPECULATIVE_FINDING = "If users configure a custom retry override, that configuration path is not exercised by the existing suite"
+
+    def _base_kwargs(self, tmp_path, edge_cases, **overrides):
+        kwargs = dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch=(
+                "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n"
+                " def foo():\n-    return 1\n+    return 2\n"
+            ),
+            review=(
+                "**Explanation:**\nThe code was vulnerable because of X.\n\n"
+                "**Affected areas:**\n- mod.py\n\n"
+                "**Validation notes:**\n- Test with payload Y.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={"still_vulnerable": False, "edge_cases": edge_cases, "potential_issues": [], "summary": ""},
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            repo_root=None,
+            detected_language="python",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def _validation_actions_block(self, report):
+        va_idx = report.find("## Validation Actions")
+        next_section = report.find("\n## ", va_idx + 1)
+        return report[va_idx:next_section if next_section != -1 else None]
+
+    def test_direct_core_behavior_ranks_before_speculative_edge_case(self, tmp_path, monkeypatch):
+        """The speculative finding is listed FIRST in the raw challenger
+        output -- proving the reorder happens on directness, not on
+        preserving the challenger's own order. suggest_tests is stubbed out
+        so the (separately re-derived, currently non-deduplicated -- cross-
+        section dedup is out of scope for this batch) Suggested-Tests path
+        doesn't add noise to this specific assertion."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        kwargs = self._base_kwargs(tmp_path, [self.SPECULATIVE_FINDING, self.DIRECT_FINDING])
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+        va_block = self._validation_actions_block(report)
+
+        direct_idx = va_block.find("redirect handling")
+        speculative_idx = va_block.find("retry override")
+        assert direct_idx != -1, va_block
+        assert speculative_idx == -1 or direct_idx < speculative_idx
+
+        top_action_idx = report.find("**Top action:**")
+        top_action_line = report[top_action_idx: report.find("\n", top_action_idx)]
+        assert "retry override" not in top_action_line
+
+    def test_membership_unchanged_natural_codepath_no_stubbing(self, tmp_path):
+        """Regression guard (final review, pre real-CVE regression): with the
+        *natural*, unstubbed suggest_tests codepath -- i.e. exactly what
+        production runs -- two distinct, real challenger findings at the
+        same priority must BOTH still be representable in Validation
+        Actions. Batch B may retitle and reorder them, but must not cause
+        one of two genuinely distinct findings to vanish from the section
+        entirely while the other is silently duplicated in its place.
+
+        `rating` is forced to "Good" via a repo with a matching test file so
+        the test-support-candidate fallback action never competes for a
+        cap slot -- isolating this assertion to exactly the two challenger
+        findings themselves.
+        """
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_mod.py").write_text("def test_foo():\n    pass\n" * 5, encoding="utf-8")
+        (tmp_path / "mod.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        kwargs = self._base_kwargs(
+            tmp_path, [self.SPECULATIVE_FINDING, self.DIRECT_FINDING], repo_root=tmp_path,
+        )
+        result = PipelineResult(**kwargs)
+        report = _build_report(result)
+        va_block = self._validation_actions_block(report)
+
+        assert "redirect handling" in va_block, va_block
+        assert "retry override" in va_block, (
+            "The speculative finding vanished from Validation Actions entirely "
+            "instead of merely being reordered/retitled -- membership changed, "
+            "not just presentation.\n" + va_block
+        )
+        # Human titles remain (item 6): the machine-shaped Suggested-Test
+        # slug must never surface as the user-facing title, even though this
+        # scenario exercises the real, unstubbed suggest_tests codepath.
+        assert "test_" not in va_block, va_block
+
+    def test_shared_action_type_cap_independent_of_title_wording(self, tmp_path, monkeypatch):
+        """Post-review fix, items 1 & 5: two actions sharing the same
+        explicit `action_type` ("test") but with VERY different display
+        titles -- one triggers the "auth" keyword branch ("Review
+        authentication flow"), the other the new generic sentence-based
+        fallback ("Verify ...") -- must still compete for the SAME 2-slot
+        cap. A third, again very differently-titled "test"-type action
+        ("Increase targeted test coverage") must be excluded by that shared
+        cap, proving the cap groups by the explicit `action_type` field,
+        never by a title-derived guess (the removed
+        `action_type_from_title`).
+
+        Isolated via a stubbed suggest_tests (fixed, known reason texts)
+        and an empty challenger (no adversarial-loop competition), so the
+        only "test"-type contenders are exactly the two Suggested-Tests
+        entries plus the test-support candidate -- a clean, unambiguous
+        reproduction of the shared-bucket cap rather than a side effect of
+        the global 3-action cap.
+        """
+        from utilities.autopatcher import pipeline as pl
+
+        auth_finding = "The auth token is not validated before being trusted"
+        redirect_finding = "The redirect handling remains exploitable when headers are stripped across origins"
+        monkeypatch.setattr(
+            pl, "suggest_tests",
+            lambda *a, **k: [
+                {"name": "test_auth_thing", "reason": auth_finding, "code": ""},
+                {"name": "test_redirect_thing", "reason": redirect_finding, "code": ""},
+            ],
+        )
+
+        # rating="Some": a test file that imports the target module by name,
+        # but isn't the same-file match -- gives exactly one same-module
+        # match (see testing_support.score_test_support), which is neither
+        # "Good" (no coverage-fallback suppression) nor "None".
+        (tmp_path / "mod.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_other.py").write_text(
+            "import mod\n\ndef test_x():\n    pass\n", encoding="utf-8",
+        )
+
+        kwargs = self._base_kwargs(
+            tmp_path,
+            # A single unrelated edge case only to make `adv_text_early`
+            # non-empty so `_build_report` calls suggest_tests at all (the
+            # stub above controls its actual return value regardless of
+            # this input) -- becomes one "verify"-type adversarial action,
+            # irrelevant to this test's "test"-type-cap assertions.
+            ["Some unrelated finding used only to trigger the suggestions codepath"],
+            repo_root=tmp_path,
+        )
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+        va_block = self._validation_actions_block(report)
+
+        assert "Review authentication flow" in va_block, va_block
+        assert "redirect handling" in va_block, va_block
+        assert "Increase targeted test coverage" not in va_block, (
+            "The third 'test'-type candidate should have been excluded by "
+            "the shared action_type cap, not survived because its title "
+            "happens to look different from the other two.\n" + va_block
+        )
+
+    def test_priority_unaffected_by_title_wording(self, tmp_path, monkeypatch):
+        """Post-review fix, item 3: two adversarial findings that produce
+        very different titles (one keyword-branch-shaped, one the new
+        generic sentence-based fallback) must both still be assigned
+        priority purely from `compute_priority` (impact level / adversarial
+        origin) -- never from title wording."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        auth_finding = "The auth token is not validated before being trusted"
+        redirect_finding = "The redirect handling remains exploitable when headers are stripped across origins"
+        kwargs = self._base_kwargs(
+            tmp_path, [auth_finding, redirect_finding],
+            impact={
+                "impact_level": "low", "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+        )
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+        va_block = self._validation_actions_block(report)
+
+        # Both adversarial items get compute_priority(True) with
+        # impact_level == "low" -> MEDIUM, regardless of which title branch
+        # (keyword vs. generic) their finding text triggered. Only the
+        # numbered title line (e.g. "1. **[MEDIUM]** ...") carries the
+        # priority marker -- the following "Reason: ..." line for the same
+        # action also contains the finding text but never the marker, so it
+        # must be excluded from this check.
+        import re as _re
+        title_lines = [
+            line for line in va_block.splitlines()
+            if _re.match(r"^\d+\.\s+\*\*\[\w+\]\*\*", line)
+        ]
+        matched = [
+            line for line in title_lines
+            if "Review authentication flow" in line or "redirect handling" in line
+        ]
+        assert len(matched) == 2, va_block
+        for line in matched:
+            assert "**[MEDIUM]**" in line, line
+
+    def test_reason_and_next_step_unaffected_by_title_wording(self, tmp_path, monkeypatch):
+        """Post-review fix, item 4: human title generation must not alter
+        an action's `reason` or `next_step` -- both are computed from the
+        same finding text independent of `normalize_title_from_text`."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        kwargs = self._base_kwargs(tmp_path, [self.DIRECT_FINDING])
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+        va_block = self._validation_actions_block(report)
+
+        assert f"Reason: {self.DIRECT_FINDING}" in va_block, va_block
+        assert "Next step: Validate the finding via focused unit tests or manual review." in va_block, va_block
+
+    def test_ranking_is_order_independent(self, tmp_path, monkeypatch):
+        """Same two findings, reversed input order -> identical outcome
+        (requirement: deterministic across input ordering when the
+        underlying evidence is equivalent)."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        kwargs_a = self._base_kwargs(tmp_path, [self.SPECULATIVE_FINDING, self.DIRECT_FINDING])
+        kwargs_b = self._base_kwargs(tmp_path, [self.DIRECT_FINDING, self.SPECULATIVE_FINDING])
+        report_a = pl._build_report(pl.PipelineResult(**kwargs_a))
+        report_b = pl._build_report(pl.PipelineResult(**kwargs_b))
+
+        assert self._validation_actions_block(report_a) == self._validation_actions_block(report_b)
+
+    def test_calibrated_observed_finding_outranks_calibrated_hypothesis(self, tmp_path, monkeypatch):
+        """Original Batch B semantics, preserved: at equal priority, an
+        "observed" finding ranks ahead of a "hypothesis" finding.
+        Validation Actions render each action's RAW finding text as
+        `reason` (never the calibrated reworded text, which only ever
+        appears in Review Results' Observed Facts), so this asserts on
+        that raw text directly. Both findings would otherwise classify as
+        the same deterministic category (plausible_risk); only
+        finding_calibration's already-computed verdict distinguishes them.
+
+        See test_calibrated_observed_outranks_hypothesis for why this
+        secondary-action ranking was NOT globally inverted despite the
+        real-CVE regression this shape is drawn from -- that regression is
+        instead addressed by `security_invariant` (TestSecurityInvariantTopAction),
+        which displaces both of these as Top Action when a concrete
+        invariant is available, without changing their relative order here."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        open_question = "A symlink created inside the base directory pointing outside it may not be re-validated"
+        resolved_observation = "The boundary check specifically prevents a sibling-directory prefix collision"
+        kwargs = self._base_kwargs(tmp_path, [resolved_observation, open_question])
+        kwargs["finding_calibration"] = [
+            {"original": open_question, "group": "hypothesis", "reworded": "Reworded open question"},
+            {"original": resolved_observation, "group": "observed", "reworded": "Reworded resolved observation"},
+        ]
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+        va_block = self._validation_actions_block(report)
+
+        assert open_question in va_block, va_block
+        assert resolved_observation in va_block, va_block
+        assert va_block.find(resolved_observation) < va_block.find(open_question), va_block
+
+    def test_high_priority_action_still_outranks_directness(self, tmp_path, monkeypatch):
+        """Requirement: an existing HIGH priority deterministic action still
+        outranks a lower-priority action regardless of directness -- priority
+        remains the primary sort key; directness only breaks ties within the
+        same tier."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        kwargs = self._base_kwargs(
+            tmp_path,
+            [self.DIRECT_FINDING],
+            impact={
+                "impact_level": "high", "changed_files": [], "affected_files": [],
+                "impact_summary": "Touches a widely-used entry point.",
+                "recommendations": [], "usage_matches": [],
+            },
+        )
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+        va_block = self._validation_actions_block(report)
+
+        # Both the adversarial item and the impact-driven fallback are HIGH
+        # here (impact_level == "high" forces HIGH priority via
+        # compute_priority) -- confirms directness doesn't starve a
+        # same-tier HIGH action, and priority is computed independently of
+        # directness.
+        assert "**[HIGH]**" in va_block
+
+    def test_top_action_equals_first_validation_action(self, tmp_path, monkeypatch):
+        """Requirement: Top Action must remain conceptually consistent with
+        Validation Actions' own ranking -- no second, independent ranking
+        system for Top Action."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        kwargs = self._base_kwargs(tmp_path, [self.SPECULATIVE_FINDING, self.DIRECT_FINDING])
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+
+        top_action_idx = report.find("**Top action:**")
+        top_action_line = report[top_action_idx: report.find("\n", top_action_idx)]
+
+        va_block = self._validation_actions_block(report)
+        # First bulleted action's line, e.g. "1. **[MEDIUM]** Verify ...  "
+        import re as _re
+        first_title_match = _re.search(r"^\d+\.\s+\*\*\[\w+\]\*\*\s+(.+?)\s*$", va_block, _re.MULTILINE)
+        assert first_title_match, va_block
+        assert first_title_match.group(1) in top_action_line
+
+
+class TestLegacyEquivalentCapMembership:
+    """Post-review fix, round 2: `cap_bucket` must reproduce the exact
+    PRE-Batch-B Validation Action membership/priority/count -- not merely a
+    *new*, provenance-based bucket split that happens to stop titles from
+    moving actions between buckets (round 1 did that, but it changed
+    membership in single-finding, weak-test-coverage reports, which is
+    itself a regression for this batch).
+
+    Expected counts/content below were verified empirically against frozen
+    pre-Batch-B `HEAD` (via a disposable git worktree, not committed) for
+    every fixture shape here; see the batch's own review notes. Only
+    `title` and same-priority *order* are allowed to differ from what HEAD
+    produced.
+    """
+
+    DIRECT = "The redirect handling remains exploitable when headers are stripped across origins"
+    SPECULATIVE = "If users configure a custom retry override, that configuration path is not exercised by the existing suite"
+
+    def _base_kwargs(self, edge_cases, impact_level="low", repo_root=None):
+        return dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch=(
+                "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n"
+                " def foo():\n-    return 1\n+    return 2\n"
+            ),
+            review=(
+                "**Explanation:**\nThe code was vulnerable because of X.\n\n"
+                "**Affected areas:**\n- mod.py\n\n"
+                "**Validation notes:**\n- Test with payload Y.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={"still_vulnerable": False, "edge_cases": edge_cases, "potential_issues": [], "summary": ""},
+            impact={
+                "impact_level": impact_level, "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            repo_root=repo_root,
+            detected_language="python",
+        )
+
+    def _validation_actions_block(self, report):
+        va_idx = report.find("## Validation Actions")
+        next_section = report.find("\n## ", va_idx + 1)
+        return report[va_idx:next_section if next_section != -1 else None]
+
+    def _bullets(self, va_block):
+        return [
+            line.strip() for line in va_block.splitlines()
+            if line.strip()[:2].rstrip(".").isdigit() and "**[" in line
+        ]
+
+    def test_A_two_findings_exact_legacy_membership(self, tmp_path):
+        """Verified against HEAD: exactly 2 items survive (both from the
+        Suggested-Tests loop; the adversarial loop's duplicate copies are
+        capped out, matching HEAD's own pre-existing behavior -- not
+        "improved" here, per the batch's own scope boundary). Both
+        underlying findings are represented; direct-behavior may display
+        first (approved directness tiebreaker)."""
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_mod.py").write_text("def test_foo():\n    pass\n" * 5, encoding="utf-8")
+        (tmp_path / "mod.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs([self.SPECULATIVE, self.DIRECT], repo_root=tmp_path))
+        report = _build_report(result)
+        va_block = self._validation_actions_block(report)
+        bullets = self._bullets(va_block)
+
+        assert len(bullets) == 2, va_block
+        assert all("**[MEDIUM]**" in b for b in bullets), va_block
+        assert "redirect handling" in va_block
+        assert "retry override" in va_block
+
+    def test_A_two_findings_reversed_input_matches(self, tmp_path):
+        """Same fixture, reversed input order -> identical membership/count
+        (order-independence for equivalent evidence)."""
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_mod.py").write_text("def test_foo():\n    pass\n" * 5, encoding="utf-8")
+        (tmp_path / "mod.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs([self.DIRECT, self.SPECULATIVE], repo_root=tmp_path))
+        report = _build_report(result)
+        va_block = self._validation_actions_block(report)
+        bullets = self._bullets(va_block)
+
+        assert len(bullets) == 2, va_block
+        assert "redirect handling" in va_block
+        assert "retry override" in va_block
+
+    def test_B_single_finding_weak_test_coverage_no_extra_action(self, tmp_path):
+        """The exact regression this fix addresses: a repo giving
+        rating="Some" (one same-module test match, short of "Good") must
+        NOT cause "Increase targeted test coverage" to newly appear --
+        verified against HEAD, that action is capped out here (2 duplicate
+        "test"-bucket entries for the one real finding already fill the
+        cap)."""
+        (tmp_path / "mod.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_other.py").write_text(
+            "import mod\n\ndef test_x():\n    pass\n", encoding="utf-8",
+        )
+
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs([self.DIRECT], repo_root=tmp_path))
+        report = _build_report(result)
+        va_block = self._validation_actions_block(report)
+        bullets = self._bullets(va_block)
+
+        assert len(bullets) == 2, (
+            "Batch B must not add a Validation Action beyond what HEAD "
+            "produced for this fixture.\n" + va_block
+        )
+        assert "Increase targeted test coverage" not in va_block, va_block
+        assert va_block.count("redirect handling") == 4, va_block  # title + Reason line, x2 entries
+
+    def test_C_single_finding_no_test_support_matches_legacy_count(self, tmp_path):
+        """rating="None" (repo present, but genuinely no matching test
+        files at all) is a DIFFERENT historical shape from "Some" above --
+        verified against HEAD, "Improve validation coverage" legitimately
+        survives here (it lands in the "other" bucket, not "test", both on
+        HEAD and here) alongside the 2 duplicate "test"-bucket entries for
+        the one real finding -- 3 items total, exactly matching HEAD."""
+        (tmp_path / "mod.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "tests").mkdir()  # present but empty -> no matches -> rating "None"
+
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs([self.DIRECT], repo_root=tmp_path))
+        report = _build_report(result)
+        va_block = self._validation_actions_block(report)
+        bullets = self._bullets(va_block)
+
+        assert len(bullets) == 3, va_block
+        assert "Improve validation coverage" in va_block, va_block
+        assert va_block.count("redirect handling") == 4, va_block  # title + Reason line, x2 entries
+
+    def test_D_high_impact_matches_legacy_count(self, tmp_path):
+        """impact_level="high" -> both the Suggested-Tests and adversarial
+        copies of the one real finding are promoted to HIGH priority;
+        verified against HEAD, exactly those 2 survive (no separate
+        "Review impacted flows" fallback -- that fallback only fires when
+        no HIGH action already exists, and one already does here)."""
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs([self.DIRECT], impact_level="high", repo_root=None))
+        report = _build_report(result)
+        va_block = self._validation_actions_block(report)
+        bullets = self._bullets(va_block)
+
+        assert len(bullets) == 2, va_block
+        assert all("**[HIGH]**" in b for b in bullets), va_block
+        assert va_block.count("redirect handling") == 4, va_block  # title + Reason line, x2 entries
+
+    def test_E_title_wording_alone_never_changes_bucket_or_membership(self, tmp_path, monkeypatch):
+        """Changing a Suggested-Tests action's rendered title from the old
+        "Add targeted tests for X" shape to the new "Verify X" shape must
+        not change its cap_bucket -- proven by two same-legacy-bucket
+        Suggested-Tests actions with wildly different titles (one via the
+        auth keyword branch, one via the new generic sentence fallback)
+        both surviving together and excluding a third same-bucket
+        contender, exactly as HEAD's title-derived bucket would have."""
+        from utilities.autopatcher import pipeline as pl
+
+        auth_finding = "The auth token is not validated before being trusted"
+        redirect_finding = self.DIRECT
+        monkeypatch.setattr(
+            pl, "suggest_tests",
+            lambda *a, **k: [
+                {"name": "test_auth_thing", "reason": auth_finding, "code": ""},
+                {"name": "test_redirect_thing", "reason": redirect_finding, "code": ""},
+            ],
+        )
+        (tmp_path / "mod.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_other.py").write_text(
+            "import mod\n\ndef test_x():\n    pass\n", encoding="utf-8",
+        )
+
+        kwargs = self._base_kwargs(
+            ["Some unrelated finding used only to trigger the suggestions codepath"],
+            repo_root=tmp_path,
+        )
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+        va_block = self._validation_actions_block(report)
+
+        assert "Review authentication flow" in va_block, va_block
+        assert "redirect handling" in va_block, va_block
+        assert "Increase targeted test coverage" not in va_block, va_block
+
+    def test_F_full_field_invariant_only_title_and_order_differ(self, tmp_path):
+        """For the two-finding fixture, every field HEAD produced --
+        priority, reason, next_step -- must be recoverable unchanged from
+        the new report; only the title wording and (for same-priority
+        items) display order are allowed to differ."""
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_mod.py").write_text("def test_foo():\n    pass\n" * 5, encoding="utf-8")
+        (tmp_path / "mod.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+        result = PipelineResult(**self._base_kwargs([self.SPECULATIVE, self.DIRECT], repo_root=tmp_path))
+        report = _build_report(result)
+        va_block = self._validation_actions_block(report)
+
+        # HEAD's exact reason/next_step text for each of the 2 surviving
+        # (Suggested-Tests-loop) actions -- unchanged by title generation.
+        assert f"Reason: {self.DIRECT}" in va_block, va_block
+        assert f"Reason: {self.SPECULATIVE}" in va_block, va_block
+        assert va_block.count("Next step: Add targeted tests for the identified behavior.") == 2, va_block
+        assert va_block.count("**[MEDIUM]**") == 2, va_block
+
+
+class TestSecurityInvariantTopAction:
+    """Post-review fix (real-CVE regression): Top Action / the first
+    Validation Action should validate the vulnerability's core remediation
+    behavior whenever that behavior is already available as
+    `PipelineResult.security_invariant` -- the Final Remediation Strategy's
+    own one-sentence security-invariant statement. This is LLM-derived
+    remediation guidance produced from already-verified repository/Planner
+    evidence and reused here for report presentation, NOT a deterministic
+    or Recommendation Policy signal -- but reusing it here still requires
+    no new LLM call, since it is already computed by a call the pipeline
+    already makes whenever it makes one at all. It must not be displaced
+    as Top Action by a secondary edge case that merely happens to rank
+    first by accident of source order or evidence-confidence classification
+    (see the reverted global observed/hypothesis reordering note on
+    `_DIRECTNESS_BY_CALIBRATION_GROUP` in pipeline.py -- that broader
+    question is deferred to a later batch). Generic fixtures only, inspired
+    by but not tied to any specific CVE/repository.
+
+    Reuses the existing "Validate behavior" action slot (same cap_bucket,
+    same directness, same unconditional-prepend mechanism) -- this is not
+    a fourth action source; it is the existing behavior-driven path with a
+    better content source when one is available.
+    """
+
+    def _base_kwargs(self, edge_cases, security_invariant=None, behavior=None, impact_level="low", **overrides):
+        kwargs = dict(
+            vulnerability_text="# Test vulnerability\n\nSome description.",
+            patch=(
+                "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n"
+                " def foo():\n-    return 1\n+    return 2\n"
+            ),
+            review=(
+                "**Explanation:**\nThe code was vulnerable because of X.\n\n"
+                "**Affected areas:**\n- mod.py\n\n"
+                "**Validation notes:**\n- Test with payload Y.\n"
+            ),
+            score_text="**Confidence score:** 0.80\n\n**Reasons:**\n- ok",
+            challenger={"still_vulnerable": False, "edge_cases": edge_cases, "potential_issues": [], "summary": ""},
+            impact={
+                "impact_level": impact_level, "changed_files": [], "affected_files": [],
+                "impact_summary": "", "recommendations": [], "usage_matches": [],
+            },
+            hygiene=[],
+            applicability={
+                "applicable": True, "skipped": False, "skipped_reason": None,
+                "error": None, "stderr": "",
+            },
+            behavior=behavior if behavior is not None else {
+                "function": "foo", "file": "mod.py",
+                "summary": "This patch likely affects application logic in mod.py.",
+                "primary_behaviors": ["normal flow", "edge-case handling"],
+                "is_generic": True,
+            },
+            security_invariant=security_invariant,
+            repo_root=None,
+            detected_language="python",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def _validation_actions_block(self, report):
+        va_idx = report.find("## Validation Actions")
+        next_section = report.find("\n## ", va_idx + 1)
+        return report[va_idx:next_section if next_section != -1 else None]
+
+    def _top_action_line(self, report):
+        idx = report.find("**Top action:**")
+        return report[idx: report.find("\n", idx)]
+
+    def test_1_core_behavior_beats_casing_edge_case(self, tmp_path, monkeypatch):
+        """urllib3-representative: a header-casing edge case must not
+        outrank the core cross-origin-stripping invariant."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        invariant = "a cross-origin redirect must strip the sensitive header from the outgoing request"
+        casing_edge_case = "Verify header name case variations like 'cookie'/'COOKIE' are matched by a lowercase comparison"
+        kwargs = self._base_kwargs([casing_edge_case], security_invariant=invariant)
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+
+        top_action_line = self._top_action_line(report)
+        va_block = self._validation_actions_block(report)
+
+        assert "cross-origin" in top_action_line.lower(), top_action_line
+        assert "case variations" not in top_action_line.lower(), top_action_line
+        first_bullet_idx = va_block.find("1.")
+        second_bullet_idx = va_block.find("2.")
+        assert "cross-origin" in va_block[first_bullet_idx:second_bullet_idx].lower(), va_block
+
+    def test_2_core_behavior_beats_legitimate_key_compatibility_concern(self, tmp_path, monkeypatch):
+        """minimist-representative: a legitimate-key compatibility/
+        regression concern must not outrank the core prototype-pollution
+        containment invariant."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        invariant = "traversal through constructor and prototype keys must not pollute the object prototype"
+        compat_concern = "Dotted keys legitimately named constructor or prototype are now silently dropped, a compatibility concern"
+        kwargs = self._base_kwargs([compat_concern], security_invariant=invariant)
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+
+        top_action_line = self._top_action_line(report)
+        va_block = self._validation_actions_block(report)
+
+        assert "constructor and prototype" in top_action_line.lower(), top_action_line
+        assert "compatibility" not in top_action_line.lower(), top_action_line
+        first_bullet_idx = va_block.find("1.")
+        second_bullet_idx = va_block.find("2.")
+        assert "constructor and prototype" in va_block[first_bullet_idx:second_bullet_idx].lower(), va_block
+
+    def test_3_core_containment_beats_secondary_path_format_concern(self, tmp_path, monkeypatch):
+        """pygeoapi-representative: a secondary path-formatting concern
+        must not outrank the core path-containment invariant."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        invariant = "a resolved request path must not escape the configured data root directory"
+        format_concern = "The resolved path format without a trailing separator differs slightly across platforms"
+        kwargs = self._base_kwargs([format_concern], security_invariant=invariant)
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+
+        top_action_line = self._top_action_line(report)
+        va_block = self._validation_actions_block(report)
+
+        assert "data root" in top_action_line.lower(), top_action_line
+        assert "trailing separator" not in top_action_line.lower(), top_action_line
+        first_bullet_idx = va_block.find("1.")
+        second_bullet_idx = va_block.find("2.")
+        assert "data root" in va_block[first_bullet_idx:second_bullet_idx].lower(), va_block
+
+    def test_3b_security_invariant_beats_single_high_secondary_action(self, tmp_path, monkeypatch):
+        """Post-review fix (real-CVE regression, pygeoapi-representative):
+        the security-invariant-derived action is MEDIUM priority by design
+        (unchanged), but a HIGH-priority secondary action must not win Top
+        Action honors purely by outranking it on priority -- Top Action
+        answers "validate the core behavior first", not "what is most
+        important overall". The HIGH action's own priority, and Validation
+        Action membership/order, must be completely unaffected."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        invariant = "a resolved request path must not escape the configured data root directory"
+        high_secondary = "A symlink inside base pointing outside is resolved by realpath and may still be followed"
+        kwargs = self._base_kwargs(
+            [high_secondary], security_invariant=invariant, impact_level="high",
+        )
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+
+        top_action_line = self._top_action_line(report)
+        va_block = self._validation_actions_block(report)
+
+        assert "data root" in top_action_line.lower(), top_action_line
+        assert "symlink" not in top_action_line.lower(), top_action_line
+        # The HIGH action's own priority and membership are untouched.
+        assert "**[MEDIUM]**" in va_block, va_block
+        assert "**[HIGH]**" in va_block, va_block
+        assert "symlink inside base" in va_block.lower(), va_block
+
+    def test_3c_security_invariant_beats_multiple_high_secondary_actions(self, tmp_path, monkeypatch):
+        """Same as above, but with two independent HIGH-priority secondary
+        actions -- the security invariant still wins Top Action, and both
+        HIGH actions remain present, HIGH, and in their existing relative
+        order (unchanged membership/priority/ordering)."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        invariant = "a resolved request path must not escape the configured data root directory"
+        high_a = "A symlink inside base pointing outside is resolved by realpath and may still be followed"
+        high_b = "The trailing slash on self.data affects the boundary comparison across platforms"
+        kwargs = self._base_kwargs(
+            [high_a, high_b], security_invariant=invariant, impact_level="high",
+        )
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+
+        top_action_line = self._top_action_line(report)
+        va_block = self._validation_actions_block(report)
+
+        assert "data root" in top_action_line.lower(), top_action_line
+        assert "symlink" not in top_action_line.lower(), top_action_line
+        assert "trailing slash" not in top_action_line.lower(), top_action_line
+        assert va_block.count("**[HIGH]**") == 2, va_block
+        assert va_block.count("**[MEDIUM]**") == 1, va_block
+        assert "symlink inside base" in va_block.lower(), va_block
+        assert "trailing slash on self.data" in va_block.lower(), va_block
+
+    def test_3d_top_action_override_does_not_alter_priority_ordering_membership_reason_next_step(
+        self, tmp_path, monkeypatch,
+    ):
+        """The Top Action override must be a pure presentation choice: the
+        Validation Actions section itself (priority, order, membership,
+        reason, next_step of every action) must be byte-for-byte identical
+        whether or not the security-invariant marker exists to redirect
+        Top Action -- only the "Top action:" line differs."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        invariant = "a resolved request path must not escape the configured data root directory"
+        high_secondary = "A symlink inside base pointing outside is resolved by realpath and may still be followed"
+
+        kwargs_with = self._base_kwargs(
+            [high_secondary], security_invariant=invariant, impact_level="high",
+        )
+        kwargs_without = self._base_kwargs(
+            [high_secondary], security_invariant=None, impact_level="high",
+        )
+        report_with = pl._build_report(pl.PipelineResult(**kwargs_with))
+        report_without = pl._build_report(pl.PipelineResult(**kwargs_without))
+
+        # The one HIGH secondary action (present regardless of whether the
+        # security-invariant action also exists) must render identically.
+        va_with = self._validation_actions_block(report_with)
+        va_without = self._validation_actions_block(report_without)
+        assert "**[HIGH]** Verify a symlink inside base pointing outside is resolved by realpath" in va_with
+        assert "**[HIGH]** Verify a symlink inside base pointing outside is resolved by realpath" in va_without
+        assert f"Reason: {high_secondary}" in va_with
+        assert f"Reason: {high_secondary}" in va_without
+        assert "Next step: Validate the finding via focused unit tests or manual review." in va_with
+        assert "Next step: Validate the finding via focused unit tests or manual review." in va_without
+
+        # Top Action differs precisely because the marker exists in one case.
+        assert "data root" in self._top_action_line(report_with).lower()
+        assert "symlink" in self._top_action_line(report_without).lower()
+
+    def test_4_secondary_observed_hypothesis_ordering_preserves_pre_existing_semantics(self, tmp_path, monkeypatch):
+        """No security_invariant/concrete behavior available here -- purely
+        calibration-driven ranking among two adversarial findings at the
+        same priority, with no primary action to displace either of them.
+
+        Post-review correction: a prior fix globally inverted this ranking
+        (hypothesis above observed) to address a real pygeoapi-shaped
+        regression, but that still used evidence-confidence classification
+        as a proxy for validation importance -- just inverted -- which is
+        too broad a change for this batch. That global reordering was
+        reverted; this secondary-action ranking must behave exactly as it
+        did before this session's change ("observed" outranks "hypothesis"
+        at equal priority). The actual product requirement -- the core
+        security invariant must not be displaced -- is covered separately
+        by tests 1-3 above via `security_invariant`, not by reordering this
+        secondary ranking. General observed-vs-hypothesis relevance among
+        secondary actions remains deferred to a later batch."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        open_question = "A symlink created inside the base directory pointing outside it may not be re-validated"
+        resolved_observation = "The boundary check specifically prevents a sibling-directory prefix collision"
+        kwargs = self._base_kwargs([resolved_observation, open_question], security_invariant=None, behavior=None)
+        kwargs["finding_calibration"] = [
+            {"original": open_question, "group": "hypothesis", "reworded": "Reworded open question"},
+            {"original": resolved_observation, "group": "observed", "reworded": "Reworded resolved observation"},
+        ]
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+        top_action_line = self._top_action_line(report)
+
+        assert "prefix collision" in top_action_line.lower(), top_action_line
+        assert "symlink" not in top_action_line.lower(), top_action_line
+
+    def test_5_no_security_invariant_ranking_matches_pre_existing_batch_b(self, tmp_path, monkeypatch):
+        """With no security_invariant (and no concrete behavior summary),
+        Validation Action ranking must behave exactly as it did before this
+        latest change -- the uncalibrated confirmed_defect/validation_gap
+        vs. plausible_risk directness tiers (`_DIRECTNESS_BY_CLASSIFIER_
+        CATEGORY`, untouched by this batch) still decide ordering, and the
+        behavior-driven action slot stays empty exactly as before
+        `security_invariant` existed."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        direct = "The redirect handling remains exploitable when headers are stripped across origins"
+        speculative = "If users configure a custom retry override, that configuration path is not exercised by the existing suite"
+        kwargs = self._base_kwargs([speculative, direct], security_invariant=None)
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+
+        va_block = self._validation_actions_block(report)
+        top_action_line = self._top_action_line(report)
+
+        assert "Validate behavior" not in va_block, va_block
+        assert "redirect handling" in top_action_line.lower(), top_action_line
+        assert "retry override" not in top_action_line.lower(), top_action_line
+
+    def test_5b_secondary_action_ordering_deterministic_alongside_core_behavior(self, tmp_path, monkeypatch):
+        """When a security-invariant-derived action is present, the
+        remaining secondary actions must still order deterministically
+        (regardless of input order) beneath it -- the new primary action
+        does not disturb the existing same-priority tiebreaker."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        invariant = "a cross-origin redirect must strip the sensitive header from the outgoing request"
+        direct = "The redirect handling remains exploitable when headers are stripped across origins"
+        speculative = "If users configure a custom retry override, that configuration path is not exercised by the existing suite"
+
+        kwargs_a = self._base_kwargs([speculative, direct], security_invariant=invariant)
+        kwargs_b = self._base_kwargs([direct, speculative], security_invariant=invariant)
+        report_a = pl._build_report(pl.PipelineResult(**kwargs_a))
+        report_b = pl._build_report(pl.PipelineResult(**kwargs_b))
+
+        assert self._validation_actions_block(report_a) == self._validation_actions_block(report_b)
+
+    def test_6_recommendation_decision_byte_for_byte_unchanged(self, tmp_path, monkeypatch):
+        """The single most important invariant: adding security_invariant
+        must never change which decision _build_recommendation_v1 returns,
+        for any of the scenarios exercised above."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        scenarios = [
+            self._base_kwargs(["some edge case"], security_invariant=None),
+            self._base_kwargs(["some edge case"], security_invariant="a concrete security invariant statement"),
+            self._base_kwargs(
+                ["Cannot verify this without running the full test suite"],
+                security_invariant="a concrete security invariant statement",
+            ),
+        ]
+
+        for kwargs in scenarios:
+            with_invariant = dict(kwargs)
+            without_invariant = dict(kwargs)
+            without_invariant["security_invariant"] = None
+
+            report_with = pl._build_report(pl.PipelineResult(**with_invariant))
+            report_without = pl._build_report(pl.PipelineResult(**without_invariant))
+
+            decisions = ("Deploy After Validation", "Deploy With Caution", "Manual Review Required", "Do Not Apply")
+            decision_with = next(d for d in decisions if f"**{d}**" in report_with)
+            decision_without = next(d for d in decisions if f"**{d}**" in report_without)
+            assert decision_with == decision_without
+
+    def test_7_legacy_membership_cap_tests_remain_green(self):
+        """Pointer/sanity check: security_invariant defaults to None and
+        must not alter the legacy-equivalent membership fixtures already
+        covered by TestLegacyEquivalentCapMembership (exercised in full via
+        the whole-suite run) -- this is a lightweight direct check that the
+        new field's absence is a true no-op."""
+        from utilities.autopatcher.pipeline import PipelineResult
+        import dataclasses
+        assert dataclasses.fields(PipelineResult)  # sanity: still a dataclass
+        default_result = PipelineResult(
+            vulnerability_text="x", patch="", review="", score_text="", challenger={},
+        )
+        assert default_result.security_invariant is None
+
+    def test_why_manual_review_unaffected_by_security_invariant(self, tmp_path, monkeypatch):
+        """A security_invariant-driven Top Action must not change the
+        "Why manual review" text or the Manual Review Required decision --
+        that mechanism is derived solely from Trust Signals, never from
+        Validation Actions."""
+        from utilities.autopatcher import pipeline as pl
+        monkeypatch.setattr(pl, "suggest_tests", lambda *a, **k: [])
+
+        kwargs = self._base_kwargs(
+            ["Cannot verify this without running the full test suite"],
+            security_invariant="a resolved request path must not escape the configured data root directory",
+        )
+        kwargs["challenger"] = {
+            "still_vulnerable": True,
+            "edge_cases": ["Cannot verify this without running the full test suite"],
+            "potential_issues": [], "summary": "",
+        }
+        result = pl.PipelineResult(**kwargs)
+        report = pl._build_report(result)
+
+        assert "**Manual Review Required**" in report
+        assert "**Why manual review:**" in report
+        assert "has not been confirmed" in report

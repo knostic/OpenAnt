@@ -906,13 +906,29 @@ class RemediationStrategyResult(NamedTuple):
     instead, never silently promoted. `rendered` (when non-empty) already
     reflects this verified subset, not the model's raw, unverified claim.
 
-    `extended_mechanism`/`required_edits` are additive fields: the same
-    already-parsed JSON values `_render_strategy` already renders into
-    Markdown, ALSO kept here structurally so the Final-Target Remediation
-    Slice builder can extract repository-looking identifiers from them
-    without re-parsing `rendered` text. No prompt or JSON schema change --
-    both fields already existed in the parsed response; this only stops
-    discarding them after rendering."""
+    `extended_mechanism`/`required_edits`/`security_invariant` are additive
+    fields: the same already-parsed JSON values `_render_strategy` already
+    renders into Markdown, ALSO kept here structurally so callers can read
+    them directly without re-parsing `rendered` text. No prompt or JSON
+    schema change -- all three fields already existed in the parsed
+    response (see prompts/remediation_strategy.md's output schema); this
+    only stops discarding them after rendering.
+
+    `security_invariant` in particular is the model's own one-sentence
+    statement of the security property this specific fix restores (e.g.
+    "a cross-origin redirect must not forward Cookie"). It is LLM-derived
+    remediation guidance, produced from the already-verified repository/
+    Planner evidence given to this call -- NOT deterministic evidence
+    itself, and it carries the same LLM-authorship caveats as this
+    function's other free-text fields (`extended_mechanism`, `required_
+    edits`). Reading it here adds no new LLM call (it is already computed
+    by this same, already-existing Final Strategy call whenever that call
+    runs at all). Report presentation (build_validation_plan) may reuse it
+    to build ONE primary Validation Action when it is present and the
+    coarser keyword-based Behavior Summary is too generic to be useful on
+    its own; see pipeline.py's behavior-driven action block. Never read by
+    Recommendation Policy, applicability, repair, or patch generation.
+    """
 
     rendered: str
     target_files: "list[str]"
@@ -920,11 +936,12 @@ class RemediationStrategyResult(NamedTuple):
     warnings: "list[str]"
     extended_mechanism: "str | None"
     required_edits: "list[str]"
+    security_invariant: "str | None" = None
 
 
 _EMPTY_STRATEGY_RESULT = RemediationStrategyResult(
     rendered="", target_files=[], target_symbols=[], warnings=[],
-    extended_mechanism=None, required_edits=[],
+    extended_mechanism=None, required_edits=[], security_invariant=None,
 )
 
 
@@ -1077,6 +1094,7 @@ def generate_remediation_strategy(
         warnings=warnings,
         extended_mechanism=plan.get("extended_mechanism") if isinstance(plan.get("extended_mechanism"), str) else None,
         required_edits=_string_list(plan.get("required_edits")),
+        security_invariant=plan.get("security_invariant") if isinstance(plan.get("security_invariant"), str) else None,
     )
 
 
