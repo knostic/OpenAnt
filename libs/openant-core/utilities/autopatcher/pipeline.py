@@ -28,6 +28,14 @@ from pathlib import Path as _Path
 from .evidence_fusion import RepositoryUnderstanding
 from .repository_grounding_models import RepositoryCandidate, RepositoryGroundingResult
 from .post_patch_evaluation import AnchorObservation, CoverageResult, render_post_patch_investigation
+from .existing_test_regression import (
+    ExistingTestComparisonResult,
+    classify_existing_test_comparison_signal,
+    evaluate_existing_test_comparison,
+    not_verified_result as _existing_test_comparison_not_verified,
+    render_existing_test_comparison,
+    test_execution_error_result as _existing_test_comparison_execution_error,
+)
 
 # Static patch signals
 try:
@@ -155,6 +163,17 @@ class PipelineResult:
     # repo_root, no patch, or the classification itself failed) -- callers
     # must fall back to "Not Verified", never infer "Confirmed".
     source_verification: "dict | None" = None
+    # Existing Test Comparison -- see existing_test_regression.py. Opt-in
+    # (see pipeline.run()'s compare_existing_tests parameter; default
+    # False). None whenever the flag was off, no repo_root/patch was
+    # available, or the feature never ran for any other reason -- callers
+    # (_compute_trust_signals' merge site, the report renderer) must treat
+    # None identically to an explicit NOT_VERIFIED result: never a
+    # positive inference ("no evidence" is not "passed"). Observability
+    # only in this slice -- deliberately NOT read by
+    # _build_recommendation_v1, not fed back into Challenger or the repair
+    # loop. That is an explicit, separate, later decision.
+    existing_test_comparison: "ExistingTestComparisonResult | None" = None
     # Edit Readiness Gate (Slice 1) -- see remediation_planner.EditReadinessResult
     # / check_edit_readiness. Observability + the actual gating signal
     # _skip_patch_generation was set from; never read by
@@ -2180,6 +2199,25 @@ _TRUST_SIGNALS_V2_ROWS = [
         "Unverified": "❌ Content not found",
         "Not Verified": "? Not verified",
     }, None),
+    # Existing Test Comparison (opt-in; see existing_test_regression.py).
+    # Display only, same rationale as source_verification above -- this
+    # signal does not yet drive _build_recommendation_v1 (explicit
+    # product decision for this first slice). target_section points at
+    # the dedicated "Existing Test Comparison" section this feature adds
+    # to the report, which carries the baseline/patched counts and any
+    # newly-failing test names. Question/status wording is deliberately
+    # factual ("new failures", never "regression") -- see
+    # existing_test_regression.py's module docstring: this is a
+    # deterministic before/after delta, not a judgment about whether a
+    # newly-failing test is an unintended regression or an intended
+    # behavior change.
+    ("Were there new test failures after the patch?", "existing_test_comparison", {
+        "PASS": "✅ Good",
+        "PRE_EXISTING_FAILURES_ONLY": "✅ Good",
+        "NEW_FAILURES_DETECTED": "❌ New failures",
+        "TEST_EXECUTION_ERROR": "? Inconclusive",
+        "NOT_VERIFIED": "? Not verified",
+    }, "Existing Test Comparison"),
 ]
 
 # Report Polish Batch C: the "N raw review concern(s) recorded before
@@ -3053,6 +3091,15 @@ def _build_report(result: PipelineResult) -> str:
         "value": "Not Verified", "label": "? Not Verified",
         "notes": "No source-verification data available for this run",
     }
+    # Existing Test Comparison -- merged in as a NEW key, same pattern as
+    # source_verification directly above: never touches
+    # _compute_trust_signals' own six-signal computation or its I1-I6
+    # invariants. classify_existing_test_comparison_signal(None) already
+    # returns a safe NOT_VERIFIED default (covers both "flag was off" and
+    # "no data available") -- never a positive inference.
+    signals["existing_test_comparison"] = classify_existing_test_comparison_signal(
+        result.existing_test_comparison
+    )
     trust_rec = _build_recommendation_v1(
         signals,
         still_vulnerable=classified_challenger.get("still_vulnerable", False),
@@ -3309,6 +3356,13 @@ def _build_report(result: PipelineResult) -> str:
             result.post_patch_coverage,
             language=_report_language,
         ) + "\n"
+
+    # §9d: Existing Test Comparison (opt-in; see pipeline.run()'s
+    # compare_existing_tests parameter). Always rendered -- "not
+    # requested" and "not verified" are themselves meaningful,
+    # deterministic states, not gaps to hide (same F-01 rationale as
+    # every other section above).
+    report += render_existing_test_comparison(result.existing_test_comparison)
 
     # §10: Impact Surface
     if result.impact:
@@ -3824,6 +3878,7 @@ def run(
     repo_root: str | Path | None = None,
     investigation_output_dir: str | Path | None = None,
     budget_controller: "object | None" = None,
+    compare_existing_tests: bool = False,
 ) -> str:
     """
     Execute the full patching pipeline.
@@ -3859,6 +3914,20 @@ def run(
         `None` (every existing caller, and any library caller) preserves
         the pre-existing fixed-budget behavior exactly, with zero
         interactive prompts from this module.
+    compare_existing_tests:
+        Opt-in (default False) for Existing Test Comparison -- see
+        existing_test_regression.py. When True and repo_root/patch are
+        both available, discovers a TestExecutionPlan for the repository
+        (test_plan_discovery.py, one bounded LLM call) and runs it once
+        against an isolated, unpatched copy and once against an isolated,
+        patched copy (Docker-only; see test_executors.py -- never falls
+        back to host execution), and compares results. Adds a new,
+        observability-only Trust Signal and report section; never read by
+        _build_recommendation_v1, never fed back into Challenger or the
+        repair loop in this slice. False (every existing caller) runs
+        neither the LLM Test Plan Discovery call nor Docker, and leaves
+        PipelineResult.existing_test_comparison as None, exactly as
+        before this parameter existed.
 
     Returns
     -------
@@ -5190,6 +5259,44 @@ def run(
         _post_patch_observations is not None and patch == _investigated_patch
     )
 
+    # Existing Test Comparison (opt-in) -- runs here because everything
+    # above (applicability-aware retry AND the Challenger-driven repair
+    # loop) has now settled: `patch` is the FINAL candidate, and
+    # `applicability_result` already reflects it. Must never run against a
+    # pre-repair candidate. Deliberately does not feed into Challenger,
+    # Finding Calibration, or the repair loop above -- detection only, in
+    # this slice; observability-only Trust Signal, same as source_
+    # verification above. Docker-only (see test_executors.py); never
+    # falls back to host execution when Docker is unavailable -- that
+    # degrades to NOT_VERIFIED, same as every other unsupported case.
+    _existing_test_comparison: "ExistingTestComparisonResult | None" = None
+    if compare_existing_tests:
+        if not repo_root:
+            _existing_test_comparison = _existing_test_comparison_not_verified(
+                "no repository root was provided"
+            )
+        elif not (patch and patch.strip()):
+            _existing_test_comparison = _existing_test_comparison_not_verified(
+                "no candidate patch was produced"
+            )
+        elif applicability_result.get("applicable") is not True:
+            _existing_test_comparison = _existing_test_comparison_not_verified(
+                "the final candidate patch does not apply; existing-test comparison "
+                "requires an applicable patch"
+            )
+        else:
+            try:
+                _existing_test_comparison = evaluate_existing_test_comparison(Path(repo_root), patch, llm=llm)
+                print(
+                    f"[pipeline] Existing Test Comparison: {_existing_test_comparison.status}",
+                    file=sys.stderr,
+                )
+            except Exception as exc:
+                print(f"[pipeline] Existing Test Comparison failed unexpectedly: {exc}", file=sys.stderr)
+                _existing_test_comparison = _existing_test_comparison_execution_error(
+                    f"comparison failed unexpectedly: {type(exc).__name__}: {exc}"
+                )
+
     # Deterministic patch signals — run on final patch after any repair loop changes
     _c_signals: list[dict] | None = None
     _r_signals: list[dict] | None = None
@@ -5385,6 +5492,7 @@ def run(
         post_patch_coverage=_post_patch_coverage,
         relocation_telemetry=_relocation_telemetry,
         source_verification=_source_verification_signal,
+        existing_test_comparison=_existing_test_comparison,
         edit_readiness=_edit_readiness,
         edit_acquisition=_edit_acquisition,
         guided_acquisition=_guided_acquisition,

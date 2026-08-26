@@ -166,6 +166,70 @@ def _require_llm_provider() -> None:
     ensure_provider_configured()
 
 
+class TestComparisonEnvironmentError(RuntimeError):
+    """Raised when ``--compare-existing-tests`` was explicitly requested
+    but the executor it requires cannot run (e.g. Docker not installed or
+    not reachable).
+
+    This is deliberately NOT the same thing as Existing Test Comparison's
+    own NOT_VERIFIED result (see existing_test_regression.py) -- that is
+    an observability-only signal computed AFTER a patch run has already
+    happened, and never changes Recommendation Policy. This exception
+    instead aborts the ENTIRE requested run, before any repository
+    analysis or LLM call, because the user explicitly asked for a test
+    comparison as part of this run and it structurally cannot even start.
+    There is no patch run, no report, and no Recommendation at all in
+    that case -- the requested command simply never began.
+    """
+    __test__ = False  # not a pytest test class -- name collides with pytest's Test* discovery
+
+
+def _require_test_comparison_environment(compare_existing_tests: bool) -> None:
+    """Fail fast, before ANY repository parsing, Repository Understanding,
+    remediation planning, patch generation, or Auto Patcher LLM call, if
+    ``--compare-existing-tests`` was explicitly requested and its
+    required executor cannot run.
+
+    A no-op when ``compare_existing_tests`` is False -- every existing
+    caller is completely unaffected. When True, delegates the actual
+    readiness probe entirely to
+    ``utilities.autopatcher.existing_test_regression.
+    preflight_test_comparison_environment`` (itself a thin wrapper over
+    the same executor ``.preflight()`` contract Existing Test Comparison
+    uses internally) -- this function's only job is deciding WHEN to call
+    it and how to turn a not-ready result into a hard abort of the whole
+    requested run, never re-implementing the Docker probe itself.
+
+    Raises:
+        TestComparisonEnvironmentError: the selected executor is not
+            ready (e.g. Docker CLI missing, daemon unreachable, preflight
+            timed out) -- message is a short, actionable sentence plus
+            bounded technical detail, never a raw stack trace. For every
+            status except CLI_MISSING, the message is built from
+            ``result.reason`` verbatim rather than composed alongside a
+            second, independently-worded call to action -- docker_
+            preflight's own reason text already ends with its own
+            actionable next step (e.g. "Start Docker and rerun..."), so
+            adding another one here would produce a message with that
+            phrase appearing twice.
+    """
+    if not compare_existing_tests:
+        return
+
+    from utilities.autopatcher.existing_test_regression import preflight_test_comparison_environment
+
+    result = preflight_test_comparison_environment()
+    if result.ready:
+        return
+
+    if result.status == "CLI_MISSING":
+        raise TestComparisonEnvironmentError(
+            "--compare-existing-tests requires Docker, but the `docker` command was not found. "
+            "Install/start Docker and rerun."
+        )
+    raise TestComparisonEnvironmentError(f"--compare-existing-tests requires Docker, but {result.reason}")
+
+
 def _run_engine_and_write_artifacts(
     vulnerability_text: str,
     repo_root: str | None,
@@ -175,6 +239,7 @@ def _run_engine_and_write_artifacts(
     advisory_id: str | None = None,
     advisory_source: str | None = None,
     budget_controller: "object | None" = None,
+    compare_existing_tests: bool = False,
 ) -> PatchStepResult:
     """Shared tail of run_patch()/run_patch_cve(): removes any stale trust
     report from a previous failed run, writes {artifact_label}-vulnerability.md,
@@ -197,6 +262,21 @@ def _run_engine_and_write_artifacts(
     unmodified into pipeline.run() -- omitted (None), this engine's
     pre-existing fixed-budget, fail-closed behavior for repository source/
     context acquisition is unchanged.
+
+    compare_existing_tests is additive too: threaded unmodified into
+    pipeline.run()'s compare_existing_tests parameter (default False).
+    False (every existing caller) preserves pre-existing behavior exactly
+    -- Existing Test Comparison never runs and
+    PipelineResult.existing_test_comparison stays None. Its required
+    environment is NOT checked here (see run_patch()/run_patch_cve()
+    instead, which each call _require_test_comparison_environment as the
+    first thing they do) -- checking it here too, after run_patch_cve()
+    has already fetched the CVE, would be too late for that entry point,
+    and duplicating the check in this shared tail as well as both
+    callers would mean three Docker readiness probes on some paths
+    instead of the intended two (the early whole-run gate, plus Existing
+    Test Comparison's own later defense-in-depth preflight). By the time
+    this function is reached, that gate has already passed.
 
     Raises:
         ConfigError: OpenAnt's config.json is malformed, or ``default_llm``
@@ -259,6 +339,7 @@ def _run_engine_and_write_artifacts(
         repo_root=repo_root,
         investigation_output_dir=investigation_dir,
         budget_controller=budget_controller,
+        compare_existing_tests=compare_existing_tests,
     )
 
     # The provider is already authoritatively resolved by this point --
@@ -326,6 +407,7 @@ def run_patch(
     output_dir: str,
     repo_root: str | None = None,
     budget_controller: "object | None" = None,
+    compare_existing_tests: bool = False,
 ) -> PatchStepResult:
     """Generate and evaluate a candidate remediation for one finding.
 
@@ -346,11 +428,19 @@ def run_patch(
         {finding_id}-trust-report.md   -- the engine's opaque Trust Report
 
     Raises:
+        TestComparisonEnvironmentError: compare_existing_tests is True
+            and its required executor cannot run (see
+            _require_test_comparison_environment) -- checked FIRST,
+            before _require_llm_provider, before pipeline_output_path is
+            even read, so an explicitly-requested prerequisite that
+            can't be satisfied aborts before any file I/O, LLM-provider
+            resolution, or repository work.
         RuntimeError: if no LLM provider can be resolved (see
             _require_llm_provider).
         FileNotFoundError: if pipeline_output_path doesn't exist.
         ValueError: if finding_id is unknown or ineligible.
     """
+    _require_test_comparison_environment(compare_existing_tests)
     _require_llm_provider()
 
     if not os.path.exists(pipeline_output_path):
@@ -386,6 +476,7 @@ def run_patch(
         output_dir=output_dir,
         artifact_label=finding_id,
         budget_controller=budget_controller,
+        compare_existing_tests=compare_existing_tests,
     )
 
 
@@ -394,6 +485,7 @@ def run_patch_cve(
     repo_root: str,
     output_dir: str,
     budget_controller: "object | None" = None,
+    compare_existing_tests: bool = False,
 ) -> PatchStepResult:
     """Generate and evaluate a candidate remediation seeded from a public CVE
     advisory instead of an OpenAnt Finding.
@@ -419,7 +511,18 @@ def run_patch_cve(
     backward compatibility with existing consumers of that field.
 
     Raises:
-        ValueError: repo_root is missing or not a directory.
+        ValueError: repo_root is missing or not a directory -- cheap,
+            local argument validation, checked first, before the
+            test-comparison-environment gate below: this is the kind of
+            "clearly invalid argument shape" check that's fine ahead of
+            Docker preflight, since it does no network/repository/LLM
+            work of its own.
+        TestComparisonEnvironmentError: compare_existing_tests is True
+            and its required executor cannot run (see
+            _require_test_comparison_environment) -- checked BEFORE
+            fetch_cve, so an unsatisfiable, explicitly-requested
+            prerequisite aborts before any NVD network call, not just
+            before pipeline.run().
         RuntimeError: if no LLM provider can be resolved (see
             _require_llm_provider).
         CVENotFoundError: NVD has no record for cve_id.
@@ -432,6 +535,8 @@ def run_patch_cve(
     # ground_repository / parsing ever see it -- see run_patch()'s matching
     # comment for why.
     repo_root = str(Path(repo_root).resolve())
+
+    _require_test_comparison_environment(compare_existing_tests)
 
     from utilities.autopatcher.cve_fetcher import fetch_cve
     from utilities.autopatcher.investigation_adapters import case_from_cve
@@ -449,4 +554,5 @@ def run_patch_cve(
         advisory_id=cve_id,
         advisory_source="NVD",
         budget_controller=budget_controller,
+        compare_existing_tests=compare_existing_tests,
     )

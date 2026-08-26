@@ -627,6 +627,7 @@ def cmd_patch(args):
     )
     max_windows = getattr(args, "max_context_budget_windows", None) or 10
     budget_controller = ContextBudgetController(policy=policy, max_windows=max_windows)
+    compare_existing_tests = bool(getattr(args, "compare_existing_tests", False))
 
     try:
         if cve:
@@ -636,6 +637,7 @@ def cmd_patch(args):
                     repo_root=args.repo_root,
                     output_dir=output_dir,
                     budget_controller=budget_controller,
+                    compare_existing_tests=compare_existing_tests,
                 )
                 ctx.outputs = {
                     "vulnerability_path": result.vulnerability_path,
@@ -652,6 +654,7 @@ def cmd_patch(args):
                     output_dir=output_dir,
                     repo_root=args.repo_root,
                     budget_controller=budget_controller,
+                    compare_existing_tests=compare_existing_tests,
                 )
                 ctx.outputs = {
                     "vulnerability_path": result.vulnerability_path,
@@ -1671,6 +1674,26 @@ def build_parser() -> argparse.ArgumentParser:
             "Hard cap on total context-budget windows (initial + approved) "
             "per acquisition stage, even under --context-budget-policy "
             "always. Must be a positive integer (default: 10)."
+        ),
+    )
+    patch_p.add_argument(
+        "--compare-existing-tests",
+        action="store_true",
+        help=(
+            "Opt-in, off by default: after the candidate patch settles, "
+            "discover how this repository prepares/runs its existing "
+            "tests and run that same test plan once against an isolated, "
+            "unpatched copy and once against an isolated, patched copy, "
+            "then report which tests newly fail after the patch (a "
+            "factual delta -- OpenAnt does not judge whether that change "
+            "is intended). This builds an isolated Docker test "
+            "environment and may download the repository's own "
+            "dependencies as part of that (Docker required -- never "
+            "falls back to running tests on the host). Supported "
+            "runtimes only (currently Python, Node, Go); anything else "
+            "reports Not Verified. Adds a new, observability-only Trust "
+            "Signal and report section -- does not change the "
+            "Recommendation."
         ),
     )
     patch_p.set_defaults(func=cmd_patch)

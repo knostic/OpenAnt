@@ -612,13 +612,14 @@ def _signals_for(integrity="Clean", improvement="High", alignment="Aligned", saf
 # ---------------------------------------------------------------------------
 
 def _signals_full(**overrides):
-    """All seven keys with a neutral 'good' baseline, so tests only need to
+    """All eight keys with a neutral 'good' baseline, so tests only need to
     override the one signal they're checking.
 
-    "source_verification" (Evidence Sufficiency Gate, Phase 1) is included
-    here with a good/"Confirmed" baseline like every other key -- it is a
-    real Trust Signals row now (see pipeline._TRUST_SIGNALS_V2_ROWS), even
-    though it is not yet read by _build_recommendation_v1."""
+    "source_verification" (Evidence Sufficiency Gate, Phase 1) and
+    "existing_test_comparison" (Existing Test Comparison) are
+    included here with a good baseline like every other key -- both are
+    real Trust Signals rows now (see pipeline._TRUST_SIGNALS_V2_ROWS), even
+    though neither is yet read by _build_recommendation_v1."""
     base = {
         "patch_integrity":       {"value": "Clean", "label": "Clean", "notes": "Applies cleanly · no hygiene issues"},
         "security_improvement":  {"value": "High", "label": "High", "notes": "Adversarial review found no remaining exploit path"},
@@ -627,6 +628,7 @@ def _signals_full(**overrides):
         "test_availability":     {"value": "Tests Available", "label": "Tests Available", "notes": "Good — test files cover this module"},
         "deployment_safety":     {"value": "Low Risk", "label": "Low Risk", "notes": "Localized change · low regression risk"},
         "source_verification":   {"value": "Confirmed", "label": "✓ Confirmed", "notes": "1 hunk(s) matched the repository uniquely"},
+        "existing_test_comparison": {"value": "PASS", "label": "✅ Pass", "notes": "No failures in either the baseline or the patched run."},
     }
     base.update(overrides)
     return base
@@ -883,6 +885,29 @@ class TestRecommendationV1:
             rec = _build_recommendation_v1(with_signal)
             assert rec == baseline, (
                 f"source_verification={value!r} changed the decision: "
+                f"{baseline} -> {rec}"
+            )
+
+    def test_decision_unaffected_by_existing_test_comparison(self):
+        """Existing Test Comparison (opt-in) is explicitly NOT
+        wired into Recommendation Policy in this slice --
+        _build_recommendation_v1 must produce the identical decision
+        regardless of what existing_test_comparison says, including
+        NEW_FAILURES_DETECTED, and even when the key is absent entirely
+        (matching a hand-built signals dict from before this signal
+        existed, or a run with --compare-existing-tests off)."""
+        base = _signals_for()
+        baseline = _build_recommendation_v1(base)
+
+        for value in (
+            "PASS", "NEW_FAILURES_DETECTED", "PRE_EXISTING_FAILURES_ONLY",
+            "NOT_VERIFIED", "TEST_EXECUTION_ERROR",
+        ):
+            with_signal = dict(base)
+            with_signal["existing_test_comparison"] = {"value": value, "label": value, "notes": ""}
+            rec = _build_recommendation_v1(with_signal)
+            assert rec == baseline, (
+                f"existing_test_comparison={value!r} changed the decision: "
                 f"{baseline} -> {rec}"
             )
 
