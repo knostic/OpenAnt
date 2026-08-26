@@ -1,5 +1,5 @@
 annotated-types==0.8.0
-anthropic[bedrock]==0.75.0
+anthropic[bedrock]==0.125.0
 openai==2.37.0
 google-genai==2.4.0
 anyio==4.14.2
