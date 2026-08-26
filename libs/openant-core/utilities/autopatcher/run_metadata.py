@@ -53,6 +53,80 @@ def collect_git_info(path: Path) -> str:
     return "unknown"
 
 
+def find_openant_root() -> "Path | None":
+    """Walk up from this file to the OpenAnt repo root (contains
+    libs/openant-core). Returns None if not found (e.g. installed as a
+    wheel outside a git checkout) -- collect_git_info/collect_full_commit_sha
+    already degrade gracefully in that case.
+
+    Shared by core.patch (the Trust Report's ``patcher_commit`` row) and by
+    trace/replay tooling (utilities.autopatcher.tools.run_traced,
+    utilities.autopatcher.stage_replay) so there is exactly one "find the
+    OpenAnt checkout root" implementation, walked from wherever this
+    module itself lives -- any file inside libs/openant-core resolves to
+    the same root.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "libs" / "openant-core").is_dir():
+            return parent
+    return None
+
+
+def collect_full_commit_sha(path: Path) -> "str | None":
+    """Return the FULL (40-char) HEAD SHA for the git repo at ``path``, or
+    None on any failure (missing git, non-repo path, unborn HEAD, ...).
+
+    Distinct from ``collect_git_info``'s short SHA, which exists purely
+    for human-readable report display: replay provenance (see
+    ``utilities.autopatcher.stage_replay``) needs the unambiguous full SHA
+    for an exact-match identity check, not a short, potentially-ambiguous
+    prefix. Returns ``None`` rather than the sentinel string ``"unknown"``
+    -- structured/JSON provenance fields use ``None``/``null`` for "could
+    not determine," never a string that could be mistaken for a real
+    (if oddly-named) commit-ish.
+    """
+    try:
+        result = run_utf8(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(path),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            sha = result.stdout.strip()
+            return sha or None
+    except Exception:
+        pass
+    return None
+
+
+def is_worktree_clean(path: Path) -> "bool | None":
+    """Return True if the git repo at ``path`` has no uncommitted changes
+    (tracked or untracked), False if it does, or None if this could not be
+    determined (missing git, non-repo path, ...).
+
+    Used only by single-stage replay's target-repository safety gate (see
+    ``utilities.autopatcher.stage_replay.validate_target_repository``) --
+    never by report rendering, and never for the OpenAnt development
+    checkout itself (which may intentionally be dirty during replay).
+    """
+    try:
+        result = run_utf8(
+            ["git", "status", "--porcelain"],
+            cwd=str(path),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() == ""
+    except Exception:
+        pass
+    return None
+
+
 def auto_output_path(
     timestamp: datetime,
     ghsa_id: Optional[str],
