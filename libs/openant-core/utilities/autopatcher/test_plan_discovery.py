@@ -32,6 +32,20 @@ than that: a malformed type or an unrecognized string both normalize to
 part of the execution-safety boundary either way (see "Confidence
 semantics" below).
 
+Confidence still goes missing more often than it should: real runs
+(including a minimist stage replay) have shown the model omitting
+``confidence`` from an otherwise well-formed response, even though the
+schema block above states it. Mentioning a field once in a long prompt is
+evidently not enough repetition to reliably survive to the end of the
+response, so ``_SYSTEM_PROMPT`` ends with a short, mandatory "every schema
+key, and confidence is one of high/medium/low" checklist placed
+immediately before the repository evidence is shown -- the last thing the
+model reads before generating. This is a prompt-only reliability nudge:
+the ``"unknown"`` fallback above is unchanged and remains the real
+safeguard, and no retry is added merely because confidence was omitted
+(see "No retries" above) -- a second omission after the checklist is
+still just "unknown," not a failure.
+
 Confidence semantics: the actual execution trust boundary is entirely
 deterministic -- structured argv, test_plan_validation.py's checks,
 test_executors.is_runtime_supported's runtime policy, result-path
@@ -56,17 +70,35 @@ citing a file it was never shown is rejected outright, the same as a
 malformed response.
 
 Structured vs. exit-code result preference: the model is asked to prefer
-``result_strategy="junit"`` over ``"exit_code"`` whenever it can confidently
-identify a specific, well-known test runner's own built-in structured-
-output flag -- purely because per-test evidence lets the downstream
-comparator (existing_test_regression.py) tell a NEW failure apart from a
+``result_strategy="junit"`` or ``"tap"`` over ``"exit_code"`` whenever it
+can confidently identify, respectively, a specific well-known test
+runner's own built-in structured-output flag, or a test entry point whose
+completely unmodified, normal invocation already emits raw TAP -- purely
+because per-test evidence lets the downstream comparator
+(existing_test_regression.py) tell a NEW failure apart from a
 PRE-EXISTING one even when the baseline wasn't fully green, which a bare
 exit code can never do. This is a preference expressed in the prompt only
--- no new field, no new architecture, no framework-specific code anywhere
-in this module or downstream. ``test_plan_validation.validate_plan``
+-- no new field beyond the "tap" enum value, no new architecture, no
+framework-specific code anywhere in this module or downstream (TAP is a
+result FORMAT emitted by many unrelated ecosystems, not a Node-specific
+addition -- see tap_parser.py). ``test_plan_validation.validate_plan``
 additionally rejects any "junit" plan whose ``test_command`` doesn't
-actually reference the declared ``result_output_path`` (see that module),
-so a plan can never claim structured output it didn't really request.
+actually reference the declared ``result_output_path``, and any "tap"
+plan that sets a ``result_output_path`` at all (see that module), so a
+plan can never claim structured output it didn't really request.
+
+TAP's evidence bar is deliberately narrower than junit's, not equal to
+it: a real minimist inspection (test_plan_discovery evidence shows
+package.json's ``scripts.test`` as ``"tap test/*.js"``) confirmed that a
+script/library NAMED "tap" does not, by itself, mean the repository's
+normal, unmodified invocation emits raw TAP -- the `tap` v0.4.x CLI's own
+DEFAULT output (with no added flag) is a human-readable per-file summary,
+not TAP at all; real TAP requires an added `--tap` flag or `TAP=1`
+environment variable this feature is not permitted to add (no command
+rewrite, no ``env`` field on ``TestExecutionPlan`` at all). The prompt
+therefore requires evidence of the UNMODIFIED entry point's own default
+behavior, never a name/dependency-based guess -- see the "tap" bullet
+below.
 
 Repository-grounding (evidence-first discovery): the prompt requires the
 model to DISCOVER how a repository already declares its own tests should
@@ -90,6 +122,35 @@ reporting-only flag to an already-evidenced command is still fine; only
 unchanged by this fix -- ``npx`` was never added to it, and still isn't;
 this is fixed at discovery, not by widening what the deterministic
 validator will accept.
+
+Setup-command grounding (repository-grounded EXECUTABILITY, not just
+command wording): the fix above preserves the right ENTRY POINT
+(``["npm", "test"]``) but a real minimist run still returned
+``setup_commands=[]`` for it -- and ``npm test`` fails with ``sh: tap:
+command not found`` (exit 127) in a fresh container, because
+package.json's own ``devDependencies`` declare ``tap``/``tape``/
+``covert``, none of which exist until installed. Two things were wrong,
+both fixed together, neither a framework provider:
+(1) ``test_evidence_acquisition._package_json_relevant_fields`` used to
+extract only ``scripts``/``engines`` from package.json, deliberately
+omitting ``dependencies``/``devDependencies``/``packageManager`` --
+the model was never SHOWN the evidence it would have needed to ground an
+install step, no matter how the prompt was worded; it now extracts those
+too (still bounded by the same per-file byte cap every other config file
+already goes through). (2) The prompt's setup rule only recognized
+lockfiles/CI/docs as sufficient setup evidence, treating a dependency
+manifest's own declaration of the entry point's invoked tool as
+insufficient by itself -- it now explicitly is sufficient: if the
+repository's own manifest declares the entry-point tool as a project
+dependency, and nothing shows it already materialized, that is
+repository-grounded setup, not invention (see the "setup_commands" rule
+below, and its "WEAK / SPECULATIVE" vs. "STRONGLY IMPLIED
+REPOSITORY-OWNED" distinction). This does not lower the bar for weak
+setup guesses (e.g. "Python files exist -> pip install -r
+requirements.txt" with no such file shown) -- it only stops discarding
+evidence the model WAS shown. A lockfile still governs INSTALL MODE only
+("npm ci" vs "npm install"), never whether to install at all -- its
+absence must not be read as "skip setup."
 """
 
 from __future__ import annotations
@@ -149,7 +210,7 @@ markdown code fences, matching this schema:
 {
   "setup_commands": [[<argv tokens>], ...],
   "test_command": [<argv tokens>],
-  "result_strategy": "junit" | "exit_code",
+  "result_strategy": "junit" | "tap" | "exit_code",
   "result_output_path": "<absolute path under /tmp/, or null>",
   "runtime_family": "python" | "node" | "go" | "rust" | "jvm" | null,
   "runtime_version_hint": "<short version string, or null>",
@@ -229,19 +290,59 @@ Rules:
   whichever manager that evidence establishes (e.g. yarn.lock present ->
   ["yarn", "test"]; pnpm-lock.yaml present -> ["pnpm", "test"]). Do not
   pick a different package manager merely from general ecosystem
-  familiarity when the evidence doesn't support it.
+  familiarity when the evidence doesn't support it. When package.json
+  exists but NONE of those signals distinguish a specific manager (no
+  lockfile of any kind, no "packageManager" field, no CI, no docs), "npm"
+  is the one choice that adds no further, unevidenced assumption -- it
+  ships with Node itself, unlike yarn/pnpm, which nothing in the evidence
+  suggests are even available. This is the absence-of-contrary-evidence
+  default for the one manager that needs no separate installation to
+  exist, not the "general ecosystem familiarity" guess this rule
+  otherwise prohibits.
 - setup_commands follow the identical evidence discipline as
-  test_command. Do NOT default to a "common for this language" install
-  command (e.g. "npm install"/"npm ci", "pip install -r
-  requirements.txt", "poetry install", "bundle install") merely because
-  it's typical -- only propose a setup command the evidence shows or
-  strongly implies (a lockfile establishing the package manager, a CI
-  install step, documented setup instructions). Where more than one
-  setup mechanism could plausibly apply, prefer whichever one best
-  matches the SAME evidence you used for the test entry point (e.g. the
-  same package manager the lockfile/CI established). If you cannot
-  determine setup safely from the evidence, prefer 0 setup_commands (or
-  low confidence if the test command cannot run at all without one) over
+  test_command -- but "no CI/install step was shown" is NOT the same
+  claim as "nothing needs installing." Work through, in order: (1) what
+  repository-owned test entry point will run; (2) what tool(s) that
+  entry point itself invokes; (3) does the repository's OWN dependency
+  manifest (package.json's dependencies/devDependencies, a
+  requirements/Pipfile/pyproject dependency list, a Cargo.toml/go.mod,
+  etc.) declare that tool as a project dependency; (4) will a fresh,
+  disposable checkout already contain it (a package manager's install
+  target -- node_modules, a virtualenv, target/ -- will NOT; a file
+  committed to the repository would). If the entry point invokes a tool
+  the repository's OWN manifest declares as a dependency, and nothing
+  suggests it is already materialized, INCLUDE the setup command that
+  installs it, using the SAME package manager you established for the
+  test entry point above -- this is making the repository's own declared
+  interface executable, not inventing a plausible-looking convention
+  (see "WEAK / SPECULATIVE SETUP" vs. "STRONGLY IMPLIED REPOSITORY-OWNED
+  SETUP" for the exact line: guessing a command such as "pip install -r
+  requirements.txt" merely because Python files exist, with no such file
+  shown, is still prohibited; declining to install a dependency the
+  manifest itself names, that the entry point itself needs, is not
+  caution -- it is discarding evidence you were given). Do NOT default to
+  a "common for this language" install command such as "npm install",
+  "npm ci", "pip install -r requirements.txt", "poetry install", or
+  "bundle install" merely because it's typical, with no dependency
+  manifest behind it -- that remains prohibited.
+    * A lockfile changes HOW you install, never WHETHER you install:
+      package-lock.json/npm-shrinkwrap.json justifies a deterministic
+      mode ("npm ci"); its ABSENCE does not mean skip setup -- it means
+      use the non-lockfile mode instead ("npm install"). Never propose
+      "npm ci" (or another manager's lockfile-only install mode) without
+      that exact lockfile actually present, and never invent or assume
+      one that isn't.
+    * These are examples of the principle, not a table to pattern-match:
+      a package-manager project whose test entry point invokes a
+      devDependency-declared CLI; a Python project whose evidenced test
+      command runs a tool its own requirements/pyproject dependency list
+      declares; a Rust/Go/JVM project where repository evidence
+      establishes its own preparation command. The rule is
+      repository-declared-dependency executability, not a per-ecosystem
+      lookup table.
+  If no dependency manifest declares the invoked tool, or the evidence is
+  ambiguous/contradictory about setup, prefer 0 setup_commands (or low
+  confidence if the test command cannot run at all without one) over
   inventing an environment.
 - Command provenance is required, not optional: reasoning_summary must be
   able to answer, briefly, "why is THIS setup command supported by the
@@ -293,16 +394,34 @@ Rules:
   `--junitxml=/tmp/openant-result.xml` to it unchanged otherwise, with
   result_strategy = "junit" and result_output_path =
   "/tmp/openant-result.xml".
+- Use result_strategy = "tap" ONLY when repository evidence clearly shows
+  that the repository-owned test entry point's NORMAL invocation --
+  completely unchanged, no added flag, no added environment variable --
+  itself emits raw TAP text (lines like "ok 1 - ..."/"not ok 2 - ...").
+  Do NOT infer "tap" merely because a script/command name CONTAINS "tap"
+  or "tape", or because a TAP-capable library is a declared dependency --
+  many such tools print a human-readable summary by default and only
+  emit real TAP with an added flag or environment variable, and you may
+  never add one (the entry point runs exactly as evidenced -- see above).
+  Sufficient evidence looks like: CI/docs directly showing raw "ok"/"not
+  ok" lines coming from THIS unmodified command, or the evidenced runner
+  being one you know, with confidence, emits TAP as its own unconditional
+  default (e.g. Node's built-in `node --test`). result_output_path must
+  be null for "tap" -- there is no report file; unlike junit, the TAP
+  text is read directly from the command's own normal output. When in
+  doubt, this is exactly the same "do not guess" situation as junit
+  below -- use "exit_code" instead.
 - If you are not fully confident in a SPECIFIC runner's own built-in
-  structured-output flag, use result_strategy = "exit_code" and leave
-  result_output_path null. This is the correct, safe choice for a custom
-  or bespoke command (e.g. `make test`, `./scripts/test.sh`) -- do NOT
-  invent a result converter, and do NOT wrap, replace, or second-guess the
-  repository's own evidenced command just to obtain structured output. The
-  repository's normal test invocation is authoritative; when in doubt,
-  choose "exit_code" rather than guess.
-- Whether proposing "junit" or "exit_code", you must NEVER add, and a
-  structured-output flag must never require:
+  structured-output flag or a genuinely-unprompted TAP stream, use
+  result_strategy = "exit_code" and leave result_output_path null. This is
+  the correct, safe choice for a custom or bespoke command (e.g. `make
+  test`, `./scripts/test.sh`) -- do NOT invent a result converter, and do
+  NOT wrap, replace, or second-guess the repository's own evidenced
+  command just to obtain structured output. The repository's normal test
+  invocation is authoritative; when in doubt, choose "exit_code" rather
+  than guess.
+- Whether proposing "junit", "tap", or "exit_code", you must NEVER add,
+  and a structured-output result must never require:
     * a speculative or unfamiliar runner flag you are not certain exists;
     * a third-party reporter/plugin flag that may need a package the
       repository has not itself declared;
@@ -339,6 +458,19 @@ Rules:
   "package.json defines scripts.test; package-lock.json establishes npm;
   the repository-owned entry point `npm test` is used as-is rather than
   reconstructing the tap invocation inside it."
+
+Before returning, verify that your JSON object contains every schema key:
+    setup_commands
+    test_command
+    result_strategy
+    result_output_path
+    runtime_family
+    runtime_version_hint
+    evidence
+    reasoning_summary
+    confidence
+confidence MUST be present and MUST be exactly one of: "high", "medium",
+"low". Do not omit it.
 """
 
 _FENCE_RE = re.compile(r"^```[a-zA-Z]*\n|\n```\s*$")
@@ -428,7 +560,13 @@ def _parse_response(raw: str) -> "tuple[dict | None, str | None]":
         return None, "reasoning_summary was not a string"
     reasoning_summary = reasoning_summary[:_MAX_REASONING_SUMMARY_CHARS]
     confidence = data.get("confidence")
-    if confidence not in VALID_CONFIDENCE_LEVELS:
+    # isinstance-guard BEFORE the membership check: an unhashable
+    # malformed value (e.g. a list/dict, not just an int or an
+    # unrecognized string) must normalize to "unknown" too, never raise --
+    # `x in <frozenset>` itself requires hashing x, so checking membership
+    # first would crash on exactly the malformed input this is supposed to
+    # tolerate.
+    if not isinstance(confidence, str) or confidence not in VALID_CONFIDENCE_LEVELS:
         confidence = "unknown"
 
     return {

@@ -4,9 +4,12 @@ result parser.
 JUnit XML is emitted by many ecosystems' test runners (pytest natively;
 jest via jest-junit; go test via go-junit-report; mvn/gradle natively;
 cargo via cargo2junit) -- one parser serves all of them, so this stays a
-small dispatch table rather than a plugin system. ``exit_code`` needs no
-parsing at all: the comparator reads ``TestExecutionResult.exit_code``
-directly (see existing_test_regression.py).
+small dispatch table rather than a plugin system. TAP (tap_parser.py) is
+likewise emitted by many unrelated producers (Node's built-in test
+runner, Perl's `prove`, Rust harnesses via a TAP flag, bespoke harnesses)
+-- it is a second RESULT FORMAT, not a Node-specific or ecosystem-specific
+addition. ``exit_code`` needs no parsing at all: the comparator reads
+``TestExecutionResult.exit_code`` directly (see existing_test_regression.py).
 
 Deterministic only. No LLM is ever consulted about whether output "looks
 like" a pass or a failure.
@@ -81,7 +84,12 @@ def parse_junit_xml(xml_text: "str | None") -> "ParsedTestCounts | None":
     return None
 
 
-_PARSERS = {"junit": parse_junit_xml}
+def _parse_tap(text: "str | None") -> "ParsedTestCounts | None":
+    from .tap_parser import parse_tap  # local import -- avoid a cycle at module load
+    return parse_tap(text)
+
+
+_PARSERS = {"junit": parse_junit_xml, "tap": _parse_tap}
 
 
 def parse_result(result_strategy: str, raw_text: "str | None") -> "ParsedTestCounts | None":

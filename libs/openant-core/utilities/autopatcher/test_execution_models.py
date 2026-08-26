@@ -33,7 +33,7 @@ from dataclasses import dataclass
 # a schema change.
 KNOWN_RUNTIME_FAMILIES = frozenset({"python", "node", "go", "rust", "jvm"})
 
-VALID_RESULT_STRATEGIES = frozenset({"junit", "exit_code"})
+VALID_RESULT_STRATEGIES = frozenset({"junit", "tap", "exit_code"})
 
 # "high"/"medium"/"low" are the only values the LLM is ever asked to
 # self-report (see test_plan_discovery._SYSTEM_PROMPT's schema block --
@@ -73,8 +73,11 @@ class TestExecutionPlan:
 
     setup_commands: "tuple[tuple[str, ...], ...]"
     test_command: "tuple[str, ...]"
-    result_strategy: str                    # "junit" | "exit_code"
-    result_output_path: "str | None"        # required iff result_strategy == "junit"
+    result_strategy: str                    # "junit" | "tap" | "exit_code"
+    result_output_path: "str | None"        # required iff result_strategy == "junit"; must be
+                                             # None for "tap" (read from captured stdout, not a
+                                             # file -- see result_parsers.parse_tap) and for
+                                             # "exit_code"
     runtime_family: "str | None"            # describes the EXECUTION ENVIRONMENT, never the test tool
     runtime_version_hint: "str | None"      # provenance only; never selects the image directly
     evidence: "tuple[str, ...]"             # repo-relative paths that justified this plan

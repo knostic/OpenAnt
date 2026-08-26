@@ -16,8 +16,13 @@ call (test_plan_discovery.py) -> an immutable, validated TestExecutionPlan
 (test_plan_validation.py) -> the SAME plan executed against an isolated,
 unpatched copy (baseline) and an isolated copy with the FINAL candidate
 patch applied (patched), via a generic executor (test_executors.py) ->
-deterministic JUnit/exit-code comparison. A baseline does not need to be
-green; a pre-existing failure is never attributed to the patch.
+deterministic JUnit/TAP/exit-code comparison. A baseline does not need to
+be green; a pre-existing failure is never attributed to the patch. JUnit
+and TAP are both normalized into the SAME per-test result shape
+(result_parsers.ParsedTestCounts) before reaching this module's own
+comparator (compare_runs) -- there is no separate TAP-specific comparison
+path, and no result-format-specific branch anywhere below
+_to_test_run_result.
 
 Scope (explicit product decision, matching the precedent set by
 source_verification.py's Evidence Sufficiency Gate): this module produces
@@ -229,6 +234,29 @@ def test_execution_error_result(reason: str,
     )
 
 
+# Structured (per-test) result strategies -> their raw text source and a
+# display label used only in the fallback/failure `reason` strings below.
+# "exit_code" is deliberately absent -- it has no structured source at
+# all, and is handled by the plain fallthrough branch after this one.
+_STRUCTURED_RESULT_LABELS = {"junit": "JUnit", "tap": "TAP"}
+
+
+def _structured_source_text(plan: TestExecutionPlan, raw: TestExecutionResult) -> "str | None":
+    """Where a structured-result strategy's raw text actually comes from.
+    JUnit reads the report file content the executor already extracted
+    into ``raw.result_output`` (from ``result_output_path``). TAP has no
+    separate report file -- test_plan_validation.py requires
+    ``result_output_path`` be null for it -- so it is read directly from
+    the test command's own normal captured stdout (see
+    test_plan_discovery.py's "TAP RESULT SOURCE" policy and
+    tap_parser.py's module docstring)."""
+    if plan.result_strategy == "junit":
+        return raw.result_output
+    if plan.result_strategy == "tap":
+        return raw.stdout
+    return None
+
+
 def _to_test_run_result(plan: TestExecutionPlan, raw: TestExecutionResult) -> TestRunResult:
     if raw.setup_failed:
         return TestRunResult(
@@ -247,8 +275,9 @@ def _to_test_run_result(plan: TestExecutionPlan, raw: TestExecutionResult) -> Te
             reason="test run did not complete within the time budget",
         )
 
-    if plan.result_strategy == "junit":
-        parsed = parse_result("junit", raw.result_output)
+    if plan.result_strategy in _STRUCTURED_RESULT_LABELS:
+        label = _STRUCTURED_RESULT_LABELS[plan.result_strategy]
+        parsed = parse_result(plan.result_strategy, _structured_source_text(plan, raw))
         if parsed is not None:
             total = parsed.passed + parsed.failed + parsed.skipped + parsed.errors
             if total > 0:
@@ -260,23 +289,27 @@ def _to_test_run_result(plan: TestExecutionPlan, raw: TestExecutionResult) -> Te
                     timed_out=False, evidence_level=("OK" if parsed.mode == "full" else "COUNTS_ONLY"),
                     reason=None,
                 )
-        # JUnit was declared but is unavailable/unparseable/empty -- fall
-        # back to exit-code-level evidence rather than discarding the run
-        # entirely; a real exit code is still real, if coarser, evidence.
+        # Structured output was declared but is unavailable/unparseable/
+        # empty (for TAP this also covers a parser that fails closed on
+        # malformed/truncated/ambiguous input -- see tap_parser.parse_tap)
+        # -- fall back to exit-code-level evidence rather than discarding
+        # the run entirely; a real exit code is still real, if coarser,
+        # evidence. The SAME fallback serves both junit and tap -- see the
+        # module docstring's "reuse the same comparator abstraction".
         if raw.exit_code is not None:
             return TestRunResult(
                 command=plan.test_command, status="COMPLETED", exit_code=raw.exit_code,
                 duration_seconds=raw.duration_seconds, passed=None, failed=None, skipped=None, errors=None,
                 failed_test_ids=None, stdout_excerpt=_excerpt(raw.stdout), stderr_excerpt=_excerpt(raw.stderr),
                 timed_out=False, evidence_level="EXIT_CODE_ONLY",
-                reason="JUnit output was declared but unavailable/unparseable; falling back to exit-code evidence",
+                reason=f"{label} output was declared but unavailable/unparseable; falling back to exit-code evidence",
             )
         return TestRunResult(
             command=plan.test_command, status="UNPARSEABLE", exit_code=raw.exit_code,
             duration_seconds=raw.duration_seconds, passed=None, failed=None, skipped=None, errors=None,
             failed_test_ids=None, stdout_excerpt=_excerpt(raw.stdout), stderr_excerpt=_excerpt(raw.stderr),
             timed_out=False, evidence_level="UNAVAILABLE",
-            reason="no usable JUnit or exit-code evidence was produced",
+            reason=f"no usable {label} or exit-code evidence was produced",
         )
 
     # result_strategy == "exit_code"

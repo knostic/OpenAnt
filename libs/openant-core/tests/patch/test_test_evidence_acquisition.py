@@ -29,10 +29,16 @@ class TestConfigFiles:
         names = [name for name, _ in bundle.present_config_files]
         assert "pyproject.toml" in names
 
-    def test_package_json_only_scripts_and_engines_extracted(self, tmp_path: Path):
+    def test_package_json_scripts_engines_and_dependencies_extracted(self, tmp_path: Path):
+        """Setup-command grounding (test_plan_discovery.py) needs to see
+        declared dependencies, not just scripts/engines -- see
+        _package_json_relevant_fields's docstring for the real minimist
+        run this fixes. `name`/`version` remain excluded -- they carry no
+        test-plan signal."""
         (tmp_path / "package.json").write_text(json.dumps({
             "name": "demo", "version": "1.0.0",
-            "dependencies": {"huge": "0.0.1", "pile": "0.0.1", "of": "0.0.1", "deps": "0.0.1"},
+            "dependencies": {"some-lib": "0.0.1"},
+            "devDependencies": {"tap": "~0.4.0"},
             "scripts": {"test": "jest"},
             "engines": {"node": ">=18"},
         }), encoding="utf-8")
@@ -40,7 +46,28 @@ class TestConfigFiles:
         content = dict(bundle.present_config_files)["package.json"]
         assert "jest" in content
         assert "engines" in content
-        assert "huge" not in content  # dependency list is not evidence content
+        assert "dependencies" in content and "some-lib" in content
+        assert "devDependencies" in content and "tap" in content
+        assert "demo" not in content  # name/version still excluded -- no test-plan signal
+
+    def test_package_manager_field_extracted(self, tmp_path: Path):
+        (tmp_path / "package.json").write_text(json.dumps({
+            "scripts": {"test": "jest"}, "packageManager": "yarn@3.2.0",
+        }), encoding="utf-8")
+        bundle = gather_test_plan_evidence(tmp_path)
+        content = dict(bundle.present_config_files)["package.json"]
+        assert "yarn@3.2.0" in content
+
+    def test_package_json_with_only_dependencies_still_produces_evidence(self, tmp_path: Path):
+        """Confirms dependencies/devDependencies are each independently
+        sufficient to produce evidence, not merely additive alongside
+        scripts/engines."""
+        (tmp_path / "package.json").write_text(json.dumps({
+            "devDependencies": {"tap": "~0.4.0"},
+        }), encoding="utf-8")
+        bundle = gather_test_plan_evidence(tmp_path)
+        names = [name for name, _ in bundle.present_config_files]
+        assert "package.json" in names
 
     def test_absent_files_not_listed(self, tmp_path: Path):
         bundle = gather_test_plan_evidence(tmp_path)

@@ -37,6 +37,12 @@ structurally unsafe:
     about to run. This is a simple substring consistency check, not a CLI
     parser for any specific runner's flag syntax -- see validate_plan's
     body for exactly what it checks.
+  - when result_strategy is "tap", result_output_path must be null --
+    unlike JUnit, TAP has no separate report file to cross-reference; the
+    structured result comes from the test command's own normal captured
+    stdout (see result_parsers.parse_tap), so there is no output-path
+    token for test_command to reference at all. "exit_code" carries the
+    identical null-output-path requirement, unchanged.
 
 Deliberately NOT re-checked here because the schema itself makes them
 impossible: no ``cwd``/``env`` fields exist on TestExecutionPlan at all;
@@ -148,9 +154,17 @@ def validate_plan(plan: TestExecutionPlan) -> PlanValidationResult:
                     "result_strategy is 'junit' but test_command does not reference "
                     f"result_output_path ({plan.result_output_path!r}) anywhere"
                 )
-        else:  # "exit_code"
+        else:  # "tap" or "exit_code" -- both are read from the test command's own
+            # captured stdout, never a result_output_path file (see
+            # result_parsers.parse_tap and TestExecutionResult.stdout).
+            # TAP is not a runner-specific reporting flag the way JUnit's
+            # --junitxml is -- there is no output-path token to cross-check
+            # against test_command here, only the same "no output path was
+            # declared" invariant exit_code already enforced.
             if plan.result_output_path:
-                return _invalid("result_strategy is 'exit_code' but result_output_path was set")
+                return _invalid(
+                    f"result_strategy is {plan.result_strategy!r} but result_output_path was set"
+                )
 
         if plan.runtime_family is not None and plan.runtime_family not in KNOWN_RUNTIME_FAMILIES:
             return _invalid(f"unrecognized runtime_family: {plan.runtime_family!r}")

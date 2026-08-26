@@ -48,6 +48,11 @@ _MAKE_PLAN = _plan(
     result_strategy="exit_code", result_output_path=None,
     runtime_family="python", evidence=("Makefile",),
 )
+_TAP_PLAN = _plan(
+    setup_commands=(("npm", "ci"),), test_command=("npm", "test"),
+    result_strategy="tap", result_output_path=None,
+    runtime_family="node", runtime_version_hint="20", evidence=("package.json",),
+)
 
 _JUNIT_OK = (
     '<?xml version="1.0"?>'
@@ -124,6 +129,7 @@ class TestGenericExecutorNoFrameworkBranching:
         (_plan(), "python:3.11-slim"),
         (_NODE_PLAN, "node:20-slim"),
         (_GO_PLAN, "golang:1.22-bookworm"),
+        (_TAP_PLAN, "node:20-slim"),
     ])
     def test_dockerfile_uses_the_approved_image_for_each_plan(self, tmp_path, plan, expected_image):
         image = executors_mod.APPROVED_IMAGES[plan.runtime_family]
@@ -131,7 +137,7 @@ class TestGenericExecutorNoFrameworkBranching:
         dockerfile = executors_mod._generate_dockerfile(plan, image)
         assert dockerfile.startswith(f"FROM {image}")
 
-    @pytest.mark.parametrize("plan", [_plan(), _NODE_PLAN, _GO_PLAN, _MAKE_PLAN])
+    @pytest.mark.parametrize("plan", [_plan(), _NODE_PLAN, _GO_PLAN, _MAKE_PLAN, _TAP_PLAN])
     def test_setup_commands_become_run_lines_regardless_of_content(self, plan):
         image = executors_mod.APPROVED_IMAGES[plan.runtime_family]
         dockerfile = executors_mod._generate_dockerfile(plan, image)
@@ -139,7 +145,7 @@ class TestGenericExecutorNoFrameworkBranching:
             import json
             assert f"RUN {json.dumps(list(cmd))}" in dockerfile
 
-    @pytest.mark.parametrize("plan", [_plan(), _NODE_PLAN, _GO_PLAN, _MAKE_PLAN])
+    @pytest.mark.parametrize("plan", [_plan(), _NODE_PLAN, _GO_PLAN, _MAKE_PLAN, _TAP_PLAN])
     def test_entrypoint_runs_the_exact_test_command(self, plan):
         script = executors_mod._generate_entrypoint_script(plan)
         for token in plan.test_command:
@@ -174,6 +180,39 @@ class TestGenericExecutorNoFrameworkBranching:
         exit_code_shape = exit_code_dockerfile.replace(json.dumps(list(exit_code_plan.test_command)), "<CMD>")
         assert junit_shape == exit_code_shape
 
+    def test_a_tap_plan_and_an_exit_code_plan_produce_identical_dockerfiles_and_entrypoints(self, tmp_path):
+        """Same generic guarantee as the junit/exit_code test above,
+        proving Problem 2 (TAP result-format support) added ZERO executor
+        branching: a "tap" plan and an "exit_code" plan with the IDENTICAL
+        setup_commands/test_command/runtime_family produce byte-identical
+        Dockerfiles and entrypoint scripts -- the executor never even
+        looks at result_strategy."""
+        image = executors_mod.APPROVED_IMAGES["node"]
+        exit_code_plan = _plan(
+            setup_commands=_TAP_PLAN.setup_commands, test_command=_TAP_PLAN.test_command,
+            result_strategy="exit_code", result_output_path=None,
+            runtime_family="node", runtime_version_hint="20", evidence=("package.json",),
+        )
+        assert executors_mod._generate_dockerfile(_TAP_PLAN, image) == executors_mod._generate_dockerfile(
+            exit_code_plan, image,
+        )
+        assert executors_mod._generate_entrypoint_script(_TAP_PLAN) == executors_mod._generate_entrypoint_script(
+            exit_code_plan,
+        )
+
+    def test_tap_plan_entrypoint_never_cats_a_result_file(self):
+        """result_output_path is null for "tap" (see
+        test_plan_validation.TestTapResultStrategy) -- the generated
+        entrypoint's `cat` guard is therefore never satisfied; the test
+        command's own normal stdout, unmodified, IS the TAP source (see
+        tap_parser.py)."""
+        script = executors_mod._generate_entrypoint_script(_TAP_PLAN)
+        # The `cat` line is templated in unconditionally (same generic
+        # script shape for every plan -- see test above), but its guard
+        # is `[ -n "" ] && [ -f "" ]`, which is always false for a null
+        # result_output_path -- it can never actually execute.
+        assert 'if [ -n "" ] && [ -f "" ]; then' in script
+
     def test_executor_module_source_contains_no_runner_specific_decision_logic(self):
         """Static guard against the executor ever growing framework-
         specific decision logic: no comparison/branch anywhere in the
@@ -193,7 +232,7 @@ class TestGenericExecutorNoFrameworkBranching:
         assert "--junitxml" not in source
 
         tree = ast.parse(source)
-        offending_literals = {"pytest", "--junitxml", "junitxml"}
+        offending_literals = {"pytest", "--junitxml", "junitxml", "tap", "result_strategy"}
         decision_node_types = (ast.Compare, ast.If, ast.IfExp)
         hits = []
         for node in ast.walk(tree):

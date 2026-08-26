@@ -71,4 +71,9 @@ class TestParseResultDispatch:
         assert parse_result("exit_code", "anything") is None
 
     def test_unknown_strategy_returns_none(self):
-        assert parse_result("tap", "1..1\nok 1") is None
+        assert parse_result("xunit", "1..1\nok 1") is None
+
+    def test_tap_dispatches_to_tap_parser(self):
+        result = parse_result("tap", "1..1\nok 1")
+        assert result is not None
+        assert result.passed == 1

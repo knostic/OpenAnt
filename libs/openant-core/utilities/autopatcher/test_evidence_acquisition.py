@@ -155,9 +155,26 @@ def _read_bounded(path: Path, limit: int) -> "str | None":
     return text
 
 
-def _package_json_scripts_and_engines(path: Path) -> "str | None":
-    """Extract only the `scripts`/`engines` keys -- never the full
-    manifest (dependency lists add no test-plan signal and can be large).
+def _package_json_relevant_fields(path: Path) -> "str | None":
+    """Extract only the keys relevant to deciding how this repository's
+    tests should be PREPARED and RUN -- never the full manifest.
+
+    `scripts`/`engines` answer "how do tests run." `dependencies`/
+    `devDependencies`/`packageManager` answer the equally necessary "what
+    does that entry point need already installed, and by which package
+    manager" -- setup-command grounding (see test_plan_discovery.py) is
+    impossible without them: a real minimist run accepted
+    ``setup_commands=[]`` for a `npm test` entry point that fails with
+    "tap: command not found" in a clean container, in part because this
+    function used to omit `devDependencies` entirely (the original
+    reasoning here was "dependency lists add no test-plan signal and can
+    be large" -- the first half was wrong; the second half is still
+    handled, unchanged, by the same _MAX_FILE_BYTES truncation every
+    other package.json field already goes through). `packageManager` is
+    a plain string (e.g. ``"yarn@3.2.0"``), extracted alongside the
+    dict-shaped keys as the one exception -- when present it is the
+    single strongest package-manager-choice signal available.
+
     Reads through the same raw-bytes bound as everything else; a
     package.json larger than that bound will fail to parse as JSON and
     simply contributes no evidence, rather than being read in full."""
@@ -170,7 +187,12 @@ def _package_json_scripts_and_engines(path: Path) -> "str | None":
         return None
     if not isinstance(data, dict):
         return None
-    relevant = {k: data[k] for k in ("scripts", "engines") if k in data and isinstance(data[k], dict)}
+    relevant = {
+        k: data[k] for k in ("scripts", "engines", "dependencies", "devDependencies")
+        if k in data and isinstance(data[k], dict)
+    }
+    if isinstance(data.get("packageManager"), str):
+        relevant["packageManager"] = data["packageManager"]
     if not relevant:
         return None
     return json.dumps(relevant, indent=2)[:_MAX_FILE_BYTES]
@@ -183,7 +205,7 @@ def _gather_config_files(root: Path) -> "tuple[tuple[str, str], ...]":
         if not p.is_file():
             continue
         if name == "package.json":
-            content = _package_json_scripts_and_engines(p)
+            content = _package_json_relevant_fields(p)
         else:
             content = _read_bounded(p, _MAX_FILE_BYTES)
         if content:

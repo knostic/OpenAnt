@@ -55,6 +55,10 @@ def _plan(**overrides) -> TestExecutionPlan:
 
 
 _EXIT_CODE_PLAN = _plan(test_command=("make", "test"), result_strategy="exit_code", result_output_path=None)
+_TAP_PLAN = _plan(
+    test_command=("node", "--test"), result_strategy="tap", result_output_path=None,
+    runtime_family="node", evidence=("package.json",),
+)
 
 
 def _junit(passed=0, failed_ids=(), errors=0, skipped=0):
@@ -74,6 +78,27 @@ def _junit(passed=0, failed_ids=(), errors=0, skipped=0):
         f'<testsuites><testsuite name="pytest" tests="{total}" '
         f'failures="{len(failed_ids)}" errors="{errors}" skipped="{skipped}">{body}</testsuite></testsuites>'
     )
+
+
+def _tap(passed=0, failed_ids=(), skipped=0):
+    """Build flat TAP text for `passed` anonymous passes plus one
+    "not ok - <id>" line per entry in `failed_ids` -- enough for
+    _to_test_run_result/compare_runs integration tests; the TAP parser's
+    own mechanics (nesting, directives, malformed/truncated input) are
+    covered exhaustively in test_tap_parser.py."""
+    lines = ["TAP version 13"]
+    n = 0
+    for _ in range(passed):
+        n += 1
+        lines.append(f"ok {n} - pass_{n}")
+    for tid in failed_ids:
+        n += 1
+        lines.append(f"not ok {n} - {tid}")
+    for _ in range(skipped):
+        n += 1
+        lines.append(f"ok {n} - skip_{n} # SKIP")
+    lines.append(f"1..{n}")
+    return "\n".join(lines) + "\n"
 
 
 def _exec_result(result_output=None, exit_code=0, timed_out=False, setup_failed=False,
@@ -229,6 +254,15 @@ class TestCompareRunsExitCodeOnly:
         assert run_result.evidence_level == "EXIT_CODE_ONLY"
         assert run_result.status == "COMPLETED"
 
+    def test_tap_declared_but_unparseable_falls_back_to_exit_code(self):
+        """Same conservative fallback as junit -- malformed/unparseable
+        TAP (tap_parser.parse_tap returning None) must still use
+        exit-code-only comparison rather than giving up entirely."""
+        raw = _exec_result(stdout="not TAP at all\n", exit_code=1)
+        run_result = etr._to_test_run_result(_TAP_PLAN, raw)
+        assert run_result.evidence_level == "EXIT_CODE_ONLY"
+        assert run_result.status == "COMPLETED"
+
 
 # ---------------------------------------------------------------------------
 # _to_test_run_result
@@ -267,6 +301,93 @@ class TestToTestRunResult:
         result = etr._to_test_run_result(_EXIT_CODE_PLAN, raw)
         assert result.status == "UNPARSEABLE"
         assert result.evidence_level == "UNAVAILABLE"
+
+
+class TestTapToTestRunResult:
+    """tap reads its structured result from the test command's own
+    captured stdout (never result_output_path -- see
+    test_plan_validation.py) and feeds the SAME normalized
+    ParsedTestCounts shape junit does into TestRunResult -- no separate
+    comparison path."""
+
+    def test_tap_full_parse_from_stdout(self):
+        raw = _exec_result(stdout=_tap(passed=5, failed_ids=["a"]), exit_code=1)
+        result = etr._to_test_run_result(_TAP_PLAN, raw)
+        assert result.evidence_level == "OK"
+        assert result.passed == 5
+        assert result.failed_test_ids == ["a"]
+
+    def test_tap_never_reads_result_output_path_field(self):
+        """Confirms the source really is raw.stdout, not
+        raw.result_output (which stays None for a tap plan -- see
+        test_plan_validation.TestTapResultStrategy)."""
+        raw = _exec_result(result_output=_junit(passed=99), stdout=_tap(passed=2), exit_code=0)
+        result = etr._to_test_run_result(_TAP_PLAN, raw)
+        assert result.passed == 2  # from stdout's TAP, not result_output's (irrelevant) JUnit
+
+    def test_tap_with_no_exit_code_and_unparseable_stdout_is_unparseable(self):
+        raw = TestExecutionResult(
+            ran=True, exit_code=None, timed_out=False, setup_failed=False, setup_error="",
+            stdout="not TAP at all\n", stderr="", result_output=None, duration_seconds=1.0, executor="docker",
+        )
+        result = etr._to_test_run_result(_TAP_PLAN, raw)
+        assert result.status == "UNPARSEABLE"
+        assert result.evidence_level == "UNAVAILABLE"
+
+    def test_tap_and_junit_use_the_same_comparator_no_separate_tap_path(self):
+        """Structural guard: existing_test_regression.py must not define
+        a second, TAP-specific comparison function -- compare_runs is the
+        only comparator, reused as-is."""
+        import inspect
+        source = inspect.getsource(etr)
+        assert "def compare_tap" not in source
+        assert source.count("def compare_runs") == 1
+
+
+class TestTapEndToEndComparison:
+    """The same baseline-vs-patched diff semantics JUnit already proves
+    (TestCompareRunsFullIdLevel above), sourced through TAP-shaped stdout
+    end to end via _to_test_run_result -- proving the SAME generic
+    compare_runs handles both formats identically."""
+
+    def _tap_run(self, stdout, exit_code=0):
+        raw = _exec_result(stdout=stdout, exit_code=exit_code)
+        return etr._to_test_run_result(_TAP_PLAN, raw)
+
+    def test_same_failure_both_sides_is_pre_existing_only(self):
+        baseline = self._tap_run(_tap(passed=2, failed_ids=["flaky"]), exit_code=1)
+        patched = self._tap_run(_tap(passed=2, failed_ids=["flaky"]), exit_code=1)
+        r = etr.compare_runs(_TAP_PLAN.test_command, baseline, patched)
+        assert r.status == etr.STATUS_PRE_EXISTING_FAILURES_ONLY
+        assert r.newly_failing_tests == []
+        assert r.pre_existing_failures == ["flaky"]
+
+    def test_failure_only_in_patched_is_new_failure(self):
+        baseline = self._tap_run(_tap(passed=3), exit_code=0)
+        patched = self._tap_run(_tap(passed=2, failed_ids=["new_break"]), exit_code=1)
+        r = etr.compare_runs(_TAP_PLAN.test_command, baseline, patched)
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.newly_failing_tests == ["new_break"]
+
+    def test_failure_only_in_baseline_is_newly_passing(self):
+        baseline = self._tap_run(_tap(passed=2, failed_ids=["old_break"]), exit_code=1)
+        patched = self._tap_run(_tap(passed=3), exit_code=0)
+        r = etr.compare_runs(_TAP_PLAN.test_command, baseline, patched)
+        assert r.status == etr.STATUS_PASS
+        assert r.newly_passing_tests == ["old_break"]
+
+    def test_both_exit_nonzero_but_tap_distinguishes_pre_existing_from_new(self):
+        """The exact minimist-shaped product scenario this feature
+        targets: both sides exit non-zero, but structured per-test TAP
+        evidence still lets the comparator tell a pre-existing failure
+        apart from a new one, rather than collapsing to NOT_VERIFIED the
+        way bare exit_code would (see TestCompareRunsExitCodeOnly)."""
+        baseline = self._tap_run(_tap(passed=5, failed_ids=["old"]), exit_code=1)
+        patched = self._tap_run(_tap(passed=4, failed_ids=["old", "new"]), exit_code=1)
+        r = etr.compare_runs(_TAP_PLAN.test_command, baseline, patched)
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.newly_failing_tests == ["new"]
+        assert r.pre_existing_failures == ["old"]
 
 
 # ---------------------------------------------------------------------------

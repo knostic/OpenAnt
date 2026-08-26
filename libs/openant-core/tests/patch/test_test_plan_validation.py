@@ -107,7 +107,7 @@ class TestMalformedPlansRejected:
         assert result.valid is False
 
     def test_unrecognized_result_strategy_rejected(self):
-        result = validate_plan(_plan(result_strategy="tap"))
+        result = validate_plan(_plan(result_strategy="xunit"))
         assert result.valid is False
 
 
@@ -222,6 +222,47 @@ class TestVersionHintSanitizedNotRejecting:
         result = validate_plan(_plan(runtime_version_hint="3.11"))
         assert result.valid is True
         assert result.plan.runtime_version_hint == "3.11"
+
+
+class TestTapResultStrategy:
+    """tap is a structured RESULT FORMAT, exactly like junit, but its
+    result comes from captured stdout rather than a result_output_path
+    file -- see test_plan_validation.py's module docstring and
+    tap_parser.py."""
+
+    def test_tap_with_null_output_path_is_valid(self):
+        result = validate_plan(_plan(
+            result_strategy="tap", result_output_path=None,
+            test_command=("npm", "test"), runtime_family="node", evidence=("package.json",),
+        ))
+        assert result.valid is True
+
+    def test_tap_with_an_output_path_set_is_rejected(self):
+        """Unlike junit, tap has no report file to point at -- setting
+        result_output_path for a "tap" plan is always a rejection, not a
+        consistency check against test_command's tokens."""
+        result = validate_plan(_plan(
+            result_strategy="tap", result_output_path="/tmp/result.tap",
+            test_command=("npm", "test"), runtime_family="node", evidence=("package.json",),
+        ))
+        assert result.valid is False
+        assert "tap" in result.reason and "result_output_path" in result.reason
+
+    def test_tap_does_not_require_test_command_to_reference_any_path(self):
+        """The junit consistency check (test_command must reference
+        result_output_path) does not apply to tap at all -- there is no
+        path to reference in the first place."""
+        result = validate_plan(_plan(
+            result_strategy="tap", result_output_path=None,
+            test_command=("node", "--test"), runtime_family="node", evidence=("package.json",),
+        ))
+        assert result.valid is True
+
+    def test_tap_result_strategy_is_recognized_by_the_enum(self):
+        from utilities.autopatcher.test_execution_models import VALID_RESULT_STRATEGIES
+        assert "tap" in VALID_RESULT_STRATEGIES
+        assert "junit" in VALID_RESULT_STRATEGIES
+        assert "exit_code" in VALID_RESULT_STRATEGIES
 
 
 class TestNeverRaises:
