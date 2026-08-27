@@ -115,6 +115,7 @@ from utilities.autopatcher.context_budget import (  # noqa: E402
     ContextBudgetController,
     DEFAULT_MAX_CONTEXT_BUDGET_WINDOWS,
 )
+from utilities.autopatcher.execution_recorder import ExecutionRecorder  # noqa: E402
 from utilities.autopatcher.llm_call_tracing import LLMCallCapture  # noqa: E402
 
 # Basenames the production pipeline writes under ./reports/debug/ when
@@ -149,7 +150,7 @@ _DEBUG_ARTIFACT_PREFIXES = (
 _REPLAY_SCHEMA_VERSION = 3
 
 
-def _replay_provenance(repo_root: "str | None") -> dict:
+def _replay_provenance(repo_root: "str | None", executions: "list[dict] | None" = None) -> dict:
     """Structured, versioned replay-provenance fields -- merged into BOTH
     the success and the failure manifest shapes, additive to every
     existing flat field (never replacing one). Computed once, after the
@@ -167,31 +168,27 @@ def _replay_provenance(repo_root: "str | None") -> dict:
 
     Additionally includes the unified full-run/replay manifest fields
     (utilities.autopatcher.lineage): "kind"="full_run", "parent"=null, and
-    an "executions" list -- HONESTLY EMPTY in this batch. Production
-    pipeline.run() is NOT yet instrumented to record real StageExecution
-    instances (see the architecture report's Batch B1 scope and
-    replay_engine.py's module docstring), so this function does not, and
-    must not, invent one execution per canonical stage merely because the
-    stage catalog exists -- that would fabricate a clean execution history
-    production never actually observed. This run's real LLM activity
-    remains fully captured exactly as before, in checkpoints.jsonl and the
-    flat trace/*.prompt.txt / *.response.txt files LLMCallTracer already
-    writes -- it is simply not yet attributed to canonical-stage execution
-    records. A replay engine resolving a dependency against a full run
-    written by THIS function will correctly see it as UNRESOLVED (no
-    matching execution anywhere) for every canonical stage -- never a
-    fabricated one.
+    an "executions" list.
 
-    BATCH B REQUIREMENT (not implemented here): once a LATER batch
-    instruments pipeline.run() itself to record real StageExecution
-    instances for the stages it actually executes (starting with
-    patch_repair_and_calibration and impact_and_behavior_analysis --
-    test_analysis_and_plan's FINAL contract depends on both), THIS
-    function's "executions" list should start reflecting them, so a full
-    run written after that migration lets a later test_analysis_and_plan
-    replay resolve those dependencies. Recording an execution for a stage
-    is independent of -- and can land before -- that stage gaining its own
-    replay handler; see replay_engine.py's module docstring.
+    Batch B2: `executions` is now REAL, HONEST, PARTIAL instrumentation --
+    the caller passes whatever
+    utilities.autopatcher.execution_recorder.ExecutionRecorder.executions
+    accumulated during this run (today: real StageExecution entries for
+    Stages 1-5's initial pass only -- repository_analysis_and_remediation_
+    planning, remediation_strategy, guided_context_acquisition, and the
+    INITIAL execution only of patch_generation_and_post_patch_investigation
+    and challenger; see pipeline.py's own recording call sites).
+    `executions=None` (no recorder was used -- every caller before this
+    batch, and any future caller that opts out) preserves the exact prior
+    behavior: a literal empty list, never fabricated. Stage 6 onward, and
+    the Challenger-driven repair loop's own regeneration/re-challenge, are
+    NOT instrumented in this batch and never appear here -- their absence
+    means "not yet instrumented," never "did not happen" (see lineage.py's
+    module docstring's HONESTY section: `executions` is a prefix, not a
+    complete stage list). A replay engine resolving a dependency on any
+    stage past S5 against a full run written by THIS function will
+    correctly see it as UNRESOLVED (no matching execution anywhere) --
+    never a fabricated one.
     """
     from utilities.autopatcher import llm_client as _llm
     from utilities.autopatcher import run_metadata as _rm
@@ -222,11 +219,11 @@ def _replay_provenance(repo_root: "str | None") -> dict:
         "target_repository": {"repo_root": repo_root, "repo_commit": repo_commit},
         "openant": {"patcher_commit": patcher_commit},
         "llm": {"provider": provider, "model": model},
-        # HONEST, not fabricated -- see the docstring above. A literal
-        # empty list, not a call into lineage.py, so it's obvious at a
-        # glance this function makes no claim about stage execution
-        # history yet.
-        "executions": [],
+        # HONEST, not fabricated -- see the docstring above. Whatever the
+        # caller's ExecutionRecorder actually observed (today: S1-S5's
+        # initial pass, when one was used), or a literal empty list when
+        # no recorder was used -- never synthesized here.
+        "executions": list(executions) if executions is not None else [],
     }
 
 
@@ -463,6 +460,13 @@ def main(argv: "list[str] | None" = None) -> int:
 
     from core.patch import TestComparisonEnvironmentError, run_patch, run_patch_cve
 
+    # Batch B2: constructed inside the `with LLMCallTracer` block below
+    # (needs `tracer.calls` -- the already-active, already-ordered call
+    # log -- to exist first); declared here, at None, purely so
+    # _failure_extra's closure can reference it even in the
+    # near-impossible case a failure occurs before it's actually built.
+    execution_recorder: "ExecutionRecorder | None" = None
+
     def _failure_extra(exc: Exception) -> dict:
         return {
             "status": "failed",
@@ -471,11 +475,27 @@ def main(argv: "list[str] | None" = None) -> int:
             "context_budget_policy": budget_controller.policy,
             "max_context_budget_windows": budget_controller.max_windows,
             "compare_existing_tests": args.compare_existing_tests,
-            **_replay_provenance(args.repo_root),
+            **_replay_provenance(
+                args.repo_root,
+                executions=execution_recorder.executions if execution_recorder is not None else None,
+            ),
         }
 
     try:
         with LLMCallTracer(trace_dir) as tracer:
+            # ExecutionRecorder is purely observational (see its module
+            # docstring): it opens no capture/monkeypatch of its own --
+            # `tracer.calls` is the SAME list object `tracer`'s already-
+            # active LLMCallCapture keeps appending to, in call order, for
+            # the whole traced run. `run_dir=output_dir` is the directory a
+            # future --source-run would point at for this run (the
+            # manifest itself lives one level deeper, under trace_dir --
+            # resolve_manifest_path already handles that nesting).
+            execution_recorder = ExecutionRecorder(
+                call_log=tracer.calls,
+                run_dir=output_dir,
+                artifacts_dir=trace_dir / "executions",
+            )
             try:
                 if cve:
                     result = run_patch_cve(
@@ -484,6 +504,7 @@ def main(argv: "list[str] | None" = None) -> int:
                         output_dir=output_dir,
                         budget_controller=budget_controller,
                         compare_existing_tests=args.compare_existing_tests,
+                        execution_recorder=execution_recorder,
                     )
                 else:
                     result = run_patch(
@@ -493,6 +514,7 @@ def main(argv: "list[str] | None" = None) -> int:
                         repo_root=args.repo_root,
                         budget_controller=budget_controller,
                         compare_existing_tests=args.compare_existing_tests,
+                        execution_recorder=execution_recorder,
                     )
             except TestComparisonEnvironmentError as exc:
                 # Expected, user-correctable prerequisite failure -- NOT
@@ -540,7 +562,7 @@ def main(argv: "list[str] | None" = None) -> int:
                     "compare_existing_tests": args.compare_existing_tests,
                     "vulnerability_path": result.vulnerability_path,
                     "trust_report_path": result.trust_report_path,
-                    **_replay_provenance(args.repo_root),
+                    **_replay_provenance(args.repo_root, executions=execution_recorder.executions),
                 },
                 debug_artifacts=_new_debug_artifacts(debug_dir, run_started),
             )

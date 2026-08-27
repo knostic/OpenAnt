@@ -28,6 +28,14 @@ from pathlib import Path as _Path
 from .evidence_fusion import RepositoryUnderstanding
 from .repository_grounding_models import RepositoryCandidate, RepositoryGroundingResult
 from .post_patch_evaluation import AnchorObservation, CoverageResult, render_post_patch_investigation
+from .execution_recorder import to_jsonable
+from .stage_registry import (
+    CHALLENGER as _S_CHALLENGER,
+    GUIDED_CONTEXT_ACQUISITION as _S_GUIDED_CONTEXT_ACQUISITION,
+    PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION as _S_PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
+    REMEDIATION_STRATEGY as _S_REMEDIATION_STRATEGY,
+    REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING as _S_REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING,
+)
 from .existing_test_regression import (
     ExistingTestComparisonResult,
     classify_existing_test_comparison_signal,
@@ -3892,6 +3900,7 @@ def run(
     investigation_output_dir: str | Path | None = None,
     budget_controller: "object | None" = None,
     compare_existing_tests: bool = False,
+    execution_recorder: "object | None" = None,
 ) -> str:
     """
     Execute the full patching pipeline.
@@ -3941,6 +3950,23 @@ def run(
         neither the LLM Test Plan Discovery call nor Docker, and leaves
         PipelineResult.existing_test_comparison as None, exactly as
         before this parameter existed.
+    execution_recorder:
+        Optional utilities.autopatcher.execution_recorder.ExecutionRecorder
+        (Batch B2) -- PURELY OBSERVATIONAL. When given, this function
+        records real StageExecution entries (see lineage.py) for the
+        canonical stages it currently instruments: Stage 1
+        (repository_analysis_and_remediation_planning), Stage 2
+        (remediation_strategy), Stage 3 (guided_context_acquisition), and
+        the INITIAL pass only of Stage 4
+        (patch_generation_and_post_patch_investigation) and Stage 5
+        (challenger). Recording then stops -- the Challenger-driven repair
+        loop (Stage 6 and everything after) is NOT instrumented in this
+        batch and runs completely unmodified/unrecorded, exactly as
+        before. `None` (every existing caller: openant/cli.py, every
+        library caller, every test) makes every recorder call inside this
+        function a guarded no-op -- this parameter changes nothing about
+        prompts, retries, gates, or the report for a normal run. Only
+        tools/run_traced.py constructs one today.
 
     Returns
     -------
@@ -3954,6 +3980,15 @@ def run(
     llm = LLMClient(api_key=api_key)
     mode = "MOCK" if llm.is_mock else "LIVE"
     print(f"[pipeline] LLM mode: {mode}", file=sys.stderr)
+
+    # Batch B2: begin recording ONE real StageExecution for canonical Stage 1
+    # (repository_analysis_and_remediation_planning) -- covers everything
+    # from here through the Remediation Planner's own verification bridge
+    # below (finished just before "# Final Strategy"). Purely observational
+    # -- see execution_recorder=None's docstring above; a no-op when None.
+    _s1_handle = None
+    if execution_recorder is not None:
+        _s1_handle = execution_recorder.start(_S_REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING)
 
     # Experiment H1: plan first, then repo code, then vulnerability pattern guidance.
     # Previously: repo code → vuln patterns → plan.
@@ -4085,6 +4120,33 @@ def run(
         except Exception as exc:
             print(f"[pipeline] Remediation planning unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
 
+    # Batch B2: finish S1's execution -- outcome reflects which of the three
+    # sub-paths above actually settled; the artifact carries the REAL
+    # structured output (never mere presence booleans) a future Stage-4
+    # replay would need: the Planner's own result, Repository Understanding,
+    # and the pre-patch anchors derived from it. Never the raw repository
+    # text/_grounding itself (that stays a run() local, not persisted here --
+    # not owned by this canonical stage's contract; see
+    # RepositoryGroundingResult/_repo_code, which are inputs to this stage,
+    # not its output).
+    _s1_rec = None
+    if execution_recorder is not None:
+        if _plan_result is not None:
+            _s1_outcome = "generated"
+        elif _plan_text:
+            _s1_outcome = "skipped_hand_authored_plan"
+        else:
+            _s1_outcome = "unavailable"
+        _s1_rec = execution_recorder.finish(
+            _s1_handle,
+            outcome=_s1_outcome,
+            artifact={
+                "plan_result": to_jsonable(_plan_result),
+                "repository_understanding": to_jsonable(_repository_understanding),
+                "pre_patch_anchors": to_jsonable(_pre_patch_anchors),
+            },
+        )
+
     # Final Strategy: a second, distinct Planner call (stage
     # "remediation_strategy") that runs only once verified Planner evidence
     # exists -- it receives materially new evidence (the verified structural
@@ -4094,6 +4156,15 @@ def run(
     # this itself. Best-effort: any failure here leaves the Target Discovery
     # Plan and Planner-Proposed Candidate Evidence exactly as already
     # gathered, and the pipeline continues without a Final Strategy section.
+    # Batch B2: begin recording S2 (remediation_strategy). consumed=[S1] --
+    # S2 is what actually reads S1's verified evidence (planner_evidence_ctx
+    # etc.), per stage_registry.STAGE_DEPENDENCIES.
+    _s2_handle = None
+    if execution_recorder is not None:
+        _s2_handle = execution_recorder.start(
+            _S_REMEDIATION_STRATEGY, consumed=[_s1_rec] if _s1_rec is not None else [],
+        )
+
     _strategy_ctx = ""
     _strategy_result = None  # read again below by the Final-Target Remediation Slice builder
     if _planner_evidence_ctx:
@@ -4125,6 +4196,24 @@ def run(
         except Exception as exc:
             print(f"[pipeline] Final remediation strategy unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
 
+    # Batch B2: finish S2. artifact is the real RemediationStrategyResult
+    # (rendered + target_files/target_symbols/warnings/extended_mechanism/
+    # required_edits/security_invariant) -- the actual structured output a
+    # future Stage-3/Stage-4 replay would need, not a summary.
+    _s2_rec = None
+    if execution_recorder is not None:
+        if _strategy_result is not None:
+            _s2_outcome = "generated"
+        elif not _planner_evidence_ctx:
+            _s2_outcome = "skipped_no_planner_evidence"
+        else:
+            _s2_outcome = "unavailable"
+        _s2_rec = execution_recorder.finish(
+            _s2_handle,
+            outcome=_s2_outcome,
+            artifact={"strategy_result": to_jsonable(_strategy_result)},
+        )
+
     # Final-Target Remediation Slice: deterministic, bounded exact source
     # built ONLY from generate_remediation_strategy()'s VERIFIED result --
     # never the earlier, exploratory Target Discovery candidates, so
@@ -4138,6 +4227,17 @@ def run(
     # them) skips the Patch Generator call itself, per the coverage
     # contract below -- this never fails the run and never introduces a
     # new recommendation category.
+    # Batch B2: begin recording S3 (guided_context_acquisition). consumed=
+    # [S1, S2] -- covers the Final-Target Slice, Edit Readiness Gate,
+    # deterministic + guided acquisition, and the target-file fallback,
+    # through the skip-patch-generation decision below.
+    _s3_handle = None
+    if execution_recorder is not None:
+        _s3_handle = execution_recorder.start(
+            _S_GUIDED_CONTEXT_ACQUISITION,
+            consumed=[r for r in (_s1_rec, _s2_rec) if r is not None],
+        )
+
     _slice_ctx = ""
     _coverage_warning_ctx = ""
     _skip_patch_generation = False
@@ -4441,6 +4541,28 @@ def run(
         except Exception as exc:
             print(f"[pipeline] Final-Target Remediation Slice unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
 
+    # Batch B2: finish S3. Per Final Correction 1: persist the REAL
+    # structured slice/readiness output Stage 4 actually consumes (`.rendered`
+    # source text included) -- Stage 4's own artifact must not become the
+    # only place this exists; never mere presence booleans.
+    _s3_rec = None
+    if execution_recorder is not None:
+        if _slice_result is not None:
+            _s3_outcome = "ready"
+        elif not (_strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols)):
+            _s3_outcome = "skipped_no_strategy_targets"
+        else:
+            _s3_outcome = "unavailable"
+        _s3_rec = execution_recorder.finish(
+            _s3_handle,
+            outcome=_s3_outcome,
+            artifact={
+                "slice_result": to_jsonable(_slice_result),
+                "edit_readiness": to_jsonable(_edit_readiness),
+                "skip_patch_generation": _skip_patch_generation,
+            },
+        )
+
     # Assemble final context, in order: hand-authored Patch Plan → original
     # Repository Grounding → vuln patterns → ordinary Repository
     # Understanding → Target Discovery Plan (exploratory) → Planner-Proposed
@@ -4456,6 +4578,25 @@ def run(
         if p and p.strip()
     ]
     code_context = "\n\n".join(_ctx_parts)
+
+    # Batch B2: begin recording S4's INITIAL execution only
+    # (patch_generation_and_post_patch_investigation) -- covers contract
+    # retry, hunk repair, Slice-4 conformance/recovery, hygiene,
+    # applicability (+ its own bounded retry), and Post-Patch Investigation,
+    # through where `patch`/the investigation triple settle just before the
+    # Challenger call. consumed=[S1, S2, S3] -- the real dependencies this
+    # stage's own context/conformance/recovery machinery reads (see
+    # stage_registry.STAGE_DEPENDENCIES). Deliberately NOT recorded again
+    # for the Challenger-driven repair loop's own regeneration further below
+    # -- that path is a materially narrower contract (no contract retry, no
+    # conformance gate, no applicability retry, no Post-Patch Investigation)
+    # and is NOT instrumented as a canonical Stage-4 execution in this batch.
+    _s4_handle = None
+    if execution_recorder is not None:
+        _s4_handle = execution_recorder.start(
+            _S_PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
+            consumed=[r for r in (_s1_rec, _s2_rec, _s3_rec) if r is not None],
+        )
 
     # _patch_validation_skip_reason distinguishes, for observability, WHY
     # patch/hunk-repair/hygiene/applicability validation is being skipped —
@@ -5065,6 +5206,43 @@ def run(
             _post_patch_ctx = ""
             _investigated_patch = None
 
+    # Batch B2: finish S4's INITIAL execution -- `patch` and the full
+    # investigation triple are settled at this exact point (before the
+    # Challenger call below, and well before the repair loop can replace
+    # `patch` further down -- see this stage's start() comment on why the
+    # repair-loop regeneration is deliberately NOT a second S4 execution
+    # yet). `canonical_contract_scope: "full"` records, honestly, that THIS
+    # execution ran every internal mechanic the canonical contract
+    # includes (contract retry, hunk repair, conformance/recovery,
+    # applicability retry, post-patch investigation) -- distinguishing it
+    # from the narrower repair-loop regeneration path, which does not, and
+    # is not recorded as an execution of this canonical stage in this batch.
+    _s4_rec = None
+    if execution_recorder is not None:
+        _s4_outcome = "no_candidate_patch" if _patch_validation_skip_reason is not None or not (patch and patch.strip()) else "settled"
+        _s4_rec = execution_recorder.finish(
+            _s4_handle,
+            outcome=_s4_outcome,
+            artifact={
+                "patch": patch,
+                "original_patch": original_patch,
+                "retry_patch": retry_patch,
+                "retry_attempted": retry_attempted,
+                "retry_succeeded": retry_succeeded,
+                "retry_failed_file": retry_failed_file,
+                "retry_error_before": retry_error_before,
+                "hygiene_findings": to_jsonable(hygiene_findings),
+                "applicability_result": to_jsonable(applicability_result),
+                "final_repair_meta": to_jsonable(_final_repair_meta),
+                "patch_target_conformance": to_jsonable(_patch_target_conformance),
+                "post_patch_recovery": to_jsonable(_post_patch_recovery),
+                "post_patch_observations": to_jsonable(_post_patch_observations),
+                "post_patch_coverage": to_jsonable(_post_patch_coverage),
+                "investigated_patch": _investigated_patch,
+            },
+            extra={"canonical_contract_scope": "full"},
+        )
+
     challenger_context = code_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else "")
 
     # No-candidate-patch early stop: once Patch Generation has definitively
@@ -5081,6 +5259,18 @@ def run(
     # confirmed_defect_count == 0 and empty classified-finding lists, and
     # both the repair loop's trigger and the calibration-input filter
     # already key off exactly those derived values.
+    #
+    # Batch B2: begin recording S5's INITIAL execution only (challenger).
+    # consumed=[S4] -- the ONLY real dependency (stage_registry.
+    # STAGE_DEPENDENCIES[CHALLENGER]). The repair loop's own re-challenge
+    # call further below is NOT recorded as a second S5 execution in this
+    # batch (see this stage's start() comment on S4 for why).
+    _s5_handle = None
+    if execution_recorder is not None:
+        _s5_handle = execution_recorder.start(
+            _S_CHALLENGER, consumed=[_s4_rec] if _s4_rec is not None else [],
+        )
+
     if patch and patch.strip():
         print("[pipeline] Step 2/4 – Challenging patch …", file=sys.stderr)
         challenger = challenge_patch(vulnerability_text, patch, llm, code_context=challenger_context)
@@ -5090,6 +5280,22 @@ def run(
             file=sys.stderr,
         )
         challenger = {}
+
+    # Batch B2: finish S5. Persist the raw Challenger output plus the
+    # deterministic classified result (_classify_challenger) -- the
+    # cleanest canonical Stage-5 output, matching what a future repair-loop
+    # migration's own S5#2 artifact would also carry.
+    _s5_rec = None
+    if execution_recorder is not None:
+        _s5_outcome = "settled" if patch and patch.strip() else "skipped_no_candidate_patch"
+        _s5_rec = execution_recorder.finish(
+            _s5_handle,
+            outcome=_s5_outcome,
+            artifact={
+                "challenger": to_jsonable(challenger),
+                "classified_challenger": to_jsonable(_classify_challenger(challenger)),
+            },
+        )
 
     # Phase C: Challenger-driven repair loop.
     #

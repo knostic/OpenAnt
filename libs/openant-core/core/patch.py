@@ -240,6 +240,7 @@ def _run_engine_and_write_artifacts(
     advisory_source: str | None = None,
     budget_controller: "object | None" = None,
     compare_existing_tests: bool = False,
+    execution_recorder: "object | None" = None,
 ) -> PatchStepResult:
     """Shared tail of run_patch()/run_patch_cve(): removes any stale trust
     report from a previous failed run, writes {artifact_label}-vulnerability.md,
@@ -277,6 +278,13 @@ def _run_engine_and_write_artifacts(
     instead of the intended two (the early whole-run gate, plus Existing
     Test Comparison's own later defense-in-depth preflight). By the time
     this function is reached, that gate has already passed.
+
+    execution_recorder is additive too (Batch B2): an optional
+    utilities.autopatcher.execution_recorder.ExecutionRecorder, threaded
+    unmodified into pipeline.run()'s execution_recorder parameter. Omitted
+    (None, every existing caller -- openant/cli.py's `patch` command) makes
+    every recorder call inside pipeline.run() a no-op; only
+    tools/run_traced.py constructs one.
 
     Raises:
         ConfigError: OpenAnt's config.json is malformed, or ``default_llm``
@@ -340,6 +348,7 @@ def _run_engine_and_write_artifacts(
         investigation_output_dir=investigation_dir,
         budget_controller=budget_controller,
         compare_existing_tests=compare_existing_tests,
+        execution_recorder=execution_recorder,
     )
 
     # The provider is already authoritatively resolved by this point --
@@ -408,6 +417,7 @@ def run_patch(
     repo_root: str | None = None,
     budget_controller: "object | None" = None,
     compare_existing_tests: bool = False,
+    execution_recorder: "object | None" = None,
 ) -> PatchStepResult:
     """Generate and evaluate a candidate remediation for one finding.
 
@@ -477,6 +487,7 @@ def run_patch(
         artifact_label=finding_id,
         budget_controller=budget_controller,
         compare_existing_tests=compare_existing_tests,
+        execution_recorder=execution_recorder,
     )
 
 
@@ -486,6 +497,7 @@ def run_patch_cve(
     output_dir: str,
     budget_controller: "object | None" = None,
     compare_existing_tests: bool = False,
+    execution_recorder: "object | None" = None,
 ) -> PatchStepResult:
     """Generate and evaluate a candidate remediation seeded from a public CVE
     advisory instead of an OpenAnt Finding.
@@ -555,4 +567,5 @@ def run_patch_cve(
         advisory_source="NVD",
         budget_controller=budget_controller,
         compare_existing_tests=compare_existing_tests,
+        execution_recorder=execution_recorder,
     )
