@@ -52,18 +52,18 @@ generalizing replay to more stages requires changing them.
 -----------------------------------------------------------------------
 "PERSISTED" != "REPLAYABLE" -- READ THIS BEFORE BATCH B
 -----------------------------------------------------------------------
-Whether a canonical stage's structured artifact can be RESOLVED (its
-manifest entry says status="produced") is entirely independent of whether
-that stage has an entry in REPLAY_HANDLERS. lineage.resolve_effective()
-only ever inspects a stage entry's status -- it has no knowledge of, and
-no import dependency on, this module at all. A future full run can
-therefore mark e.g. "patch_repair_and_calibration" status="produced"
-(once ITS production code is migrated to persist a real structured
-artifact) long before patch_repair_and_calibration itself gains a
-REPLAY_HANDLERS entry -- see
+Whether a canonical stage's structured artifact can be RESOLVED (a real
+StageExecution record exists for it in the lineage) is entirely
+independent of whether that stage has an entry in REPLAY_HANDLERS.
+lineage.resolve_effective() only ever looks for a matching execution
+record -- it has no knowledge of, and no import dependency on, this
+module at all. A future full run can therefore record a real
+"patch_repair_and_calibration" execution (once ITS production code is
+migrated to persist one) long before patch_repair_and_calibration itself
+gains a REPLAY_HANDLERS entry -- see
 tests/patch/test_lineage.py::test_produced_artifact_resolves_even_when_stage_has_no_replay_handler
-for the proof, and lineage.py's module docstring for the "not_persisted"
-vs. "produced" vs. "legacy" status story this depends on.
+for the proof, and lineage.py's module docstring for the full v3
+execution-record model this depends on.
 
 This is exactly what test_analysis_and_plan's FINAL contract will need:
 it depends on patch_repair_and_calibration and
@@ -116,9 +116,9 @@ REPLAY_HANDLERS[TEST_ANALYSIS_AND_PLAN].dependencies back to the full
 approved set -- at which point downstream stages (existing_test_comparison
 etc.) become correctly dependency-checked against it. Nothing else in this
 engine needs to change for that to happen; see lineage.py's module
-docstring for why "dependencies_checked" living in each artifact's own
-manifest entry, not read from the live registry, is what makes this
-transition safe.
+docstring for why "consumed" living in each execution's own manifest
+record, not read from the live registry, is what makes this transition
+safe.
 """
 
 from __future__ import annotations
@@ -164,17 +164,28 @@ class ReplayEngineError(RuntimeError):
 @dataclass(frozen=True)
 class RunFnResult:
     """What a stage's run_fn hands back to the engine. The engine, not the
-    run_fn, turns this into a manifest entry / writes run_manifest.json --
-    run_fn only writes its OWN artifact file(s)."""
+    run_fn, turns this into a StageExecution record / writes
+    run_manifest.json -- run_fn only writes its OWN artifact file(s).
+
+    `llm_calls`/`external_calls` are the real, ordered call records this
+    execution made (e.g. {"seq":..., "stage":..., "prompt_file":...,
+    "response_file":...}) -- attributed to THIS execution, not a bare
+    stage-name tag, which is what lets two executions of the same
+    canonical stage (once production instrumentation lands in a later
+    batch) keep their LLM history unambiguous even when their raw
+    `stage=` tags collide."""
 
     outcome: "Optional[str]"
     artifact_path: "Optional[Path]"
+    llm_calls: list = dataclasses.field(default_factory=list)
+    external_calls: list = dataclasses.field(default_factory=list)
     extra_stage_fields: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class ReplayResult:
     stage: str
+    execution_id: str
     outcome: "Optional[str]"
     manifest: dict
     output_dir: Path
@@ -232,11 +243,20 @@ def _run_test_analysis_and_plan(
     with LLMCallCapture() as capture:
         plan = discover_test_plan(repo_root, llm, rejection_reason=rejection_reason)
 
+    llm_call_records: "list[dict]" = []
     for call in capture.calls:
         seq = call["seq"]
         tag = call["stage"]
-        (output_dir / f"{seq:03d}_{tag}.prompt.txt").write_text(call["prompt"], encoding="utf-8")
-        (output_dir / f"{seq:03d}_{tag}.response.txt").write_text(call["response"] or "", encoding="utf-8")
+        prompt_path = output_dir / f"{seq:03d}_{tag}.prompt.txt"
+        response_path = output_dir / f"{seq:03d}_{tag}.response.txt"
+        prompt_path.write_text(call["prompt"], encoding="utf-8")
+        response_path.write_text(call["response"] or "", encoding="utf-8")
+        llm_call_records.append({
+            "seq": seq,
+            "stage": tag,
+            "prompt_file": prompt_path.name,
+            "response_file": response_path.name,
+        })
 
     _assert_llm_ownership(capture.calls, TEST_ANALYSIS_AND_PLAN)
 
@@ -253,11 +273,11 @@ def _run_test_analysis_and_plan(
     return RunFnResult(
         outcome=outcome,
         artifact_path=artifact_path,
+        llm_calls=llm_call_records,
         extra_stage_fields={
             "transitional": True,
             "sub_artifacts_produced": ["test_execution_plan"],
             "sub_artifacts_not_yet_produced": ["test_support", "suggested_tests"],
-            "llm_call_count": len(capture.calls),
         },
     )
 
@@ -448,12 +468,33 @@ def replay_stage(
     else:
         replay_model = _llm_module._cached_model.get(replay_provider) if replay_provider else None
 
-    consumed_dependencies = {dep: res.as_identity_dict() for dep, res in resolved_dependencies.items()}
-    stage_entry = lineage.produced_stage_entry(
-        artifact_path=run_result.artifact_path,
-        dependencies_checked=handler.dependencies,
-        consumed_dependencies=consumed_dependencies,
+    consumed = {dep: res.as_identity_dict() for dep, res in resolved_dependencies.items()}
+
+    # replay_of: does a prior execution of THIS SAME canonical stage exist
+    # anywhere in the source lineage? Purely a provenance pointer (not a
+    # data dependency, so it never participates in staleness checking) --
+    # set only when genuinely knowable, never fabricated. Today, every
+    # full run's lineage has no real StageExecution history yet (see
+    # lineage.py's module docstring), so this is null for a replay's FIRST
+    # hop and only becomes non-null once the same stage is replayed again
+    # from a lineage that already contains a real execution of it.
+    replay_of = lineage.find_latest_execution_identity(chain, stage_name)
+
+    # run_stage.py always creates exactly one new execution per invocation
+    # ("execute one stage and stop") into a freshly-validated, empty
+    # --output directory -- sequence is therefore always 1 within it.
+    execution_id = lineage.make_execution_id(1, stage_name)
+    execution_record = lineage.new_execution_record(
+        execution_id=execution_id,
+        canonical_stage=stage_name,
+        sequence=1,
+        invocation_kind=lineage.INVOCATION_KIND_REPLAY,
+        consumed=consumed,
         outcome=run_result.outcome,
+        replay_of=replay_of,
+        artifact_path=run_result.artifact_path,
+        llm_calls=run_result.llm_calls,
+        external_calls=run_result.external_calls,
         timing={
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
@@ -464,7 +505,6 @@ def replay_stage(
 
     replay_manifest = lineage.new_replay_manifest(
         parent=source_run,
-        replaces_stage=stage_name,
         target_repository={
             "repo_root": str(repo_root) if repo_root else provenance.repo_root,
             "repo_commit": provenance.repo_commit,
@@ -480,12 +520,13 @@ def replay_stage(
             "replay_provider": replay_provider,
             "replay_model": replay_model,
         },
-        stages={stage_name: stage_entry},
+        executions=[execution_record],
     )
     (output_dir / "run_manifest.json").write_text(json.dumps(replay_manifest, indent=2), encoding="utf-8")
 
     return ReplayResult(
         stage=stage_name,
+        execution_id=execution_id,
         outcome=run_result.outcome,
         manifest=replay_manifest,
         output_dir=output_dir,

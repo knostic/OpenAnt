@@ -1025,7 +1025,7 @@ class TestEndToEndRealRunTracedThenRunStage:
 
         source_trace = trace_output_dir / "trace"
         manifest = json.loads((source_trace / "run_manifest.json").read_text())
-        assert manifest["schema_version"] == 2  # sanity: this really is a NEW trace
+        assert manifest["schema_version"] == 3  # sanity: this really is a NEW trace
 
         # Now replay test_analysis_and_plan from that REAL trace (Batch A:
         # its transitional implementation exercises exactly the same
@@ -1043,10 +1043,14 @@ class TestEndToEndRealRunTracedThenRunStage:
         assert exit_code == 0
         replay_manifest = json.loads((replay_output_dir / "run_manifest.json").read_text())
         assert replay_manifest["kind"] == "replay"
-        assert replay_manifest["replaces_stage"] == "test_analysis_and_plan"
-        stage_entry = replay_manifest["stages"]["test_analysis_and_plan"]
-        assert stage_entry["outcome"] == "accepted"
-        assert stage_entry["transitional"] is True
+        assert "replaces_stage" not in replay_manifest
+        assert "stages" not in replay_manifest
+        matching = [e for e in replay_manifest["executions"] if e["canonical_stage"] == "test_analysis_and_plan"]
+        assert len(matching) == 1
+        execution = matching[0]
+        assert execution["invocation_kind"] == "replay"
+        assert execution["outcome"] == "accepted"
+        assert execution["transitional"] is True
         assert replay_manifest["target_repository"]["repo_commit"] == _head_sha(repo)
 
 

@@ -90,16 +90,26 @@ def _write_full_run_trace(
     repo_root: Path,
     llm_provider: str = "anthropic",
     llm_model: str = "claude-source-x",
+    executions: "list | None" = None,
 ) -> Path:
+    """A v3 full-run manifest -- honestly empty `executions` by default
+    (production pipeline.run() is not instrumented yet in Batch B1; see
+    lineage.py's module docstring), never synthesized placeholder rows."""
     trace_dir.mkdir(parents=True, exist_ok=True)
     manifest = lineage.new_full_run_manifest(
         target_repository={"repo_root": str(repo_root), "repo_commit": _head_sha(repo_root)},
         openant={"patcher_commit": "1234567890abcdef1234567890abcdef12345678"},
         llm={"provider": llm_provider, "model": llm_model},
-        stages=lineage.legacy_stage_entries(stage_registry.CANONICAL_STAGE_ORDER),
+        executions=executions or [],
     )
     (trace_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return trace_dir
+
+
+def _execution_for(manifest: dict, canonical_stage: str) -> dict:
+    matching = [e for e in manifest["executions"] if e["canonical_stage"] == canonical_stage]
+    assert len(matching) == 1, f"expected exactly one execution for {canonical_stage!r}, found {len(matching)}"
+    return matching[0]
 
 
 def _accepted_response_json(evidence=("pyproject.toml",)) -> str:
@@ -203,16 +213,21 @@ class TestTestAnalysisAndPlanReplay:
         result = replay_stage(source_run=source, stage_name="test_analysis_and_plan", output_dir=output_dir)
 
         assert result.outcome == "accepted"
+        assert result.execution_id == "001_test_analysis_and_plan"
         assert len(calls) == 1
         assert calls[0]["stage"] == "test_plan_discovery"  # the only tag this stage owns
         manifest = json.loads((output_dir / "run_manifest.json").read_text())
         assert manifest["kind"] == "replay"
-        assert manifest["replaces_stage"] == "test_analysis_and_plan"
-        entry = manifest["stages"]["test_analysis_and_plan"]
-        assert entry["status"] == "produced"
-        assert entry["transitional"] is True
-        assert entry["sub_artifacts_produced"] == ["test_execution_plan"]
-        assert "test_support" in entry["sub_artifacts_not_yet_produced"]
+        assert "replaces_stage" not in manifest
+        assert "stages" not in manifest
+        assert len(manifest["executions"]) == 1
+        execution = _execution_for(manifest, "test_analysis_and_plan")
+        assert execution["execution_id"] == "001_test_analysis_and_plan"
+        assert execution["invocation_kind"] == "replay"
+        assert execution["transitional"] is True
+        assert execution["sub_artifacts_produced"] == ["test_execution_plan"]
+        assert "test_support" in execution["sub_artifacts_not_yet_produced"]
+        assert execution["llm_calls"] and execution["llm_calls"][0]["stage"] == "test_plan_discovery"
         assert (output_dir / "test_execution_plan.json").is_file()
 
     def test_rejected_plan_via_engine(self, tmp_path, monkeypatch):
@@ -234,9 +249,72 @@ class TestTestAnalysisAndPlanReplay:
 
         result = replay_stage(source_run=source, stage_name="test_analysis_and_plan", output_dir=output_dir)
 
-        entry = result.manifest["stages"]["test_analysis_and_plan"]
-        assert entry["dependencies_checked"] == []
-        assert entry["consumed_dependencies"] == {}
+        execution = _execution_for(result.manifest, "test_analysis_and_plan")
+        assert execution["consumed"] == {}
+
+    def test_invocation_kind_is_replay(self, tmp_path, monkeypatch):
+        repo = _make_target_repo(tmp_path)
+        source = _write_full_run_trace(tmp_path / "run", repo_root=repo)
+        _install_fake_call_llm(monkeypatch, _accepted_response_json())
+
+        result = replay_stage(source_run=source, stage_name="test_analysis_and_plan", output_dir=tmp_path / "out")
+
+        execution = _execution_for(result.manifest, "test_analysis_and_plan")
+        assert execution["invocation_kind"] == "replay"
+
+    def test_replay_of_is_null_when_source_has_no_prior_execution(self, tmp_path, monkeypatch):
+        """The source full run predates real StageExecution persistence
+        (Batch B1 scope) -- replay_of must be honestly null, never
+        fabricated."""
+        repo = _make_target_repo(tmp_path)
+        source = _write_full_run_trace(tmp_path / "run", repo_root=repo)
+        _install_fake_call_llm(monkeypatch, _accepted_response_json())
+
+        result = replay_stage(source_run=source, stage_name="test_analysis_and_plan", output_dir=tmp_path / "out")
+
+        execution = _execution_for(result.manifest, "test_analysis_and_plan")
+        assert execution["replay_of"] is None
+
+    def test_replay_of_references_the_prior_execution_when_chaining(self, tmp_path, monkeypatch):
+        """Replaying the SAME canonical stage a second time, from a
+        lineage that already contains a real execution of it, must set
+        replay_of honestly -- this is genuinely knowable here."""
+        repo = _make_target_repo(tmp_path)
+        source = _write_full_run_trace(tmp_path / "run", repo_root=repo)
+        _install_fake_call_llm(monkeypatch, _accepted_response_json())
+        first = tmp_path / "replay-1"
+        first_result = replay_stage(source_run=source, stage_name="test_analysis_and_plan", output_dir=first)
+
+        _install_fake_call_llm(monkeypatch, _accepted_response_json())
+        second_result = replay_stage(source_run=first, stage_name="test_analysis_and_plan", output_dir=tmp_path / "replay-2")
+
+        execution = _execution_for(second_result.manifest, "test_analysis_and_plan")
+        assert execution["replay_of"] == {"run": str(first), "execution_id": first_result.execution_id}
+
+    def test_replay_produces_exactly_one_new_execution_record(self, tmp_path, monkeypatch):
+        repo = _make_target_repo(tmp_path)
+        source = _write_full_run_trace(tmp_path / "run", repo_root=repo)
+        _install_fake_call_llm(monkeypatch, _accepted_response_json())
+
+        result = replay_stage(source_run=source, stage_name="test_analysis_and_plan", output_dir=tmp_path / "out")
+
+        assert len(result.manifest["executions"]) == 1
+
+    def test_replay_produces_same_test_execution_plan_content_as_before(self, tmp_path, monkeypatch):
+        """Migrating to v3 must not change WHAT gets discovered -- only
+        how it's persisted."""
+        repo = _make_target_repo(tmp_path)
+        source = _write_full_run_trace(tmp_path / "run", repo_root=repo)
+        _install_fake_call_llm(monkeypatch, _accepted_response_json())
+        output_dir = tmp_path / "out"
+
+        replay_stage(source_run=source, stage_name="test_analysis_and_plan", output_dir=output_dir)
+
+        parsed = json.loads((output_dir / "test_execution_plan.json").read_text())
+        assert parsed["test_command"] == ["python", "-m", "pytest", "--junitxml=/tmp/openant-result.xml"]
+        assert parsed["result_strategy"] == "junit"
+        assert parsed["confidence"] == "high"
+        assert parsed["evidence"] == ["pyproject.toml"]
 
 
 class TestRepoIdentitySafety:
@@ -507,7 +585,7 @@ class TestSyntheticChaining:
         replay_downstream = tmp_path / "replay-downstream"
         result = replay_stage(source_run=replay_upstream, stage_name=self.DOWNSTREAM, output_dir=replay_downstream)
 
-        consumed = result.manifest["stages"][self.DOWNSTREAM]["consumed_dependencies"][self.UPSTREAM]
+        consumed = _execution_for(result.manifest, self.DOWNSTREAM)["consumed"][self.UPSTREAM]
         assert consumed["run"] == str(replay_upstream)
 
     def test_downstream_replay_from_original_is_stale_after_upstream_replayed_elsewhere(self, tmp_path):
@@ -549,5 +627,5 @@ class TestSyntheticChaining:
         # branch_a, never branch_b.
         downstream_from_a = tmp_path / "downstream-from-a"
         result = replay_stage(source_run=branch_a, stage_name=self.DOWNSTREAM, output_dir=downstream_from_a)
-        consumed = result.manifest["stages"][self.DOWNSTREAM]["consumed_dependencies"][self.UPSTREAM]
+        consumed = _execution_for(result.manifest, self.DOWNSTREAM)["consumed"][self.UPSTREAM]
         assert consumed["run"] == str(branch_a)

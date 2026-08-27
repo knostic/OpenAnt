@@ -138,6 +138,7 @@ def main(argv: "list[str] | None" = None) -> int:
 
     print(json.dumps({
         "stage": result.stage,
+        "execution_id": result.execution_id,
         "outcome": result.outcome,
         "output_dir": str(result.output_dir),
         "run_manifest": str(result.output_dir / "run_manifest.json"),

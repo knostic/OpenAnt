@@ -71,16 +71,18 @@ _REPLAY_MANIFEST_SCHEMA_VERSION = 1
 # no "schema_version" key at all is treated as legacy (bounded Run
 # Metadata fallback, never this set).
 #
-# Extended to include 2 alongside the pre-existing 1 when
+# Extended to include 2, then 3, alongside the pre-existing 1 as
 # utilities.autopatcher.lineage's unified full-run/replay manifest bumped
-# its OWN schema_version to 2 (Batch A cleanup) -- both versions carry
-# target_repository/openant/llm in the identical structured shape this
-# module has always read; lineage.py's newer schema_version=2 only adds
-# NEW top-level keys ("kind"/"parent"/"replaces_stage"/"stages") this
-# module has no need to know about. The two modules independently
-# interpret the SAME top-level "schema_version" field for two different,
-# non-conflicting questions -- see lineage.py's module docstring.
-_SUPPORTED_SOURCE_SCHEMA_VERSIONS = frozenset({1, 2})
+# its OWN schema_version (2 for the unified manifest, Batch A cleanup; 3
+# for the execution-based "executions" list replacing "stages", Batch B1)
+# -- all three versions carry target_repository/openant/llm in the
+# identical structured shape this module has always read; lineage.py's
+# newer schema_versions only add/change top-level keys ("kind"/"parent"/
+# "executions") this module has no need to know about. The two modules
+# independently interpret the SAME top-level "schema_version" field for
+# two different, non-conflicting questions -- see lineage.py's module
+# docstring.
+_SUPPORTED_SOURCE_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 
 
 class StageReplayError(RuntimeError):

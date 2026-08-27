@@ -49,8 +49,9 @@ from types import MappingProxyType
 
 # ---------------------------------------------------------------------------
 # Canonical stage names, in pipeline order. Stable identifiers -- used as
-# dict keys, CLI --stage values, and manifest "stages"/"replaces_stage"
-# keys. Never renamed casually; a rename is a schema-affecting change.
+# dict keys, CLI --stage values, and each manifest execution record's
+# "canonical_stage" value (see lineage.py). Never renamed casually; a
+# rename is a schema-affecting change.
 # ---------------------------------------------------------------------------
 
 REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING = "repository_analysis_and_remediation_planning"

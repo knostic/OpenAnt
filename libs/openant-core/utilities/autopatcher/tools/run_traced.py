@@ -116,8 +116,6 @@ from utilities.autopatcher.context_budget import (  # noqa: E402
     DEFAULT_MAX_CONTEXT_BUDGET_WINDOWS,
 )
 from utilities.autopatcher.llm_call_tracing import LLMCallCapture  # noqa: E402
-from utilities.autopatcher import lineage as _lineage  # noqa: E402
-from utilities.autopatcher.stage_registry import CANONICAL_STAGE_ORDER  # noqa: E402
 
 # Basenames the production pipeline writes under ./reports/debug/ when
 # AUTOPATCHER_DEBUG is set (see utilities/autopatcher/pipeline.py and
@@ -140,13 +138,15 @@ _DEBUG_ARTIFACT_PREFIXES = (
 # existing consumer of this exact version -- purely additive new top-level
 # manifest keys elsewhere never require a bump.
 #
-# Bumped 1 -> 2 for the unified full-run/replay manifest (utilities.
-# autopatcher.lineage.SCHEMA_VERSION -- kept as a literal here rather than
-# importing that constant directly, to avoid coupling this module's own
-# versioning story to lineage.py's internals; a dedicated test asserts the
-# two never drift apart). See lineage.py's module docstring for the full
-# three-tier schema_version story (legacy v1 / canonical v2 / unsupported).
-_REPLAY_SCHEMA_VERSION = 2
+# Bumped 1 -> 2 -> 3: 2 introduced the unified full-run/replay manifest;
+# 3 replaced its "stages": {name: entry} singleton map with an
+# execution-based "executions": [...] list (utilities.autopatcher.lineage.
+# SCHEMA_VERSION -- kept as a literal here rather than importing that
+# constant directly, to avoid coupling this module's own versioning story
+# to lineage.py's internals; a dedicated test asserts the two never drift
+# apart). See lineage.py's module docstring for the full schema_version
+# story (legacy v1 / v2-compat / canonical v3 / unsupported).
+_REPLAY_SCHEMA_VERSION = 3
 
 
 def _replay_provenance(repo_root: "str | None") -> dict:
@@ -166,34 +166,32 @@ def _replay_provenance(repo_root: "str | None") -> dict:
     touch it.
 
     Additionally includes the unified full-run/replay manifest fields
-    (utilities.autopatcher.lineage): "kind"="full_run", "parent"=null,
-    "replaces_stage"=null, and a "stages" map with EVERY canonical stage
-    present but marked status="not_persisted" -- production pipeline.run()
-    is NOT yet refactored onto the 13-stage registry (see the architecture
-    report's Batch A / Foundation scope), so this function does not, and
-    must not, claim any per-stage structured artifact was persisted for
-    this run beyond what genuinely exists (the flat prompt/response trace
-    files + checkpoints.jsonl already written by LLMCallTracer).
-    "not_persisted" is the HONEST status for this case -- this is a NEW
-    (v2) full run, not a legacy one; "legacy" is reserved for a v1-or-older
-    trace loaded via lineage.load_manifest()'s bounded compatibility path
-    (see lineage.py's module docstring for why the two must never be
-    confused). A replay engine resolving a dependency against a full run
-    written by THIS function will correctly see every stage as
-    "not_persisted" (no artifact_path, no dependencies_checked) -- never a
-    fabricated "produced" entry.
+    (utilities.autopatcher.lineage): "kind"="full_run", "parent"=null, and
+    an "executions" list -- HONESTLY EMPTY in this batch. Production
+    pipeline.run() is NOT yet instrumented to record real StageExecution
+    instances (see the architecture report's Batch B1 scope and
+    replay_engine.py's module docstring), so this function does not, and
+    must not, invent one execution per canonical stage merely because the
+    stage catalog exists -- that would fabricate a clean execution history
+    production never actually observed. This run's real LLM activity
+    remains fully captured exactly as before, in checkpoints.jsonl and the
+    flat trace/*.prompt.txt / *.response.txt files LLMCallTracer already
+    writes -- it is simply not yet attributed to canonical-stage execution
+    records. A replay engine resolving a dependency against a full run
+    written by THIS function will correctly see it as UNRESOLVED (no
+    matching execution anywhere) for every canonical stage -- never a
+    fabricated one.
 
-    BATCH B REQUIREMENT (not implemented here): as each canonical stage's
-    production code is migrated to persist a real structured artifact
-    (starting with patch_repair_and_calibration and
-    impact_and_behavior_analysis -- test_analysis_and_plan's FINAL
-    contract depends on both), THIS function must start writing
-    produced_stage_entry(...) for that stage instead of leaving it in the
-    not_persisted map below, so that a full run written after that
-    migration lets a later test_analysis_and_plan replay resolve those
-    dependencies. Persisting an artifact for a stage is independent of --
-    and can land before -- that stage gaining its own replay handler; see
-    replay_engine.py's module docstring.
+    BATCH B REQUIREMENT (not implemented here): once a LATER batch
+    instruments pipeline.run() itself to record real StageExecution
+    instances for the stages it actually executes (starting with
+    patch_repair_and_calibration and impact_and_behavior_analysis --
+    test_analysis_and_plan's FINAL contract depends on both), THIS
+    function's "executions" list should start reflecting them, so a full
+    run written after that migration lets a later test_analysis_and_plan
+    replay resolve those dependencies. Recording an execution for a stage
+    is independent of -- and can land before -- that stage gaining its own
+    replay handler; see replay_engine.py's module docstring.
     """
     from utilities.autopatcher import llm_client as _llm
     from utilities.autopatcher import run_metadata as _rm
@@ -221,11 +219,14 @@ def _replay_provenance(repo_root: "str | None") -> dict:
         "schema_version": _REPLAY_SCHEMA_VERSION,
         "kind": "full_run",
         "parent": None,
-        "replaces_stage": None,
         "target_repository": {"repo_root": repo_root, "repo_commit": repo_commit},
         "openant": {"patcher_commit": patcher_commit},
         "llm": {"provider": provider, "model": model},
-        "stages": _lineage.not_persisted_stage_entries(CANONICAL_STAGE_ORDER),
+        # HONEST, not fabricated -- see the docstring above. A literal
+        # empty list, not a call into lineage.py, so it's obvious at a
+        # glance this function makes no claim about stage execution
+        # history yet.
+        "executions": [],
     }
 
 
