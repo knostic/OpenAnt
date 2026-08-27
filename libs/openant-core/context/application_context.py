@@ -303,6 +303,8 @@ def gather_context_sources(repo_path: Path) -> dict[str, str]:
         Dictionary mapping filename to content.
     """
     sources = {}
+    skipped: list[str] = []
+    truncated: list[str] = []
 
     # Read priority files
     for filename in CONTEXT_FILES:
@@ -311,15 +313,46 @@ def gather_context_sources(repo_path: Path) -> dict[str, str]:
             # Guarded, and bounded at the syscall rather than after the fact: the
             # old form read the whole file and *then* truncated to 10 000 chars, so
             # a README symlinked to /dev/zero or a multi-GB file was fully resident
-            # before the cap ever applied.
-            content = read_repo_file(filepath, max_bytes=10_000)
+            # before the cap ever applied. ``oversize="truncate"`` is the intended
+            # semantics here (#217 — exploration reads take the bounded prefix,
+            # per read_repo_file's own caller guidance); the default "raise" made
+            # every doc above the ceiling vanish while the truncation handler
+            # below was dead code.
+            # Read one char PAST the cap: len > 10_000 is the only precise
+            # truncation signal (chars are what the model consumes; a
+            # byte-based stat check false-positives on multi-byte files
+            # whose whole char count fits, and a bare >= misfires at the
+            # exact boundary — confirm-round catches on both sides).
+            content = read_repo_file(filepath, max_bytes=10_001,
+                                     oversize="truncate")
             if content is None:
                 continue
-            if len(content) >= 10_000:
-                content = content + "\n\n[... truncated ...]"
+            if len(content) > 10_000:
+                content = content[:10_000] + "\n\n[... truncated ...]"
+                truncated.append(filename)
             sources[filename] = content
         except Exception as e:  # noqa: BLE001 - context gathering is best-effort
             print(f"Warning: Could not read {filename}: {e}", file=sys.stderr)
+            skipped.append(filename)
+
+    # #217: the degradation must be VISIBLE to the context generator (and so
+    # to the artifact) — the generator prices the gap into its confidence via
+    # its existing "based on how much information was available" instruction;
+    # no post-hoc arithmetic on the model's number.
+    if skipped:
+        # String-valued (the sources dict is dict[str, str] and every prompt
+        # builder does text assembly on its values — a list here crashed both
+        # builders the moment the bookkeeping first fired; 4-seat wave catch).
+        sources["[skipped_sources]"] = (
+            "Documentation files that could NOT be read and were excluded "
+            "from the sources below: " + ", ".join(skipped)
+        )
+    if truncated:
+        sources["[truncated_sources]"] = (
+            "Documentation files read only as a bounded 10 000-character "
+            "prefix (content may continue past the truncation marker): "
+            + ", ".join(truncated)
+        )
 
     # Get directory structure (top 2 levels)
     dir_structure = get_directory_structure(repo_path, max_depth=2)
