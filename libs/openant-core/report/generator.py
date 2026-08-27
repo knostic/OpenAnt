@@ -32,6 +32,7 @@ def _extract_usage(
     input_tokens: int,
     output_tokens: int,
     model: str,
+    usage_details: dict | None = None,
     pricing: dict[str, float] | None = None,
 ) -> dict:
     """Build the usage dict from token counts.
@@ -57,22 +58,34 @@ def _extract_usage(
         input_cost = (input_tokens / 1_000_000) * pricing["input"]
         output_cost = (output_tokens / 1_000_000) * pricing["output"]
         total_cost = input_cost + output_cost
-    return {
+    usage: dict = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
         "cost_usd": round(total_cost, 6),
     }
+    if usage_details is not None:
+        # #211 pass-through capture: verbatim, informational only.
+        usage["usage_details"] = usage_details
+    return usage
 
 
 def _merge_usage(usages: list[dict]) -> dict:
-    """Merge multiple usage dicts into one."""
+    """Merge multiple usage dicts into one.
+
+    #211 pass-through: per-completion ``usage_details`` (when any completion
+    captured provider detail fields) are carried VERBATIM as a list — same
+    shape the agentic loops record — never summed, never in cost.
+    """
     merged = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
     for u in usages:
         merged["input_tokens"] += u["input_tokens"]
         merged["output_tokens"] += u["output_tokens"]
         merged["total_tokens"] += u["total_tokens"]
         merged["cost_usd"] = round(merged["cost_usd"] + u["cost_usd"], 6)
+    details = [u.get("usage_details") for u in usages if u.get("usage_details") is not None]
+    if details:
+        merged["usage_details"] = details
     return merged
 
 
@@ -185,7 +198,9 @@ def generate_summary_report(
 
     Returns:
         (report_text, usage_dict) where usage_dict has input_tokens,
-        output_tokens, total_tokens, cost_usd.
+        output_tokens, total_tokens, cost_usd — plus a verbatim
+        ``usage_details`` key when the provider supplied usage detail
+        fields (#211 pass-through; never summed, never in cost).
     """
     from utilities.llm import Message, TextBlock
 
@@ -227,6 +242,7 @@ def generate_summary_report(
         result.output_tokens,
         binding.model,
         pricing=lookup_pricing(binding),
+        usage_details=result.usage_details,
     )
 
 
@@ -364,6 +380,7 @@ def generate_disclosure(
         result.output_tokens,
         binding.model,
         pricing=lookup_pricing(binding),
+        usage_details=result.usage_details,
     )
 
 

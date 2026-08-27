@@ -641,6 +641,57 @@ def _warn_unknown_output_item(kind: str) -> None:
         )
 
 
+def _extract_usage_details_chat(usage: Any) -> Optional[dict]:
+    """Pass-through capture (#211): chat-completions usage detail fields.
+
+    Copies ``completion_tokens_details.reasoning_tokens`` and
+    ``prompt_tokens_details.cached_tokens`` / ``cache_write_tokens``
+    VERBATIM when present; ``None`` when the provider reported none
+    (absent ≠ 0). NEVER feeds the cost formula: OpenAI documents
+    ``completion_tokens`` as already INCLUDING reasoning tokens, so
+    summing would double-count — the captured fields exist for
+    reconciliation against a provider bill, and OpenRouter (which
+    reuses this unifier) surfaces the same detail fields.
+    """
+    if usage is None:
+        return None
+    details: dict = {}
+    ctd = getattr(usage, "completion_tokens_details", None)
+    reasoning = getattr(ctd, "reasoning_tokens", None) if ctd is not None else None
+    if reasoning is not None:
+        details["reasoning_tokens"] = reasoning
+    ptd = getattr(usage, "prompt_tokens_details", None)
+    if ptd is not None:
+        for field_name in ("cached_tokens", "cache_write_tokens"):
+            value = getattr(ptd, field_name, None)
+            if value is not None:
+                details[field_name] = value
+    return details or None
+
+
+def _extract_usage_details_responses(usage: Any) -> Optional[dict]:
+    """Pass-through capture (#211): responses-API usage detail fields.
+
+    Same contract as :func:`_extract_usage_details_chat` but for the
+    Responses API field names (``output_tokens_details.reasoning_tokens``,
+    ``input_tokens_details.cached_tokens`` — field names verified against
+    the pinned openai SDK 2.37.0 ``ResponseUsage`` types). Verbatim,
+    present-only, never in the cost math.
+    """
+    if usage is None:
+        return None
+    details: dict = {}
+    otd = getattr(usage, "output_tokens_details", None)
+    reasoning = getattr(otd, "reasoning_tokens", None) if otd is not None else None
+    if reasoning is not None:
+        details["reasoning_tokens"] = reasoning
+    itd = getattr(usage, "input_tokens_details", None)
+    cached = getattr(itd, "cached_tokens", None) if itd is not None else None
+    if cached is not None:
+        details["cached_tokens"] = cached
+    return details or None
+
+
 def _responses_to_unified(response: Any) -> CompletionResult:
     """Translate an OpenAI ``Response`` (Responses API) into unified types.
 
@@ -736,6 +787,7 @@ def _responses_to_unified(response: Any) -> CompletionResult:
         content=content_blocks,
         input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
         output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+        usage_details=_extract_usage_details_responses(usage),
         stop_reason=stop_reason,
         raw=response,
     )
@@ -838,6 +890,7 @@ def _response_to_unified(
         content=content_blocks,
         input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
         output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+        usage_details=_extract_usage_details_chat(usage),
         # BUG-7: an UNKNOWN finish_reason defaults to "max_tokens", not "end_turn" —
         # the chat-path analog of _responses_to_unified's abnormal-status handling, so
         # a proxy/future-value truncation isn't laundered into a clean completion.

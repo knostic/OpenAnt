@@ -308,6 +308,28 @@ def _tool_to_anthropic(tool: ToolDef) -> dict[str, Any]:
     }
 
 
+def _extract_usage_details(usage: Any) -> Optional[dict]:
+    """Pass-through capture (#211): provider-supplied cache billing fields.
+
+    Copies ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
+    VERBATIM when the provider reported them; returns ``None`` when neither
+    is present (absent ≠ 0 — fabricated zeros would poison reconciliation
+    against a provider bill). These fields NEVER feed the cost formula:
+    ``TokenTracker`` stores them verbatim, unsummed. (Anthropic's
+    ``output_tokens`` includes thinking tokens; there is no separate
+    reasoning field to capture on this path.)
+    """
+    if usage is None:
+        return None
+    details: dict = {}
+    for field_name in ("cache_read_input_tokens",
+                       "cache_creation_input_tokens"):
+        value = getattr(usage, field_name, None)
+        if value is not None:
+            details[field_name] = value
+    return details or None
+
+
 def _response_to_unified(
     response: Any, *, adapter: str = "AnthropicAdapter"
 ) -> CompletionResult:
@@ -392,6 +414,7 @@ def _response_to_unified(
         content=content_blocks,
         input_tokens=getattr(usage, "input_tokens", 0),
         output_tokens=getattr(usage, "output_tokens", 0),
+        usage_details=_extract_usage_details(usage),
         # R2-C: an unknown/abnormal stop_reason defaults to "max_tokens" (not
         # "end_turn") — as the warning above notes, treating a refusal/abnormal
         # termination as end_turn masks false negatives. Known values (end_turn/
