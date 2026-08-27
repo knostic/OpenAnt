@@ -59,13 +59,20 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
         report.duration_seconds = round(time.monotonic() - start, 2)
 
         # Capture cost delta
-        end_cost, end_tokens = _snapshot_usage()
+        end_cost, end_snapshot = _snapshot_usage()
         report.cost_usd = round(end_cost - start_cost, 6)
         report.token_usage = {
-            "input_tokens": end_tokens.get("input", 0) - start_tokens.get("input", 0),
-            "output_tokens": end_tokens.get("output", 0) - start_tokens.get("output", 0),
-            "total_tokens": end_tokens.get("total", 0) - start_tokens.get("total", 0),
+            "input_tokens": end_snapshot.get("input", 0) - start_tokens.get("input", 0),
+            "output_tokens": end_snapshot.get("output", 0) - start_tokens.get("output", 0),
+            "total_tokens": end_snapshot.get("total", 0) - start_tokens.get("total", 0),
         }
+        # #216: a step whose cost is incomplete (any call on an unpriced
+        # model) must say so IN the artifact — OR the end snapshot's marker
+        # (run-cumulative, so a step after unpriced spend also flags).
+        if end_snapshot.get("cost_incomplete"):
+            report.token_usage["cost_incomplete"] = True
+            report.token_usage["unpriced_models"] = end_snapshot.get(
+                "unpriced_models", [])
 
         report.write(output_dir)
         print(
@@ -76,7 +83,8 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
 
 
 def _snapshot_usage() -> tuple[float, dict]:
-    """Return (cost_usd, {input, output, total}) from the global tracker.
+    """Return (cost_usd, {input, output, total, cost_incomplete,
+    unpriced_models}) from the global tracker.
 
     Returns zeroes if the tracker isn't available (e.g. for local-only steps).
     """
@@ -87,6 +95,9 @@ def _snapshot_usage() -> tuple[float, dict]:
             "input": usage.total_input_tokens,
             "output": usage.total_output_tokens,
             "total": usage.total_tokens,
+            "cost_incomplete": usage.cost_incomplete,
+            "unpriced_models": usage.unpriced_models,
         }
     except Exception:
-        return 0.0, {"input": 0, "output": 0, "total": 0}
+        return 0.0, {"input": 0, "output": 0, "total": 0,
+                     "cost_incomplete": False, "unpriced_models": []}

@@ -80,6 +80,9 @@ class TokenTracker:
             self.total_input_tokens = 0
             self.total_output_tokens = 0
             self.total_cost_usd = 0.0
+            # #216: models dispatched without a pricing record (their cost
+            # contributes $0 — the run's cost figure is incomplete).
+            self._unpriced_models: set[str] = set()
 
     @property
     def total_tokens(self) -> int:
@@ -119,6 +122,15 @@ class TokenTracker:
         if pricing is None:
             _warn_unknown_pricing(model)
             total_cost = 0.0
+            # #216: an unpriced-but-dispatched model must be LOUD in the
+            # artifacts, not just stderr — record it so get_totals exposes
+            # cost_incomplete + unpriced_models (flows to UsageInfo → step
+            # reports → scan.report.json).
+            with self._lock:
+                self._unpriced_models.add(model)
+            tl = self._thread_local
+            if hasattr(tl, "unit_unpriced"):
+                tl.unit_unpriced.add(model)
         else:
             input_cost = (input_tokens / 1_000_000) * pricing["input"]
             output_cost = (output_tokens / 1_000_000) * pricing["output"]
@@ -147,16 +159,22 @@ class TokenTracker:
 
         return call_record
 
-    def add_prior_usage(self, input_tokens: int, output_tokens: int, cost_usd: float):
+    def add_prior_usage(self, input_tokens: int, output_tokens: int, cost_usd: float,
+                        unpriced_models: list[str] | None = None):
         """Inject usage from a prior run (e.g. restored checkpoints).
 
         This ensures step reports capture the total cost across all runs,
-        not just the current run's API calls.
+        not just the current run's API calls. ``unpriced_models`` restores
+        the #216 incomplete-cost marker across a resume (the tracker resets
+        per process; without this, a resumed run's cost silently looks
+        complete again).
         """
         with self._lock:
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
             self.total_cost_usd += cost_usd
+            if unpriced_models:
+                self._unpriced_models.update(unpriced_models)
 
     def start_unit_tracking(self):
         """Start tracking usage for the current unit on this thread.
@@ -169,15 +187,23 @@ class TokenTracker:
         tl.unit_input = 0
         tl.unit_output = 0
         tl.unit_cost = 0.0
+        tl.unit_unpriced: set[str] = set()
 
     def get_unit_usage(self) -> dict:
         """Return usage accumulated since ``start_unit_tracking()`` on this thread."""
         tl = self._thread_local
-        return {
+        usage = {
             "input_tokens": getattr(tl, "unit_input", 0),
             "output_tokens": getattr(tl, "unit_output", 0),
             "cost_usd": round(getattr(tl, "unit_cost", 0.0), 6),
         }
+        # #216: the unit's own unpriced models — persisted into the unit's
+        # checkpoint record so a resume restores the incomplete-cost marker.
+        unpriced = getattr(tl, "unit_unpriced", set())
+        if unpriced:
+            usage["cost_incomplete"] = True
+            usage["unpriced_models"] = sorted(unpriced)
+        return usage
 
     def get_summary(self) -> dict:
         """
@@ -193,6 +219,10 @@ class TokenTracker:
                 "total_output_tokens": self.total_output_tokens,
                 "total_tokens": self.total_input_tokens + self.total_output_tokens,
                 "total_cost_usd": round(self.total_cost_usd, 6),
+                # #216: the cost figure is INCOMPLETE when any dispatched
+                # model had no pricing (its tokens counted, its dollars $0).
+                "cost_incomplete": bool(self._unpriced_models),
+                "unpriced_models": sorted(self._unpriced_models),
                 "calls": list(self.calls),
             }
 
@@ -210,6 +240,8 @@ class TokenTracker:
                 "total_output_tokens": self.total_output_tokens,
                 "total_tokens": self.total_input_tokens + self.total_output_tokens,
                 "total_cost_usd": round(self.total_cost_usd, 6),
+                "cost_incomplete": bool(self._unpriced_models),
+                "unpriced_models": sorted(self._unpriced_models),
             }
 
 
