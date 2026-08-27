@@ -498,6 +498,39 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-27"
+    },
+    {
+      "id": "qwen3.8:27b",
+      "provider": "ollama",
+      "status": "current",
+      "price": {
+        "input": 0.0,
+        "output": 0.0
+      },
+      "source": "verified on ollama.com/library/qwen3.8 (18GB, 256K ctx); local inference is free — $0 by definition, not an unverified vendor price",
+      "retrieved": "2026-08-27"
+    },
+    {
+      "id": "qwen3.5:9b",
+      "provider": "ollama",
+      "status": "current",
+      "price": {
+        "input": 0.0,
+        "output": 0.0
+      },
+      "source": "modest-hardware alternative; verified on ollama.com/library/qwen3.5 (6.6GB); local inference is free — $0 by definition",
+      "retrieved": "2026-08-27"
+    },
+    {
+      "id": "mistral-small3.2:latest",
+      "provider": "ollama",
+      "status": "current",
+      "price": {
+        "input": 0.0,
+        "output": 0.0
+      },
+      "source": "verified live end-to-end: planted-vuln scan, both CWE-89 findings detected (2026-08-25); local inference is free — $0 by definition",
+      "retrieved": "2026-08-27"
     }
   ]
 }

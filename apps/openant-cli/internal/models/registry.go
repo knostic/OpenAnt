@@ -62,6 +62,10 @@ var tierModel = map[string]map[string]string{
 	"anthropic": {"strong": "claude-opus-4-8", "light": "claude-sonnet-4-6"},
 	"openai":    {"strong": "gpt-4o", "light": "gpt-4o-mini"},
 	"google":    {"strong": "gemini-1.5-pro", "light": "gemini-2.0-flash"},
+	// Local models: free, so tier maps to capability, not cost. Qwen3.8
+	// (27B) is the current-gen local default; qwen3.8 ships 27b only —
+	// modest-hardware users can pick a smaller model per-phase.
+	"ollama": {"strong": "qwen3.8:27b", "light": "qwen3.8:27b"},
 }
 
 // FindConfig locates config/models.json by walking up from the executable path

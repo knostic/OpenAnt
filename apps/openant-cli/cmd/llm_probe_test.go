@@ -287,3 +287,57 @@ func TestProbeOpenAI_ReasoningModelsUseMaxCompletionTokens(t *testing.T) {
 		})
 	}
 }
+
+func TestProbeOllama_BlankKeyUsesPlaceholderAndDefaultsToLocalhost(t *testing.T) {
+	var gotPath, gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// A blank key must probe with the same placeholder the Python adapter
+	// sends (stock Ollama ignores it); a blank base_url must default to the
+	// local Ollama endpoint (overridden to the test server here), appending
+	// /chat/completions to the /v1 base — no double /v1.
+	orig := ollamaAPIBase
+	defer func() { ollamaAPIBase = orig }()
+	ollamaAPIBase = server.URL + "/v1"
+
+	if err := probeOllama("", "", "qwen3.8:27b"); err != nil {
+		t.Fatalf("expected nil error for 200, got: %v", err)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Errorf("path = %q, want '/v1/chat/completions'", gotPath)
+	}
+	if gotAuth != "Bearer ollama" {
+		t.Errorf("authorization = %q, want 'Bearer ollama' (placeholder)", gotAuth)
+	}
+
+	// A non-blank key (key-checking remote gateway) is forwarded verbatim.
+	if err := probeOllama("gateway-secret", server.URL+"/v1", "qwen3.8:27b"); err != nil {
+		t.Fatalf("expected nil error for 200, got: %v", err)
+	}
+	if gotAuth != "Bearer gateway-secret" {
+		t.Errorf("authorization = %q, want 'Bearer gateway-secret'", gotAuth)
+	}
+}
+
+func TestProbeOllama_UnpulledModel404GetsPullHint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"message":"model 'ghost' not found, try pulling it first"}}`))
+	}))
+	defer server.Close()
+
+	err := probeOllama("ollama", server.URL+"/v1", "ghost")
+	if err == nil {
+		t.Fatal("expected an error for 404, got nil")
+	}
+	if pe, ok := err.(*AnthropicProbeError); !ok || pe.Kind != "model_not_found" {
+		t.Fatalf("kind = %v, want model_not_found; err = %v", err, err)
+	} else if !strings.Contains(pe.Message, "ollama pull") {
+		t.Errorf("message = %q, want an `ollama pull` hint", pe.Message)
+	}
+}
