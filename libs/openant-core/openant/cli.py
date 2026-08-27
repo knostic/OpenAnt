@@ -1420,7 +1420,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan_p.add_argument("--no-skip-tests", action="store_true", help="Include test files in parsing (default: tests are skipped)")
     scan_p.add_argument("--library-mode", action="store_true",
                         help="Seed the exported public API as entry points (for libraries with no main/route/CLI entry point)")
-    scan_p.add_argument("--limit", type=int, help="Max units to analyze")
+    scan_p.add_argument("--limit", type=int, help="Max units to analyze and enhance (the LLM reachability pass still reviews the full codebase)")
     scan_p.add_argument(
         "--llm-config",
         default=None,

@@ -6,7 +6,7 @@ for both agentic and single-shot enhancement modes.
 
 Checkpoints are always enabled for agentic mode. Per-unit progress is saved
 to ``{output_dir}/enhance_checkpoints/`` so interrupted runs can resume
-automatically. On successful completion the checkpoint dir is removed.
+automatically. Checkpoints are preserved alongside results (see the scanner's enhance step).
 """
 
 import json
@@ -99,6 +99,18 @@ def enhance_dataset(
     print(f"[Enhance] Loading dataset: {dataset_path}", file=sys.stderr)
     dataset = read_json(dataset_path)
     units = dataset.get("units", [])
+    # #213: apply --limit to the INTENDED population, not the raw head. When
+    # diff-mode annotated the dataset (diff_selected markers), analyze's own
+    # order is filter-then-limit (analyzer.py:523-557); a raw head-slice here
+    # would slice ALPHABETICALLY first and silently drop diff-selected units
+    # outside the head — the run would enhance/analyze ~0 units and exit
+    # clean (a false-coverage regression glm-5.3 caught in review). Match
+    # analyze's population semantics EXACTLY, including its key-presence
+    # predicate (analyzer.py:523): a diff that selected ZERO units still
+    # counts as annotated — filtering to 0 beats spending the limit on
+    # unrelated units (sonnet confirm-round catch).
+    if any("diff_selected" in u for u in units if isinstance(u, dict)):
+        units = [u for u in units if isinstance(u, dict) and u.get("diff_selected")]
     if limit:
         units = units[:limit]
         dataset["units"] = units  # so the agentic/single-shot paths enhance only these

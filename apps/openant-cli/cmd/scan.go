@@ -75,7 +75,7 @@ func registerScanFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&scanEnhanceMode, "enhance-mode", "agentic", "Enhancement mode: agentic (thorough) or single-shot (fast)")
 	cmd.Flags().BoolVar(&scanNoReport, "no-report", false, "Skip report generation")
 	cmd.Flags().BoolVar(&scanSkipDynamicTest, "skip-dynamic-test", false, "Skip Docker-isolated dynamic testing (default: run dynamic tests)")
-	cmd.Flags().IntVar(&scanLimit, "limit", 0, "Max units to analyze (0 = no limit)")
+	cmd.Flags().IntVar(&scanLimit, "limit", 0, "Max units to analyze and enhance, 0 = no limit (the LLM reachability pass still reviews the full codebase)")
 	cmd.Flags().StringVar(&scanLLMConfig, "llm-config", "", "Name of the llm-config in ~/.config/openant/config.json (defaults to the file's default_llm, or the built-in 'openant-default' if no config file exists).")
 	cmd.Flags().IntVar(&scanWorkers, "workers", 8, "Number of parallel workers for LLM steps (default: 8)")
 	cmd.Flags().IntVar(&scanBackoff, "backoff", 30, "Seconds to wait when rate-limited (default: 30)")
