@@ -904,6 +904,9 @@ def _record_usage_in_tracker(usage: dict, binding):
                 input_tokens=usage["input_tokens"],
                 output_tokens=usage["output_tokens"],
                 pricing=lookup_pricing(binding),
+                # #211 pass-through capture: verbatim when the generator's
+                # usage dict carries it; never in the cost math.
+                usage_details=usage.get("usage_details"),
             )
     except Exception:
         pass  # Best effort — don't break report generation
