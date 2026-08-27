@@ -40,6 +40,24 @@ from utilities.llm.providers.bedrock import BedrockAdapter
 from utilities.rate_limiter import get_rate_limiter, reset_rate_limiter
 
 
+def test_no_region_maps_to_typed_auth_error(monkeypatch):
+    """anthropic>=1.0 removed the warned us-east-1 fallback: constructing
+    AnthropicBedrock with no resolvable region raises the SDK's bare
+    ValueError. The adapter must surface that as a typed, actionable
+    LLMAuthError — not crash adapter construction. Constructs the REAL
+    SDK class (no injected fake) so this path is exercised where the
+    mocked-client contract suite is structurally blind."""
+    for var in ("AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    # Point the AWS config file nowhere so a developer machine's own
+    # ~/.aws/config cannot silently satisfy the region lookup. (Do NOT
+    # set a bogus AWS_PROFILE: the SDK then raises botocore's
+    # ProfileNotFound, a different failure mode.)
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/nonexistent-openant-test-aws-config")
+    with pytest.raises(LLMAuthError, match="region"):
+        BedrockAdapter()
+
+
 @pytest.fixture(autouse=True)
 def _reset_state():
     reset_rate_limiter()
