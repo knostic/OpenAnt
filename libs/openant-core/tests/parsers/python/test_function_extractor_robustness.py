@@ -85,6 +85,29 @@ def test_post_parse_extraction_error_is_isolated():
     assert res["statistics"]["files_processed"] == 1
 
 
+def test_extract_all_crash_is_isolated_and_bucketed():
+    """extract_all's per-file guard, exercised deterministically. The fixture-based
+    extract_all test above is vacuous on platforms where _STACK_BLOWER parses
+    cleanly (ubuntu on 3.14+), so without this companion no test would cover
+    extract_all's crash-isolation path there. Mirrors the Ruby extractor's
+    injected-crash template."""
+    repo = _repo({"good.py": "def eps():\n    return 6\n", "boom.py": "def trigger_boom():\n    return 1\n"})
+    ex = FunctionExtractor(repo)
+    orig = ex.process_function
+
+    def boom(node, *a, **k):
+        if getattr(node, "name", "") == "trigger_boom":
+            raise RecursionError("simulated deep extraction recursion")
+        return orig(node, *a, **k)
+
+    ex.process_function = boom
+    res = ex.extract_all(["good.py", "boom.py"])
+    assert "good.py:eps" in res["functions"], "post-parse crash in one file aborted extract_all"
+    st = res["statistics"]
+    assert st["files_with_errors"] == 1, f"crash not recorded: {st}"
+    assert st["files_processed"] == 1, f"crashed file mislabeled as processed: {st}"
+
+
 def test_parse_stage_crash_is_isolated_and_bucketed():
     """A crash INSIDE ast.parse (RecursionError from deep nesting) must be isolated
     like a post-parse crash, recorded in files_with_errors, and never counted as
