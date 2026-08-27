@@ -99,6 +99,7 @@ class AgentResult:
         input_tokens: int = 0,
         output_tokens: int = 0,
         cost_usd: float = 0.0,
+        usage_details: Optional[list] = None,
     ):
         self.include_functions = include_functions
         self.usage_context = usage_context
@@ -113,6 +114,8 @@ class AgentResult:
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.cost_usd = cost_usd
+        # #211 pass-through capture: per-turn detail dicts, verbatim.
+        self.usage_details = usage_details
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -128,6 +131,9 @@ class AgentResult:
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
                 "cost_usd": self.cost_usd,
+                # #211: verbatim when captured; never summed, never in cost.
+                **({"usage_details": self.usage_details}
+                   if self.usage_details is not None else {}),
             },
             "reachability": {
                 "is_entry_point": self.is_entry_point,
@@ -239,6 +245,8 @@ class ContextAgent:
         iterations = 0
         total_input_tokens = 0
         total_output_tokens = 0
+        # #211 pass-through capture: per-turn usage detail dicts, verbatim.
+        per_turn_usage_details: list = []
 
         while iterations < MAX_ITERATIONS:
             iterations += 1
@@ -272,6 +280,7 @@ class ContextAgent:
 
             total_input_tokens += result.input_tokens
             total_output_tokens += result.output_tokens
+            per_turn_usage_details.append(result.usage_details)
 
             assistant_content = result.content
             stop_reason = result.stop_reason
@@ -296,6 +305,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return AgentResult(
                     include_functions=[],
@@ -311,6 +321,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
+                    usage_details=per_turn_usage_details,
                 )
 
             tool_results: list[ToolResultBlock] = []
@@ -366,6 +377,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return AgentResult(
                     include_functions=[],
@@ -381,6 +393,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
+                    usage_details=per_turn_usage_details,
                 )
 
             # If finish was called, return result
@@ -391,6 +404,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
 
                 return AgentResult(
@@ -407,6 +421,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
+                    usage_details=per_turn_usage_details,
                 )
 
             # Add assistant message and tool results to conversation.
@@ -429,6 +444,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return AgentResult(
                     include_functions=[],
@@ -444,6 +460,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
+                    usage_details=per_turn_usage_details,
                 )
 
         # Max iterations reached
@@ -456,6 +473,7 @@ class ContextAgent:
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
+            usage_details=per_turn_usage_details,
         )
 
         return AgentResult(
@@ -472,6 +490,7 @@ class ContextAgent:
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             cost_usd=call_record.get("cost_usd", 0.0),
+            usage_details=per_turn_usage_details,
         )
 
 

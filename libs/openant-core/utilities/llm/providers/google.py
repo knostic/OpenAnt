@@ -144,6 +144,26 @@ def reset_warnings() -> None:
         _warned_finish_reasons.clear()
 
 
+def _extract_usage_details(usage: Any) -> Optional[dict]:
+    """Pass-through capture (#211): Gemini usage detail fields.
+
+    Copies ``thoughts_token_count`` / ``cached_content_token_count``
+    VERBATIM when present; ``None`` otherwise (absent ≠ 0). Never feeds
+    the cost formula — note ``thoughts_token_count`` is ALREADY summed
+    into ``output_tokens`` above (Gemini bills candidates + thoughts as
+    output), so these captured fields are informational for bill
+    reconciliation, not additional billed tokens.
+    """
+    if usage is None:
+        return None
+    details: dict = {}
+    for field_name in ("thoughts_token_count", "cached_content_token_count"):
+        value = getattr(usage, field_name, None)
+        if value is not None:
+            details[field_name] = value
+    return details or None
+
+
 class GoogleAdapter:
     """:class:`LLMAdapter` implementation backed by ``google.genai.Client``."""
 
@@ -441,6 +461,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
             (getattr(usage, "candidates_token_count", 0) or 0)
             + (getattr(usage, "thoughts_token_count", 0) or 0)
         )
+    usage_details = _extract_usage_details(usage)
 
     # R4-2: a safety/blocked candidate finish reason is the more
     # specific signal — raise it regardless of whether the candidate
@@ -515,6 +536,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
         content=content_blocks,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        usage_details=usage_details,
         stop_reason=stop_reason,
         raw=response,
     )

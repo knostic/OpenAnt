@@ -87,6 +87,9 @@ def simple_text(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         pricing=lookup_pricing(binding),
+        # #211 pass-through capture: provider detail fields verbatim
+        # (never in the cost math — see TokenTracker.record_call).
+        usage_details=result.usage_details,
     )
 
     return "\n".join(
