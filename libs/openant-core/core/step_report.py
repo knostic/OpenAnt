@@ -29,7 +29,11 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
     - timestamp (UTC ISO 8601)
     - duration (wall-clock seconds)
     - cost / token usage (from ``core.tracking`` if available)
-    - errors (any exception that propagates)
+    - errors (any exception that propagates, or any error appended to
+      ``report.errors`` inside the block — in which case the step's status
+      is derived as ``"error"`` at exit rather than left at ``"success"``.
+      Errors also win over an explicitly-set ``"skipped"``: a step that
+      both marks itself skipped and records errors reports ``"error"``.)
 
     The caller should set ``ctx.summary`` and ``ctx.outputs`` inside the
     ``with`` block. On exit the report is written to ``{output_dir}/{step}.report.json``.
@@ -56,6 +60,19 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
         traceback.print_exc(file=sys.stderr)
         raise
     finally:
+        # Issue #209: a step that records errors via ``ctx.errors.append(...)``
+        # (exception caught BY DESIGN — e.g. the report phase's summary and
+        # disclosure handlers in ``core/scanner.py``) must not report success.
+        # Derive the status from the errors list at exit: non-empty errors
+        # means "error", idempotently with the propagating-exception path
+        # above. Errors also WIN over an explicitly-set ``"skipped"`` (a
+        # skipped step that recorded errors is more error than skipped — no
+        # current call site produces that combination; locked by test). The
+        # scanner's degrade idiom (status="skipped" with the reason in
+        # ``summary``, no errors) is unaffected.
+        if report.errors and report.status != "error":
+            report.status = "error"
+
         report.duration_seconds = round(time.monotonic() - start, 2)
 
         # Capture cost delta
