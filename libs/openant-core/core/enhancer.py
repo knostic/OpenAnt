@@ -63,7 +63,10 @@ def enhance_dataset(
     """
     # #214: snapshot cumulative usage at phase start so the "Enhance" summary
     # below reports this phase's delta, not the prior phases' total.
-    _phase_baseline = tracking.get_usage()
+    # #281: MUTABLE holder — the enhance path's checkpoint-restore injects
+    # prior usage into the tracker AFTER this snapshot; the injection site
+    # refreshes the holder (see verifier's identical shape).
+    _phase_baseline = {"usage": tracking.get_usage()}
     # Configure global rate limiter
     configure_rate_limiter(backoff_seconds=float(backoff_seconds))
 
@@ -133,8 +136,13 @@ def enhance_dataset(
             progress_callback=_on_unit_done,
             restored_callback=_on_restored,
             workers=workers,
+            phase_baseline=_phase_baseline,
         )
     elif mode == "single-shot":
+        # NOTE: single-shot enhance performs NO add_prior_usage injection
+        # (no checkpoint restore on this path) — its baseline was already
+        # correct pre-#281; no holder threading needed (wave catch: threading
+        # it anyway was dead code).
         enhanced = enhancer.enhance_dataset(
             dataset,
             progress_callback=_on_unit_done,
@@ -178,7 +186,7 @@ def enhance_dataset(
     if error_count:
         print(f"[Enhance] Errors: {error_count} ({error_summary})", file=sys.stderr)
 
-    tracking.log_usage("Enhance", _phase_baseline)
+    tracking.log_usage("Enhance", _phase_baseline["usage"])
 
     usage = tracking.get_usage()
 

@@ -77,7 +77,12 @@ def run_verification(
     """
     # #214: snapshot cumulative usage at phase start so the "Stage 2" summary
     # below reports this phase's delta, not every prior phase's total.
-    _phase_baseline = tracking.get_usage()
+    # #281: MUTABLE holder — verify_batch's checkpoint-restore injects the
+    # prior session's usage into the tracker AFTER this snapshot; the
+    # injection site refreshes the holder so the delta below counts only
+    # the CURRENT session's calls (calls exclude restored units, so
+    # tokens/cost must too — the internally-consistent line #214 promised).
+    _phase_baseline = {"usage": tracking.get_usage()}
     os.makedirs(output_dir, exist_ok=True)
 
     # Configure global rate limiter
@@ -212,6 +217,7 @@ def run_verification(
             workers=workers,
             checkpoint=checkpoint,
             restored_callback=_on_restored,
+            phase_baseline=_phase_baseline,
         )
     except Exception as e:
         print(f"[Verify] ERROR during batch verification: {e}", file=sys.stderr)
@@ -236,7 +242,7 @@ def run_verification(
     # Checkpoints are preserved as a permanent artifact alongside results
     # (final summary with phase="done" is written inside verify_batch).
 
-    tracking.log_usage("Stage 2", _phase_baseline)
+    tracking.log_usage("Stage 2", _phase_baseline["usage"])
 
     # Merge verified results back into the full result set
     verified_ids = {r.get("unit_id") or r.get("route_key") for r in verified_results}
