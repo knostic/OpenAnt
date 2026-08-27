@@ -31,9 +31,12 @@ from .post_patch_evaluation import AnchorObservation, CoverageResult, render_pos
 from .execution_recorder import to_jsonable
 from .stage_registry import (
     CHALLENGER as _S_CHALLENGER,
+    CONFIDENCE_SCORING as _S_CONFIDENCE_SCORING,
     GUIDED_CONTEXT_ACQUISITION as _S_GUIDED_CONTEXT_ACQUISITION,
+    IMPACT_AND_BEHAVIOR_ANALYSIS as _S_IMPACT_AND_BEHAVIOR_ANALYSIS,
     PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION as _S_PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
     PATCH_REPAIR_AND_CALIBRATION as _S_PATCH_REPAIR_AND_CALIBRATION,
+    PATCH_REVIEW as _S_PATCH_REVIEW,
     REMEDIATION_STRATEGY as _S_REMEDIATION_STRATEGY,
     REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING as _S_REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING,
 )
@@ -5701,13 +5704,34 @@ def run(
     # calibration` is already its final value by the time execution reaches
     # here.)
 
+    # Batch B4: begin recording S7 (patch_review). consumed=[S6] (stage_
+    # registry.STAGE_DEPENDENCIES[PATCH_REVIEW]).
+    _s7_handle = None
+    if execution_recorder is not None:
+        _s7_handle = execution_recorder.start(
+            _S_PATCH_REVIEW, consumed=[_s6_rec] if _s6_rec is not None else [],
+        )
+    _s8_handle = None  # opened right after S7 finishes, in each branch below
+
     # No-candidate-patch early stop (continued -- see the Challenger gate
     # above): the Patch Reviewer and Confidence Scorer are equally
     # patch-dependent and must not fabricate a review/score for a diff
     # that does not exist.
+    _s7_rec = None
     if patch and patch.strip():
         print("[pipeline] Step 3/4 – Reviewing patch …", file=sys.stderr)
         review = review_patch(vulnerability_text, patch, llm)
+        if execution_recorder is not None:
+            _s7_rec = execution_recorder.finish(_s7_handle, outcome="settled", artifact={"review": review})
+            # Batch B4: begin recording S8 (confidence_scoring), right after
+            # S7's own LLM call settles and before score_confidence()'s --
+            # consumed=[S6, S7] (stage_registry.STAGE_DEPENDENCIES[
+            # CONFIDENCE_SCORING]). Must start here, not earlier, so
+            # review_patch()'s "patch_review"-tagged call is never inside
+            # S8's own cursor window (STAGE_OWNED_LLM_TAGS would reject it).
+            _s8_handle = execution_recorder.start(
+                _S_CONFIDENCE_SCORING, consumed=[r for r in (_s6_rec, _s7_rec) if r is not None],
+            )
 
         print("[pipeline] Step 4/4 – Evaluating Trust Signals…", file=sys.stderr)
         score_text = score_confidence(
@@ -5725,6 +5749,11 @@ def run(
         )
         review = ""
         score_text = ""
+        if execution_recorder is not None:
+            _s7_rec = execution_recorder.finish(_s7_handle, outcome="skipped_no_candidate_patch", artifact={"review": review})
+            _s8_handle = execution_recorder.start(
+                _S_CONFIDENCE_SCORING, consumed=[r for r in (_s6_rec, _s7_rec) if r is not None],
+            )
 
     # Adjust the numeric score based on adversarial challenger results
     orig_score_str = _extract_score(score_text)
@@ -5773,6 +5802,32 @@ def run(
 
         # Prepend adjustment summary to the original scorer output for context
         score_text = adjustment_text + score_text
+
+    # Batch B4: finish S8. The deterministic score-adjustment above is part
+    # of Confidence Scoring's own settled output (it post-processes only
+    # THIS call's own score_text + challenger, already an S6-consumed
+    # value) -- no new LLM call, so it stays inside this same execution.
+    _s8_rec = None
+    if execution_recorder is not None:
+        _s8_outcome = "settled" if (patch and patch.strip()) else "skipped_no_candidate_patch"
+        _s8_rec = execution_recorder.finish(
+            _s8_handle, outcome=_s8_outcome,
+            artifact={"score_text": score_text, "orig_score": orig_score, "adjusted_score": adjusted_score},
+        )
+
+    # Batch B4: begin recording S9 (impact_and_behavior_analysis).
+    # consumed=[S6] (stage_registry.STAGE_DEPENDENCIES[
+    # IMPACT_AND_BEHAVIOR_ANALYSIS] -- NOT PATCH_REVIEW/CONFIDENCE_SCORING,
+    # matching the actual dataflow: both analyzers below read only
+    # `patch`/`challenger`, both S6-settled values). Owns zero LLM tags
+    # (STAGE_OWNED_LLM_TAGS[IMPACT_AND_BEHAVIOR_ANALYSIS] == ()) -- both
+    # analyzers are purely deterministic.
+    _s9_handle = None
+    if execution_recorder is not None:
+        _s9_handle = execution_recorder.start(
+            _S_IMPACT_AND_BEHAVIOR_ANALYSIS, consumed=[_s6_rec] if _s6_rec is not None else [],
+        )
+
     # Run Impact Surface analysis (lightweight, deterministic).
     # Repository-dependent: skipped entirely when no repo_root is known
     # (F-01) instead of substituting Path.cwd(). impact_dict stays None,
@@ -5809,6 +5864,21 @@ def run(
         behavior = BehaviorAnalyzer().analyze(patch)
     except Exception:
         behavior = None
+
+    # Batch B4: finish S9. Always "settled" -- both analyzers are
+    # best-effort (their own try/except already degrades to None on
+    # failure, same as every other optional section in this function) and
+    # this stage's real contract is "ran its deterministic analysis,"
+    # never gated on repo_root/candidate-patch the way S7/S8 are.
+    if execution_recorder is not None:
+        execution_recorder.finish(
+            _s9_handle, outcome="settled",
+            artifact={
+                "impact": to_jsonable(impact_dict),
+                "behavior": to_jsonable(behavior),
+                "detected_language": _detected_language,
+            },
+        )
 
     result = PipelineResult(
         vulnerability_text=vulnerability_text,

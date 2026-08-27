@@ -102,12 +102,12 @@ def _s6(rec):
 # ---------------------------------------------------------------------------
 
 class TestNoRepair:
-    def test_exactly_six_executions_and_s6_consumes_exact_s4_s5(self, tmp_path):
+    def test_exactly_nine_executions_and_s6_consumes_exact_s4_s5(self, tmp_path):
         _, rec = _run_with_recorder(
             tmp_path, patches_gen=[_CLEAN_DIFF], patches_app=[_APPLICABILITY_CLEAN],
             patches_chall=[_CHALLENGER_CLEAN],
         )
-        assert len(rec.executions) == 6
+        assert len(rec.executions) == 9
         s4, s5, s6 = rec.executions[3], rec.executions[4], rec.executions[5]
         assert s6["canonical_stage"] == "patch_repair_and_calibration"
         assert s6["consumed"] == {
@@ -164,10 +164,10 @@ class TestRepairAccepted:
             patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_CLEAN],
         )
 
-    def test_still_exactly_six_canonical_executions(self, tmp_path):
+    def test_still_exactly_nine_canonical_executions(self, tmp_path):
         _, rec = self._run(tmp_path)
-        assert len(rec.executions) == 6
-        assert [e["canonical_stage"] for e in rec.executions][-1] == "patch_repair_and_calibration"
+        assert len(rec.executions) == 9
+        assert [e["canonical_stage"] for e in rec.executions][5] == "patch_repair_and_calibration"
 
     def test_repair_internal_activity_visible_in_artifact(self, tmp_path):
         _, rec = self._run(tmp_path)

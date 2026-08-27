@@ -66,7 +66,7 @@ class TestRealTracedRunRecordsExecutions:
         assert manifest["kind"] == "full_run"
         assert manifest["parent"] is None
         assert "executions" in manifest
-        assert len(manifest["executions"]) == 6
+        assert len(manifest["executions"]) == 9
 
     def test_exact_canonical_stage_order(self, run_traced, tmp_path, monkeypatch):
         _, manifest = _run_traced(run_traced, tmp_path, monkeypatch)
@@ -77,6 +77,9 @@ class TestRealTracedRunRecordsExecutions:
             "patch_generation_and_post_patch_investigation",
             "challenger",
             "patch_repair_and_calibration",
+            "patch_review",
+            "confidence_scoring",
+            "impact_and_behavior_analysis",
         ]
 
     def test_exact_execution_ids(self, run_traced, tmp_path, monkeypatch):
@@ -88,6 +91,9 @@ class TestRealTracedRunRecordsExecutions:
             "004_patch_generation_and_post_patch_investigation",
             "005_challenger",
             "006_patch_repair_and_calibration",
+            "007_patch_review",
+            "008_confidence_scoring",
+            "009_impact_and_behavior_analysis",
         ]
 
     def test_consumed_edges_reference_the_output_dir_as_run(self, run_traced, tmp_path, monkeypatch):
@@ -143,6 +149,29 @@ class TestRealTracedRunRecordsExecutions:
         s4_seqs = {c["seq"] for c in manifest["executions"][3]["llm_calls"]}
         s5_seqs = {c["seq"] for c in manifest["executions"][4]["llm_calls"]}
         assert s4_seqs.isdisjoint(s5_seqs)
+        # Batch B4: extend the disjointness proof across S6-S9 too -- no
+        # call leaks between any adjacent newly-instrumented stage.
+        s6_seqs = {c["seq"] for c in manifest["executions"][5]["llm_calls"]}
+        s7_seqs = {c["seq"] for c in manifest["executions"][6]["llm_calls"]}
+        s8_seqs = {c["seq"] for c in manifest["executions"][7]["llm_calls"]}
+        s9_seqs = {c["seq"] for c in manifest["executions"][8]["llm_calls"]}
+        all_windows = [s4_seqs, s5_seqs, s6_seqs, s7_seqs, s8_seqs, s9_seqs]
+        for i, window_a in enumerate(all_windows):
+            for window_b in all_windows[i + 1:]:
+                assert window_a.isdisjoint(window_b)
+        assert s9_seqs == set()  # impact_and_behavior_analysis owns zero LLM tags
+
+    def test_s7_s8_llm_calls_within_registry_owned_tags(self, run_traced, tmp_path, monkeypatch):
+        from utilities.autopatcher.stage_registry import (
+            CONFIDENCE_SCORING, PATCH_REVIEW, STAGE_OWNED_LLM_TAGS,
+        )
+
+        _, manifest = _run_traced(run_traced, tmp_path, monkeypatch)
+        s7, s8 = manifest["executions"][6], manifest["executions"][7]
+        for call in s7["llm_calls"]:
+            assert call["stage"] in STAGE_OWNED_LLM_TAGS[PATCH_REVIEW]
+        for call in s8["llm_calls"]:
+            assert call["stage"] in STAGE_OWNED_LLM_TAGS[CONFIDENCE_SCORING]
 
     def test_s1_artifact_has_real_structured_plan_result(self, run_traced, tmp_path, monkeypatch):
         _, manifest = _run_traced(run_traced, tmp_path, monkeypatch)
