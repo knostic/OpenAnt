@@ -44,7 +44,14 @@ def test_pathological_file_does_not_abort_extract_from_scan():
     ex = FunctionExtractor(repo)
     res = ex.extract_from_scan({"files": [{"path": "good.py"}, {"path": "bad.py"}]})
     assert "good.py:alpha" in res["functions"], "good file's units lost — a bad file aborted the parse"
-    assert res["statistics"]["files_with_errors"] >= 1
+    # Whether _STACK_BLOWER actually crashes is platform-dependent on 3.14+ (deep
+    # binary-op chains overflow the C stack on macos/windows but parse cleanly on
+    # ubuntu's larger stacks). Assert the accounting invariant instead of the
+    # crash itself: every file lands in exactly one bucket. Crash-recording is
+    # still covered deterministically by test_post_parse_extraction_error_is_isolated,
+    # which injects the error rather than relying on this fixture.
+    st = res["statistics"]
+    assert st["files_processed"] + st["files_with_errors"] == 2
 
 
 def test_pathological_file_does_not_abort_extract_all():
@@ -80,6 +87,9 @@ def test_stats_not_double_counted():
         "g2.py": "def b():\n    return 2\n",
         "bad.py": _STACK_BLOWER,
     })
+    # Same platform-dependence as above: on interpreters where the fixture parses
+    # cleanly, the file is (correctly) counted as processed; where it crashes it
+    # is counted once as an error and never as processed. Either way no file is
+    # counted twice, so the buckets must sum to the file count.
     st = FunctionExtractor(repo).extract_all(["g1.py", "g2.py", "bad.py"])["statistics"]
-    assert st["files_processed"] == 2, "a crashed file must not be counted as processed"
-    assert st["files_with_errors"] == 1
+    assert st["files_processed"] + st["files_with_errors"] == 3, "a file was counted twice (or lost)"
