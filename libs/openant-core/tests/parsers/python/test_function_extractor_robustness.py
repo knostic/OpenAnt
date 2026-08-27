@@ -79,6 +79,37 @@ def test_post_parse_extraction_error_is_isolated():
     res = ex.extract_from_scan({"files": [{"path": "good.py"}, {"path": "boom.py"}]})
     assert "good.py:gamma" in res["functions"], "post-parse crash in one file aborted the batch"
     assert res["statistics"]["files_with_errors"] >= 1
+    # Bucket assignment, not just accounting: the crashed file must land in
+    # files_with_errors AND must not be counted as processed (a mislabeling
+    # regression keeps the sum invariant but reports the wrong bucket).
+    assert res["statistics"]["files_processed"] == 1
+
+
+def test_parse_stage_crash_is_isolated_and_bucketed():
+    """A crash INSIDE ast.parse (RecursionError from deep nesting) must be isolated
+    like a post-parse crash, recorded in files_with_errors, and never counted as
+    processed. Deterministic — the crash is injected, unlike _STACK_BLOWER, whose
+    crash occurrence is platform/stack-size dependent on 3.14+."""
+    import parsers.python.function_extractor as fe_mod
+
+    repo = _repo({"good.py": "def delta():\n    return 4\n", "deep.py": "def d():\n    return 5\n"})
+    ex = FunctionExtractor(repo)
+    orig_parse = fe_mod.ast.parse
+
+    def parse_boom(source, *a, **k):
+        if "return 5" in source:
+            raise RecursionError("simulated parse-stage stack overflow")
+        return orig_parse(source, *a, **k)
+
+    fe_mod.ast.parse = parse_boom
+    try:
+        res = ex.extract_from_scan({"files": [{"path": "good.py"}, {"path": "deep.py"}]})
+    finally:
+        fe_mod.ast.parse = orig_parse
+    assert "good.py:delta" in res["functions"], "parse-stage crash aborted the batch"
+    st = res["statistics"]
+    assert st["files_with_errors"] == 1, f"parse-stage crash not recorded: {st}"
+    assert st["files_processed"] == 1, f"crashed file mislabeled as processed: {st}"
 
 
 def test_stats_not_double_counted():
