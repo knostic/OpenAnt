@@ -67,7 +67,7 @@ jobs:
 
       - name: Cache JS parser node_modules
         id: cache-node-modules
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: libs/openant-core/parsers/javascript/node_modules
           key: ${{ runner.os }}-jsparser-nodemodules-${{ hashFiles('libs/openant-core/parsers/javascript/package-lock.json') }}
@@ -161,7 +161,7 @@ jobs:
 
       - name: Cache JS parser node_modules
         id: cache-node-modules
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: libs/openant-core/parsers/javascript/node_modules
           key: ${{ runner.os }}-jsparser-nodemodules-${{ hashFiles('libs/openant-core/parsers/javascript/package-lock.json') }}
