@@ -273,6 +273,11 @@ class VerificationResult:
     # lets the reporter render "unverified" (not "rejected") and lets the
     # metrics bucket it as needs-review (not "safe").
     incomplete: bool = False
+    # #211 pass-through capture: per-turn provider usage detail dicts
+    # (verbatim; None entries for turns that reported none). Serialized
+    # into the unit's verification record so results_verified.json is
+    # reconcilable against a provider bill; never summed, never in cost.
+    usage_details: Optional[list] = None
 
     def to_dict(self) -> dict:
         result = {
@@ -282,6 +287,8 @@ class VerificationResult:
             "iterations": self.iterations,
             "total_tokens": self.total_tokens
         }
+        if self.usage_details is not None:
+            result["usage_details"] = self.usage_details
         if self.exploit_path:
             result["exploit_path"] = self.exploit_path.to_dict()
         if self.security_weakness:
@@ -395,6 +402,10 @@ class FindingVerifier:
         iterations = 0
         total_input_tokens = 0
         total_output_tokens = 0
+        # #211 pass-through capture: per-turn provider usage detail dicts,
+        # verbatim (None entries for turns whose provider reported none).
+        # Passed to record_call as a list; never summed, never in cost.
+        per_turn_usage_details: list = []
 
         while iterations < MAX_ITERATIONS:
             iterations += 1
@@ -412,6 +423,7 @@ class FindingVerifier:
 
             total_input_tokens += response.input_tokens
             total_output_tokens += response.output_tokens
+            per_turn_usage_details.append(response.usage_details)
 
             assistant_content = response.content
             stop_reason = response.stop_reason
@@ -420,7 +432,8 @@ class FindingVerifier:
             if stop_reason == "end_turn":
                 result = self._try_parse_text_response(
                     assistant_content, finding, iterations,
-                    total_input_tokens, total_output_tokens
+                    total_input_tokens, total_output_tokens,
+                    usage_details=per_turn_usage_details,
                 )
                 if result:
                     return result
@@ -442,10 +455,12 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return VerificationResult(
                     agree=False,
                     correct_finding=finding,
+                    usage_details=per_turn_usage_details,
                     explanation="Verification incomplete",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
@@ -497,10 +512,12 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return VerificationResult(
                     agree=False,
                     correct_finding=finding,
+                    usage_details=per_turn_usage_details,
                     explanation="Verification incomplete (finish call truncated at max_tokens)",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
@@ -513,10 +530,12 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return self._parse_finish_result(
                     finish_result, finding, iterations,
-                    total_input_tokens + total_output_tokens
+                    total_input_tokens + total_output_tokens,
+                    usage_details=per_turn_usage_details,
                 )
 
             # Echo only the block kinds the loop consumes (Text + ToolUse);
@@ -534,12 +553,14 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 # Fail-safe (R4-7): see the :380 path above. Don't auto-agree;
                 # keep the Stage-1 verdict surfaced for human triage.
                 return VerificationResult(
                     agree=False,
                     correct_finding=finding,
+                    usage_details=per_turn_usage_details,
                     explanation="Verification incomplete (no tool calls)",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
@@ -553,12 +574,14 @@ class FindingVerifier:
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
+            usage_details=per_turn_usage_details,
         )
         # Fail-safe (R4-7): exhausting the iteration budget is not agreement.
         # Don't auto-agree; keep the Stage-1 verdict surfaced for human triage.
         return VerificationResult(
             agree=False,
             correct_finding=finding,
+            usage_details=per_turn_usage_details,
             explanation="Max iterations reached",
             iterations=iterations,
             total_tokens=total_input_tokens + total_output_tokens,
@@ -1068,7 +1091,8 @@ class FindingVerifier:
         finish_result: dict,
         original_finding: str,
         iterations: int,
-        total_tokens: int
+        total_tokens: int,
+        usage_details: list | None = None,
     ) -> VerificationResult:
         """Parse the finish tool result into VerificationResult."""
         # Parse exploit path if present
@@ -1129,6 +1153,7 @@ class FindingVerifier:
             explanation=finish_result.get("explanation", ""),
             iterations=iterations,
             total_tokens=total_tokens,
+            usage_details=usage_details,
             exploit_path=exploit_path,
             security_weakness=finish_result.get("security_weakness"),
             incomplete=incomplete,
@@ -1140,7 +1165,8 @@ class FindingVerifier:
         original_finding: str,
         iterations: int,
         total_input_tokens: int,
-        total_output_tokens: int
+        total_output_tokens: int,
+        usage_details: list | None = None,
     ) -> Optional[VerificationResult]:
         """Try to parse a text response as JSON."""
         for block in assistant_content:
@@ -1152,10 +1178,12 @@ class FindingVerifier:
                         input_tokens=total_input_tokens,
                         output_tokens=total_output_tokens,
                         pricing=lookup_pricing(self.binding),
+                        usage_details=usage_details,
                     )
                     return self._parse_finish_result(
                         result, original_finding, iterations,
-                        total_input_tokens + total_output_tokens
+                        total_input_tokens + total_output_tokens,
+                        usage_details=usage_details,
                     )
         return None
 

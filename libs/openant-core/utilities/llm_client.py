@@ -96,6 +96,7 @@ class TokenTracker:
         output_tokens: int,
         *,
         pricing: dict[str, float] | None = None,
+        usage_details: dict | list | None = None,
     ) -> dict:
         """
         Record a single LLM call.
@@ -113,6 +114,15 @@ class TokenTracker:
                 (with a one-time stderr warning on miss). New code
                 should always pass ``pricing`` via
                 ``binding.adapter.pricing.get(binding.model)``.
+            usage_details: Pass-through capture (#211): provider-supplied
+                billing-relevant DETAIL fields (reasoning tokens; cache
+                read/write tokens) VERBATIM — a dict for a single call,
+                or a list of per-turn dicts for an agentic loop. Stored
+                on the call record for reconciliation against a provider
+                bill; NEVER summed into totals and NEVER in the cost
+                formula (whether a provider's ``completion_tokens``
+                already includes reasoning differs by route — summing
+                would double-count on including routes).
 
         Returns:
             Dict with call details including cost.
@@ -140,7 +150,12 @@ class TokenTracker:
             "model": model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cost_usd": round(total_cost, 6)
+            "cost_usd": round(total_cost, 6),
+            # #211 pass-through capture: stored VERBATIM (absent when the
+            # provider supplied none — never a fabricated empty dict; in the
+            # per-turn list form, turns without details appear as None
+            # ENTRIES), never summed into the totals below, never in cost.
+            **({"usage_details": usage_details} if usage_details is not None else {}),
         }
 
         # Update totals (thread-safe)

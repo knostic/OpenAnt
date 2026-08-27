@@ -166,7 +166,8 @@ def scan_repository(
         generate_context: If True, generate application context (reduces FP).
         generate_report: If True, generate summary + disclosure reports.
         skip_tests: If True, exclude test files from parsing (default: True).
-        limit: Max number of units to analyze.
+        limit: Max number of units to analyze and enhance (the LLM
+            reachability pass still reviews the full codebase).
         enhance: If True, run agentic/single-shot context enhancement.
         enhance_mode: ``"agentic"`` (thorough) or ``"single-shot"`` (fast).
         dynamic_test: If True, run Docker-isolated dynamic testing (requires Docker).
@@ -512,9 +513,9 @@ def scan_repository(
                         )
                         app_ctx_payload = None
 
-                # --limit governs the analyze stage, not how many units the
-                # LLM reachability pass reviews — it must see the full
-                # codebase to find missed entry points.
+                # --limit governs the analyze AND enhance stages, not how
+                # many units the LLM reachability pass reviews — it must see
+                # the full codebase to find missed entry points.
                 signals = analyze_reachability(
                     dataset=dataset,
                     app_context=app_ctx_payload,
@@ -761,6 +762,17 @@ def scan_repository(
                     workers=workers,
                     backoff_seconds=backoff_seconds,
                     # checkpoint_path auto-derived from output_path
+                    # #213: --limit bounds the enhance phase too — the
+                    # scan's cheapest-mode flag must bound the run's spend,
+                    # and enhance is a high-volume per-unit LLM phase. NOTE
+                    # the ordering trade-off (deliberate, per the issue's
+                    # ruling): a limited run selects units BEFORE the
+                    # enhancer writes security_classification, so analyze's
+                    # classification-priority re-sort no-ops on the
+                    # pre-limited set — bounded runs choose cost-bound over
+                    # classification-priority coverage. (LLM reachability
+                    # stays unbounded: it needs the full corpus.)
+                    limit=limit,
                 )
 
                 ctx.summary = {

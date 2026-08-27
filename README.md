@@ -192,6 +192,34 @@ Or run the full pipeline in one command:
 openant scan --verify
 ```
 
+#### Exit codes (important for CI)
+
+`openant scan` — and each step verb (`analyze`, `verify`, …) when run step-by-step —
+exits **1 when it finds vulnerabilities** — that is the tool working, not failing. The
+contract:
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Clean scan — no vulnerabilities found |
+| 1 | **Vulnerabilities found** (a successful run) |
+| 2 | Error — the scan itself failed (check `errors` in the JSON envelope on stdout) |
+
+Generic CI steps and process supervisors treat any non-zero exit as a failure, which
+misclassifies a healthy findings run. Gate on the contract instead of parsing stdout:
+
+```bash
+rc=0
+openant scan --verify /path/to/repo || rc=$?   # || captures: set -e safe
+if [ "$rc" -gt 1 ]; then
+  echo "scan FAILED (exit $rc)" >&2; exit "$rc"
+fi
+# rc 0 = clean, rc 1 = findings found — both are successful runs
+```
+
+The `|| rc=$?` form matters: CI defaults to `set -e` (GitHub Actions `run:`, Jenkins `sh`),
+where a bare `openant scan` exiting 1 would terminate the script before the capture line —
+reproducing exactly the misclassification this section exists to prevent.
+
 ### Web UI
 
 `openant serve` starts a local web UI over the same scan pipeline: submit a

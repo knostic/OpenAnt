@@ -443,6 +443,20 @@ def build_pipeline_output(
             "cwe_name": vuln.get("cwe_name") or finding.get("cwe_name") or full_result.get("cwe_name", "Unknown"),
             "stage1_verdict": finding.get("verdict", finding.get("finding", "vulnerable")),
             "stage2_verdict": stage2_verdict,
+            # #215 (partial repair): the two FINDING-SEMANTIC transit
+            # fields — confidence (float 0.0-1.0 per the verdict schema,
+            # json_corrector.py:32; NOT analysis_core.py:181's error-shape
+            # default) and json_corrected (provenance: the finding's JSON
+            # was model-repaired, json_corrector.py:278) — populated
+            # upstream, surviving into results_verified.json, previously
+            # DROPPED by this fixed-key record. Present-only: absent
+            # upstream stays absent (never a fabricated 0/False — a REAL
+            # falsy value threads through). elapsed_seconds/prompt_length
+            # stay OUT (per-unit step telemetry, not finding metadata).
+            **({"confidence": finding["confidence"]}
+               if finding.get("confidence") is not None else {}),
+            **({"json_corrected": finding["json_corrected"]}
+               if finding.get("json_corrected") is not None else {}),
             "description": description,
             "vulnerable_code": vulnerable_code,
             "vulnerable_code_section": vulnerable_code_section,
@@ -904,6 +918,9 @@ def _record_usage_in_tracker(usage: dict, binding):
                 input_tokens=usage["input_tokens"],
                 output_tokens=usage["output_tokens"],
                 pricing=lookup_pricing(binding),
+                # #211 pass-through capture: verbatim when the generator's
+                # usage dict carries it; never in the cost math.
+                usage_details=usage.get("usage_details"),
             )
     except Exception:
         pass  # Best effort — don't break report generation
