@@ -50,6 +50,36 @@ func probeOpenRouter(apiKey, baseURL, model string) error {
 	return probeChatCompletionsAt(apiKey, base+"/chat/completions", model)
 }
 
+// ollamaAPIBase is the default Ollama base URL — it already includes the
+// ``/v1`` segment (matching the Python adapter's ``_DEFAULT_BASE_URL``).
+// Package var so tests can point at httptest.
+var ollamaAPIBase = "http://localhost:11434/v1"
+
+// probeOllama verifies an Ollama model is pulled and serving. Ollama speaks
+// the OpenAI chat-completions wire API on its own base (already carrying
+// ``/v1``, like OpenRouter) and ignores Authorization headers — stock local
+// Ollama needs no key, so a blank key probes with the same placeholder the
+// Python adapter sends. A key-checking remote gateway still works: any
+// non-blank key is forwarded verbatim.
+func probeOllama(apiKey, baseURL, model string) error {
+	base := strings.TrimRight(baseURL, "/")
+	if base == "" {
+		base = ollamaAPIBase
+	}
+	if apiKey == "" {
+		apiKey = "ollama" // placeholder; matches utilities/llm/providers/ollama.py
+	}
+	err := probeChatCompletionsAt(apiKey, base+"/chat/completions", model)
+	if err == nil {
+		return nil
+	}
+	// Rewrite the generic 404 wording into the fixable `ollama pull` hint.
+	if pe, ok := err.(*AnthropicProbeError); ok && pe.Kind == "model_not_found" {
+		pe.Message = fmt.Sprintf("model %q not pulled into Ollama — run `ollama pull %s` (or `ollama list` to see what's installed)", model, model)
+	}
+	return err
+}
+
 // probeChatCompletionsAt POSTs a minimal 1-token request to a full
 // chat-completions endpoint and maps the HTTP status to a probe error. Shared
 // by the OpenAI and OpenRouter probes (both speak the OpenAI wire API).
