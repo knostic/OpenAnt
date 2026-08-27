@@ -267,9 +267,22 @@ def _disclosure_verdict_header(vulnerability_data: dict) -> str:
     location the "{affected_versions}" prompt field never carries.
     """
     verdict = str(vulnerability_data.get("stage2_verdict") or "").lower()
+    stage1 = str(vulnerability_data.get("stage1_verdict") or "").lower()
     if verdict in _STAGE2_CONFIRMED:
         status = f"CONFIRMED by Stage-2 attacker simulation ({verdict})"
-    else:  # unverified / vulnerable / bypassable / error / anything else eligible
+    elif (verdict in ("vulnerable", "bypassable")
+          and stage1 and stage1 != verdict):
+        # #283: stage1 != stage2 on a still-real verdict is the Stage-2
+        # RECLASSIFICATION signal (e.g. vulnerable -> bypassable, adjudicated
+        # by attacker simulation). "UNVERIFIED — not confirmed by Stage-2"
+        # would be FALSE here: Stage 2 DID adjudicate. When stage1 == stage2
+        # (or stage1 is absent) the finding may not have been through Stage 2
+        # at all — the conservative UNVERIFIED wording stays.
+        status = (
+            f"ADJUDICATED by Stage-2 attacker simulation — reclassified "
+            f"{stage1} -> {verdict}, still a real finding"
+        )
+    else:  # unverified / error / same-verdict vulnerable/bypassable
         status = (
             "UNVERIFIED — not confirmed by Stage-2 attacker simulation "
             f"({verdict or 'unknown'})"
