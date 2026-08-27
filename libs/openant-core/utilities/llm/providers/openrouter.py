@@ -147,7 +147,12 @@ def _classify_error(exc: Exception, *, report_429: bool) -> Exception:
         if key_disabled:
             return LLMAuthError(message)
         if any(marker in lowered for marker in _MODERATION_MARKERS):
-            return LLMRefusalError(message)
+            # #212: prefix aligns this family with the cross-adapter refusal
+            # marker ("refused the request") for the verify phase's
+            # print-time refused count; the provider's body text survives.
+            return LLMRefusalError(
+                f"OpenRouter refused the request (403 input moderation): {message}"
+            )
         return LLMAuthError(message)
     if isinstance(exc, openai.RateLimitError):
         retry_after = _retry_after_from(exc)

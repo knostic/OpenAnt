@@ -191,6 +191,17 @@ class CompletionResult:
             ``Message.content`` already enforces).
         input_tokens: From the provider's usage metadata.
         output_tokens: Ditto.
+        usage_details: Provider-supplied billing-relevant usage DETAIL
+            fields (reasoning tokens; cache read/write tokens), copied
+            VERBATIM by the adapter — present-only, absent when the
+            provider reported none. Pass-through capture for #211:
+            these fields never feed the cost formula and are never
+            summed into token totals; they exist so the accounting
+            artifacts can be reconciled against a provider bill. (The
+            cost-math question — whether ``output_tokens`` already
+            includes reasoning on a given route — is deliberately
+            unresolved; summing here would double-count on routes
+            where it does.)
         stop_reason: Normalised across providers. The pipeline's
             agentic loops branch on ``"tool_use"`` to know whether
             to execute tools and continue.
@@ -204,6 +215,9 @@ class CompletionResult:
     output_tokens: int
     stop_reason: StopReason
     raw: Any = field(default=None, repr=False)
+    # After ``raw`` so the pre-existing positional contract
+    # (content, input, output, stop_reason, raw) is unchanged.
+    usage_details: dict | None = field(default=None, repr=False)
 
     def __post_init__(self):
         # Accept list for ergonomic construction by adapters; freeze
