@@ -58,12 +58,16 @@ def _extract_usage(
         input_cost = (input_tokens / 1_000_000) * pricing["input"]
         output_cost = (output_tokens / 1_000_000) * pricing["output"]
         total_cost = input_cost + output_cost
-    usage: dict = {
+    usage = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
         "cost_usd": round(total_cost, 6),
     }
+    if pricing is None:
+        # #216: this fallback costs OUTSIDE the tracker — the usage dict
+        # must not claim a complete cost it does not have.
+        usage["cost_incomplete"] = True
     if usage_details is not None:
         # #211 pass-through capture: verbatim, informational only.
         usage["usage_details"] = usage_details
@@ -79,6 +83,8 @@ def _merge_usage(usages: list[dict]) -> dict:
     """
     merged = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
     for u in usages:
+        if u.get("cost_incomplete"):
+            merged["cost_incomplete"] = True
         merged["input_tokens"] += u["input_tokens"]
         merged["output_tokens"] += u["output_tokens"]
         merged["total_tokens"] += u["total_tokens"]

@@ -1358,6 +1358,16 @@ def _write_scan_report(
             "input_tokens": total_input,
             "output_tokens": total_output,
             "total_tokens": total_input + total_output,
+            # #216: the aggregate rebuilds token_usage from the step
+            # reports — OR-aggregate the incomplete-cost marker across them
+            # (a rebuild must not drop the advisory).
+            **({
+                "cost_incomplete": True,
+                "unpriced_models": sorted({m for sr in step_reports
+                                           for m in (sr.get("token_usage", {})
+                                                     .get("unpriced_models") or [])}),
+            } if any(sr.get("token_usage", {}).get("cost_incomplete")
+                     for sr in step_reports) else {}),
         },
     )
 

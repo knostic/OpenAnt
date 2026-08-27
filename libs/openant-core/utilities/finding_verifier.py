@@ -669,6 +669,7 @@ class FindingVerifier:
         _summary_input_tokens = 0
         _summary_output_tokens = 0
         _summary_cost_usd = 0.0
+        _summary_unpriced: set[str] = set()
 
         # Sum usage from ALL existing checkpoints (including errored ones
         # — their cost was already spent in a prior run)
@@ -677,16 +678,25 @@ class FindingVerifier:
             _summary_input_tokens += _cp_usage.get("input_tokens", 0)
             _summary_output_tokens += _cp_usage.get("output_tokens", 0)
             _summary_cost_usd += _cp_usage.get("cost_usd", 0.0)
+            # #216: restore the incomplete-cost marker per unit.
+            _summary_unpriced.update(_cp_usage.get("unpriced_models") or [])
 
         def _usage_dict():
-            return {"input_tokens": _summary_input_tokens,
-                    "output_tokens": _summary_output_tokens,
-                    "cost_usd": round(_summary_cost_usd, 6)}
+            usage = {"input_tokens": _summary_input_tokens,
+                     "output_tokens": _summary_output_tokens,
+                     "cost_usd": round(_summary_cost_usd, 6)}
+            # #216: persist the unpriced set into _summary.json (mirrors
+            # analyzer's — a resume-of-resume keeps the marker).
+            if _summary_unpriced:
+                usage["cost_incomplete"] = True
+                usage["unpriced_models"] = sorted(_summary_unpriced)
+            return usage
 
         # Inject prior usage into tracker so step_report captures the total
-        if _summary_input_tokens or _summary_output_tokens:
+        if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
             self.tracker.add_prior_usage(
-                _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+                _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
+                unpriced_models=sorted(_summary_unpriced) or None)
 
         if checkpoint is not None:
             checkpoint.write_summary(total, _summary_completed, _summary_errors,

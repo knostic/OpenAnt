@@ -26,6 +26,8 @@ def get_usage() -> UsageInfo:
         total_output_tokens=totals["total_output_tokens"],
         total_tokens=totals["total_tokens"],
         total_cost_usd=totals["total_cost_usd"],
+        cost_incomplete=totals.get("cost_incomplete", False),
+        unpriced_models=totals.get("unpriced_models", []),
     )
 
 
