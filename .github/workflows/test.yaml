@@ -13,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
@@ -37,10 +37,10 @@ jobs:
         os: ${{ github.repository == 'knostic/OpenAnt' && fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
           cache: "pip"
@@ -49,14 +49,14 @@ jobs:
             libs/openant-core/pyproject.toml
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: libs/openant-core/parsers/javascript/package-lock.json
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: libs/openant-core/parsers/go/go_parser/go.mod
           cache-dependency-path: libs/openant-core/parsers/go/go_parser/go.mod
@@ -67,7 +67,7 @@ jobs:
 
       - name: Cache JS parser node_modules
         id: cache-node-modules
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: libs/openant-core/parsers/javascript/node_modules
           key: ${{ runner.os }}-jsparser-nodemodules-${{ hashFiles('libs/openant-core/parsers/javascript/package-lock.json') }}
@@ -103,16 +103,16 @@ jobs:
         os: ${{ github.repository == 'knostic/OpenAnt' && fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: apps/openant-cli/go.mod
           cache-dependency-path: apps/openant-cli/go.sum
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
           cache: "pip"
@@ -121,9 +121,9 @@ jobs:
             libs/openant-core/pyproject.toml
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: libs/openant-core/parsers/javascript/package-lock.json
 
@@ -161,7 +161,7 @@ jobs:
 
       - name: Cache JS parser node_modules
         id: cache-node-modules
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: libs/openant-core/parsers/javascript/node_modules
           key: ${{ runner.os }}-jsparser-nodemodules-${{ hashFiles('libs/openant-core/parsers/javascript/package-lock.json') }}
