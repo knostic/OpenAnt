@@ -89,10 +89,11 @@ _OPENAI_FINISH_REASONS: dict[str, StopReason] = {
 }
 
 # OpenAI's ``finish_reason`` literal includes ``"content_filter"`` — the
-# response was withheld or truncated by the moderation layer. We surface
-# it as a typed ``LLMRefusalError`` rather than normalising to
-# ``end_turn``, so a security scan doesn't read a filtered response as a
-# clean, finding-free pass.
+# response was withheld or truncated by a filter (which filter — model
+# safety classifier or gateway moderation — is provider/route-specific and
+# NOT asserted; #212). We surface it as a typed ``LLMRefusalError`` rather
+# than normalising to ``end_turn``, so a security scan doesn't read a
+# filtered response as a clean, finding-free pass.
 _OPENAI_CONTENT_FILTER_REASON = "content_filter"
 
 # OpenAI reasoning models (o1/o3/o4 families) reject ``max_tokens`` and
@@ -692,6 +693,24 @@ def _extract_usage_details_responses(usage: Any) -> Optional[dict]:
     return details or None
 
 
+def _responses_refusal_text(response: Any) -> Optional[str]:
+    """#212: the provider's own refusal text on a filtered Responses call.
+
+    Present-only scan of the message output parts (``output_text`` parts may
+    carry a ``refusal`` sibling on gateway-routed calls); ``None`` when the
+    provider supplied none. Never asserts WHO filtered.
+    """
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for part in getattr(item, "content", None) or []:
+            if getattr(part, "type", None) in ("output_text", "refusal"):
+                text = getattr(part, "refusal", None)
+                if text:
+                    return text
+    return None
+
+
 def _responses_to_unified(response: Any) -> CompletionResult:
     """Translate an OpenAI ``Response`` (Responses API) into unified types.
 
@@ -710,9 +729,20 @@ def _responses_to_unified(response: Any) -> CompletionResult:
     if status == "incomplete":
         reason = getattr(getattr(response, "incomplete_details", None), "reason", None)
         if reason == "content_filter":
+            # #212: do NOT assert WHO filtered ("moderation layer") — the
+            # provider's own refusal text, when present, says (and this
+            # reporter-verified case: it is usually the MODEL's safety
+            # classifier, not a gateway). Carry the provider's words verbatim.
+            refusal_text = _responses_refusal_text(response)
+            # Redact per the module's invariant: every provider-supplied
+            # string embedded in an error message passes redact_secrets()
+            # (a gateway echoing secret-shaped text into a refusal must
+            # not leak into persisted artifacts).
+            detail = (f"; refusal: {redact_secrets(refusal_text)}"
+                      if refusal_text else "")
             raise LLMRefusalError(
-                "OpenAI content-filtered the response (incomplete: content_filter); "
-                "the completion was withheld by the moderation layer"
+                "OpenAI refused the request (incomplete: content_filter)"
+                f"{detail}"
             )
         elif reason == "max_output_tokens":
             stop_reason = "max_tokens"
@@ -849,11 +879,19 @@ def _response_to_unified(
     # R4-2: a content-filter finish is the more specific signal — raise
     # it regardless of whether the message carried partial text/tool
     # calls. OpenAI reports this as ``finish_reason == "content_filter"``.
+    # #212: carry the provider's own refusal words (``message.refusal``)
+    # verbatim when present, and never assert WHO filtered without
+    # evidence — the "moderation layer" phrasing sent #212's reporter
+    # chasing a route change when the refusals were the model's own
+    # safety classifier.
     if raw_finish == _OPENAI_CONTENT_FILTER_REASON:
+        refusal_text = getattr(getattr(choice, "message", None), "refusal", None)
+        # Redact per the module invariant (see the Responses path).
+        detail = (f"; refusal: {redact_secrets(refusal_text)}"
+                  if refusal_text else "")
         raise LLMRefusalError(
-            f"{adapter} content-filtered the response "
-            "(finish_reason='content_filter'); the completion was withheld "
-            "or truncated by the moderation layer"
+            f"{adapter} refused the request "
+            f"(finish_reason='content_filter'){detail}"
         )
 
     # An empty completion -- no text AND no tool calls (``message.content`` is

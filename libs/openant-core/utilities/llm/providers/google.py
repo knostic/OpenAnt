@@ -432,9 +432,22 @@ def _response_to_unified(response: Any) -> CompletionResult:
         # that would mask a refusal as a non-finding.
         feedback = getattr(response, "prompt_feedback", None)
         block_reason = getattr(feedback, "block_reason", None) if feedback else None
+        # #212: a prompt-level policy block IS a refusal (the same
+        # deterministic-refusal family as a candidate-level SAFETY finish)
+        # — typed accordingly and marker-aligned so the verify phase's
+        # print-time refused count derives for this family too. Only when
+        # the provider actually SUPPLIED a block reason: an empty-candidates
+        # response with no prompt_feedback evidence stays a plain response
+        # error (retryable shape upstream), never an evidence-free refusal
+        # claim (fable D2 — the fix's own no-assertion-beyond-evidence rule).
+        if block_reason:
+            raise LLMRefusalError(
+                f"Gemini refused the request "
+                f"(prompt blocked: {block_reason})"
+            )
         raise LLMResponseError(
-            f"Gemini returned no candidates "
-            f"(prompt blocked: {block_reason or 'unknown reason'})"
+            f"Gemini returned no candidates (empty response; no prompt "
+            "block reason supplied)"
         )
 
     # Usage metadata lives on response.usage_metadata for the new SDK.
@@ -455,8 +468,11 @@ def _response_to_unified(response: Any) -> CompletionResult:
     # carried partial text or a function_call. Gemini reports these as
     # SAFETY / RECITATION / BLOCKLIST / PROHIBITED_CONTENT / SPII.
     if raw_finish in _GEMINI_REFUSAL_FINISH_REASONS:
+        # #212: message aligned with the cross-adapter refusal marker
+        # ("refused the request") so the verify phase's print-time refused
+        # count derives correctly for every provider family.
         raise LLMRefusalError(
-            f"Gemini blocked the response (finish_reason={raw_finish!r}); "
+            f"Gemini refused the request (finish_reason={raw_finish!r}); "
             "the candidate was withheld for safety or policy reasons"
         )
 
