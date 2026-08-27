@@ -45,6 +45,7 @@ def _isolate_shared_infra(monkeypatch):
     monkeypatch.setattr(llm_client, "_cached_model", {})
     monkeypatch.setattr(llm_client, "_cached_adapters", {})
     monkeypatch.setattr(llm_client, "_call_metadata", {})
+    monkeypatch.setattr(llm_client, "_call_history", {})
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -678,6 +679,94 @@ def test_complete_default_stage_is_unknown_and_does_not_break(monkeypatch):
     assert isinstance(result, str)
     meta = llm_client.get_call_metadata()
     assert "unknown" in meta
+
+
+# ---------------------------------------------------------------------------
+# Ordered call HISTORY (Auto Patcher stage-replay foundation, Batch A):
+# get_call_metadata() only ever kept the LATEST call per stage tag -- a
+# stage that legitimately makes more than one call under the same tag
+# (e.g. Finding Calibration's v1/v2 passes) silently lost the earlier
+# call's metadata. get_call_history() must never lose a call.
+# ---------------------------------------------------------------------------
+
+def test_repeated_same_tag_calls_are_all_recorded_in_history(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+
+    call_llm("first prompt", stage="finding_calibration")
+    call_llm("second prompt", stage="finding_calibration")
+
+    history = llm_client.get_call_history()
+    assert len(history["finding_calibration"]) == 2
+
+
+def test_call_history_preserves_call_order(monkeypatch):
+    cf = _config_with_default_llm("test-config", "anthropic", "claude-test-model")
+    monkeypatch.setattr(llm_client, "load_config_file", lambda: cf)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+    _install_fake_adapter(monkeypatch, outcomes=[
+        _completion_result(stop_reason="max_tokens"),
+        _completion_result(stop_reason="end_turn"),
+    ])
+
+    call_llm("first", stage="finding_calibration")
+    call_llm("second", stage="finding_calibration")
+
+    history = llm_client.get_call_history()["finding_calibration"]
+    assert [c["stop_reason"] for c in history] == ["max_tokens", "end_turn"]
+
+
+def test_call_history_does_not_lose_metadata_that_get_call_metadata_overwrites(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+
+    call_llm("v1 prompt", stage="finding_calibration")
+    call_llm("v2 prompt", stage="finding_calibration")
+
+    # get_call_metadata() -- unchanged, backward-compatible behavior --
+    # only shows the LAST call.
+    latest = llm_client.get_call_metadata()
+    assert len(latest) == 1  # one stage key, "finding_calibration"
+
+    # get_call_history() shows BOTH.
+    history = llm_client.get_call_history()
+    assert len(history["finding_calibration"]) == 2
+
+
+def test_call_history_keeps_different_stages_separate(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+
+    call_llm("prompt", stage="challenger")
+    call_llm("prompt", stage="patch_repair_regeneration")
+
+    history = llm_client.get_call_history()
+    assert list(history.keys()) == ["challenger", "patch_repair_regeneration"]
+    assert len(history["challenger"]) == 1
+    assert len(history["patch_repair_regeneration"]) == 1
+
+
+def test_clear_call_metadata_also_clears_call_history(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+
+    call_llm("prompt", stage="patch_generation")
+    assert llm_client.get_call_history()
+
+    llm_client.clear_call_metadata()
+
+    assert llm_client.get_call_history() == {}
+    assert llm_client.get_call_metadata() == {}
+
+
+def test_call_history_returns_independent_copies(monkeypatch):
+    """Mutating the returned dict/list must never affect internal state."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    call_llm("prompt", stage="patch_review")
+
+    history = llm_client.get_call_history()
+    history["patch_review"].append({"fabricated": True})
+    history["patch_review"][0]["provider"] = "tampered"
+
+    fresh = llm_client.get_call_history()
+    assert len(fresh["patch_review"]) == 1
+    assert fresh["patch_review"][0]["provider"] != "tampered"
 
 
 # ---------------------------------------------------------------------------

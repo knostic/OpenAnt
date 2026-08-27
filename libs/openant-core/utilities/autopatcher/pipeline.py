@@ -3705,6 +3705,19 @@ _CONTRACT_VIOLATION_RETRY_HINT = (
 
 _CONTRACT_RETRY_STAGE = "patch_generation_contract_retry"
 
+# Canonical-stage LLM-ownership disambiguation (Auto Patcher stage-replay
+# foundation): the Challenger-driven repair loop's patch regeneration
+# belongs to the patch_repair_and_calibration canonical stage, not
+# patch_generation_and_post_patch_investigation -- even though both call
+# generate_patch(). Before this tag existed, both call sites traced under
+# the plain "patch_generation" default, making the two canonical stages'
+# LLM calls indistinguishable in a trace and unenforceable for stage-replay
+# LLM-ownership checks (a replay of one stage could not be told apart from
+# a leaked call belonging to the other). This is an observability/ownership
+# change only -- it does not alter prompt content, retry behavior, or the
+# request itself; see generate_patch()'s `stage` parameter.
+_REPAIR_REGENERATION_STAGE = "patch_repair_regeneration"
+
 
 def _generate_patch_with_contract_check(
     vulnerability_text: str,
@@ -5160,6 +5173,7 @@ def run(
                     vulnerability_text, llm,
                     code_context=code_context,
                     retry_hint=_r_hint,
+                    stage=_REPAIR_REGENERATION_STAGE,
                 )
                 _repair_loop_meta = None
                 try:

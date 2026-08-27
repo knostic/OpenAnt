@@ -485,8 +485,11 @@ class TestOutputDirectorySafety:
 
 class TestStageDispatch:
     def test_unsupported_stage_fails_before_llm(self, run_stage, tmp_path, capsys):
+        """"challenger" IS a canonical stage (utilities.autopatcher.
+        stage_registry) but has no run_fn wired up yet in this batch --
+        registered-but-not-replayable, not unknown."""
         exit_code = run_stage.main([
-            "--source-trace", str(tmp_path / "nonexistent"),
+            "--source-run", str(tmp_path / "nonexistent"),
             "--stage", "challenger",
             "--output", str(tmp_path / "out"),
         ])
@@ -494,11 +497,58 @@ class TestStageDispatch:
         captured = capsys.readouterr()
         assert "challenger" in captured.err
         assert "not replayable yet" in captured.err
-        assert "test_plan_discovery" in captured.err
+        assert "test_analysis_and_plan" in captured.err  # currently the only replayable stage
         assert not (tmp_path / "out").exists()  # zero work performed
 
+    def test_unknown_stage_fails_before_llm(self, run_stage, tmp_path, capsys):
+        """A stage name that isn't even in the canonical registry gets a
+        DIFFERENT, more specific message than a registered-but-not-yet-
+        replayable one."""
+        exit_code = run_stage.main([
+            "--source-run", str(tmp_path / "nonexistent"),
+            "--stage", "not_a_real_stage",
+            "--output", str(tmp_path / "out"),
+        ])
+        assert exit_code == 2
+        captured = capsys.readouterr()
+        assert "Unknown stage" in captured.err
+        assert "not_a_real_stage" in captured.err
+        assert "test_analysis_and_plan" in captured.err  # canonical stage list is shown
+        assert not (tmp_path / "out").exists()
+
     def test_only_test_plan_discovery_is_supported_in_phase_1(self):
+        """stage_replay.SUPPORTED_STAGES is Phase 1's own, now-superseded
+        dispatch set -- kept unchanged for backward compatibility of any
+        direct caller of replay_test_plan_discovery(). The CLI's actual
+        canonical stage list now comes from stage_registry.py (see
+        TestCanonicalRegistryMigration below), not from this constant."""
         assert SUPPORTED_STAGES == frozenset({"test_plan_discovery"})
+
+
+class TestCanonicalRegistryMigration:
+    """Batch A: run_stage.py's --stage now comes from the 13-stage
+    canonical registry, not the Phase-1 one-entry dispatch table."""
+
+    def test_test_plan_discovery_is_no_longer_a_valid_cli_stage(self, run_stage, tmp_path, capsys):
+        exit_code = run_stage.main([
+            "--source-run", str(tmp_path / "nonexistent"),
+            "--stage", "test_plan_discovery",
+            "--output", str(tmp_path / "out"),
+        ])
+        assert exit_code == 2
+        assert "Unknown stage" in capsys.readouterr().err
+
+    def test_source_trace_flag_still_accepted_as_alias(self, run_stage, tmp_path, monkeypatch):
+        """--source-trace remains a working alias for --source-run."""
+        repo = _make_target_repo(tmp_path)
+        trace_dir = _write_structured_source_trace(tmp_path / "run", repo_root=repo)
+        _install_fake_call_llm(monkeypatch, _accepted_response_json())
+        output_dir = tmp_path / "replay-out"
+
+        exit_code = run_stage.main([
+            "--source-trace", str(trace_dir), "--stage", "test_analysis_and_plan", "--output", str(output_dir),
+        ])
+        assert exit_code == 0
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +622,7 @@ class TestRejectedPlanReplay:
         output_dir = tmp_path / "replay-out"
 
         exit_code = run_stage.main([
-            "--source-trace", str(trace_dir), "--stage", "test_plan_discovery", "--output", str(output_dir),
+            "--source-run", str(trace_dir), "--stage", "test_analysis_and_plan", "--output", str(output_dir),
         ])
         assert exit_code == 0
 
@@ -907,12 +957,12 @@ class TestRunStageCLI:
         output_dir = tmp_path / "replay-out"
 
         exit_code = run_stage.main([
-            "--source-trace", str(trace_dir), "--stage", "test_plan_discovery", "--output", str(output_dir),
+            "--source-run", str(trace_dir), "--stage", "test_analysis_and_plan", "--output", str(output_dir),
         ])
 
         assert exit_code == 0
         printed = json.loads(capsys.readouterr().out)
-        assert printed["stage"] == "test_plan_discovery"
+        assert printed["stage"] == "test_analysis_and_plan"
         assert printed["outcome"] == "accepted"
         assert printed["output_dir"] == str(output_dir)
 
@@ -926,7 +976,7 @@ class TestRunStageCLI:
         output_dir = tmp_path / "replay-out"
 
         exit_code = run_stage.main([
-            "--source-trace", str(trace_dir), "--stage", "test_plan_discovery", "--output", str(output_dir),
+            "--source-run", str(trace_dir), "--stage", "test_analysis_and_plan", "--output", str(output_dir),
         ])
 
         assert exit_code == 2
@@ -940,7 +990,7 @@ class TestRunStageCLI:
         output_dir = tmp_path / "replay-out"
 
         exit_code = run_stage.main([
-            "--source-trace", str(trace_dir), "--stage", "test_plan_discovery",
+            "--source-run", str(trace_dir), "--stage", "test_analysis_and_plan",
             "--output", str(output_dir), "--repo-root", str(repo),
         ])
         assert exit_code == 0
@@ -975,24 +1025,29 @@ class TestEndToEndRealRunTracedThenRunStage:
 
         source_trace = trace_output_dir / "trace"
         manifest = json.loads((source_trace / "run_manifest.json").read_text())
-        assert manifest["schema_version"] == 1  # sanity: this really is a NEW trace
+        assert manifest["schema_version"] == 2  # sanity: this really is a NEW trace
 
-        # Now replay test_plan_discovery from that REAL trace, with a
-        # controlled response so this assertion is about wiring, not LLM
-        # content.
+        # Now replay test_analysis_and_plan from that REAL trace (Batch A:
+        # its transitional implementation exercises exactly the same
+        # discover_test_plan call Phase 1's test_plan_discovery replay
+        # did), with a controlled response so this assertion is about
+        # wiring, not LLM content.
         _install_fake_call_llm(monkeypatch, _accepted_response_json())
         replay_output_dir = tmp_path / "replay-out"
 
         exit_code = run_stage.main([
-            "--source-trace", str(source_trace), "--stage", "test_plan_discovery",
+            "--source-run", str(source_trace), "--stage", "test_analysis_and_plan",
             "--output", str(replay_output_dir),
         ])
 
         assert exit_code == 0
-        replay_manifest = json.loads((replay_output_dir / "replay_manifest.json").read_text())
-        assert replay_manifest["outcome"] == "accepted"
+        replay_manifest = json.loads((replay_output_dir / "run_manifest.json").read_text())
+        assert replay_manifest["kind"] == "replay"
+        assert replay_manifest["replaces_stage"] == "test_analysis_and_plan"
+        stage_entry = replay_manifest["stages"]["test_analysis_and_plan"]
+        assert stage_entry["outcome"] == "accepted"
+        assert stage_entry["transitional"] is True
         assert replay_manifest["target_repository"]["repo_commit"] == _head_sha(repo)
-        assert replay_manifest["source_run"] == {"input_type": "cve", "input_id": "CVE-2021-77777"}
 
 
 # ---------------------------------------------------------------------------

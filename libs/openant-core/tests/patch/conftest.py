@@ -38,3 +38,4 @@ def _default_to_mock_and_isolated_config(monkeypatch):
     monkeypatch.setattr(llm_client, "_cached_model", {})
     monkeypatch.setattr(llm_client, "_cached_adapters", {})
     monkeypatch.setattr(llm_client, "_call_metadata", {})
+    monkeypatch.setattr(llm_client, "_call_history", {})

@@ -853,7 +853,7 @@ class TestReplayProvenanceManifest:
             run_traced.main(argv)
 
         manifest = json.loads((output_dir / "trace" / "run_manifest.json").read_text())
-        assert manifest["schema_version"] == 1
+        assert manifest["schema_version"] == 2
 
     def test_success_manifest_has_full_target_repo_sha(self, run_traced, tmp_path, monkeypatch):
         monkeypatch.setenv("LLM_PROVIDER", "mock")
@@ -959,7 +959,7 @@ class TestReplayProvenanceManifest:
                 run_traced.main(argv)
 
         manifest = json.loads((output_dir / "trace" / "run_manifest.json").read_text())
-        assert manifest["schema_version"] == 1
+        assert manifest["schema_version"] == 2
         assert manifest["target_repository"]["repo_root"] == str(repo_root)
         assert len(manifest["target_repository"]["repo_commit"]) == 40
         assert "openant" in manifest

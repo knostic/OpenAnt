@@ -80,7 +80,24 @@ _cached_adapters: dict = {}
 # pipeline run completes.
 #
 # `model` here is ALWAYS the model that actually executed.
+#
+# NOTE: this dict holds only the MOST RECENT call for a given stage tag --
+# a stage that legitimately makes more than one call under the same tag
+# (e.g. Finding Calibration's v1 and v2 passes both tagged
+# "finding_calibration") silently overwrites the earlier entry here. This
+# is preserved, unchanged, for backward compatibility with every existing
+# consumer of get_call_metadata() (core/patch.py's RunMetadata, tests).
+# See _call_history / get_call_history() below for the ordered, complete
+# record -- added for the Auto Patcher stage-replay foundation, which needs
+# to prove "this stage made exactly N calls" per stage, not just "a call
+# with this tag happened at some point."
 _call_metadata: dict = {}
+
+# Ordered, complete history of every call, keyed by stage name -> list of
+# per-call metadata dicts in call order. Never overwrites -- every call
+# appends. Same lifetime/reset semantics as _call_metadata (cleared by
+# clear_call_metadata()).
+_call_history: dict = {}
 
 # Display names for user-facing messages. Internal `provider` strings stay
 # lowercase ("anthropic", "openai") to match canonical config's convention.
@@ -99,19 +116,39 @@ class ModelUnavailableError(RuntimeError):
 
 
 def get_call_metadata() -> dict:
-    """Return a copy of the per-stage LLM call metadata collected so far."""
+    """Return a copy of the per-stage LLM call metadata collected so far.
+
+    One entry per stage tag -- the MOST RECENT call under that tag. Use
+    get_call_history() instead when a stage may legitimately make more
+    than one call under the same tag and every call's metadata (not just
+    the last) is needed.
+    """
     return dict(_call_metadata)
 
 
-def clear_call_metadata() -> None:
-    """Clear per-stage LLM call metadata.
+def get_call_history() -> dict:
+    """Return a copy of the complete, ordered per-stage call history:
+    ``{stage: [call_metadata, ...]}``, one list entry per call to that
+    stage tag, in call order. Unlike get_call_metadata(), no call is ever
+    lost to a same-tag overwrite -- a stage that legitimately makes
+    several calls under one tag (e.g. two "finding_calibration" passes)
+    has all of them here, in order.
+    """
+    return {stage: [dict(call) for call in calls] for stage, calls in _call_history.items()}
 
-    Call this once at the start of a run — _call_metadata is module-level
-    state and otherwise persists across multiple run() invocations in the
-    same process (e.g. a batch runner, or a test suite), letting a stale
-    stage entry from a previous run leak into a new run's report.
+
+def clear_call_metadata() -> None:
+    """Clear per-stage LLM call metadata (both the latest-call view and
+    the ordered call history).
+
+    Call this once at the start of a run — _call_metadata/_call_history
+    are module-level state and otherwise persist across multiple run()
+    invocations in the same process (e.g. a batch runner, or a test
+    suite), letting a stale stage entry from a previous run leak into a
+    new run's report.
     """
     _call_metadata.clear()
+    _call_history.clear()
 
 
 def _resolve_max_tokens() -> int:
@@ -612,12 +649,14 @@ def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> s
 
     if provider == "mock":
         print("Using mock LLM", file=sys.stderr)
-        _call_metadata[stage] = {
+        record = {
             "provider": "mock",
             "model": "mock",
             "max_tokens_configured": None,
             "stop_reason": "mock",
         }
+        _call_metadata[stage] = record
+        _call_history.setdefault(stage, []).append(dict(record))
         return _mock_response(prompt)
 
     model_to_use = _resolve_model(provider, model)
@@ -664,11 +703,13 @@ def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> s
         pricing=getattr(adapter, "pricing", {}).get(model_to_use),
     )
 
-    _call_metadata[stage] = {
+    record = {
         "provider": provider,
         "model": model_to_use,
         "max_tokens_configured": resolved_max_tokens,
         "stop_reason": result.stop_reason,
     }
+    _call_metadata[stage] = record
+    _call_history.setdefault(stage, []).append(dict(record))
 
     return "\n".join(block.text for block in result.content if isinstance(block, TextBlock))

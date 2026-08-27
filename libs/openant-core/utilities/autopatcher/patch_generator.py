@@ -240,6 +240,7 @@ def generate_patch(
     llm: LLMClient,
     code_context: str = "",
     retry_hint: str = "",
+    stage: str = "patch_generation",
 ) -> str:
     """
     Generate a patch for the given vulnerability description.
@@ -258,6 +259,19 @@ def generate_patch(
         When non-empty, appended as a "## Retry instruction" section to the
         user message.  Used by the applicability-aware retry path to tell the
         model what went wrong and to use only the provided code context.
+    stage:
+        The `stage` label passed to llm.complete() — purely an observability/
+        ownership tag for the LLM call tracer (see generate_patch_raw's own
+        `stage` parameter, which this forwards to unchanged). Defaults to
+        "patch_generation" so every pre-existing caller is unaffected. A
+        caller regenerating a patch for a DIFFERENT canonical replay stage
+        than the one that owns plain "patch_generation" — e.g. the
+        Challenger-driven repair loop, which is
+        patch_repair_and_calibration's own regeneration, not
+        patch_generation_and_post_patch_investigation's — must pass a
+        distinct value so the two stages' LLM calls stay unambiguous in a
+        trace and for stage-replay LLM-ownership enforcement. Never changes
+        the prompt content or the request itself.
 
     Returns
     -------
@@ -272,5 +286,5 @@ def generate_patch(
         _generate_patch_with_contract_check for the bounded
         contract-violation retry built on top of generate_patch_raw().
     """
-    raw = generate_patch_raw(vulnerability_text, llm, code_context=code_context, retry_hint=retry_hint)
+    raw = generate_patch_raw(vulnerability_text, llm, code_context=code_context, retry_hint=retry_hint, stage=stage)
     return classify_patch_response(raw).diff
