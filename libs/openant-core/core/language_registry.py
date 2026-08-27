@@ -80,7 +80,21 @@ def find_languages_config() -> Path | None:
     found = _search_upward(Path(__file__).parent)
     if found is not None:
         return found
-    return _search_upward(Path.cwd())
+    found = _search_upward(Path.cwd())
+    if found is not None:
+        # #273 visibility: the CWD leg can find a config in the working
+        # directory — including a scanned repo's own config when run from
+        # inside it. skip_dirs/extensions from it are data-only (parser
+        # scripts are hard-guarded in parser_script_path); this note makes
+        # the source loud instead of silent.
+        print(
+            f"[languages] note: config/languages.json located via the "
+            f"working directory ({found}); if this is the scanned "
+            f"repository, its settings are being trusted for "
+            f"skip_dirs/extensions",
+            file=sys.stderr,
+        )
+    return found
 
 # Root of openant-core, used to resolve parser script paths.
 _CORE_ROOT = Path(__file__).parent.parent
@@ -283,8 +297,29 @@ def docker_template_for(language: str) -> str | None:
 
 
 def parser_script_path(language: str) -> Path | None:
-    """Absolute path to a language's subprocess parser entry point."""
+    """Absolute path to a language's subprocess parser entry point.
+
+    #273 hard guard: the config file may come from an untrusted source
+    (the resolver's CWD-upward leg can find a scanned repo's own
+    config/languages.json), and ``Path('/root') / '/abs'`` is ``'/abs'``
+    in pathlib — an absolute ``parser.script`` value previously resolved
+    to ITSELF and was executed via ``sys.executable``. Resolve and require
+    the result to stay under ``_CORE_ROOT`` (rejects absolute values,
+    ``..`` escapes, and symlink escapes alike); anything else returns None
+    (the caller degrades to a typed error, never executes).
+    """
     spec = load_registry().get(language)
     if spec is None or not spec.parser_script:
         return None
-    return _CORE_ROOT / spec.parser_script
+    root = _CORE_ROOT.resolve()
+    try:
+        candidate = (root / spec.parser_script).resolve()
+    except (OSError, ValueError):
+        # Hostile script values (e.g. embedded NULs, absurd length) can
+        # make resolve itself raise — total guard, never executes.
+        return None
+    if not candidate.is_relative_to(root) or candidate == root:
+        # == root: "." and friends resolve to the root DIRECTORY — not a
+        # script; reject alongside out-of-root escapes.
+        return None
+    return candidate

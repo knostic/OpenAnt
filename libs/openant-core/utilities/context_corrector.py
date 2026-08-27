@@ -61,10 +61,16 @@ def _canonical_skip_dirs() -> set[str]:
     """
     skip = set(_FALLBACK_SKIP_DIRS)
     try:
-        # utilities/context_corrector.py -> utilities -> openant-core -> libs -> repo root
-        cfg = Path(__file__).resolve().parent.parent.parent.parent / "config" / "languages.json"
-        with open(cfg, 'r', encoding='utf-8') as fh:
-            skip |= set(json.load(fh).get("skip_dirs", ()))
+        # #273: resolve through the registry's own locator. The previous
+        # fixed four-.parent walk matched only the CHECKOUT depth — in a
+        # wheel install the config sits two parents up, the walk missed,
+        # and every pip install silently degraded to this frozen fallback.
+        from core.language_registry import find_languages_config
+
+        cfg = find_languages_config()
+        if cfg is not None:
+            with open(cfg, 'r', encoding='utf-8') as fh:
+                skip |= set(json.load(fh).get("skip_dirs", ()))
     except Exception:
         pass
     return skip

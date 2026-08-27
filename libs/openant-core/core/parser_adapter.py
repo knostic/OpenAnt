@@ -808,6 +808,19 @@ def _parse_via_subprocess(
     print(f"[Parser] Running {language} parser...", file=sys.stderr)
 
     parser_script = parser_script_path(language)
+    if parser_script is None:
+        # #273: the guard rejected the config's parser.script (absolute
+        # path, .. escape, or symlink escape out of the engine root) or the
+        # language has no script. Say THAT — a bare str(None) spawn would
+        # fail with a misleading generic RuntimeError exactly in the
+        # hostile-config scenario this guard exists for.
+        raise RuntimeError(
+            f"No runnable parser script for language {language!r}: the "
+            "registry entry has no parser.script, or its value was "
+            "rejected by the engine-root containment guard "
+            "(config/languages.json may come from an untrusted source — "
+            "see parser_script_path)"
+        )
 
     cmd = [
         sys.executable, str(parser_script),
