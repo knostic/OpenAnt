@@ -66,7 +66,7 @@ class TestRealTracedRunRecordsExecutions:
         assert manifest["kind"] == "full_run"
         assert manifest["parent"] is None
         assert "executions" in manifest
-        assert len(manifest["executions"]) == 5
+        assert len(manifest["executions"]) == 6
 
     def test_exact_canonical_stage_order(self, run_traced, tmp_path, monkeypatch):
         _, manifest = _run_traced(run_traced, tmp_path, monkeypatch)
@@ -76,6 +76,7 @@ class TestRealTracedRunRecordsExecutions:
             "guided_context_acquisition",
             "patch_generation_and_post_patch_investigation",
             "challenger",
+            "patch_repair_and_calibration",
         ]
 
     def test_exact_execution_ids(self, run_traced, tmp_path, monkeypatch):
@@ -86,6 +87,7 @@ class TestRealTracedRunRecordsExecutions:
             "003_guided_context_acquisition",
             "004_patch_generation_and_post_patch_investigation",
             "005_challenger",
+            "006_patch_repair_and_calibration",
         ]
 
     def test_consumed_edges_reference_the_output_dir_as_run(self, run_traced, tmp_path, monkeypatch):
@@ -94,10 +96,13 @@ class TestRealTracedRunRecordsExecutions:
         assert s4["consumed"]["guided_context_acquisition"]["run"] == str(output_dir)
         assert s4["consumed"]["guided_context_acquisition"]["execution_id"] == "003_guided_context_acquisition"
 
-    def test_no_stage6_or_repeated_stage_executions(self, run_traced, tmp_path, monkeypatch):
+    def test_no_repeated_canonical_stage_executions(self, run_traced, tmp_path, monkeypatch):
+        """Batch B3: S6 (patch_repair_and_calibration) IS now expected --
+        but no canonical stage should ever appear twice (no fabricated
+        S4#2/S5#2/S6#2)."""
         _, manifest = _run_traced(run_traced, tmp_path, monkeypatch)
         stages = [e["canonical_stage"] for e in manifest["executions"]]
-        assert "patch_repair_and_calibration" not in stages
+        assert "patch_repair_and_calibration" in stages
         assert len(stages) == len(set(stages))  # no canonical stage repeated
 
     def test_every_execution_has_an_artifact_file(self, run_traced, tmp_path, monkeypatch):
@@ -174,3 +179,60 @@ class TestRealTracedRunRecordsExecutions:
         stages = [e["canonical_stage"] for e in manifest["executions"]]
         assert "patch_generation_and_post_patch_investigation" in stages
         assert "challenger" not in stages  # S5 never finished -- honestly absent
+
+
+class TestStage6CalibrationFallback:
+    """Case D: the real mock-mode challenger response
+    (llm_client._MOCK_CHALLENGE) has no confirmed_defect finding, so Stage
+    6's late-calibration fallback genuinely fires with a real LLM call --
+    this is the exact dataflow that previously blocked Stage-6 persistence
+    (the fallback settling `finding_calibration` after Existing Test
+    Comparison/Stage 7 would have started). Proves, end-to-end, that it now
+    settles INSIDE S6, before S6 finishes, with no Stage-7 leakage."""
+
+    def test_fallback_llm_call_is_captured_inside_s6(self, run_traced, tmp_path, monkeypatch):
+        _, manifest = _run_traced(run_traced, tmp_path, monkeypatch)
+        s6 = manifest["executions"][5]
+        assert s6["canonical_stage"] == "patch_repair_and_calibration"
+        tags = [c["stage"] for c in s6["llm_calls"]]
+        assert "finding_calibration" in tags
+
+    def test_s6_llm_calls_all_within_registry_owned_tags(self, run_traced, tmp_path, monkeypatch):
+        from utilities.autopatcher.stage_registry import PATCH_REPAIR_AND_CALIBRATION, STAGE_OWNED_LLM_TAGS
+
+        _, manifest = _run_traced(run_traced, tmp_path, monkeypatch)
+        s6 = manifest["executions"][5]
+        owned = STAGE_OWNED_LLM_TAGS[PATCH_REPAIR_AND_CALIBRATION]
+        for call in s6["llm_calls"]:
+            assert call["stage"] in owned
+
+    def test_no_stage7_call_leaks_into_s6(self, run_traced, tmp_path, monkeypatch):
+        """patch_review/confidence_scorer (Stage 7/Confidence Scoring's own
+        owned tags) must never appear inside S6's llm_calls."""
+        _, manifest = _run_traced(run_traced, tmp_path, monkeypatch)
+        s6 = manifest["executions"][5]
+        tags = {c["stage"] for c in s6["llm_calls"]}
+        assert "patch_review" not in tags
+        assert "confidence_scorer" not in tags
+
+    def test_final_calibration_artifact_matches_what_downstream_report_used(self, run_traced, tmp_path, monkeypatch):
+        """The S6 artifact's `finding_calibration` must be the SAME final
+        value that fed the report -- proven by checking it's non-empty,
+        sourced from the fallback, and its reworded text appears in the
+        trust report the run actually wrote."""
+        output_dir, manifest = _run_traced(run_traced, tmp_path, monkeypatch)
+        s6 = manifest["executions"][5]
+        artifact = json.loads(Path(s6["artifact_path"]).read_text())
+        assert artifact["finding_calibration_source"] == "fallback"
+        assert artifact["finding_calibration"]
+        trust_report = (output_dir / "patch" / "CVE-2021-12345-trust-report.md").read_text()
+        first_reworded = artifact["finding_calibration"][0]["reworded"]
+        assert first_reworded in trust_report
+
+    def test_repair_not_triggered_honestly_recorded(self, run_traced, tmp_path, monkeypatch):
+        _, manifest = _run_traced(run_traced, tmp_path, monkeypatch)
+        s6 = manifest["executions"][5]
+        artifact = json.loads(Path(s6["artifact_path"]).read_text())
+        assert artifact["repair_attempted"] is False
+        assert artifact["repair_outcome"] == "not_triggered_no_defects"
+        assert artifact["authoritative_candidate"]["source"] == "original"

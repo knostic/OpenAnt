@@ -33,6 +33,7 @@ from .stage_registry import (
     CHALLENGER as _S_CHALLENGER,
     GUIDED_CONTEXT_ACQUISITION as _S_GUIDED_CONTEXT_ACQUISITION,
     PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION as _S_PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
+    PATCH_REPAIR_AND_CALIBRATION as _S_PATCH_REPAIR_AND_CALIBRATION,
     REMEDIATION_STRATEGY as _S_REMEDIATION_STRATEGY,
     REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING as _S_REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING,
 )
@@ -5297,6 +5298,25 @@ def run(
             },
         )
 
+    # Batch B3: begin recording S6's execution (patch_repair_and_calibration).
+    # consumed=[S4, S5] (stage_registry.STAGE_DEPENDENCIES[PATCH_REPAIR_AND_
+    # CALIBRATION]) -- covers classification, calibration v1, the repair
+    # loop, and the (now-adjacent, see below) final-calibration fallback --
+    # through where `finding_calibration` is FULLY, finally settled, before
+    # Evidence Sufficiency Gate/Existing Test Comparison/Stage 7 begin.
+    # Repair-triggered regeneration/re-challenge remain INTERNAL to this one
+    # S6 execution in this batch -- NOT recorded as canonical S4#2/S5#2 (the
+    # repair-regeneration code path is proven NOT equivalent to Stage 4's
+    # full canonical contract: no contract retry, no conformance/recovery,
+    # no applicability-aware retry, no post-patch investigation -- forcing
+    # symmetry now would misrepresent two different contracts as one).
+    _s6_handle = None
+    if execution_recorder is not None:
+        _s6_handle = execution_recorder.start(
+            _S_PATCH_REPAIR_AND_CALIBRATION,
+            consumed=[r for r in (_s4_rec, _s5_rec) if r is not None],
+        )
+
     # Phase C: Challenger-driven repair loop.
     #
     # Flow: Patch v1 -> Challenger v1 -> raw classification -> Finding
@@ -5309,9 +5329,12 @@ def run(
     # this block (as before) -- but ONLY when there is at least one raw
     # confirmed_defect finding to gate on. When there are none
     # (_orig_defect_count == 0, the common case), this block does nothing
-    # and calibration runs exactly once, later, at its original position
-    # and cost (see the "Finding calibration" block below) -- no extra LLM
-    # call is added for the all-clear path.
+    # and calibration runs exactly once, later, immediately after this
+    # block (see the "Finding calibration" fallback right below -- moved
+    # here, adjacent, in Batch B3, so ALL of Stage 6's owned computation is
+    # textually contiguous and settles before the S6 execution finishes;
+    # previously this same fallback ran much further down, after Existing
+    # Test Comparison) -- no extra LLM call is added for the all-clear path.
     _repair_classified = _classify_challenger(challenger)
     _orig_defect_count = _repair_classified["confirmed_defect_count"]
 
@@ -5322,6 +5345,17 @@ def run(
     repair_defect_count = 0
     repair_rechallenged = False
     finding_calibration: list[dict] | None = None
+    # Batch B3: pre-initialized (not previously read outside the repair
+    # try/except block, so never previously needed a default) purely so
+    # this batch's S6 artifact-building code below can safely reference
+    # them even in the edge case where the repair try block raised before
+    # reaching their own assignment (e.g. generate_patch() itself failing)
+    # -- repair_attempted can be True with these still None in that case.
+    # No effect on existing repair-loop behavior: nothing inside the try
+    # block reads these before assigning them.
+    _r_hygiene: "list | None" = None
+    _r_app: "dict | None" = None
+    _r_applicable: "bool | None" = None
 
     if _orig_defect_count > 0:
         # Finding Calibration v1: widened to include confirmed_defect
@@ -5450,6 +5484,142 @@ def run(
             except Exception as exc:
                 print(f"[pipeline] Repair loop failed unexpectedly: {exc}", file=sys.stderr)
 
+    # Batch B3: moved here from further below (originally after Existing
+    # Test Comparison/deterministic signals) so ALL Stage-6-owned
+    # computation -- classification, calibration v1, the repair loop, and
+    # this final-calibration fallback -- is textually contiguous and fully
+    # settles before the S6 execution below finishes, and before Evidence
+    # Sufficiency Gate/Existing Test Comparison/Stage 7 (none of which are
+    # Stage-6-owned) begin. Pure reordering: this block reads only
+    # `_post_patch_observations`/`patch`/`_investigated_patch` (settled by
+    # Stage 4, long before this point) and `finding_calibration`/
+    # `challenger` (settled by the repair loop directly above) -- nothing
+    # produced by Evidence Sufficiency Gate/Existing Test Comparison/
+    # deterministic signals, so moving it earlier changes no computed
+    # value, only the console-log line order (never report/result content).
+    #
+    # Post-Patch Investigation staleness guard: if the repair loop above
+    # replaced `patch`, the evidence computed before the first Challenger
+    # call describes a patch that no longer exists. Never let it leak into
+    # calibrate_findings() below (or score_confidence() further down,
+    # which reuses this same flag) in that case -- they must fall back to
+    # the plain code_context, same as if the feature never ran.
+    _post_patch_evidence_current = (
+        _post_patch_observations is not None and patch == _investigated_patch
+    )
+
+    # Finding calibration (evidence-quality pass) — classifies and rewords
+    # the plausible_risk/generic findings from the FINAL challenger result
+    # (post-repair, if a repair was accepted) so calibration reasons about
+    # the patch that will actually be reported. confirmed_defect and
+    # validation_gap findings are not sent here — those already have
+    # unambiguous framing from earlier report-presentation work. Best-effort:
+    # any failure leaves finding_calibration as None, and report rendering
+    # falls back to the uncalibrated classifier text rather than losing
+    # findings or crashing the run.
+    #
+    # Only runs when the repair block above did NOT already compute the
+    # authoritative calibration (i.e. _orig_defect_count was 0 -- no raw
+    # confirmed_defect finding existed, so `challenger`/`patch` are still
+    # exactly what they were before the repair block, and this is
+    # identical to the pre-existing, unwidened plausible_risk/generic-only
+    # call). This is what keeps the common all-clear case free of any
+    # extra LLM call.
+    _finding_calibration_source = "none"
+    if finding_calibration is not None:
+        _finding_calibration_source = "v2" if repair_succeeded else "v1"
+    if finding_calibration is None:
+        _final_classified = _classify_challenger(challenger)
+        _calibration_inputs = [
+            f["text"]
+            for f in (
+                _final_classified["classified_edge_cases"]
+                + _final_classified["classified_potential_issues"]
+            )
+            if f["category"] in ("plausible_risk", "generic")
+        ]
+        if _calibration_inputs:
+            try:
+                finding_calibration = calibrate_findings(
+                    vulnerability_text, patch, _calibration_inputs, llm,
+                    code_context=(challenger_context if _post_patch_evidence_current else code_context),
+                )
+                _finding_calibration_source = "fallback"
+            except Exception as _exc:
+                print(f"[pipeline] Finding calibration failed (non-fatal): {_exc}", file=sys.stderr)
+
+    # Batch B3: finish S6. `consumed` stays strictly {S4#1, S5#1} -- the
+    # exact canonical candidate this execution evaluated -- regardless of
+    # whether an internal repair attempt fired; the repair-triggered
+    # regeneration/re-challenge have NO canonical execution identity yet
+    # (see this stage's start() comment), so their result is represented
+    # ONLY inside this artifact's own `repair_regeneration`/
+    # `repair_rechallenge` fields, never smuggled into `consumed`. Likewise
+    # `authoritative_candidate` distinguishes the ORIGINAL canonical
+    # candidate (a real {run, execution_id} pointer to S4#1/S5#1) from an
+    # accepted INTERNAL repair candidate (no execution identity exists for
+    # it -- represented by its own settled content instead, never a vague
+    # display string).
+    _s6_rec = None
+    if execution_recorder is not None:
+        if not (patch and patch.strip()) and not repair_attempted:
+            _s6_outcome = "skipped_no_candidate_patch"
+        else:
+            _s6_outcome = "settled"
+        if not repair_attempted:
+            _repair_outcome = "not_triggered_no_defects" if _orig_defect_count == 0 else "not_triggered_gate_declined"
+        elif _r_applicable is None:
+            _repair_outcome = "attempted_failed"  # never even completed applicability check
+        elif _r_applicable is False:
+            _repair_outcome = "attempted_inapplicable"
+        elif repair_succeeded:
+            _repair_outcome = "attempted_applicable_accepted"
+        elif repair_rechallenged:
+            _repair_outcome = "attempted_applicable_rejected"
+        else:
+            _repair_outcome = "attempted_failed"  # applicable, but re-challenge/calibration itself raised
+        # `authoritative_candidate` names ONLY what was actually selected --
+        # it must never repeat S4#1/S5#1 in a way that implies they
+        # identify/produced the repaired candidate (they didn't; they are
+        # this execution's canonical CONSUMED inputs, already recorded
+        # exactly once, correctly, in StageExecution.consumed above). No
+        # execution identity exists for an internal repair candidate --
+        # fabricating one here would misrepresent it as canonical.
+        _authoritative_candidate = {
+            "source": "internal_repair" if repair_succeeded else "original",
+            "patch": patch,
+            "applicability_result": to_jsonable(applicability_result),
+            "hygiene_findings": to_jsonable(hygiene_findings),
+        }
+        _s6_rec = execution_recorder.finish(
+            _s6_handle,
+            outcome=_s6_outcome,
+            artifact={
+                "original_candidate_evaluated": {
+                    "patch": original_patch,
+                    "challenger": to_jsonable(_repair_classified),
+                },
+                "repair_attempted": repair_attempted,
+                "repair_regeneration": (
+                    {
+                        "patch": repair_patch_content,
+                        "hygiene_findings": to_jsonable(_r_hygiene) if repair_attempted else None,
+                        "applicability_result": to_jsonable(_r_app) if repair_attempted else None,
+                    } if repair_attempted else None
+                ),
+                "repair_rechallenge": (
+                    {
+                        "challenger": to_jsonable(repair_challenger_result),
+                        "confirmed_defect_count": repair_defect_count,
+                    } if repair_rechallenged else None
+                ),
+                "repair_outcome": _repair_outcome,
+                "finding_calibration": to_jsonable(finding_calibration),
+                "finding_calibration_source": _finding_calibration_source,
+                "authoritative_candidate": _authoritative_candidate,
+            },
+        )
+
     # Evidence Sufficiency Gate (Phase 1) -- a deterministic Trust Signal,
     # computed here because everything above (the retry and challenger-repair
     # loops) has now settled and `_final_repair_meta` reflects whichever
@@ -5469,15 +5639,10 @@ def run(
     except Exception:
         pass
 
-    # Post-Patch Investigation staleness guard: if the repair loop above
-    # replaced `patch`, the evidence computed before the first Challenger
-    # call describes a patch that no longer exists. Never let it leak into
-    # calibrate_findings()/score_confidence() below in that case -- they
-    # must fall back to the plain code_context, same as if the feature
-    # never ran.
-    _post_patch_evidence_current = (
-        _post_patch_observations is not None and patch == _investigated_patch
-    )
+    # (Batch B3: `_post_patch_evidence_current` now computed earlier,
+    # immediately after the repair loop -- see that comment -- since
+    # calibrate_findings()'s own use of it moved there too. Still used
+    # below, unchanged, by score_confidence().)
 
     # Existing Test Comparison (opt-in) -- runs here because everything
     # above (applicability-aware retry AND the Challenger-driven repair
@@ -5530,41 +5695,11 @@ def run(
         except Exception as _exc:
             print(f"[pipeline] Remediation signals failed (non-fatal): {_exc}", file=sys.stderr)
 
-    # Finding calibration (evidence-quality pass) — classifies and rewords
-    # the plausible_risk/generic findings from the FINAL challenger result
-    # (post-repair, if a repair was accepted) so calibration reasons about
-    # the patch that will actually be reported. confirmed_defect and
-    # validation_gap findings are not sent here — those already have
-    # unambiguous framing from earlier report-presentation work. Best-effort:
-    # any failure leaves finding_calibration as None, and report rendering
-    # falls back to the uncalibrated classifier text rather than losing
-    # findings or crashing the run.
-    #
-    # Only runs when the repair block above did NOT already compute the
-    # authoritative calibration (i.e. _orig_defect_count was 0 -- no raw
-    # confirmed_defect finding existed, so `challenger`/`patch` are still
-    # exactly what they were before the repair block, and this is
-    # identical to the pre-existing, unwidened plausible_risk/generic-only
-    # call). This is what keeps the common all-clear case free of any
-    # extra LLM call.
-    if finding_calibration is None:
-        _final_classified = _classify_challenger(challenger)
-        _calibration_inputs = [
-            f["text"]
-            for f in (
-                _final_classified["classified_edge_cases"]
-                + _final_classified["classified_potential_issues"]
-            )
-            if f["category"] in ("plausible_risk", "generic")
-        ]
-        if _calibration_inputs:
-            try:
-                finding_calibration = calibrate_findings(
-                    vulnerability_text, patch, _calibration_inputs, llm,
-                    code_context=(challenger_context if _post_patch_evidence_current else code_context),
-                )
-            except Exception as _exc:
-                print(f"[pipeline] Finding calibration failed (non-fatal): {_exc}", file=sys.stderr)
+    # (Batch B3: the final-calibration fallback that used to live here now
+    # runs immediately after the repair loop, above -- see that comment --
+    # so it's part of Stage 6's contiguous, fully-settled output. `finding_
+    # calibration` is already its final value by the time execution reaches
+    # here.)
 
     # No-candidate-patch early stop (continued -- see the Challenger gate
     # above): the Patch Reviewer and Confidence Scorer are equally

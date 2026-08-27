@@ -103,7 +103,7 @@ def _run_with_recorder(tmp_path, *, patches_gen, patches_app, patches_chall, no_
 # ---------------------------------------------------------------------------
 
 class TestNoRepairTopology:
-    def test_exactly_five_executions_in_order(self, tmp_path):
+    def test_exactly_six_executions_in_order(self, tmp_path):
         _, rec = _run_with_recorder(
             tmp_path, patches_gen=[_CLEAN_DIFF], patches_app=[_APPLICABILITY_CLEAN],
             patches_chall=[_CHALLENGER_CLEAN],
@@ -114,6 +114,7 @@ class TestNoRepairTopology:
             GUIDED_CONTEXT_ACQUISITION,
             PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
             CHALLENGER,
+            "patch_repair_and_calibration",
         ]
         assert [e["execution_id"] for e in rec.executions] == [
             "001_repository_analysis_and_remediation_planning",
@@ -121,6 +122,7 @@ class TestNoRepairTopology:
             "003_guided_context_acquisition",
             "004_patch_generation_and_post_patch_investigation",
             "005_challenger",
+            "006_patch_repair_and_calibration",
         ]
 
     def test_exact_consumed_edges(self, tmp_path):
@@ -129,7 +131,7 @@ class TestNoRepairTopology:
             tmp_path, patches_gen=[_CLEAN_DIFF], patches_app=[_APPLICABILITY_CLEAN],
             patches_chall=[_CHALLENGER_CLEAN],
         )
-        s1, s2, s3, s4, s5 = rec.executions
+        s1, s2, s3, s4, s5, s6 = rec.executions
         assert s1["consumed"] == {}
         assert s2["consumed"] == {
             REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING: {"run": run_dir, "execution_id": s1["execution_id"]},
@@ -145,6 +147,10 @@ class TestNoRepairTopology:
         }
         assert s5["consumed"] == {
             PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION: {"run": run_dir, "execution_id": s4["execution_id"]},
+        }
+        assert s6["consumed"] == {
+            PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION: {"run": run_dir, "execution_id": s4["execution_id"]},
+            CHALLENGER: {"run": run_dir, "execution_id": s5["execution_id"]},
         }
 
     def test_all_invoked_by_null(self, tmp_path):
@@ -269,33 +275,41 @@ class TestS5Artifact:
 
 
 # ---------------------------------------------------------------------------
-# 16-17: repair path still records exactly S1-S5, never S6/S4#2/S5#2
+# Batch B3: repair path now records exactly S1-S6 (S6 real, since this
+# batch), but NEVER a fabricated canonical S4#2/S5#2 -- repair regeneration/
+# re-challenge stay internal to S6's own artifact (see test_pipeline_
+# execution_recording_stage6.py for the full Stage-6-specific proof set).
 # ---------------------------------------------------------------------------
 
-class TestRepairLoopNotRecorded:
-    def test_repair_accepted_still_records_exactly_five(self, tmp_path):
+class TestRepairLoopDoesNotFabricateS4_2OrS5_2:
+    def test_repair_accepted_records_exactly_six_canonical_executions(self, tmp_path):
         _, rec = _run_with_recorder(
             tmp_path,
             patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
             patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
             patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_CLEAN],
         )
-        assert len(rec.executions) == 5
-        stages = {e["canonical_stage"] for e in rec.executions}
-        assert "patch_repair_and_calibration" not in stages
+        assert len(rec.executions) == 6
+        stages = [e["canonical_stage"] for e in rec.executions]
+        assert stages[5] == "patch_repair_and_calibration"
         ids = {e["execution_id"] for e in rec.executions}
-        assert "006_patch_repair_and_calibration" not in ids
-        assert "006_patch_generation_and_post_patch_investigation" not in ids
-        assert "005_patch_generation_and_post_patch_investigation" not in ids  # no S4#2
+        assert ids == {
+            "001_repository_analysis_and_remediation_planning",
+            "002_remediation_strategy",
+            "003_guided_context_acquisition",
+            "004_patch_generation_and_post_patch_investigation",
+            "005_challenger",
+            "006_patch_repair_and_calibration",
+        }  # no fabricated 005_patch_generation_and_post_patch_investigation (S4#2) etc.
 
-    def test_repair_rejected_still_records_exactly_five(self, tmp_path):
+    def test_repair_rejected_records_exactly_six_canonical_executions(self, tmp_path):
         _, rec = _run_with_recorder(
             tmp_path,
             patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
             patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
             patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_WITH_DEFECT],
         )
-        assert len(rec.executions) == 5
+        assert len(rec.executions) == 6
 
     def test_s4_and_s5_artifacts_reflect_pre_repair_state_only(self, tmp_path):
         """S4/S5's recorded artifacts describe the INITIAL pass -- the
