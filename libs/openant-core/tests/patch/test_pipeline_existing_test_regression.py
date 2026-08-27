@@ -60,13 +60,40 @@ def _calibrate_all_observed(vulnerability_text, patch, findings, llm, code_conte
     return [{"original": f, "group": "observed", "reworded": f} for f in findings]
 
 
+_FAKE_DISCOVERED_PLAN = None  # built lazily, see _default_discovered_plan()
+
+
+def _default_discovered_plan():
+    """A minimal real TestExecutionPlan -- discover_test_plan_for_comparison
+    is mocked to "succeed" with this by default, so tests in this file
+    (which exercise the WIRING around comparison, not discovery itself)
+    reach evaluate_existing_test_comparison_with_plan() exactly as they
+    did before the Batch B5 discovery/comparison split."""
+    from utilities.autopatcher.test_execution_models import TestExecutionPlan
+    return TestExecutionPlan(
+        setup_commands=(), test_command=("python", "-m", "pytest"),
+        result_strategy="exit_code", result_output_path=None,
+        runtime_family="python", runtime_version_hint=None,
+        evidence=(), reasoning_summary="test fixture plan", confidence="high",
+    )
+
+
 def _run_pipeline(
     tmp_path, *, compare_existing_tests, repo_root=None,
     patches_gen=(_CLEAN_DIFF,), patches_chall=(_CHALLENGER_CLEAN,),
     etr_return_value=None, etr_side_effect=None,
+    discovery_return_value=None,
 ):
     """Run pipeline.run() with everything mocked except the wiring under
-    test. Returns (PipelineResult, report, mock_evaluate)."""
+    test. Returns (PipelineResult, report, mock_evaluate).
+
+    discover_test_plan_for_comparison (Batch B5's S10 half) is mocked to
+    succeed by default (a fixture plan, no early_result) so every existing
+    test here reaches evaluate_existing_test_comparison_with_plan() (S11's
+    half, still named `mock_evaluate` for these tests' own purposes)
+    exactly as before the split -- pass discovery_return_value explicitly
+    to exercise a discovery-level early stop instead.
+    """
     captured = {}
     import utilities.autopatcher.pipeline as _pipeline_mod
     orig_build = _pipeline_mod._build_report
@@ -74,6 +101,9 @@ def _run_pipeline(
     def _capture(r):
         captured["result"] = r
         return orig_build(r)
+
+    if discovery_return_value is None:
+        discovery_return_value = (_default_discovered_plan(), None, mock.MagicMock())
 
     with (
         mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
@@ -89,7 +119,11 @@ def _run_pipeline(
         mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
         mock.patch("utilities.autopatcher.pipeline._build_report", side_effect=_capture),
         mock.patch(
-            "utilities.autopatcher.pipeline.evaluate_existing_test_comparison",
+            "utilities.autopatcher.pipeline.discover_test_plan_for_comparison",
+            return_value=discovery_return_value,
+        ) as mock_discover,
+        mock.patch(
+            "utilities.autopatcher.pipeline.evaluate_existing_test_comparison_with_plan",
             return_value=etr_return_value, side_effect=etr_side_effect,
         ) as mock_evaluate,
     ):
@@ -173,7 +207,7 @@ class TestFeatureFlagOn:
         )
         assert result.repair_succeeded is True
         mock_evaluate.assert_called_once()
-        called_repo_root, called_patch = mock_evaluate.call_args[0]
+        called_repo_root, called_patch, called_plan = mock_evaluate.call_args[0]
         assert "repaired" in called_patch
         assert called_patch == result.patch
 

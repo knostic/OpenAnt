@@ -458,88 +458,111 @@ def _baseline_unusable_reason(baseline: TestRunResult) -> str:
     return f"Baseline test output could not be interpreted: {baseline.reason or baseline.status}"
 
 
-def evaluate_existing_test_comparison(
-    repo_root: "Path | str",
-    patch: str,
-    llm,
-    setup_timeout: int = DEFAULT_SETUP_TIMEOUT,
-    run_timeout: int = DEFAULT_RUN_TIMEOUT,
-) -> ExistingTestComparisonResult:
-    """Run Existing Test Comparison for ``patch`` against ``repo_root``.
-    Never mutates ``repo_root`` -- every execution happens inside a
-    disposable ``patch_workspace.temporary_repo_copy``. Never raises: any
-    unexpected internal failure degrades to a TEST_EXECUTION_ERROR/
-    NOT_VERIFIED result rather than propagating.
+def discover_test_plan_for_comparison(
+    repo_root: "Path | str", patch: str, llm,
+) -> "tuple[TestExecutionPlan | None, ExistingTestComparisonResult | None, object | None]":
+    """The DISCOVERY half of what used to be one fused
+    evaluate_existing_test_comparison() call (extracted so a caller --
+    pipeline.run(), for canonical Stage-10/Stage-11 StageExecution
+    recording -- can record test-plan discovery and existing-test
+    comparison as separate, truthful executions; see
+    evaluate_existing_test_comparison_with_plan() for the other half).
 
-    Same-plan invariant: Test Plan Discovery runs EXACTLY ONCE here,
-    against the original (unpatched) ``repo_root``, before either
-    workspace is created. The single resulting immutable
-    ``TestExecutionPlan`` is reused, unmodified, for both the baseline and
-    patched runs -- there is no code path in this function capable of
-    invoking discovery a second time.
+    Returns ``(plan, None, executor)`` when a TestExecutionPlan was
+    discovered, or ``(None, early_result, None)`` when comparison must
+    stop before (or at) discovery -- ``early_result`` is EXACTLY the
+    ExistingTestComparisonResult evaluate_existing_test_comparison() would
+    have returned at that same point, unchanged: identical reasons,
+    identical NOT_VERIFIED/TEST_EXECUTION_ERROR shapes.
 
-    Environment preflight (fail-fast, BEFORE any LLM/Docker cost):
-    cheap, deterministic checks -- candidate patch present, repo_root is a
-    real directory, and the selected executor's own ``.preflight()`` (for
-    Docker: CLI present, daemon reachable, daemon minimally usable; see
-    utilities.docker_isolation.docker_preflight) -- all run before
-    gather_test_plan_evidence/discover_test_plan is ever called. This is
-    the fix for a real observed failure mode: Test Plan Discovery
+    ``executor``: the SAME already-preflighted executor instance this
+    function itself just selected, returned so a caller that goes on to
+    run evaluate_existing_test_comparison_with_plan() can pass it straight
+    through (``executor=``) and skip a second, redundant ``.preflight()``
+    call -- preserving the original function's "exactly one preflight
+    call" behavior even when discovery and comparison are invoked as two
+    separate steps. ``None`` whenever no executor was successfully
+    preflighted (every early-stop case above).
+
+    Environment preflight (fail-fast, BEFORE any LLM/Docker cost): cheap,
+    deterministic checks -- candidate patch present, repo_root is a real
+    directory, and the selected executor's own ``.preflight()`` -- all run
+    before gather_test_plan_evidence/discover_test_plan is ever called.
+    This is the fix for a real observed failure mode: Test Plan Discovery
     spending an LLM call and then execution failing anyway because the
-    Docker daemon was not running. A preflight failure returns
-    NOT_VERIFIED with a precise reason and never touches evidence
-    acquisition, the LLM, or any workspace/Docker work. The LLM
-    provider/model itself is deliberately NOT re-probed here -- that is
-    already a deterministic, non-billed check
-    (core.patch._require_llm_provider) which has already passed by the
-    time this function can be reached at all (see pipeline.run()).
+    Docker daemon was not running.
 
-    This is the SECOND of two preflight checks in the overall request
-    path, both deliberately kept: ``core.patch._require_test_comparison_
-    environment`` (via ``preflight_test_comparison_environment`` above)
-    runs FIRST, before the entire Auto Patcher pipeline (repository
-    grounding, Repository Understanding, remediation planning, patch
-    generation -- all of it) starts at all, and aborts the WHOLE requested
-    run if ``--compare-existing-tests`` can't even attempt to work. This
-    function's own preflight below is defense-in-depth for the case where
-    THIS function is reached anyway (direct internal callers, future
-    executor changes, or the environment changing between the early check
-    and here) -- it degrades gracefully to a plain NOT_VERIFIED
-    (observability-only, does not abort anything) rather than assuming
-    the early check makes this one redundant.
-
-    Fail-fast ordering:
-      1. environment preflight (patch/repo_root presence, executor
-         readiness) -- zero LLM cost, zero Docker build/run
-      2. Test Plan Discovery (one LLM call; also fails closed if the
-         resulting plan doesn't validate)
-      3. runtime-support check (no Docker work if unsupported)
-      4. baseline run -- patched side is skipped entirely if unusable
-      5. patched run (final candidate patch applied, same plan)
-      6. comparison
+    Never raises: any unexpected internal failure degrades to a
+    TEST_EXECUTION_ERROR result, same as evaluate_existing_test_comparison
+    itself.
     """
     try:
         repo_root = Path(repo_root)
 
         if not patch or not patch.strip():
-            return _not_started("no candidate patch was provided")
+            return None, _not_started("no candidate patch was provided"), None
         if not repo_root.is_dir():
-            return _not_started(f"repository root does not exist or is not a directory: {repo_root}")
+            return None, _not_started(f"repository root does not exist or is not a directory: {repo_root}"), None
 
-        # Single canonical readiness gate -- the same executor instance is
-        # reused below for the actual baseline/patched runs, so readiness
-        # is determined in exactly one place, not re-derived differently
-        # later.
         executor = select_executor("docker")
         preflight = executor.preflight()
         if not preflight.ready:
-            return _not_started(preflight.reason)
+            return None, _not_started(preflight.reason), None
 
         plan = discover_test_plan(repo_root, llm)
         if plan is None:
-            return _not_verified(
+            return None, _not_verified(
                 "no reliable test execution plan could be discovered for this repository"
-            )
+            ), executor
+        return plan, None, executor
+    except Exception as exc:  # noqa: BLE001 -- never let this feature crash the pipeline
+        return None, ExistingTestComparisonResult(
+            status=STATUS_TEST_EXECUTION_ERROR, command=None, baseline=None, patched=None,
+            reason=f"Existing Test Comparison failed unexpectedly: {type(exc).__name__}: {exc}",
+        ), None
+
+
+def evaluate_existing_test_comparison_with_plan(
+    repo_root: "Path | str",
+    patch: str,
+    plan: TestExecutionPlan,
+    setup_timeout: int = DEFAULT_SETUP_TIMEOUT,
+    run_timeout: int = DEFAULT_RUN_TIMEOUT,
+    executor: object = None,
+) -> ExistingTestComparisonResult:
+    """The COMPARISON half of what used to be one fused
+    evaluate_existing_test_comparison() call: given an ALREADY-discovered
+    ``plan`` (see discover_test_plan_for_comparison()), run the baseline
+    and patched executions and compare them. Never mutates ``repo_root``.
+    Never re-discovers a plan -- there is no code path here capable of
+    calling discover_test_plan(). Never raises.
+
+    ``executor``: optional, an already-selected-and-preflighted executor
+    (as returned by discover_test_plan_for_comparison()) -- when given,
+    reused as-is with NO second ``.preflight()`` call, preserving the
+    original fused function's "exactly one preflight call" behavior. When
+    omitted (``None``, e.g. a caller that only ever wants the comparison
+    half and hasn't already preflighted one itself), this function selects
+    and preflights its own, same as before this module's discovery/
+    comparison split.
+
+    Fail-fast ordering (same as evaluate_existing_test_comparison(), minus
+    the discovery step, which the caller already did):
+      1. environment preflight (executor readiness, skipped if `executor`
+         was already given ready) -- zero Docker build either way
+      2. runtime-support check (no Docker work if unsupported)
+      3. baseline run -- patched side is skipped entirely if unusable
+      4. patched run (final candidate patch applied, same plan)
+      5. comparison
+    """
+    try:
+        repo_root = Path(repo_root)
+
+        if executor is None:
+            executor = select_executor("docker")
+            preflight = executor.preflight()
+            if not preflight.ready:
+                return _not_started(preflight.reason)
 
         if not is_runtime_supported(plan.runtime_family):
             return _not_verified(
@@ -603,6 +626,37 @@ def evaluate_existing_test_comparison(
             status=STATUS_TEST_EXECUTION_ERROR, command=None, baseline=None, patched=None,
             reason=f"Existing Test Comparison failed unexpectedly: {type(exc).__name__}: {exc}",
         )
+
+
+def evaluate_existing_test_comparison(
+    repo_root: "Path | str",
+    patch: str,
+    llm,
+    setup_timeout: int = DEFAULT_SETUP_TIMEOUT,
+    run_timeout: int = DEFAULT_RUN_TIMEOUT,
+) -> ExistingTestComparisonResult:
+    """Run Existing Test Comparison for ``patch`` against ``repo_root``,
+    exactly as before this module's discovery/comparison split -- this is
+    now a thin composition of discover_test_plan_for_comparison() +
+    evaluate_existing_test_comparison_with_plan(), preserved unchanged for
+    any caller that wants the whole thing in one call (every caller
+    before this split, and any non-pipeline caller). See those two
+    functions' own docstrings for the fail-fast ordering and Same-plan
+    invariant (Test Plan Discovery runs EXACTLY ONCE, reused unmodified
+    for both the baseline and patched runs) -- both still hold exactly as
+    documented; this wrapper adds no new behavior.
+
+    pipeline.run() itself does NOT call this wrapper -- it calls the two
+    halves directly, so Stage 10 (test_analysis_and_plan) and Stage 11
+    (existing_test_comparison) can be recorded as separate, truthful
+    StageExecutions.
+    """
+    plan, early_result, executor = discover_test_plan_for_comparison(repo_root, patch, llm)
+    if early_result is not None:
+        return early_result
+    return evaluate_existing_test_comparison_with_plan(
+        repo_root, patch, plan, setup_timeout=setup_timeout, run_timeout=run_timeout, executor=executor,
+    )
 
 
 def _run_side(repo_root, plan, executor, patch: "str | None", setup_timeout, run_timeout) -> TestRunResult:

@@ -32,6 +32,7 @@ from .execution_recorder import to_jsonable
 from .stage_registry import (
     CHALLENGER as _S_CHALLENGER,
     CONFIDENCE_SCORING as _S_CONFIDENCE_SCORING,
+    EXISTING_TEST_COMPARISON as _S_EXISTING_TEST_COMPARISON,
     GUIDED_CONTEXT_ACQUISITION as _S_GUIDED_CONTEXT_ACQUISITION,
     IMPACT_AND_BEHAVIOR_ANALYSIS as _S_IMPACT_AND_BEHAVIOR_ANALYSIS,
     PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION as _S_PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
@@ -39,11 +40,13 @@ from .stage_registry import (
     PATCH_REVIEW as _S_PATCH_REVIEW,
     REMEDIATION_STRATEGY as _S_REMEDIATION_STRATEGY,
     REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING as _S_REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING,
+    TEST_ANALYSIS_AND_PLAN as _S_TEST_ANALYSIS_AND_PLAN,
 )
 from .existing_test_regression import (
     ExistingTestComparisonResult,
     classify_existing_test_comparison_signal,
-    evaluate_existing_test_comparison,
+    discover_test_plan_for_comparison,
+    evaluate_existing_test_comparison_with_plan,
     not_verified_result as _existing_test_comparison_not_verified,
     render_existing_test_comparison,
     test_execution_error_result as _existing_test_comparison_execution_error,
@@ -5673,17 +5676,103 @@ def run(
                 "requires an applicable patch"
             )
         else:
+            # Batch B5: begin recording S10 (test_analysis_and_plan).
+            # consumed=[S6] -- the exact ACTUAL dataflow: discover_test_
+            # plan()/evaluate_existing_test_comparison_with_plan() below
+            # read only `repo_root`/`patch` (S6-settled), never `impact`/
+            # `behavior` (S9). NOTE: stage_registry.STAGE_DEPENDENCIES[
+            # TEST_ANALYSIS_AND_PLAN] also declares IMPACT_AND_BEHAVIOR_
+            # ANALYSIS (S9) as a dependency -- but S9 does not even execute
+            # until AFTER this block in current code order, so no S9
+            # execution exists yet to truthfully reference here. This is a
+            # genuine, pre-existing mismatch between the registry's
+            # declared graph and actual production dataflow/ordering, not
+            # invented by this batch -- consumed stays strictly truthful
+            # (S6 only) rather than fabricating a forward reference.
+            _s10_handle = None
+            if execution_recorder is not None:
+                _s10_handle = execution_recorder.start(
+                    _S_TEST_ANALYSIS_AND_PLAN, consumed=[_s6_rec] if _s6_rec is not None else [],
+                )
             try:
-                _existing_test_comparison = evaluate_existing_test_comparison(Path(repo_root), patch, llm=llm)
+                _test_plan, _discovery_early_result, _executor_for_comparison = discover_test_plan_for_comparison(
+                    Path(repo_root), patch, llm,
+                )
+            except Exception as exc:
+                _test_plan = None
+                _executor_for_comparison = None
+                _discovery_early_result = _existing_test_comparison_execution_error(
+                    f"comparison failed unexpectedly: {type(exc).__name__}: {exc}"
+                )
+
+            # Batch B5: finish S10. Mirrors the transitional Stage-10
+            # replay's own artifact contract exactly for the accepted case
+            # (the real TestExecutionPlan fields, via the same "accepted"/
+            # "rejected" outcome vocabulary) -- see this stage's own
+            # comment below on the one remaining, honestly-reported
+            # mismatch (rejected-case reason specificity).
+            _s10_rec = None
+            if execution_recorder is not None:
+                if _test_plan is not None:
+                    _s10_rec = execution_recorder.finish(
+                        _s10_handle, outcome="accepted", artifact=to_jsonable(_test_plan),
+                    )
+                else:
+                    _s10_rec = execution_recorder.finish(
+                        _s10_handle, outcome="rejected",
+                        artifact={"reason": _discovery_early_result.reason if _discovery_early_result else None},
+                    )
+
+            # Batch B5: begin recording S11 (existing_test_comparison).
+            # consumed=[S6, S10] (stage_registry.STAGE_DEPENDENCIES[
+            # EXISTING_TEST_COMPARISON]) -- matches actual dataflow exactly:
+            # evaluate_existing_test_comparison_with_plan() reads
+            # `repo_root`/`patch` (S6) and `plan` (S10), nothing else.
+            _s11_handle = None
+            if execution_recorder is not None:
+                _s11_handle = execution_recorder.start(
+                    _S_EXISTING_TEST_COMPARISON,
+                    consumed=[r for r in (_s6_rec, _s10_rec) if r is not None],
+                )
+
+            if _discovery_early_result is not None:
+                # No plan -- S11 truthfully never attempts comparison
+                # (matches the ORIGINAL fused function's exact behavior:
+                # discovery failing short-circuits everything below it).
+                _existing_test_comparison = _discovery_early_result
                 print(
                     f"[pipeline] Existing Test Comparison: {_existing_test_comparison.status}",
                     file=sys.stderr,
                 )
-            except Exception as exc:
-                print(f"[pipeline] Existing Test Comparison failed unexpectedly: {exc}", file=sys.stderr)
-                _existing_test_comparison = _existing_test_comparison_execution_error(
-                    f"comparison failed unexpectedly: {type(exc).__name__}: {exc}"
-                )
+                if execution_recorder is not None:
+                    execution_recorder.finish(
+                        _s11_handle, outcome="skipped_no_plan",
+                        artifact=to_jsonable(_existing_test_comparison),
+                    )
+            else:
+                try:
+                    _existing_test_comparison = evaluate_existing_test_comparison_with_plan(
+                        Path(repo_root), patch, _test_plan, executor=_executor_for_comparison,
+                    )
+                    print(
+                        f"[pipeline] Existing Test Comparison: {_existing_test_comparison.status}",
+                        file=sys.stderr,
+                    )
+                    if execution_recorder is not None:
+                        execution_recorder.finish(
+                            _s11_handle, outcome="settled",
+                            artifact=to_jsonable(_existing_test_comparison),
+                        )
+                except Exception as exc:
+                    print(f"[pipeline] Existing Test Comparison failed unexpectedly: {exc}", file=sys.stderr)
+                    _existing_test_comparison = _existing_test_comparison_execution_error(
+                        f"comparison failed unexpectedly: {type(exc).__name__}: {exc}"
+                    )
+                    if execution_recorder is not None:
+                        execution_recorder.finish(
+                            _s11_handle, outcome="error",
+                            artifact=to_jsonable(_existing_test_comparison),
+                        )
 
     # Deterministic patch signals — run on final patch after any repair loop changes
     _c_signals: list[dict] | None = None
