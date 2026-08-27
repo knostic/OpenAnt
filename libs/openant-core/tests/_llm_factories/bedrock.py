@@ -18,7 +18,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import anthropic
-import httpx
+import httpx2 as httpx
 
 from utilities.llm import LLMAdapter
 from utilities.llm.providers.bedrock import BedrockAdapter
