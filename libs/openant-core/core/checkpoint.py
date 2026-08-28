@@ -251,6 +251,7 @@ class StepCheckpoint:
         error_breakdown: dict,
         phase: str = "in_progress",
         usage: dict | None = None,
+        incomplete: int = 0,
     ):
         """Write/overwrite _summary.json in checkpoint dir.
 
@@ -264,6 +265,11 @@ class StepCheckpoint:
             phase: ``"in_progress"`` or ``"done"``.
             usage: Optional dict with ``input_tokens``, ``output_tokens``,
                 ``cost_usd`` accumulated so far for this step.
+            incomplete: #293 — units that ended WITHOUT a verdict (the loop
+                ran out / gave up): neither completed nor errored. All three
+                buckets are always emitted so ``completed + incomplete +
+                errors == total_units`` is visible and checkable; callers
+                that predate the third bucket default it to 0.
         """
         self.ensure_dir()
         filepath = os.path.join(self.dir, SUMMARY_FILE)
@@ -273,6 +279,7 @@ class StepCheckpoint:
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "total_units": total_units,
             "completed": completed,
+            "incomplete": incomplete,
             "errors": errors,
             "error_breakdown": error_breakdown,
         }
@@ -311,8 +318,8 @@ class StepCheckpoint:
         doing its own file scanning.
 
         Returns:
-            Dict with keys: step, checkpoint_dir, completed, errors,
-            total_files, total_units, phase, error_breakdown.
+            Dict with keys: step, checkpoint_dir, completed, incomplete,
+            errors, total_files, total_units, phase, error_breakdown.
         """
         # Derive step name from directory name (e.g. "enhance_checkpoints" → "enhance")
         dir_name = os.path.basename(checkpoint_dir.rstrip("/"))
@@ -322,6 +329,7 @@ class StepCheckpoint:
             "step": step,
             "checkpoint_dir": checkpoint_dir,
             "completed": 0,
+            "incomplete": 0,
             "errors": 0,
             "total_files": 0,
             "total_units": 0,
@@ -340,6 +348,7 @@ class StepCheckpoint:
 
         # Read all checkpoint files and classify each
         completed = 0
+        incomplete = 0
         errors = 0
         error_breakdown = {}
 
@@ -365,7 +374,9 @@ class StepCheckpoint:
             #   - analyze: result.verdict == "ERROR" or result.finding == "error"
             #   - verify: verification is empty or verification.correct_finding == "error"
             #   - dynamic-test: top-level status == "ERROR"
+            #   - verify adapter-raise (#286): top-level "error" key
             is_error = False
+            is_incomplete = False
             err_type = None
 
             # Enhance-style: error under the context named by ``context_key``
@@ -385,28 +396,49 @@ class StepCheckpoint:
                     is_error = True
                     err_type = "analysis_error"
 
-            # Verify-style: verification empty or correct_finding == "error"
+            # Verify-style: verification empty or correct_finding == "error";
+            # #293: a non-empty verification carrying incomplete=True (verdict
+            # present, loop never finished) is the third state
             elif "verification" in data:
                 v = data.get("verification", {})
                 if not v or v.get("correct_finding") == "error":
                     is_error = True
                     err_type = "verification_error"
+                elif v.get("incomplete"):
+                    is_incomplete = True
 
             # Dynamic-test-style: top-level status == "ERROR"
             elif data.get("status") == "ERROR":
                 is_error = True
                 err_type = "test_error"
 
+            # #286/#293: a top-level "error" key (the verify adapter-raise
+            # marker) beats every other classification — an errored verify
+            # checkpoint carries BOTH "error" and verification.incomplete.
+            if not is_error and data.get("error"):
+                is_error = True
+                is_incomplete = False
+                err_type = "error_key"
+
+            # #293: enhance-style incomplete — the agent's degenerate exit
+            # (security_classification == "incomplete") is not a completion
+            if not is_error and not is_incomplete and isinstance(enhance_ctx, dict):
+                if enhance_ctx.get("security_classification") == "incomplete":
+                    is_incomplete = True
+
             if is_error:
                 errors += 1
                 if err_type:
                     error_breakdown[err_type] = error_breakdown.get(err_type, 0) + 1
+            elif is_incomplete:
+                incomplete += 1
             else:
                 completed += 1
 
         result["completed"] = completed
+        result["incomplete"] = incomplete
         result["errors"] = errors
-        result["total_files"] = completed + errors
+        result["total_files"] = completed + incomplete + errors
         result["error_breakdown"] = error_breakdown
 
         return result

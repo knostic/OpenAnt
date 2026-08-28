@@ -569,6 +569,12 @@ def run_analysis(
     _summary_output_tokens = 0
     _summary_cost_usd = 0.0
     _summary_unpriced: set[str] = set()
+    # #293 adjudication: analyze has NO third state — "inconclusive" is a
+    # first-class COMPLETED verdict (verdict_taxonomy FINDING_VERDICT_ORDER;
+    # the Stage-1 prompt's own enum), not a degenerate no-verdict marker like
+    # verify's verification.incomplete or enhance's INCOMPLETE_CLASSIFICATION.
+    # The third bucket stays 0 here but is still emitted for shape consistency.
+    _summary_incomplete = 0
     for _uid, _cp in _existing.items():
         _r = _cp.get("result", {})
         if _r.get("verdict") == "ERROR" or _r.get("finding") == "error":
@@ -612,16 +618,19 @@ def run_analysis(
     # Write initial summary
     checkpoint.write_summary(total, _summary_completed, _summary_errors,
                              _summary_error_breakdown, phase="in_progress",
-                             usage=_usage_dict())
+                             usage=_usage_dict(), incomplete=_summary_incomplete)
 
     def _summary_callback(finding, usage=None):
         """Update summary counters after each unit. Called from main thread."""
-        nonlocal _summary_completed, _summary_errors, _summary_error_breakdown
+        nonlocal _summary_completed, _summary_incomplete, _summary_errors
+        nonlocal _summary_error_breakdown
         nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
         if finding == "error":
             _summary_errors += 1
             _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
         else:
+            # #293 adjudication: "inconclusive"/"insufficient_context" are
+            # completed verdicts (taxonomy), not incomplete — no third state.
             _summary_completed += 1
         if usage:
             _summary_input_tokens += usage.get("input_tokens", 0)
@@ -629,7 +638,7 @@ def run_analysis(
             _summary_cost_usd += usage.get("cost_usd", 0.0)
         checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                  _summary_error_breakdown, phase="in_progress",
-                                 usage=_usage_dict())
+                                 usage=_usage_dict(), incomplete=_summary_incomplete)
 
     # --- Stage 1: Detection ---
     results, code_by_route = _run_detection(
@@ -660,7 +669,9 @@ def run_analysis(
             results[i] = out["result"]
             code_by_route[out["route_key"]] = out["code_for_route"]
 
-            # Update summary: retry succeeded → flip error to completed
+            # Update summary: retry produced a verdict → flip error to
+            # completed (#293 adjudication: inconclusive is a completed
+            # verdict; analyze has no third state)
             if out["finding"] != "error":
                 _summary_errors = max(0, _summary_errors - 1)
                 _summary_completed += 1
@@ -670,7 +681,7 @@ def run_analysis(
             _summary_cost_usd += retry_usage.get("cost_usd", 0.0)
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                      _summary_error_breakdown, phase="in_progress",
-                                     usage=_usage_dict())
+                                     usage=_usage_dict(), incomplete=_summary_incomplete)
 
             # Update checkpoint
             if checkpoint is not None:
@@ -690,7 +701,7 @@ def run_analysis(
     # Write final summary with phase="done"
     checkpoint.write_summary(total, _summary_completed, _summary_errors,
                              _summary_error_breakdown, phase="done",
-                             usage=_usage_dict())
+                             usage=_usage_dict(), incomplete=_summary_incomplete)
 
     tracking.log_usage("Stage 1", _phase_baseline)
 

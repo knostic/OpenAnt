@@ -546,6 +546,7 @@ def run_experiment(
             metrics["verifications_total"] = 0
             metrics["verifications_agreed"] = 0
             metrics["verifications_disagreed"] = 0
+            metrics["verifications_incomplete"] = 0
             metrics["consistency_updates"] = 0
 
             # Include ALL results for verification (including inconclusive and those with missing finding)
@@ -587,7 +588,14 @@ def run_experiment(
                     result["verification"] = verification.to_dict()
                     metrics["verifications_total"] += 1
 
-                    if verification.agree:
+                    # #293: three states, not two — an incomplete
+                    # verification is un-adjudicated (neither agreed nor
+                    # disagreed; the false "Changed from X to X" note is the
+                    # same bug fixed in finding_verifier._verify_one).
+                    if verification.incomplete:
+                        metrics["verifications_incomplete"] += 1
+                        print(f"    ○ INCOMPLETE: {stage1_finding} (no verdict)")
+                    elif verification.agree:
                         metrics["verifications_agreed"] += 1
                         print(f"    ✓ AGREED: {verification.correct_finding}")
                     else:
@@ -773,6 +781,7 @@ def print_summary(experiment: dict):
         print(f"  Total verified:      {metrics['verifications_total']}")
         print(f"  Agreed:              {metrics['verifications_agreed']}")
         print(f"  Disagreed:           {metrics['verifications_disagreed']}")
+        print(f"  Incomplete:          {metrics.get('verifications_incomplete', 0)}")
         if metrics.get('consistency_updates', 0) > 0:
             print(f"  Consistency updates: {metrics['consistency_updates']}")
     print()

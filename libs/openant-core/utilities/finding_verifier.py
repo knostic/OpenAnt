@@ -688,6 +688,7 @@ class FindingVerifier:
         # Separate already-done (successful) from to-do (new + errored)
         results_to_verify = []
         _restored_ok = 0
+        _restored_incomplete = 0
         for r in results:
             key = r.get("unit_id") or r.get("route_key", "unknown")
             cp_data = checkpointed.get(key)
@@ -699,23 +700,31 @@ class FindingVerifier:
                     r["finding"] = cp_data["finding"]
                 if "verification_note" in cp_data:
                     r["verification_note"] = cp_data["verification_note"]
-                _restored_ok += 1
+                # #293: a restored INCOMPLETE checkpoint (verdict present but
+                # incomplete) is restored work, but not a completion — seed
+                # the third bucket so the summary never counts it completed.
+                _ver = cp_data.get("verification", {})
+                if isinstance(_ver, dict) and _ver.get("incomplete"):
+                    _restored_incomplete += 1
+                else:
+                    _restored_ok += 1
             else:
                 # Either no checkpoint, or an errored one — re-verify
                 results_to_verify.append(r)
 
-        if _restored_ok:
-            print(f"[Verify] Restored {_restored_ok} findings from checkpoints",
-                  file=sys.stderr, flush=True)
+        if _restored_ok or _restored_incomplete:
+            print(f"[Verify] Restored {_restored_ok + _restored_incomplete} findings "
+                  f"from checkpoints", file=sys.stderr, flush=True)
             if restored_callback:
-                restored_callback(_restored_ok)
-        errored_retries = len(checkpointed) - _restored_ok
+                restored_callback(_restored_ok + _restored_incomplete)
+        errored_retries = len(checkpointed) - _restored_ok - _restored_incomplete
         if errored_retries:
             print(f"[Verify] Retrying {errored_retries} previously errored findings",
                   file=sys.stderr, flush=True)
 
         # Initialize summary tracking for _summary.json
         _summary_completed = _restored_ok
+        _summary_incomplete = _restored_incomplete
         _summary_errors = 0
         _summary_error_breakdown = {}
         _summary_input_tokens = 0
@@ -757,15 +766,21 @@ class FindingVerifier:
         if checkpoint is not None:
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                      _summary_error_breakdown, phase="in_progress",
-                                     usage=_usage_dict())
+                                     usage=_usage_dict(), incomplete=_summary_incomplete)
 
         def _summary_callback(detail, usage=None):
             """Update summary counters after each unit. Called from main thread."""
-            nonlocal _summary_completed, _summary_errors, _summary_error_breakdown
+            nonlocal _summary_completed, _summary_incomplete, _summary_errors
+            nonlocal _summary_error_breakdown
             nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
             if detail == "error":
                 _summary_errors += 1
                 _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
+            elif detail.startswith("incomplete"):
+                # #293: the third state — the loop never reached a verdict.
+                # _verify_one tags incomplete units "incomplete:<finding>"
+                # (our own deterministic prefix, not model text).
+                _summary_incomplete += 1
             else:
                 _summary_completed += 1
             if usage:
@@ -775,7 +790,7 @@ class FindingVerifier:
             if checkpoint is not None:
                 checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                          _summary_error_breakdown, phase="in_progress",
-                                         usage=_usage_dict())
+                                         usage=_usage_dict(), incomplete=_summary_incomplete)
 
         remaining = len(results_to_verify)
         mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
@@ -795,7 +810,7 @@ class FindingVerifier:
         if checkpoint is not None:
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                      _summary_error_breakdown, phase="done",
-                                     usage=_usage_dict())
+                                     usage=_usage_dict(), incomplete=_summary_incomplete)
 
         # Step 2: Consistency cross-check (barrier — needs all results)
         results = self._check_consistency(results, code_by_route)
@@ -826,7 +841,28 @@ class FindingVerifier:
 
             result["verification"] = verification.to_dict()
 
-            if verification.agree:
+            # #293: an INCOMPLETE verification (the loop never reached a
+            # verdict) is neither a completion nor a disagreement — it is
+            # un-adjudicated. Before this branch it fell into the disagreed
+            # else: counted as a completion by the summary callback AND
+            # stamped with the false "Changed from X to X" note (Stage-1
+            # verdict is preserved in incomplete results, so X == X).
+            if verification.incomplete:
+                # FAM-REPORT-2 (wave catch): the self-contradictory-finish
+                # path returns incomplete=True with correct_finding set to
+                # the MORE-SEVERE verdict — propagate it or the upgraded
+                # vuln is silently dropped at the reporter's disclosure
+                # filter. For the ordinary incomplete paths correct_finding
+                # IS the Stage-1 verdict, so this is a no-op there.
+                result["finding"] = verification.correct_finding
+                detail = f"incomplete:{verification.correct_finding}"
+                result["verification_note"] = (
+                    f"Verification incomplete: {verification.explanation}"
+                    if verification.explanation else "Verification incomplete")
+                self._log("info", f"Verification incomplete: {stage1_finding}",
+                          unit_id=route_key, total_tokens=verification.total_tokens,
+                          iterations=verification.iterations)
+            elif verification.agree:
                 detail = f"agreed:{verification.correct_finding}"
                 self._log("info", f"Verification agreed: {verification.correct_finding}",
                           unit_id=route_key, total_tokens=verification.total_tokens,

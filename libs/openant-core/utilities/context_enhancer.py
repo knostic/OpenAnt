@@ -643,7 +643,15 @@ class ContextEnhancer:
         # Initialize summary tracking for _summary.json
         # Counts are updated in the main thread (as_completed loop) — no lock needed.
         _summary_cp = None
-        _summary_completed = len(processed_ids)
+        # #293: restored INCOMPLETE units (agent degenerate exit) are restored
+        # work but not completions — seed the third bucket, not completed.
+        _restored_incomplete = sum(
+            1 for u in units
+            if u.get("id") in processed_ids
+            and (u.get("agent_context", {}) or {}).get("security_classification")
+                == INCOMPLETE_CLASSIFICATION)
+        _summary_completed = len(processed_ids) - _restored_incomplete
+        _summary_incomplete = _restored_incomplete
         _summary_errors = 0
         _summary_error_breakdown = {}
         _summary_input_tokens = 0
@@ -683,6 +691,7 @@ class ContextEnhancer:
 
             _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                       _summary_error_breakdown, phase="in_progress",
+                                      incomplete=_summary_incomplete,
                                       usage={"input_tokens": _summary_input_tokens,
                                              "output_tokens": _summary_output_tokens,
                                              "cost_usd": round(_summary_cost_usd, 6)})
@@ -762,7 +771,8 @@ class ContextEnhancer:
 
         def _update_summary(classification, unit):
             """Update summary counters after a unit completes. Called from main thread."""
-            nonlocal _summary_completed, _summary_errors, _summary_error_breakdown
+            nonlocal _summary_completed, _summary_incomplete, _summary_errors
+            nonlocal _summary_error_breakdown
             nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
             if _summary_cp is None:
                 return
@@ -771,6 +781,10 @@ class ContextEnhancer:
                 err = unit.get("agent_context", {}).get("error", {})
                 err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
                 _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
+            elif classification == INCOMPLETE_CLASSIFICATION:
+                # #293: the agent's degenerate exit (no completed finish call)
+                # is the third state — not a completion, not an error.
+                _summary_incomplete += 1
             else:
                 _summary_completed += 1
             # Accumulate per-unit usage
@@ -787,7 +801,7 @@ class ContextEnhancer:
                 _usage["unpriced_models"] = sorted(_summary_unpriced)
             _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                       _summary_error_breakdown, phase="in_progress",
-                                      usage=_usage)
+                                      usage=_usage, incomplete=_summary_incomplete)
 
         if workers <= 1:
             # Sequential mode
@@ -853,8 +867,14 @@ class ContextEnhancer:
                 unit["agent_context"] = {}
                 uid, classification, elapsed, _ = _enhance_one(unit)
 
-                # Update summary: retry succeeded → flip error to completed
-                if classification != "error":
+                # Update summary: retry produced an outcome → flip the error
+                # to completed OR incomplete (#293: a retried unit can land
+                # on the agent's degenerate exit, which is not a completion)
+                if classification == INCOMPLETE_CLASSIFICATION:
+                    round_recovered += 1
+                    _summary_errors = max(0, _summary_errors - 1)
+                    _summary_incomplete += 1
+                elif classification != "error":
                     round_recovered += 1
                     _summary_errors = max(0, _summary_errors - 1)
                     _summary_completed += 1
@@ -868,6 +888,7 @@ class ContextEnhancer:
                 if _summary_cp is not None:
                     _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                               _summary_error_breakdown, phase="in_progress",
+                                              incomplete=_summary_incomplete,
                                               usage={"input_tokens": _summary_input_tokens,
                                                      "output_tokens": _summary_output_tokens,
                                                      "cost_usd": round(_summary_cost_usd, 6)})
@@ -888,6 +909,7 @@ class ContextEnhancer:
         if _summary_cp is not None:
             _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                       _summary_error_breakdown, phase="done",
+                                      incomplete=_summary_incomplete,
                                       usage={"input_tokens": _summary_input_tokens,
                                              "output_tokens": _summary_output_tokens,
                                              "cost_usd": round(_summary_cost_usd, 6)})

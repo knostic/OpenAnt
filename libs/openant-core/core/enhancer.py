@@ -173,6 +173,7 @@ def enhance_dataset(
     error_summary = {}
     context_key = "agent_context" if mode == "agentic" else "llm_context"
 
+    incomplete_count = 0
     for unit in enhanced.get("units", []):
         ctx = unit.get(context_key, {})
         if ctx.get("error"):
@@ -186,6 +187,9 @@ def enhance_dataset(
             continue
         cls = ctx.get("security_classification", "unknown")
         classifications[cls] = classifications.get(cls, 0) + 1
+        # #293: the agent's degenerate exit is not a successful enhance
+        if cls == "incomplete":
+            incomplete_count += 1
 
     # Checkpoints are preserved as a permanent artifact alongside results.
     # Final summary (phase="done") is written by context_enhancer.
@@ -204,7 +208,7 @@ def enhance_dataset(
 
     return EnhanceResult(
         enhanced_dataset_path=output_path,
-        units_enhanced=len(units) - error_count,
+        units_enhanced=len(units) - error_count - incomplete_count,
         error_count=error_count,
         error_summary=error_summary,
         classifications=classifications,
