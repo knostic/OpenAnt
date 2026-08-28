@@ -23,6 +23,7 @@ Usage:
 """
 
 import random
+import re
 import sys
 import threading
 import time
@@ -235,21 +236,39 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     """
     if not error_info:
         return False
-    
+
     if isinstance(error_info, dict):
         error_type = error_info.get("type", "")
-        
+
         # Always retry these transient error types. "parse_error" is a malformed
         # LLM response (unparseable JSON): re-generating the completion often
         # yields well-formed output, so it is treated as transient here.
         if error_type in ("rate_limit", "connection", "timeout", "parse_error"):
             return True
-        
+
+        # #292: the transient empty-completion raise is honoured on the DICT
+        # shape too. New dicts carry type "empty_completion"
+        # (context_enhancer._build_error_info); the message backstop below
+        # also catches dicts built before that classification existed (stored
+        # agent_context adopted on resume). Before this, the dict branch
+        # classified the same exception as api_status and looked for a
+        # status_code the raise never carries — enhance never retried the one
+        # error class that actually occurred.
+        if error_type == "empty_completion":
+            return True
+
         # Retry server errors (5xx), but not client errors (4xx)
         if error_type == "api_status":
+            # #292 message backstop: an old-shape dict (type api_status, no
+            # status_code) built from an empty-completion raise. Same
+            # substrings + refusal guard as the string branch below.
+            msg = str(error_info.get("message", "")).lower()
+            if "refused the request" not in msg and (
+                    "no usable content" in msg or "empty completion" in msg):
+                return True
             status_code = error_info.get("status_code", 0)
             return status_code >= 500
-        
+
         return False
     
     # String-based error checking.
@@ -269,14 +288,23 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     # marker wins over the substring scan.
     if "refused the request" in error_str:
         return False
-    return any(term in error_str for term in (
+    # #292: status codes are PARSED bounded numbers tested against the SAME
+    # explicit allowlist as before — not a 5xx range (501 is a deterministic
+    # "not implemented", deliberately excluded; 505/506 likewise), and not an
+    # unanchored substring scan, which matched "byte offset 5000" /
+    # "read 15002 bytes". Residual, accepted: a standalone "500" in
+    # non-status context ("token count 500") still parses as the code.
+    # Transient Anthropic/Cloudflare-edge 5xx. 529 ("overloaded") is the
+    # Anthropic overload signal; 520/522/523/524 are Cloudflare edge failures
+    # (unknown error / connection timed out / origin unreachable / timeout)
+    # that are equally transient.
+    _RETRYABLE_STATUS_CODES = frozenset(
+        ("500", "502", "503", "504", "520", "522", "523", "524", "529"))
+    status_hit = any(
+        code in _RETRYABLE_STATUS_CODES
+        for code in re.findall(r"\b5\d{2}\b", error_str))
+    return status_hit or any(term in error_str for term in (
         "rate_limit", "connection", "timeout",
-        # Transient Anthropic/Cloudflare-edge 5xx. 529 ("overloaded") is the
-        # Anthropic overload signal; 520/522/523/524 are Cloudflare edge
-        # failures (unknown error / connection timed out / origin unreachable /
-        # timeout) that are equally transient. 501 is a deterministic
-        # "not implemented" and is deliberately excluded.
-        "500", "502", "503", "504", "520", "522", "523", "524", "529",
         "overloaded",
         # A provider adapter raises LLMResponseError on an empty completion (no
         # text/tool block) — typically a thinking-block truncation or a

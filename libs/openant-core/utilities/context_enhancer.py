@@ -108,6 +108,15 @@ def _build_error_info(exc: Exception) -> dict:
         info["type"] = "not_found"
     elif isinstance(exc, LLMResponseError):
         info["type"] = "api_status"
+        # #292: the transient empty-completion raise is its OWN type, so the
+        # retry decision does not depend on a status_code the exception
+        # cannot carry (the raise is bare — no `from`, no __cause__). Same
+        # substrings + refusal guard as is_retryable_error's string branch;
+        # LLMRefusalError subclasses LLMResponseError, so the guard matters.
+        msg = str(exc).lower()
+        if "refused the request" not in msg and (
+                "no usable content" in msg or "empty completion" in msg):
+            info["type"] = "empty_completion"
 
     # Best-effort diagnostics. The unified LLMError taxonomy is
     # provider-neutral and does not itself carry status_code/request_id,
