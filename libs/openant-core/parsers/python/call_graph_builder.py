@@ -204,7 +204,12 @@ class CallGraphBuilder:
         # file are visible to every unit in it (the fixture's main() must see
         # the module-scope HANDLERS); own-scope containers override.
         containers = dict(self._module_containers(caller_file))
-        containers.update(self._collect_container_map(tree, caller_file))
+        local_map, local_dropped = self._collect_container_map(tree, caller_file)
+        # a name locally rebound (dropped) must not fall through to the
+        # module-scope table — the local scope owns it now
+        for name in local_dropped:
+            containers.pop(name, None)
+        containers.update(local_map)
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
@@ -232,9 +237,19 @@ class CallGraphBuilder:
                 # reachability edge from the ENCLOSING unit (the third member
                 # of the reference family this file already recognises:
                 # name=func bindings and f(func) callback args).
-                elts = node.values if isinstance(node, ast.Dict) else node.elts
+                # Load-context only: Store-context Names (assignment targets
+                # in `a, b = f()` / `for k, v in ...:` tuples) are NOT
+                # references — scanning them fabricates edges. Dict values
+                # with a None key are `{**base}` unpacking, not refs either.
+                if isinstance(node, ast.Dict):
+                    elts = [v for k, v in zip(node.keys, node.values)
+                            if k is not None]
+                else:
+                    elts = node.elts
                 for e in elts:
-                    if isinstance(e, ast.Name) and not self._is_builtin(e.id):
+                    if (isinstance(e, ast.Name)
+                            and isinstance(e.ctx, ast.Load)
+                            and not self._is_builtin(e.id)):
                         resolved = self._resolve_simple_call(e.id, caller_file)
                         if resolved:
                             calls.add(resolved)
@@ -324,10 +339,13 @@ class CallGraphBuilder:
 
         Covers `name = {..: func}` / `[func]` / `(func,)` / `{func}` literals
         and `name = dict(k=func)` / `OrderedDict(...)` calls. SINGLE-ASSIGNMENT
-        GUARD: a name rebound to anything else (or to another container) is
-        ambiguous for a per-name map and dropped — dispatch through it
-        records nothing rather than guessing (the literal reference edges
-        from the assignment itself are unaffected).
+        GUARD: a name rebound after a CONTAINER binding (to anything,
+        including another container) is ambiguous for a per-name map and
+        dropped — dispatch through it records nothing rather than guessing
+        (the literal reference edges from the assignment itself are
+        unaffected). A first binding that is not a container is simply not
+        recorded, so the conditional-init pattern H = None ... H = {...}
+        still yields a live entry.
         """
         containers: Dict[str, Set[str]] = {}
         dropped: Set[str] = set()
@@ -341,13 +359,13 @@ class CallGraphBuilder:
                 continue
             refs = self._container_value_refs(node.value, caller_file)
             if name in containers:
-                # re-assignment of any kind -> ambiguous, drop the name
+                # re-assignment of a container binding -> ambiguous, drop
                 dropped.add(name)
                 containers.pop(name, None)
                 continue
             if refs is not None:
                 containers[name] = refs
-        return containers
+        return containers, dropped
 
     def _container_value_refs(self, value: ast.expr, caller_file: str) -> Optional[Set[str]]:
         """Resolve the function references held by a container value.
@@ -358,17 +376,21 @@ class CallGraphBuilder:
         """
         elts: List[ast.expr]
         if isinstance(value, ast.Dict):
-            elts = list(value.values)
+            elts = [v for k, v in zip(value.keys, value.values) if k is not None]
         elif isinstance(value, (ast.List, ast.Set, ast.Tuple)):
             elts = list(value.elts)
         elif (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
                 and value.func.id in ("dict", "OrderedDict")):
-            elts = list(value.args) + [kw.value for kw in value.keywords]
+            # dict(**other) unpacking (kw.arg is None) is not a function ref
+            elts = ([a for a in value.args if not isinstance(a, ast.Starred)]
+                    + [kw.value for kw in value.keywords if kw.arg is not None])
         else:
             return None
         refs: Set[str] = set()
         for e in elts:
-            if isinstance(e, ast.Name) and not self._is_builtin(e.id):
+            if (isinstance(e, ast.Name)
+                    and isinstance(e.ctx, ast.Load)
+                    and not self._is_builtin(e.id)):
                 resolved = self._resolve_simple_call(e.id, caller_file)
                 if resolved:
                     refs.add(resolved)
@@ -393,7 +415,7 @@ class CallGraphBuilder:
         if module_code:
             try:
                 tree = ast.parse(textwrap.dedent(module_code))
-                result = self._collect_container_map(tree, caller_file)
+                result, _dropped = self._collect_container_map(tree, caller_file)
             except SyntaxError:
                 result = {}
         cached[caller_file] = result
