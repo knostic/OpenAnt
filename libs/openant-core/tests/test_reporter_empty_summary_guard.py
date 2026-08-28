@@ -29,6 +29,7 @@ class _Result:
         self.input_tokens = 10
         self.output_tokens = 5 if has_text else 0
         self.stop_reason = "end_turn"
+        self.usage_details = None  # matches CompletionResult (#211 capture)
 
 
 class _Adapter:
