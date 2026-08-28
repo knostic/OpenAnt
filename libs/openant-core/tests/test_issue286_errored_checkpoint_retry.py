@@ -42,15 +42,31 @@ def _classifier_from_source():
 
 
 def test_errored_checkpoint_classifies_as_retry():
-    """The #286 core: the verify-error shape (verification carries
-    incomplete=True — exactly what finding_verifier.py:802 writes) must
-    classify as ERRORED (retryable), not completed."""
+    """The #286 core: the verify-ERROR shape (the adapter-raise error
+    string, now copied into the checkpoint by the writer) must classify
+    as ERRORED (retryable), not completed."""
     cp = {"verification": {"agree": False, "incomplete": True},
-          "finding": "vulnerable"}
+          "finding": "vulnerable",
+          "error": "LLMRefusalError: refused"}
     assert _classifier_from_source()(cp) is True, (
-        "an incomplete-verification checkpoint IS errored — the exact "
-        "signal the verify error path writes; treating it as completed "
-        "adopts a failed unit and never retries it (#286)"
+        "a checkpoint carrying the adapter-raise error string IS "
+        "errored — treating it as completed adopts a failed unit and "
+        "never retries it (#286)"
+    )
+
+
+def test_deterministic_incomplete_does_not_retry():
+    """Wave catch (glm F1/F2, kimi F2): incomplete=True alone is NOT a
+    retry signal — five non-error fail-safe writers set it (max
+    iterations, truncated finish, no tool calls, degenerate finish);
+    those are deterministic outcomes, and retrying them on every resume
+    is unbounded waste (Opus 5 refusals are deterministic per #212)."""
+    cp = {"verification": {"agree": False, "incomplete": True,
+                           "explanation": "Verification incomplete"},
+          "finding": "vulnerable"}
+    assert _classifier_from_source()(cp) is False, (
+        "incomplete WITHOUT an error string is a deterministic "
+        "fail-safe outcome, not a retryable error"
     )
 
 

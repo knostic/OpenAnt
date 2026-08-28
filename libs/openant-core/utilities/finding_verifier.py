@@ -625,17 +625,20 @@ class FindingVerifier:
             checkpointed = checkpoint.load()
 
         def _cp_is_error(cp_data):
-            """A verify checkpoint is errored if verification is missing/empty,
-            correct_finding == 'error', or the verification is INCOMPLETE.
+            """A verify checkpoint is errored (retryable on resume) when:
+            verification is missing/empty, correct_finding == 'error',
+            OR the checkpoint carries the adapter-raise ``error`` string.
 
-            #286: the verify error path writes ``verification =
-            {"incomplete": True}`` (finding_verifier.py:802 — the adapter-raise
-            fail-safe) and puts the error string on the RESULT dict, which the
-            checkpoint writer does not copy. correct_finding == 'error' has no
-            writer on that path, so the old two-condition classifier read
-            errored units as finished work and adopted them on resume — never
-            retried (the reporter's 223/223 adoption with 48 hard errors).
-            ``incomplete`` is the signal the error path actually writes.
+            #286: the verify ERROR path (adapter raise — the retryable
+            class) writes the error string on the RESULT dict; the checkpoint
+            writer now copies it into ``cp_data["error"]``. That field is
+            the SURGICAL retry signal. ``verification.incomplete`` alone is
+            deliberately NOT a retry signal: five non-error fail-safe
+            writers set incomplete=True (degenerate finish, truncated
+            finish, no tool calls, max iterations, plus the error path) —
+            those are deterministic outcomes, and retrying them on every
+            resume is unbounded waste (wave catches F1/F2: Opus 5 refusals
+            are deterministic; they would retry forever).
             """
             if not cp_data:
                 return True
@@ -644,7 +647,7 @@ class FindingVerifier:
                 return True
             if v.get("correct_finding") == "error":
                 return True
-            return bool(v.get("incomplete"))
+            return bool(cp_data.get("error"))
 
         # Separate already-done (successful) from to-do (new + errored)
         results_to_verify = []
@@ -840,6 +843,15 @@ class FindingVerifier:
                         "finding": result.get("finding", ""),
                         "verification_note": result.get("verification_note", ""),
                     }
+                    # #286: the adapter-raise error string lives on the
+                    # RESULT dict — copy it into the checkpoint so the
+                    # resume classifier can distinguish a retryable ERROR
+                    # (adapter raised) from a deterministic incomplete
+                    # (max-iterations / truncated finish / no tool calls —
+                    # those are stable outcomes, retrying them forever is
+                    # unbounded waste).
+                    if result.get("error"):
+                        cp_data["error"] = result["error"]
                     if usage:
                         cp_data["usage"] = usage
                     checkpoint.save(key, cp_data)
@@ -871,6 +883,10 @@ class FindingVerifier:
                         "finding": result.get("finding", ""),
                         "verification_note": result.get("verification_note", ""),
                     }
+                    # #286: copy the adapter-raise error into the
+                    # checkpoint (see the sequential writer's note).
+                    if result.get("error"):
+                        cp_data["error"] = result["error"]
                     if usage:
                         cp_data["usage"] = usage
                     checkpoint.save(key, cp_data)
