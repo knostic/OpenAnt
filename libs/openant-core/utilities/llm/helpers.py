@@ -20,6 +20,20 @@ from ..llm_client import TokenTracker, get_global_tracker
 from .adapter import Message, TextBlock
 from .registry import PhaseBinding
 
+# Thinking-era output budget (the simple_text default; PR #242 raised it from
+# 8192). Claude-5 / Gemini-2.5+ / OpenAI o-series spend output budget on hidden
+# reasoning; 8192 can be fully consumed by reasoning on a large unit, yielding a
+# reasoning-only (empty) completion that the adapter drops -> hard "no usable
+# content" error. 20000 is under the Anthropic non-streaming 10-min ceiling
+# (32000 is rejected with a "Streaming is required" ValueError; 20000 is
+# accepted) and is a CAP, not a floor on generation -- models still stop at
+# end_turn on small prompts, so this does not raise cost for short answers.
+# #290: the multi-turn tool-using agent loops (finding_verifier,
+# agentic_enhancer/agent) bypass simple_text and call adapter.complete
+# directly, so they import THIS constant instead of pinning their own 4096 —
+# the two budget paths cannot drift apart again.
+DEFAULT_MAX_TOKENS = 20000
+
 
 def lookup_pricing(binding: PhaseBinding) -> Optional[dict]:
     """Return the adapter's price entry for ``binding.model``, or None.
@@ -38,15 +52,8 @@ def simple_text(
     prompt: str,
     *,
     system: Optional[str] = None,
-    # Thinking-era default. Claude-5 / Gemini-2.5+ / OpenAI o-series spend
-    # output budget on hidden reasoning; 8192 can be fully consumed by
-    # reasoning on a large unit, yielding a reasoning-only (empty) completion
-    # that the adapter drops -> hard "no usable content" error. 20000 is under
-    # the Anthropic non-streaming 10-min ceiling (32000 is rejected with a
-    # "Streaming is required" ValueError; 20000 is accepted) and is a CAP, not
-    # a floor on generation -- models still stop at end_turn on small prompts,
-    # so this does not raise cost for short answers.
-    max_tokens: int = 20000,
+    # See DEFAULT_MAX_TOKENS above for why this is 20000, not 8192.
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     tracker: Optional[TokenTracker] = None,
 ) -> str:
     """Send one user-prompt completion, return the concatenated text reply.
