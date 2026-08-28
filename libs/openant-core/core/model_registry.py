@@ -9,7 +9,7 @@ Python engine (here) and the Go CLI (``internal/models``), mirroring how
 shipped claim) plus ``source`` + ``retrieved`` (its provenance), so nothing
 asserts a provider fact without a receipt.
 
-Two invariants this module exists to hold:
+Three invariants this module exists to hold:
 
 * **A null price is NEVER a zero price.** ``pricing_map`` OMITS any record whose
   ``price`` is null (retired/unknown models). A null price must fall through to
@@ -22,6 +22,13 @@ Two invariants this module exists to hold:
   to an empty map, because an empty pricing map would price every model at \\$0.
   Unlike ``languages.json`` this file feeds no argparse ``choices``, so there is
   no ``--help`` path to keep alive — pricing is only ever needed for real work.
+* **Local providers price at an explicit, provenanced \\$0.** Providers whose
+  models run on the user's own hardware (``_LOCAL_PROVIDERS``) are exempt from
+  the positive-price rule — their \\$0 is free by definition, not an unverified
+  vendor quote. Their ``current`` models MUST still carry a non-null, explicit
+  ``{"input": 0, "output": 0}`` dict so they are INCLUDED in ``pricing_map``;
+  a null price would drop them onto the unknown-model warn path, which is
+  wrong for a known, deliberately-free provider.
 """
 
 from __future__ import annotations
@@ -40,7 +47,14 @@ from pathlib import Path
 _CONFIG_REL = Path("config") / "models.json"
 _SEARCH_LEVELS = 6
 _VALID_STATUS = frozenset({"current", "retired", "unknown"})
-_VALID_PROVIDERS = frozenset({"anthropic", "openai", "google", "bedrock", "openrouter"})
+_VALID_PROVIDERS = frozenset({"anthropic", "openai", "google", "bedrock", "openrouter", "ollama"})
+
+# Local-inference providers: models run on the user's own hardware, so $0 is a
+# truthful, verified fact — not an unverified vendor quote. The "current =>
+# positive price" invariant exists to stop cloud models silently pricing real
+# token spend at $0; it does not apply here. Local models must still carry an
+# explicit non-null zero dict (see pricing_map) so cost reporting stays defined.
+_LOCAL_PROVIDERS = frozenset({"ollama"})
 
 
 def _search_upward(start: Path) -> Path | None:
