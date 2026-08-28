@@ -70,7 +70,6 @@ from .agentic_enhancer.tools import ToolExecutor
 # loops cannot drift apart.
 from .agentic_enhancer.agent import (
     MAX_PROMPT_CHARS,
-    MAX_TOOL_RESULT_CHARS,
     cap_tool_result_content,
 )
 from prompts.verification_prompts import (
