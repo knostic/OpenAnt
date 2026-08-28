@@ -238,6 +238,14 @@ def run_verification(
           f"{confirmed_vulnerabilities} confirmed vulnerabilities", file=sys.stderr)
     if error_count:
         print(f"[Verify] Errors: {error_count}", file=sys.stderr)
+    # #212: adjudication COVERAGE headline — the denominator was invisible
+    # without reading results_verified.json (a reporter measured 41/223
+    # adjudicated and nothing human-facing said so). Deterministic; the
+    # refused count is DERIVED at print time (see helper docstring).
+    coverage_line = _adjudication_coverage_line(
+        counts=_counts, verified_results=verified_results,
+        candidates_total=len(vulnerable_results))
+    print(f"[Verify] Coverage: {coverage_line}", file=sys.stderr)
 
     # Checkpoints are preserved as a permanent artifact alongside results
     # (final summary with phase="done" is written inside verify_batch).
@@ -274,6 +282,56 @@ def run_verification(
         needs_review=needs_review,
         error_count=error_count,
         usage=tracking.get_usage(),
+    )
+
+
+_REFUSAL_MARKER = "refused the request"
+
+
+def _adjudication_coverage_line(*, counts: dict, verified_results: list,
+                                candidates_total: int) -> str:
+    """#212: one deterministic human-facing adjudication-coverage line.
+
+    ``Adjudicated X/Y (Z%)`` where X = completed adjudications = every
+    verified result minus needs_review minus errors (NOT merely agreed +
+    disagreed: a disagreement whose corrected finding is STILL vulnerable/
+    bypassable is bucketed ``confirmed_vulnerabilities`` only by
+    ``_count_verification_outcomes``, and dropping it would understate the
+    exact metric #212 was filed over), Y = Stage-2 candidates in.
+    ``refused`` is DERIVED AT PRINT TIME by matching the typed refusal
+    marker ("refused the request" — aligned across the adapter families:
+    anthropic, openai chat/responses/nested-part, google, openrouter-403)
+    in the stored per-result error strings, and is a SUBSET of ``errored``
+    (printed as such — the buckets are not additive). Deliberately NOT a
+    persisted bucket (a new VerifyResult/schema field would be #284's
+    territory and a schema surface).
+    """
+    adjudicated = len(verified_results) - counts["needs_review"] - counts["error_count"]
+    refused = sum(
+        1 for r in verified_results
+        if r.get("error") and _REFUSAL_MARKER in str(r["error"]).lower()
+    )
+    # A disagreement whose corrected finding is STILL vulnerable lands in
+    # ``confirmed_vulnerabilities`` only — count it here so the listed
+    # buckets sum EXACTLY to the headline numerator (reconciliation).
+    confirmed_only = sum(
+        1 for r in verified_results
+        if not r.get("error")
+        and (verification := r.get("verification", {}))
+        and not verification.get("incomplete")
+        and not verification.get("agree", False)
+        and str(r.get("finding") or r.get("verdict", "")).lower()
+        in ("vulnerable", "bypassable")
+    )
+    pct = (100 * adjudicated / candidates_total) if candidates_total else 0
+    # Human form: integer when exact ("40%"), one decimal when not ("18.4%").
+    pct_str = f"{pct:.1f}".rstrip("0").rstrip(".") or "0"
+    return (
+        f"Adjudicated {adjudicated}/{candidates_total} ({pct_str}%): "
+        f"agreed {counts['agreed']}, disagreed {counts['disagreed']}, "
+        f"confirmed-still-vulnerable {confirmed_only}, "
+        f"errored {counts['error_count']} (incl. refused {refused}), "
+        f"needs_review {counts['needs_review']}"
     )
 
 

@@ -91,6 +91,11 @@ class UsageInfo:
     total_output_tokens: int = 0
     total_tokens: int = 0
     total_cost_usd: float = 0.0
+    # #216: the cost figure is incomplete when any dispatched model had no
+    # pricing record (tokens counted, dollars $0). Deterministic advisory —
+    # flows into step reports and scan.report.json via tracking.get_usage.
+    cost_incomplete: bool = False
+    unpriced_models: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)

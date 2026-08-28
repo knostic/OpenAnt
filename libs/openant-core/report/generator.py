@@ -32,6 +32,7 @@ def _extract_usage(
     input_tokens: int,
     output_tokens: int,
     model: str,
+    usage_details: dict | None = None,
     pricing: dict[str, float] | None = None,
 ) -> dict:
     """Build the usage dict from token counts.
@@ -57,22 +58,40 @@ def _extract_usage(
         input_cost = (input_tokens / 1_000_000) * pricing["input"]
         output_cost = (output_tokens / 1_000_000) * pricing["output"]
         total_cost = input_cost + output_cost
-    return {
+    usage = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
         "cost_usd": round(total_cost, 6),
     }
+    if pricing is None:
+        # #216: this fallback costs OUTSIDE the tracker — the usage dict
+        # must not claim a complete cost it does not have.
+        usage["cost_incomplete"] = True
+    if usage_details is not None:
+        # #211 pass-through capture: verbatim, informational only.
+        usage["usage_details"] = usage_details
+    return usage
 
 
 def _merge_usage(usages: list[dict]) -> dict:
-    """Merge multiple usage dicts into one."""
+    """Merge multiple usage dicts into one.
+
+    #211 pass-through: per-completion ``usage_details`` (when any completion
+    captured provider detail fields) are carried VERBATIM as a list — same
+    shape the agentic loops record — never summed, never in cost.
+    """
     merged = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
     for u in usages:
+        if u.get("cost_incomplete"):
+            merged["cost_incomplete"] = True
         merged["input_tokens"] += u["input_tokens"]
         merged["output_tokens"] += u["output_tokens"]
         merged["total_tokens"] += u["total_tokens"]
         merged["cost_usd"] = round(merged["cost_usd"] + u["cost_usd"], 6)
+    details = [u.get("usage_details") for u in usages if u.get("usage_details") is not None]
+    if details:
+        merged["usage_details"] = details
     return merged
 
 
@@ -185,7 +204,9 @@ def generate_summary_report(
 
     Returns:
         (report_text, usage_dict) where usage_dict has input_tokens,
-        output_tokens, total_tokens, cost_usd.
+        output_tokens, total_tokens, cost_usd — plus a verbatim
+        ``usage_details`` key when the provider supplied usage detail
+        fields (#211 pass-through; never summed, never in cost).
     """
     from utilities.llm import Message, TextBlock
 
@@ -205,9 +226,12 @@ def generate_summary_report(
     text = "\n".join(b.text for b in result.content if isinstance(b, TextBlock))
     # #209: refuse to bless an empty summary. An empty/whitespace completion
     # (e.g. the Claude-5 thinking/empty-completion path) otherwise produces a
-    # summary-free SUMMARY_REPORT.md that the report step records as
-    # status=success with summary_path in its outputs — asserting a deliverable
-    # it never produced. Guard the raw LLM output HERE, before the deterministic
+    # summary-free SUMMARY_REPORT.md — an empty deliverable is wrong regardless
+    # of what status it is recorded under. (Historically this also left the
+    # report step's status="success" with summary_path in its outputs; that
+    # half is now fixed by core/step_report.py's #209 errors->status
+    # derivation, so the report step correctly reports "error" when this guard
+    # fires.) Guard the raw LLM output HERE, before the deterministic
     # provenance banner is prepended: on a threat-model scan the banner is
     # non-empty, so a guard on the banner+text combination would miss exactly
     # this case. Raising here also covers the standalone `python -m report
@@ -215,7 +239,7 @@ def generate_summary_report(
     if not text.strip():
         raise RuntimeError(
             "summary report generation returned empty output; refusing to write "
-            "a summary-free SUMMARY_REPORT.md and report success"
+            "a summary-free SUMMARY_REPORT.md"
         )
     # Prepend the provenance banner deterministically (see helper docstring).
     text = _context_provenance_header(pipeline_data) + text
@@ -224,6 +248,7 @@ def generate_summary_report(
         result.output_tokens,
         binding.model,
         pricing=lookup_pricing(binding),
+        usage_details=result.usage_details,
     )
 
 
@@ -361,6 +386,7 @@ def generate_disclosure(
         result.output_tokens,
         binding.model,
         pricing=lookup_pricing(binding),
+        usage_details=result.usage_details,
     )
 
 

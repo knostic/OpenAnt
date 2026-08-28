@@ -640,6 +640,7 @@ class ContextEnhancer:
         _summary_input_tokens = 0
         _summary_output_tokens = 0
         _summary_cost_usd = 0.0
+        _summary_unpriced: set[str] = set()
 
         if checkpoint_dir:
             SC = _get_step_checkpoint()
@@ -660,6 +661,8 @@ class ContextEnhancer:
                     _summary_input_tokens += cp_usage.get("input_tokens", 0)
                     _summary_output_tokens += cp_usage.get("output_tokens", 0)
                     _summary_cost_usd += cp_usage.get("cost_usd", 0.0)
+                    # #216: restore the incomplete-cost marker per unit.
+                    _summary_unpriced.update(cp_usage.get("unpriced_models") or [])
                     # Count errors for non-completed units
                     if uid not in processed_ids and cp_data.get("agent_context", {}).get("error"):
                         _summary_errors += 1
@@ -676,7 +679,7 @@ class ContextEnhancer:
                                              "cost_usd": round(_summary_cost_usd, 6)})
 
             # Inject prior usage into tracker so step_report captures the total
-            if _summary_input_tokens or _summary_output_tokens:
+            if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
                 self.tracker.add_prior_usage(
                     _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
                 # #281: refresh the caller's phase baseline AFTER the
@@ -766,11 +769,16 @@ class ContextEnhancer:
             _summary_input_tokens += meta.get("input_tokens", 0)
             _summary_output_tokens += meta.get("output_tokens", 0)
             _summary_cost_usd += meta.get("cost_usd", 0.0)
+            _summary_unpriced.update(meta.get("unpriced_models") or [])
+            _usage = {"input_tokens": _summary_input_tokens,
+                      "output_tokens": _summary_output_tokens,
+                      "cost_usd": round(_summary_cost_usd, 6)}
+            if _summary_unpriced:
+                _usage["cost_incomplete"] = True
+                _usage["unpriced_models"] = sorted(_summary_unpriced)
             _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                       _summary_error_breakdown, phase="in_progress",
-                                      usage={"input_tokens": _summary_input_tokens,
-                                             "output_tokens": _summary_output_tokens,
-                                             "cost_usd": round(_summary_cost_usd, 6)})
+                                      usage=_usage)
 
         if workers <= 1:
             # Sequential mode

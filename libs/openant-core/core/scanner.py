@@ -28,6 +28,7 @@ from core.schemas import (
 from core.step_report import step_context
 from core import tracking
 from utilities.file_io import read_json, write_json
+from utilities.llm.adapter import LLMAuthError
 
 # Import app context generator (optional)
 try:
@@ -166,7 +167,8 @@ def scan_repository(
         generate_context: If True, generate application context (reduces FP).
         generate_report: If True, generate summary + disclosure reports.
         skip_tests: If True, exclude test files from parsing (default: True).
-        limit: Max number of units to analyze.
+        limit: Max number of units to analyze and enhance (the LLM
+            reachability pass still reviews the full codebase).
         enhance: If True, run agentic/single-shot context enhancement.
         enhance_mode: ``"agentic"`` (thorough) or ``"single-shot"`` (fast).
         dynamic_test: If True, run Docker-isolated dynamic testing (requires Docker).
@@ -475,12 +477,10 @@ def scan_repository(
             except Exception as exc:
                 # Broaden beyond (OSError, json.JSONDecodeError): read_json opens
                 # strict UTF-8, so a bad-encoding dataset raises UnicodeDecodeError
-                # (a ValueError) which previously escaped and aborted the whole
-                # scan. NOTE: this guards only the dataset READ. The stage's LLM
-                # call (analyze_reachability, below) is NOT wrapped here, so a
-                # provider error there still aborts the scan — a separate gap
-                # tracked as a follow-up (wrap the whole stage body like
-                # enhance/verify do).
+                # (a ValueError). NOTE: this inner guard predates the whole-body
+                # wrap below (#268) and stays for its precise skip reason; the
+                # body wrap catches everything else (corrupt call_graph.json in
+                # the re-filter, failed writes) and degrades the same way.
                 print(f"  WARNING: failed to load dataset: {exc}", file=sys.stderr)
                 ctx.status = "skipped"
                 ctx.summary = {"skipped": True, "reason": str(exc)}
@@ -490,239 +490,272 @@ def scan_repository(
                 _record_skip(result, "llm-reachability", "failed")
                 dataset = None
 
-            if dataset is not None:
-                app_ctx_payload = None
-                if app_context_path and os.path.exists(app_context_path):
-                    try:
-                        app_ctx_payload = read_json(app_context_path)
-                    except Exception as exc:
-                        # Broad like the dataset load above: this optional
-                        # app-context read must never abort the scan. read_json
-                        # opens strict UTF-8, so a bad-encoding self-written file
-                        # raises UnicodeDecodeError (not OSError/JSONDecodeError);
-                        # a missing payload just means the reachability prompt
-                        # runs without the extra app-context hint. Warn (like the
-                        # dataset-load sibling) so this recall-affecting
-                        # degradation is visible, not silent.
-                        print(
-                            f"  WARNING: could not read app context for "
-                            f"reachability ({exc}); continuing without the "
-                            f"app-context hint.",
-                            file=sys.stderr,
-                        )
-                        app_ctx_payload = None
-
-                # --limit governs the analyze stage, not how many units the
-                # LLM reachability pass reviews — it must see the full
-                # codebase to find missed entry points.
-                signals = analyze_reachability(
-                    dataset=dataset,
-                    app_context=app_ctx_payload,
-                    binding=llm_reach_binding,
-                    max_code_bytes=llm_reachability_max_code_bytes,
-                )
-                summary = apply_signals(dataset, signals)
-
-                signals_path = os.path.join(output_dir, "llm_reachability.json")
-                write_json(signals_path, {"signals": signals_to_json(signals)}, indent=2)
-
-                pre_filter_count = len(dataset.get("units", []))
-                post_filter_count = pre_filter_count
-                refilter_supported = False
-
-                # Re-apply the structural reachability filter using
-                # LLM-promoted entry points as additional BFS seeds.
-                # Only possible when the parser persisted call_graph.json.
-                # Which parsers do so is determined by PROBING THE FILESYSTEM
-                # below, not by a hardcoded language list — an earlier comment
-                # here claimed only Python and Zig persist it, which is wrong
-                # (JavaScript writes a fully-formed call_graph.json too). Keep
-                # this probe-based: parsers gain and lose the behaviour over
-                # time, and a stale list here would silently skip re-filtering
-                # for a language that actually supports it.
-                if processing_level != "all":
-                    cg_dirs = resolve_call_graph_dirs(output_dir)
-                    if cg_dirs:
-                        from core.parser_adapter import apply_reachability_filter
-
-                        llm_promoted_ids = {
-                            u["id"] for u in dataset.get("units", [])
-                            if u.get("is_entry_point") and u.get("id")
-                        }
-                        partitions = partition_units_by_language(
-                            dataset.get("units", [])
-                        )
-                        kept: list[dict] = []
-                        unfilterable: dict[str, int] = {}
-                        # Per-language reachability_filter stats, aggregated back
-                        # onto the rebuilt dataset below. Without this the rebuild
-                        # at `dataset = {**dataset, "units": kept}` carried the
-                        # ORIGINAL (pre-LLM) metadata, so the reporter rendered
-                        # "reachability filtering not applied" on a scan that DID
-                        # prune via the LLM-seeded re-filter.
-                        refilter_by_language: dict[str, dict] = {}
-
-                        for lang, lang_units in partitions.items():
-                            lang_dir = cg_dirs.get(lang)
-                            if lang_dir is None and None in cg_dirs:
-                                # Legacy flat layout: one graph covers everything.
-                                lang_dir = cg_dirs[None]
-                            if lang_dir is None:
-                                # This language's parser persisted no call graph,
-                                # so its units pass through unfiltered — the
-                                # pre-existing behaviour, now scoped per language
-                                # instead of disabling the filter for the whole
-                                # scan just because the primary lacked a graph.
-                                unfilterable[lang or "unknown"] = len(lang_units)
-                                kept.extend(lang_units)
-                                continue
-
-                            # Deep-copy metadata: the shallow {**dataset} copy
-                            # shares the nested metadata dict across every
-                            # per-language call, so each filter's stats
-                            # overwrote the previous language's.
-                            lang_dataset = {
-                                **dataset,
-                                "units": lang_units,
-                                "metadata": dict(dataset.get("metadata") or {}),
-                            }
-                            filtered = apply_reachability_filter(
-                                lang_dataset,
-                                lang_dir,
-                                processing_level,
-                                extra_entry_points=scope_entry_points_to_units(
-                                    llm_promoted_ids, lang_units
-                                ),
-                                library_mode=library_mode,
-                            )
-                            kept.extend(filtered.get("units", []))
-                            _rf = (filtered.get("metadata") or {}).get(
-                                "reachability_filter"
-                            )
-                            if _rf:
-                                refilter_by_language[lang or "unknown"] = _rf
-
-                        # Rebuild the dataset, aggregating the per-language filter
-                        # stats into metadata so the reporter reads a real record
-                        # instead of the stale pre-LLM one. Unfilterable languages
-                        # (no call graph) are folded in as pass-throughs so the
-                        # aggregate reconciles with len(kept).
-                        _new_md = dict(dataset.get("metadata") or {})
-                        # Only stamp a record when a real per-language filter ran.
-                        # If every language was unfilterable (no call graph), the
-                        # units passed through untouched, so leaving no record —
-                        # the honest "not applied" signal — is correct; a "0%
-                        # reduction" record would falsely claim filtering happened.
-                        if refilter_by_language:
-                            _per_lang = dict(refilter_by_language)
-                            _unfiltered = 0
-                            for _lang, _cnt in unfilterable.items():
-                                _unfiltered += _cnt
-                                _per_lang[_lang] = {
-                                    "original_units": _cnt,
-                                    "entry_points": 0,
-                                    "reachable_units": _cnt,
-                                    "filtered_out": 0,
-                                    "reduction_percentage": 0,
-                                    "unfilterable": True,
-                                }
-                            _orig = sum(
-                                r.get("original_units", 0) for r in _per_lang.values()
-                            )
-                            _reach = sum(
-                                r.get("reachable_units", 0) for r in _per_lang.values()
-                            )
-                            _agg = {
-                                "original_units": _orig,
-                                "entry_points": sum(
-                                    r.get("entry_points", 0) for r in _per_lang.values()
-                                ),
-                                "reachable_units": _reach,
-                                "filtered_out": _orig - _reach,
-                                # Units that flowed through unfiltered (no call
-                                # graph for their language) — folded into the
-                                # totals above but surfaced explicitly so the
-                                # record never silently claims they were filtered.
-                                "unfiltered_units": _unfiltered,
-                                "reduction_percentage": (
-                                    round((1 - _reach / _orig) * 100, 1)
-                                    if _orig
-                                    else 0
-                                ),
-                                "per_language": _per_lang,
-                            }
-                            # Lift any per-language advisory (e.g. an empty-seed
-                            # blackout — a language that flowed through unfiltered
-                            # because it had no real entry points) to the top
-                            # level, where the reporter reads it (reporter.py:505).
-                            # Without this the record reads "filter applied, N%
-                            # reduction" while hiding that a language blacked out —
-                            # the exact fidelity gap this record exists to close.
-                            _warnings = [
-                                f"{_lang}: {_r['warning']}"
-                                for _lang, _r in _per_lang.items()
-                                if _r.get("warning")
-                            ]
-                            if _warnings:
-                                _agg["warning"] = "; ".join(_warnings)
-                            _new_md["reachability_filter"] = _agg
-                        else:
-                            # No real filter ran (every language unfilterable):
-                            # honour the "not applied" contract by clearing any
-                            # record inherited from an upstream merge, so a stale
-                            # record can never misdescribe the passed-through units.
-                            _new_md.pop("reachability_filter", None)
-                        dataset = {**dataset, "units": kept, "metadata": _new_md}
-                        post_filter_count = len(kept)
-                        result.units_count = post_filter_count
-                        refilter_supported = True
-
-                        for lang, count in unfilterable.items():
+            # #268: guard the WHOLE stage body (the pattern enhance/verify
+            # use), not just the dataset read — a non-LLM failure below
+            # (corrupt call_graph.json in the re-filter at parser_adapter,
+            # a failed write_json) previously aborted the whole scan via
+            # step_context re-raise instead of degrading to a recorded skip.
+            # Provider errors are NOT at issue: analyze_reachability already
+            # skips failed batches, re-raising only LLMAuthError by design —
+            # and that one MUST still abort (bad credentials must not be
+            # silently skipped into a "successful" degraded scan).
+            pre_llmreach_units_count = result.units_count
+            try:
+                if dataset is not None:
+                    app_ctx_payload = None
+                    if app_context_path and os.path.exists(app_context_path):
+                        try:
+                            app_ctx_payload = read_json(app_context_path)
+                        except Exception as exc:
+                            # Broad like the dataset load above: this optional
+                            # app-context read must never abort the scan. read_json
+                            # opens strict UTF-8, so a bad-encoding self-written file
+                            # raises UnicodeDecodeError (not OSError/JSONDecodeError);
+                            # a missing payload just means the reachability prompt
+                            # runs without the extra app-context hint. Warn (like the
+                            # dataset-load sibling) so this recall-affecting
+                            # degradation is visible, not silent.
                             print(
-                                f"\n  WARNING: {lang} persisted no call_graph.json; "
-                                f"{count} unit(s) skip post-LLM re-filtering and "
-                                f"flow to downstream stages unfiltered.",
+                                f"  WARNING: could not read app context for "
+                                f"reachability ({exc}); continuing without the "
+                                f"app-context hint.",
                                 file=sys.stderr,
                             )
-                    else:
-                        # Parser doesn't persist call_graph.json — the full
-                        # unfiltered dataset will flow to downstream stages.
-                        # Warn loudly so the cost impact is visible.
-                        print(
-                            f"\n  WARNING: --llm-reachability with "
-                            f"--level {processing_level}: "
-                            f"{parse_result.language} does not yet support "
-                            f"post-LLM re-filtering (call_graph.json not found). "
-                            f"Downstream stages will process all "
-                            f"{pre_filter_count} units instead of the filtered "
-                            f"subset — this may significantly increase cost.",
-                            file=sys.stderr,
-                        )
+                            app_ctx_payload = None
 
-                # Persist final dataset so downstream stages see promoted
-                # entry points, per-unit signals, and the applied filter.
-                write_json(active_dataset_path, dataset, indent=2)
+                    # --limit governs the analyze AND enhance stages, not how many units the
+                    # LLM reachability pass reviews — it must see the full
+                    # codebase to find missed entry points.
+                    signals = analyze_reachability(
+                        dataset=dataset,
+                        app_context=app_ctx_payload,
+                        binding=llm_reach_binding,
+                        max_code_bytes=llm_reachability_max_code_bytes,
+                    )
+                    summary = apply_signals(dataset, signals)
 
-                ctx.summary = {
-                    "units_reviewed": pre_filter_count,
-                    "signals_added": summary["signals_applied"],
-                    "entry_points_promoted": summary["entry_points_promoted"],
-                    "units_touched": summary["units_touched"],
-                    "post_filter_units": post_filter_count,
-                    "refilter_supported": refilter_supported,
-                }
-                ctx.outputs = {"signals_path": signals_path}
+                    signals_path = os.path.join(output_dir, "llm_reachability.json")
+                    write_json(signals_path, {"signals": signals_to_json(signals)}, indent=2)
 
-                print(
-                    f"  LLM reachability: {summary['signals_applied']} signals, "
-                    f"{summary['entry_points_promoted']} new entry points",
-                    file=sys.stderr,
-                )
-                if processing_level != "all" and refilter_supported:
+                    pre_filter_count = len(dataset.get("units", []))
+                    post_filter_count = pre_filter_count
+                    refilter_supported = False
+
+                    # Re-apply the structural reachability filter using
+                    # LLM-promoted entry points as additional BFS seeds.
+                    # Only possible when the parser persisted call_graph.json.
+                    # Which parsers do so is determined by PROBING THE FILESYSTEM
+                    # below, not by a hardcoded language list — an earlier comment
+                    # here claimed only Python and Zig persist it, which is wrong
+                    # (JavaScript writes a fully-formed call_graph.json too). Keep
+                    # this probe-based: parsers gain and lose the behaviour over
+                    # time, and a stale list here would silently skip re-filtering
+                    # for a language that actually supports it.
+                    if processing_level != "all":
+                        cg_dirs = resolve_call_graph_dirs(output_dir)
+                        if cg_dirs:
+                            from core.parser_adapter import apply_reachability_filter
+
+                            llm_promoted_ids = {
+                                u["id"] for u in dataset.get("units", [])
+                                if u.get("is_entry_point") and u.get("id")
+                            }
+                            partitions = partition_units_by_language(
+                                dataset.get("units", [])
+                            )
+                            kept: list[dict] = []
+                            unfilterable: dict[str, int] = {}
+                            # Per-language reachability_filter stats, aggregated back
+                            # onto the rebuilt dataset below. Without this the rebuild
+                            # at `dataset = {**dataset, "units": kept}` carried the
+                            # ORIGINAL (pre-LLM) metadata, so the reporter rendered
+                            # "reachability filtering not applied" on a scan that DID
+                            # prune via the LLM-seeded re-filter.
+                            refilter_by_language: dict[str, dict] = {}
+
+                            for lang, lang_units in partitions.items():
+                                lang_dir = cg_dirs.get(lang)
+                                if lang_dir is None and None in cg_dirs:
+                                    # Legacy flat layout: one graph covers everything.
+                                    lang_dir = cg_dirs[None]
+                                if lang_dir is None:
+                                    # This language's parser persisted no call graph,
+                                    # so its units pass through unfiltered — the
+                                    # pre-existing behaviour, now scoped per language
+                                    # instead of disabling the filter for the whole
+                                    # scan just because the primary lacked a graph.
+                                    unfilterable[lang or "unknown"] = len(lang_units)
+                                    kept.extend(lang_units)
+                                    continue
+
+                                # Deep-copy metadata: the shallow {**dataset} copy
+                                # shares the nested metadata dict across every
+                                # per-language call, so each filter's stats
+                                # overwrote the previous language's.
+                                lang_dataset = {
+                                    **dataset,
+                                    "units": lang_units,
+                                    "metadata": dict(dataset.get("metadata") or {}),
+                                }
+                                filtered = apply_reachability_filter(
+                                    lang_dataset,
+                                    lang_dir,
+                                    processing_level,
+                                    extra_entry_points=scope_entry_points_to_units(
+                                        llm_promoted_ids, lang_units
+                                    ),
+                                    library_mode=library_mode,
+                                )
+                                kept.extend(filtered.get("units", []))
+                                _rf = (filtered.get("metadata") or {}).get(
+                                    "reachability_filter"
+                                )
+                                if _rf:
+                                    refilter_by_language[lang or "unknown"] = _rf
+
+                            # Rebuild the dataset, aggregating the per-language filter
+                            # stats into metadata so the reporter reads a real record
+                            # instead of the stale pre-LLM one. Unfilterable languages
+                            # (no call graph) are folded in as pass-throughs so the
+                            # aggregate reconciles with len(kept).
+                            _new_md = dict(dataset.get("metadata") or {})
+                            # Only stamp a record when a real per-language filter ran.
+                            # If every language was unfilterable (no call graph), the
+                            # units passed through untouched, so leaving no record —
+                            # the honest "not applied" signal — is correct; a "0%
+                            # reduction" record would falsely claim filtering happened.
+                            if refilter_by_language:
+                                _per_lang = dict(refilter_by_language)
+                                _unfiltered = 0
+                                for _lang, _cnt in unfilterable.items():
+                                    _unfiltered += _cnt
+                                    _per_lang[_lang] = {
+                                        "original_units": _cnt,
+                                        "entry_points": 0,
+                                        "reachable_units": _cnt,
+                                        "filtered_out": 0,
+                                        "reduction_percentage": 0,
+                                        "unfilterable": True,
+                                    }
+                                _orig = sum(
+                                    r.get("original_units", 0) for r in _per_lang.values()
+                                )
+                                _reach = sum(
+                                    r.get("reachable_units", 0) for r in _per_lang.values()
+                                )
+                                _agg = {
+                                    "original_units": _orig,
+                                    "entry_points": sum(
+                                        r.get("entry_points", 0) for r in _per_lang.values()
+                                    ),
+                                    "reachable_units": _reach,
+                                    "filtered_out": _orig - _reach,
+                                    # Units that flowed through unfiltered (no call
+                                    # graph for their language) — folded into the
+                                    # totals above but surfaced explicitly so the
+                                    # record never silently claims they were filtered.
+                                    "unfiltered_units": _unfiltered,
+                                    "reduction_percentage": (
+                                        round((1 - _reach / _orig) * 100, 1)
+                                        if _orig
+                                        else 0
+                                    ),
+                                    "per_language": _per_lang,
+                                }
+                                # Lift any per-language advisory (e.g. an empty-seed
+                                # blackout — a language that flowed through unfiltered
+                                # because it had no real entry points) to the top
+                                # level, where the reporter reads it (reporter.py:505).
+                                # Without this the record reads "filter applied, N%
+                                # reduction" while hiding that a language blacked out —
+                                # the exact fidelity gap this record exists to close.
+                                _warnings = [
+                                    f"{_lang}: {_r['warning']}"
+                                    for _lang, _r in _per_lang.items()
+                                    if _r.get("warning")
+                                ]
+                                if _warnings:
+                                    _agg["warning"] = "; ".join(_warnings)
+                                _new_md["reachability_filter"] = _agg
+                            else:
+                                # No real filter ran (every language unfilterable):
+                                # honour the "not applied" contract by clearing any
+                                # record inherited from an upstream merge, so a stale
+                                # record can never misdescribe the passed-through units.
+                                _new_md.pop("reachability_filter", None)
+                            dataset = {**dataset, "units": kept, "metadata": _new_md}
+                            post_filter_count = len(kept)
+                            result.units_count = post_filter_count
+                            refilter_supported = True
+
+                            for lang, count in unfilterable.items():
+                                print(
+                                    f"\n  WARNING: {lang} persisted no call_graph.json; "
+                                    f"{count} unit(s) skip post-LLM re-filtering and "
+                                    f"flow to downstream stages unfiltered.",
+                                    file=sys.stderr,
+                                )
+                        else:
+                            # Parser doesn't persist call_graph.json — the full
+                            # unfiltered dataset will flow to downstream stages.
+                            # Warn loudly so the cost impact is visible.
+                            print(
+                                f"  WARNING: --llm-reachability with "
+                                f"--level {processing_level}: "
+                                f"{parse_result.language} does not yet support "
+                                f"post-LLM re-filtering (call_graph.json not found). "
+                                f"Downstream stages will process all "
+                                f"{pre_filter_count} units instead of the filtered "
+                                f"subset — this may significantly increase cost.",
+                                file=sys.stderr,
+                            )
+
+                    # Persist final dataset so downstream stages see promoted
+                    # entry points, per-unit signals, and the applied filter.
+                    write_json(active_dataset_path, dataset, indent=2)
+
+                    ctx.summary = {
+                        "units_reviewed": pre_filter_count,
+                        "signals_added": summary["signals_applied"],
+                        "entry_points_promoted": summary["entry_points_promoted"],
+                        "units_touched": summary["units_touched"],
+                        "post_filter_units": post_filter_count,
+                        "refilter_supported": refilter_supported,
+                    }
+                    ctx.outputs = {"signals_path": signals_path}
+
                     print(
-                        f"  After reachability filter: {post_filter_count} units",
+                        f"  LLM reachability: {summary['signals_applied']} signals, "
+                        f"{summary['entry_points_promoted']} new entry points",
                         file=sys.stderr,
                     )
+                    if processing_level != "all" and refilter_supported:
+                        print(
+                            f"  After reachability filter: {post_filter_count} units",
+                            file=sys.stderr,
+                        )
+            except LLMAuthError:
+                # The designed abort: bad credentials surface loudly, never
+                # degrade into a skip (a silently-skipped reachability pass
+                # reads as a clean run to a credential-less user).
+                raise
+            except Exception as exc:
+                # #268 (wave catch): the body mutates result.units_count
+                # mid-flow (post-re-filter) BEFORE the dataset persist; a
+                # failure in that window left the count describing a dataset
+                # that never reached disk. Restore the pre-stage count so the
+                # result matches what downstream actually consumes.
+                result.units_count = pre_llmreach_units_count
+                print(
+                    f"  WARNING: LLM reachability stage failed: {exc}",
+                    file=sys.stderr,
+                )
+                ctx.status = "skipped"
+                ctx.summary = {"skipped": True, "reason": str(exc)}
+                # Record the crash so the degraded reachability pass is
+                # visible in the artifacts, matching the dataset-read guard.
+                _record_skip(result, "llm-reachability", "failed")
+                dataset = None
 
         collected_step_reports.append(
             _load_step_report(output_dir, "llm-reachability")
@@ -761,6 +794,17 @@ def scan_repository(
                     workers=workers,
                     backoff_seconds=backoff_seconds,
                     # checkpoint_path auto-derived from output_path
+                    # #213: --limit bounds the enhance phase too — the
+                    # scan's cheapest-mode flag must bound the run's spend,
+                    # and enhance is a high-volume per-unit LLM phase. NOTE
+                    # the ordering trade-off (deliberate, per the issue's
+                    # ruling): a limited run selects units BEFORE the
+                    # enhancer writes security_classification, so analyze's
+                    # classification-priority re-sort no-ops on the
+                    # pre-limited set — bounded runs choose cost-bound over
+                    # classification-priority coverage. (LLM reachability
+                    # stays unbounded: it needs the full corpus.)
+                    limit=limit,
                 )
 
                 ctx.summary = {
@@ -1314,6 +1358,16 @@ def _write_scan_report(
             "input_tokens": total_input,
             "output_tokens": total_output,
             "total_tokens": total_input + total_output,
+            # #216: the aggregate rebuilds token_usage from the step
+            # reports — OR-aggregate the incomplete-cost marker across them
+            # (a rebuild must not drop the advisory).
+            **({
+                "cost_incomplete": True,
+                "unpriced_models": sorted({m for sr in step_reports
+                                           for m in (sr.get("token_usage", {})
+                                                     .get("unpriced_models") or [])}),
+            } if any(sr.get("token_usage", {}).get("cost_incomplete")
+                     for sr in step_reports) else {}),
         },
     )
 
