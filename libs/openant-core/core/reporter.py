@@ -422,7 +422,19 @@ def build_pipeline_output(
         elif verification.get("incomplete"):
             stage2_verdict = "unverified"
         elif verification:
-            stage2_verdict = "rejected"
+            # #283: agree=False + COMPLETE does not mean "not a finding".
+            # finding_verifier writes the corrected verdict onto
+            # r["finding"] as its authoritative call; a disagreement that
+            # reclassifies vulnerable -> bypassable (still real) must stay
+            # DISCLOSURE_ELIGIBLE — the "final verdict, not the agree flag"
+            # rule the stats side already uses (verifier.py:321,
+            # _write_verified_results). Only a corrected verdict that is
+            # ITSELF disclosure-dropped maps to "rejected".
+            corrected = str(finding.get("finding") or finding.get("verdict", "")).lower()
+            if corrected in ("vulnerable", "bypassable"):
+                stage2_verdict = corrected
+            else:
+                stage2_verdict = "rejected"
         else:
             stage2_verdict = finding.get("finding", "vulnerable")
 
