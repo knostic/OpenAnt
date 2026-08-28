@@ -27,7 +27,7 @@ from utilities.llm import (
     resolve_llm_config,
 )
 from utilities.file_io import normalize_results, read_json, write_json
-from utilities.finding_verifier import FindingVerifier
+from utilities.finding_verifier import FindingVerifier, MAX_TOKENS_PER_RESPONSE
 from utilities.agentic_enhancer.repository_index import load_index_from_file
 
 # Import application context (optional)
@@ -179,7 +179,14 @@ def run_verification(
         [lambda: get_verification_system_prompt(None)])
     checkpoint.sync_identity(fingerprint_for_binding(
         verify_binding, _verify_texts,
-        extra_key={"analyze_fingerprint": experiment.get("analyze_fingerprint")}))
+        extra_key={
+            "analyze_fingerprint": experiment.get("analyze_fingerprint"),
+            # #287: the verify phase's generation budget is part of its
+            # checkpoint identity — a budget change invalidates verify
+            # checkpoints specifically (no scheme bump; the extra_key
+            # mechanism is the pre-existing plumbing).
+            "gen_params": {"max_tokens": MAX_TOKENS_PER_RESPONSE},
+        }))
 
     # Run Stage 2 verification via verify_batch
     tracker = get_global_tracker()

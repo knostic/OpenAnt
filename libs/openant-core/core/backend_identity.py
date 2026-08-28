@@ -29,6 +29,20 @@ Deliberate exclusions (minimal by mandate):
     non-deterministically every scan; callers MUST render templates with
     ``app_context=None`` so it never enters ``templates_sha`` (including it
     caused a VERIFIED ~17k-token spurious re-pay on a same-config resume).
+  * Generation parameters (``max_tokens``, ``temperature``, etc.) are
+    deliberately NOT global KEY members (#242: "this config-only change does
+    not invalidate prior checkpoints. Rationale is FN-safe: pre-fix empty
+    completions were recorded as ERROR, which never adopts on resume, so
+    truncation-degraded successes are the only carry-over"). #287 re-checked
+    the rationale: the FN-safety argument is CONDITIONAL on the ERROR-retry
+    working — restored by #286/#377 (the adapter-raise error string is now
+    copied into the checkpoint and retried on resume). The residual
+    carry-over is truncation-degraded SUCCESSES (stale adoption, weaker
+    than FN). The VERIFY phase opts IN its budget via ``extra_key`` (the
+    existing mechanism, verifier.py:182): a ``max_tokens`` change invalidates
+    verify checkpoints specifically, without a scheme bump. Other phases use
+    ``simple_text`` whose default lives in helpers.py (a change there is a
+    code-level behavior change, already visible in ``templates_sha``).
 
 Bump ``FINGERPRINT_SCHEME_VERSION`` when the KEY definition changes; it is part
 of the KEY, so old sidecars invalidate cleanly.
