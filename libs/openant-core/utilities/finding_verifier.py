@@ -625,14 +625,26 @@ class FindingVerifier:
             checkpointed = checkpoint.load()
 
         def _cp_is_error(cp_data):
-            """A verify checkpoint is errored if verification is missing/empty
-            or correct_finding == 'error'."""
+            """A verify checkpoint is errored if verification is missing/empty,
+            correct_finding == 'error', or the verification is INCOMPLETE.
+
+            #286: the verify error path writes ``verification =
+            {"incomplete": True}`` (finding_verifier.py:802 — the adapter-raise
+            fail-safe) and puts the error string on the RESULT dict, which the
+            checkpoint writer does not copy. correct_finding == 'error' has no
+            writer on that path, so the old two-condition classifier read
+            errored units as finished work and adopted them on resume — never
+            retried (the reporter's 223/223 adoption with 48 hard errors).
+            ``incomplete`` is the signal the error path actually writes.
+            """
             if not cp_data:
                 return True
             v = cp_data.get("verification", {})
             if not v:
                 return True
-            return v.get("correct_finding") == "error"
+            if v.get("correct_finding") == "error":
+                return True
+            return bool(v.get("incomplete"))
 
         # Separate already-done (successful) from to-do (new + errored)
         results_to_verify = []
