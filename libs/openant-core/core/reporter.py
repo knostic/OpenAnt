@@ -586,8 +586,18 @@ def build_pipeline_output(
             "skipped_steps": skipped_steps_detail,
         },
         "results": {
-            "vulnerable": metrics.get("vulnerable", 0) + metrics.get("bypassable", 0),
-            "safe": metrics.get("safe", 0) + metrics.get("protected", 0),
+            # #289: re-derive from the DEDUPED findings list, not from
+            # metrics (the pre-dedup count) — the same file must never
+            # report 183 in results.vulnerable alongside 175 entries in
+            # findings. The pre-dedup count and the dedup delta are
+            # explicit so the difference is explainable, not contradictory.
+            "vulnerable": len(findings_data),
+            "vulnerable_before_dedup": metrics.get("vulnerable", 0) + metrics.get("bypassable", 0),
+            "deduplicated": (metrics.get("vulnerable", 0) + metrics.get("bypassable", 0)) - len(findings_data),
+            # #289: protected is its OWN key — the lossy safe-fold destroyed
+            # a verdict the pipeline computes and the template has a row for.
+            "safe": metrics.get("safe", 0),
+            "protected": metrics.get("protected", 0),
             "inconclusive": metrics.get("inconclusive", 0),
             # F13: errored units are part of `total` (see units_analyzed above), so the
             # results buckets must include them or they cannot reconcile to `total`.
