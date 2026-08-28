@@ -142,7 +142,7 @@ class CallGraphBuilder:
         self.call_graph: Dict[str, List[str]] = {}
         self.reverse_call_graph: Dict[str, List[str]] = {}
         # Contexts whose fallback call-scan input was truncated by the ReDoS budget
-        # (scan_budget.py) — the call graph there is KNOWN-INCOMPLETE. See residual-evasion.md.
+        # (scan_budget.py) — the call graph there is KNOWN-INCOMPLETE. See issue #288.
         self.scan_truncated: List[str] = []
 
     def build_call_graph(self) -> None:
