@@ -96,7 +96,7 @@ def _blank_rust_literals(text: str) -> str:
     Deliberately matches the regex's EXACT (incomplete) scope — 1-hash raw strings only,
     no ``r##``/byte-string/``br`` forms — so the extracted call set is unchanged. Extending
     it to more literal forms would remove real phantom edges but is a call-set change; see
-    residual-evasion.md (tracked as future work, alongside the token-tree-walk that would
+    issue #288 (tracked as future work, alongside the token-tree-walk that would
     retire this scanner entirely).
     """
     # An UNTERMINATED literal is left UNCHANGED, exactly like the regex: with no
@@ -238,7 +238,7 @@ class CallGraphBuilder:
         # Machine-readable record of macro bodies whose call-scan input was truncated by
         # the ReDoS budget (scan_budget.py). A non-empty list means the call graph for
         # those contexts is KNOWN-INCOMPLETE — downstream reachability should over-seed
-        # rather than trust the callee list. See residual-evasion.md.
+        # rather than trust the callee list. See issue #288.
         self.scan_truncated: List[str] = []
 
     # -- public API (parity with sibling parsers) ----------------------------
@@ -525,7 +525,7 @@ class CallGraphBuilder:
         treats the body, not the grammar. tree-sitter DOES lex the `token_tree`
         into structured nodes (string_literal / identifier / nested token_tree),
         so a node-walk could recover these calls without any regex or scan
-        budget. That rewrite is deferred (see residual-evasion.md R1/T); the
+        budget. That rewrite is deferred (see issue #288 R1/T); the
         regex path is retained for now with a linear literal-stripper in front.
         """
         macro_name = None
@@ -546,7 +546,7 @@ class CallGraphBuilder:
         text = _blank_rust_literals(text)
         # THEN bound the stripped text for _MACRO_CALL_RE, which is still O(n^2) on an
         # adversarial dotted/scoped chain with no trailing '('. This residual (a call after
-        # >8KB of non-literal token soup can be truncated) is tracked in residual-evasion.md.
+        # >8KB of non-literal token soup can be truncated) is tracked in issue #288.
         from utilities.scan_budget import bound_macro_scan_text
         text, _truncated = bound_macro_scan_text(text, context=f"rust macro {macro_name}")
         if _truncated:
