@@ -273,6 +273,11 @@ class VerificationResult:
     # lets the reporter render "unverified" (not "rejected") and lets the
     # metrics bucket it as needs-review (not "safe").
     incomplete: bool = False
+    # #211 pass-through capture: per-turn provider usage detail dicts
+    # (verbatim; None entries for turns that reported none). Serialized
+    # into the unit's verification record so results_verified.json is
+    # reconcilable against a provider bill; never summed, never in cost.
+    usage_details: Optional[list] = None
 
     def to_dict(self) -> dict:
         result = {
@@ -282,6 +287,8 @@ class VerificationResult:
             "iterations": self.iterations,
             "total_tokens": self.total_tokens
         }
+        if self.usage_details is not None:
+            result["usage_details"] = self.usage_details
         if self.exploit_path:
             result["exploit_path"] = self.exploit_path.to_dict()
         if self.security_weakness:
@@ -395,6 +402,10 @@ class FindingVerifier:
         iterations = 0
         total_input_tokens = 0
         total_output_tokens = 0
+        # #211 pass-through capture: per-turn provider usage detail dicts,
+        # verbatim (None entries for turns whose provider reported none).
+        # Passed to record_call as a list; never summed, never in cost.
+        per_turn_usage_details: list = []
 
         while iterations < MAX_ITERATIONS:
             iterations += 1
@@ -412,6 +423,7 @@ class FindingVerifier:
 
             total_input_tokens += response.input_tokens
             total_output_tokens += response.output_tokens
+            per_turn_usage_details.append(response.usage_details)
 
             assistant_content = response.content
             stop_reason = response.stop_reason
@@ -420,7 +432,8 @@ class FindingVerifier:
             if stop_reason == "end_turn":
                 result = self._try_parse_text_response(
                     assistant_content, finding, iterations,
-                    total_input_tokens, total_output_tokens
+                    total_input_tokens, total_output_tokens,
+                    usage_details=per_turn_usage_details,
                 )
                 if result:
                     return result
@@ -442,10 +455,12 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return VerificationResult(
                     agree=False,
                     correct_finding=finding,
+                    usage_details=per_turn_usage_details,
                     explanation="Verification incomplete",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
@@ -497,10 +512,12 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return VerificationResult(
                     agree=False,
                     correct_finding=finding,
+                    usage_details=per_turn_usage_details,
                     explanation="Verification incomplete (finish call truncated at max_tokens)",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
@@ -513,10 +530,12 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return self._parse_finish_result(
                     finish_result, finding, iterations,
-                    total_input_tokens + total_output_tokens
+                    total_input_tokens + total_output_tokens,
+                    usage_details=per_turn_usage_details,
                 )
 
             # Echo only the block kinds the loop consumes (Text + ToolUse);
@@ -534,12 +553,14 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 # Fail-safe (R4-7): see the :380 path above. Don't auto-agree;
                 # keep the Stage-1 verdict surfaced for human triage.
                 return VerificationResult(
                     agree=False,
                     correct_finding=finding,
+                    usage_details=per_turn_usage_details,
                     explanation="Verification incomplete (no tool calls)",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
@@ -553,12 +574,14 @@ class FindingVerifier:
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
+            usage_details=per_turn_usage_details,
         )
         # Fail-safe (R4-7): exhausting the iteration budget is not agreement.
         # Don't auto-agree; keep the Stage-1 verdict surfaced for human triage.
         return VerificationResult(
             agree=False,
             correct_finding=finding,
+            usage_details=per_turn_usage_details,
             explanation="Max iterations reached",
             iterations=iterations,
             total_tokens=total_input_tokens + total_output_tokens,
@@ -573,6 +596,7 @@ class FindingVerifier:
         workers: int = 10,
         checkpoint=None,
         restored_callback: Optional[Callable] = None,
+        phase_baseline: dict | None = None,
     ) -> list:
         """
         Verify a batch of results with consistency cross-check.
@@ -646,6 +670,7 @@ class FindingVerifier:
         _summary_input_tokens = 0
         _summary_output_tokens = 0
         _summary_cost_usd = 0.0
+        _summary_unpriced: set[str] = set()
 
         # Sum usage from ALL existing checkpoints (including errored ones
         # — their cost was already spent in a prior run)
@@ -654,16 +679,29 @@ class FindingVerifier:
             _summary_input_tokens += _cp_usage.get("input_tokens", 0)
             _summary_output_tokens += _cp_usage.get("output_tokens", 0)
             _summary_cost_usd += _cp_usage.get("cost_usd", 0.0)
+            # #216: restore the incomplete-cost marker per unit.
+            _summary_unpriced.update(_cp_usage.get("unpriced_models") or [])
 
         def _usage_dict():
-            return {"input_tokens": _summary_input_tokens,
-                    "output_tokens": _summary_output_tokens,
-                    "cost_usd": round(_summary_cost_usd, 6)}
+            usage = {"input_tokens": _summary_input_tokens,
+                     "output_tokens": _summary_output_tokens,
+                     "cost_usd": round(_summary_cost_usd, 6)}
+            # #216: persist the unpriced set into _summary.json (mirrors
+            # analyzer's — a resume-of-resume keeps the marker).
+            if _summary_unpriced:
+                usage["cost_incomplete"] = True
+                usage["unpriced_models"] = sorted(_summary_unpriced)
+            return usage
 
         # Inject prior usage into tracker so step_report captures the total
-        if _summary_input_tokens or _summary_output_tokens:
+        if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
             self.tracker.add_prior_usage(
                 _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+            # #281: refresh the caller's phase baseline AFTER the injection
+            # so its "Stage 2" delta excludes the restored usage.
+            if phase_baseline is not None:
+                from core import tracking as _tracking
+                phase_baseline["usage"] = _tracking.get_usage()
 
         if checkpoint is not None:
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
@@ -1058,7 +1096,8 @@ class FindingVerifier:
         finish_result: dict,
         original_finding: str,
         iterations: int,
-        total_tokens: int
+        total_tokens: int,
+        usage_details: list | None = None,
     ) -> VerificationResult:
         """Parse the finish tool result into VerificationResult."""
         # Parse exploit path if present
@@ -1119,6 +1158,7 @@ class FindingVerifier:
             explanation=finish_result.get("explanation", ""),
             iterations=iterations,
             total_tokens=total_tokens,
+            usage_details=usage_details,
             exploit_path=exploit_path,
             security_weakness=finish_result.get("security_weakness"),
             incomplete=incomplete,
@@ -1130,7 +1170,8 @@ class FindingVerifier:
         original_finding: str,
         iterations: int,
         total_input_tokens: int,
-        total_output_tokens: int
+        total_output_tokens: int,
+        usage_details: list | None = None,
     ) -> Optional[VerificationResult]:
         """Try to parse a text response as JSON."""
         for block in assistant_content:
@@ -1142,10 +1183,12 @@ class FindingVerifier:
                         input_tokens=total_input_tokens,
                         output_tokens=total_output_tokens,
                         pricing=lookup_pricing(self.binding),
+                        usage_details=usage_details,
                     )
                     return self._parse_finish_result(
                         result, original_finding, iterations,
-                        total_input_tokens + total_output_tokens
+                        total_input_tokens + total_output_tokens,
+                        usage_details=usage_details,
                     )
         return None
 

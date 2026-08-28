@@ -262,6 +262,13 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     # above already retries it via status_code >= 500; mirror that here so the
     # string path is not silently non-retryable.
     error_str = str(error_info).lower()
+    # #212: a DETERMINISTIC refusal is never retryable, regardless of what
+    # the provider's verbatim refusal text contains — the refusal message now
+    # embeds that text, which could incidentally contain a retryable-looking
+    # substring ("timeout", a 5xx code, ...). The cross-adapter refusal
+    # marker wins over the substring scan.
+    if "refused the request" in error_str:
+        return False
     return any(term in error_str for term in (
         "rate_limit", "connection", "timeout",
         # Transient Anthropic/Cloudflare-edge 5xx. 529 ("overloaded") is the

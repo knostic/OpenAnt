@@ -29,7 +29,11 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
     - timestamp (UTC ISO 8601)
     - duration (wall-clock seconds)
     - cost / token usage (from ``core.tracking`` if available)
-    - errors (any exception that propagates)
+    - errors (any exception that propagates, or any error appended to
+      ``report.errors`` inside the block — in which case the step's status
+      is derived as ``"error"`` at exit rather than left at ``"success"``.
+      Errors also win over an explicitly-set ``"skipped"``: a step that
+      both marks itself skipped and records errors reports ``"error"``.)
 
     The caller should set ``ctx.summary`` and ``ctx.outputs`` inside the
     ``with`` block. On exit the report is written to ``{output_dir}/{step}.report.json``.
@@ -56,16 +60,39 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
         traceback.print_exc(file=sys.stderr)
         raise
     finally:
+        # Issue #209/#285: a step that records errors via
+        # ``ctx.errors.append(...)`` or that counts per-item failures in
+        # ``summary["error_count"]`` (exception caught BY DESIGN) must not
+        # report success. Derive the status from evidence at exit:
+        # non-empty ``errors`` OR a positive integer ``error_count`` in
+        # ``summary`` ⇒ ``"partial"`` — deliberately NOT ``"error"`` (which
+        # stays reserved for the propagating-exception path). The scanner's
+        # degrade idiom (status="skipped", reason in summary, no errors) is
+        # unaffected.
+        if report.status != "error":
+            _summary = report.summary if isinstance(report.summary, dict) else {}
+            _counted = _summary.get("error_count")
+            _error_count = _counted if isinstance(_counted, int) and _counted > 0 else 0
+            if report.errors or _error_count:
+                report.status = "partial"
+
         report.duration_seconds = round(time.monotonic() - start, 2)
 
         # Capture cost delta
-        end_cost, end_tokens = _snapshot_usage()
+        end_cost, end_snapshot = _snapshot_usage()
         report.cost_usd = round(end_cost - start_cost, 6)
         report.token_usage = {
-            "input_tokens": end_tokens.get("input", 0) - start_tokens.get("input", 0),
-            "output_tokens": end_tokens.get("output", 0) - start_tokens.get("output", 0),
-            "total_tokens": end_tokens.get("total", 0) - start_tokens.get("total", 0),
+            "input_tokens": end_snapshot.get("input", 0) - start_tokens.get("input", 0),
+            "output_tokens": end_snapshot.get("output", 0) - start_tokens.get("output", 0),
+            "total_tokens": end_snapshot.get("total", 0) - start_tokens.get("total", 0),
         }
+        # #216: a step whose cost is incomplete (any call on an unpriced
+        # model) must say so IN the artifact — OR the end snapshot's marker
+        # (run-cumulative, so a step after unpriced spend also flags).
+        if end_snapshot.get("cost_incomplete"):
+            report.token_usage["cost_incomplete"] = True
+            report.token_usage["unpriced_models"] = end_snapshot.get(
+                "unpriced_models", [])
 
         report.write(output_dir)
         print(
@@ -76,7 +103,8 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
 
 
 def _snapshot_usage() -> tuple[float, dict]:
-    """Return (cost_usd, {input, output, total}) from the global tracker.
+    """Return (cost_usd, {input, output, total, cost_incomplete,
+    unpriced_models}) from the global tracker.
 
     Returns zeroes if the tracker isn't available (e.g. for local-only steps).
     """
@@ -87,6 +115,9 @@ def _snapshot_usage() -> tuple[float, dict]:
             "input": usage.total_input_tokens,
             "output": usage.total_output_tokens,
             "total": usage.total_tokens,
+            "cost_incomplete": usage.cost_incomplete,
+            "unpriced_models": usage.unpriced_models,
         }
     except Exception:
-        return 0.0, {"input": 0, "output": 0, "total": 0}
+        return 0.0, {"input": 0, "output": 0, "total": 0,
+                     "cost_incomplete": False, "unpriced_models": []}

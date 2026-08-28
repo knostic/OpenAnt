@@ -74,7 +74,17 @@ def find_models_config() -> Path | None:
     found = _search_upward(Path(__file__).parent)
     if found is not None:
         return found
-    return _search_upward(Path.cwd())
+    found = _search_upward(Path.cwd())
+    if found is not None:
+        # #273 sibling: same CWD-leg visibility as language_registry — the
+        # working directory (possibly the scanned repo) supplied the config.
+        print(
+            f"[models] note: config/models.json located via the working "
+            f"directory ({found}); if this is the scanned repository, "
+            f"its pricing records are being trusted",
+            file=sys.stderr,
+        )
+    return found
 
 
 @lru_cache(maxsize=1)

@@ -146,10 +146,18 @@ pipeline_output.json
 | `docker_executor.py` | Builds images, runs containers, handles compose and cleanup |
 | `result_collector.py` | Parses container stdout JSON, classifies results |
 | `reporter.py` | Generates the Markdown report |
-| `docker_templates/python.Dockerfile` | Reference Dockerfile for Python tests (`python:3.11-slim`) |
-| `docker_templates/node.Dockerfile` | Reference Dockerfile for Node.js tests (`node:20-slim`) |
-| `docker_templates/go.Dockerfile` | Reference Dockerfile for Go tests (`golang:1.22-alpine`) |
-| `docker_templates/attacker_server.py` | HTTP capture server for SSRF/exfiltration tests (port 9999) |
+| `docker_templates/python.Dockerfile` | Reference Dockerfile for Python tests (documentation only) |
+| `docker_templates/node.Dockerfile` | Reference Dockerfile for Node.js tests (documentation only) |
+| `docker_templates/go.Dockerfile` | Reference Dockerfile for Go tests (documentation only) |
+| `docker_templates/attacker_server.py` | HTTP capture server for SSRF/exfiltration tests (port 9999) — the only file here the executor reads |
+
+Note: the `*.Dockerfile` templates are **reference documentation, not the
+runtime**. The Dockerfile actually built for each test is LLM-generated per
+finding (`generation["dockerfile"]`, written by `docker_executor.py`); the
+only prompt-pinned base image is Go (`test_generator.py`); Python/Node base
+images are chosen per generation; the attacker sidecar's image is inlined in
+`docker_executor.py`. Do not reason about test runtimes from the template
+files — that has misled review before (see #351's correction comment).
 
 ## Container Output Contract
 

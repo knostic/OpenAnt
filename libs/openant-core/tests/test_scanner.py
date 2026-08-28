@@ -4,7 +4,7 @@ Covers two areas:
 
 - error-handling: the OPTIONAL stages (enhance, verify, dynamic-test) were
   wrapped in ``step_context`` but had NO inner try/except. ``step_context``
-  re-raises (core/step_report.py:57), so an optional-stage error escaped
+  re-raises (core/step_report.py:61), so an optional-stage error escaped
   ``scan_repository`` to cli.py's blanket ``except`` and discarded all completed
   parse/analyze work. The fix adds an inner warn-and-continue try/except around
   each optional stage, matching the existing app-context / llm-reachability

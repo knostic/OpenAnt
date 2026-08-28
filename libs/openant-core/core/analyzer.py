@@ -568,6 +568,7 @@ def run_analysis(
     _summary_input_tokens = 0
     _summary_output_tokens = 0
     _summary_cost_usd = 0.0
+    _summary_unpriced: set[str] = set()
     for _uid, _cp in _existing.items():
         _r = _cp.get("result", {})
         if _r.get("verdict") == "ERROR" or _r.get("finding") == "error":
@@ -579,16 +580,34 @@ def run_analysis(
         _summary_input_tokens += _cp_usage.get("input_tokens", 0)
         _summary_output_tokens += _cp_usage.get("output_tokens", 0)
         _summary_cost_usd += _cp_usage.get("cost_usd", 0.0)
+        # #216: restore the incomplete-cost marker from per-unit records.
+        _summary_unpriced.update(_cp_usage.get("unpriced_models") or [])
 
     def _usage_dict():
-        return {"input_tokens": _summary_input_tokens,
-                "output_tokens": _summary_output_tokens,
-                "cost_usd": round(_summary_cost_usd, 6)}
+        usage = {"input_tokens": _summary_input_tokens,
+                 "output_tokens": _summary_output_tokens,
+                 "cost_usd": round(_summary_cost_usd, 6)}
+        # #216: persist the unpriced set into _summary.json so a resume of
+        # a resume keeps the marker (run-cumulative semantics).
+        _all_unpriced = set(_summary_unpriced) | set(
+            get_global_tracker().get_totals().get("unpriced_models") or [])
+        if _all_unpriced:
+            usage["cost_incomplete"] = True
+            usage["unpriced_models"] = sorted(_all_unpriced)
+        return usage
 
     # Inject prior usage into tracker so step_report captures the total
-    if _summary_input_tokens or _summary_output_tokens:
+    if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
         get_global_tracker().add_prior_usage(
             _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+        # #281: re-snapshot the phase baseline AFTER the injection — the
+        # pre-injection baseline made the "Stage 1" delta include the prior
+        # session's tokens/cost (calls exclude restored units while
+        # tokens/cost included them: an internally inconsistent line, and
+        # #214's "this phase's delta" contract broken on resumed runs).
+        # The step reports' totals still include the prior usage (the
+        # run-total contract); only the per-phase stderr line is the delta.
+        _phase_baseline = tracking.get_usage()
 
     # Write initial summary
     checkpoint.write_summary(total, _summary_completed, _summary_errors,
