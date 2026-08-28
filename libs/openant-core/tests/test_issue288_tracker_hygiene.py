@@ -36,7 +36,10 @@ def test_no_citations_to_nonexistent_trackers():
     core = Path(__file__).parent.parent
     missing = []
     for py in core.rglob("*.py"):
-        if "/tests/" in str(py) or "/.venv/" in str(py):
+        # Path-parts check: separator-agnostic (Windows paths use
+        # backslashes, so a literal "/tests/" substring fails to exclude
+        # this file on windows-latest and a test can flag itself).
+        if {"tests", ".venv"} & set(py.parts):
             continue
         text = py.read_text(errors="replace")
         for m in re.finditer(r"[Ss]ee\s+`?(residual-evasion[A-Za-z0-9_/.-]*)`?", text):
@@ -70,7 +73,10 @@ def test_citations_point_to_issue():
     core = Path(__file__).parent.parent
     stale = []
     for py in core.rglob("*.py"):
-        if "/tests/" in str(py) or "/.venv/" in str(py):
+        # Path-parts check: separator-agnostic (Windows paths use
+        # backslashes, so a literal "/tests/" substring fails to exclude
+        # this file on windows-latest and a test can flag itself).
+        if {"tests", ".venv"} & set(py.parts):
             continue
         text = py.read_text(errors="replace")
         if "residual-evasion.md" in text:
