@@ -35,8 +35,8 @@ from context.application_context import gather_context_sources  # noqa: E402
 
 
 def _doc_repo(tmp_path: Path):
-    (tmp_path / "README.md").write_text("# Big doc\n" + ("x" * 20_000))
-    (tmp_path / "pyproject.toml").write_text("[project]\nname='t'\n")
+    (tmp_path / "README.md").write_text("# Big doc\n" + ("x" * 20_000), encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='t'\n", encoding="utf-8")
     return tmp_path
 
 
@@ -78,8 +78,8 @@ def test_skipped_unreadable_docs_listed(tmp_path, monkeypatch):
 
 
 def test_small_docs_unaffected(tmp_path: Path):
-    (tmp_path / "README.md").write_text("# small\n")
-    (tmp_path / "pyproject.toml").write_text("[project]\nname='t'\n")
+    (tmp_path / "README.md").write_text("# small\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='t'\n", encoding="utf-8")
     sources = gather_context_sources(tmp_path)
     assert sources["README.md"] == "# small\n"
     assert "[truncated_sources]" not in sources
@@ -90,7 +90,7 @@ def test_exactly_at_ceiling_not_marked_truncated(tmp_path: Path):
     """A doc of exactly 10 000 bytes fits whole — nothing was lost, so no
     false truncation entry (the inherited >= off-by-one, now feeding a
     visible artifact record, had to go)."""
-    (tmp_path / "README.md").write_text("x" * 10_000)
+    (tmp_path / "README.md").write_text("x" * 10_000, encoding="utf-8")
     sources = gather_context_sources(tmp_path)
     assert "[truncated_sources]" not in sources
     assert "[... truncated ...]" not in sources["README.md"]
@@ -115,7 +115,7 @@ def test_multibyte_file_under_char_cap_not_marked_truncated(tmp_path: Path):
     but whose CHAR count fits under the cap is COMPLETE — a byte-based
     check false-positives; the char basis (what the model consumes) is the
     truthful signal."""
-    (tmp_path / "README.md").write_text("日" * 5_000)  # 5,000 chars, ~15,000 bytes
+    (tmp_path / "README.md").write_text("日" * 5_000, encoding="utf-8")  # 5,000 chars, ~15,000 bytes
     sources = gather_context_sources(tmp_path)
     assert "[truncated_sources]" not in sources
     assert "[... truncated ...]" not in sources["README.md"]
@@ -123,7 +123,7 @@ def test_multibyte_file_under_char_cap_not_marked_truncated(tmp_path: Path):
 
 
 def test_one_char_over_cap_is_truncated(tmp_path: Path):
-    (tmp_path / "README.md").write_text("x" * 10_001)
+    (tmp_path / "README.md").write_text("x" * 10_001, encoding="utf-8")
     sources = gather_context_sources(tmp_path)
     assert "[truncated_sources]" in sources
     assert sources["README.md"].count("x") == 10_000
