@@ -55,6 +55,15 @@ _null_logger = logging.getLogger("null_verifier")
 _null_logger.addHandler(logging.NullHandler())
 from .agentic_enhancer.repository_index import RepositoryIndex
 from .agentic_enhancer.tools import ToolExecutor
+# #291: the enhance loop has capped its conversation input since PR #133
+# (MAX_PROMPT_CHARS on inlined primary_code, cap_tool_result_content on every
+# serialized tool result) with a comment naming the failure mode — unbounded
+# input growth until context overflow (400). This loop is structurally
+# identical (20-iteration tool conversation) and applied NEITHER cap: raw
+# json.dumps(outcome) appended every turn, so verify's input grew without
+# bound. Reuse the enhance caps rather than redefining them, so the two
+# loops cannot drift apart.
+from .agentic_enhancer.agent import MAX_PROMPT_CHARS, cap_tool_result_content
 from prompts.verification_prompts import (
     VERIFICATION_SYSTEM_PROMPT,
     get_verification_prompt,
@@ -384,6 +393,13 @@ class FindingVerifier:
         Returns:
             VerificationResult with verdict, exploit path, and explanation
         """
+        # #291: cap the inlined unit code the way the enhance loop caps its
+        # primary_code (MAX_PROMPT_CHARS) — an oversized unit otherwise
+        # overflows the model context on turn 1. Explicit marker so the model
+        # knows content was elided.
+        if len(code) > MAX_PROMPT_CHARS:
+            marker = "\n... (truncated)"
+            code = code[: MAX_PROMPT_CHARS - len(marker)] + marker
         user_prompt = get_verification_prompt(
             code=code,
             finding=finding,
@@ -495,7 +511,12 @@ class FindingVerifier:
                             ToolResultBlock(
                                 tool_use_id=tool_use_id,
                                 name=tool_name,
-                                content=json.dumps(outcome),
+                                # #291: capped, not raw json.dumps — the
+                                # enhance loop's cap_tool_result_content
+                                # (PR #133) with the same 24k limit; raw
+                                # appends grew verify's input without bound
+                                # across the 20 iterations.
+                                content=cap_tool_result_content(outcome),
                             )
                         )
 
