@@ -596,6 +596,7 @@ class FindingVerifier:
         workers: int = 10,
         checkpoint=None,
         restored_callback: Optional[Callable] = None,
+        phase_baseline: dict | None = None,
     ) -> list:
         """
         Verify a batch of results with consistency cross-check.
@@ -695,8 +696,12 @@ class FindingVerifier:
         # Inject prior usage into tracker so step_report captures the total
         if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
             self.tracker.add_prior_usage(
-                _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
-                unpriced_models=sorted(_summary_unpriced) or None)
+                _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+            # #281: refresh the caller's phase baseline AFTER the injection
+            # so its "Stage 2" delta excludes the restored usage.
+            if phase_baseline is not None:
+                from core import tracking as _tracking
+                phase_baseline["usage"] = _tracking.get_usage()
 
         if checkpoint is not None:
             checkpoint.write_summary(total, _summary_completed, _summary_errors,

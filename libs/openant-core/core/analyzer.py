@@ -599,8 +599,15 @@ def run_analysis(
     # Inject prior usage into tracker so step_report captures the total
     if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
         get_global_tracker().add_prior_usage(
-            _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
-            unpriced_models=sorted(_summary_unpriced) or None)
+            _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+        # #281: re-snapshot the phase baseline AFTER the injection — the
+        # pre-injection baseline made the "Stage 1" delta include the prior
+        # session's tokens/cost (calls exclude restored units while
+        # tokens/cost included them: an internally inconsistent line, and
+        # #214's "this phase's delta" contract broken on resumed runs).
+        # The step reports' totals still include the prior usage (the
+        # run-total contract); only the per-phase stderr line is the delta.
+        _phase_baseline = tracking.get_usage()
 
     # Write initial summary
     checkpoint.write_summary(total, _summary_completed, _summary_errors,

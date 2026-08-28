@@ -379,6 +379,7 @@ class ContextEnhancer:
         workers: int = 10,
         checkpoint_path: str = None,
         restored_callback: Optional[Callable] = None,
+        phase_baseline: dict | None = None,
     ) -> dict:
         """
         Enhance all units in a dataset (single-shot mode).
@@ -558,6 +559,7 @@ class ContextEnhancer:
         progress_callback: Optional[Callable] = None,
         restored_callback: Optional[Callable] = None,
         workers: int = 10,
+        phase_baseline: dict | None = None,
     ) -> dict:
         """
         Enhance all units using agentic approach with tool use.
@@ -679,8 +681,12 @@ class ContextEnhancer:
             # Inject prior usage into tracker so step_report captures the total
             if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
                 self.tracker.add_prior_usage(
-                    _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
-                    unpriced_models=sorted(_summary_unpriced) or None)
+                    _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+                # #281: refresh the caller's phase baseline AFTER the
+                # injection so its "Enhance" delta excludes restored usage.
+                if phase_baseline is not None:
+                    from core import tracking as _tracking
+                    phase_baseline["usage"] = _tracking.get_usage()
 
         remaining = total - len(processed_ids)
         self._log("info", f"Enhancing {remaining} units with agentic analysis ({len(processed_ids)} already done)", units=remaining)
