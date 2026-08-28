@@ -161,6 +161,11 @@ class ScanResult:
     output_dir: str
     dataset_path: str | None = None
     enhanced_dataset_path: str | None = None
+    # #285: the scan-level status (worst per-step: error > partial > skipped
+    # > success) and the aggregate errors — carried so the envelope / webui /
+    # CLI consumers see a degraded scan without re-reading scan.report.json.
+    scan_status: str = "success"
+    scan_errors: list = field(default_factory=list)
     analyzer_output_path: str | None = None
     app_context_path: str | None = None
     results_path: str | None = None
@@ -219,6 +224,8 @@ class ScanResult:
     def to_dict(self) -> dict:
         return {
             "output_dir": self.output_dir,
+            "scan_status": self.scan_status,
+            "scan_errors": self.scan_errors,
             "dataset_path": self.dataset_path,
             "enhanced_dataset_path": self.enhanced_dataset_path,
             "analyzer_output_path": self.analyzer_output_path,

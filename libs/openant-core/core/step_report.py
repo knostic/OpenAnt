@@ -60,18 +60,21 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
         traceback.print_exc(file=sys.stderr)
         raise
     finally:
-        # Issue #209: a step that records errors via ``ctx.errors.append(...)``
-        # (exception caught BY DESIGN — e.g. the report phase's summary and
-        # disclosure handlers in ``core/scanner.py``) must not report success.
-        # Derive the status from the errors list at exit: non-empty errors
-        # means "error", idempotently with the propagating-exception path
-        # above. Errors also WIN over an explicitly-set ``"skipped"`` (a
-        # skipped step that recorded errors is more error than skipped — no
-        # current call site produces that combination; locked by test). The
-        # scanner's degrade idiom (status="skipped" with the reason in
-        # ``summary``, no errors) is unaffected.
-        if report.errors and report.status != "error":
-            report.status = "error"
+        # Issue #209/#285: a step that records errors via
+        # ``ctx.errors.append(...)`` or that counts per-item failures in
+        # ``summary["error_count"]`` (exception caught BY DESIGN) must not
+        # report success. Derive the status from evidence at exit:
+        # non-empty ``errors`` OR a positive integer ``error_count`` in
+        # ``summary`` ⇒ ``"partial"`` — deliberately NOT ``"error"`` (which
+        # stays reserved for the propagating-exception path). The scanner's
+        # degrade idiom (status="skipped", reason in summary, no errors) is
+        # unaffected.
+        if report.status != "error":
+            _summary = report.summary if isinstance(report.summary, dict) else {}
+            _counted = _summary.get("error_count")
+            _error_count = _counted if isinstance(_counted, int) and _counted > 0 else 0
+            if report.errors or _error_count:
+                report.status = "partial"
 
         report.duration_seconds = round(time.monotonic() - start, 2)
 

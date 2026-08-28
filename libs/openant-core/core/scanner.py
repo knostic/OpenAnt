@@ -868,6 +868,11 @@ def scan_repository(
         ctx.summary = {
             "total_units": analyze_result.metrics.total,
             "analyzed": analyze_result.metrics.total - analyze_result.metrics.errors,
+            # #285 (wave catch): the flat error_count the step-status
+            # derivation reads — analyze counts per-unit failures here, not
+            # in ctx.errors, so without this key every-unit-errors stayed
+            # status="success" (the same false-green shape verify had).
+            "error_count": analyze_result.metrics.errors,
             "verdicts": {
                 "vulnerable": analyze_result.metrics.vulnerable,
                 "bypassable": analyze_result.metrics.bypassable,
@@ -1302,6 +1307,15 @@ def _write_scan_report(
     """Write ``scan.report.json`` — the aggregate report for the full pipeline."""
     total_cost = sum(sr.get("cost_usd", 0) for sr in step_reports)
     total_duration = sum(sr.get("duration_seconds", 0) for sr in step_reports)
+    # #285: aggregate the per-step status and errors — the scan report must
+    # be at least as informative as the per-step files it summarises.
+    _STATUS_RANK = {"success": 0, "skipped": 1, "partial": 2, "error": 3}
+    _worst_status = "success"
+    for sr in step_reports:
+        _st = str(sr.get("status", "success") or "success").lower()
+        if _STATUS_RANK.get(_st, 0) > _STATUS_RANK.get(_worst_status, 0):
+            _worst_status = _st
+    _all_errors = [e for sr in step_reports for e in sr.get("errors", [])]
     total_input = sum(
         sr.get("token_usage", {}).get("input_tokens", 0) for sr in step_reports
     )
@@ -1309,8 +1323,14 @@ def _write_scan_report(
         sr.get("token_usage", {}).get("output_tokens", 0) for sr in step_reports
     )
 
+    # #285: carry the derived status/errors onto the ScanResult so the
+    # envelope and downstream consumers see the degraded scan.
+    result.scan_status = _worst_status
+    result.scan_errors = _all_errors
     scan_report = StepReport(
         step="scan",
+        status=_worst_status,
+        errors=_all_errors,
         summary={
             "units_count": result.units_count,
             "language": result.language,
