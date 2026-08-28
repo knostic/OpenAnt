@@ -409,23 +409,48 @@ def _write_verified_results(
         "confirmed_findings": [
             r for r in verified_only
             # Canonical read (matches :99 input filter): fall back to `verdict`.
+            # NOTE (#284 wave review — deliberately UNCHANGED): this list is
+            # the DISCLOSURE PIPELINE input, not a metrics bucket. Incomplete
+            # and errored verifications are disclosure-ELIGIBLE (verdict
+            # "unverified"/"error" both in DISCLOSURE_ELIGIBLE — the #69
+            # F4/F5 fail-safe + the #210 chain), so they MUST stay here even
+            # though the metrics recount below classifies them into
+            # needs_review/errors. The two consumers disagree BY DESIGN.
             if str(r.get("finding") or r.get("verdict", "")).lower()
             in ("vulnerable", "bypassable")
         ],
     }
 
-    # Recount metrics after verification
+    # Recount metrics after verification.
+    # #284: classify on the SAME signals _count_verification_outcomes uses
+    # — ``r.get("error")`` FIRST, then ``verification.incomplete`` — before
+    # falling through to the verdict string. The old verdict-string recount
+    # had no reachable errors path on real data (errored records keep their
+    # Stage-1 ``finding: "vulnerable"`` — a value the verify error path
+    # never overwrites), so 48 errored + 134 incomplete units on the
+    # reporter's run landed in ``vulnerable``: "183 confirmed, 0 errors"
+    # for a scan that confirmed 1 and could not finish 182. An errored or
+    # incomplete unit must NEVER be counted as a confirmed vulnerability.
     counts = {
         "vulnerable": 0, "bypassable": 0, "inconclusive": 0,
-        "protected": 0, "safe": 0, "errors": 0,
+        "protected": 0, "safe": 0, "errors": 0, "needs_review": 0,
     }
     for r in merged_results:
+        if r.get("error"):
+            counts["errors"] += 1
+            continue
+        verification = r.get("verification", {})
+        if isinstance(verification, dict) and verification.get("incomplete"):
+            counts["needs_review"] += 1
+            continue
         # Canonical read: lowercase a PRESENT finding too (not only the
         # verdict/default), so a verdict-only result is classified correctly.
         finding = str(r.get("finding") or r.get("verdict") or "error").lower()
         if finding in counts:
             counts[finding] += 1
         elif r.get("verdict") == "ERROR":
+            # Retained (#284's correction): legacy/foreign records carrying
+            # the uppercase ERROR verdict still bucket to errors.
             counts["errors"] += 1
 
     output["metrics"] = {"total": len(merged_results), **counts}
