@@ -19,6 +19,7 @@ On completion, a final ``scan.report.json`` aggregates all step reports.
 import json
 import os
 import shutil
+from typing import Dict
 import sys
 from pathlib import Path
 
@@ -526,11 +527,16 @@ def scan_repository(
                     # --limit governs the analyze AND enhance stages, not how many units the
                     # LLM reachability pass reviews — it must see the full
                     # codebase to find missed entry points.
+                    # #294: collect parse-level batch-drop stats so the
+                    # step report's units_reviewed stops implying full
+                    # coverage when batches were dropped.
+                    reach_stats: Dict[str, int] = {}
                     signals = analyze_reachability(
                         dataset=dataset,
                         app_context=app_ctx_payload,
                         binding=llm_reach_binding,
                         max_code_bytes=llm_reachability_max_code_bytes,
+                        stats=reach_stats,
                     )
                     summary = apply_signals(dataset, signals)
 
@@ -721,6 +727,11 @@ def scan_repository(
                         "units_touched": summary["units_touched"],
                         "post_filter_units": post_filter_count,
                         "refilter_supported": refilter_supported,
+                        # #294: the honest coverage numbers — units_reviewed
+                        # counts what was SENT for review, not what was
+                        # actually reviewed.
+                        "batches_dropped": reach_stats.get("batches_dropped", 0),
+                        "units_not_reviewed": reach_stats.get("units_not_reviewed", 0),
                     }
                     ctx.outputs = {"signals_path": signals_path}
 
