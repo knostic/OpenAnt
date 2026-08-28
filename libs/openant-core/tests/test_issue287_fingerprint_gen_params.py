@@ -26,14 +26,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-def _verify_fingerprint(max_tokens):
+def _verify_fingerprint(max_tokens, input_caps=None):
     """Build the verify-phase fingerprint exactly as verifier.py:182 does
-    (the extra_key mechanism), with the given max_tokens."""
+    (the extra_key mechanism), with the given max_tokens and input caps."""
     from core.backend_identity import fingerprint_for_binding
 
     class _Binding:
         phase = "verify"
-        model = "claude-opus-5"
+        model = "claude-5-opus"
         provider_name = "anthropic"
         base_url = None
 
@@ -43,10 +43,12 @@ def _verify_fingerprint(max_tokens):
     class _Template(str):
         pass
 
+    extra_key = {"analyze_fingerprint": "sha256:abc",
+                 "gen_params": {"max_tokens": max_tokens}}
+    if input_caps is not None:
+        extra_key["input_caps"] = input_caps
     return fingerprint_for_binding(
-        _Binding(), [_Template("template")],
-        extra_key={"analyze_fingerprint": "sha256:abc",
-                   "gen_params": {"max_tokens": max_tokens}})
+        _Binding(), [_Template("template")], extra_key=extra_key)
 
 
 def test_different_max_tokens_different_digest():
@@ -79,4 +81,19 @@ def test_exclusion_documented_in_backend_identity():
     )
     assert "#286" in src or "377" in src, (
         "the FN-safety rationale's #286/#377 dependency must be named"
+    )
+
+
+def test_different_input_caps_different_digest():
+    """Union-diff checkpoint (20 submitted, 2026-08-29): #291's input caps
+    change what the model saw on every turn — they are part of the verify
+    conversation's identity exactly like max_tokens. A cap change must
+    invalidate the checkpoint identity (stale adoption of checkpoints
+    produced under uncapped-input semantics otherwise)."""
+    caps_a = {"max_prompt_chars": 60_000, "max_tool_result_chars": 24_000}
+    caps_b = {"max_prompt_chars": 30_000, "max_tool_result_chars": 24_000}
+    a = _verify_fingerprint(20000, caps_a)
+    b = _verify_fingerprint(20000, caps_b)
+    assert a["key_digest"] != b["key_digest"], (
+        "an input-cap change must invalidate the verify checkpoint identity"
     )
