@@ -25,6 +25,11 @@ from ..llm import (
     ToolUseBlock,
     lookup_pricing,
 )
+# #290 sibling: same shape as finding_verifier — this loop bypasses
+# simple_text and previously pinned its own 4096, so PR #242's raised default
+# never reached enhance either. Shares the thinking-era budget; see
+# llm/helpers.py:DEFAULT_MAX_TOKENS.
+from ..llm.helpers import DEFAULT_MAX_TOKENS
 from .repository_index import RepositoryIndex
 from .tools import TOOL_DEFINITIONS, ToolExecutor
 from .prompts import SYSTEM_PROMPT, get_user_prompt
@@ -34,7 +39,7 @@ from .reachability_analyzer import ReachabilityAnalyzer
 
 # Safety limits
 MAX_ITERATIONS = 20
-MAX_TOKENS_PER_RESPONSE = 4096
+MAX_TOKENS_PER_RESPONSE = DEFAULT_MAX_TOKENS
 
 # Classification stamped on a degenerate exit (agent ended without a completed
 # `finish` tool call: bare end_turn, no tool calls, or MAX_ITERATIONS reached).

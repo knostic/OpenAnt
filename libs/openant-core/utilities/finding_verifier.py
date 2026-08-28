@@ -49,6 +49,11 @@ from .llm import (
     ToolUseBlock,
     lookup_pricing,
 )
+# #290: this loop bypasses simple_text (it needs raw content blocks for the
+# tool conversation), so it takes its output budget from the SAME constant as
+# simple_text's default — a private 4096 here is how PR #242's raise never
+# reached verify on any route.
+from .llm.helpers import DEFAULT_MAX_TOKENS
 
 # Null logger that discards all messages (used when no logger provided)
 _null_logger = logging.getLogger("null_verifier")
@@ -71,7 +76,13 @@ except ImportError:
 
 
 MAX_ITERATIONS = 20
-MAX_TOKENS_PER_RESPONSE = 4096
+# #290: was a private 4096 — half of simple_text's raised default, on the
+# largest units in the scan, by a route PR #242 could not reach. A truncated
+# finish call is deliberately downgraded to verification-incomplete (FN-safe
+# direction), so an undersized cap silently converts adjudications into
+# needs_review. Shares simple_text's thinking-era budget; see
+# llm/helpers.py:DEFAULT_MAX_TOKENS.
+MAX_TOKENS_PER_RESPONSE = DEFAULT_MAX_TOKENS
 
 
 # Expected JSON shape of a verifier `finish` response — handed to JSONCorrector
