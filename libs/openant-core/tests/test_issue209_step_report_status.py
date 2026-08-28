@@ -1,6 +1,6 @@
 """Regression tests for issue #209 (per-step status half).
 
-``step_context`` only set ``status="error"`` when an exception PROPAGATED out
+``step_context`` only set ``status="partial"`` when an exception PROPAGATED out
 of the ``with`` block. A step that catches its own exception by design and
 records it via ``ctx.errors.append(...)`` — exactly what the scan's report
 phase does for summary/disclosure generation (``core/scanner.py`` handlers,
@@ -46,7 +46,7 @@ def test_errors_recorded_without_exception_yield_error_status(tmp_path: Path):
 
     report = _read_report(tmp_path, "report")
     assert report["errors"], "errors list must be recorded"
-    assert report["status"] == "error", (
+    assert report["status"] == "partial", (
         f"a step with recorded errors must not claim success (got {report['status']!r})"
     )
 
@@ -62,6 +62,8 @@ def test_propagated_exception_still_error(tmp_path: Path):
         with step_context("analyze", str(tmp_path)):
             raise RuntimeError("boom")
     report = _read_report(tmp_path, "analyze")
+    # The escaping exception keeps the RESERVED "error" status (#285: only
+    # caught-by-design errors/downgrades are "partial").
     assert report["status"] == "error"
     assert any("boom" in e for e in report["errors"])
 
@@ -87,7 +89,7 @@ def test_errors_recorded_override_explicit_skipped(tmp_path: Path):
     with step_context("weird", str(tmp_path)) as ctx:
         ctx.status = "skipped"
         ctx.errors.append("boom")
-    assert _read_report(tmp_path, "weird")["status"] == "error"
+    assert _read_report(tmp_path, "weird")["status"] == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -212,24 +214,24 @@ def test_scan_report_step_error_status_when_summary_fails(
 ):
     """The #209 end-to-end shape: summary raises (#279's guard), handler
     catches by design, scan continues — and report.report.json must say
-    status="error" with the recorded error, not success."""
+    status="partial" with the recorded error, not success."""
     result, report = _scan_with_report_failures(
         monkeypatch, tmp_path, summary_fails=True, disclosures_fail=False
     )
     assert result is not None, "scan must COMPLETE (report failure must not abort)"
-    assert report["status"] == "error"
+    assert report["status"] == "partial"
     assert len(report["errors"]) == 1
     assert "Summary report" in report["errors"][0]
 
 
 def test_scan_report_step_error_status_when_both_fail(monkeypatch, tmp_path):
-    """Both deliverables fail: two recorded errors, still status="error",
+    """Both deliverables fail: two recorded errors, still status="partial",
     scan still completes (multiple-errors shape)."""
     result, report = _scan_with_report_failures(
         monkeypatch, tmp_path, summary_fails=True, disclosures_fail=True
     )
     assert result is not None
-    assert report["status"] == "error"
+    assert report["status"] == "partial"
     assert len(report["errors"]) == 2
 
 
@@ -243,7 +245,7 @@ def test_scan_report_step_error_status_when_only_disclosures_fail(
         monkeypatch, tmp_path, summary_fails=False, disclosures_fail=True
     )
     assert result is not None
-    assert report["status"] == "error"
+    assert report["status"] == "partial"
     assert len(report["errors"]) == 1
     assert "Disclosure docs" in report["errors"][0]
 
