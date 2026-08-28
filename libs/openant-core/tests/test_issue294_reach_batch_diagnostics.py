@@ -145,13 +145,12 @@ class _ScriptedBinding:
 
 
 def test_analyze_reachability_counts_dropped_units(tmp_path, monkeypatch):
-    import core.llm_reachability as lr
 
     dataset = _dataset(4)  # batch_size=2 → 2 batches
     responses = iter([
         # batch 1: valid
-        '{"signals": [{"unit_id": "f0.py:fn", "kind": "entry_point", '
-        '"confidence": "high", "reason": "ok"}]}',
+        ('{"signals": [{"unit_id": "f0.py:fn", "kind": "entry_point", '
+         '"confidence": "high", "reason": "ok"}]}'),
         # batch 2: malformed (prose refusal)
         "I can't help with analyzing this code for security purposes.",
     ])
@@ -162,7 +161,7 @@ def test_analyze_reachability_counts_dropped_units(tmp_path, monkeypatch):
                         lambda binding, prompt, **kw: next(responses))
 
     stats: dict = {}
-    signals = lr.analyze_reachability(
+    signals = analyze_reachability(
         dataset, binding=_ScriptedBinding(), batch_size=2,
         on_error=errs.append, stats=stats)
 
@@ -176,13 +175,12 @@ def test_analyze_reachability_counts_dropped_units(tmp_path, monkeypatch):
 
 def test_analyze_reachability_stats_absent_means_uncounted(tmp_path, monkeypatch):
     """No stats dict → no counting (backwards-compatible call shape)."""
-    import core.llm_reachability as lr
 
     dataset = _dataset(2)
     import utilities.llm as llm_mod
     monkeypatch.setattr(llm_mod, "simple_text",
                         lambda binding, prompt, **kw: "not json at all")
-    signals = lr.analyze_reachability(dataset, binding=_ScriptedBinding(),
+    signals = analyze_reachability(dataset, binding=_ScriptedBinding(),
                                       batch_size=2)
     assert signals == []
 
@@ -196,11 +194,15 @@ def test_scanner_summary_surfaces_drop_counts(tmp_path, monkeypatch):
     import core.analyzer as analyzer
     import core.reporter as reporter
     import core.tracking as tracking
+    # Module-style import is REQUIRED here (do not "consolidate" with the
+    # file's top-level from-import): this test monkeypatches attributes ON
+    # the core.llm_reachability module (analyze_reachability, apply_signals,
+    # signals_to_json) that core.scanner resolves through the module at call
+    # time — the from-imported name would bypass the patch.
     import core.llm_reachability as lr
 
     # hermetic registry: no config file, no keys, no probe calls
     import utilities.llm as llm_mod
-    from utilities.llm import PhaseBinding
 
     class _StubAdapter:
         name = "anthropic"
@@ -210,7 +212,7 @@ def test_scanner_summary_surfaces_drop_counts(tmp_path, monkeypatch):
     class _StubRegistry:
         config_name = "stub"
         def get(self, phase):
-            return PhaseBinding(phase=phase, adapter=_StubAdapter(),
+            return llm_mod.PhaseBinding(phase=phase, adapter=_StubAdapter(),
                                 model="stub-model", provider_name="anthropic")
 
     monkeypatch.setattr(llm_mod, "build_phase_registry",
