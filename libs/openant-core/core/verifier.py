@@ -77,7 +77,12 @@ def run_verification(
     """
     # #214: snapshot cumulative usage at phase start so the "Stage 2" summary
     # below reports this phase's delta, not every prior phase's total.
-    _phase_baseline = tracking.get_usage()
+    # #281: MUTABLE holder — verify_batch's checkpoint-restore injects the
+    # prior session's usage into the tracker AFTER this snapshot; the
+    # injection site refreshes the holder so the delta below counts only
+    # the CURRENT session's calls (calls exclude restored units, so
+    # tokens/cost must too — the internally-consistent line #214 promised).
+    _phase_baseline = {"usage": tracking.get_usage()}
     os.makedirs(output_dir, exist_ok=True)
 
     # Configure global rate limiter
@@ -212,6 +217,7 @@ def run_verification(
             workers=workers,
             checkpoint=checkpoint,
             restored_callback=_on_restored,
+            phase_baseline=_phase_baseline,
         )
     except Exception as e:
         print(f"[Verify] ERROR during batch verification: {e}", file=sys.stderr)
@@ -232,11 +238,19 @@ def run_verification(
           f"{confirmed_vulnerabilities} confirmed vulnerabilities", file=sys.stderr)
     if error_count:
         print(f"[Verify] Errors: {error_count}", file=sys.stderr)
+    # #212: adjudication COVERAGE headline — the denominator was invisible
+    # without reading results_verified.json (a reporter measured 41/223
+    # adjudicated and nothing human-facing said so). Deterministic; the
+    # refused count is DERIVED at print time (see helper docstring).
+    coverage_line = _adjudication_coverage_line(
+        counts=_counts, verified_results=verified_results,
+        candidates_total=len(vulnerable_results))
+    print(f"[Verify] Coverage: {coverage_line}", file=sys.stderr)
 
     # Checkpoints are preserved as a permanent artifact alongside results
     # (final summary with phase="done" is written inside verify_batch).
 
-    tracking.log_usage("Stage 2", _phase_baseline)
+    tracking.log_usage("Stage 2", _phase_baseline["usage"])
 
     # Merge verified results back into the full result set
     verified_ids = {r.get("unit_id") or r.get("route_key") for r in verified_results}
@@ -268,6 +282,56 @@ def run_verification(
         needs_review=needs_review,
         error_count=error_count,
         usage=tracking.get_usage(),
+    )
+
+
+_REFUSAL_MARKER = "refused the request"
+
+
+def _adjudication_coverage_line(*, counts: dict, verified_results: list,
+                                candidates_total: int) -> str:
+    """#212: one deterministic human-facing adjudication-coverage line.
+
+    ``Adjudicated X/Y (Z%)`` where X = completed adjudications = every
+    verified result minus needs_review minus errors (NOT merely agreed +
+    disagreed: a disagreement whose corrected finding is STILL vulnerable/
+    bypassable is bucketed ``confirmed_vulnerabilities`` only by
+    ``_count_verification_outcomes``, and dropping it would understate the
+    exact metric #212 was filed over), Y = Stage-2 candidates in.
+    ``refused`` is DERIVED AT PRINT TIME by matching the typed refusal
+    marker ("refused the request" — aligned across the adapter families:
+    anthropic, openai chat/responses/nested-part, google, openrouter-403)
+    in the stored per-result error strings, and is a SUBSET of ``errored``
+    (printed as such — the buckets are not additive). Deliberately NOT a
+    persisted bucket (a new VerifyResult/schema field would be #284's
+    territory and a schema surface).
+    """
+    adjudicated = len(verified_results) - counts["needs_review"] - counts["error_count"]
+    refused = sum(
+        1 for r in verified_results
+        if r.get("error") and _REFUSAL_MARKER in str(r["error"]).lower()
+    )
+    # A disagreement whose corrected finding is STILL vulnerable lands in
+    # ``confirmed_vulnerabilities`` only — count it here so the listed
+    # buckets sum EXACTLY to the headline numerator (reconciliation).
+    confirmed_only = sum(
+        1 for r in verified_results
+        if not r.get("error")
+        and (verification := r.get("verification", {}))
+        and not verification.get("incomplete")
+        and not verification.get("agree", False)
+        and str(r.get("finding") or r.get("verdict", "")).lower()
+        in ("vulnerable", "bypassable")
+    )
+    pct = (100 * adjudicated / candidates_total) if candidates_total else 0
+    # Human form: integer when exact ("40%"), one decimal when not ("18.4%").
+    pct_str = f"{pct:.1f}".rstrip("0").rstrip(".") or "0"
+    return (
+        f"Adjudicated {adjudicated}/{candidates_total} ({pct_str}%): "
+        f"agreed {counts['agreed']}, disagreed {counts['disagreed']}, "
+        f"confirmed-still-vulnerable {confirmed_only}, "
+        f"errored {counts['error_count']} (incl. refused {refused}), "
+        f"needs_review {counts['needs_review']}"
     )
 
 
@@ -351,23 +415,48 @@ def _write_verified_results(
         "confirmed_findings": [
             r for r in verified_only
             # Canonical read (matches :99 input filter): fall back to `verdict`.
+            # NOTE (#284 wave review — deliberately UNCHANGED): this list is
+            # the DISCLOSURE PIPELINE input, not a metrics bucket. Incomplete
+            # and errored verifications are disclosure-ELIGIBLE (verdict
+            # "unverified"/"error" both in DISCLOSURE_ELIGIBLE — the #69
+            # F4/F5 fail-safe + the #210 chain), so they MUST stay here even
+            # though the metrics recount below classifies them into
+            # needs_review/errors. The two consumers disagree BY DESIGN.
             if str(r.get("finding") or r.get("verdict", "")).lower()
             in ("vulnerable", "bypassable")
         ],
     }
 
-    # Recount metrics after verification
+    # Recount metrics after verification.
+    # #284: classify on the SAME signals _count_verification_outcomes uses
+    # — ``r.get("error")`` FIRST, then ``verification.incomplete`` — before
+    # falling through to the verdict string. The old verdict-string recount
+    # had no reachable errors path on real data (errored records keep their
+    # Stage-1 ``finding: "vulnerable"`` — a value the verify error path
+    # never overwrites), so 48 errored + 134 incomplete units on the
+    # reporter's run landed in ``vulnerable``: "183 confirmed, 0 errors"
+    # for a scan that confirmed 1 and could not finish 182. An errored or
+    # incomplete unit must NEVER be counted as a confirmed vulnerability.
     counts = {
         "vulnerable": 0, "bypassable": 0, "inconclusive": 0,
-        "protected": 0, "safe": 0, "errors": 0,
+        "protected": 0, "safe": 0, "errors": 0, "needs_review": 0,
     }
     for r in merged_results:
+        if r.get("error"):
+            counts["errors"] += 1
+            continue
+        verification = r.get("verification", {})
+        if isinstance(verification, dict) and verification.get("incomplete"):
+            counts["needs_review"] += 1
+            continue
         # Canonical read: lowercase a PRESENT finding too (not only the
         # verdict/default), so a verdict-only result is classified correctly.
         finding = str(r.get("finding") or r.get("verdict") or "error").lower()
         if finding in counts:
             counts[finding] += 1
         elif r.get("verdict") == "ERROR":
+            # Retained (#284's correction): legacy/foreign records carrying
+            # the uppercase ERROR verdict still bucket to errors.
             counts["errors"] += 1
 
     output["metrics"] = {"total": len(merged_results), **counts}
