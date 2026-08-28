@@ -27,7 +27,12 @@ from utilities.llm import (
     resolve_llm_config,
 )
 from utilities.file_io import normalize_results, read_json, write_json
-from utilities.finding_verifier import FindingVerifier, MAX_TOKENS_PER_RESPONSE
+from utilities.finding_verifier import (
+    FindingVerifier,
+    MAX_TOKENS_PER_RESPONSE,
+    MAX_PROMPT_CHARS,
+    MAX_TOOL_RESULT_CHARS,
+)
 from utilities.agentic_enhancer.repository_index import load_index_from_file
 
 # Import application context (optional)
@@ -186,6 +191,16 @@ def run_verification(
             # checkpoints specifically (no scheme bump; the extra_key
             # mechanism is the pre-existing plumbing).
             "gen_params": {"max_tokens": MAX_TOKENS_PER_RESPONSE},
+            # Union-diff checkpoint (20 submitted, 2026-08-29): #291's input
+            # caps are part of the verify conversation's identity exactly
+            # like the output budget — a resumed run must not adopt
+            # checkpoints produced under uncapped-input semantics (the same
+            # silent-staleness class #285/#286/#287 closed for errors and
+            # generation params).
+            "input_caps": {
+                "max_prompt_chars": MAX_PROMPT_CHARS,
+                "max_tool_result_chars": MAX_TOOL_RESULT_CHARS,
+            },
         }))
 
     # Run Stage 2 verification via verify_batch
