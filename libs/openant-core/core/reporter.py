@@ -592,6 +592,10 @@ def build_pipeline_output(
             # F13: errored units are part of `total` (see units_analyzed above), so the
             # results buckets must include them or they cannot reconcile to `total`.
             "errors": metrics.get("errors", 0),
+            # #284 (wave catch): incomplete verifications are ALSO part of total —
+            # the partition must carry needs_review or the buckets cannot reconcile
+            # on any scan with incomplete units (the F13 invariant, extended).
+            "needs_review": metrics.get("needs_review", 0),
             "total": total_units,
         },
         "findings": findings_data,
