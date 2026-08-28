@@ -181,7 +181,7 @@ def test_analyze_reachability_stats_absent_means_uncounted(tmp_path, monkeypatch
     monkeypatch.setattr(llm_mod, "simple_text",
                         lambda binding, prompt, **kw: "not json at all")
     signals = analyze_reachability(dataset, binding=_ScriptedBinding(),
-                                      batch_size=2)
+                                   batch_size=2)
     assert signals == []
 
 
@@ -213,7 +213,8 @@ def test_scanner_summary_surfaces_drop_counts(tmp_path, monkeypatch):
         config_name = "stub"
         def get(self, phase):
             return llm_mod.PhaseBinding(phase=phase, adapter=_StubAdapter(),
-                                model="stub-model", provider_name="anthropic")
+                                        model="stub-model",
+                                        provider_name="anthropic")
 
     monkeypatch.setattr(llm_mod, "build_phase_registry",
                         lambda cf, cfg: _StubRegistry())
