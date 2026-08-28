@@ -416,7 +416,10 @@ class CallGraphBuilder:
             try:
                 tree = ast.parse(textwrap.dedent(module_code))
                 result, _dropped = self._collect_container_map(tree, caller_file)
-            except SyntaxError:
+            except (SyntaxError, ValueError, RecursionError):
+                # module_code is a reconstructed snippet: never let a bad
+                # one abort the whole build_call_graph() — degrade to an
+                # empty map for this file (over-seed floor, not a crash).
                 result = {}
         cached[caller_file] = result
         return result
