@@ -327,7 +327,13 @@ class CallGraphBuilder:
             code = func_info.get("code", "")
             file_path = func_info.get("file_path", "")
             if file_path and file_path in file_aliases:
-                alias_to_target[func_id].update(file_aliases[file_path])
+                # DEEP-COPY, never merge shared set references: the per-unit
+                # pass below mutates its map in place (setdefault().add), so
+                # a shared reference would leak a function-local shadowing
+                # binding into every function of the file (review finding:
+                # contradicts the B9 comment's anti-clobber intent).
+                alias_to_target[func_id].update(
+                    {k: set(v) for k, v in file_aliases[file_path].items()})
             if not code:
                 continue
             try:

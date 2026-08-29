@@ -125,3 +125,27 @@ def test_unknown_subscript_abstains():
             "}\n",
     })
     assert _edges(cg, ":use") == []
+
+
+
+def test_local_shadow_does_not_leak_file_wide():
+    """Regression (panel finding): a function-local container shadowing a
+    file-scope name must not mutate the file map other functions see —
+    the per-function merge must deep-copy, never share set references."""
+    cg = _cg({"app.zig": (
+        "fn handlerA() void {}\n"
+        "fn handlerB() void {}\n"
+        "const TABLE = [_]*const fn () void{ handlerA };\n"
+        "fn main() void {\n"
+        "    const TABLE = [_]*const fn () void{ handlerB };\n"
+        "    TABLE[0]();\n"
+        "}\n"
+        "fn other() void {\n"
+        "    TABLE[0]();\n"
+        "}\n"
+    )})
+    main_edges = _edges(cg, ":main")
+    other_edges = _edges(cg, ":other")
+    assert any("handlerB" in e for e in main_edges), "main's local table dispatches to handlerB"
+    assert any("handlerA" in e for e in other_edges), "other still sees the FILE table (handlerA)"
+    assert not any("handlerB" in e for e in other_edges), "main's local binding must NOT leak to other"
