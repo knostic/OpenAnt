@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from core.schemas import VerifyResult, UsageInfo
+from core.verdict_taxonomy import FINDING_VERDICT_ORDER
 from core import tracking
 from core.checkpoint import StepCheckpoint
 from core.progress import ProgressReporter
@@ -132,6 +133,12 @@ def run_verification(
             agreed=0,
             disagreed=0,
             confirmed_vulnerabilities=0,
+            # #302: the denominator survives the zero-findings early return —
+            # a clean scan's scope statement is "adjudicated 0 of N", never
+            # "0 of 0" beside total_units=N in the same artifact.
+            units_analyzed_total=len(all_results),
+            downgraded=0,
+            upgraded=0,
             usage=tracking.get_usage(),
         )
 
@@ -303,6 +310,11 @@ def run_verification(
         confirmed_vulnerabilities=confirmed_vulnerabilities,
         needs_review=needs_review,
         error_count=error_count,
+        # #302: the scope — M is every analyzed unit; only N
+        # (findings_input, the Stage-1 positives) entered adjudication.
+        units_analyzed_total=len(all_results),
+        downgraded=_counts.get("downgraded", 0),
+        upgraded=_counts.get("upgraded", 0),
         usage=tracking.get_usage(),
     )
 
@@ -381,6 +393,11 @@ def _count_verification_outcomes(verified_results: list) -> dict:
         "needs_review": 0,
         "confirmed_vulnerabilities": 0,
         "error_count": 0,
+        # #302: the direction of Stage-2 changes — one-directionality is
+        # structural (only Stage-1 positives enter), and the artifacts must
+        # show it rather than leave it inferable from raw records.
+        "downgraded": 0,
+        "upgraded": 0,
     }
     for r in verified_results:
         if r.get("error"):
@@ -391,11 +408,15 @@ def _count_verification_outcomes(verified_results: list) -> dict:
             # Could not complete — needs manual review, NOT a disagreement.
             counts["needs_review"] += 1
             continue
+        # #302: the canonical final finding — `finding` may have been
+        # overwritten either by the verifier's disagreement branch OR by the
+        # post-batch consistency pass (which mutates `finding` without
+        # touching `verification.agree`), so the direction computation below
+        # runs for BOTH branches: a consistency-driven change is as much a
+        # Stage-2 change as a disagreement.
+        finding = str(r.get("finding") or r.get("verdict", "")).lower()
         if verification.get("agree", False):
             counts["agreed"] += 1
-            # Canonical read (matches :99 input filter): fall back to `verdict`
-            # so a verdict-only VULNERABLE result is not silently dropped.
-            finding = str(r.get("finding") or r.get("verdict", "")).lower()
             if finding in ("vulnerable", "bypassable"):
                 counts["confirmed_vulnerabilities"] += 1
         else:
@@ -406,13 +427,23 @@ def _count_verification_outcomes(verified_results: list) -> dict:
             # disagreed but the finding is STILL vulnerable/bypassable (e.g.
             # vulnerable -> bypassable), it is a confirmed vulnerability, NOT
             # safe — counting it as ``disagreed`` would under-report the vuln.
-            # Canonical read (matches :99 input filter): fall back to `verdict`
-            # so a verdict-only VULNERABLE disagreement is not silently dropped.
-            finding = str(r.get("finding") or r.get("verdict", "")).lower()
             if finding in ("vulnerable", "bypassable"):
                 counts["confirmed_vulnerabilities"] += 1
             else:
                 counts["disagreed"] += 1
+        # #302: direction. `verdict` is the UN-overwritten Stage-1 original;
+        # FINDING_VERDICT_ORDER ranks severity (vulnerable first). A missing
+        # original abstains — never guessed. Runs for agreed records too: the
+        # consistency pass can change an agreed unit's finding (wave catch —
+        # otherwise those changes silently escape the counters).
+        original = str(r.get("verdict") or "").lower()
+        if original in FINDING_VERDICT_ORDER and finding in FINDING_VERDICT_ORDER:
+            oi = FINDING_VERDICT_ORDER.index(original)
+            ci = FINDING_VERDICT_ORDER.index(finding)
+            if ci > oi:
+                counts["downgraded"] += 1
+            elif ci < oi:
+                counts["upgraded"] += 1
     return counts
 
 

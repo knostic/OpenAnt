@@ -480,6 +480,25 @@ def build_pipeline_output(
     # Compute costs and durations from step reports
     costs = {}
     durations = {}
+    # #302: Stage 2's SCOPE from the verify step report — the denominator
+    # (adjudicated N of M analyzed units; the rest were not re-examined) and
+    # the direction of its changes, so the summary generator's single input
+    # can state them. Present-only: absent when no verify step ran.
+    _verify_scope: dict = {}
+    for sr in (step_reports or []):
+        if sr.get("step") == "verify":
+            _vs = sr.get("summary", {})
+            if isinstance(_vs, dict):
+                for _k in ("findings_input", "units_analyzed_total",
+                           "downgraded", "upgraded"):
+                    if isinstance(_vs.get(_k), int) and not isinstance(
+                            _vs.get(_k), bool):
+                        _verify_scope[_k] = _vs[_k]
+                if _vs.get("same_model_verification") is not None:
+                    _verify_scope["same_model_verification"] = bool(
+                        _vs["same_model_verification"])
+            break
+
     if step_reports:
         for sr in step_reports:
             step = sr.get("step", "unknown")
@@ -596,6 +615,8 @@ def build_pipeline_output(
             "reachability_reduction_percentage": reachability_reduction_percentage,
             "reachability_warnings": reachability_warnings,
             **_reach_telemetry,
+
+            **_verify_scope,
             "units_analyzed": total_units - metrics.get("errors", 0),
             "processing_level": processing_level,
             "costs": costs,

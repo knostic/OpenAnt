@@ -34,6 +34,7 @@ OUTPUT FORMAT:
 - After CodeQL filter: {n} units
 - Analyzed in Stage 1: {n} units
 - Verified in Stage 2: {n} findings
+- Stage 2 scope: adjudicated {pipeline_stats.findings_input} of {pipeline_stats.units_analyzed_total} analyzed units (Stage-1 positives only; the remaining units were NOT re-examined). Direction of Stage-2 changes: {pipeline_stats.downgraded} downgraded, {pipeline_stats.upgraded} upgraded. If pipeline_stats.same_model_verification is true, note that Stage 2 ran on the same model as Stage 1 and is not an independent instrument.
 
 ## Per-Step Costs
 

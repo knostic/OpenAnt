@@ -163,6 +163,27 @@ def aggregate_reachability_telemetry(per_lang: dict) -> dict:
         out["orphan_advisory"] = "; ".join(advisories)
     return out
 
+def same_model_verification_note(analyze_binding, verify_binding) -> str | None:
+    """#302: a note when analyze and verify resolve to the same model.
+
+    A legitimate configuration, but Stage 2 is then not an independent
+    instrument — the adjudication shares the model's blind spots, and a
+    high disagreement rate does not establish independence. The note makes
+    that visible in the scan banner and the step summary.
+    """
+    if analyze_binding is None or verify_binding is None:
+        return None
+    if (getattr(analyze_binding, "model", None) == getattr(verify_binding, "model", None)
+            and getattr(analyze_binding, "provider_name", None)
+            == getattr(verify_binding, "provider_name", None)):
+        return (
+            f"analyze and verify use the same model "
+            f"({analyze_binding.provider_name}/{analyze_binding.model}); "
+            "Stage 2 is not an independent instrument — adjudication shares "
+            "the model's blind spots, so the disagreement rate does not "
+            "establish independence")
+    return None
+
 
 def scan_repository(
     repo_path: str,
@@ -992,6 +1013,12 @@ def scan_repository(
                 # and chained-verify sites in cli.py build the same dict
                 # through the same helper, so the three cannot drift).
                 ctx.summary = verify_step_summary(verify_result)
+                # #302: the same-model note — banner + step summary
+                _same_model = same_model_verification_note(
+                    registry.get("analyze"), registry.get("verify"))
+                if _same_model:
+                    ctx.summary["same_model_verification"] = True
+                    print(f"  [Note] {_same_model}", file=sys.stderr)
                 ctx.outputs = {
                     "verified_results_path": verify_result.verified_results_path,
                 }

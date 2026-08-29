@@ -47,16 +47,16 @@ SEVEN_KEYS = {
 
 
 def test_shared_helper_emits_all_seven_fields():
+    # #302 (stacked on #300) extends the helper with the three scope keys
+    # (units_analyzed_total/downgraded/upgraded); the #300 contract is that
+    # these SEVEN are always present — a superset check, not exact-set.
     s = verify_step_summary(VR)
-    assert set(s.keys()) == SEVEN_KEYS, s
+    assert SEVEN_KEYS <= set(s.keys()), s
     assert s["needs_review"] == 134
     assert s["error_count"] == 48
-    # the counters reconcile: every input finding is accounted for
-    # The four counters are a BOUND, not exact equality: a
+    # The four reconciliation counters are a BOUND, not exact equality: a
     # disagreed-but-still-vulnerable result increments ONLY
     # confirmed_vulnerabilities (verifier.py's else-branch), so
-    # agreed+disagreed+needs_review+error_count < findings_input whenever
-    # that bucket is non-empty. The <= assertion is the honest contract.
     assert (s["agreed"] + s["disagreed"] + s["needs_review"]
             + s["error_count"]) <= s["findings_input"]
 
@@ -83,9 +83,9 @@ def test_standalone_verify_step_report_carries_all_fields(tmp_path, monkeypatch)
         checkpoint=None, backoff=30, llm_config=None,
     )
     rc = cli.cmd_verify(args)
-    assert rc == 1  # confirmed_vulnerabilities=30 > 0 forces rc 1 (cli.py cmd_verify)  # 1: confirmed vulns (30) — the command's contract
+    assert rc == 1  # confirmed_vulnerabilities=30 > 0 forces rc 1 (cli.py cmd_verify)
     report = json.loads((tmp_path / "verify.report.json").read_text())
-    assert set(report["summary"].keys()) == SEVEN_KEYS, report["summary"]
+    assert SEVEN_KEYS <= set(report["summary"].keys()), report["summary"]
     assert report["summary"]["needs_review"] == 134
     assert report["summary"]["error_count"] == 48
 
