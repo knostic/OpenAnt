@@ -27,8 +27,10 @@ type ReportData struct {
 	Findings          []Finding      `json:"findings"`
 	FindingsByVerdict []FindingGroup `json:"findings_by_verdict"`
 	StepReports       []StepReport   `json:"step_reports"`
-	Categories        []Category     `json:"categories"`
-	Diff              *DiffInfo      `json:"diff,omitempty"`
+	// #305: excluded languages reach the SARIF notifications.
+	ExcludedLanguages []string   `json:"excluded_languages"`
+	Categories        []Category `json:"categories"`
+	Diff              *DiffInfo  `json:"diff,omitempty"`
 }
 
 // DiffInfo carries the incremental-scan range info to the report templates.
@@ -226,6 +228,11 @@ type Finding struct {
 	Analysis           string `json:"analysis"`
 	DynamicTestStatus  string `json:"dynamic_test_status"`
 	DynamicTestDetails string `json:"dynamic_test_details"`
+	// #305: the parsers emit start_line in primary_origin and it survived
+	// enhancement — it was dropped at the report boundary. Threaded so the
+	// SARIF region can anchor the alert to the real row (0 = unknown: emit
+	// no region, never a synthetic line).
+	StartLine int `json:"start_line"`
 }
 
 // HasDynamicTest returns true if this finding has dynamic test results.
@@ -269,6 +276,12 @@ type StepReport struct {
 	Cost      string `json:"cost"`
 	Status    string `json:"status"`
 	Timestamp string `json:"timestamp"`
+	// #305: the degradation channel — per-step failures and the
+	// disambiguated skip reason, threaded by the report-data projection so
+	// the SARIF invocations block (and any honest CI gate) can see them.
+	ErrorCount    int      `json:"error_count"`
+	Errors        []string `json:"errors"`
+	SkippedReason string   `json:"skipped_reason"`
 }
 
 // StatusColor returns a Tailwind text color class based on step status.

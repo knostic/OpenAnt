@@ -292,3 +292,240 @@ func TestSARIFURI_StripsLeadingDotSlashAndNormalizesBackslashes(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #305: the invocations block — a degraded scan must be distinguishable from
+// a clean one on the merge-gate channel.
+// ---------------------------------------------------------------------------
+
+func sarifInvocations(t *testing.T, sarif map[string]any) (map[string]any, []map[string]any) {
+	t.Helper()
+	runs := sarif["runs"].([]any)
+	run := runs[0].(map[string]any)
+	inv := run["invocations"].([]any)[0].(map[string]any)
+	notifs, _ := inv["toolExecutionNotifications"].([]map[string]any)
+	if inv["toolExecutionNotifications"] == nil {
+		notifs = nil
+	} else {
+		// tolerate []any too depending on construction
+		if asAny, ok := inv["toolExecutionNotifications"].([]any); ok {
+			for _, n := range asAny {
+				notifs = append(notifs, n.(map[string]any))
+			}
+		}
+	}
+	return inv, notifs
+}
+
+func TestSARIFCleanScanExecutionSuccessful(t *testing.T) {
+	data := ReportData{Title: "t", RepoName: "r", Language: "go",
+		StepReports: []StepReport{
+			{Step: "parse", Status: "success"},
+			{Step: "verify", Status: "skipped", SkippedReason: "no_candidates"},
+		}}
+	sarif := BuildSARIF(data, SARIFOptions{})
+	inv, notifs := sarifInvocations(t, sarif)
+	if inv["executionSuccessful"] != true {
+		t.Errorf("clean scan (operator opt-out skip) must be executionSuccessful=true; got %v",
+			inv["executionSuccessful"])
+	}
+	if notifs != nil {
+		t.Errorf("clean scan carries no notifications; got %v", notifs)
+	}
+}
+
+func TestSARIFErroredStepFailsExecution(t *testing.T) {
+	data := ReportData{Title: "t", RepoName: "r", Language: "go",
+		StepReports: []StepReport{
+			{Step: "parse", Status: "success"},
+			{Step: "verify", Status: "partial", ErrorCount: 48,
+				Errors: []string{"adapter raise"}},
+		}}
+	sarif := BuildSARIF(data, SARIFOptions{})
+	inv, notifs := sarifInvocations(t, sarif)
+	if inv["executionSuccessful"] != false {
+		t.Errorf("errored step must be executionSuccessful=false")
+	}
+	if len(notifs) == 0 {
+		t.Fatalf("errored step must emit a warning notification")
+	}
+	found := false
+	for _, n := range notifs {
+		if n["level"] == "warning" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("notifications must be at warning level (Code Scanning default view)")
+	}
+}
+
+func TestSARIFFailureClassSkipFailsExecution(t *testing.T) {
+	data := ReportData{Title: "t", RepoName: "r", Language: "go",
+		StepReports: []StepReport{
+			{Step: "parse", Status: "success"},
+			{Step: "app-context", Status: "skipped", SkippedReason: "module_unavailable"},
+		}}
+	sarif := BuildSARIF(data, SARIFOptions{})
+	inv, _ := sarifInvocations(t, sarif)
+	if inv["executionSuccessful"] != false {
+		t.Errorf("module_unavailable is a FAILURE-class skip: executionSuccessful=false")
+	}
+}
+
+func TestSARIFExcludedLanguageFailsExecution(t *testing.T) {
+	data := ReportData{Title: "t", RepoName: "r", Language: "go",
+		StepReports:       []StepReport{{Step: "parse", Status: "success"}},
+		ExcludedLanguages: []string{"swift"}}
+	sarif := BuildSARIF(data, SARIFOptions{})
+	inv, notifs := sarifInvocations(t, sarif)
+	if inv["executionSuccessful"] != false {
+		t.Errorf("an excluded language is a degradation: executionSuccessful=false")
+	}
+	if len(notifs) == 0 {
+		t.Errorf("the excluded language must be notified")
+	}
+}
+
+func TestSARIFRegionCarriesRealStartLine(t *testing.T) {
+	data := ReportData{Title: "t", RepoName: "r", Language: "go",
+		Findings: []Finding{{Number: 1, Verdict: "vulnerable", File: "a.go",
+			Function: "f", StartLine: 42}},
+		StepReports: []StepReport{{Step: "parse", Status: "success"}}}
+	sarif := BuildSARIF(data, SARIFOptions{})
+	res := sarif["runs"].([]any)[0].(map[string]any)["results"].([]map[string]any)[0]
+	loc := res["locations"].([]any)[0].(map[string]any)
+	phys := loc["physicalLocation"].(map[string]any)
+	region, ok := phys["region"].(map[string]any)
+	if !ok {
+		t.Fatalf("a finding with StartLine=42 must carry region.startLine; got %v", phys)
+	}
+	if region["startLine"] != 42 {
+		t.Errorf("region.startLine must be 42; got %v", region["startLine"])
+	}
+}
+
+func TestSARIFNoRegionForUnknownLine(t *testing.T) {
+	data := ReportData{Title: "t", RepoName: "r", Language: "go",
+		Findings: []Finding{{Number: 1, Verdict: "vulnerable", File: "a.go",
+			Function: "f", StartLine: 0}},
+		StepReports: []StepReport{{Step: "parse", Status: "success"}}}
+	sarif := BuildSARIF(data, SARIFOptions{})
+	res := sarif["runs"].([]any)[0].(map[string]any)["results"].([]map[string]any)[0]
+	loc := res["locations"].([]any)[0].(map[string]any)
+	phys := loc["physicalLocation"].(map[string]any)
+	if _, ok := phys["region"]; ok {
+		t.Errorf("StartLine=0 (unknown) must stay file-scoped — no synthetic region")
+	}
+}
+
+// wave catches (#305): the descriptor must be schema-valid (no `name`
+// key — reportingDescriptorReference is additionalProperties:false), the
+// scan mirror row must not duplicate notifications, docker_unavailable
+// is a failure-class skip, and a partial-with-zero-counts step degrades
+// visibly without a "0 unit error(s)" text.
+
+func notificationTexts(t *testing.T, inv map[string]any) []string {
+	t.Helper()
+	var texts []string
+	if raw, ok := inv["toolExecutionNotifications"]; ok && raw != nil {
+		switch asTyped := raw.(type) {
+		case []map[string]any:
+			for _, nt := range asTyped {
+				d := nt["descriptor"].(map[string]any)
+				if _, hasName := d["name"]; hasName {
+					t.Errorf("descriptor carries schema-invalid `name`; got %v", d)
+				}
+				m := nt["message"].(map[string]any)
+				texts = append(texts, m["text"].(string))
+			}
+		case []any:
+			for _, n := range asTyped {
+				nt := n.(map[string]any)
+				d := nt["descriptor"].(map[string]any)
+				if _, hasName := d["name"]; hasName {
+					t.Errorf("descriptor carries schema-invalid `name`; got %v", d)
+				}
+				m := nt["message"].(map[string]any)
+				texts = append(texts, m["text"].(string))
+			}
+		}
+	}
+	return texts
+}
+
+func TestSARIFNotificationDescriptorIsSchemaValid(t *testing.T) {
+	data := ReportData{Title: "t", RepoName: "r", Language: "go",
+		StepReports: []StepReport{
+			{Step: "verify", Status: "partial", ErrorCount: 3},
+		}}
+	sarif := BuildSARIF(data, SARIFOptions{})
+	inv, _ := sarifInvocations(t, sarif)
+	_ = notificationTexts(t, inv) // asserts descriptor shape inside
+}
+
+func TestSARIFScanMirrorRowDoesNotDuplicateNotifications(t *testing.T) {
+	data := ReportData{Title: "t", RepoName: "r", Language: "go",
+		StepReports: []StepReport{
+			{Step: "verify", Status: "partial", ErrorCount: 48,
+				Errors: []string{"adapter raise"}},
+			// the synthetic aggregate row mirrors verify's errors
+			{Step: "scan", Status: "partial", ErrorCount: 48,
+				Errors: []string{"adapter raise"}},
+		}}
+	sarif := BuildSARIF(data, SARIFOptions{})
+	inv, _ := sarifInvocations(t, sarif)
+	texts := notificationTexts(t, inv)
+	verifyNotifs := 0
+	for _, txt := range texts {
+		if len(txt) >= 11 && txt[:11] == "step verify" {
+			verifyNotifs++
+		}
+		if len(txt) >= 10 && txt[:10] == "step scan:" {
+			t.Errorf("the scan mirror row must not emit notifications; got %q", txt)
+		}
+	}
+	if verifyNotifs != 1 {
+		t.Errorf("exactly one verify notification expected; got %d (%v)",
+			verifyNotifs, texts)
+	}
+}
+
+func TestSARIFDockerUnavailableIsAFailureSkip(t *testing.T) {
+	data := ReportData{Title: "t", RepoName: "r", Language: "go",
+		StepReports: []StepReport{
+			{Step: "parse", Status: "success"},
+			{Step: "dynamic-test", Status: "skipped",
+				SkippedReason: "docker_unavailable"},
+		}}
+	sarif := BuildSARIF(data, SARIFOptions{})
+	inv, _ := sarifInvocations(t, sarif)
+	if inv["executionSuccessful"] != false {
+		t.Errorf("docker_unavailable (a runner without Docker) must be a failure-class skip")
+	}
+}
+
+func TestSARIFPartialWithoutCountsDegradesVisibly(t *testing.T) {
+	data := ReportData{Title: "t", RepoName: "r", Language: "go",
+		StepReports: []StepReport{
+			{Step: "verify", Status: "partial", ErrorCount: 0},
+		}}
+	sarif := BuildSARIF(data, SARIFOptions{})
+	inv, _ := sarifInvocations(t, sarif)
+	if inv["executionSuccessful"] != false {
+		t.Errorf("a partial step must fail executionSuccessful even with no counts")
+	}
+	texts := notificationTexts(t, inv)
+	found := false
+	for _, txt := range texts {
+		if txt == "step verify: degraded (status partial)" {
+			found = true
+		}
+		if txt == "step verify: 0 unit error(s)" {
+			t.Errorf("the misleading 0-error text must not appear; got %q", txt)
+		}
+	}
+	if !found {
+		t.Errorf("the degraded-status notification must appear; got %v", texts)
+	}
+}

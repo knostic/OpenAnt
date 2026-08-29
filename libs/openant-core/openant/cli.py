@@ -40,6 +40,62 @@ def _output_json(data: dict):
     sys.stdout.write("\n")
 
 
+def _unit_start_line(unit: dict) -> int:
+    """#305 (the adjacent finding in the issue comment): the parsers emit
+    ``start_line`` inside ``code.primary_origin`` and it survives
+    enhancement — the report boundary dropped it, so the SARIF region had
+    nothing to anchor to. Every malformed/hostile shape resolves to 0
+    (unknown → file-scoped region), never a crash."""
+    origin = unit.get("code") or {}
+    if not isinstance(origin, dict):
+        return 0
+    origin = origin.get("primary_origin") or {}
+    if not isinstance(origin, dict):
+        return 0
+    start_line = origin.get("start_line") or 0
+    if not isinstance(start_line, int) or isinstance(start_line, bool):
+        return 0
+    return start_line
+
+
+def _step_report_rows(step_reports: list[dict],
+                      skip_reasons: dict | None = None) -> list[dict]:
+    """Project step reports into the Go consumer's row shape (#305).
+
+    The five display fields plus the degradation data the SARIF
+    invocations block needs: per-step ``error_count`` (the #285 flat key,
+    falling back to the raw errors list length) and the ``errors``
+    themselves (capped — a pathological step must not balloon the report
+    payload), and each step's disambiguated skip reason from the scan
+    aggregate's ``steps_skipped_reasons``.
+    """
+    skip_reasons = skip_reasons or {}
+    rows = []
+    for sr in step_reports:
+        duration = sr.get("duration_seconds", 0)
+        cost = sr.get("cost_usd", 0)
+        dur_str = f"{duration / 60:.1f}m" if duration >= 60 else f"{duration:.1f}s"
+        cost_str = f"${cost:.2f}" if cost > 0 else "-"
+        errors = [str(e) for e in (sr.get("errors") or [])][:5]
+        summary = sr.get("summary") or {}
+        error_count = summary.get("error_count")
+        if not isinstance(error_count, int) or isinstance(error_count, bool):
+            error_count = len(sr.get("errors") or [])
+        step = sr.get("step", "unknown")
+        rows.append({
+            "step": step,
+            "duration": dur_str,
+            "cost": cost_str,
+            "status": sr.get("status", "unknown"),
+            "timestamp": sr.get("timestamp", ""),
+            # #305: the degradation channel
+            "error_count": error_count,
+            "errors": errors,
+            "skipped_reason": str(skip_reasons.get(step, "")),
+        })
+    return rows
+
+
 def _load_step_reports(directory: str) -> list[dict]:
     """Load all {step}.report.json files from a directory.
 
@@ -954,6 +1010,7 @@ def cmd_report_data(args):
                     "analysis": justification,
                     "dynamic_test_status": dt_status,
                     "dynamic_test_details": dt_details,
+                    "start_line": _unit_start_line(unit),
                     "number": 0,  # assigned after sort
                 })
 
@@ -1103,23 +1160,33 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
                 remediation_html = re.sub(r'#(\d+)', _linkify_finding, remediation_html)
 
             # --- Step reports ---
-            step_reports_data = []
-            for sr in _load_step_reports(results_dir):
-                duration = sr.get("duration_seconds", 0)
-                cost = sr.get("cost_usd", 0)
-                if duration >= 60:
-                    dur_str = f"{duration / 60:.1f}m"
-                else:
-                    dur_str = f"{duration:.1f}s"
-                cost_str = f"${cost:.2f}" if cost > 0 else "-"
-
-                step_reports_data.append({
-                    "step": sr.get("step", "unknown"),
-                    "duration": dur_str,
-                    "cost": cost_str,
-                    "status": sr.get("status", "unknown"),
-                    "timestamp": sr.get("timestamp", ""),
-                })
+            # #305: the projection previously copied five display fields and
+            # dropped `errors`/`error_count`/skip reasons — the degradation
+            # data the SARIF invocations block (and any honest CI gate)
+            # needs. Thread them now (the #285 vocabulary).
+            _all_steps = _load_step_reports(results_dir)
+            _skip_reasons = {}
+            _excluded_langs: list[str] = []
+            for sr in _all_steps:
+                if sr.get("step") == "scan":
+                    _summary = sr.get("summary", {})
+                    _skip_reasons = _summary.get("steps_skipped_reasons", {}) or {}
+                    # wave catches (#305): excluded_languages is a {lang:
+                    # reason} DICT everywhere in Python — the Go consumer
+                    # expects a list, so an unconverted dict would break the
+                    # JSON unmarshal outright. Format it; and an operator
+                    # --languages opt-out ("not requested via --languages")
+                    # is a legitimate scoping choice, NOT a degradation —
+                    # only involuntary exclusions reach the report/SARIF.
+                    _excl = _summary.get("excluded_languages") or {}
+                    if isinstance(_excl, dict):
+                        _excluded_langs = sorted(
+                            f"{lang} ({reason})" for lang, reason in _excl.items()
+                            if "not requested" not in str(reason))
+                    elif isinstance(_excl, list):
+                        _excluded_langs = [str(x) for x in _excl]
+                    break
+            step_reports_data = _step_report_rows(_all_steps, _skip_reasons)
 
             # Sort by timestamp
             step_reports_data.sort(key=lambda s: s.get("timestamp", ""))
@@ -1190,6 +1257,9 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
                 "findings": findings,
                 "findings_by_verdict": findings_by_verdict,
                 "step_reports": step_reports_data,
+                # #305: excluded languages reach the Go consumer so the SARIF
+                # notifications can carry them.
+                "excluded_languages": _excluded_langs,
                 "categories": categories,
                 "diff": diff_block,
             }
