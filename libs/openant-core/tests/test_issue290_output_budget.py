@@ -32,7 +32,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from utilities.agentic_enhancer import agent as enhancer_agent  # noqa: E402
 from utilities import finding_verifier  # noqa: E402
-from utilities.llm import helpers as llm_helpers  # noqa: E402
 from utilities.llm.helpers import DEFAULT_MAX_TOKENS, simple_text  # noqa: E402
 
 
