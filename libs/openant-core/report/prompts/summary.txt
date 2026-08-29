@@ -27,7 +27,7 @@ OUTPUT FORMAT:
 
 ## Pipeline Statistics
 
-- If pipeline_stats.coverage exists, add a Coverage line: test files skipped (per language from coverage.test_files_skipped), symlinks refused, directories unreadable; also note per_language, parse_errors, excluded_languages, and degraded if present — a reader must see what did NOT enter the pipeline
+- If a top-level `coverage` key exists, add a Coverage line: test files skipped (per language from coverage.test_files_skipped), symlinks refused, directories unreadable; also note the top-level per_language, parse_errors, excluded_languages, and degraded keys if present — a reader must see what did NOT enter the pipeline. (These are TOP-LEVEL keys beside application_type, NOT nested under pipeline_stats.) If `coverage` is absent, add no Coverage line
 
 - Parsed: {n} functions from {n} files
 - Total units: {pipeline_stats.total_units}

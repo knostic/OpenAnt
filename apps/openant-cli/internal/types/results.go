@@ -65,11 +65,15 @@ type ScanData struct {
 	Usage               UsageInfo   `json:"usage"`
 	StepReports         []any       `json:"step_reports"`
 	SkippedSteps        []string    `json:"skipped_steps"`
-	// #307: the multi-language coverage fields the CHANGELOG claims —
-	// the typed decode previously discarded them; comma-ok consumers are
-	// additive-safe. per_language is the scan summary's {lang: record}
-	// map; excluded_languages is {lang: reason}; degraded is absent
-	// (omitempty) when unknown.
+	// #307: the multi-language coverage fields the CHANGELOG claims.
+	// NOTE (review finding, corrected): ScanData is not currently
+	// unmarshaled anywhere in the CLI (the formatter renders the
+	// untyped envelope), and ScanResult.to_dict serializes
+	// per_language/parse_errors/excluded_languages/degraded but NOT
+	// coverage — so these fields are FORWARD-DECLARED surface only:
+	// they populate once a typed decode is wired (or from
+	// pipeline_output.json, where the reporter emits them). They are
+	// additive/omitempty and change nothing observable today.
 	PerLanguage       map[string]any `json:"per_language,omitempty"`
 	ParseErrors       []any          `json:"parse_errors,omitempty"`
 	ExcludedLanguages map[string]any `json:"excluded_languages,omitempty"`

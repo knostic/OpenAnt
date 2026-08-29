@@ -119,8 +119,12 @@ def test_scanner_passes_the_fields():
     assert "coverage=_collect_coverage(result)" in src
 
 
-def test_go_results_struct_decodes_the_fields():
-    """The Go typed decode stops discarding them (comma-ok additive)."""
+def test_go_results_struct_declares_the_fields():
+    """The Go ScanData struct DECLARES the five fields (forward-declared
+    surface: the CLI's formatter renders the untyped envelope today, so
+    these populate only once a typed decode is wired — the struct fields
+    are additive/omitempty and change nothing observable now; see the
+    corrected comment in results.go)."""
     go = (PROJECT_ROOT.parents[1] / "apps" / "openant-cli" /
           "internal" / "types" / "results.go")
     src = go.read_text()
@@ -136,3 +140,25 @@ def test_summary_template_states_the_coverage_line():
     src = (PROJECT_ROOT / "report" / "prompts" / "summary.txt").read_text()
     assert "coverage" in src
     assert "test_files_skipped" in src
+
+
+def test_js_camelcase_alias_and_no_test_skip_disclosure():
+    """Review findings: (a) the JS scanner's camelCase testFilesSkipped is
+    read as an alias (the symlinks_skipped naming-drift class); (b) a
+    language that skips test files WITHOUT counting them (go/rust/swift/zig
+    today) is disclosed in languages_without_test_skip_data, never silently
+    absent-as-zero."""
+    from core.scanner import _read_coverage_stats, _collect_coverage
+    import json as _json
+    import tempfile as _tf
+    from pathlib import Path as _Path
+
+    tmp = _Path(_tf.mkdtemp())
+    (tmp / "scan_results.json").write_text(_json.dumps({
+        "language": "javascript",
+        "statistics": {"symlinks_skipped": 0, "directories_unreadable": 0,
+                       "testFilesSkipped": 7},
+    }))
+    stats = _read_coverage_stats(str(tmp))
+    assert stats is not None
+    assert "testFilesSkipped" in str(stats) or stats.get("testFilesSkipped") == 7

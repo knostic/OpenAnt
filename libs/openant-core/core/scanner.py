@@ -1326,6 +1326,10 @@ _COVERAGE_COUNT_KEYS = ("symlinks_skipped", "directories_unreadable")
 # by default; 1,346 files on the filing run, larger than every language-
 # or threshold-based exclusion combined) — aggregated per language.
 _TEST_FILES_SKIPPED_KEY = "test_files_skipped"
+# JavaScript's scanner still writes camelCase testFilesSkipped (the same
+# naming drift the 2026-08 CHANGELOG fixed for symlinks_skipped) — read it
+# as an alias until the parser is renamed.
+_TEST_FILES_SKIPPED_ALIASES = ("test_files_skipped", "testFilesSkipped")
 _COVERAGE_EXAMPLE_KEYS = ("symlink_examples", "unreadable_examples")
 # Parsers disagree on the filename: the in-process Python parser writes
 # scan_result.json (singular); the subprocess parsers write scan_results.json.
@@ -1354,7 +1358,7 @@ def _read_coverage_stats(dir_path: str) -> dict:
         return {
             k: stats[k]
             for k in (*_COVERAGE_COUNT_KEYS, *_COVERAGE_EXAMPLE_KEYS,
-                      _TEST_FILES_SKIPPED_KEY)
+                      *_TEST_FILES_SKIPPED_ALIASES)
             if k in stats
         }
     return {}
@@ -1395,6 +1399,11 @@ def _collect_coverage(result: ScanResult) -> dict:
     examples: dict[str, list] = {k: [] for k in _COVERAGE_EXAMPLE_KEYS}
     without_data: list[str] = []
     test_files: dict[str, int] = {}
+    # #307 (review finding): a language may be coverage-instrumented (so it
+    # passes the presence probe above) yet skip test files WITHOUT counting
+    # them — go/rust/swift/zig today. Counting those as an absent entry
+    # would read as "zero skipped"; disclosing them keeps absence ≠ zero.
+    no_test_skip_data: list[str] = []
     for lang, d in _language_scan_dirs(result):
         stats = _read_coverage_stats(d)
         if not any(k in stats for k in _COVERAGE_COUNT_KEYS):
@@ -1406,16 +1415,31 @@ def _collect_coverage(result: ScanResult) -> dict:
             for ex in stats.get(k, []) or []:
                 if len(examples[k]) < 5 and ex not in examples[k]:
                     examples[k].append(ex)
-        # #307: the test-file exclusion, per language
-        skipped = stats.get(_TEST_FILES_SKIPPED_KEY)
-        if isinstance(skipped, int) and not isinstance(skipped, bool):
+        # #307: the test-file exclusion, per language. snake_case first,
+        # then the JS camelCase alias; a language that skips test files but
+        # reports NO count of them (go/rust/swift/zig today) is DISCLOSED
+        # below, never silently counted as zero.
+        skipped = None
+        for key in _TEST_FILES_SKIPPED_ALIASES:
+            v = stats.get(key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                skipped = v
+                break
+        if skipped is not None:
             test_files[lang or "unknown"] = skipped
+        else:
+            no_test_skip_data.append(lang or "unknown")
     return {
         **counts,
         **examples,
         # #307: the dominant exclusion, per-language attributed
         **({"test_files_skipped": test_files} if test_files else {}),
         "languages_without_coverage_data": sorted(set(without_data)),
+        # #307 (review finding): the languages whose test-file exclusion is
+        # UNCOUNTERED — the reader must see that "no entry" means unknown,
+        # not zero (the same absence-vs-zero doctrine as the list above).
+        **({"languages_without_test_skip_data": sorted(set(no_test_skip_data))}
+           if no_test_skip_data else {}),
     }
 
 
