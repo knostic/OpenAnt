@@ -22,6 +22,7 @@ from pathlib import Path
 from core.schemas import ReportResult
 from core.language_registry import fence_for_path
 from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
+from utilities.child_interp import child_interpreter_env
 from utilities.file_io import normalize_results, open_utf8, read_json, write_json
 
 # Root of openant-core
@@ -709,7 +710,12 @@ def generate_html_report(
     # No cwd=_CORE_ROOT: these are now `-m` package invocations resolved through
     # the installed distribution, not source-tree-relative scripts. Depending on
     # cwd is what made them unrunnable from an installed wheel.
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    # #303: the child resolves THIS checkout by construction (PYTHONPATH
+    # precedes site-packages, so the re-pointable shared-venv .pth cannot
+    # win). -P keeps the untrusted CWD off sys.path; the env keeps the
+    # venv's .pth off the resolution.
+    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr,
+                            env=child_interpreter_env())
 
     if result.returncode != 0:
         raise RuntimeError(f"HTML report generation failed (exit code {result.returncode})")
@@ -744,7 +750,9 @@ def generate_csv_report(
     # No cwd=_CORE_ROOT: these are now `-m` package invocations resolved through
     # the installed distribution, not source-tree-relative scripts. Depending on
     # cwd is what made them unrunnable from an installed wheel.
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    # #303: same as the HTML path above — explicit resolution for the child.
+    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr,
+                            env=child_interpreter_env())
 
     if result.returncode != 0:
         raise RuntimeError(f"CSV export failed (exit code {result.returncode})")
