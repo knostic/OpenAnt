@@ -32,11 +32,16 @@ def collect_result(
         DynamicTestResult with parsed status and evidence
     """
     finding_id = finding.get("id", "unknown")
+    # #314: the run-stable identity (threaded from the pipeline finding)
+    # so the report merge can verify the join — the positional VULN-NNN
+    # is not a durable key across artifacts.
+    identity_key = finding.get("identity_key", "")
 
     # Generation failed
     if generation is None:
         return DynamicTestResult(
             finding_id=finding_id,
+            identity_key=identity_key,
             status="ERROR",
             details="Test generation failed — LLM did not return valid test code",
             generation_cost_usd=generation_cost,
@@ -46,6 +51,7 @@ def collect_result(
     if execution is None:
         return DynamicTestResult(
             finding_id=finding_id,
+            identity_key=identity_key,
             status="ERROR",
             details="Docker execution was not attempted",
             test_code=generation.get("test_script", ""),
@@ -58,6 +64,7 @@ def collect_result(
     if execution.build_error:
         return DynamicTestResult(
             finding_id=finding_id,
+            identity_key=identity_key,
             status="ERROR",
             details=f"Docker build failed: {execution.build_error[:2000]}",
             test_code=generation.get("test_script", ""),
@@ -71,6 +78,7 @@ def collect_result(
     if execution.timed_out:
         return DynamicTestResult(
             finding_id=finding_id,
+            identity_key=identity_key,
             status="INCONCLUSIVE",
             details="Container execution timed out",
             test_code=generation.get("test_script", ""),
@@ -86,6 +94,7 @@ def collect_result(
     if parsed is None:
         return DynamicTestResult(
             finding_id=finding_id,
+            identity_key=identity_key,
             status="ERROR",
             details=f"Container did not produce valid JSON output. "
                     f"Exit code: {execution.exit_code}. "

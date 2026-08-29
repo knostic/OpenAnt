@@ -128,18 +128,56 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
     from datetime import datetime
     date_str = datetime.fromtimestamp(dynamic_path.stat().st_mtime).strftime("%B %Y")
 
+    # #314: the merge verifies the IDENTITY, not just the positional ID.
+    # VULN-NNN is assigned by list position — drop or add one finding
+    # anywhere but the end and every later ID shifts, so a stale
+    # results file left in the scan directory merges one finding's
+    # result into a DIFFERENT finding, stamped with the stale file's
+    # mtime and nothing marking it. Three rules, each surfaced (never
+    # silent):
+    #   - positional match + identity_key AGREES -> merge (auditable)
+    #   - positional match + identity_key DISAGREES -> REFUSE (the stale
+    #     case: a different finding) — the mis-join is refused
+    #   - results without identity_key (a legacy/pre-fix file) -> ABSTAIN
+    #     (never silently fall back to the positional ID: that is the
+    #     defect)
+    merged_count = 0
+    refused_count = 0
+    abstained_count = 0
     for finding in pipeline_data.get("findings", []):
         fid = finding.get("id")
-        if fid and fid in results_by_id:
-            r = results_by_id[fid]
-            finding["dynamic_testing"] = {
-                "status": r.get("status"),
-                "details": r.get("details"),
-                "evidence": r.get("evidence", []),
-                "tested": f"Docker container, {date_str}",
-            }
+        if not fid or fid not in results_by_id:
+            continue
+        r = results_by_id[fid]
+        r_key = r.get("identity_key")
+        f_key = finding.get("identity_key")
+        if not r_key or not f_key:
+            abstained_count += 1
+            continue
+        if r_key != f_key:
+            refused_count += 1
+            continue
+        finding["dynamic_testing"] = {
+            "status": r.get("status"),
+            "details": r.get("details"),
+            "evidence": r.get("evidence", []),
+            "tested": f"Docker container, {date_str}",
+            # the join is auditable after the fact
+            "identity_key": r_key,
+        }
+        merged_count += 1
 
-    print(f"  Merged {len(results_by_id)} dynamic test results from {dynamic_path.name}", file=sys.stderr)
+    # #314 suggestion 3: what happened is SURFACED, never silent
+    print(f"  Merged {merged_count} dynamic test results from {dynamic_path.name}", file=sys.stderr)
+    if refused_count:
+        print(f"  [Warning] Refused {refused_count} dynamic test result(s) whose "
+              f"identity_key disagrees with the finding — a stale results file "
+              f"from a previous run; re-run the dynamic tests to regenerate",
+              file=sys.stderr)
+    if abstained_count:
+        print(f"  [Warning] Skipped {abstained_count} dynamic test result(s) with "
+              f"no identity_key (a legacy results file); re-run the dynamic "
+              f"tests to regenerate", file=sys.stderr)
     return pipeline_data
 
 

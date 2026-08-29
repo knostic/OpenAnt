@@ -88,6 +88,7 @@ DYNAMIC_POISON = {
     "results": [
         {
             "finding_id": "VULN-001",
+            "identity_key": "k",
             "status": "CONFIRMED",
             "details": "reproduced",
             "evidence": ["step-1"],
@@ -102,7 +103,10 @@ DYNAMIC_POISON = {
 PIPELINE_OUTPUT = {
     "repository": {"name": "poison/repo"},
     "findings": [
-        {"id": "VULN-001", "location": {"function": "app/api.py:handler"}}
+        # #314: identity_key is the verified join key (VULN-NNN is
+        # positional); the fixture reflects the new artifact shape.
+        {"id": "VULN-001", "identity_key": "k",
+         "location": {"function": "app/api.py:handler"}}
     ],
 }
 

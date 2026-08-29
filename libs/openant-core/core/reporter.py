@@ -203,6 +203,22 @@ def _dedup_caller_callee(
 # Pipeline output builder
 # ---------------------------------------------------------------------------
 
+def finding_identity_key(file_path: str, function: str, cwe_id: int) -> str:
+    """#314: a run-stable identity for a finding — a short hash over the
+    stable triple (location file, function, CWE).
+
+    VULN-NNN is assigned by list position: drop or add one finding
+    anywhere but the end and every later ID shifts, so the positional ID
+    is not a durable join key across artifacts (a stale
+    dynamic_test_results.json merges one finding's result into a
+    DIFFERENT finding). The identity key is derived from the finding's
+    identity, not its position. Short + hex so it stays human-auditable
+    alongside the display ID."""
+    import hashlib
+    payload = f"{file_path}|{function}|{int(cwe_id or 0)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
 def _load_reachability_metadata(scan_dir: str) -> dict | None:
     """Return the reachability-filter record for this scan, if one exists.
 
@@ -451,8 +467,14 @@ def build_pipeline_output(
         else:
             stage2_verdict = finding.get("finding", "vulnerable")
 
+        _file = route_key.split(":")[0] if ":" in route_key else "unknown"
+        _func = route_key.split(":", 1)[1] if ":" in route_key else route_key
+        _cwe = vuln.get("cwe_id") or finding.get("cwe_id") or full_result.get("cwe_id", 0)
         findings_data.append({
             "id": f"VULN-{i+1:03d}",
+            # #314: the run-stable join key (see finding_identity_key);
+            # VULN-NNN stays as the display ID.
+            "identity_key": finding_identity_key(_file, _func, _cwe),
             "name": vuln.get("name", finding.get("finding", "Unknown Vulnerability")),
             "short_name": vuln.get("short_name", finding.get("verdict", "vuln")),
             "location": {
