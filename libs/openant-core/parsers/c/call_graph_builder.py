@@ -349,7 +349,18 @@ class CallGraphBuilder:
                 source = f.read()
             parser = self._get_parser_for_file(file_path)
             tree = parser.parse(source)
-            result = self._collect_container_map(tree.root_node, source, file_path)
+            # TOP-LEVEL ONLY (panel finding): _collect_container_map walks the
+            # whole tree, so a container nested inside an unrelated function's
+            # body would leak file-wide (an opaque same-named parameter in
+            # another function would dispatch to THIS function's targets).
+            # Walk the root's children without descending into function_definition.
+            top_level = [c for c in tree.root_node.children
+                         if c.type != 'function_definition']
+            class _ShallowRoot:
+                type = 'translation_unit'
+                def __init__(self, children):
+                    self.children = children
+            result = self._collect_container_map(_ShallowRoot(top_level), source, file_path)
         except OSError:
             result = {}
         cached[file_path] = result
@@ -372,7 +383,12 @@ class CallGraphBuilder:
         return set(containers.get(base, ()))
 
     def _dispatch_base_identifier(self, node) -> Optional[str]:
-        """Find the base identifier a subscript/member call dispatches over."""
+        """Find the base identifier a SUBSCRIPT/MEMBER call dispatches over.
+        A bare identifier root returns None (panel finding): a direct call
+        through a name shadowing a file-scope container must not fabricate
+        edges to all of the container's targets."""
+        if node is not None and node.type == "identifier":
+            return None
         current = node
         for _ in range(4):  # bounded descent: cmds[i].fn() nests two levels
             if current is None:

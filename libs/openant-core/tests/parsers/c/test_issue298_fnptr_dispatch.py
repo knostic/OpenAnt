@@ -154,3 +154,46 @@ def test_non_function_initializer_values_ignored(tmp_path):
         }
     """)
     assert cg.call_graph.get("src/d.c:f", []) == []
+
+
+
+def test_local_container_does_not_leak_file_wide(tmp_path):
+    """Regression (panel finding): a container initialised INSIDE a function
+    is that function's local — it must not enter the file-scope map another
+    function resolves against (a same-named opaque parameter in the other
+    function would otherwise dispatch to THIS function's targets)."""
+    src = """
+    static void h1(void) {}
+    static void h2(void) {}
+    static void real_target(void) {}
+    void funcA(int i) {
+        void (*tbl[])(void) = { h1, h2 };
+        tbl[i]();
+    }
+    void funcB(void (*tbl[])(void), int i) {
+        tbl[i]();
+    }
+    """
+    cg = _build(tmp_path, src)
+    a = cg.call_graph.get("src/d.c:funcA", [])
+    b = cg.call_graph.get("src/d.c:funcB", [])
+    assert "src/d.c:h1" in a and "src/d.c:h2" in a, "funcA's local table still dispatches"
+    assert "src/d.c:h1" not in b and "src/d.c:h2" not in b, "funcA's LOCAL must not leak into funcB"
+
+
+def test_bare_identifier_call_does_not_dispatch_container(tmp_path):
+    """Regression (panel finding): a DIRECT call through a name that merely
+    shadows a file-scope container must not fabricate edges to all of the
+    container's targets."""
+    src = """
+    static void h1(void) {}
+    static void h2(void) {}
+    static void cmds(void) { h1(); }
+    static void (*CMD_TABLE[])(void) = { h1, h2 };
+    static void runner(int i) { CMD_TABLE[i](); }
+    static void caller(void) { cmds(); }
+    """
+    cg = _build(tmp_path, src)
+    caller = cg.call_graph.get("src/d.c:caller", [])
+    assert "src/d.c:cmds" in caller, "the direct call still resolves to the function"
+    assert "src/d.c:h2" not in caller, "a bare-name call must NOT fabricate h2 (a table-only target)"
