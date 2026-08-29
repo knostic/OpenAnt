@@ -1,6 +1,7 @@
 package python
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -245,5 +246,57 @@ func TestInvoke_LateInterruptDoesNotDiscardEnvelope(t *testing.T) {
 	}
 	if got.res.ExitCode != 0 {
 		t.Fatalf("expected normalized exit 0 for clean success, got %d", got.res.ExitCode)
+	}
+}
+
+func TestInvoke_TimeoutErrorNamesTheDeadline(t *testing.T) {
+	// #161 (jblu42, the extra-care protocol): the deadline kill used to
+	// surface as the cryptic "failed to read stdout: read |0: file already
+	// closed" — the exact error the reporter hit against a local Ollama
+	// model (~1 min/unit; the deadline fires after ~20-40 entries). The
+	// surfaced error must carry the DIAGNOSIS: the deadline, the env
+	// override (#237's surface — regression-tested by driving it here, not
+	// a test hook), and the checkpoint-resume path.
+	// C1 (fable need-check): assert diagnosis-PRESENCE, not the racy
+	// literal string — which error surfaces first post-kill is a race.
+	hang, _ := writeHangScript(t)
+	// C2: shrink the deadline via the PUBLIC override — no test hooks.
+	t.Setenv("OPENANT_INVOKE_TIMEOUT", "1") // 1 second
+
+	_, err := Invoke(hang, []string{"parse", "."}, "", true, "")
+	if err == nil {
+		t.Fatalf("expected the deadline to fire on a hung subprocess")
+	}
+	msg := err.Error()
+	for _, want := range []string{"invoke deadline", "OPENANT_INVOKE_TIMEOUT", "checkpoint"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the timeout error must name %q; got: %s", want, msg)
+		}
+	}
+	// C5.6: the effective deadline (the override's 1s) must appear —
+	// confirms to an override user that their setting took effect.
+	if !strings.Contains(msg, "1s") {
+		t.Errorf("the error must show the effective deadline value; got: %s", msg)
+	}
+}
+
+func TestInvoke_NonDeadlineDeathDoesNotClaimADeadline(t *testing.T) {
+	// C4 (the negative control): a subprocess death WITHOUT the deadline
+	// expired must NOT be mis-diagnosed as a timeout — a false "you hit
+	// the deadline" is worse than no diagnosis. Also pins the #313
+	// interaction: a non-timeout death keeps its own semantics.
+	dir := t.TempDir()
+	script := filepath.Join(dir, "failer.py")
+	if err := os.WriteFile(script, []byte("import sys; sys.exit(3)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPENANT_INVOKE_TIMEOUT", "600") // far beyond this test's run
+
+	_, err := Invoke("python3", []string{"-c", fmt.Sprintf(
+		"import runpy,sys; sys.argv=['failer']; runpy.run_path(%q)", script)}, "", true, "")
+	if err != nil {
+		if strings.Contains(err.Error(), "invoke deadline") {
+			t.Errorf("a non-deadline death must not claim a deadline; got: %s", err)
+		}
 	}
 }
