@@ -47,8 +47,11 @@ SEVEN_KEYS = {
 
 
 def test_shared_helper_emits_all_seven_fields():
+    # #302 (stacked on #300) extends the helper with the three scope keys
+    # (units_analyzed_total/downgraded/upgraded); the #300 contract is that
+    # these SEVEN are always present — a superset check, not exact-set.
     s = verify_step_summary(VR)
-    assert set(s.keys()) == SEVEN_KEYS, s
+    assert SEVEN_KEYS <= set(s.keys()), s
     assert s["needs_review"] == 134
     assert s["error_count"] == 48
     # the counters reconcile: every input finding is accounted for
@@ -80,7 +83,7 @@ def test_standalone_verify_step_report_carries_all_fields(tmp_path, monkeypatch)
     rc = cli.cmd_verify(args)
     assert rc in (0, 1)  # 1: confirmed vulns (30) — the command's contract
     report = json.loads((tmp_path / "verify.report.json").read_text())
-    assert set(report["summary"].keys()) == SEVEN_KEYS, report["summary"]
+    assert SEVEN_KEYS <= set(report["summary"].keys()), report["summary"]
     assert report["summary"]["needs_review"] == 134
     assert report["summary"]["error_count"] == 48
 

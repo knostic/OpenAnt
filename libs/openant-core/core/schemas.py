@@ -303,6 +303,9 @@ def verify_step_summary(result: "VerifyResult") -> dict:
         "confirmed_vulnerabilities": result.confirmed_vulnerabilities,
         "needs_review": result.needs_review,
         "error_count": result.error_count,
+        "units_analyzed_total": result.units_analyzed_total,
+        "downgraded": result.downgraded,
+        "upgraded": result.upgraded,
     }
 
 
@@ -320,6 +323,14 @@ class VerifyResult:
     # never folds them into ``safe``.
     needs_review: int = 0
     error_count: int = 0
+    # #302: Stage 2's SCOPE — the denominator (all analyzed units; only
+    # Stage-1 positives enter) and the direction of its changes
+    # (structurally one-way: a Stage-1 negative is never re-examined, so
+    # no upgrade path exists for it). Persisted so the artifacts state
+    # "adjudicated N of M" instead of implying whole-codebase adjudication.
+    units_analyzed_total: int = 0
+    downgraded: int = 0
+    upgraded: int = 0
     usage: UsageInfo = field(default_factory=UsageInfo)
 
     def step_summary(self) -> dict:
@@ -337,6 +348,9 @@ class VerifyResult:
             "confirmed_vulnerabilities": self.confirmed_vulnerabilities,
             "needs_review": self.needs_review,
             "error_count": self.error_count,
+            "units_analyzed_total": self.units_analyzed_total,
+            "downgraded": self.downgraded,
+            "upgraded": self.upgraded,
             "usage": self.usage.to_dict(),
         }
 
