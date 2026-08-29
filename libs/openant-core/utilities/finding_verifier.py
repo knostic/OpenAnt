@@ -70,6 +70,10 @@ from .agentic_enhancer.tools import ToolExecutor
 # loops cannot drift apart.
 from .agentic_enhancer.agent import (
     MAX_PROMPT_CHARS,
+    # RE-EXPORT, not unused: core/verifier.py imports MAX_TOOL_RESULT_CHARS
+    # from THIS module (it feeds the "max_tool_result_chars" key in the
+    # verify output schema). A same-file usage scan will not see it.
+    MAX_TOOL_RESULT_CHARS,
     cap_tool_result_content,
 )
 from prompts.verification_prompts import (
