@@ -77,6 +77,76 @@ func BuildSARIF(data ReportData, opts SARIFOptions) map[string]any {
 		run["versionControlProvenance"] = []any{prov}
 	}
 
+	// #305: the invocations block — the designated SARIF place a degraded
+	// scan becomes visible on the one channel that turns into a merge gate.
+	// executionSuccessful is FALSE when any step errored (per-step
+	// error_count / errors) or any skipped step carries a FAILURE-class
+	// reason; an operator opt-out (not_requested) or an auto-skip with no
+	// candidates is a legitimate clean run, not a failure.
+	invocation := map[string]any{
+		"executionSuccessful": true,
+	}
+	var notifications []map[string]any
+	warn := func(text string) {
+		notifications = append(notifications, map[string]any{
+			"level": "warning", // Code Scanning keeps warnings in the default view
+			// descriptor is a reportingDescriptorReference per the SARIF 2.1.0
+			// schema (additionalProperties: false — a `name` key here would be
+			// schema-INVALID and risks the whole upload being rejected; the
+			// text lives in message.text). Wave catch.
+			"descriptor": map[string]any{"id": "OpenAnt"},
+			"message":    map[string]any{"text": text},
+		})
+	}
+	failureSkip := map[string]bool{
+		"failed":             true,
+		"module_unavailable": true,
+		// wave catch: docker_unavailable is the same kind of involuntary
+		// environment gap as module_unavailable (the dynamic-test step on a
+		// runner without Docker) — it was silently passing as clean.
+		"docker_unavailable": true,
+	}
+	execOK := true
+	for _, sr := range data.StepReports {
+		// wave catch: the synthetic `scan` aggregate row mirrors every real
+		// step's errors — emitting it would duplicate each notification
+		// under a step name that is not part of the pipeline vocabulary.
+		if sr.Step == "scan" {
+			continue
+		}
+		if sr.ErrorCount > 0 || len(sr.Errors) > 0 ||
+			sr.Status == "error" || sr.Status == "partial" {
+			execOK = false
+			if sr.ErrorCount > 0 || len(sr.Errors) > 0 {
+				detail := fmt.Sprintf("step %s: %d unit error(s)", sr.Step, sr.ErrorCount)
+				if len(sr.Errors) > 0 {
+					detail += " — " + strings.Join(sr.Errors, "; ")
+				}
+				warn(detail)
+			} else {
+				// wave catch: partial with no populated counts — degrade
+				// visibly without a misleading "0 unit error(s)" text.
+				warn(fmt.Sprintf("step %s: degraded (status %s)", sr.Step, sr.Status))
+			}
+		}
+		if failureSkip[sr.SkippedReason] {
+			execOK = false
+			warn(fmt.Sprintf("step %s skipped: %s", sr.Step, sr.SkippedReason))
+		}
+	}
+	for _, lang := range data.ExcludedLanguages {
+		if lang == "" {
+			continue
+		}
+		execOK = false
+		warn(fmt.Sprintf("language excluded from analysis: %s", lang))
+	}
+	invocation["executionSuccessful"] = execOK
+	if len(notifications) > 0 {
+		invocation["toolExecutionNotifications"] = notifications
+	}
+	run["invocations"] = []any{invocation}
+
 	return map[string]any{
 		"$schema": sarifSchema,
 		"version": sarifVersion,
@@ -133,12 +203,11 @@ func sarifRulesFor(data ReportData) ([]map[string]any, map[string]int) {
 
 // sarifResultFor renders a single Finding as a SARIF result object.
 //
-// We intentionally emit a file-scoped location with no startLine because the
-// current Finding struct does not carry line numbers; emitting startLine: 1
-// (or any synthetic value) would cause GitHub Code Scanning to anchor the
-// alert to the wrong row, which is worse than no anchor at all. When line
-// data lands in ReportData, the region payload here is the only place that
-// needs to grow.
+// We emit a file-scoped location, with a region ONLY when the finding
+// carries a real line anchor (Finding.StartLine, threaded by the report-data
+// projection — #305). Emitting startLine: 1 (or any synthetic value) would
+// cause GitHub Code Scanning to anchor the alert to the wrong row, which is
+// worse than no anchor at all, so a 0/unknown line stays file-scoped.
 func sarifResultFor(f Finding, ruleIndex map[string]int) map[string]any {
 	v := normalizedVerdict(f.Verdict)
 
@@ -191,6 +260,14 @@ func sarifLocationFor(f Finding) map[string]any {
 				"uriBaseId": "%SRCROOT%",
 			},
 		},
+	}
+	// #305: line data now reaches ReportData (Finding.StartLine). Emit the
+	// region ONLY when the anchor is real — the file-scoped location stands
+	// when the line is unknown (0), per the no-synthetic-line rule above.
+	if f.StartLine > 0 {
+		loc["physicalLocation"].(map[string]any)["region"] = map[string]any{
+			"startLine": f.StartLine,
+		}
 	}
 	if f.Function != "" {
 		loc["logicalLocations"] = []any{
