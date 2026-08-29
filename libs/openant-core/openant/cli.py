@@ -203,13 +203,26 @@ def _select_languages_for(args):
     selection/exclusion banner is the mitigation, so the coverage change is never
     silent.
     """
+    from core.parser_adapter import detect_languages
     explicit = getattr(args, "language", "auto") not in (None, "auto")
     multi = (getattr(args, "languages", None)
              or getattr(args, "all_languages", False)
              or getattr(args, "multi_language", False))
     if explicit and not multi:
-        return None
-    from core.parser_adapter import detect_languages
+        # #308: the -l path previously returned None BEFORE detection ran,
+        # so the exclusion set was never computed — `excluded_languages: {}`
+        # was indistinguishable from "genuinely nothing was excluded" while
+        # identical --languages scans reported the gap. Build the selection
+        # now so the exclusions are computed and reported; `selected` is the
+        # named language only, so WHAT GETS SCANNED DOES NOT CHANGE (a
+        # single-element selection takes the same legacy branch below).
+        # ValueError (a source-free repo, or the language absent from it)
+        # falls back to today's exit-0 behaviour — those are the only two
+        # reachable raises (argparse constrains -l to supported languages).
+        try:
+            return resolve_language_selection(args, detect_languages(args.repo))
+        except ValueError:
+            return None
 
     return resolve_language_selection(args, detect_languages(args.repo))
 
@@ -1319,6 +1332,11 @@ def resolve_language_selection(args, counts: dict[str, int]):
         all_languages=getattr(args, "all_languages", False),
         min_files=getattr(args, "min_language_files", DEFAULT_MIN_FILES),
         min_share=getattr(args, "min_language_share", DEFAULT_MIN_SHARE),
+        # #308: the exclusion reason names the flag the user actually
+        # typed — -l on the explicit path, --languages otherwise.
+        deselected_reason=(
+            "not requested via -l" if explicit
+            else "not requested via --languages"),
     )
     # Report here rather than at each call site: this is the single point every
     # command funnels through, so a coverage gap cannot escape by way of a
