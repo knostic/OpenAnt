@@ -776,8 +776,10 @@ class CallGraphBuilder:
         return None
 
     def _container_string_names(self, array_node, source: bytes) -> Set[str]:
-        """The string-literal elements of an array literal (both the
-        `'k' => 'fn'` value form and the bare `'fn'` list form)."""
+        """The string-literal elements of an array literal: the VALUE after
+        an `=>` arrow (`'k' => 'fn'` — the key is NEVER a target: a key like
+        'init'/'get' colliding with a real function would fabricate an
+        edge), or a bare list-form string element (`['fn', ...]`)."""
         names: Set[str] = set()
         for element in array_node.children:
             if element.type == 'string':
@@ -785,19 +787,31 @@ class CallGraphBuilder:
                 if value:
                     names.add(value)
             elif element.type == 'array_element_initializer':
-                # `'k' => 'fn'` (value after the arrow) or the bare list
-                # form `'fn'` (the initializer's own string child, no arrow)
-                seen_arrow = False
-                taken = False
+                # `'k' => 'fn'` — only the POST-ARROW value is a target; the
+                # key before the arrow is a dictionary label, not a callee.
+                # Bare `'fn'` (no arrow anywhere in this element) is the list
+                # form and IS a target.
+                arrow_seen = False
+                value_taken = False
                 for c in element.children:
                     if c.type == '=>':
-                        seen_arrow = True
-                        taken = False
-                    elif c.type in ('string', 'encapsed_string') and not taken:
-                        value = self._string_literal_value(c, source)
-                        if value:
-                            names.add(value)
-                        taken = True
+                        arrow_seen = True
+                        value_taken = False
+                    elif c.type in ('string', 'encapsed_string'):
+                        if arrow_seen and not value_taken:
+                            value = self._string_literal_value(c, source)
+                            if value:
+                                names.add(value)
+                            value_taken = True
+                        # pre-arrow string = the KEY: skipped deliberately
+                        # (a key is a label; resolving it fabricates edges)
+                if not arrow_seen:
+                    # bare list form: the element's string child is the target
+                    for c in element.children:
+                        if c.type in ('string', 'encapsed_string'):
+                            value = self._string_literal_value(c, source)
+                            if value:
+                                names.add(value)
         return names
 
     def _known_function_names(self, names: Set[str]) -> Set[str]:

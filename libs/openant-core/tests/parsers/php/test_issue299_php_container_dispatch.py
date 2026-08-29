@@ -127,3 +127,20 @@ def test_unknown_subscript_abstains():
             "}\n",
     })
     assert _edges(cg, ":use_") == []
+
+
+def test_dict_key_never_fabricates_edge():
+    """Regression (panel finding): the KEY of `'k' => 'fn'` is a label, not a
+    callee — a key colliding with a real function must not fabricate an edge."""
+    files = {
+        "handlers.php": """<?php
+function init() { return 1; }
+function handlerA() { return 2; }
+$TBL = ['init' => 'handlerA'];
+function dispatch($mode) { global $TBL; $TBL[$mode](); }
+""",
+    }
+    cg = _cg(files)
+    dispatch_edges = _edges(cg, ":dispatch")
+    assert any("handlerA" in e for e in dispatch_edges), "value dispatch still works"
+    assert not any("init" in e for e in dispatch_edges), "the KEY 'init' must NOT fabricate an edge to function init()"
