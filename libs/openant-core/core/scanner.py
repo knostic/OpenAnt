@@ -112,6 +112,58 @@ def partition_units_by_language(units: list[dict]) -> dict[str | None, list[dict
     return parts
 
 
+def aggregate_reachability_telemetry(per_lang: dict) -> dict:
+    """#301: sum the per-language prune telemetry into the top-level record.
+
+    The merged-run shape keeps the orphan/dead-cluster counts per language
+    (under ``reachability_filter.per_language``) while the reporter reads only
+    the top level — so on a multi-language scan the classification the
+    reporter now forwards would otherwise exist but never reach it. Counts sum
+    exactly; ``pruned_by_file`` merges per-file and re-caps at the module's
+    top-20 (each language capped its own top-20, so a cross-language sum can
+    miss a file outside its own language's cap — an advisory pointer, noted).
+    Present-only: a record set without telemetry contributes nothing, and
+    the result is empty when no language ran the classification.
+    """
+    agg: Dict[str, int] = {}
+    by_file: Dict[str, int] = {}
+    asym = 0
+    for record in per_lang.values():
+        if not isinstance(record, dict):
+            continue
+        for key in ("pruned_orphan_count", "pruned_in_dead_cluster_count"):
+            v = record.get(key)
+            if isinstance(v, int):
+                agg[key] = agg.get(key, 0) + v
+        v = record.get("pruned_forward_called_by_reachable_count")
+        if isinstance(v, int):
+            asym += v
+        bf = record.get("pruned_by_file")
+        if isinstance(bf, dict):
+            for f, c in bf.items():
+                if isinstance(c, int):
+                    by_file[f] = by_file.get(f, 0) + c
+    out: dict = {}
+    out.update(agg)
+    if agg or asym:
+        # the hard invariant is always present when the classification ran —
+        # a measured 0 is the healthy signal, not a fabricated one
+        out["pruned_forward_called_by_reachable_count"] = asym
+    if by_file:
+        top = sorted(by_file.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
+        out["pruned_by_file"] = dict(top)
+    # per-language orphan advisories lift to the top level (the same shape
+    # as the warning lift; its own key, never the reserved warning slot).
+    advisories = [
+        f"{lang}: {record['orphan_advisory']}"
+        for lang, record in sorted(per_lang.items())
+        if isinstance(record, dict) and record.get("orphan_advisory")
+    ]
+    if advisories:
+        out["orphan_advisory"] = "; ".join(advisories)
+    return out
+
+
 def scan_repository(
     repo_path: str,
     output_dir: str,
@@ -650,6 +702,7 @@ def scan_repository(
                                     r.get("reachable_units", 0) for r in _per_lang.values()
                                 )
                                 _agg = {
+                                    **aggregate_reachability_telemetry(_per_lang),
                                     "original_units": _orig,
                                     "entry_points": sum(
                                         r.get("entry_points", 0) for r in _per_lang.values()
@@ -682,6 +735,7 @@ def scan_repository(
                                 ]
                                 if _warnings:
                                     _agg["warning"] = "; ".join(_warnings)
+
                                 _new_md["reachability_filter"] = _agg
                             else:
                                 # No real filter ran (every language unfilterable):
