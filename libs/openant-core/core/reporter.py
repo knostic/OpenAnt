@@ -248,6 +248,16 @@ def build_pipeline_output(
     threat_model_warnings: list | None = None,
     skipped_steps: list | None = None,
     skipped_step_reasons: dict | None = None,
+    # #307: the multi-language coverage fields the CHANGELOG (2026-07-22)
+    # says pipeline_output.json carries — it did not, and this producer had
+    # no parameter for them. Present-only: None (absent upstream) stays
+    # absent in the artifact; degraded=None means unknown, degraded=False
+    # is a deliberate clean assertion.
+    per_language: dict | None = None,
+    parse_errors: list | None = None,
+    excluded_languages: dict | None = None,
+    degraded: bool | None = None,
+    coverage: dict | None = None,
 ) -> tuple[str, int]:
     """Build ``pipeline_output.json`` from analysis results.
 
@@ -597,6 +607,13 @@ def build_pipeline_output(
         },
         "analysis_date": datetime.now(timezone.utc).isoformat(),
         "application_type": application_type,
+        # #307: the CHANGELOG-claimed coverage fields, present-only.
+        **({"per_language": per_language} if per_language is not None else {}),
+        **({"parse_errors": parse_errors} if parse_errors is not None else {}),
+        **({"excluded_languages": excluded_languages}
+           if excluded_languages is not None else {}),
+        **({"degraded": degraded} if degraded is not None else {}),
+        **({"coverage": coverage} if coverage is not None else {}),
         # Which path supplied the security model (Plan DoD #9). Additive key;
         # Go consumers use comma-ok access so it is safe to add.
         "context_source": context_source,

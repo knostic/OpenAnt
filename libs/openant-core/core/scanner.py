@@ -1110,6 +1110,14 @@ def scan_repository(
             context_source=result.context_source,
             threat_model_sha256=result.threat_model_sha256,
             threat_model_warnings=result.threat_model_warnings,
+            # #307: the CHANGELOG-claimed coverage fields reach the
+            # deliverable (the report generator and dynamic tester read
+            # only this file).
+            per_language=result.per_language,
+            parse_errors=result.parse_errors,
+            excluded_languages=result.excluded_languages,
+            degraded=result.degraded,
+            coverage=_collect_coverage(result),
             # Authoritative skip data so pipeline_output.json reflects real
             # pipeline status (esp. a non-aborting verify failure) instead of
             # always reporting "nothing skipped". At this point (Step 6) all
@@ -1314,6 +1322,14 @@ def _read_app_type(app_context_path: str) -> str | None:
 # that a scan skipped part of the tree; without them a partially-covered scan of
 # a hostile repo looks identical to a clean one. Aggregated here, at report time.
 _COVERAGE_COUNT_KEYS = ("symlinks_skipped", "directories_unreadable")
+# #307: the DOMINANT exclusion — test files set aside by --skip-tests (on
+# by default; 1,346 files on the filing run, larger than every language-
+# or threshold-based exclusion combined) — aggregated per language.
+_TEST_FILES_SKIPPED_KEY = "test_files_skipped"
+# JavaScript's scanner still writes camelCase testFilesSkipped (the same
+# naming drift the 2026-08 CHANGELOG fixed for symlinks_skipped) — read it
+# as an alias until the parser is renamed.
+_TEST_FILES_SKIPPED_ALIASES = ("test_files_skipped", "testFilesSkipped")
 _COVERAGE_EXAMPLE_KEYS = ("symlink_examples", "unreadable_examples")
 # Parsers disagree on the filename: the in-process Python parser writes
 # scan_result.json (singular); the subprocess parsers write scan_results.json.
@@ -1341,7 +1357,8 @@ def _read_coverage_stats(dir_path: str) -> dict:
             return {}
         return {
             k: stats[k]
-            for k in (*_COVERAGE_COUNT_KEYS, *_COVERAGE_EXAMPLE_KEYS)
+            for k in (*_COVERAGE_COUNT_KEYS, *_COVERAGE_EXAMPLE_KEYS,
+                      *_TEST_FILES_SKIPPED_ALIASES)
             if k in stats
         }
     return {}
@@ -1381,6 +1398,12 @@ def _collect_coverage(result: ScanResult) -> dict:
     counts = {k: 0 for k in _COVERAGE_COUNT_KEYS}
     examples: dict[str, list] = {k: [] for k in _COVERAGE_EXAMPLE_KEYS}
     without_data: list[str] = []
+    test_files: dict[str, int] = {}
+    # #307 (review finding): a language may be coverage-instrumented (so it
+    # passes the presence probe above) yet skip test files WITHOUT counting
+    # them — go/rust/swift/zig today. Counting those as an absent entry
+    # would read as "zero skipped"; disclosing them keeps absence ≠ zero.
+    no_test_skip_data: list[str] = []
     for lang, d in _language_scan_dirs(result):
         stats = _read_coverage_stats(d)
         if not any(k in stats for k in _COVERAGE_COUNT_KEYS):
@@ -1392,10 +1415,31 @@ def _collect_coverage(result: ScanResult) -> dict:
             for ex in stats.get(k, []) or []:
                 if len(examples[k]) < 5 and ex not in examples[k]:
                     examples[k].append(ex)
+        # #307: the test-file exclusion, per language. snake_case first,
+        # then the JS camelCase alias; a language that skips test files but
+        # reports NO count of them (go/rust/swift/zig today) is DISCLOSED
+        # below, never silently counted as zero.
+        skipped = None
+        for key in _TEST_FILES_SKIPPED_ALIASES:
+            v = stats.get(key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                skipped = v
+                break
+        if skipped is not None:
+            test_files[lang or "unknown"] = skipped
+        else:
+            no_test_skip_data.append(lang or "unknown")
     return {
         **counts,
         **examples,
+        # #307: the dominant exclusion, per-language attributed
+        **({"test_files_skipped": test_files} if test_files else {}),
         "languages_without_coverage_data": sorted(set(without_data)),
+        # #307 (review finding): the languages whose test-file exclusion is
+        # UNCOUNTERED — the reader must see that "no entry" means unknown,
+        # not zero (the same absence-vs-zero doctrine as the list above).
+        **({"languages_without_test_skip_data": sorted(set(no_test_skip_data))}
+           if no_test_skip_data else {}),
     }
 
 
