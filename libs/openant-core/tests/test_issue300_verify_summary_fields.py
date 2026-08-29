@@ -52,8 +52,14 @@ def test_shared_helper_emits_all_seven_fields():
     assert s["needs_review"] == 134
     assert s["error_count"] == 48
     # the counters reconcile: every input finding is accounted for
+    # Exact equality: _count_verification_outcomes buckets every verified
+    # result into exactly one of the four counters (exhaustive, mutually
+    # exclusive, continue-guarded), and verify_batch returns results 1:1 —
+    # so findings_verified == findings_input and the four buckets sum to it.
+    # A <= here would only catch over-counting, silently passing dropped
+    # findings.
     assert (s["agreed"] + s["disagreed"] + s["needs_review"]
-            + s["error_count"]) <= s["findings_input"]
+            + s["error_count"]) == s["findings_input"]
 
 
 def _stub_run_verification(**kwargs):
@@ -78,7 +84,7 @@ def test_standalone_verify_step_report_carries_all_fields(tmp_path, monkeypatch)
         checkpoint=None, backoff=30, llm_config=None,
     )
     rc = cli.cmd_verify(args)
-    assert rc in (0, 1)  # 1: confirmed vulns (30) — the command's contract
+    assert rc == 1  # confirmed_vulnerabilities=30 > 0 forces rc 1 (cli.py cmd_verify)  # 1: confirmed vulns (30) — the command's contract
     report = json.loads((tmp_path / "verify.report.json").read_text())
     assert set(report["summary"].keys()) == SEVEN_KEYS, report["summary"]
     assert report["summary"]["needs_review"] == 134
