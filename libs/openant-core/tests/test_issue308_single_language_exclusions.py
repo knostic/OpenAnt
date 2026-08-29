@@ -114,8 +114,29 @@ def test_languages_path_unchanged(monkeypatch):
     assert set(sel.excluded.values()) == {"not requested via --languages"}
 
 
-def test_populate_guard_fires_for_explicit_l():
-    """The populate site (`if selection is not None`) now receives a
-    selection on the -l path — the guard itself is the contract."""
-    src = (PROJECT_ROOT / "openant" / "cli.py").read_text()
-    assert "if selection is not None and not result.excluded_languages:" in src
+def test_l_and_languages_paths_produce_identical_selections(monkeypatch):
+    """The PR's own bar (#308): -l python and --languages python must produce
+    IDENTICAL selection structure — selected, primary, counts, and the
+    excluded-language KEY SET (the reason STRINGS deliberately name their
+    flag, so values differ by design)."""
+    import core.parser_adapter as pa
+    monkeypatch.setattr(pa, "detect_languages", _FakeAdapter.detect_languages)
+    sel_l = _select_languages_for(_args(lang="python"))
+    sel_langs = _select_languages_for(_args(lang=None, languages="python"))
+    assert sel_l is not None and sel_langs is not None
+    assert sel_l.selected == sel_langs.selected == ["python"]
+    assert sel_l.primary == sel_langs.primary
+    assert sel_l.counts == sel_langs.counts
+    assert set(sel_l.excluded) == set(sel_langs.excluded) \
+        == {"javascript", "php"}, "both paths must exclude the same languages"
+
+
+def test_populate_guard_fires_for_explicit_l(monkeypatch):
+    """BEHAVIORAL (replaces the former source-grep): the -l path must return a
+    selection whose excluded_languages is non-empty when other languages were
+    detected — the condition the populate site guards on."""
+    import core.parser_adapter as pa
+    monkeypatch.setattr(pa, "detect_languages", _FakeAdapter.detect_languages)
+    sel = _select_languages_for(_args(lang="python"))
+    assert sel is not None
+    assert sel.excluded, "the -l path must now carry the exclusion set"

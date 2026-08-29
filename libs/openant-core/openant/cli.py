@@ -203,6 +203,7 @@ def _select_languages_for(args):
     selection/exclusion banner is the mitigation, so the coverage change is never
     silent.
     """
+    from core.parser_adapter import detect_languages
     explicit = getattr(args, "language", "auto") not in (None, "auto")
     multi = (getattr(args, "languages", None)
              or getattr(args, "all_languages", False)
@@ -218,12 +219,10 @@ def _select_languages_for(args):
         # ValueError (a source-free repo, or the language absent from it)
         # falls back to today's exit-0 behaviour — those are the only two
         # reachable raises (argparse constrains -l to supported languages).
-        from core.parser_adapter import detect_languages
         try:
             return resolve_language_selection(args, detect_languages(args.repo))
         except ValueError:
             return None
-    from core.parser_adapter import detect_languages
 
     return resolve_language_selection(args, detect_languages(args.repo))
 
