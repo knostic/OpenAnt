@@ -4,6 +4,7 @@ Stage 3: Call Graph Builder for Zig
 Builds bidirectional call graphs showing function dependencies.
 """
 
+import os
 import posixpath
 import re
 from collections import defaultdict
@@ -178,7 +179,13 @@ class CallGraphBuilder:
             # dispatches to A's foo, not to every same-named foo.
             var_types = self._collect_var_types(code)
 
-            calls = self._find_calls_in_code(code, file_path)
+            # #299 (2 of 7): the caller's alias NAMES gate subscript dispatch —
+            # `tbl[i]()` records the base name only when `tbl` is a known
+            # alias/container (so the resolver expands it to the referenced
+            # functions); an unknown base abstains rather than resolving the
+            # bare name (the Go false-edge lesson applied proactively).
+            alias_names = set(alias_to_target.get(func_id, {}).keys())
+            calls = self._find_calls_in_code(code, file_path, alias_names)
 
             for call_name in calls:
                 resolved_ids = self._resolve_call(
@@ -307,8 +314,20 @@ class CallGraphBuilder:
         """
         alias_to_target: Dict[str, Dict[str, Set[str]]] = defaultdict(dict)
 
+        # #299 (2 of 7): FILE-SCOPE const declarations are the common placement
+        # for dispatch tables (`const tbl = [_]fn () void{ a, b };` at file
+        # scope, dispatched from a function in the same file). The per-function
+        # parse below only sees each function's own body, so file-scope
+        # bindings were invisible. Parse each file once (cached) and merge its
+        # bindings under every function of that file; a function-local binding
+        # of the same name overrides the file-scope one (shadowing).
+        file_aliases = self._collect_file_scope_aliases(name_to_ids)
+
         for func_id, func_info in self.functions.items():
             code = func_info.get("code", "")
+            file_path = func_info.get("file_path", "")
+            if file_path and file_path in file_aliases:
+                alias_to_target[func_id].update(file_aliases[file_path])
             if not code:
                 continue
             try:
@@ -323,6 +342,75 @@ class CallGraphBuilder:
             )
 
         return alias_to_target
+
+    def _collect_file_scope_aliases(
+        self, name_to_ids: Dict[str, List[str]]
+    ) -> Dict[str, Dict[str, Set[str]]]:
+        """Parse each file once and collect its top-level const aliases.
+
+        Covers plain fn aliases (`const f = handler;`), struct field-init
+        bindings (`const h = T{ .cb = fn };`), and — new for #299 — array
+        containers of function references (`const tbl = [_]fn(){ a, b };`),
+        all at file scope, so functions in the file can dispatch through
+        them. Abstains (empty map for the file) on any read/parse failure.
+        """
+        out: Dict[str, Dict[str, Set[str]]] = {}
+        files = sorted({fi.get("file_path", "") for fi in self.functions.values()
+                        if fi.get("file_path")})
+        for file_path in files:
+            full = file_path if os.path.isabs(file_path) else os.path.join(
+                self.repository, file_path)
+            try:
+                with open(full, "rb") as fh:
+                    source = fh.read()
+                tree = self.parser.parse(source)
+            except OSError:
+                out[file_path] = {}
+                continue
+            aliases: Dict[str, Set[str]] = {}
+            # TOP-LEVEL declarations only: a VarDecl inside a function body
+            # is that function's OWN alias (BUG B9: per-function aliasing —
+            # a file-keyed merge would clobber one function's binding with
+            # another's), so the file pass must not descend into bodies.
+            for child in tree.root_node.children:
+                if child.type in ("variable_declaration", "VarDecl"):
+                    self._collect_aliases_from_decl(
+                        child, source, name_to_ids, aliases)
+            out[file_path] = aliases
+        return out
+
+    def _collect_aliases_from_decl(
+        self, var_decl, source, name_to_ids, aliases
+    ):
+        """Collect the alias/container bindings of ONE variable_declaration.
+
+        Shared by the per-function walk and the file-scope top-level pass
+        (#299: the same binding shapes at either scope).
+        """
+        ident_children = [
+            c for c in var_decl.children if c.type in ("identifier", "IDENTIFIER")
+        ]
+        if not ident_children:
+            return
+        # A simple alias is exactly: const <alias> = <target-identifier>;
+        if len(ident_children) == 2:
+            alias_name = self._get_node_text(ident_children[0], source)
+            target_name = self._get_node_text(ident_children[1], source)
+            if alias_name and target_name in name_to_ids:
+                aliases.setdefault(alias_name, set()).add(target_name)
+        var_name = self._get_node_text(ident_children[0], source)
+        struct_init = next(
+            (c for c in var_decl.children
+             if c.type in ("struct_initializer", "StructInit")),
+            None,
+        )
+        if var_name and struct_init is not None:
+            self._collect_field_fn_bindings(
+                struct_init, source, name_to_ids, aliases, var_name
+            )
+            self._collect_array_fn_bindings(
+                struct_init, source, name_to_ids, aliases, var_name
+            )
 
     def _collect_aliases_from_node(
         self,
@@ -354,36 +442,13 @@ class CallGraphBuilder:
         while stack:
             current = stack.pop()
             if current.type in ("variable_declaration", "VarDecl"):
-                ident_children = [
-                    c for c in current.children if c.type in ("identifier", "IDENTIFIER")
-                ]
-                # A simple alias is exactly: const <alias> = <target-identifier>;
-                if len(ident_children) == 2:
-                    alias_name = self._get_node_text(ident_children[0], source)
-                    target_name = self._get_node_text(ident_children[1], source)
-                    # Only record when the target is a known function name. A Zig
-                    # `const` binding is immutable, but the SAME alias name can be
-                    # declared on distinct control-flow paths within one function
-                    # (`const doit = foo` in one branch, `= bar` in another).
-                    # Accumulate every target in a set instead of last-wins
-                    # overwriting, so a later `doit()` over-approximates to both.
-                    if alias_name and target_name in name_to_ids:
-                        aliases.setdefault(alias_name, set()).add(target_name)
-                # Struct field-init fn pointers: `const h = T{ .cb = knownFn };` binds
-                # `h.cb` -> knownFn so a later `h.cb()` resolves. The first identifier
-                # child is the bound variable; the struct type name is nested inside the
-                # struct_initializer and is ignored.
-                if ident_children:
-                    var_name = self._get_node_text(ident_children[0], source)
-                    struct_init = next(
-                        (c for c in current.children
-                         if c.type in ("struct_initializer", "StructInit")),
-                        None,
-                    )
-                    if var_name and struct_init is not None:
-                        self._collect_field_fn_bindings(
-                            struct_init, source, name_to_ids, aliases, var_name
-                        )
+                # Shared binding logic (also used by the file-scope top-level
+                # pass): plain fn aliases, struct field-init bindings, and
+                # #299's array containers — accumulating every target in a
+                # set rather than last-wins, so a same-named alias on distinct
+                # control-flow paths over-approximates to all of them.
+                self._collect_aliases_from_decl(
+                    current, source, name_to_ids, aliases)
 
             stack.extend(current.children)
 
@@ -434,13 +499,39 @@ class CallGraphBuilder:
                 # than last-wins overwriting.
                 aliases.setdefault(f"{var_name}.{field_name}", set()).add(target_name)
 
-    def _find_calls_in_code(self, code: str, caller_file: str = "") -> Set[str]:
+    def _collect_array_fn_bindings(
+        self, struct_init, source, name_to_ids, aliases, var_name
+    ):
+        """Record array-literal function references as bare-name bindings.
+
+        For `const tbl = [_]fn () void{ a, b };` bind `tbl` -> {a, b} so a
+        later subscript call `tbl[i]()` resolves to every referenced function.
+        Only bare identifiers naming KNOWN functions are kept — data arrays
+        (`[_]i32{1, 2}`) bind nothing, and an unknown element abstains.
+        """
+        init_list = next(
+            (c for c in struct_init.children
+             if c.type in ("initializer_list", "InitList")),
+            None,
+        )
+        if init_list is None:
+            return
+        for child in init_list.children:
+            if child.type not in ("identifier", "IDENTIFIER"):
+                continue
+            target = self._get_node_text(child, source)
+            if target and target in name_to_ids:
+                aliases.setdefault(var_name, set()).add(target)
+
+    def _find_calls_in_code(self, code: str, caller_file: str = "",
+                           alias_names=None) -> Set[str]:
         """Find all function calls in a code snippet."""
         calls = set()
 
         try:
             tree = self.parser.parse(code.encode("utf-8"))
-            self._extract_calls_from_node(tree.root_node, code.encode("utf-8"), calls)
+            self._extract_calls_from_node(tree.root_node, code.encode("utf-8"),
+                                          calls, alias_names)
         except Exception:
             # Fallback to regex-based extraction
             calls = self._find_calls_with_regex(code)
@@ -472,7 +563,7 @@ class CallGraphBuilder:
         return names
 
     def _extract_calls_from_node(
-        self, node: Node, source: bytes, calls: Set[str]
+        self, node: Node, source: bytes, calls: Set[str], alias_names=None
     ) -> None:
         """Extract call sites from AST nodes.
 
@@ -493,6 +584,19 @@ class CallGraphBuilder:
                 callee = current.children[0] if current.children else None
                 if callee is not None and callee.type in ("identifier", "IDENTIFIER"):
                     calls.add(self._get_node_text(callee, source))
+                elif (callee is not None
+                        and callee.type in ("index_expression", "IndexExpr")
+                        and alias_names is not None):
+                    # #299 (2 of 7): a subscript call `tbl[i]()` over a KNOWN
+                    # container/alias — record the base name; the resolver
+                    # expands it to the container's referenced functions.
+                    # Unknown bases abstain (no bare-name false edges).
+                    for sub in callee.children:
+                        if sub.type in ("identifier", "IDENTIFIER"):
+                            base = self._get_node_text(sub, source)
+                            if base in alias_names:
+                                calls.add(base)
+                            break
                 elif callee is not None and callee.type in ("field_expression", "field_access"):
                     # Carry the RECEIVER by keeping only the full dotted form
                     # (`recv.method`); the resolver splits it and dispatches on the
