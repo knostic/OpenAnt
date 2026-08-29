@@ -572,12 +572,17 @@ def apply_reachability_filter(
     # already claim the slot. call_graph/reverse_call_graph are the UN-pruned graphs.
     _rf = dataset["metadata"]["reachability_filter"]
     _pruned_ids = [u.get("id", "") for u in units if u.get("id", "") not in reachable_ids]
-    _extra, _asym_warning = compute_prune_telemetry(
+    _extra, _asym_warning, _orphan_advisory = compute_prune_telemetry(
         reachable_ids, sorted(_pruned_ids), call_graph, reverse_call_graph, output_dir)
     _rf.update(_extra)
     if _asym_warning and "warning" not in _rf:
         _rf["warning"] = _asym_warning
         print(f"  [Warning] {_asym_warning}", file=sys.stderr)
+    # #301: the orphan-rate advisory — its own key, NEVER the reserved
+    # ``warning`` slot, and it reaches the scan summary on stderr.
+    if _orphan_advisory:
+        _rf["orphan_advisory"] = _orphan_advisory
+        print(f"  [Advisory] {_orphan_advisory}", file=sys.stderr)
 
     # Warn about unimplemented higher-level filters
     if processing_level == "codeql":
