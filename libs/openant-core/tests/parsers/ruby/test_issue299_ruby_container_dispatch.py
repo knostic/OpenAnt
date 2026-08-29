@@ -118,3 +118,29 @@ def test_unknown_subscript_abstains():
         "end\n",
     })
     assert _edges(cg, ":use") == []
+
+
+def test_method_local_container_does_not_leak_file_wide():
+    """Regression (panel finding): a container assigned INSIDE a method is
+    that method's local — it must not enter the file-scope map other
+    methods resolve against (the C parser's scope-leak class)."""
+    files = {
+        "app.rb": """def handlerA; 1; end
+def handlerB; 2; end
+def handlerC; 3; end
+HANDLERS = { 'a' => method(:handlerA) }
+def uses_local_table(key)
+  local = { 'x' => method(:handlerB) }
+  local[key].call
+end
+def uses_file_table(key)
+  HANDLERS[key].call
+end
+""",
+    }
+    cg = _cg(files)
+    local_edges = _edges(cg, ":uses_local_table")
+    file_edges = _edges(cg, ":uses_file_table")
+    assert any("handlerB" in e for e in local_edges), "the local table still dispatches for its own method"
+    assert any("handlerA" in e for e in file_edges), "the file table still dispatches"
+    assert not any("handlerB" in e for e in file_edges), "uses_local_table's LOCAL must not leak into uses_file_table"

@@ -497,8 +497,13 @@ class CallGraphBuilder:
         return containers
 
     def _file_containers(self, caller_file: str) -> Dict[str, Set[str]]:
-        """File-scope CONSTANT containers (the common placement), parsed once
-        per file and cached. Abstains (empty map) on read/parse failure."""
+        """TOP-LEVEL CONSTANT containers only (the common placement), parsed
+        once per file and cached. Abstains (empty map) on read/parse failure.
+        A whole-file walk would leak method-local containers file-wide (the
+        C parser's exact scope-leak class: an unrelated method's local table
+        would dispatch in every other method); method/class/module bodies are
+        deliberately skipped here — each unit's own locals are collected
+        separately by _collect_local_containers on its own body."""
         cached = getattr(self, '_file_container_cache', None)
         if cached is None:
             cached = {}
@@ -512,11 +517,36 @@ class CallGraphBuilder:
             with open(full, 'rb') as fh:
                 source = fh.read()
             tree = self.ruby_parser.parse(source)
-            result = self._collect_local_containers(tree.root_node, source)
+            result = self._top_level_containers(tree.root_node, source)
         except OSError:
             result = {}
         cached[caller_file] = result
         return result
+
+    def _top_level_containers(self, root, source: bytes) -> Dict[str, Set[str]]:
+        """Container assignments at the file's TOP LEVEL only: the walk never
+        descends into method/singleton_method/class/module/sclass bodies."""
+        containers: Dict[str, Set[str]] = {}
+        stack = [root]
+        skip_bodies = ('method', 'singleton_method', 'class', 'module', 'sclass')
+        while stack:
+            node = stack.pop()
+            if node.type in skip_bodies:
+                continue
+            if node.type == 'assignment':
+                lhs = node.children[0] if node.children else None
+                rhs = node.children[-1] if node.children else None
+                if lhs is not None and lhs.type == 'constant' \
+                        and rhs is not None and rhs.type in ('hash', 'array'):
+                    name = self._node_str(lhs, source)
+                    if name in containers:
+                        containers.pop(name, None)
+                    else:
+                        names = self._container_element_names(rhs, source)
+                        if names:
+                            containers[name] = names
+            stack.extend(reversed(node.children))
+        return containers
 
     def _resolve_bare_identifier(self, node, source: bytes, caller_file: str,
                                  caller_class: Optional[str],
