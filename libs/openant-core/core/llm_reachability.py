@@ -207,6 +207,44 @@ _VALID_KINDS = {"entry_point", "external_input", "cross_process"}
 _VALID_CONFIDENCES = {"high", "medium", "low"}
 
 
+def _strip_fence(text: str) -> str:
+    """Strip a leading ```json ... ``` (or bare ``` ... ```) fence."""
+    fence = re.match(
+        r"^```(?:json)?\s*(?P<body>.*?)\s*```\s*$",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if fence:
+        return fence.group("body").strip()
+    return text
+
+
+def _classify_malformed(response_text: str) -> str:
+    """#294: name the failure SHAPE.
+
+    Six materially different failures — a bare array (the model answered,
+    wrong shape), a truncation (budget/transport), a prose refusal (policy),
+    an empty completion (adapter empty-content), fenced variants, and valid
+    JSON of a non-object type — previously produced one byte-identical log
+    line, so a completed run could not be diagnosed even in principle.
+    """
+    if not response_text or not response_text.strip():
+        return "empty response (no content)"
+    cleaned = _strip_fence(response_text.strip())
+    try:
+        value = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Heuristic with a known blind spot (wave catch): prose that merely
+        # MENTIONS a brace ("I can't return `{}` for this") lands here as
+        # "truncated" — a diagnostic label only, never behavior-affecting.
+        if "{" in cleaned or "[" in cleaned:
+            return "truncated or unbalanced JSON"
+        return "non-JSON text (prose/refusal)"
+    if isinstance(value, list):
+        return "valid JSON array, expected an object"
+    return f"valid JSON of wrong type {type(value).__name__}, expected an object"
+
+
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     """Best-effort JSON extraction from a model response.
 
@@ -215,16 +253,7 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     """
     if not text:
         return None
-    cleaned = text.strip()
-
-    # Strip ```json ... ``` or ``` ... ``` fences.
-    fence = re.match(
-        r"^```(?:json)?\s*(?P<body>.*?)\s*```\s*$",
-        cleaned,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if fence:
-        cleaned = fence.group("body").strip()
+    cleaned = _strip_fence(text.strip())
 
     try:
         return json.loads(cleaned)
@@ -247,23 +276,41 @@ def parse_response(
     response_text: str,
     valid_unit_ids: Optional[set] = None,
     on_error: Optional[Callable[[str], None]] = None,
+    batch_label: Optional[str] = None,
+    on_batch_drop: Optional[Callable[[], None]] = None,
 ) -> List[ReachabilitySignal]:
     """Parse a single LLM response into validated ``ReachabilitySignal``s.
 
     Malformed entries are skipped (not raised); the optional ``on_error``
     callback receives a one-line description per skipped item, useful for
     logging.
+
+    #294: a batch-level drop names its failure SHAPE (see
+    :func:`_classify_malformed`), carries the caller-supplied
+    ``batch_label`` and a truncated raw snippet (the evidence — the raw
+    response was previously discarded entirely), and fires ``on_batch_drop``
+    once so the caller can count the loss.
     """
     log = on_error or (lambda msg: print(f"[LLMReach] {msg}", file=sys.stderr))
+    label = f" [{batch_label}]" if batch_label else ""
+    # None-safe: the docstring promises malformed entries are skipped, not
+    # raised — a None response_text must classify, not crash (wave catch).
+    snippet = f" raw[:200]={(response_text or '')[:200]!r}"
 
     data = _extract_json(response_text)
     if not isinstance(data, dict):
-        log("malformed response: not a JSON object — skipping batch")
+        shape = _classify_malformed(response_text)
+        log(f"malformed response: {shape} — skipping batch{label};{snippet}")
+        if on_batch_drop is not None:
+            on_batch_drop()
         return []
 
     raw_signals = data.get("signals")
     if not isinstance(raw_signals, list):
-        log("malformed response: 'signals' missing or not a list — skipping batch")
+        log(f"malformed response: 'signals' missing or not a list "
+            f"(got {type(raw_signals).__name__}) — skipping batch{label};{snippet}")
+        if on_batch_drop is not None:
+            on_batch_drop()
         return []
 
     out: List[ReachabilitySignal] = []
@@ -324,6 +371,7 @@ def analyze_reachability(
     max_code_bytes: int = DEFAULT_MAX_CODE_BYTES,
     max_units: Optional[int] = None,
     on_error: Optional[Callable[[str], None]] = None,
+    stats: Optional[Dict[str, int]] = None,
 ) -> List[ReachabilitySignal]:
     """Run the LLM reachability review stage over a parsed dataset.
 
@@ -384,6 +432,13 @@ def analyze_reachability(
 
     signals: List[ReachabilitySignal] = []
     batches = _chunk(units, batch_size)
+    # #294: count parse-level batch drops and the units they carried —
+    # a dropped batch is a coverage gap in the most consequential direction
+    # (this stage decides which units are analyzed at all), and previously
+    # nothing counted it: the step report said units_reviewed=N for a run
+    # in which some units were never reviewed.
+    dropped_batches = 0
+    units_not_reviewed = 0
     for i, batch in enumerate(batches):
         prompt = build_prompt(
             batch, app_context=app_context, max_code_bytes=max_code_bytes
@@ -403,10 +458,23 @@ def analyze_reachability(
                 print(f"[LLMReach] {msg}", file=sys.stderr)
             continue
 
+        def _count_drop(batch=batch):
+            nonlocal dropped_batches, units_not_reviewed
+            dropped_batches += 1
+            units_not_reviewed += len(batch)
+
+        first = batch[0].get("id", "?") if batch else "?"
+        last = batch[-1].get("id", "?") if batch else "?"
         parsed = parse_response(
-            text, valid_unit_ids=valid_ids, on_error=on_error
+            text, valid_unit_ids=valid_ids, on_error=on_error,
+            batch_label=f"batch {i + 1}/{len(batches)}, units {first}..{last}",
+            on_batch_drop=_count_drop,
         )
         signals.extend(parsed)
+
+    if stats is not None:
+        stats["batches_dropped"] = dropped_batches
+        stats["units_not_reviewed"] = units_not_reviewed
 
     return signals
 
