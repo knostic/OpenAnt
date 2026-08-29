@@ -287,7 +287,7 @@ class EnhanceResult:
 # ---------------------------------------------------------------------------
 
 def verify_step_summary(result: "VerifyResult") -> dict:
-    """The seven-field verify step-report summary (issue #300).
+    """The verify step-report summary (issue #300; ten fields since #302).
 
     Shared by every construction site — core/scanner.py (the pipeline),
     openant/cli.py's chained analyze --verify, and standalone openant
@@ -335,7 +335,7 @@ class VerifyResult:
 
     def step_summary(self) -> dict:
         """The verify step-report summary (issue #300): the shared
-        seven-field construction every site uses."""
+        construction every site uses (ten fields since #302)."""
         return verify_step_summary(self)
 
     def to_dict(self) -> dict:

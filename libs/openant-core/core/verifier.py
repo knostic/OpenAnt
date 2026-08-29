@@ -133,6 +133,12 @@ def run_verification(
             agreed=0,
             disagreed=0,
             confirmed_vulnerabilities=0,
+            # #302: the denominator survives the zero-findings early return —
+            # a clean scan's scope statement is "adjudicated 0 of N", never
+            # "0 of 0" beside total_units=N in the same artifact.
+            units_analyzed_total=len(all_results),
+            downgraded=0,
+            upgraded=0,
             usage=tracking.get_usage(),
         )
 
