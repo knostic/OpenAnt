@@ -129,4 +129,10 @@ def test_scan_report_records_the_resolved_core_path(tmp_path):
     result.language = "python"
     _write_scan_report(str(tmp_path), result, [])
     report = json.loads((tmp_path / "scan.report.json").read_text())
-    assert report["summary"]["openant_core_path"] == str(resolved_core_path())
+    # leak hygiene: the recorded path is ~-relativized when under the
+    # user's home (CI: /home/runner/... -> ~/...), never the raw absolute
+    import os as _os
+    _raw = str(resolved_core_path())
+    _home = _os.path.expanduser("~")
+    _expected = "~" + _raw[len(_home):] if _raw.startswith(_home) else _raw
+    assert report["summary"]["openant_core_path"] == _expected
