@@ -239,7 +239,7 @@ def build_pipeline_output(
     repo_url: str | None = None,
     language: str | None = None,
     commit_sha: str | None = None,
-    application_type: str = "web_app",
+    application_type: str = "unknown",
     processing_level: str | None = None,
     step_reports: list[dict] | None = None,
     context_source: str = "none",
@@ -261,7 +261,9 @@ def build_pipeline_output(
         repo_url: Repository URL.
         language: Primary language.
         commit_sha: Commit SHA being analyzed.
-        application_type: App type for context (default ``"web_app"``).
+        application_type: App type for context (default ``"unknown"`` —
+            #304: a caller that omits it gets the honest unknown, never a
+            fabricated web_app).
         processing_level: Processing level used (``"reachable"``, etc.).
         step_reports: Optional list of step report dicts for duration/cost info.
         context_source: Which path supplied the security model —

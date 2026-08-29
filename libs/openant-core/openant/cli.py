@@ -600,7 +600,7 @@ def cmd_build_output(args):
                 repo_url=args.repo_url,
                 language=args.language,
                 commit_sha=args.commit_sha,
-                application_type=args.app_type or "web_app",
+                application_type=args.app_type or "unknown",
                 processing_level=args.processing_level,
                 step_reports=step_reports,
             )
