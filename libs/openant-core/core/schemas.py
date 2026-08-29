@@ -293,7 +293,10 @@ def verify_step_summary(result: "VerifyResult") -> dict:
     openant/cli.py's chained analyze --verify, and standalone openant
     verify — so the sites cannot drift. All seven fields reconcile:
     agreed + disagreed + needs_review + error_count accounts for every
-    findings_input finding.
+    findings_input finding except the disagreed-but-still-vulnerable
+    case, which increments only confirmed_vulnerabilities (see
+    core/verifier.py _count_verification_outcomes) — the four reconciliation
+    counters are therefore a bound (<=), not exact equality.
     """
     return {
         "findings_input": result.findings_input,
