@@ -75,18 +75,9 @@ def test_sequential_interrupt_raises_after_report(monkeypatch, tmp_path):
     CLI can handle it as an interrupt, not an error envelope)."""
     import core.analyzer as az
 
-    # drive _run_detection's sequential path: monkeypatch _process_and_save
-    # to raise KeyboardInterrupt on the second unit
+    # drive _run_detection's sequential path: the interrupt must surface
+    # on the SECOND unit
     calls = {"n": 0}
-
-    def fake_process(i, unit):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            raise KeyboardInterrupt
-        return {"index": i, "result": {"unit_id": f"u{i}", "finding": "safe",
-                                        "verdict": "SAFE"},
-                "route_key": f"f.py:u{i}", "code_for_route": "x",
-                "finding": "safe", "elapsed": 0.1}
 
     # _process_and_save is a closure inside _run_detection; drive the
     # interrupt through _process_unit instead (the function the closure
