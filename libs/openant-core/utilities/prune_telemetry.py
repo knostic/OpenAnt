@@ -45,7 +45,7 @@ def compute_prune_telemetry(reachable_ids, pruned_ids, call_graph, reverse_call_
       - When ``output_dir`` is given and something was pruned, writes ``pruned_units.json``
         (best-effort; a telemetry failure never propagates).
 
-    Returns ``(extra_rf_keys, asym_warning_or_None)`` — the caller merges the keys into
+    Returns ``(extra_rf_keys, asym_warning_or_None, orphan_advisory_or_None)`` — the caller merges the keys into
     its own base rf (original_units/entry_points/... stay caller-owned) and applies its
     own warning precedence (e.g. a blackout warning may override the asymmetry one).
 
