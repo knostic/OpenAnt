@@ -195,6 +195,22 @@ class CallGraphBuilder:
         # function ID up front so the call resolver can follow it.
         aliases = self._build_alias_map(tree, caller_file)
 
+        # #295: dispatch tables. A container of function references
+        # (HANDLERS = {'a': handler} / LIST_REF = [handler] /
+        # BUILT = dict(c=handler)) plus a subscript call over it
+        # (HANDLERS[mode]()) is the standard dispatch pattern; previously it
+        # produced NO edge to the target, so the target was pruned while the
+        # dispatcher was kept. The module-level containers of this caller's
+        # file are visible to every unit in it (the fixture's main() must see
+        # the module-scope HANDLERS); own-scope containers override.
+        containers = dict(self._module_containers(caller_file))
+        local_map, local_dropped = self._collect_container_map(tree, caller_file)
+        # a name locally rebound (dropped) must not fall through to the
+        # module-scope table — the local scope owns it now
+        for name in local_dropped:
+            containers.pop(name, None)
+        containers.update(local_map)
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 resolved = self._resolve_call_node(node, caller_file, caller_class, local_types, aliases, self_aliases)
@@ -206,6 +222,37 @@ class CallGraphBuilder:
                 # main resolver above never sees it.
                 for callee in self._resolve_callback_args(node, caller_file):
                     calls.add(callee)
+                # #295: a subscript call over a known container dispatches to
+                # every function that container references. Over-seed is the
+                # safe direction for reachability (a superset of the true
+                # targets is kept; nothing is invented — only names the
+                # container literal actually referenced).
+                if isinstance(node.func, ast.Subscript):
+                    base = node.func.value
+                    if isinstance(base, ast.Name) and base.id in containers:
+                        for target in containers[base.id]:
+                            calls.add(target)
+            elif isinstance(node, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
+                # #295: a function reference inside a container literal is a
+                # reachability edge from the ENCLOSING unit (the third member
+                # of the reference family this file already recognises:
+                # name=func bindings and f(func) callback args).
+                # Load-context only: Store-context Names (assignment targets
+                # in `a, b = f()` / `for k, v in ...:` tuples) are NOT
+                # references — scanning them fabricates edges. Dict values
+                # with a None key are `{**base}` unpacking, not refs either.
+                if isinstance(node, ast.Dict):
+                    elts = [v for k, v in zip(node.keys, node.values)
+                            if k is not None]
+                else:
+                    elts = node.elts
+                for e in elts:
+                    if (isinstance(e, ast.Name)
+                            and isinstance(e.ctx, ast.Load)
+                            and not self._is_builtin(e.id)):
+                        resolved = self._resolve_simple_call(e.id, caller_file)
+                        if resolved:
+                            calls.add(resolved)
 
         return calls
 
@@ -286,6 +333,96 @@ class CallGraphBuilder:
                 if resolved:
                     callees.append(resolved)
         return callees
+
+    def _collect_container_map(self, tree: ast.AST, caller_file: str) -> Dict[str, Set[str]]:
+        """#295: map local container names -> the functions they reference.
+
+        Covers `name = {..: func}` / `[func]` / `(func,)` / `{func}` literals
+        and `name = dict(k=func)` / `OrderedDict(...)` calls. SINGLE-ASSIGNMENT
+        GUARD: a name rebound after a CONTAINER binding (to anything,
+        including another container) is ambiguous for a per-name map and
+        dropped — dispatch through it records nothing rather than guessing
+        (the literal reference edges from the assignment itself are
+        unaffected). A first binding that is not a container is simply not
+        recorded, so the conditional-init pattern H = None ... H = {...}
+        still yields a live entry.
+        """
+        containers: Dict[str, Set[str]] = {}
+        dropped: Set[str] = set()
+        for node in self._walk_current_scope(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                continue
+            name = node.targets[0].id
+            if name in dropped:
+                continue
+            refs = self._container_value_refs(node.value, caller_file)
+            if name in containers:
+                # re-assignment of a container binding -> ambiguous, drop
+                dropped.add(name)
+                containers.pop(name, None)
+                continue
+            if refs is not None:
+                containers[name] = refs
+        return containers, dropped
+
+    def _container_value_refs(self, value: ast.expr, caller_file: str) -> Optional[Set[str]]:
+        """Resolve the function references held by a container value.
+
+        Returns None when `value` is not a recognised container shape (so
+        the caller can distinguish "not a container" from "container with
+        no resolvable function refs" — an empty set IS a container).
+        """
+        elts: List[ast.expr]
+        if isinstance(value, ast.Dict):
+            elts = [v for k, v in zip(value.keys, value.values) if k is not None]
+        elif isinstance(value, (ast.List, ast.Set, ast.Tuple)):
+            elts = list(value.elts)
+        elif (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                and value.func.id in ("dict", "OrderedDict")):
+            # dict(**other) unpacking (kw.arg is None) is not a function ref
+            elts = ([a for a in value.args if not isinstance(a, ast.Starred)]
+                    + [kw.value for kw in value.keywords if kw.arg is not None])
+        else:
+            return None
+        refs: Set[str] = set()
+        for e in elts:
+            if (isinstance(e, ast.Name)
+                    and isinstance(e.ctx, ast.Load)
+                    and not self._is_builtin(e.id)):
+                resolved = self._resolve_simple_call(e.id, caller_file)
+                if resolved:
+                    refs.add(resolved)
+        return refs
+
+    def _module_containers(self, caller_file: str) -> Dict[str, Set[str]]:
+        """#295: container map for the FILE's module scope (cached per file).
+
+        Module-level tables (the common placement) must be visible to every
+        function unit in the same file: `main`'s `HANDLERS[mode]()` needs the
+        module-scope HANDLERS. Sourced from the file's __module__ unit code.
+        """
+        cached = getattr(self, "_module_container_cache", None)
+        if cached is None:
+            cached = {}
+            self._module_container_cache = cached
+        if caller_file in cached:
+            return cached[caller_file]
+        module_id = f"{caller_file}:__module__"
+        module_code = self.functions.get(module_id, {}).get("code", "")
+        result: Dict[str, Set[str]] = {}
+        if module_code:
+            try:
+                tree = ast.parse(textwrap.dedent(module_code))
+                result, _dropped = self._collect_container_map(tree, caller_file)
+            except (SyntaxError, ValueError, RecursionError):
+                # module_code is a reconstructed snippet: never let a bad
+                # one abort the whole build_call_graph() — degrade to an
+                # empty map for this file (over-seed floor, not a crash).
+                result = {}
+        cached[caller_file] = result
+        return result
 
     def _build_alias_map(self, tree: ast.AST, caller_file: str) -> Dict[str, str]:
         """Map local names bound to a known function value -> that function's ID.
