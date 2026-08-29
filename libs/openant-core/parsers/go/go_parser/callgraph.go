@@ -200,8 +200,15 @@ func (c *CallGraphBuilder) collectFileContainers(fullPath, relPath string) {
 
 // compositeFuncTargets returns the bare identifiers inside a composite
 // literal (map values via KeyValueExpr, or direct elements) — the function
-// references a dispatch table holds.
+// references a dispatch table holds. TYPE-SHAPE GUARD (#299 review finding):
+// only composite literals whose element type is function-valued
+// (map[K]func..., []func..., [N]func...) are treated as dispatch tables —
+// map[string]int{...} or []MyStruct{...} literals must not have their
+// bare identifiers read as call targets (fabrication on name collision).
 func compositeFuncTargets(lit *ast.CompositeLit) []string {
+	if !funcValuedElementType(lit.Type) {
+		return nil
+	}
 	var targets []string
 	for _, elt := range lit.Elts {
 		var id *ast.Ident
@@ -218,6 +225,43 @@ func compositeFuncTargets(lit *ast.CompositeLit) []string {
 		}
 	}
 	return targets
+}
+
+// funcValuedElementType reports whether the composite literal's type has
+// function-valued elements: a MapType with FuncType values, an ArrayType
+// (incl. slice) of FuncType, or an IndexExpr/IndexListExpr of a generic
+// container whose ultimate element resolves to FuncType by name-shape
+// (conservative: only the syntactic shapes above; anything else abstains).
+func funcValuedElementType(t ast.Expr) bool {
+	switch typ := t.(type) {
+	case *ast.MapType:
+		_, ok := typ.Value.(*ast.FuncType)
+		return ok
+	case *ast.ArrayType:
+		_, ok := typ.Elt.(*ast.FuncType)
+		return ok
+	case *ast.IndexExpr:
+		return funcValuedElementType(typ.X) && isFuncValuedIndexArg(typ.Index)
+	case *ast.IndexListExpr:
+		return funcValuedElementType(typ.X)
+	}
+	return false
+}
+
+// isFuncValuedIndexArg reports whether a generic instantiation's LAST type
+// argument is func-shaped (map[K, V] with V=func..., or []T with T=func...).
+// Without go/types this is heuristic on the syntactic shape: a *ast.FuncType
+// argument is unambiguous; anything else abstains (safe direction).
+func isFuncValuedIndexArg(idx ast.Expr) bool {
+	switch a := idx.(type) {
+	case *ast.FuncType:
+		return true
+	case *ast.IndexListExpr:
+		if n := len(a.Indices); n > 0 {
+			return isFuncValuedIndexArg(a.Indices[n-1])
+		}
+	}
+	return false
 }
 
 func (c *CallGraphBuilder) parseImports(fullPath, relPath string) {

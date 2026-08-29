@@ -17,6 +17,7 @@ package main
 //   - a subscript over an UNKNOWN name records nothing (abstain over guess).
 
 import (
+	"strings"
 	"os"
 	"path/filepath"
 	"testing"
@@ -190,5 +191,30 @@ func TestMethodValueSurvives(t *testing.T) {
 	cg := buildGraphForFiles(t, map[string]string{"m.go": methodValueSrc})
 	if !hasEdge(cg, "m.go:useMethodValue", "m.go:Widget.Compute") {
 		t.Errorf("method value f := v.Compute; f() must edge to Widget.Compute; got %v", cg)
+	}
+}
+
+
+func TestNonFunctionTypedLiteralAbstains(t *testing.T) {
+	// Review finding: compositeFuncTargets accepted ANY composite literal by
+	// identifier shape; map[string]int{...} whose values collide with real
+	// function names must not fabricate dispatch edges.
+	files := map[string]string{
+		"main.go": `package main
+
+func handlerA() {}
+func lookup() {}
+
+var counts = map[string]int{"a": 1, "handlerA": 2}  // VALUE type is int
+
+func useCount(k string) int { return counts[k] }
+`,
+	}
+	cg := buildGraphForFiles(t, files)
+	useEdges := cg["main.go:useCount"]
+	for _, e := range useEdges {
+		if strings.Contains(e, "handlerA") {
+			t.Fatalf("map[string]int literal fabricated a dispatch edge to handlerA: %v", useEdges)
+		}
 	}
 }
