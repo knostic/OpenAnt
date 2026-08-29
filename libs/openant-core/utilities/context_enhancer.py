@@ -493,7 +493,12 @@ class ContextEnhancer:
                         progress_callback(uid, classification, elapsed)
             except KeyboardInterrupt:
                 self._log("warning", "Interrupted — progress saved to checkpoints")
-                return dataset
+                # #417: stop swallowing the interrupt. The per-unit checkpoints
+                # are already on disk and logged; returning the dataset let the
+                # pipeline continue (analyze → verify → report) and the Go layer
+                # never saw an interrupt (empty-stdout short-circuit never
+                # fires → no exit 130) — the analyze stage's #313 fix, mirrored.
+                raise
         else:
             executor = ThreadPoolExecutor(max_workers=workers)
             futures = {executor.submit(_process_one, unit): unit for unit in units_to_process}
@@ -506,7 +511,10 @@ class ContextEnhancer:
                 self._log("warning", "Interrupted — cancelling pending work...")
                 executor.shutdown(wait=False, cancel_futures=True)
                 self._log("info", "Progress saved to checkpoints")
-                return dataset
+                # #417: same contract as the sequential path — after cancelling
+                # pending work and logging the checkpoint state, RE-RAISE so
+                # the interrupt reaches the caller (never complete the scan).
+                raise
             executor.shutdown(wait=False)
 
         # Recompute stats from unit results (thread-safe)
@@ -813,7 +821,12 @@ class ContextEnhancer:
                         progress_callback(uid, classification, elapsed)
             except KeyboardInterrupt:
                 self._log("warning", "Interrupted — progress saved to checkpoints")
-                return dataset
+                # #417: stop swallowing the interrupt. The per-unit checkpoints
+                # are already on disk and logged; returning the dataset let the
+                # pipeline continue (analyze → verify → report) and the Go layer
+                # never saw an interrupt (empty-stdout short-circuit never
+                # fires → no exit 130) — the analyze stage's #313 fix, mirrored.
+                raise
         else:
             # Parallel mode
             executor = ThreadPoolExecutor(max_workers=workers)
@@ -829,7 +842,10 @@ class ContextEnhancer:
                 self._log("warning", "Interrupted — cancelling pending work...")
                 executor.shutdown(wait=False, cancel_futures=True)
                 self._log("info", "Progress saved to checkpoints")
-                return dataset
+                # #417: same contract as the sequential path — after cancelling
+                # pending work and logging the checkpoint state, RE-RAISE so
+                # the interrupt reaches the caller (never complete the scan).
+                raise
             executor.shutdown(wait=False)
 
         # Auto-retry failed units with transient errors (rate limit, connection,
