@@ -32,6 +32,7 @@ Output (JSON):
 """
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -213,11 +214,36 @@ class CallGraphBuilder:
             return self._extract_calls_regex(code, caller_id)
 
         root = tree.root_node
+
+        # #299 (4 of 7): PHP's dispatch-table idiom holds function names as
+        # STRINGS ($handlers = ['a' => 'handlerA']; $handlers[$k]();) — the
+        # array form of the _resolve_variable_function single-binding idiom.
+        # Collect the caller's local containers, then layer the file-scope
+        # containers (the common placement) on top; local bindings override.
+        containers = dict(self._file_containers(caller_file))
+        containers.update(self._collect_local_containers(root, code_bytes))
+        container_vars = set(containers.keys())
+
         stack = [root]
         while stack:
             node = stack.pop()
             if node.type in ('function_call_expression', 'member_call_expression',
                              'scoped_call_expression', 'object_creation_expression'):
+                # #299 (4 of 7): a subscript callee $handlers[$k]() over a KNOWN
+                # container dispatches to every function the container's strings
+                # reference (over-seed, the safe direction; unknown bases
+                # abstain — the base is a $variable, never a function name, so
+                # no false edge to a same-named function is possible).
+                base = (self._subscript_call_base(node, code_bytes)
+                        if node.type == 'function_call_expression' else None)
+                if base is not None and base in container_vars:
+                    for name in containers[base]:
+                        rid = self._resolve_simple_call(name, caller_file, None,
+                                                        caller_namespace)
+                        if rid:
+                            calls.add(rid)
+                    stack.extend(reversed(node.children))
+                    continue
                 resolved = self._resolve_call_node(node, code_bytes, caller_file,
                                                    caller_class, caller_namespace, root)
                 if resolved:
@@ -733,6 +759,124 @@ class CallGraphBuilder:
         if '\\' in name:
             return name.rsplit('\\', 1)[-1]
         return name
+
+    # ------------------------------------------------------------------
+    # #299 (4 of 7): string-name dispatch containers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _subscript_call_base(node, source: bytes):
+        """The base variable text of a $var[$k]() call's callee, or None."""
+        children = [c for c in node.children if c.type != 'arguments']
+        if len(children) < 1 or children[0].type != 'subscript_expression':
+            return None
+        for c in children[0].children:
+            if c.type == 'variable_name':
+                return source[c.start_byte:c.end_byte].decode('utf-8',
+                                                               errors='replace')
+        return None
+
+    def _container_string_names(self, array_node, source: bytes) -> Set[str]:
+        """The string-literal elements of an array literal (both the
+        `'k' => 'fn'` value form and the bare `'fn'` list form)."""
+        names: Set[str] = set()
+        for element in array_node.children:
+            if element.type == 'string':
+                value = self._string_literal_value(element, source)
+                if value:
+                    names.add(value)
+            elif element.type == 'array_element_initializer':
+                # `'k' => 'fn'` (value after the arrow) or the bare list
+                # form `'fn'` (the initializer's own string child, no arrow)
+                seen_arrow = False
+                taken = False
+                for c in element.children:
+                    if c.type == '=>':
+                        seen_arrow = True
+                        taken = False
+                    elif c.type in ('string', 'encapsed_string') and not taken:
+                        value = self._string_literal_value(c, source)
+                        if value:
+                            names.add(value)
+                        taken = True
+        return names
+
+    def _known_function_names(self, names: Set[str]) -> Set[str]:
+        """Filter container strings down to names a user function has."""
+        return {n for n in names if n in self.functions_by_name}
+
+    def _collect_local_containers(self, root, source: bytes) -> Dict[str, Set[str]]:
+        """$var = array literal of known-function strings -> container map
+        (within this caller's own body)."""
+        containers: Dict[str, Set[str]] = {}
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type == 'assignment_expression':
+                children = [c for c in node.children if c.type not in ('=',)]
+                if (len(children) >= 2 and children[0].type == 'variable_name'
+                        and children[1].type == 'array_creation_expression'):
+                    var = source[children[0].start_byte:children[0].end_byte] \
+                        .decode('utf-8', errors='replace')
+                    targets = self._known_function_names(
+                        self._container_string_names(children[1], source))
+                    if var in containers:
+                        # rebound -> ambiguous, drop rather than guess
+                        containers.pop(var, None)
+                        continue
+                    if targets:
+                        containers[var] = targets
+            stack.extend(reversed(node.children))
+        return containers
+
+    def _file_containers(self, caller_file: str) -> Dict[str, Set[str]]:
+        """File-scope $var = [...] containers (the common placement), parsed
+        once per file and cached. Functions see them via `global $var;`."""
+        cached = getattr(self, '_file_container_cache', None)
+        if cached is None:
+            cached = {}
+            self._file_container_cache = cached
+        if caller_file in cached:
+            return cached[caller_file]
+        result: Dict[str, Set[str]] = {}
+        try:
+            full = (caller_file if os.path.isabs(caller_file)
+                    else os.path.join(self.repo_path, caller_file))
+            with open(full, 'rb') as fh:
+                source = fh.read()
+            tree = self.php_parser.parse(source)
+            top = tree.root_node
+            # top-level statements only: an assignment inside a function is
+            # that function's own container (per-function semantics)
+            scratch = set()
+            stack = []
+            for child in top.children:
+                if child.type == 'expression_statement':
+                    stack.append(child)
+            while stack:
+                node = stack.pop()
+                if node.type == 'assignment_expression':
+                    children = [c for c in node.children if c.type not in ('=',)]
+                    if (len(children) >= 2 and children[0].type == 'variable_name'
+                            and children[1].type == 'array_creation_expression'):
+                        var = source[children[0].start_byte:children[0].end_byte] \
+                            .decode('utf-8', errors='replace')
+                        targets = self._known_function_names(
+                            self._container_string_names(children[1], source))
+                        if var in result:
+                            result.pop(var, None)
+                        elif targets:
+                            result[var] = targets
+                        scratch.discard(var)
+                # do not descend into function/method bodies
+                for c in node.children:
+                    if c.type not in ('function_declaration', 'method_declaration',
+                                      'anonymous_function', 'arrow_function',
+                                      'class_declaration'):
+                        stack.append(c)
+        except OSError:
+            result = {}
+        cached[caller_file] = result
+        return result
 
     def _extract_calls_regex(self, code: str, caller_id: str) -> Set[str]:
         """Fallback regex-based call extraction for unparseable code."""
