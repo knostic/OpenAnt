@@ -29,6 +29,7 @@ from core.language_registry import (
     supported_languages,
 )
 from core.schemas import ParseResult
+from utilities.child_interp import child_interpreter_env
 from utilities.file_io import open_utf8, read_json, write_json
 from utilities.prune_telemetry import compute_prune_telemetry
 
@@ -847,6 +848,10 @@ def _parse_via_subprocess(
         stderr=sys.stderr,
         cwd=str(_CORE_ROOT),
         timeout=1800,  # 30 min — large repos, tree-sitter/Node/Go toolchains
+        # #303: the child resolves THIS checkout by construction — the shared
+        # venv's editable .pth (re-pointable mid-scan by a concurrent session)
+        # cannot win over an explicit PYTHONPATH entry.
+        env=child_interpreter_env(),
     )
 
     if result.returncode != 0:

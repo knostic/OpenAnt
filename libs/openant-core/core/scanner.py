@@ -28,6 +28,7 @@ from core.schemas import (
 )
 from core.step_report import step_context
 from core import tracking
+from utilities.child_interp import resolved_core_path
 from utilities.file_io import read_json, write_json
 from utilities.llm.adapter import LLMAuthError
 
@@ -110,6 +111,14 @@ def partition_units_by_language(units: list[dict]) -> dict[str | None, list[dict
     for unit in units:
         parts.setdefault(unit.get("language"), []).append(unit)
     return parts
+
+
+def _relativize_home(path_str: str) -> str:
+    """Strip the user's home prefix (~) from an absolute path (leak hygiene)."""
+    home = os.path.expanduser("~")
+    if path_str.startswith(home):
+        return "~" + path_str[len(home):]
+    return path_str
 
 
 def aggregate_reachability_telemetry(per_lang: dict) -> dict:
@@ -1437,6 +1446,16 @@ def _write_scan_report(
             "excluded_languages": result.excluded_languages,
             "degraded": result.degraded,
             "context_source": result.context_source,
+            # #303: WHICH checkout produced this scan — the parent's resolved
+            # openant-core root. The shared venv's editable .pth is
+            # re-pointable by a concurrent session mid-scan; the children
+            # now resolve explicitly (utilities/child_interp.py), and this
+            # record makes any residual skew detectable after the fact.
+            # RELATIVIZED when under the user's home: the adjacent
+            # inputs.repo_path is deliberately basename-only, and a raw
+            # absolute path here would leak the OS username into a
+            # diagnostic artifact likely to be attached to support tickets.
+            "openant_core_path": _relativize_home(str(resolved_core_path())),
             # R5: provenance of a repo-supplied threat model. sha is absent (key
             # omitted) when no threat model was loaded — never the empty hash.
             **(
