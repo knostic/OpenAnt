@@ -384,7 +384,10 @@ class CallGraphBuilder:
         for func_id, func_info in self.functions.items():
             file_path = func_info.get("file_path", "")
             if file_path and file_path in file_aliases:
-                alias_to_target[func_id].update(file_aliases[file_path])
+                # DEEP-COPY (panel finding): shared set references leak a
+                # local shadowing binding into every function of the file.
+                alias_to_target[func_id].update(
+                    {k: set(v) for k, v in file_aliases[file_path].items()})
             code = func_info.get("code", "")
             if not code:
                 continue
@@ -799,8 +802,11 @@ class CallGraphBuilder:
                                               "labels": labels, "arity": arity,
                                               "trailing": trailing,
                                               "unlabeled_trailing": unlabeled_trailing})
+                        # DO NOT `continue` here (panel finding: a dropped-edge
+                        # regression) — the OUTER call still needs its argument
+                        # references collected and its remaining children walked
+                        # (tbl[i](makeArg()) must record makeArg's ref too).
                         stack.extend(callee.children)
-                        continue
                     if callee.type == "simple_identifier":
                         labels, arity, trailing, unlabeled_trailing = self._call_labels(node, source)
                         sites.append({"text": self._text(callee, source),
