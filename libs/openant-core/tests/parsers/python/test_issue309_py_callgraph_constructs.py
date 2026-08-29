@@ -42,7 +42,8 @@ def _cg(files: dict):
     out = tempfile.mkdtemp()
     parse_repository(str(repo), out, language="python",
                    processing_level="all", skip_tests=True, name="r")
-    return json.load(open(Path(out) / "call_graph.json"))["call_graph"]
+    with open(Path(out) / "call_graph.json") as fh:
+        return json.load(fh)["call_graph"]
 
 
 def test_init_definition_resolves():
