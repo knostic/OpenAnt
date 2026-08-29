@@ -22,6 +22,7 @@ reachability recall while avoiding gross same-name over-connection:
             -> caller -> referenced function (callback reachability)
 """
 
+import os
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -200,7 +201,12 @@ class CallGraphBuilder:
             caller_class = func_info.get("class_name")
 
             var_types, local_names, var_qualified = self._collect_var_types(code, type_names)
-            call_sites, arg_refs = self._find_calls_in_code(code, file_path)
+            # #299 (3 of 7): the caller's alias NAMES gate subscript dispatch —
+            # `tbl[i]()` records the base only when `tbl` is a known
+            # alias/container (tier-1 expansion then resolves it); an unknown
+            # base abstains rather than resolving the bare name.
+            alias_names = set(alias_to_target.get(func_id, {}).keys())
+            call_sites, arg_refs = self._find_calls_in_code(code, file_path, alias_names)
 
             for site in call_sites:
                 sites_total += 1
@@ -365,9 +371,23 @@ class CallGraphBuilder:
         return type_names, dict(ctor_index)
 
     def _build_alias_index(self, name_to_ids) -> Dict[str, Dict[str, Set[str]]]:
-        """Per-function `let f = knownFn` aliases (over-approximated as sets)."""
+        """Per-function `let f = knownFn` aliases (over-approximated as sets).
+
+        #299 (3 of 7): FILE-SCOPE `let` declarations are the common placement
+        for dispatch tables and were invisible to the per-function parse
+        (each function only sees its own body). Parse each file once (cached)
+        and merge its TOP-LEVEL bindings under every function of that file;
+        a function-local binding of the same name overrides (shadowing).
+        """
         alias_to_target: Dict[str, Dict[str, Set[str]]] = defaultdict(dict)
+        file_aliases = self._collect_file_scope_aliases(name_to_ids)
         for func_id, func_info in self.functions.items():
+            file_path = func_info.get("file_path", "")
+            if file_path and file_path in file_aliases:
+                # DEEP-COPY (panel finding): shared set references leak a
+                # local shadowing binding into every function of the file.
+                alias_to_target[func_id].update(
+                    {k: set(v) for k, v in file_aliases[file_path].items()})
             code = func_info.get("code", "")
             if not code:
                 continue
@@ -378,6 +398,67 @@ class CallGraphBuilder:
             self._collect_aliases(tree.root_node, code.encode("utf-8"),
                                   name_to_ids, alias_to_target[func_id])
         return alias_to_target
+
+    def _collect_file_scope_aliases(self, name_to_ids) -> Dict[str, Dict[str, Set[str]]]:
+        """Collect each file's TOP-LEVEL let bindings (plain aliases and
+        container literals). Top-level only: a `let` inside a function body
+        is that function's own alias (per-function semantics — a file-keyed
+        merge would clobber one function's binding with another's).
+        Abstains (empty map) on any read/parse failure.
+        """
+        out: Dict[str, Dict[str, Set[str]]] = {}
+        files = sorted({fi.get("file_path", "") for fi in self.functions.values()
+                        if fi.get("file_path")})
+        for file_path in files:
+            full = file_path if os.path.isabs(file_path) else os.path.join(
+                self.repository, file_path)
+            aliases: Dict[str, Set[str]] = {}
+            try:
+                with open(full, "rb") as fh:
+                    source = fh.read()
+                tree = self.parser.parse(source)
+            except OSError:
+                out[file_path] = aliases
+                continue
+            for child in tree.root_node.children:
+                if child.type == "property_declaration":
+                    self._collect_aliases(child, source, name_to_ids, aliases)
+            out[file_path] = aliases
+        return out
+
+    def _container_literal_targets(self, prop, source, name_to_ids) -> Set[str]:
+        """The KNOWN-function names referenced by a container-literal RHS.
+
+        Array literals contribute their bare identifier elements;
+        dictionary literals contribute the identifier VALUES (after `:`).
+        Non-function elements (data values) do not resolve and bind nothing.
+        """
+        targets: Set[str] = set()
+        lit = None
+        seen_eq = False
+        for c in prop.children:
+            if c.type == "=":
+                seen_eq = True
+            elif seen_eq and c.type in ("array_literal", "dictionary_literal"):
+                lit = c
+                break
+        if lit is None:
+            return targets
+        for element in lit.children:
+            if element.type == "simple_identifier":
+                text = self._text(element, source)
+                if text in name_to_ids:
+                    targets.add(text)
+            elif element.type == ":":
+                # dictionary entry: the next identifier child is the VALUE
+                idx = lit.children.index(element)
+                for nxt in lit.children[idx + 1:]:
+                    if nxt.type == "simple_identifier":
+                        text = self._text(nxt, source)
+                        if text in name_to_ids:
+                            targets.add(text)
+                        break
+        return targets
 
     def _collect_aliases(self, root: Node, source: bytes, name_to_ids, aliases) -> None:
         """`let f = handler` where handler is a known function → alias f->handler.
@@ -395,6 +476,18 @@ class CallGraphBuilder:
                 rhs = self._eq_rhs_identifier(node, source)
                 if name and rhs and rhs in name_to_ids:
                     aliases.setdefault(name, set()).add(rhs)
+                # #299 (3 of 7): a container literal of function references —
+                # `let tbl: [() -> Int] = [handlerA, handlerB]` /
+                # `let map: [String: () -> Int] = ["a": handler]` — binds the
+                # variable to every KNOWN function among its elements, so a
+                # later `tbl[i]()` dispatches to all of them (the same
+                # set-over-approximation as the plain alias; data arrays bind
+                # nothing — the name_to_ids gate).
+                elif name:
+                    targets = self._container_literal_targets(node, source,
+                                                              name_to_ids)
+                    if targets:
+                        aliases.setdefault(name, set()).update(targets)
             elif node.type == "assignment":
                 # a REASSIGNMENT `f = b` (in a branch) — `var f = a; if c { f = b }
                 # else { f = d }; f()` must union {a,b,d}, not keep only the initial
@@ -612,7 +705,8 @@ class CallGraphBuilder:
 
     # -- call extraction ----------------------------------------------------
 
-    def _find_calls_in_code(self, code: str, caller_file: str = ""):
+    def _find_calls_in_code(self, code: str, caller_file: str = "",
+                            alias_names=None):
         """Return (call_sites, arg_refs).
 
         call_sites: a LIST of per-occurrence records — {text, labels, arity,
@@ -635,7 +729,7 @@ class CallGraphBuilder:
         # `except` alone reports 0 failures while real bodies fail to parse.
         if tree.root_node.has_error:
             self.stats_extra["reparse_error_bodies"] = self.stats_extra.get("reparse_error_bodies", 0) + 1
-        self._extract_calls(tree.root_node, code.encode("utf-8"), sites, arg_refs)
+        self._extract_calls(tree.root_node, code.encode("utf-8"), sites, arg_refs, alias_names)
 
         shadowing = self._same_file_function_names(caller_file)
         repo_names = self._repo_function_names()
@@ -661,7 +755,8 @@ class CallGraphBuilder:
         ]
         return kept, arg_refs
 
-    def _extract_calls(self, root: Node, source: bytes, sites: List[dict], arg_refs: Set[str]) -> None:
+    def _extract_calls(self, root: Node, source: bytes, sites: List[dict],
+                       arg_refs: Set[str], alias_names=None) -> None:
         """Iterative worklist walk collecting per-occurrence call-site records.
 
         Handles `call_expression` (callee = `simple_identifier` plain/ctor, or
@@ -674,9 +769,44 @@ class CallGraphBuilder:
         stack = [root]
         while stack:
             node = stack.pop()
+            # NOTE (#299): the `not _is_subscript` guard is DELIBERATE and must
+            # stay. It excludes a subscript ACCESS `x[i]` (a call_expression
+            # whose value_arguments are led by `[`) from function-call
+            # resolution: recording it would fabricate a call edge to whatever
+            # `x` resolves to — a data-array access mis-read as a function
+            # call. The DISPATCH idiom (`tbl[i]()` — the outer call whose
+            # CALLEE is such a subscript node) is handled separately below via
+            # the alias-gated container path, which abstains unless the base
+            # names a known function-referencing container.
             if node.type == "call_expression" and not self._is_subscript(node):
                 callee = node.children[0] if node.children else None
                 if callee is not None:
+                    # #299 (3 of 7): a subscript-callee call `tbl[i]()` —
+                    # the callee is an INNER call_expression (the subscript
+                    # `tbl[i]`) — dispatches through a KNOWN container: the
+                    # base name is recorded only when it is a known alias of
+                    # the caller (the resolver's tier-1 expansion resolves it
+                    # to the container's referenced functions). Unknown bases
+                    # abstain — no bare-name false edges.
+                    if (callee.type == "call_expression"
+                            and self._is_subscript(callee)
+                            and alias_names is not None):
+                        inner_callee = callee.children[0] if callee.children else None
+                        if (inner_callee is not None
+                                and inner_callee.type == "simple_identifier"):
+                            base = self._text(inner_callee, source)
+                            if base in alias_names:
+                                labels, arity, trailing, unlabeled_trailing = (
+                                    self._call_labels(node, source))
+                                sites.append({"text": base,
+                                              "labels": labels, "arity": arity,
+                                              "trailing": trailing,
+                                              "unlabeled_trailing": unlabeled_trailing})
+                        # DO NOT `continue` here (panel finding: a dropped-edge
+                        # regression) — the OUTER call still needs its argument
+                        # references collected and its remaining children walked
+                        # (tbl[i](makeArg()) must record makeArg's ref too).
+                        stack.extend(callee.children)
                     if callee.type == "simple_identifier":
                         labels, arity, trailing, unlabeled_trailing = self._call_labels(node, source)
                         sites.append({"text": self._text(callee, source),
