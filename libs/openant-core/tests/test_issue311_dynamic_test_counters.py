@@ -127,8 +127,6 @@ def test_summary_json_consistent_with_unit_files(tmp_path, monkeypatch):
 def test_error_checkpoints_still_retried(tmp_path):
     """The retry contract is unchanged: an ERROR checkpoint is NOT
     'already done' — it lands in the retry set, not the restore set."""
-    import utilities.dynamic_tester as dt
-
     cp_dir = tmp_path / "cp"
     cp_dir.mkdir()
     (cp_dir / "f1.json").write_text(json.dumps(
