@@ -65,6 +65,16 @@ type ScanData struct {
 	Usage               UsageInfo   `json:"usage"`
 	StepReports         []any       `json:"step_reports"`
 	SkippedSteps        []string    `json:"skipped_steps"`
+	// #307: the multi-language coverage fields the CHANGELOG claims —
+	// the typed decode previously discarded them; comma-ok consumers are
+	// additive-safe. per_language is the scan summary's {lang: record}
+	// map; excluded_languages is {lang: reason}; degraded is absent
+	// (omitempty) when unknown.
+	PerLanguage       map[string]any `json:"per_language,omitempty"`
+	ParseErrors       []any          `json:"parse_errors,omitempty"`
+	ExcludedLanguages map[string]any `json:"excluded_languages,omitempty"`
+	Degraded          *bool          `json:"degraded,omitempty"`
+	Coverage          map[string]any `json:"coverage,omitempty"`
 }
 
 // ScanMetrics holds vulnerability counts from a full pipeline scan.

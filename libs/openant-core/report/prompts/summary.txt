@@ -27,6 +27,8 @@ OUTPUT FORMAT:
 
 ## Pipeline Statistics
 
+- If pipeline_stats.coverage exists, add a Coverage line: test files skipped (per language from coverage.test_files_skipped), symlinks refused, directories unreadable; also note per_language, parse_errors, excluded_languages, and degraded if present — a reader must see what did NOT enter the pipeline
+
 - Parsed: {n} functions from {n} files
 - Total units: {pipeline_stats.total_units}
 - Reachable units: {pipeline_stats.reachable_units}
