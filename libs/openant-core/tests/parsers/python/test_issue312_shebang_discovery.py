@@ -50,13 +50,11 @@ def _scan(files: dict):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
         if rel == "tool_shebang":
-            # 0o755 is LOAD-BEARING: shebang discovery keys on the executable
-            # bit (this fixture models a real extensionless tool). The
-            # world-readable bits are exactly what a real tool's mode is;
-            # narrowing the mask (0o700) would ALSO work for the test but
-            # diverges from the modeled reality. Deliberate — not a CodeQL
-            # permission bug (test fixture in a temp dir, no secret content).
-            os.chmod(p, 0o755)
+            # The EXECUTABLE bit is LOAD-BEARING (shebang discovery keys on
+            # it); the group/other bits are not. 0o700 keeps the test honest
+            # (a real tool's exec bit) without tripping CodeQL's
+            # py/overly-permissive-file — same discovery, quieter mode.
+            os.chmod(p, 0o700)
     scanner = RepositoryScanner(str(repo))
     result = scanner.scan()
     found = sorted(f["path"] for f in result["files"])
