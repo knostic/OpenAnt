@@ -286,6 +286,29 @@ class EnhanceResult:
 # Verify result
 # ---------------------------------------------------------------------------
 
+def verify_step_summary(result: "VerifyResult") -> dict:
+    """The seven-field verify step-report summary (issue #300).
+
+    Shared by every construction site — core/scanner.py (the pipeline),
+    openant/cli.py's chained analyze --verify, and standalone openant
+    verify — so the sites cannot drift. All seven fields reconcile:
+    agreed + disagreed + needs_review + error_count accounts for every
+    findings_input finding except the disagreed-but-still-vulnerable
+    case, which increments only confirmed_vulnerabilities (see
+    core/verifier.py _count_verification_outcomes) — the four reconciliation
+    counters are therefore a bound (<=), not exact equality.
+    """
+    return {
+        "findings_input": result.findings_input,
+        "findings_verified": result.findings_verified,
+        "agreed": result.agreed,
+        "disagreed": result.disagreed,
+        "confirmed_vulnerabilities": result.confirmed_vulnerabilities,
+        "needs_review": result.needs_review,
+        "error_count": result.error_count,
+    }
+
+
 @dataclass
 class VerifyResult:
     """Result of `open-ant verify`."""
@@ -301,6 +324,11 @@ class VerifyResult:
     needs_review: int = 0
     error_count: int = 0
     usage: UsageInfo = field(default_factory=UsageInfo)
+
+    def step_summary(self) -> dict:
+        """The verify step-report summary (issue #300): the shared
+        seven-field construction every site uses."""
+        return verify_step_summary(self)
 
     def to_dict(self) -> dict:
         return {

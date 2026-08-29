@@ -478,6 +478,7 @@ def cmd_analyze(args):
                       "Skipping verification.", file=sys.stderr)
             else:
                 from core.verifier import run_verification
+                from core.schemas import verify_step_summary
                 with step_context("verify", output_dir, inputs={
                     "results_path": result.results_path,
                     "analyzer_output_path": os.path.abspath(args.analyzer_output),
@@ -495,13 +496,12 @@ def cmd_analyze(args):
                         llm_config_name=args.llm_config,
                     )
 
-                    vctx.summary = {
-                        "findings_input": vresult.findings_input,
-                        "findings_verified": vresult.findings_verified,
-                        "agreed": vresult.agreed,
-                        "disagreed": vresult.disagreed,
-                        "confirmed_vulnerabilities": vresult.confirmed_vulnerabilities,
-                    }
+                    # #300: the shared seven-field construction — the
+                    # standalone path previously omitted needs_review /
+                    # error_count (the pipeline's summary had them), so the
+                    # command a user runs directly was strictly less
+                    # informative. One helper so the sites cannot drift.
+                    vctx.summary = verify_step_summary(vresult)
                     vctx.outputs = {
                         "verified_results_path": vresult.verified_results_path,
                     }
@@ -526,7 +526,7 @@ def cmd_analyze(args):
 def cmd_verify(args):
     """Run Stage 2 attacker-simulation verification on Stage 1 results."""
     from core.verifier import run_verification
-    from core.schemas import success, error
+    from core.schemas import success, error, verify_step_summary
     from core.step_report import step_context
     from core import tracking
 
@@ -557,13 +557,10 @@ def cmd_verify(args):
                 llm_config_name=args.llm_config,
             )
 
-            ctx.summary = {
-                "findings_input": result.findings_input,
-                "findings_verified": result.findings_verified,
-                "agreed": result.agreed,
-                "disagreed": result.disagreed,
-                "confirmed_vulnerabilities": result.confirmed_vulnerabilities,
-            }
+            # #300: the shared seven-field construction (see the chained
+            # verify site above) — needs_review / error_count included, so
+            # #285's status derivation finds its required key here too.
+            ctx.summary = verify_step_summary(result)
             ctx.outputs = {
                 "verified_results_path": result.verified_results_path,
             }

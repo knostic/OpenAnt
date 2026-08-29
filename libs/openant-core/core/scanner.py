@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 from core.schemas import (
-    ScanResult, AnalysisMetrics, UsageInfo, StepReport,
+    ScanResult, AnalysisMetrics, UsageInfo, StepReport, verify_step_summary,
 )
 from core.step_report import step_context
 from core import tracking
@@ -934,15 +934,10 @@ def scan_repository(
                     registry=registry,
                 )
 
-                ctx.summary = {
-                    "findings_input": verify_result.findings_input,
-                    "findings_verified": verify_result.findings_verified,
-                    "agreed": verify_result.agreed,
-                    "disagreed": verify_result.disagreed,
-                    "confirmed_vulnerabilities": verify_result.confirmed_vulnerabilities,
-                    "needs_review": verify_result.needs_review,
-                    "error_count": verify_result.error_count,
-                }
+                # #300: the shared seven-field construction (the standalone
+                # and chained-verify sites in cli.py build the same dict
+                # through the same helper, so the three cannot drift).
+                ctx.summary = verify_step_summary(verify_result)
                 ctx.outputs = {
                     "verified_results_path": verify_result.verified_results_path,
                 }
