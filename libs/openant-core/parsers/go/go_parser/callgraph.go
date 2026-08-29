@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 // CallGraphBuilder builds call graphs from function information
@@ -20,6 +21,13 @@ type CallGraphBuilder struct {
 
 	// Import tracking per file
 	importsByFile map[string]map[string]string // file -> alias -> package_path
+
+	// #299: file -> container name -> function names referenced by the
+	// container's composite literal (var handlers = map[string]func(){...} /
+	// var tbl = []func(){...}). Dispatch through a known container
+	// (handlers[k]()) records edges to every referenced function —
+	// over-seed, the safe direction for reachability.
+	containersByFile map[string]map[string][]string
 
 	// Built-in functions to skip
 	builtins map[string]bool
@@ -62,13 +70,14 @@ func NewCallGraphBuilder(repoPath string) *CallGraphBuilder {
 	}
 
 	return &CallGraphBuilder{
-		repoPath:        repoPath,
-		fset:            token.NewFileSet(),
-		functionsByName: make(map[string][]string),
-		functionsByFile: make(map[string][]string),
-		methodsByType:   make(map[string][]string),
-		importsByFile:   make(map[string]map[string]string),
-		builtins:        builtins,
+		repoPath:         repoPath,
+		fset:             token.NewFileSet(),
+		functionsByName:  make(map[string][]string),
+		functionsByFile:  make(map[string][]string),
+		methodsByType:    make(map[string][]string),
+		importsByFile:    make(map[string]map[string]string),
+		containersByFile: make(map[string]map[string][]string),
+		builtins:         builtins,
 	}
 }
 
@@ -149,7 +158,110 @@ func (c *CallGraphBuilder) buildIndexes(analyzer *AnalyzerOutput) {
 
 		fullPath := filepath.Join(c.repoPath, funcInfo.FilePath)
 		c.parseImports(fullPath, funcInfo.FilePath)
+		// #299: collect file-scope dispatch containers from the same parse
+		c.collectFileContainers(fullPath, funcInfo.FilePath)
 	}
+}
+
+// collectFileContainers parses a file (full mode, once, cached) and records
+// every package-scope `var name = <composite literal>` whose elements are
+// function identifiers: the dispatch-table idiom. Target NAMES are stored and
+// resolved through the normal name-resolution path at the dispatch site.
+func (c *CallGraphBuilder) collectFileContainers(fullPath, relPath string) {
+	if c.containersByFile[relPath] != nil {
+		return
+	}
+	c.containersByFile[relPath] = map[string][]string{}
+	file, err := parser.ParseFile(token.NewFileSet(), fullPath, nil, 0)
+	if err != nil {
+		return
+	}
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok || len(vs.Names) != 1 || len(vs.Values) != 1 {
+				continue
+			}
+			lit, ok := vs.Values[0].(*ast.CompositeLit)
+			if !ok {
+				continue
+			}
+			targets := compositeFuncTargets(lit)
+			if len(targets) > 0 {
+				c.containersByFile[relPath][vs.Names[0].Name] = targets
+			}
+		}
+	}
+}
+
+// compositeFuncTargets returns the bare identifiers inside a composite
+// literal (map values via KeyValueExpr, or direct elements) — the function
+// references a dispatch table holds. TYPE-SHAPE GUARD (#299 review finding):
+// only composite literals whose element type is function-valued
+// (map[K]func..., []func..., [N]func...) are treated as dispatch tables —
+// map[string]int{...} or []MyStruct{...} literals must not have their
+// bare identifiers read as call targets (fabrication on name collision).
+func compositeFuncTargets(lit *ast.CompositeLit) []string {
+	if !funcValuedElementType(lit.Type) {
+		return nil
+	}
+	var targets []string
+	for _, elt := range lit.Elts {
+		var id *ast.Ident
+		switch e := elt.(type) {
+		case *ast.Ident:
+			id = e
+		case *ast.KeyValueExpr:
+			if v, ok := e.Value.(*ast.Ident); ok {
+				id = v
+			}
+		}
+		if id != nil && id.Name != "" {
+			targets = append(targets, id.Name)
+		}
+	}
+	return targets
+}
+
+// funcValuedElementType reports whether the composite literal's type has
+// function-valued elements: a MapType with FuncType values, an ArrayType
+// (incl. slice) of FuncType, or an IndexExpr/IndexListExpr of a generic
+// container whose ultimate element resolves to FuncType by name-shape
+// (conservative: only the syntactic shapes above; anything else abstains).
+func funcValuedElementType(t ast.Expr) bool {
+	switch typ := t.(type) {
+	case *ast.MapType:
+		_, ok := typ.Value.(*ast.FuncType)
+		return ok
+	case *ast.ArrayType:
+		_, ok := typ.Elt.(*ast.FuncType)
+		return ok
+	case *ast.IndexExpr:
+		return funcValuedElementType(typ.X) && isFuncValuedIndexArg(typ.Index)
+	case *ast.IndexListExpr:
+		return funcValuedElementType(typ.X)
+	}
+	return false
+}
+
+// isFuncValuedIndexArg reports whether a generic instantiation's LAST type
+// argument is func-shaped (map[K, V] with V=func..., or []T with T=func...).
+// Without go/types this is heuristic on the syntactic shape: a *ast.FuncType
+// argument is unambiguous; anything else abstains (safe direction).
+func isFuncValuedIndexArg(idx ast.Expr) bool {
+	switch a := idx.(type) {
+	case *ast.FuncType:
+		return true
+	case *ast.IndexListExpr:
+		if n := len(a.Indices); n > 0 {
+			return isFuncValuedIndexArg(a.Indices[n-1])
+		}
+	}
+	return false
 }
 
 func (c *CallGraphBuilder) parseImports(fullPath, relPath string) {
@@ -212,6 +324,15 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 	// reassignment (or a non-ident RHS) marks the name ambiguous so we emit
 	// no false edge — precision over recall.
 	aliases := c.collectFuncValueAliases(file)
+	// #299: method-value bindings (f := v.Method) — resolved against the
+	// receiver variable's locally-known type at the call site.
+	methodAliases := c.collectMethodValueAliases(file)
+	// #299: local dispatch containers (t := []func(){h1, h2}) merged over
+	// the file-scope containers.
+	containers := c.collectLocalContainers(file)
+	for name, targets := range c.containersByFile[funcInfo.FilePath] {
+		containers[name] = targets
+	}
 
 	// Per-body receiver-variable -> static-type model. Method calls are resolved
 	// against the receiver's TYPE (walking below), never its variable name, so a
@@ -256,6 +377,37 @@ func (c *CallGraphBuilder) extractCalls(funcInfo FunctionInfo) []CallInfo {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
+		}
+
+		// #299: dispatch through a known container — a subscript call
+		// handlers[k]() / tbl[i]() whose base names a tracked container of
+		// function references records an edge to EVERY referenced function
+		// (over-seed, the safe direction; nothing invented — only names the
+		// container's literal actually referenced).
+		if idx, ok := call.Fun.(*ast.IndexExpr); ok {
+			if base, ok := idx.X.(*ast.Ident); ok {
+				if targets, ok := containers[base.Name]; ok {
+					for _, target := range targets {
+						if !isBuiltin(target) {
+							calls = append(calls, CallInfo{Name: target})
+						}
+					}
+					return true
+				}
+			}
+		}
+
+		// #299: bare-ident call through a method-value binding
+		// (f := v.Method; f()) — resolve against the receiver's type.
+		if ident, ok := call.Fun.(*ast.Ident); ok {
+			if ma, ok := methodAliases[ident.Name]; ok {
+				mi := CallInfo{Name: ma.method, IsMethod: true, Receiver: ma.recvVar}
+				mi.ReceiverTypes = varTypes[ma.recvVar]
+				if mi.Name != "" && !isBuiltin(mi.Name) {
+					calls = append(calls, mi)
+				}
+				return true
+			}
 		}
 
 		callInfo := c.analyzeCallExpr(call, imports)
@@ -399,6 +551,83 @@ func (c *CallGraphBuilder) collectVarTypes(file *ast.File) map[string][]string {
 	return varTypes
 }
 
+// methodValueAlias is a `f := v.Method` binding: calling f() resolves to the
+// method on the receiver variable's locally-known type (#299).
+type methodValueAlias struct {
+	method  string
+	recvVar string
+}
+
+// collectMethodValueAliases scans a parsed function body for single,
+// unconditional method-value bindings (`f := v.Method`) and returns the bound
+// name -> (method, receiver var). Abstains on anything ambiguous, matching
+// collectFuncValueAliases' precision-over-recall contract.
+func (c *CallGraphBuilder) collectMethodValueAliases(file *ast.File) map[string]methodValueAlias {
+	out := make(map[string]methodValueAlias)
+	ambiguous := make(map[string]bool)
+	ast.Inspect(file, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		if len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			return true
+		}
+		lid, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if ambiguous[lid.Name] {
+			return true
+		}
+		if _, seen := out[lid.Name]; seen {
+			delete(out, lid.Name)
+			ambiguous[lid.Name] = true
+			return true
+		}
+		sel, ok := assign.Rhs[0].(*ast.SelectorExpr)
+		if !ok {
+			return true // non-selector RHS is not a method value; the plain
+			// alias tracker owns that case
+		}
+		if recv, ok := sel.X.(*ast.Ident); ok {
+			out[lid.Name] = methodValueAlias{method: sel.Sel.Name, recvVar: recv.Name}
+		}
+		return true
+	})
+	return out
+}
+
+// collectLocalContainers scans a parsed function body for single-binding
+// local dispatch containers (`t := []func(){h1, h2}`) and returns
+// name -> referenced function names (#299).
+func (c *CallGraphBuilder) collectLocalContainers(file *ast.File) map[string][]string {
+	out := make(map[string][]string)
+	ast.Inspect(file, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			return true
+		}
+		lid, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if _, seen := out[lid.Name]; seen {
+			delete(out, lid.Name) // rebound -> ambiguous, drop
+			return true
+		}
+		lit, ok := assign.Rhs[0].(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		if targets := compositeFuncTargets(lit); len(targets) > 0 {
+			out[lid.Name] = targets
+		}
+		return true
+	})
+	return out
+}
+
 // collectFuncValueAliases scans a parsed function body for single, unconditional
 // func-value bindings (`f := helper`) and returns name -> target-function-name.
 // A name bound more than once, or bound to anything other than a bare identifier,
@@ -455,6 +684,43 @@ func (c *CallGraphBuilder) collectFuncValueAliases(file *ast.File) map[string]st
 	return aliases
 }
 
+// isTypeIndexExpr reports whether an IndexExpr's argument is TYPE-shaped —
+// the generic-instantiation form fn[T]() — as opposed to a VALUE index
+// m[k](). Without go/types the test is syntactic: type parameters are
+// conventionally exported identifiers (T, K, V, SomeType), qualified type
+// names (pkg.T), nested instantiations (fn[A[B]]), or type literals
+// (*T, []T, map[K]V, chan T, interface{...}, struct{...}, func(...)...).
+// A lowercase identifier, literal, call, or binary expression is a value
+// index and must NOT be unwrapped to the container's bare name (#299's
+// false-edge fix). Accepted residual: a generic call whose type parameter
+// is lowercase (non-idiomatic) is treated as value indexing and abstains.
+// predeclaredTypeNames are Go's universe-block type names: lowercase, but
+// type-shaped when they appear as a single index argument (genericFn[int](3)).
+var predeclaredTypeNames = map[string]bool{
+	"bool": true, "byte": true, "rune": true, "string": true,
+	"int": true, "int8": true, "int16": true, "int32": true, "int64": true,
+	"uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
+	"uintptr": true, "float32": true, "float64": true,
+	"complex64": true, "complex128": true, "error": true, "any": true, "comparable": true,
+}
+
+func isTypeIndexExpr(idx ast.Expr) bool {
+	switch e := idx.(type) {
+	case *ast.Ident:
+		if predeclaredTypeNames[e.Name] {
+			return true // int/string/any/... — lowercase but TYPE names
+		}
+		r := []rune(e.Name)
+		return len(r) > 0 && unicode.IsUpper(r[0])
+	case *ast.SelectorExpr, *ast.IndexExpr, *ast.IndexListExpr,
+		*ast.StarExpr, *ast.ArrayType, *ast.MapType, *ast.ChanType,
+		*ast.InterfaceType, *ast.StructType, *ast.FuncType, *ast.Ellipsis:
+		return true
+	default:
+		return false // BasicLit, CallExpr, BinaryExpr, UnaryExpr: value index
+	}
+}
+
 func (c *CallGraphBuilder) analyzeCallExpr(call *ast.CallExpr, imports map[string]string) CallInfo {
 	info := CallInfo{}
 
@@ -462,10 +728,23 @@ func (c *CallGraphBuilder) analyzeCallExpr(call *ast.CallExpr, imports map[strin
 	// analyzed identically to their non-generic forms. A single type argument parses as
 	// *ast.IndexExpr, multiple as *ast.IndexListExpr; both wrap the underlying function
 	// expression (an Ident or a SelectorExpr) in .X.
+	//
+	// #299: the unwrap historically fired for ANY IndexExpr, so a map/slice
+	// VALUE index handlers[k]() collapsed to the bare identifier `handlers`
+	// — producing a FALSE edge to any same-named function while the real
+	// dispatch target got nothing. Now a single-argument IndexExpr is only
+	// unwrapped when the index is TYPE-SHAPED (the generic-instantiation
+	// form); a value index is left alone (the walk's container-dispatch
+	// path handles tracked containers; unknown bases record nothing).
+	// IndexListExpr is always generic (multiple type arguments).
 	fun := call.Fun
 	switch idx := fun.(type) {
 	case *ast.IndexExpr:
-		fun = idx.X
+		if isTypeIndexExpr(idx.Index) {
+			fun = idx.X
+		} else {
+			return info // value indexing: no bare-name resolution
+		}
 	case *ast.IndexListExpr:
 		fun = idx.X
 	}
