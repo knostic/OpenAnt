@@ -100,6 +100,21 @@ MAX_ITERATIONS = 20
 # llm/helpers.py:DEFAULT_MAX_TOKENS.
 MAX_TOKENS_PER_RESPONSE = DEFAULT_MAX_TOKENS
 
+# #296: the ONE incomplete-verification marker the conclusive-exploit-path
+# guards exact-match today. Deliberately a single string — introducing the
+# constant must NOT change which inputs match. Widening it to the other
+# incomplete markers ("Verification incomplete (finish call truncated at
+# max_tokens)", "... (no tool calls)", the errored note, or model-authored
+# text) would make BOTH guards return False more often, and for both that
+# is the false-negative direction traced in #296: _has_conclusive_exploit_path
+# stops protecting the Stage-1 verdict, and _has_conclusive_exploitable_path
+# stops blocking the downgrade into DISCLOSURE_DROPPED — re-opening the
+# silent vulnerable->safe/inconclusive/rejected family PR #195/#243 closed.
+# Any behavior change here must be direction-aware first (see #296's
+# suggested-fix section): an unfinished verification must not become the
+# reason a finding is downgraded out of disclosure.
+INCOMPLETE_VERIFICATION_MARKER = "Max iterations reached"
+
 
 # Expected JSON shape of a verifier `finish` response — handed to JSONCorrector
 # so a malformed-but-recoverable verifier reply is repaired into THIS shape (no
@@ -1088,7 +1103,8 @@ class FindingVerifier:
         verification = result.get("verification", {})
 
         # If max iterations was reached, the analysis is not conclusive
-        if verification.get("explanation") == "Max iterations reached":
+        # (#296: the marker is a named constant; the match set is UNCHANGED)
+        if verification.get("explanation") == INCOMPLETE_VERIFICATION_MARKER:
             return False
 
         # Check for exploit path analysis. A model may emit ``exploit_path``
@@ -1119,7 +1135,12 @@ class FindingVerifier:
         shows the path IS reachable, attacker-controlled, and unbroken. Defaults
         require proof — a missing field must NOT read as exploitable."""
         verification = result.get("verification", {})
-        if verification.get("explanation") == "Max iterations reached":
+        # #296: the marker is a named constant; the match set is UNCHANGED.
+        # DO NOT widen this test without reading #296 first: this guard
+        # BLOCKS the downgrade into DISCLOSURE_DROPPED — making it False
+        # more often re-opens the silent vulnerable->safe family PR
+        # #195/#243 closed.
+        if verification.get("explanation") == INCOMPLETE_VERIFICATION_MARKER:
             return False
         exploit_path = verification.get("exploit_path")
         if not isinstance(exploit_path, dict):

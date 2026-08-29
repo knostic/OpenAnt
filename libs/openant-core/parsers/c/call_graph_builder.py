@@ -32,6 +32,7 @@ Output (JSON):
 """
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -212,12 +213,31 @@ class CallGraphBuilder:
         # method on the receiver's known type.
         local_var_types = self._extract_local_var_types(tree.root_node, code_bytes)
 
+        # #298: function-pointer dispatch containers. A name initialised
+        # with a braced list of function references (an ops struct with
+        # designated initialisers, an array of function pointers, a
+        # struct-array command table) plus a subscript or member call
+        # through that name (tbl[i]() / o.read(x) / cmds[i].fn()) is C's
+        # polymorphism idiom; previously it produced NO edge, so the
+        # dispatcher kept zero out-edges and every target was orphaned.
+        # File-scope containers are visible to every function in the file
+        # (parsed from the file itself, cached); local containers override.
+        containers = dict(self._file_containers(file_path))
+        containers.update(self._collect_container_map(tree.root_node, code_bytes, caller_file))
+
         stack = [tree.root_node]
         while stack:
             node = stack.pop()
             if node.type == 'call_expression':
                 func_node = node.child_by_field_name('function')
                 if func_node:
+                    # #298: dispatch through a known container — the
+                    # over-seed direction (a superset of the true targets
+                    # is kept; nothing is invented: only names the
+                    # container's initialisers actually referenced).
+                    for target in self._container_dispatch_targets(
+                            func_node, code_bytes, containers):
+                        calls.add(target)
                     call_name, receiver = self._extract_call_name_and_receiver(
                         func_node, code_bytes
                     )
@@ -234,8 +254,156 @@ class CallGraphBuilder:
                 # name a known function; non-function identifiers (variables) do not
                 # resolve and so do not create edges.
                 calls.update(self._extract_callback_args(node, code_bytes, caller_file))
+            elif node.type == 'initializer_list':
+                # #298: a function referenced in an initialiser is a
+                # reachability edge from the enclosing unit (the same
+                # family as _extract_callback_args' call-argument refs).
+                for target in self._initializer_targets(node, code_bytes, caller_file):
+                    calls.add(target)
             stack.extend(reversed(node.children))
         return calls
+
+    # ------------------------------------------------------------------
+    # #298: function-pointer dispatch containers
+    # ------------------------------------------------------------------
+    def _initializer_targets(self, init_node, source: bytes, caller_file: str) -> Set[str]:
+        """Resolve the function references inside an initializer_list.
+
+        Covers direct identifier elements ({ h_a, h_b }), designated
+        initialiser values ({ .read = my_read }), address-of operands
+        ({ &h_a }), and nested initializer_lists (struct-array tables:
+        { {"a", cmd_a}, {"b", cmd_b} }). Non-function identifiers (data
+        values) do not resolve and create no edges.
+        """
+        targets: Set[str] = set()
+        stack = [init_node]
+        while stack:
+            node = stack.pop()
+            name: Optional[str] = None
+            if node.type == 'identifier':
+                name = source[node.start_byte:node.end_byte] \
+                    .decode('utf-8', errors='replace')
+            elif node.type in ('pointer_expression', 'unary_expression'):
+                operand = node.child_by_field_name('argument')
+                if operand is not None and operand.type == 'identifier':
+                    name = source[operand.start_byte:operand.end_byte] \
+                        .decode('utf-8', errors='replace')
+            if name and not self._is_stdlib(name):
+                resolved = self._resolve_call(name, caller_file)
+                if resolved:
+                    targets.add(resolved)
+            if node.type == 'initializer_list' or node.type == 'initializer_pair':
+                stack.extend(reversed(node.children))
+        return targets
+
+    def _collect_container_map(self, root, source: bytes,
+                               caller_file: str) -> Dict[str, Set[str]]:
+        """#298: map container names -> the functions their initialisers
+        reference, within this tree. SINGLE-DECLARATION GUARD: a name
+        declared twice is ambiguous for a per-name map and dropped —
+        dispatch through it records nothing rather than guessing."""
+        containers: Dict[str, Set[str]] = {}
+        dropped: Set[str] = set()
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type == 'declaration':
+                for child in node.children:
+                    if child.type != 'init_declarator':
+                        continue
+                    name = self._declared_var_name(child, source)
+                    if not name or name in dropped:
+                        continue
+                    init = child.child_by_field_name('value')
+                    if init is None or init.type != 'initializer_list':
+                        continue
+                    targets = self._initializer_targets(init, source, caller_file)
+                    if name in containers:
+                        dropped.add(name)
+                        containers.pop(name, None)
+                        continue
+                    containers[name] = targets
+            stack.extend(reversed(node.children))
+        return containers
+
+    def _file_containers(self, file_path: str) -> Dict[str, Set[str]]:
+        """#298: container map for a file's TOP-LEVEL declarations (cached).
+
+        File-scope tables (`static struct ops o = {...}` at file scope) are
+        the common placement and must be visible to every function in the
+        file. The builder works per-function, so parse the file itself.
+        """
+        cached = getattr(self, "_file_container_cache", None)
+        if cached is None:
+            cached = {}
+            self._file_container_cache = cached
+        if file_path in cached:
+            return cached[file_path]
+        result: Dict[str, Set[str]] = {}
+        try:
+            # file_path is the repo-relative caller-file key ("src/d.c");
+            # resolve it against the repository root the extractor recorded.
+            full = file_path if os.path.isabs(file_path) \
+                else os.path.join(self.repo_path, file_path)
+            with open(full, 'rb') as f:
+                source = f.read()
+            parser = self._get_parser_for_file(file_path)
+            tree = parser.parse(source)
+            # TOP-LEVEL ONLY (panel finding): _collect_container_map walks the
+            # whole tree, so a container nested inside an unrelated function's
+            # body would leak file-wide (an opaque same-named parameter in
+            # another function would dispatch to THIS function's targets).
+            # Walk the root's children without descending into function_definition.
+            top_level = [c for c in tree.root_node.children
+                         if c.type != 'function_definition']
+            class _ShallowRoot:
+                type = 'translation_unit'
+                def __init__(self, children):
+                    self.children = children
+            result = self._collect_container_map(_ShallowRoot(top_level), source, file_path)
+        except OSError:
+            result = {}
+        cached[file_path] = result
+        return result
+
+    def _container_dispatch_targets(self, func_node, source: bytes,
+                                    containers: Dict[str, Set[str]]) -> Set[str]:
+        """#298: the callee is a subscript/member expression over a known
+        container — dispatch to every function that container references.
+
+        Handles tbl[i]() (subscript), o.read(x) (member over identifier),
+        and cmds[i].fn() (member over subscript). Returns empty for
+        anything else, including subscripts over unknown names.
+        """
+        if not containers:
+            return set()
+        base = self._dispatch_base_identifier(func_node)
+        if base is None:
+            return set()
+        return set(containers.get(base, ()))
+
+    def _dispatch_base_identifier(self, node) -> Optional[str]:
+        """Find the base identifier a SUBSCRIPT/MEMBER call dispatches over.
+        A bare identifier root returns None (panel finding): a direct call
+        through a name shadowing a file-scope container must not fabricate
+        edges to all of the container's targets."""
+        if node is not None and node.type == "identifier":
+            return None
+        current = node
+        for _ in range(4):  # bounded descent: cmds[i].fn() nests two levels
+            if current is None:
+                return None
+            if current.type == 'identifier':
+                return current.text.decode('utf-8', errors='replace') \
+                    if current.text else None
+            if current.type == 'subscript_expression':
+                current = current.children[0] if current.children else None
+                continue
+            if current.type == 'field_expression':
+                current = current.children[0] if current.children else None
+                continue
+            return None
+        return None
 
     def _extract_callback_args(self, call_node, source: bytes, caller_file: str) -> Set[str]:
         """Resolve function-name arguments passed to a call (higher-order/callback)."""
@@ -322,7 +490,12 @@ class CallGraphBuilder:
         """
         if node.type == 'identifier':
             return source[node.start_byte:node.end_byte].decode('utf-8', errors='replace')
-        if node.type in ('pointer_declarator', 'init_declarator', 'reference_declarator'):
+        if node.type in ('pointer_declarator', 'init_declarator',
+                         'reference_declarator', 'function_declarator',
+                         'array_declarator', 'parenthesized_declarator'):
+            # #298: function/array/parenthesized declarators cover the
+            # function-pointer TABLE shape `void (*tbl[])(void) = {...}` —
+            # the declared name sits under the nested declarators.
             inner = node.child_by_field_name('declarator')
             if inner is not None:
                 return self._declared_var_name(inner, source)
