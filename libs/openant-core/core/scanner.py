@@ -113,6 +113,14 @@ def partition_units_by_language(units: list[dict]) -> dict[str | None, list[dict
     return parts
 
 
+def _relativize_home(path_str: str) -> str:
+    """Strip the user's home prefix (~) from an absolute path (leak hygiene)."""
+    home = os.path.expanduser("~")
+    if path_str.startswith(home):
+        return "~" + path_str[len(home):]
+    return path_str
+
+
 def aggregate_reachability_telemetry(per_lang: dict) -> dict:
     """#301: sum the per-language prune telemetry into the top-level record.
 
@@ -1443,7 +1451,11 @@ def _write_scan_report(
             # re-pointable by a concurrent session mid-scan; the children
             # now resolve explicitly (utilities/child_interp.py), and this
             # record makes any residual skew detectable after the fact.
-            "openant_core_path": str(resolved_core_path()),
+            # RELATIVIZED when under the user's home: the adjacent
+            # inputs.repo_path is deliberately basename-only, and a raw
+            # absolute path here would leak the OS username into a
+            # diagnostic artifact likely to be attached to support tickets.
+            "openant_core_path": _relativize_home(str(resolved_core_path())),
             # R5: provenance of a repo-supplied threat model. sha is absent (key
             # omitted) when no threat model was loaded — never the empty hash.
             **(
