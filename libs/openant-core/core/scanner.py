@@ -1100,7 +1100,11 @@ def scan_repository(
             language=result.language,
             application_type=(
                 app_context_path and _read_app_type(app_context_path)
-            ) or "web_app",
+            ) or "unknown",
+            # #304: an absent context is UNKNOWN, not a fabricated web_app —
+            # the deliverable must never present a guess as an observation
+            # (context_source: "none" carries the real state one field away;
+            # the summary template now joins the two for the reader).
             processing_level=processing_level,
             step_reports=collected_step_reports,
             context_source=result.context_source,

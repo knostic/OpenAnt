@@ -600,7 +600,7 @@ def cmd_build_output(args):
                 repo_url=args.repo_url,
                 language=args.language,
                 commit_sha=args.commit_sha,
-                application_type=args.app_type or "web_app",
+                application_type=args.app_type or "unknown",
                 processing_level=args.processing_level,
                 step_reports=step_reports,
             )
@@ -1649,7 +1649,7 @@ def build_parser() -> argparse.ArgumentParser:
     bo_p.add_argument("--repo-url", help="Repository URL")
     bo_p.add_argument("--language", help="Primary language")
     bo_p.add_argument("--commit-sha", help="Commit SHA")
-    bo_p.add_argument("--app-type", help="Application type (default: web_app)")
+    bo_p.add_argument("--app-type", help="Application type (default: unknown — no fabricated assumption)")
     bo_p.add_argument("--processing-level", help="Processing level used")
     bo_p.set_defaults(func=cmd_build_output)
 

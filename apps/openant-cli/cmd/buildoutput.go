@@ -38,7 +38,7 @@ func init() {
 	buildOutputCmd.Flags().StringVar(&buildOutputRepoURL, "repo-url", "", "Repository URL")
 	buildOutputCmd.Flags().StringVar(&buildOutputLanguage, "language", "", "Primary language")
 	buildOutputCmd.Flags().StringVar(&buildOutputCommitSHA, "commit-sha", "", "Commit SHA")
-	buildOutputCmd.Flags().StringVar(&buildOutputAppType, "app-type", "", "Application type (default: web_app)")
+	buildOutputCmd.Flags().StringVar(&buildOutputAppType, "app-type", "", "Application type (default: unknown — no fabricated assumption)")
 	buildOutputCmd.Flags().StringVar(&buildOutputProcessingLevel, "processing-level", "", "Processing level used")
 }
 
