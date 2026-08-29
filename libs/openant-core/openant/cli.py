@@ -58,6 +58,24 @@ def _unit_start_line(unit: dict) -> int:
     return start_line
 
 
+def _excluded_languages_for_report(summary: dict) -> list[str]:
+    """#305 (wave catch BLOCKER 1+2): the scan summary's excluded_languages
+    is a {lang: reason} DICT everywhere in Python — the Go consumer
+    unmarshals []string, so an unconverted dict would break the JSON
+    unmarshal outright. Format it as a list; and an operator --languages
+    opt-out ("not requested via --languages") is a legitimate scoping
+    choice, NOT a degradation — only involuntary exclusions reach the
+    report/SARIF."""
+    excl = (summary or {}).get("excluded_languages") or {}
+    if isinstance(excl, dict):
+        return sorted(
+            f"{lang} ({reason})" for lang, reason in excl.items()
+            if "not requested" not in str(reason))
+    if isinstance(excl, list):
+        return [str(x) for x in excl]
+    return []
+
+
 def _step_report_rows(step_reports: list[dict],
                       skip_reasons: dict | None = None) -> list[dict]:
     """Project step reports into the Go consumer's row shape (#305).
@@ -1184,20 +1202,7 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
                 if sr.get("step") == "scan":
                     _summary = sr.get("summary", {})
                     _skip_reasons = _summary.get("steps_skipped_reasons", {}) or {}
-                    # wave catches (#305): excluded_languages is a {lang:
-                    # reason} DICT everywhere in Python — the Go consumer
-                    # expects a list, so an unconverted dict would break the
-                    # JSON unmarshal outright. Format it; and an operator
-                    # --languages opt-out ("not requested via --languages")
-                    # is a legitimate scoping choice, NOT a degradation —
-                    # only involuntary exclusions reach the report/SARIF.
-                    _excl = _summary.get("excluded_languages") or {}
-                    if isinstance(_excl, dict):
-                        _excluded_langs = sorted(
-                            f"{lang} ({reason})" for lang, reason in _excl.items()
-                            if "not requested" not in str(reason))
-                    elif isinstance(_excl, list):
-                        _excluded_langs = [str(x) for x in _excl]
+                    _excluded_langs = _excluded_languages_for_report(_summary)
                     break
             step_reports_data = _step_report_rows(_all_steps, _skip_reasons)
 
