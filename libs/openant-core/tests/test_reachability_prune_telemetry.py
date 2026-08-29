@@ -50,7 +50,7 @@ def _load_helper():
 
 
 def test_compute_prune_telemetry_tolerates_null_graphs():
-    extra, warn = _load_helper()({"f:a"}, ["f:b"], None, None, None)
+    extra, warn, advisory = _load_helper()({"f:a"}, ["f:b"], None, None, None)
     assert extra == {"pruned_orphan_count": 1, "pruned_in_dead_cluster_count": 0,
                      "pruned_forward_called_by_reachable_count": 0, "pruned_by_file": {"f": 1}}
     assert warn is None

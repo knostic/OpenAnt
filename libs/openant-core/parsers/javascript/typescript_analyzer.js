@@ -1726,6 +1726,115 @@ class TypeScriptAnalyzer {
     return null;
   }
 
+  // ------------------------------------------------------------------
+  // #299 (6 of 7): dispatch containers (object/array literals of handlers)
+  // ------------------------------------------------------------------
+
+  /**
+   * Map variable/const names -> handler-function names referenced by an
+   * object/array literal initializer, from one node's descendants.
+   * Rebound names are dropped (ambiguous) rather than guessed.
+   */
+  _collectContainersFrom(node) {
+    const containers = {};
+    const dropped = {};
+    if (!node) return containers;
+    const ts = require("ts-morph");
+    // getDescendantsOfKind is the reliable descent (a manual getChildren()
+    // walk stops at the SyntaxList wrapper). For the FILE map this includes
+    // declarations inside function bodies — safe by design (over-seed): a
+    // container referenced by name dispatches to its handlers regardless of
+    // which scope declared it, and the name gate still requires the literal
+    // to reference known handler names.
+    for (const decl of node.getDescendantsOfKind(
+      ts.SyntaxKind.VariableDeclaration,
+    )) {
+      const nameNode = decl.getNameNode ? decl.getNameNode() : null;
+      const init = decl.getInitializer ? decl.getInitializer() : null;
+      if (!nameNode || !init) continue;
+      const name = nameNode.getText();
+      if (dropped[name]) continue;
+      const kind = init.getKindName();
+      if (
+        kind !== "ObjectLiteralExpression" &&
+        kind !== "ArrayLiteralExpression"
+      ) {
+        continue;
+      }
+      if (Object.prototype.hasOwnProperty.call(containers, name)) {
+        // second declaration of the same name -> ambiguous, drop
+        delete containers[name];
+        dropped[name] = true;
+        continue;
+      }
+      const targets = this._containerElementNames(init);
+      if (targets.length > 0) containers[name] = targets;
+    }
+    return containers;
+  }
+
+  /**
+   * The bare-identifier handler names an object/array literal references.
+   * Object literals contribute property VALUES; array literals their
+   * elements. Non-identifier elements contribute nothing (the name gate at
+   * resolution abstains).
+   */
+  _containerElementNames(literal) {
+    const names = [];
+    const kind = literal.getKindName();
+    if (kind === "ObjectLiteralExpression") {
+      for (const prop of literal.getProperties()) {
+        const init = prop.getInitializer ? prop.getInitializer() : null;
+        if (init && init.getKindName() === "Identifier") {
+          names.push(init.getText());
+        }
+      }
+    } else if (kind === "ArrayLiteralExpression") {
+      for (const el of literal.getElements()) {
+        if (el.getKindName() === "Identifier") names.push(el.getText());
+      }
+    }
+    return names;
+  }
+
+  /**
+   * Resolve an ElementAccessExpression callee over a KNOWN container to the
+   * container's handler names, or null when the base is not a known
+   * container (abstain — no invented edges). Merges the enclosing
+   * function's local containers with the file-scope map (cached per file).
+   */
+  _containerTargetsForCallee(callee, funcNode) {
+    const base = callee.getExpression();
+    if (!base || base.getKindName() !== "Identifier") return null;
+    const name = base.getText();
+    // file-scope containers, cached per relative path
+    if (!this._fileContainersCache) this._fileContainersCache = {};
+    const rel =
+      (funcNode.getSourceFile &&
+        funcNode.getSourceFile().getFilePath()) ||
+      "";
+    let fileMap = this._fileContainersCache[rel];
+    if (fileMap === undefined) {
+      try {
+        fileMap = this._collectContainersFrom(funcNode.getSourceFile());
+      } catch (e) {
+        fileMap = {};
+      }
+      this._fileContainersCache[rel] = fileMap;
+    }
+    // NOTE: the file map is collected from the SOURCE FILE root, which
+    // includes function bodies — a function-local table is ALSO visible
+    // there. That is safe for dispatch (over-seed direction), matching the
+    // sibling parsers' file-scope merge; the name gate still requires the
+    // literal to reference known handler names.
+    const localMap = this._collectContainersFrom(funcNode);
+    const targets =
+      (localMap && Object.prototype.hasOwnProperty.call(localMap, name) && localMap[name]) ||
+      (Object.prototype.hasOwnProperty.call(fileMap, name) && fileMap[name]) ||
+      null;
+    return targets || null;
+  }
+
   /**
    * Extract function calls from within a function body.
    *
@@ -1762,6 +1871,24 @@ class TypeScriptAnalyzer {
         const isMember =
           !!callee && callee.getKindName() === "PropertyAccessExpression";
         pushName(normalized, false, isMember);
+      } else if (
+        // #299 (6 of 7): a container dispatch — `handlers[k]()` /
+        // `tbl[0]()` — an ElementAccessExpression whose BASE identifier names
+        // a known container of handler references. Resolve to EVERY
+        // referenced function (over-seed, the safe direction). The container
+        // map merges this function's local const/var declarations with the
+        // file-scope ones (the common placement).
+        callee &&
+        callee.getKindName() === "ElementAccessExpression" &&
+        this._containerTargetsForCallee
+      ) {
+        const targets = this._containerTargetsForCallee(callee, funcNode);
+        if (targets !== null) {
+          for (const target of targets) pushName(target, false);
+        } else {
+          const raw = callee.getText().replace(/\s+/g, " ").trim();
+          pushName(raw, true);
+        }
       } else {
         // Dynamic / element-access callee — record the raw span trimmed to a
         // single line so node names never become multiline blobs.
@@ -1872,6 +1999,16 @@ class TypeScriptAnalyzer {
         } else if (!target) {
           // Unresolvable static name — bucket as indirect so it isn't lost.
           if (!indirect.includes(name)) indirect.push(name);
+          // #299 (6 of 7): CONSUMER — an indirect entry that resolves when
+          // the member restriction is dropped becomes a REFERENCE edge (a
+          // receiver call `x.foo()` whose same-named free function exists:
+          // over-seed, the reachability-safe direction). This is the
+          // plumbing the umbrella asks for: the detection already worked,
+          // only the graph never consumed it.
+          const ref = resolveName(name, callerFile, false);
+          if (ref && ref !== callerId && !resolvedTargets.includes(ref)) {
+            resolvedTargets.push(ref);
+          }
         }
       }
 

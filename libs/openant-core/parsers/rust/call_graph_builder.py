@@ -24,6 +24,7 @@ design notes for the actual node-type dump this was built from):
   stream of well-known formatting/assertion macros (see `_scan_macro_body`).
 """
 
+import os
 import posixpath
 import re
 from collections import defaultdict
@@ -381,6 +382,18 @@ class CallGraphBuilder:
             return sites
         source = code.encode("utf-8")
 
+        # #299 (7 of 7): dispatch containers — an array literal of bare-ident
+        # function references (`static TBL: [fn(); N] = [a, b];` or a local
+        # `let t = [a, b];`) binds its name; a subscript call over a KNOWN
+        # container resolves to every referenced function (over-seed, the
+        # safe direction). Idiomatic Rust dispatches via match / dyn Fn /
+        # bound locals (all already resolving) — this completes the family
+        # shape; the umbrella measured the idiom as rare in real code, so
+        # corpus gains are expected ≈0 (pre-registered).
+        containers = dict(self._file_containers(caller_file))
+        containers.update(self._collect_local_containers(tree.root_node, source))
+        container_names = set(containers.keys())
+
         stack = [tree.root_node]
         entered_fn = False
         while stack:
@@ -398,6 +411,19 @@ class CallGraphBuilder:
                 entered_fn = True
             if node.type == "call_expression":
                 callee = node.children[0] if node.children else None
+                # #299 (7 of 7): a subscript callee TBL[i]() over a KNOWN
+                # container — one site per referenced function. Unknown bases
+                # fall through to _describe_callee (which abstains on the
+                # index_expression shape; no bare-name false edges).
+                if (callee is not None and callee.type == "index_expression"
+                        and container_names):
+                    base = self._index_expression_base(callee, source)
+                    if base is not None and base in containers:
+                        for target in sorted(containers[base]):
+                            sites.append({"kind": "bare", "name": target,
+                                          "bare_filter_name": target})
+                        stack.extend(node.children)
+                        continue
                 site = self._describe_callee(callee, source)
                 if site is not None:
                     sites.append(site)
@@ -425,6 +451,96 @@ class CallGraphBuilder:
                     or bare in repo_names):
                 filtered.append(site)
         return filtered
+
+    # ------------------------------------------------------------------
+    # #299 (7 of 7): dispatch containers
+    # ------------------------------------------------------------------
+    def _index_expression_base(self, callee: Node, source: bytes) -> Optional[str]:
+        """The base identifier text of an index_expression callee."""
+        for child in callee.children:
+            if child.type == "identifier":
+                return self._text(child, source)
+        return None
+
+    def _array_expression_targets(self, arr, source: bytes, repo_names) -> list:
+        """The bare-ident known-function names an array literal references."""
+        targets = []
+        for child in arr.children:
+            if child.type == "identifier":
+                name = self._text(child, source)
+                if name in repo_names:
+                    targets.append(name)
+        return targets
+
+    def _collect_local_containers(self, root, source: bytes) -> Dict[str, list]:
+        """let NAME: [fn(); N] = [a, b]; -> container map (this caller's body).
+        A rebound name is dropped rather than guessed."""
+        repo_names = set(self._build_name_index()) if not self.functions else {
+            fi.get("name") for fi in self.functions.values() if fi.get("name")}
+        containers: Dict[str, list] = {}
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type == "let_declaration":
+                ident = None
+                arr = None
+                for child in node.children:
+                    if child.type == "identifier" and ident is None:
+                        ident = self._text(child, source)
+                    elif child.type == "array_expression":
+                        arr = child
+                if ident is not None and arr is not None:
+                    if ident in containers:
+                        containers.pop(ident, None)
+                    else:
+                        targets = self._array_expression_targets(arr, source, repo_names)
+                        if targets:
+                            containers[ident] = targets
+            stack.extend(node.children)
+        return containers
+
+    def _file_containers(self, caller_file: str) -> Dict[str, list]:
+        """File-scope static containers (static TBL: [...] = [a, b];), parsed
+        once per file and cached. Abstains (empty) on read/parse failure."""
+        cached = getattr(self, "_file_container_cache", None)
+        if cached is None:
+            cached = {}
+            self._file_container_cache = cached
+        if caller_file in cached:
+            return cached[caller_file]
+        result: Dict[str, list] = {}
+        repo_names = {fi.get("name") for fi in self.functions.values()
+                      if fi.get("name")}
+        try:
+            full = (caller_file if os.path.isabs(caller_file)
+                    else os.path.join(self.repository, caller_file))
+            with open(full, "rb") as fh:
+                source = fh.read()
+            tree = self.parser.parse(source)
+            stack = [tree.root_node]
+            while stack:
+                node = stack.pop()
+                if node.type == "static_item":
+                    ident = None
+                    arr = None
+                    for child in node.children:
+                        if child.type == "identifier" and ident is None:
+                            ident = self._text(child, source)
+                        elif child.type == "array_expression":
+                            arr = child
+                    if ident is not None and arr is not None:
+                        if ident in result:
+                            result.pop(ident, None)
+                        else:
+                            targets = self._array_expression_targets(arr, source,
+                                                                     repo_names)
+                            if targets:
+                                result[ident] = targets
+                stack.extend(node.children)
+        except OSError:
+            result = {}
+        cached[caller_file] = result
+        return result
 
     def _describe_callee(self, callee: Optional[Node], source: bytes) -> Optional[dict]:
         if callee is None:

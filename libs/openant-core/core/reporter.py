@@ -536,6 +536,7 @@ def build_pipeline_output(
         os.path.dirname(os.path.abspath(results_path))
     )
     reachability_warnings: list[str] = []
+    _reach_telemetry: dict = {}
     reachability_filter_applied = _reach is not None
     reachable_units = total_units
     original_units = total_units
@@ -550,6 +551,21 @@ def build_pipeline_output(
         _rf_warning = _reach.get("warning")
         if isinstance(_rf_warning, str) and _rf_warning:
             reachability_warnings.append(_rf_warning)
+        # #301: the prune classification (orphan = missing-edge ROOT
+        # candidate; dead_cluster = downstream shadow) previously reached no
+        # consumer — forward it present-only so pipeline_output carries the
+        # signal that distinguishes genuinely-dead code from missing edges.
+        for _tk in ("pruned_orphan_count", "pruned_in_dead_cluster_count",
+                    "pruned_forward_called_by_reachable_count"):
+            _tv = _reach.get(_tk)
+            if isinstance(_tv, int):
+                _reach_telemetry[_tk] = _tv
+        _bf = _reach.get("pruned_by_file")
+        if isinstance(_bf, dict):
+            _reach_telemetry["pruned_by_file"] = _bf
+        _oa = _reach.get("orphan_advisory")
+        if isinstance(_oa, str) and _oa:
+            _reach_telemetry["orphan_advisory"] = _oa
     elif total_units > 0 and (processing_level or "").lower() not in ("", "all", "none"):
         reachability_warnings.append(
             f"Reachability filtering was requested (level={processing_level!r}) "
@@ -598,6 +614,8 @@ def build_pipeline_output(
             "reachability_filter_applied": reachability_filter_applied,
             "reachability_reduction_percentage": reachability_reduction_percentage,
             "reachability_warnings": reachability_warnings,
+            **_reach_telemetry,
+
             **_verify_scope,
             "units_analyzed": total_units - metrics.get("errors", 0),
             "processing_level": processing_level,

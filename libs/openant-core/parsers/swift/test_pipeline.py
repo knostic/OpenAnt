@@ -264,13 +264,18 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
             # `result[...]`: a pruned graph forces the asymmetry invariant to a
             # manufactured 0. Highest-risk line in this change.
             pruned_ids = sorted(set(functions) - set(filtered_functions))
-            _extra, _asym_warning = compute_prune_telemetry(
+            # #301: third return value = the orphan-rate advisory (its own
+            # key, never the reserved warning slot; core parity).
+            _extra, _asym_warning, _orphan_advisory = compute_prune_telemetry(
                 reachable, pruned_ids, call_graph, reverse_call_graph, output_dir)
             rf.update(_extra)
             if _asym_warning:
                 rf["warning"] = _asym_warning
             if _blackout:            # blackout warning takes precedence (core parity)
                 rf["warning"] = _blackout
+            if _orphan_advisory:
+                rf["orphan_advisory"] = _orphan_advisory
+                print(f"  [Advisory] {_orphan_advisory}", file=sys.stderr)
         result["_reachability_filter"] = rf
     except Exception as _e:          # telemetry is advisory; never break the scan
         print(f"  [Warning] prune telemetry skipped: {_e}", file=sys.stderr)
