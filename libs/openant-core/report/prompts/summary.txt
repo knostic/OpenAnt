@@ -12,7 +12,7 @@ OUTPUT FORMAT:
 **Commit:** {repository.commit_sha or "Not available"}
 **Scan Mode:** {scan_mode_line}
 **Analysis Date:** {date}
-**Application Type:** {app_type} — if `context_source` is "none", render the application type as "unknown (not determined — no application context was generated)" regardless of any app_type value present
+**Application Type:** {app_type} — if `context_source` is "none" AND the app_type value is itself "unknown", render "unknown (not determined — no application context was generated)". An EXPLICIT operator-supplied app_type (e.g. from --app-type) must be rendered as given: an explicit assertion is never overridden by the absent-context rule.
 **Processing Level:** {pipeline_stats.processing_level or "Not available"}
 
 ## Results

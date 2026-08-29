@@ -34,7 +34,8 @@ exists but is malformed it **raises**. This is a deliberate inversion of
 ``check_manual_override``'s catch-all ``except Exception: print(warning); continue``.
 The rationale is asymmetric blast radius: a broken ``OPENANT.md`` degrades to
 LLM-generated context, which is merely worse; a broken ``OPENANT.THREATMODEL.md``
-degrades to the default ``"web_app"`` assumption, which silently inverts the entire
+degrades to an assumed attacker model (historically the fabricated ``"web_app"``
+default — now ``"unknown"`` per #304), which silently inverts the entire
 security model of a scan that the operator explicitly asked to be threat-model driven
 — and the resulting report looks completely successful. A typo must not be able to
 produce a confident, wrong answer.
@@ -815,8 +816,9 @@ def load_threat_model(repo_path: Path | str) -> ApplicationContext | None:
             ``check_manual_override``'s catch-all: absence is a choice, but a
             *present and broken* threat model is an error the operator must see.
             Silently continuing would produce a scan that looks entirely
-            successful while analysing the repository under the default
-            ``"web_app"`` attacker model — the exact opposite of what was asked
+            successful while analysing the repository under an assumed
+            attacker model (the fabricated ``"web_app"`` default pre-#304; ``"unknown"``
+            now) — the exact opposite of what was asked
             for, with no signal anywhere in the output that it happened.
         OSError: Propagated if the file exists but cannot be read (permissions,
             unreadable encoding). Same reasoning: not silently swallowed.

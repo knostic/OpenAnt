@@ -1649,7 +1649,7 @@ def build_parser() -> argparse.ArgumentParser:
     bo_p.add_argument("--repo-url", help="Repository URL")
     bo_p.add_argument("--language", help="Primary language")
     bo_p.add_argument("--commit-sha", help="Commit SHA")
-    bo_p.add_argument("--app-type", help="Application type (default: web_app)")
+    bo_p.add_argument("--app-type", help="Application type (default: unknown — no fabricated assumption)")
     bo_p.add_argument("--processing-level", help="Processing level used")
     bo_p.set_defaults(func=cmd_build_output)
 
