@@ -36,8 +36,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utilities.prune_telemetry import (  # noqa: E402
-    ORPHAN_MIN_PRUNED_FOR_ADVISORY,
-    ORPHAN_RATE_WARN_THRESHOLD,
     compute_prune_telemetry,
 )
 from core.reporter import build_pipeline_output  # noqa: E402
@@ -232,7 +230,6 @@ def test_scanner_aggregate_absent_when_no_telemetry():
 def test_parser_adapter_integration_stores_advisory_in_its_own_key(tmp_path, capsys):
     """Drive the REAL apply_reachability_filter: the advisory lands in its own
     metadata key (NEVER the reserved warning slot) and reaches stderr."""
-    import json
     from core.parser_adapter import apply_reachability_filter
 
     ids = ["f.py:root"] + [f"f.py:o{i}" for i in range(8)] + ["f.py:cr", "f.py:c1"]
@@ -255,7 +252,6 @@ def test_parser_adapter_integration_stores_advisory_in_its_own_key(tmp_path, cap
 
 def test_parser_adapter_no_advisory_no_stderr_noise(tmp_path, capsys):
     """Below the rate: no key, no stderr line."""
-    import json
     from core.parser_adapter import apply_reachability_filter
 
     ids = ["f.py:root", "f.py:a", "f.py:b", "f.py:c"]
