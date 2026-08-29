@@ -32,6 +32,7 @@ Output (JSON):
 """
 
 import json
+import os
 import posixpath
 import re
 import sys
@@ -236,11 +237,31 @@ class CallGraphBuilder:
         # method on an unrelated type.
         local_types = self._collect_receiver_types(tree.root_node, code_bytes)
 
+        # #299 (5 of 7): dispatch containers — a CONSTANT/local assigned a
+        # hash/array of method(:sym) objects or symbols. File-scope containers
+        # (Ruby constants — the common placement) are parsed from the file
+        # (cached); local containers override.
+        containers = dict(self._file_containers(caller_file))
+        containers.update(self._collect_local_containers(tree.root_node, code_bytes))
+
         # Second pass: resolve calls and bare (parenless) identifier calls.
         stack = [tree.root_node]
         while stack:
             node = stack.pop()
             if node.type == 'call':
+                # #299 (5 of 7): container dispatch is MULTI-target (a table
+                # references many functions), so it is resolved here in the
+                # walk rather than in the single-id resolver: `HANDLERS[k].call`
+                # over a KNOWN container, and `send(SYMS[k])` whose argument
+                # element-references a known container. Unknown bases fall
+                # through to normal resolution (and abstain there).
+                if containers:
+                    targets = self._container_dispatch_targets(
+                        node, code_bytes, containers, caller_file, caller_class)
+                    if targets is not None:
+                        calls.update(targets)
+                        stack.extend(reversed(node.children))
+                        continue
                 resolved = self._resolve_call_node(node, code_bytes, caller_file,
                                                    caller_class, caller_module, caller_method,
                                                    method_object_bindings, local_types)
@@ -364,6 +385,139 @@ class CallGraphBuilder:
                 return sym.lstrip(':')
         return None
 
+    # ------------------------------------------------------------------
+    # #299 (5 of 7): dispatch containers (method(:sym) / symbol tables)
+    # ------------------------------------------------------------------
+    def _container_dispatch_targets(self, node, source: bytes,
+                                    containers: Dict[str, Set[str]],
+                                    caller_file: str,
+                                    caller_class: Optional[str]):
+        """Resolve a container-dispatch call to ALL its targets, or None.
+
+        Two shapes: `HANDLERS[k].call` (method call on an element_reference
+        over a known container) and `send(SYMS[k])` (send/public_send whose
+        first argument element-references a known container). Returns None
+        when the node is neither shape (fall through) or the base is not a
+        known container (abstain, no invented edges).
+        """
+        recv_field = node.child_by_field_name('receiver')
+        meth_field = node.child_by_field_name('method')
+        method_name = self._node_str(meth_field, source) if meth_field is not None else None
+
+        base = None
+        if (method_name == 'call' and recv_field is not None
+                and recv_field.type == 'element_reference'):
+            base = self._element_reference_base(recv_field, source)
+        elif method_name in ('send', 'public_send', '__send__'):
+            args = node.child_by_field_name('arguments')
+            if args is not None:
+                for a in args.children:
+                    if a.type == 'element_reference':
+                        base = self._element_reference_base(a, source)
+                        break
+        if base is None or base not in containers:
+            return None
+        resolved = set()
+        for name in sorted(containers[base]):
+            rid = self._resolve_simple_call(name, caller_file, caller_class)
+            if rid:
+                resolved.add(rid)
+        return resolved
+
+    def _element_reference_base(self, elem_ref, source: bytes):
+        """The base name (constant/identifier) of an element_reference."""
+        for child in elem_ref.children:
+            if child.type in ('constant', 'identifier'):
+                return self._node_str(child, source)
+        return None
+
+    def _container_element_names(self, lit, source: bytes) -> Set[str]:
+        """The method(:sym) / :sym names a container literal references.
+
+        Hash literals contribute pair VALUES; array literals contribute
+        their symbol/method elements. Non-function elements resolve to
+        nothing and are naturally ignored (the name gate at dispatch).
+        """
+        names: Set[str] = set()
+        stack = [lit]
+        while stack:
+            n = stack.pop()
+            if n.type == 'pair':
+                # the value is the LAST child (after '=>')
+                if n.children:
+                    value = n.children[-1]
+                    names.update(self._method_call_or_symbol(value, source))
+            elif n.type == 'call':
+                names.update(self._method_call_or_symbol(n, source))
+            elif n.type in ('simple_symbol', 'symbol'):
+                names.add(self._node_str(n, source).lstrip(':'))
+            stack.extend(reversed(n.children))
+        return names
+
+    def _method_call_or_symbol(self, node, source: bytes) -> Set[str]:
+        """A method(:sym) call or bare symbol -> the referenced name(s)."""
+        names: Set[str] = set()
+        if node.type in ('simple_symbol', 'symbol'):
+            names.add(self._node_str(node, source).lstrip(':'))
+            return names
+        if node.type == 'call':
+            callee = None
+            arg_list = None
+            for child in node.children:
+                if child.type == 'identifier' and callee is None:
+                    callee = self._node_str(child, source)
+                elif child.type == 'argument_list':
+                    arg_list = child
+            if callee == 'method' and arg_list is not None:
+                for arg in arg_list.children:
+                    if arg.type in ('simple_symbol', 'symbol'):
+                        names.add(self._node_str(arg, source).lstrip(':'))
+        return names
+
+    def _collect_local_containers(self, root, source: bytes) -> Dict[str, Set[str]]:
+        """name = hash/array of method(:sym)/symbol elements -> container map
+        (within this caller's own body; a rebound name is dropped)."""
+        containers: Dict[str, Set[str]] = {}
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type == 'assignment':
+                lhs = node.children[0] if node.children else None
+                rhs = node.children[-1] if node.children else None
+                if lhs is not None and lhs.type in ('identifier', 'constant') \
+                        and rhs is not None and rhs.type in ('hash', 'array'):
+                    name = self._node_str(lhs, source)
+                    if name in containers:
+                        containers.pop(name, None)  # rebound -> ambiguous
+                        continue
+                    names = self._container_element_names(rhs, source)
+                    if names:
+                        containers[name] = names
+            stack.extend(reversed(node.children))
+        return containers
+
+    def _file_containers(self, caller_file: str) -> Dict[str, Set[str]]:
+        """File-scope CONSTANT containers (the common placement), parsed once
+        per file and cached. Abstains (empty map) on read/parse failure."""
+        cached = getattr(self, '_file_container_cache', None)
+        if cached is None:
+            cached = {}
+            self._file_container_cache = cached
+        if caller_file in cached:
+            return cached[caller_file]
+        result: Dict[str, Set[str]] = {}
+        try:
+            full = (caller_file if os.path.isabs(caller_file)
+                    else os.path.join(self.repo_path, caller_file))
+            with open(full, 'rb') as fh:
+                source = fh.read()
+            tree = self.ruby_parser.parse(source)
+            result = self._collect_local_containers(tree.root_node, source)
+        except OSError:
+            result = {}
+        cached[caller_file] = result
+        return result
+
     def _resolve_bare_identifier(self, node, source: bytes, caller_file: str,
                                  caller_class: Optional[str],
                                  local_vars: Set[str]) -> Optional[str]:
@@ -400,7 +554,8 @@ class CallGraphBuilder:
                            caller_module: Optional[str] = None,
                            caller_method: Optional[str] = None,
                            method_object_bindings: Optional[Dict[str, str]] = None,
-                           local_types: Optional[Dict[str, str]] = None
+                           local_types: Optional[Dict[str, str]] = None,
+                           containers: Optional[Dict[str, Set[str]]] = None
                            ) -> Optional[str]:
         """Resolve a tree-sitter call node to a function ID."""
         # `super(args)` is a call node whose head is a `super` node, not an
