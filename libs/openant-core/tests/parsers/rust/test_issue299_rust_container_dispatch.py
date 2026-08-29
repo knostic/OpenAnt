@@ -39,7 +39,8 @@ def _cg(files: dict):
     out = tempfile.mkdtemp()
     parse_repository(repo, out, language="rust", processing_level="all",
                      skip_tests=True, name="r")
-    return json.load(open(os.path.join(out, "call_graph.json")))
+    with open(os.path.join(out, "call_graph.json")) as fh:
+        return json.load(fh)
 
 
 def _edges(cg, caller_suffix):
