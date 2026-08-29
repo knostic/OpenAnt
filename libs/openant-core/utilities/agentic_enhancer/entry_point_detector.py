@@ -232,8 +232,12 @@ class EntryPointDetector:
     """
     Detects entry points in a codebase where user input enters the application.
 
-    Entry points are the starting points for taint analysis - if vulnerable code
-    is not reachable from any entry point, it cannot be exploited by external users.
+    Entry points are the starting points for reachability filtering. What the
+    filter computes today is call-graph reachability: a unit with no recorded
+    call path from any entry point is dropped — a claim about the parsed
+    call graph, not a proof of unexploitability (an edge the parser did not
+    record produces the same result as dead code). "Taint analysis" is the
+    roadmap framing, not a description of the current filter.
 
     Attributes:
         functions: Dict of func_id -> func_data from extractor
