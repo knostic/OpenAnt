@@ -348,9 +348,11 @@ Entry Point: handle_request()
 Intermediate: process_data()
     │
     ▼
-Target: unsafe_eval()  ← REACHABLE (exploitable)
+Target: unsafe_eval()  ← REACHABLE in the static call graph
 
-Isolated: helper_function()  ← NOT REACHABLE (not exploitable)
+Isolated: helper_function()  ← NOT REACHABLE in the static call graph (no recorded call path
+from any entry point — which is a claim about the parsed call graph, not a proof of
+unexploitability: an edge the parser did not record produces the same result as dead code)
 ```
 
 **Entry points** are functions that directly receive external input:
@@ -503,7 +505,7 @@ if reachability.is_reachable_from_entry_point(func_id):
     print(f"REACHABLE from {entry}")
     print(f"Path: {' → '.join(path)}")
 else:
-    print("NOT REACHABLE - cannot be exploited externally")
+    print("NOT REACHABLE in the static call graph - no recorded call path from any entry point")
 ```
 
 ### Statistics
