@@ -168,29 +168,28 @@ func CheckOpenantInstalled(pythonPath string) error {
 		)
 	}
 
-	// If we're not already using the managed venv, create one and use it.
-	vp := venvPython()
-	if pythonPath != vp {
-		fmt.Fprintln(os.Stderr, "Creating managed Python environment at ~/.openant/venv/...")
-		if err := createVenv(pythonPath); err != nil {
-			return fmt.Errorf(
-				"failed to create venv at %s: %w\n"+
-					"Try manually: %s -m venv %s && %s -m pip install -e %s",
-				venvDir(), err, pythonPath, venvDir(), vp, corePath,
-			)
-		}
-		pythonPath = vp
-	}
-
-	fmt.Fprintf(os.Stderr, "Installing openant from %s...\n", corePath)
 	// #62 (ar7casper): concurrent invocations that both detect a missing
 	// install race pip on the same venv (pip does not support concurrent
-	// writes). Serialize on the OS-level lock, mirroring the JS
-	// bootstrap's .openant-npm-install.lock pattern.
+	// writes) — and BOTH create the venv itself if it is missing. Serialize
+	// the ENTIRE create-then-install sequence on the OS-level lock
+	// (review finding: createVenv previously raced outside it), mirroring
+	// the JS bootstrap's .openant-npm-install.lock pattern.
 	venvRoot := filepath.Dir(venvDir())
 	if err := withVenvInstallLock(venvRoot, func() error {
 		// Re-check under the lock: another process may have finished
-		// installing while we waited (the JS pattern's re-check).
+		// creating+installing while we waited (the JS pattern's re-check).
+		if pythonPath != venvPython() {
+			fmt.Fprintln(os.Stderr, "Creating managed Python environment at ~/.openant/venv/...")
+			if err := createVenv(pythonPath); err != nil {
+				return fmt.Errorf(
+					"failed to create venv at %s: %w\n"+
+						"Try manually: %s -m venv %s && %s -m pip install -e %s",
+					venvDir(), err, pythonPath, venvDir(), venvPython(), corePath,
+				)
+			}
+			pythonPath = venvPython()
+		}
+		fmt.Fprintf(os.Stderr, "Installing openant from %s...\n", corePath)
 		if isOpenantImportable(pythonPath) {
 			return nil
 		}
@@ -539,12 +538,6 @@ func fileExists(path string) bool {
 // venvInstallLockPath returns the lockfile path guarding concurrent pip
 // installs into the managed venv. Mirrors the JS bootstrap's pattern
 // (parser_adapter.py's _file_lock over .openant-npm-install.lock): the
-// lockfile lives next to the install target so it's on the same
-// filesystem, and only the OS-level lock matters for mutual exclusion.
-func venvInstallLockPath() string {
-	return filepath.Join(venvDir(), ".deps-install.lock")
-}
-
 // withVenvInstallLock runs fn under an exclusive lock so two concurrent
 // invocations that both detect a missing or stale install serialize
 // instead of racing pip on the same venv (pip does not support
