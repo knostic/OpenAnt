@@ -183,7 +183,19 @@ func CheckOpenantInstalled(pythonPath string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "Installing openant from %s...\n", corePath)
-	if err := installOpenant(pythonPath, corePath); err != nil {
+	// #62 (ar7casper): concurrent invocations that both detect a missing
+	// install race pip on the same venv (pip does not support concurrent
+	// writes). Serialize on the OS-level lock, mirroring the JS
+	// bootstrap's .openant-npm-install.lock pattern.
+	venvRoot := filepath.Dir(venvDir())
+	if err := withVenvInstallLock(venvRoot, func() error {
+		// Re-check under the lock: another process may have finished
+		// installing while we waited (the JS pattern's re-check).
+		if isOpenantImportable(pythonPath) {
+			return nil
+		}
+		return installOpenant(pythonPath, corePath)
+	}); err != nil {
 		return fmt.Errorf(
 			"failed to install openant from %s:\n  %w\n"+
 				"Try manually: %s -m pip install -e %s",
@@ -351,10 +363,16 @@ func checkDepsStaleWith(pythonPath string, coreFinder func() (string, error)) er
 	}
 
 	fmt.Fprintln(os.Stderr, "Dependencies changed, updating openant installation...")
-	// Known limitation: concurrent invocations that both detect stale deps
-	// will race to pip-install into the same venv. pip does not support
-	// concurrent writes; an OS-level lock would be needed to close this gap.
-	if err := installOpenant(pythonPath, corePath); err != nil {
+	// #62 (ar7casper): the known limitation is closed — concurrent
+	// invocations serialize on the OS-level lock (mirroring the JS
+	// bootstrap), and staleness is re-checked under it.
+	venvRoot := filepath.Dir(venvDir())
+	if err := withVenvInstallLock(venvRoot, func() error {
+		if stale2, _, err2 := depsStaleness(corePath); err2 == nil && !stale2 {
+			return nil
+		}
+		return installOpenant(pythonPath, corePath)
+	}); err != nil {
 		return fmt.Errorf(
 			"failed to update openant dependencies: %w\n"+
 				"Try manually: %s -m pip install -e %s",
@@ -516,4 +534,39 @@ func findOpenantCore() (string, error) {
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
+}
+
+// venvInstallLockPath returns the lockfile path guarding concurrent pip
+// installs into the managed venv. Mirrors the JS bootstrap's pattern
+// (parser_adapter.py's _file_lock over .openant-npm-install.lock): the
+// lockfile lives next to the install target so it's on the same
+// filesystem, and only the OS-level lock matters for mutual exclusion.
+func venvInstallLockPath() string {
+	return filepath.Join(venvDir(), ".deps-install.lock")
+}
+
+// withVenvInstallLock runs fn under an exclusive lock so two concurrent
+// invocations that both detect a missing or stale install serialize
+// instead of racing pip on the same venv (pip does not support
+// concurrent writes: corrupted RECORD files, partial wheel extraction,
+// broken .dist-info metadata).
+//
+// The lock is the same cross-platform shape the JS bootstrap uses
+// (msvcrt.locking on Windows, flock elsewhere) via Go's build-tag
+// split: lock_unix.go / lock_windows.go.
+func withVenvInstallLock(venvDir string, fn func() error) error {
+	lockPath := filepath.Join(venvDir, ".deps-install.lock")
+	if err := os.MkdirAll(venvDir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := lockFileExcl(f); err != nil {
+		return err
+	}
+	defer unlockFile(f)
+	return fn()
 }
