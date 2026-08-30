@@ -102,8 +102,28 @@ def test_agentic_parallel_interrupt_propagates(monkeypatch, tmp_path):
             _dataset(), analyzer_output_path=_analyzer_output(tmp_path), workers=2)
 
 
+def test_single_shot_parallel_interrupt_propagates(monkeypatch):
+    """The single-shot PARALLEL path (the fourth handler) carries the same
+    contract — after cancelling pending futures, it re-raises."""
+    import utilities.context_enhancer as ce
+
+    state = {"calls": 0}
+
+    def fake_enhance_unit(self, unit, all_units):
+        state["calls"] += 1
+        if state["calls"] == 2:
+            raise KeyboardInterrupt
+        unit.setdefault("llm_context", {})["security_classification"] = "neutral"
+
+    monkeypatch.setattr(ce.ContextEnhancer, "enhance_unit", fake_enhance_unit)
+
+    enhancer = ce.ContextEnhancer(_stub_binding(), tracker=_tracker())
+    with pytest.raises(KeyboardInterrupt):
+        enhancer.enhance_dataset(_dataset(), workers=2)
+
+
 def test_single_shot_interrupt_propagates(monkeypatch):
-    """The single-shot enhance loop (both paths) carries the same contract."""
+    """The single-shot enhance loop's sequential path carries the contract."""
     import utilities.context_enhancer as ce
 
     state = {"calls": 0}
