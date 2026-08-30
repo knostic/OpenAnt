@@ -22,7 +22,7 @@ from pathlib import Path
 
 from core.schemas import AnalyzeResult, AnalysisMetrics, UsageInfo
 from core import tracking
-from core.checkpoint import StepCheckpoint
+from core.checkpoint import StepCheckpoint, analyze_result_is_error
 from core.progress import ProgressReporter
 
 # Import existing analysis machinery
@@ -234,10 +234,7 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
     code_by_route = {}
     units_to_process = []
 
-    def _cp_is_error(cp_data):
-        res = cp_data.get("result", {}) if cp_data else {}
-        return res.get("verdict") == "ERROR" or res.get("finding") == "error"
-
+    # Hoisted to module level (testable; mirrors checkpoint.py's predicates).
     for i, unit in enumerate(units):
         uid = unit.get("id", f"unit_{i}")
         cp_data = checkpointed.get(uid)
@@ -337,6 +334,54 @@ def _interrupt_report(results, total):
         f"({not_started} not started); progress saved to checkpoints")
 
 
+def _cp_is_error(cp_data):
+    """Is this checkpointed unit an error (must be re-analyzed, not adopted)?
+
+    Delegates to ``checkpoint.analyze_result_is_error`` — the one shared
+    predicate (load_ids / status / the summary seed below all use it; four
+    hand-copies drifted within one PR).
+    """
+    res = cp_data.get("result", {}) if cp_data else {}
+    return analyze_result_is_error(res)
+
+
+def _seed_summary(existing: dict) -> dict:
+    """Seed the _summary.json counters from checkpointed rows.
+
+    Counts as completed ONLY the rows adoption will keep: an errored row
+    (``analyze_result_is_error``) is re-analyzed and its outcome is owned by
+    ``_summary_callback`` — seeding it here (as completed OR as an error)
+    double-counts on resume (completed + errors > total; the pre-existing
+    verdict=="ERROR" over-count, which #316/#324 was extending to the
+    neither-key shape). Usage tokens accumulate over ALL rows — the spend
+    happened regardless of the row's fate.
+
+    Returns: completed, input_tokens, output_tokens, cost_usd,
+    unpriced_models (the #216 marker).
+    """
+    completed = 0
+    input_tokens = 0
+    output_tokens = 0
+    cost_usd = 0.0
+    unpriced: set = set()
+    for _cp in existing.values():
+        if not analyze_result_is_error(_cp.get("result") or {}):
+            completed += 1
+        _usage = _cp.get("usage", {})
+        input_tokens += _usage.get("input_tokens", 0)
+        output_tokens += _usage.get("output_tokens", 0)
+        cost_usd += _usage.get("cost_usd", 0.0)
+        # #216: restore the incomplete-cost marker from per-unit records.
+        unpriced.update(_usage.get("unpriced_models") or [])
+    return {
+        "completed": completed,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": cost_usd,
+        "unpriced_models": unpriced,
+    }
+
+
 def _count_verdicts(results):
     """Count verdict categories from a results list."""
     counts = {
@@ -353,11 +398,27 @@ def _count_verdicts(results):
         # checkpoint-resume semantics own those units).
         if r is None:
             continue
-        finding = r.get("finding", r.get("verdict", "error").lower())
-        if finding in counts:
-            counts[finding] += 1
-        elif r.get("verdict") == "ERROR":
+        # #324/null-verdict: an INEFFECTIVE finding (absent/None/non-string/
+        # empty) falls back to the verdict, which must itself be an effective
+        # string — the eager ``.lower()`` default crashed post-LLM-spend on
+        # ``{"verdict": null}``.
+        finding = r.get("finding")
+        verdict = r.get("verdict")
+        if not isinstance(finding, str) or not finding.strip():
+            finding = verdict if isinstance(verdict, str) and verdict.strip() else None
+        if finding is None:
+            # Neither an effective finding nor an effective verdict — the
+            # malformed shape (#324; null/empty verdicts): an error, not a
+            # silent drop.
             counts["errors"] += 1
+        elif finding.lower() in counts:
+            counts[finding.lower()] += 1
+        elif verdict == "ERROR" or finding.lower() == "error":
+            # finding=="error" without verdict=="ERROR" (a legacy
+            # half-stamped row): agree with analyze_result_is_error, which
+            # classifies it as an error.
+            counts["errors"] += 1
+        # else: an unrecognized verdict — the documented F13 gap (dropped).
     return counts
 
 
@@ -587,32 +648,20 @@ def run_analysis(
     # Initialize summary tracking for _summary.json
     # Count checkpointed units to seed the counters and sum existing usage
     _existing = checkpoint.load()
-    _summary_completed = 0
-    _summary_errors = 0
     _summary_error_breakdown = {}
-    _summary_input_tokens = 0
-    _summary_output_tokens = 0
-    _summary_cost_usd = 0.0
-    _summary_unpriced: set[str] = set()
     # #293 adjudication: analyze has NO third state — "inconclusive" is a
     # first-class COMPLETED verdict (verdict_taxonomy FINDING_VERDICT_ORDER;
     # the Stage-1 prompt's own enum), not a degenerate no-verdict marker like
     # verify's verification.incomplete or enhance's INCOMPLETE_CLASSIFICATION.
     # The third bucket stays 0 here but is still emitted for shape consistency.
     _summary_incomplete = 0
-    for _uid, _cp in _existing.items():
-        _r = _cp.get("result", {})
-        if _r.get("verdict") == "ERROR" or _r.get("finding") == "error":
-            _summary_errors += 1
-            _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
-        else:
-            _summary_completed += 1
-        _cp_usage = _cp.get("usage", {})
-        _summary_input_tokens += _cp_usage.get("input_tokens", 0)
-        _summary_output_tokens += _cp_usage.get("output_tokens", 0)
-        _summary_cost_usd += _cp_usage.get("cost_usd", 0.0)
-        # #216: restore the incomplete-cost marker from per-unit records.
-        _summary_unpriced.update(_cp_usage.get("unpriced_models") or [])
+    _seed = _seed_summary(_existing)
+    _summary_completed = _seed["completed"]
+    _summary_errors = 0  # errored rows are re-analyzed; _summary_callback owns them
+    _summary_input_tokens = _seed["input_tokens"]
+    _summary_output_tokens = _seed["output_tokens"]
+    _summary_cost_usd = _seed["cost_usd"]
+    _summary_unpriced: set[str] = _seed["unpriced_models"]
 
     def _usage_dict():
         usage = {"input_tokens": _summary_input_tokens,

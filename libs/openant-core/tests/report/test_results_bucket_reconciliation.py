@@ -24,6 +24,13 @@ whose verdict is unrecognized (neither a known bucket nor verdict=="ERROR") from
 ALL buckets, so metrics built from such rows already have sum(buckets) < total. That
 pre-existing gap is documented by `test_count_verdicts_drops_unrecognized_verdict`
 below and is explicitly out of F13's scope.
+
+#316/#324 UPDATE: the NEITHER-KEY shape (a result with no `verdict` and no
+`finding`) is no longer dropped — `_normalize_result` stamps the one error
+shape at the producer, and `_count_verdicts` routes the shape to `errors`
+(the legacy singular-"error" default could never match the "errors" key).
+Unrecognized VERDICT strings (e.g. "SOMETHING_WEIRD") and the mapped-but-
+bucketless `insufficient_context` remain the documented gap above.
 """
 import json
 import sys
@@ -103,12 +110,16 @@ def test_count_verdicts_drops_unrecognized_verdict():
     """DOCUMENTS the pre-existing partition gap F13 does NOT close: a row with an
     unrecognized verdict is dropped from every bucket, so the produced metrics
     already under-sum `total`. Kept as a red-flag guard: if a future change makes
-    _count_verdicts total-preserving, update F13's scope note."""
+    _count_verdicts total-preserving, update F13's scope note.
+
+    #316/#324: the NEITHER-KEY shape is now partitioned into `errors` (see the
+    scope note above); the unrecognized-VERDICT drop remains the gap."""
     rows = [
         {"finding": "vulnerable"},
         {"verdict": "ERROR"},
         {"verdict": "SOMETHING_WEIRD"},  # neither a bucket nor "ERROR" -> dropped
+        {"reasoning": "no verdict keys"},  # neither-key -> counted as an error (#324)
     ]
     counts = _count_verdicts(rows)
-    assert sum(counts.values()) == 2          # only 2 of 3 rows partitioned
-    assert sum(counts.values()) < len(rows)   # the gap is real, and out of F13 scope
+    assert sum(counts.values()) == 3          # 3 of 4 rows partitioned
+    assert sum(counts.values()) < len(rows)   # the unrecognized-verdict gap is real

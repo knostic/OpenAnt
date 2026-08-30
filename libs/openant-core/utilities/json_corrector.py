@@ -260,7 +260,22 @@ class JSONCorrector:
                 if "correct_finding" in extracted and isinstance(extracted["correct_finding"], str):
                     extracted["correct_finding"] = extracted["correct_finding"].lower()
                     if "verdict" not in extracted:
-                        extracted["verdict"] = extracted["correct_finding"].upper()
+                        # #316: an off-enum correct_finding is a malformed
+                        # reply, not a verdict — map through the verify enum
+                        # (_VERIFY_SCHEMA's five) and route anything else to
+                        # ERROR (the caller's not-in-("ERROR", None) gate
+                        # then rejects the correction) instead of
+                        # synthesizing a verdict no consumer recognizes.
+                        _verify_finding_to_verdict = {
+                            "safe": "SAFE",
+                            "protected": "PROTECTED",
+                            "bypassable": "BYPASSABLE",
+                            "vulnerable": "VULNERABLE",
+                            "inconclusive": "INCONCLUSIVE",
+                        }
+                        extracted["verdict"] = _verify_finding_to_verdict.get(
+                            extracted["correct_finding"], "ERROR"
+                        )
 
                 # Normalize finding -> verdict
                 if "verdict" not in extracted and "finding" in extracted:
@@ -271,10 +286,26 @@ class JSONCorrector:
                         "inconclusive": "INCONCLUSIVE",
                         "insufficient_context": "INSUFFICIENT_CONTEXT",
                     }
-                    extracted["verdict"] = mapping.get(finding.lower(), finding.upper())
+                    if not isinstance(finding, str):
+                        # Mirror of analysis_core._normalize_result: a
+                        # non-string finding is a malformed reply — the one
+                        # error shape, not a crash on .lower().
+                        extracted["verdict"] = "ERROR"
+                    else:
+                        # #316: an unrecognized finding string maps to ERROR — a
+                        # failed correction is visible and retried; a synthesized
+                        # verdict is silently uncountable.
+                        extracted["verdict"] = mapping.get(finding.lower(), "ERROR")
 
             # Validate the extracted data has the caller's required fields
-            if all(k in extracted for k in required_keys):
+            if vuln_mode and str(extracted.get("verdict", "")).upper() == "ERROR":
+                # #316: the correction recovered no recognizable verdict (the
+                # mappers' ERROR default) — report failure, not "successful!",
+                # so the log matches what the caller adopts. Case-insensitive:
+                # the extracted verdict is only upper-cased later, by
+                # _normalize_result.
+                print(f"      JSON correction failed: recovered no recognizable verdict", file=sys.stderr)
+            elif all(k in extracted for k in required_keys):
                 extracted["json_corrected"] = True
                 print(f"      JSON correction successful! keys={list(extracted.keys())}", file=sys.stderr)
                 return extracted

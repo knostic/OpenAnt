@@ -51,8 +51,8 @@ def get_stage1_consistency_prompt(findings: list, code_samples: dict) -> str:
         # it stays one inert line. reasoning is prior-stage LLM output (untrusted) and
         # was interpolated raw beside the (now-fenced) code — give it its own
         # length-adaptive fence so it can't inject prompt directives. verdict is
-        # model-derived (analysis_core maps a non-enum finding through .upper(), so a
-        # newline survives) — collapse it too.
+        # model-derived (a raw verdict string still passes through analysis_core's
+        # normalization, so a newline survives) — collapse it too.
         rk_label = collapse_inline(route_key) or "unknown"
         verdict_label = collapse_inline(f.get('verdict', 'unknown')) or "unknown"
         reasoning = str(f.get("reasoning", "N/A"))[:300]
