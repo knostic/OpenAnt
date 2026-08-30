@@ -277,8 +277,16 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
                     unit_elapsed=out["elapsed"],
                 )
         except KeyboardInterrupt:
-            print("[Detect] Interrupted — progress saved to checkpoints",
-                  file=sys.stderr, flush=True)
+            print(_interrupt_report(results, total), file=sys.stderr, flush=True)
+            progress.finish()
+            # #313: stop swallowing the interrupt. The checkpoints are
+            # written (per-unit saves happen in _process_and_save) and the
+            # report is printed; swallowing it made the None placeholders
+            # reach _count_verdicts (AttributeError) and the resulting
+            # error envelope made the Go CLI record the interrupt as a
+            # FAILED scan — the interrupt short-circuit fires only on
+            # empty stdout.
+            raise
         progress.finish()
         return results, code_by_route
 
@@ -307,14 +315,26 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
         print("[Detect] Interrupted — cancelling pending work...",
               file=sys.stderr, flush=True)
         executor.shutdown(wait=False, cancel_futures=True)
-        print("[Detect] Progress saved to checkpoints",
-              file=sys.stderr, flush=True)
+        print(_interrupt_report(results, total), file=sys.stderr, flush=True)
+        progress.finish()
+        raise  # #313: see the sequential handler note
     else:
         executor.shutdown(wait=False)
 
     progress.finish()
 
     return results, code_by_route
+
+
+def _interrupt_report(results, total):
+    """#313: what an interrupted run actually did — N analysed, M not
+    started, checkpoints written. Both numbers derive from the results
+    list (the None placeholders are the not-started units)."""
+    analysed = sum(1 for r in results if r is not None)
+    not_started = total - analysed
+    return (
+        f"[Detect] Interrupted after {analysed}/{total} unit(s) "
+        f"({not_started} not started); progress saved to checkpoints")
 
 
 def _count_verdicts(results):
@@ -328,6 +348,11 @@ def _count_verdicts(results):
         "errors": 0,
     }
     for r in results:
+        # #313: an interrupted run leaves None placeholders for units that
+        # never ran — skip them (an un-run unit is not a verdict; the
+        # checkpoint-resume semantics own those units).
+        if r is None:
+            continue
         finding = r.get("finding", r.get("verdict", "error").lower())
         if finding in counts:
             counts[finding] += 1
