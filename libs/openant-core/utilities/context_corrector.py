@@ -524,6 +524,19 @@ class ContextCorrector:
                 new_result["prompt_length"] = len(prompt)
                 new_result["response_length"] = len(response)
 
+                if new_result.get("verdict") == "ERROR":
+                    # #316 (mirror): the re-analysis recovered no
+                    # recognizable verdict — a FAILED correction, not
+                    # "Correction successful! New verdict: ERROR". Stamp the
+                    # failure on the returned original (every other break in
+                    # this loop does; experiment.py reads correction_status)
+                    # and preserve the garbage reply for manual review.
+                    current_result["correction_attempted"] = True
+                    current_result["correction_status"] = "reanalysis_unrecognized_verdict"
+                    if new_result.get("raw_finding") is not None:
+                        current_result["raw_finding"] = new_result["raw_finding"]
+                    print(f"      Correction failed: re-analysis produced no recognizable verdict", file=sys.stderr)
+                    break
                 if new_result.get("verdict") != "INSUFFICIENT_CONTEXT":
                     # Correction successful
                     new_result["correction_status"] = "success"
@@ -598,8 +611,19 @@ class ContextCorrector:
 
     @staticmethod
     def _normalize_result(result: dict) -> dict:
-        """Normalize finding -> verdict and ensure uppercase."""
-        if "verdict" not in result and "finding" in result:
+        """Normalize finding -> verdict and ensure uppercase.
+
+        #316/#324 mirror of ``core.analysis_core._normalize_result``: an
+        unrecognized, non-string, or absent finding/verdict routes to the
+        one error shape (verdict=ERROR, finding="error", raw preserved) —
+        never a synthesized verdict. (Both-keys-disagreement rows are not
+        reconciled here — same as the core function, a present effective
+        verdict short-circuits the finding branch; that family is the
+        documented F13 residual.)
+        """
+        verdict = result.get("verdict")
+        has_verdict = isinstance(verdict, str) and verdict.strip() != ""
+        if not has_verdict and "finding" in result:
             finding = result["finding"]
             mapping = {
                 "vulnerable": "VULNERABLE", "safe": "SAFE",
@@ -607,7 +631,19 @@ class ContextCorrector:
                 "inconclusive": "INCONCLUSIVE",
                 "insufficient_context": "INSUFFICIENT_CONTEXT",
             }
-            result["verdict"] = mapping.get(finding.lower(), finding.upper())
+            if not isinstance(finding, str):
+                result["raw_finding"] = finding
+                result["finding"] = "error"
+                result["verdict"] = "ERROR"
+            else:
+                v = mapping.get(finding.lower(), "ERROR")
+                if v == "ERROR" and finding.lower() != "error":
+                    result["raw_finding"] = finding
+                    result["finding"] = "error"
+                result["verdict"] = v
+        elif not has_verdict:
+            result["verdict"] = "ERROR"
+            result["finding"] = "error"
         if "verdict" in result and isinstance(result["verdict"], str):
             result["verdict"] = result["verdict"].upper()
         return result

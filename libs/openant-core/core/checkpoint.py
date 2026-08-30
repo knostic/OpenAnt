@@ -41,6 +41,43 @@ SUMMARY_FILE = "_summary.json"
 _RESERVED_FILES = frozenset({SUMMARY_FILE, FINGERPRINT_FILE})
 
 
+def analyze_result_is_error(res) -> bool:
+    """Is an analyze-style ``result`` an error (retried, never adopted as complete)?
+
+    The single shared predicate for every resume-facing consumer
+    (``StepCheckpoint.load_ids``, ``StepCheckpoint.status``, and
+    ``analyzer._cp_is_error`` / the summary seed loop). Four hand-copies of
+    the two-arm test drifted within one PR — keep them in agreement here.
+
+    Error shapes:
+      * ``verdict == "ERROR"`` or ``finding == "error"`` — the explicit error;
+      * neither an EFFECTIVE verdict nor an EFFECTIVE finding — a malformed
+        model reply (#324's JSON-shaped refusal). "Effective" = a non-empty
+        string: a ``{"verdict": null}`` refusal carries the key but no
+        verdict, and must not be counted completed.
+
+    Verdict-first: a row where both keys are present and disagree is
+    classified by its verdict ("ERROR" wins). ``_count_verdicts`` is
+    finding-first — a legacy ``{"verdict": "ERROR", "finding": "vulnerable"}``
+    row is an error here (retried) but counted vulnerable there; the retried
+    outcome replaces it, so the disagreement is transient. An
+    unrecognized-but-effective verdict (``"SAY WHAT"``) is NOT an error here
+    — that drop is the documented F13 partition gap, deliberately out of
+    scope (#316/#324).
+    """
+    if not isinstance(res, dict):
+        # A hand-edited/corrupt "result": null row must not crash the
+        # classifier (status() is the Go CLI's checkpoint-status source).
+        return True
+    verdict = res.get("verdict")
+    finding = res.get("finding")
+    if verdict == "ERROR" or finding == "error":
+        return True
+    has_verdict = isinstance(verdict, str) and verdict.strip() != ""
+    has_finding = isinstance(finding, str) and finding.strip() != ""
+    return not (has_verdict or has_finding)
+
+
 class StepCheckpoint:
     """Manages per-unit checkpoint files for a pipeline step."""
 
@@ -113,7 +150,11 @@ class StepCheckpoint:
                     continue
                 # Analyze: result.verdict/finding
                 result = data.get("result", {})
-                if result.get("verdict") == "ERROR" or result.get("finding") == "error":
+                if "result" in data and analyze_result_is_error(result):
+                    # #324: neither-key / ineffective-verdict rows are
+                    # malformed replies, not completed units. Scoped to
+                    # analyze-style rows ("result" key present) — the other
+                    # three phases never write it.
                     continue
                 # Verify: verification empty or correct_finding == "error"
                 if "verification" in data:
@@ -391,8 +432,7 @@ class StepCheckpoint:
 
             # Analyze-style: result.verdict or result.finding
             elif "result" in data:
-                res = data.get("result", {})
-                if res.get("verdict") == "ERROR" or res.get("finding") == "error":
+                if analyze_result_is_error(data.get("result", {})):
                     is_error = True
                     err_type = "analysis_error"
 

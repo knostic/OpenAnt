@@ -36,14 +36,24 @@ def _normalize_result(result: dict) -> dict:
     Handles cases where the model returns 'finding' instead of 'verdict',
     or uses different casing/naming conventions.
     """
-    # Normalize finding -> verdict
-    if "verdict" not in result and "finding" in result:
+    # Normalize finding -> verdict. A verdict only counts as present when it
+    # is an EFFECTIVE string — {"verdict": null} is the #324 refusal shape
+    # with the key present (a null verdict crashed _count_verdicts' fallback).
+    verdict = result.get("verdict")
+    has_verdict = isinstance(verdict, str) and verdict.strip() != ""
+    if not has_verdict and "finding" in result:
         finding = result["finding"]
         if not isinstance(finding, str):
             # A non-string finding (list/dict/null/number) is a malformed model reply,
             # not a verdict — map it to ERROR so the error / manual-review accounting
             # counts it, instead of a garbage verdict (e.g. "['VULNERABLE']" from
             # str(finding).upper()) that silently escapes that accounting.
+            # #316: stamp BOTH keys (verdict + finding) — the finding-keyed
+            # consumers (_summary_callback, _count_verdicts) would otherwise
+            # disagree with the verdict-keyed ones. Raw value preserved for
+            # manual review.
+            result["raw_finding"] = finding
+            result["finding"] = "error"
             result["verdict"] = "ERROR"
         else:
             finding_to_verdict = {
@@ -54,7 +64,24 @@ def _normalize_result(result: dict) -> dict:
                 "inconclusive": "INCONCLUSIVE",
                 "insufficient_context": "INSUFFICIENT_CONTEXT",
             }
-            result["verdict"] = finding_to_verdict.get(finding.lower(), finding.upper())
+            verdict = finding_to_verdict.get(finding.lower(), "ERROR")
+            if verdict == "ERROR" and finding.lower() != "error":
+                # #316: an unrecognized finding string is a malformed model
+                # reply, not a verdict. Map it to ERROR — counted in `errors`,
+                # retried on resume, manual-review-visible — instead of the
+                # upper-case passthrough that escaped every accounting (the
+                # non-string branch above chose the same direction).
+                result["raw_finding"] = finding
+                result["finding"] = "error"
+            result["verdict"] = verdict
+    elif not has_verdict:
+        # #324: a parsed object with neither an effective verdict NOR a
+        # finding (a JSON-shaped refusal, e.g. {"reasoning": ...}) is not an
+        # analysis. Stamp the one error shape so it is counted in `errors`
+        # (units_analyzed stops overstating) and re-analyzed on resume
+        # instead of adopted as complete.
+        result["verdict"] = "ERROR"
+        result["finding"] = "error"
 
     # Ensure verdict is uppercase
     if "verdict" in result and isinstance(result["verdict"], str):
