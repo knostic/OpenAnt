@@ -123,13 +123,11 @@ def test_excluded_languages_projection_is_a_list_and_filters_optouts():
                            "swift": "no parser for .swift files",
                        }}}, f)
 
-    # replicate the projection's extraction (the inline loop in
-    # cmd_report_data) — the contract: a formatted LIST, opt-outs dropped
-    _excl = _load_step_reports(d)[0]["summary"]["excluded_languages"]
-    _excluded_langs: list = []
-    if isinstance(_excl, dict):
-        _excluded_langs = sorted(
-            f"{lang} ({reason})" for lang, reason in _excl.items()
-            if "not requested" not in str(reason))
-    assert _excluded_langs == ["swift (no parser for .swift files)"]
-    assert isinstance(_excluded_langs, list)  # json.dumps-safe for []string
+    # the REAL helper (the self-audit of this campaign's tests caught this
+    # as a replica-of-inline-code fake: the test used to re-implement the
+    # loop, so a change to the production loop left the test green)
+    from openant.cli import _excluded_languages_for_report
+    summary = _load_step_reports(d)[0]["summary"]
+    excluded = _excluded_languages_for_report(summary)
+    assert excluded == ["swift (no parser for .swift files)"]
+    assert isinstance(excluded, list)  # json.dumps-safe for []string
