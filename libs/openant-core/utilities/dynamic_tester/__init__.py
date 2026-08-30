@@ -53,6 +53,31 @@ def should_skip_for_language(file_path: str, scan_language: str | None) -> tuple
         "skipped instead of generating an untemplated test"
     )
 
+def _summary_counts_from_checkpoints(checkpointed) -> dict:
+    """#311: derive write_summary's counts from the SAVED UNIT FILES.
+
+    The loop previously accumulated `_completed`/`_errors` locally, which
+    (a) bypassed the generation-failure `continue` — an errored run wrote
+    `errors: 0` — and (b) counted errors as a SUBSET of completed while
+    `StepCheckpoint.status()` recomputes them as DISJOINT, so the two
+    sources disagreed even without the bypass. Deriving from the same
+    source `status()` reads makes the two structurally incapable of
+    drifting. The retry contract is unchanged: an ERROR checkpoint is
+    still classified not-done and retried on resume.
+    """
+    if not checkpointed:
+        return {"completed": 0, "errors": 1 if checkpointed is False else 0}
+    completed = errors = 0
+    for cp in checkpointed.values():
+        if not isinstance(cp, dict):
+            continue
+        if cp.get("status") == "ERROR":
+            errors += 1
+        else:
+            completed += 1
+    return {"completed": completed, "errors": errors}
+
+
 def run_dynamic_tests(
     pipeline_output_path: str,
     output_dir: str | None = None,
@@ -168,10 +193,14 @@ def run_dynamic_tests(
     total = len(findings)
     restored = len(successful_ids)
     remaining = total - restored
-    _completed = restored
-    _errors = 0
 
-    # Write initial summary so Go CLI can show accurate counts
+    # Write initial summary so Go CLI can show accurate counts.
+    # #311: DERIVED from the saved unit files (the same source status()
+    # recomputes from) — not loop-local accumulators, which bypassed the
+    # generation-failure path and wrote errors: 0 for errored runs.
+    _counts = _summary_counts_from_checkpoints(checkpointed)
+    _completed = _counts["completed"]
+    _errors = _counts["errors"]
     checkpoint.ensure_dir()
     checkpoint.write_summary(total, _completed, _errors, {}, phase="in_progress")
 
@@ -253,6 +282,14 @@ def run_dynamic_tests(
             results.append(result)
             if checkpoint:
                 checkpoint.save(finding_id, result.to_dict())
+                # #311: the saved ERROR unit file IS the count — derive the
+                # summary from the unit files so this branch can no longer
+                # write errors: 0 for an errored run.
+                _counts = _summary_counts_from_checkpoints(checkpoint.load())
+                _completed = _counts["completed"]
+                _errors = _counts["errors"]
+                checkpoint.write_summary(total, _completed, _errors, {},
+                                         phase="in_progress")
             continue
 
         print(f"  Generated (${generation_cost:.4f}). Running in Docker...",
@@ -330,12 +367,14 @@ def run_dynamic_tests(
         result.generation_output_tokens = unit_usage["output_tokens"]
         results.append(result)
 
-        # Save checkpoint and update summary after each finding
+        # Save checkpoint and update summary after each finding.
+        # #311: the counts are re-derived from the saved unit files (the
+        # checkpoint was just saved, so the derivation includes it).
         if checkpoint:
             checkpoint.save(finding_id, result.to_dict())
-            _completed += 1
-            if result.status == "ERROR":
-                _errors += 1
+            _counts = _summary_counts_from_checkpoints(checkpoint.load())
+            _completed = _counts["completed"]
+            _errors = _counts["errors"]
             checkpoint.write_summary(total, _completed, _errors, {}, phase="in_progress")
 
         print(f"  Result: {result.status} ({result.elapsed_seconds:.1f}s)",
@@ -368,6 +407,10 @@ def run_dynamic_tests(
     # Mark done. Checkpoints are preserved as a permanent artifact alongside
     # results — allows retroactive retry of errored findings after fixes.
     if checkpoint:
-        checkpoint.write_summary(total, _completed, _errors, {}, phase="done")
+        # #311: the final summary derives from the unit files too — the
+        # authoritative record, structurally identical to status().
+        _counts = _summary_counts_from_checkpoints(checkpoint.load())
+        checkpoint.write_summary(total, _counts["completed"],
+                                 _counts["errors"], {}, phase="done")
 
     return results
