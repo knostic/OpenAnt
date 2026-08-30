@@ -561,7 +561,12 @@ def _run_compose(
     finally:
         # Always tear down
         _run_command(
-            compose_base + ["down", "--volumes", "--remove-orphans"],
+            # --rmi local (review finding): down --volumes does NOT remove
+            # images; with the per-run UUID project name, every run leaves
+            # uniquely-named openant-<run_id>-<safe_id>-<service> images
+            # accumulating forever. --rmi local removes the images this
+            # compose project built.
+            compose_base + ["down", "--volumes", "--remove-orphans", "--rmi", "local"],
             timeout=30,
             cwd=work_dir,
         )

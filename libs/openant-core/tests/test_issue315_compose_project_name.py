@@ -56,7 +56,7 @@ def test_project_name_is_a_valid_docker_reference():
     for run_id, finding_id in [("a1b2c3d4", "VULN-001"), ("deadbeef", "XSS in <login>")]:
         safe_id = re.sub(r"[^a-z0-9-]", "-", finding_id.lower()).strip("-_.")
         name = compose_project_name(run_id, safe_id)
-        assert re.fullmatch(r"[a-z0-9][a-z0-9._-]*", name), (finding_id, name)
+        assert re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name), (finding_id, name)  # compose project names forbid dots (review fix)
 
 
 def test_the_call_site_passes_the_run_id():
