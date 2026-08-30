@@ -294,7 +294,16 @@ func depsHash(corePath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(append([]byte(corePath+"\x00"), pyproject...))
+	// #59: the staleness key covers requirements.txt too — installOpenant
+	// now installs it (the exact CI pins), so a pin change must trigger a
+	// reinstall the same way a pyproject change does. A MISSING file is not
+	// an error (the dev-layout degrade path): hash the corePath+pyproject
+	// alone, matching the old key.
+	reqs, reqsErr := os.ReadFile(filepath.Join(corePath, "requirements.txt"))
+	if reqsErr != nil {
+		reqs = nil // degrade: the dev layout without requirements.txt
+	}
+	sum := sha256.Sum256(append(append([]byte(corePath+"\x00"), pyproject...), reqs...))
 	return hex.EncodeToString(sum[:]), nil
 }
 
@@ -382,11 +391,45 @@ func isOpenantImportable(pythonPath string) bool {
 }
 
 // installOpenant runs `python -m pip install -e <corePath>`.
-func installOpenant(pythonPath, corePath string) error {
+// installOpenantCmds builds the commands installOpenant runs (the test seam).
+func installOpenantCmds(pythonPath, corePath string) []*exec.Cmd {
+	// #59 (ar7casper): end-user installs must be DETERMINISTIC — CI runs
+	// `pip install -r requirements.txt && pip install ".[dev]"`, where
+	// requirements.txt carries the EXACT pins. An end user running `openant
+	// scan` today resolves pyproject.toml's FLOOR pins (>=), pulling whatever
+	// PyPI currently serves — so a user hits anthropic==1.2.1 while CI tested
+	// ==1.2.0, and an upstream SDK change lands on users without ever being
+	// exercised in CI. Mirror CI: requirements.txt first (the exact pins),
+	// then the editable install (which must not upgrade what was pinned — pip
+	// does not downgrade pinned deps unless the pin conflicts, and
+	// pyproject's floors are compatible with the pins by construction).
+	reqs := filepath.Join(corePath, "requirements.txt")
+	cmds := []*exec.Cmd{}
+	if _, err := os.Stat(reqs); err == nil {
+		reqCmd := exec.Command(pythonPath, "-m", "pip", "install", "-r", reqs)
+		reqCmd.Stdout = os.Stderr // pip output goes to stderr so it doesn't pollute JSON stdout
+		reqCmd.Stderr = os.Stderr
+		cmds = append(cmds, reqCmd)
+	}
+	// A dev layout without requirements.txt degrades to the old behavior
+	// (the editable install alone) — the staleness check must not error
+	// every run.
 	cmd := exec.Command(pythonPath, "-m", "pip", "install", "-e", corePath)
 	cmd.Stdout = os.Stderr // pip output goes to stderr so it doesn't pollute JSON stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	cmds = append(cmds, cmd)
+	return cmds
+}
+
+// installOpenant mirrors CI: requirements.txt (the exact pins) first, then
+// the editable install.
+func installOpenant(pythonPath, corePath string) error {
+	for _, c := range installOpenantCmds(pythonPath, corePath) {
+		if err := c.Run(); err != nil {
+			return fmt.Errorf("pip install failed (%v): %w", c.Args, err)
+		}
+	}
+	return nil
 }
 
 // PipUninstall returns an *exec.Cmd that runs `python -m pip uninstall openant -y`.
