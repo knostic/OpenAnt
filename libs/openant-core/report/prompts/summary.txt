@@ -70,9 +70,9 @@ OUTPUT FORMAT:
 [For each VULNERABLE finding where stage2_verdict is "confirmed" or "agreed", one row.]
 [If no vulnerabilities were confirmed, write: "No vulnerabilities were confirmed."]
 
-| # | Vulnerability | Location | CWE | Verified |
-|---|--------------|----------|-----|----------|
-| 1 | {short_name} | {file:function} | CWE-{n} | {static|verified|dynamic} |
+| # | Vulnerability | Location | CWE | Severity | Verified |
+|---|--------------|----------|-----|----------|----------|
+| 1 | {short_name} | {file:function} | CWE-{n} | {severity} | {static|verified|dynamic} |
 
 ## False Positives Eliminated
 
@@ -98,6 +98,7 @@ INSTRUCTIONS:
 - If a count is zero, still show "0" in the table
 - Keep "Reason" column under 15 words
 - "Verified" column: "dynamic" if dynamic_testing exists for that finding, "verified" if stage2_verdict is "confirmed" or "agreed" (Stage 2 attacker simulation passed), else "static"
+- "Severity" column: the finding's `severity` field from the input data (critical / high / medium / low); if absent, write the empty cell
 - Language comes from repository.language
 - Commit SHA comes from repository.commit_sha; if null or missing, write "Not available"
 - Scan Mode is derived from the top-level `diff` field on the input data:

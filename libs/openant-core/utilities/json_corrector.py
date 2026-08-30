@@ -30,6 +30,7 @@ from .llm import PhaseBinding, simple_text
 _VULN_SCHEMA = """{
     "verdict": "VULNERABLE" | "SAFE" | "INSUFFICIENT_CONTEXT",
     "confidence": 0.0-1.0,
+    "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
     "vulnerabilities": [
         {
             "type": "SQL Injection | XSS | Command Injection | Path Traversal | Open Redirect | XXE | Insecure Deserialization | Broken Access Control | Other",

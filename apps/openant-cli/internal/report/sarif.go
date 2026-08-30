@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -165,20 +166,39 @@ func sarifRulesFor(data ReportData) ([]map[string]any, map[string]int) {
 		descByVerdict[c.Verdict] = c.Description
 	}
 
+	// #215: rules stay ONE PER VERDICT — the ruleId is the alert's identity
+	// in GitHub Code Scanning (a finding whose severity model-flips between
+	// runs must NOT move rules: close+reopen would discard accumulated
+	// dismissal/triage state; wave round-2 reverted the per-severity fanout
+	// for exactly this). The numeric security-severity — which Code Scanning
+	// reads from the RULE's properties — is the verdict's MAX finding
+	// severity: coarse per-rule ranking without identity churn. The
+	// per-finding label stays on the result (filterable).
 	seen := make(map[string]int)
-	rules := make([]map[string]any, 0)
+	maxSev := make(map[string]string)
 	for _, f := range data.Findings {
 		v := normalizedVerdict(f.Verdict)
-		if _, ok := seen[v]; ok {
-			continue
+		if _, ok := seen[v]; !ok {
+			seen[v] = len(seen)
 		}
-		seen[v] = len(rules)
-
+		if s := severityRank(f.Severity); s > severityRank(maxSev[v]) {
+			maxSev[v] = severityLabel(f.Severity)
+		}
+	}
+	rules := make([]map[string]any, 0, len(seen))
+	for v := range seen {
 		desc := descByVerdict[v]
 		if desc == "" {
 			desc = fmt.Sprintf("Finding with verdict %q.", v)
 		}
-
+		props := map[string]any{
+			"verdict": v,
+			"tags":    []string{"security", "openant"},
+		}
+		if maxSev[v] != "" {
+			props["severity"] = maxSev[v]
+			props["security-severity"] = securitySeverityFor(maxSev[v])
+		}
 		rules = append(rules, map[string]any{
 			"id":   "openant.verdict." + v,
 			"name": "OpenAntVerdict_" + strings.ReplaceAll(v, "-", "_"),
@@ -191,13 +211,14 @@ func sarifRulesFor(data ReportData) ([]map[string]any, map[string]int) {
 			"defaultConfiguration": map[string]any{
 				"level": sarifLevelForVerdict(v),
 			},
-			"properties": map[string]any{
-				"verdict": v,
-				"tags":    []string{"security", "openant"},
-			},
+			"properties": props,
 		})
 	}
-
+	// deterministic order for the rules array (map iteration is random)
+	sort.Slice(rules, func(i, j int) bool {
+		return seen[rules[i]["id"].(string)[len("openant.verdict."):]] <
+			seen[rules[j]["id"].(string)[len("openant.verdict."):]]
+	})
 	return rules, seen
 }
 
@@ -229,6 +250,19 @@ func sarifResultFor(f Finding, ruleIndex map[string]int) map[string]any {
 	props := map[string]any{
 		"verdict":  v,
 		"function": f.Function,
+	}
+	// #215: the severity label (+ source) on the result (filterable). The
+	// numeric security-severity lives on the RULE — the verdict's MAX
+	// finding severity, so the alert's rule identity stays STABLE (a
+	// per-severity fanout would re-key alerts on every severity flip and
+	// discard Code Scanning triage state; wave round-2 reverted it). The
+	// SARIF level itself stays verdict-based — level is visibility,
+	// severity is rank.
+	if severityLabel(f.Severity) != "" {
+		props["severity"] = severityLabel(f.Severity)
+		if f.SeveritySource != "" {
+			props["severity_source"] = f.SeveritySource
+		}
 	}
 	if f.DynamicTestStatus != "" {
 		props["dynamicTestStatus"] = f.DynamicTestStatus
@@ -310,6 +344,48 @@ func findingMessage(f Finding) string {
 // existing fingerprints.
 func fingerprintFor(f Finding, verdict string) string {
 	return fmt.Sprintf("%s|%s|%s", f.File, f.Function, verdict)
+}
+
+// severityLabel sanitizes the model/projected severity onto the canonical
+// enum — anything else (including empty) is "no severity" and emits nothing.
+func severityLabel(sev string) string {
+	switch sev {
+	case "critical", "high", "medium", "low":
+		return sev
+	}
+	return ""
+}
+
+// severityRank orders the labels for the per-verdict max (0 = none).
+func severityRank(sev string) int {
+	switch severityLabel(sev) {
+	case "low":
+		return 1
+	case "medium":
+		return 2
+	case "high":
+		return 3
+	case "critical":
+		return 4
+	}
+	return 0
+}
+
+// securitySeverityFor maps a severity label onto GitHub Code Scanning's
+// numeric security-severity convention (labels rank; the mapping is
+// display-oriented, not a CVSS score).
+func securitySeverityFor(sev string) string {
+	switch sev {
+	case "critical":
+		return "9.0"
+	case "high":
+		return "7.5"
+	case "medium":
+		return "5.0"
+	case "low":
+		return "2.5"
+	}
+	return ""
 }
 
 // sarifLevelForVerdict maps an OpenAnt verdict to a SARIF result.level.

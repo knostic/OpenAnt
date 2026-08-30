@@ -20,6 +20,8 @@ import json
 from typing import TYPE_CHECKING
 from datetime import datetime
 
+from core.verdict_taxonomy import SEVERITIES, _SEVERITIES
+
 from prompts.prompt_selector import get_analysis_prompt
 from prompts.vulnerability_analysis import get_system_prompt as get_stage1_system_prompt
 from utilities.context_reviewer import ContextReviewer
@@ -86,6 +88,33 @@ def _normalize_result(result: dict) -> dict:
     # Ensure verdict is uppercase
     if "verdict" in result and isinstance(result["verdict"], str):
         result["verdict"] = result["verdict"].upper()
+
+    # #215: a rankable severity, FINDING-ONLY — stamped AFTER the verdict
+    # decision, and only for the finding verdicts (VULNERABLE/BYPASSABLE).
+    # Severity validation never produces the error shape and never touches
+    # the error key (the #426 composition invariant: analyze_result_is_error
+    # and _count_verdicts are keyed on verdict/finding only, and
+    # is_retryable_error never sees severity). Every OTHER row — ERROR
+    # (an analysis failure, not a finding), and safe/protected/inconclusive
+    # (no finding to rank; the prompt itself says null) — carries NO
+    # severity: a "low" on a safe unit would defeat the triage filter the
+    # reporter asked for (severity=low must not return non-findings).
+    if result.get("verdict") in ("VULNERABLE", "BYPASSABLE"):  # the finding verdicts (SEVERITY_FINDING_VERDICTS, uppercased)
+        sev = result.get("severity")
+        if isinstance(sev, str) and sev.strip().lower() in _SEVERITIES:
+            result["severity"] = sev.strip().lower()
+            result["severity_source"] = "model"
+        else:
+            # Derive conservatively: a verdict cannot know criticality, so
+            # no derived "critical"; vulnerable is high, bypassable medium.
+            # Stage-2 reclassifications and model omissions land here — the
+            # read-time sites RE-DERIVE from the final verdict, so a stale
+            # Stage-1 stamp never outranks the final one.
+            result["severity"] = "high" if result["verdict"] == "VULNERABLE" else "medium"
+            result["severity_source"] = "derived"
+    else:
+        result.pop("severity", None)
+        result.pop("severity_source", None)
 
     # Ensure CWE fields are always present.
     if "cwe_id" not in result:
@@ -319,6 +348,15 @@ def analyze_unit(
         corrected = json_corrector.attempt_correction(response)
         corrected = _normalize_result(corrected)
         if corrected.get("verdict") not in ("ERROR", None):
+            # #215: the severity on a JSON-repaired record carries its own
+            # provenance. ONLY a model-supplied enum value (what
+            # _normalize_result stamps "model") becomes "corrected" — a
+            # DERIVED stamp stays derived, or the restamp would defeat the
+            # read-time re-derivation (wave round-2: the unconditional
+            # "severity" in corrected fired on EVERY finding row).
+            if (corrected.get("json_corrected")
+                    and corrected.get("severity_source") == "model"):
+                corrected["severity_source"] = "corrected"
             result = corrected
 
     result["route_key"] = route_key

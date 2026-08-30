@@ -529,3 +529,119 @@ func TestSARIFPartialWithoutCountsDegradesVisibly(t *testing.T) {
 		t.Errorf("the degraded-status notification must appear; got %v", texts)
 	}
 }
+
+// #215: the severity label threads onto the RESULT properties (filterable),
+// while the numeric security-severity — what GitHub Code Scanning ranks by —
+// lives on the RULE (reportingDescriptor.properties) as the verdict's MAX
+// finding severity, with STABLE one-rule-per-verdict ids. Level stays
+// verdict-based.
+func TestBuildSARIF_SeverityProperties(t *testing.T) {
+	data := sarifFixtureData()
+	data.Findings[0].Severity = "high"
+	data.Findings[0].SeveritySource = "model"
+	got := BuildSARIF(data, SARIFOptions{})
+	run := got["runs"].([]any)[0].(map[string]any)
+	results := run["results"].([]map[string]any)
+
+	// the result: the label (+ source), no numeric property (that is the rule's)
+	props := results[0]["properties"].(map[string]any)
+	if props["severity"] != "high" {
+		t.Errorf("result severity property: got %v, want high", props["severity"])
+	}
+	if props["severity_source"] != "model" {
+		t.Errorf("result severity_source: got %v, want model", props["severity_source"])
+	}
+	if _, ok := props["security-severity"]; ok {
+		t.Error("security-severity belongs to the RULE, not the result")
+	}
+	// STABLE rule id — the alert's identity (no per-severity fanout: a
+	// severity flip between runs must not move rules and discard Code
+	// Scanning triage state)
+	if results[0]["ruleId"] != "openant.verdict.vulnerable" {
+		t.Errorf("ruleId: got %v, want openant.verdict.vulnerable (stable)", results[0]["ruleId"])
+	}
+
+	// the RULE carries the verdict's MAX finding severity where Code Scanning reads it
+	rules := run["tool"].(map[string]any)["driver"].(map[string]any)["rules"].([]map[string]any)
+	var vulnRule map[string]any
+	for _, r := range rules {
+		if r["id"] == "openant.verdict.vulnerable" {
+			vulnRule = r
+		}
+	}
+	if vulnRule == nil {
+		t.Fatal("the vulnerable rule was not built")
+	}
+	rp := vulnRule["properties"].(map[string]any)
+	if rp["security-severity"] != "7.5" {
+		t.Errorf("rule security-severity: got %v, want 7.5", rp["security-severity"])
+	}
+	if rp["severity"] != "high" {
+		t.Errorf("rule severity: got %v, want high", rp["severity"])
+	}
+	// the MAX: a critical sibling raises the rule (coarse ranking, stable identity)
+	data.Findings = append(data.Findings, Finding{
+		Number: 3, Verdict: "vulnerable", File: "x.py", Function: "f",
+		Severity: "critical", SeveritySource: "model"})
+	got3 := BuildSARIF(data, SARIFOptions{})
+	rules3 := got3["runs"].([]any)[0].(map[string]any)["tool"].(map[string]any)["driver"].(map[string]any)["rules"].([]map[string]any)
+	n := 0
+	for _, r := range rules3 {
+		if r["id"].(string) == "openant.verdict.vulnerable" {
+			n++
+			rp3 := r["properties"].(map[string]any)
+			if rp3["security-severity"] != "9.0" {
+				t.Errorf("max severity: got %v, want 9.0", rp3["security-severity"])
+			}
+		}
+	}
+	if n != 1 {
+		t.Errorf("one rule per verdict (no fanout), got %d vulnerable rules", n)
+	}
+
+	// an unknown/absent severity: no result label
+	if _, ok := results[1]["properties"].(map[string]any)["severity"]; ok {
+		t.Error("a finding without severity must not carry a severity property")
+	}
+	// a non-canonical severity is sanitized to empty — no label
+	data.Findings[1].Severity = "weird"
+	got2 := BuildSARIF(data, SARIFOptions{})
+	results2 := got2["runs"].([]any)[0].(map[string]any)["results"].([]map[string]any)
+	if _, ok := results2[1]["properties"].(map[string]any)["severity"]; ok {
+		t.Error("a non-canonical severity must emit no label")
+	}
+}
+
+func TestSecuritySeverityFor(t *testing.T) {
+	cases := map[string]string{
+		"critical": "9.0",
+		"high":     "7.5",
+		"medium":   "5.0",
+		"low":      "2.5",
+		"":         "",
+		"weird":    "",
+	}
+	for in, want := range cases {
+		if got := securitySeverityFor(in); got != want {
+			t.Errorf("securitySeverityFor(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Deep-refute #2: the Python→Go key contract — the projection's
+// "severity"/"severity_source" must match the struct tags, or the wiring
+// silently drops the values.
+func TestFindingJSONTags(t *testing.T) {
+	f := Finding{Severity: "high", SeveritySource: "model"}
+	b, err := json.Marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["severity"] != "high" || m["severity_source"] != "model" {
+		t.Errorf("the json tags must be severity/severity_source; got %v", m)
+	}
+}

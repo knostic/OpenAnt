@@ -307,7 +307,7 @@ python generate_report.py <experiment.json> <dataset.json> [output.html]
 
 ### CSV Export
 
-Ten columns for filtering and sorting:
+Twelve columns for filtering and sorting:
 
 | Column | Description |
 |--------|-------------|

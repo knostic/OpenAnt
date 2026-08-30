@@ -597,6 +597,12 @@ class ContextCorrector:
                     corrected = self._normalize_result(corrected)
                     if corrected.get("verdict") not in ("ERROR", None):
                         corrected["json_corrected"] = True
+                        # #215 mirror of analyze_unit: only a MODEL-supplied
+                        # severity value becomes "corrected" (the extraction
+                        # prompt can fabricate the field); a derived stamp
+                        # stays derived.
+                        if corrected.get("severity_source") == "model":
+                            corrected["severity_source"] = "corrected"
                         return corrected
                 except Exception:
                     pass
@@ -646,6 +652,23 @@ class ContextCorrector:
             result["finding"] = "error"
         if "verdict" in result and isinstance(result["verdict"], str):
             result["verdict"] = result["verdict"].upper()
+        # #215 mirror: the finding-gated severity stamp, AFTER the uppercase
+        # fold (core's order — stamping before it lost a model severity on a
+        # lowercase-verdict reply, wave round-2). The shared enum comes from
+        # verdict_taxonomy so the twin cannot drift.
+        from core.verdict_taxonomy import SEVERITIES as _SEVS
+        if result.get("verdict") in ("VULNERABLE", "BYPASSABLE"):  # SEVERITY_FINDING_VERDICTS, uppercased
+            sev = result.get("severity")
+            if isinstance(sev, str) and sev.strip().lower() in _SEVS:
+                result["severity"] = sev.strip().lower()
+                result["severity_source"] = "model"
+            else:
+                result["severity"] = ("high" if result["verdict"] == "VULNERABLE"
+                                      else "medium")
+                result["severity_source"] = "derived"
+        else:
+            result.pop("severity", None)
+            result.pop("severity_source", None)
         return result
 
 

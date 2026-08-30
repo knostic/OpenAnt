@@ -41,6 +41,19 @@ FINDING_VERDICT_ORDER = (
 # / ``finding == "error"``). Not part of the ordered display list.
 ERROR_VERDICT = "error"
 
+# --- #215: finding severity ---------------------------------------------------
+# The canonical severity enum — the same four levels the JSON corrector's
+# legacy _VULN_SCHEMA has carried since inception. FINDING-ONLY: a row whose
+# verdict is not a finding verdict carries NO severity. Lives here (a leaf
+# module) so every importer — analysis_core, reporter, csv_export, cli, the
+# context corrector twin — shares one definition without pulling the LLM
+# stack into a standalone exporter.
+SEVERITIES = ("critical", "high", "medium", "low")
+_SEVERITIES = frozenset(SEVERITIES)
+
+# The verdicts that carry a severity (see SEVERITIES above).
+SEVERITY_FINDING_VERDICTS = ("vulnerable", "bypassable")
+
 # --- Stage-2 verification verdicts -------------------------------------------
 # ``core/reporter.py`` maps the Stage-2 ``verification`` dict onto these.
 STAGE2_VERDICTS = frozenset({

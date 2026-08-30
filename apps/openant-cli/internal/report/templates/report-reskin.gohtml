@@ -313,6 +313,7 @@
                             <details id="finding-{{$f.Number}}" class="bg-knostic-card-bg border border-knostic-border-light rounded-lg group card-hover">
                                 <summary class="flex flex-wrap items-center gap-2 sm:gap-3 px-4 sm:px-5 py-3 hover:bg-knostic-purple-light rounded-lg transition-colors">
                                     <span class="text-knostic-muted text-xs font-mono font-medium w-8">#{{$f.Number}}</span>
+                                    {{if $f.Severity}}<span class="inline-block px-2 py-0.5 rounded text-[10px] font-semibold text-white uppercase" style="background-color: {{$f.SeverityColor}}" title="severity source: {{$f.SeveritySource}}">{{$f.Severity}}</span>{{end}}
                                     {{if $f.HasDynamicTest}}<span class="inline-block px-2 py-0.5 rounded text-[10px] font-semibold text-white" style="background-color: {{$f.DynamicTestColor}}">{{$f.DynamicTestStatus}}</span>{{end}}
                                     {{$url := $.FileURL $f.File}}{{if $url}}<a href="{{$url}}" target="_blank" rel="noopener" class="text-xs bg-white border border-knostic-border-light px-2 py-1 rounded text-knostic-purple hover:text-knostic-purple-hover transition-colors" onclick="event.stopPropagation()">{{$f.File}}</a>{{else}}<code class="text-xs bg-white border border-knostic-border-light px-2 py-1 rounded text-knostic-navy">{{$f.File}}</code>{{end}}
                                     <span class="font-mono text-xs text-knostic-muted">{{$f.Function}}</span>
@@ -330,6 +331,7 @@
                         <details id="finding-{{$f.Number}}" class="bg-knostic-card-bg border border-knostic-border-light rounded-lg group card-hover">
                             <summary class="flex flex-wrap items-center gap-2 sm:gap-3 px-4 sm:px-5 py-3 hover:bg-knostic-purple-light rounded-lg transition-colors">
                                 <span class="text-knostic-muted text-xs font-mono font-medium w-8">#{{$f.Number}}</span>
+                                {{if $f.Severity}}<span class="inline-block px-2 py-0.5 rounded text-[10px] font-semibold text-white uppercase" style="background-color: {{$f.SeverityColor}}" title="severity source: {{$f.SeveritySource}}">{{$f.Severity}}</span>{{end}}
                                 {{if $f.HasDynamicTest}}<span class="inline-block px-2 py-0.5 rounded text-[10px] font-semibold text-white" style="background-color: {{$f.DynamicTestColor}}">{{$f.DynamicTestStatus}}</span>{{end}}
                                 {{$url := $.FileURL $f.File}}{{if $url}}<a href="{{$url}}" target="_blank" rel="noopener" class="text-xs bg-white border border-knostic-border-light px-2 py-1 rounded text-knostic-purple hover:text-knostic-purple-hover transition-colors" onclick="event.stopPropagation()">{{$f.File}}</a>{{else}}<code class="text-xs bg-white border border-knostic-border-light px-2 py-1 rounded text-knostic-navy">{{$f.File}}</code>{{end}}
                                 <span class="font-mono text-xs text-knostic-muted">{{$f.Function}}</span>

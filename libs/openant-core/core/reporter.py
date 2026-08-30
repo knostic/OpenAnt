@@ -22,6 +22,7 @@ from pathlib import Path
 from core.schemas import ReportResult
 from core.language_registry import fence_for_path
 from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
+from core.verdict_taxonomy import SEVERITIES, SEVERITY_FINDING_VERDICTS
 from utilities.child_interp import child_interpreter_env
 from utilities.file_io import normalize_results, open_utf8, read_json, write_json
 
@@ -251,6 +252,35 @@ def _load_reachability_metadata(scan_dir: str) -> dict | None:
         return None
     rf = metadata.get("reachability_filter")
     return rf if isinstance(rf, dict) else None
+
+
+def _severity_fields(finding: dict) -> dict:
+    """#215: the severity + severity_source record fields for one finding.
+
+    FINDING-ONLY: rows whose final verdict is not vulnerable/bypassable
+    carry NO severity (a "low" on a safe unit defeats the triage filter the
+    reporter asked for). A model-supplied value threads present-only; a
+    DERIVED value is RE-DERIVED from the FINAL verdict — Stage 2 reclassifies
+    (finding_verifier rewrites `finding` in three places), and a stale
+    Stage-1 stamp must not outrank the final verdict. Old artifacts that
+    carry no severity at all land in the same derivation.
+    """
+    verdict = str(finding.get("finding") or finding.get("verdict") or "").strip().lower()
+    if verdict not in SEVERITY_FINDING_VERDICTS:
+        return {}
+    sev = finding.get("severity")
+    source = finding.get("severity_source")
+    # ONLY a model-supplied value keeps its rank: a corrected value rides a
+    # JSON repair whose extraction prompt may have fabricated it
+    # (conservative-default), and a derived value went stale when Stage 2
+    # reclassified the row — both re-derive from the FINAL verdict, with
+    # their provenance labels preserved.
+    if sev in SEVERITIES and source == "model":
+        return {"severity": sev, "severity_source": "model"}
+    derived = "high" if verdict == "vulnerable" else "medium"
+    return {"severity": derived,
+            "severity_source": (source if source in ("corrected", "derived")
+                               else "derived")}
 
 
 def build_pipeline_output(
@@ -508,6 +538,12 @@ def build_pipeline_output(
                if finding.get("confidence") is not None else {}),
             **({"json_corrected": finding["json_corrected"]}
                if finding.get("json_corrected") is not None else {}),
+            # #215: a rankable severity on EVERY finding. Present-only for a
+            # model/stamped value; the READ-TIME derivation covers OLD
+            # artifacts (pre-#215 results_verified.json, resumed pre-PR
+            # checkpoints) so every scan ranks on the new surfaces — with
+            # severity_source recording which happened.
+            **_severity_fields(finding),
             "description": description,
             "vulnerable_code": vulnerable_code,
             "vulnerable_code_section": vulnerable_code_section,

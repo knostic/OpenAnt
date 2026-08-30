@@ -31,6 +31,35 @@ import os
 import sys
 from utilities.file_io import normalize_results, read_json
 
+from core.verdict_taxonomy import SEVERITIES as _SEVERITIES, SEVERITY_FINDING_VERDICTS
+
+
+def _severity_source_for(result: dict) -> str:
+    """The provenance matching _severity_for ("" when no severity)."""
+    if _severity_for(result) == "":
+        return ""
+    src = result.get("severity_source")
+    if result.get("severity") in _SEVERITIES and src == "model":
+        return "model"
+    return src if src in ("corrected", "derived") else "derived"
+
+
+def _severity_for(result: dict) -> str:
+    """#215: the severity for one CSV row — FINDING-ONLY (empty for
+    non-findings, so severity=low does not return safe/ERROR units); a
+    model value keeps; a derived value RE-DERIVES from the final verdict
+    (Stage 2 reclassifies; a stale Stage-1 stamp must not outrank it)."""
+    verdict = str(result.get("finding") or result.get("verdict") or "").strip().lower()
+    if verdict not in SEVERITY_FINDING_VERDICTS:
+        return ""
+    sev = result.get("severity")
+    src = result.get("severity_source")
+    # ONLY a model value keeps its rank (corrected rides a possibly-
+    # fabricated repair; derived went stale under Stage-2 reclassification).
+    if sev in _SEVERITIES and src == "model":
+        return sev
+    return "high" if verdict == "vulnerable" else "medium"
+
 # Characters that make a spreadsheet treat a cell as a formula on open (CSV / formula
 # injection, CWE-1236 / OWASP). Cells written from scanned source or LLM text must be
 # neutralized so opening the export in Excel / Google Sheets can't execute a payload.
@@ -176,6 +205,11 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
             'unit_id': route_key,
             'unit_description': llm_context.get('reasoning', '')[:500] if llm_context.get('reasoning') else '',
             'unit_code': unit_code,
+            # #215: the rankable severity — the stamped/model value, or the
+            # same conservative derivation the reporter applies (so an old
+            # scan's CSV still ranks).
+            'severity': _severity_for(result),
+            'severity_source': _severity_source_for(result),
             'stage2_verdict': stage2_verdict,
             'stage2_justification': verification.get('explanation', ''),
             'stage1_verdict': stage1_verdict,
@@ -192,6 +226,8 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
         'unit_id',
         'unit_description',
         'unit_code',
+        'severity',
+        'severity_source',
         'stage2_verdict',
         'stage2_justification',
         'stage1_verdict',

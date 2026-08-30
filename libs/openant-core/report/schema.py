@@ -25,6 +25,10 @@ class Finding:
     suggested_fix: Optional[str] = None
     steps_to_reproduce: Optional[list] = None
     rejection_reason: Optional[str] = None
+    # #215: a rankable severity + its provenance. Optional and NOT required —
+    # old artifacts (pre-#215 scans) must validate.
+    severity: Optional[str] = None
+    severity_source: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "Finding":
@@ -46,6 +50,8 @@ class Finding:
             suggested_fix=data.get("suggested_fix"),
             steps_to_reproduce=data.get("steps_to_reproduce"),
             rejection_reason=data.get("rejection_reason"),
+            severity=data.get("severity"),
+            severity_source=data.get("severity_source"),
         )
 
 
