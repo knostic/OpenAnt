@@ -186,6 +186,11 @@ class CallGraphBuilder:
         # Local variable -> constructor-type map, so that `v = ClassName(); v.method()`
         # dispatches to the bound type's method.
         local_types = self._collect_local_types(tree)
+        # #309 (item 4): a type-annotated parameter carries its receiver
+        # type in the signature — consult it (a local Assign binding still
+        # wins, matching Python's own scoping).
+        for pname, ptype in self._collect_annotated_params(tree).items():
+            local_types.setdefault(pname, ptype)
         # Receiver names that refer to the current instance/class: self/cls plus any
         # local name single-bound to them (obj = self; obj.method()).
         self_aliases = {'self', 'cls'} | self._collect_self_aliases(tree)
@@ -212,6 +217,25 @@ class CallGraphBuilder:
         containers.update(local_map)
 
         for node in ast.walk(tree):
+            # #309 (item 3): a @property READ (an ast.Attribute in Load
+            # context — the idiomatic use) emits a reference edge when the
+            # receiver's type is known and the attribute resolves to a
+            # unit classified as a property. A property reached only by
+            # reads is otherwise indistinguishable from dead code. A CALL
+            # through the property (w.secret_prop()) is an ast.Call and
+            # resolves through the normal path above — this handles the
+            # read alone.
+            if isinstance(node, ast.Attribute):
+                value = node.value
+                if (isinstance(value, ast.Name)
+                        and isinstance(node.ctx, ast.Load)
+                        and value.id in local_types):
+                    typed = self._resolve_class_method(
+                        local_types[value.id], node.attr, caller_file)
+                    if typed:
+                        func_data = self.functions.get(typed, {})
+                        if func_data.get('unit_type') == 'property':
+                            calls.add(typed)
             if isinstance(node, ast.Call):
                 resolved = self._resolve_call_node(node, caller_file, caller_class, local_types, aliases, self_aliases)
                 if resolved:
@@ -281,6 +305,24 @@ class CallGraphBuilder:
             if isinstance(node, self._SCOPE_NODES):
                 continue                  # do not cross into a nested scope
             stack.extend(ast.iter_child_nodes(node))
+
+    def _collect_annotated_params(self, tree: ast.AST) -> Dict[str, str]:
+        """#309 (item 4): map parameter names to their CLASS annotation.
+
+        ``ast.arg.annotation`` was never read anywhere in the parser — the
+        receiver's type was written down in the signature and simply not
+        consulted. Only a bare ``ast.Name`` annotation is recorded (the
+        conservative case: ``w: Widget``); anything more complex
+        (``Optional[Widget]``, strings) abstains.
+        """
+        types: Dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.arguments):
+                for arg in (*node.args, *node.kwonlyargs):
+                    ann = arg.annotation
+                    if isinstance(ann, ast.Name) and arg.arg not in ("self", "cls"):
+                        types[arg.arg] = ann.id
+        return types
 
     def _collect_local_types(self, tree: ast.AST) -> Dict[str, str]:
         """Map local variable names to the class name they are constructed from.
@@ -811,11 +853,24 @@ class CallGraphBuilder:
                         target_id = f"{potential_file}:{class_name}.{func_name}"
                         if target_id in self.functions:
                             return target_id
+                        # #309 (item 2): `from X import f as g` records
+                        # imports['g'] = 'X.f' — the TRUE name is the path
+                        # tail, not the local alias g the caller used.
+                        target_id = f"{potential_file}:{class_name}.{remaining[-1]}"
+                        if target_id in self.functions:
+                            return target_id
 
                 # Look for standalone function
                 target_id = f"{potential_file}:{target_name}"
                 if target_id in self.functions:
                     return target_id
+                # #309 (item 2): the from-import alias — the true name is
+                # the dotted path's tail (`from X import f as g` → look for
+                # f at X, not g).
+                if remaining:
+                    target_id = f"{potential_file}:{remaining[-1]}"
+                    if target_id in self.functions:
+                        return target_id
 
         # Strategy 1b: package re-export via __init__.py.
         # `from pkg import name` records import_path 'pkg.name', but `name` may not live in
@@ -878,6 +933,13 @@ class CallGraphBuilder:
             if init_file in seen:                       # re-export cycle guard
                 continue
             pkg_imports = self.imports[init_file]
+            # #309 (item 1): the name may be DEFINED in the package
+            # __init__.py (not re-exported) — probe the definition directly.
+            # `from pkg import defined_here` previously resolved only the
+            # re-export arm; the definition got no edge at all.
+            defined_id = f"{init_file}:{func_name}"
+            if defined_id in self.functions:
+                return defined_id
             if func_name not in pkg_imports:
                 continue
             seen.add(init_file)
