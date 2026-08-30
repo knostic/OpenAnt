@@ -26,6 +26,7 @@ Output (JSON):
 
 import json
 import os
+import re
 import stat
 import sys
 from datetime import datetime
@@ -140,6 +141,33 @@ class RepositoryScanner:
         """Check if a file is a Python source file."""
         ext = os.path.splitext(file_name)[1].lower()
         return ext in self.source_extensions
+
+    # #312: the shebang probe needs no filesystem access here — the
+    # FIRST-LINE match lives in _is_python_shebang, and discovery calls it
+    # only for extensionless regular files (cheap: one open, one line).
+    _SHEBANG_RE = re.compile(rb"^#!.*python", re.IGNORECASE)
+
+    def _is_python_shebang(self, path) -> bool:
+        """#312: an extensionless executable whose first line is a
+        ``#!...python`` shebang IS first-party Python source. Byte-identical
+        twins of .py files were silently dropped here — and the skip was
+        uncounted, so the coverage gap left no trace in any artifact."""
+        try:
+            with open(path, "rb") as fh:
+                first = fh.readline(256)
+        except OSError:
+            return False
+        return bool(self._SHEBANG_RE.match(first))
+
+    def _note_shebang(self, path) -> None:
+        """Count a shebang-discovered file so the coverage gain stays
+        visible — the shape _note_symlink established (its own stats key
+        plus a few example paths; never folded into another counter)."""
+        self.stats['shebang_files_detected'] = \
+            self.stats.get('shebang_files_detected', 0) + 1
+        self.stats.setdefault('shebang_examples', [])
+        if len(self.stats['shebang_examples']) < 5:
+            self.stats['shebang_examples'].append(str(path))
 
     def is_test_file(self, relative_path: str) -> bool:
         """Check if a file is a test file.
@@ -307,7 +335,15 @@ class RepositoryScanner:
                     self._note_symlink(entry)
                     continue
                 if not self.is_source_file(entry.name):
-                    continue
+                    # #312: extension-only discovery silently dropped
+                    # shebang'd executables — byte-identical twins of .py
+                    # files. The shebang fallback recovers them; the count
+                    # keeps the gain visible.
+                    if (os.path.splitext(entry.name)[1] == ""
+                            and self._is_python_shebang(entry)):
+                        self._note_shebang(entry)
+                    else:
+                        continue
 
                 # Skip test files if configured
                 if self.skip_tests and self.is_test_file(entry_relative):
