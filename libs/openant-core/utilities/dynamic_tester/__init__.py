@@ -273,15 +273,33 @@ def run_dynamic_tests(
         # finding in addition to cost.
         tracker.start_unit_tracking()
 
-        # Step 1: Generate test
+        # Step 1: Generate test. #431: a RAISED exception (live repro: the
+        # adapter hit the provider content filter and raised LLMResponseError
+        # after its internal retries) previously escaped unhandled — it
+        # aborted the whole loop (remaining findings never attempted) and the
+        # on-disk _summary.json kept errors: 0, the exact #311 defect on the
+        # raise route. Treat a raise exactly like a None return: record the
+        # ERROR unit file, derive the summary from the files, continue.
         print("  Generating test...", file=sys.stderr)
-        generation = generate_test(finding, repo_info, dynamic_test_binding, tracker)
+        try:
+            generation = generate_test(finding, repo_info, dynamic_test_binding, tracker)
+        except Exception as gen_exc:
+            generation = None
+            print(f"  Test generation raised: {type(gen_exc).__name__}", file=sys.stderr)
+            _gen_exc_message = str(gen_exc)
+            _gen_exc_raised = True
+        else:
+            _gen_exc_raised = False
+            _gen_exc_message = ""
         unit_usage = tracker.get_unit_usage()
         generation_cost = unit_usage["cost_usd"]
 
         if generation is None:
             print("  Test generation failed.", file=sys.stderr)
             result = collect_result(finding, None, None, generation_cost)
+            if _gen_exc_raised:
+                # keep the raised exception's own words (the None path has none)
+                result.details = f"Test generation raised {_gen_exc_message[:2000]}"
             result.generation_input_tokens = unit_usage["input_tokens"]
             result.generation_output_tokens = unit_usage["output_tokens"]
             results.append(result)
