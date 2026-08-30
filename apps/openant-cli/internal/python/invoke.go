@@ -219,7 +219,15 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 			exitCode = ee.ExitCode()
 			// #161: a deadline kill can surface here first (the race
 			// with the pipe-close path above) — the same diagnosis.
-			if ctx.Err() == context.DeadlineExceeded {
+			// Review finding: gate on the KILL ITSELF (ExitCode < 0, a
+			// signal death), not ctx.Err() alone. A child that finished
+			// legitimately with exit 1 ("vulnerabilities found") in the
+			// window just before the deadline hit must keep its envelope —
+			// the #313 principle: a fully-parsed envelope MUST win over a
+			// late/expired context. ctx.Err() == DeadlineExceeded alone
+			// misdiagnosed that natural finish as a kill and discarded a
+			// complete scan result.
+			if ctx.Err() == context.DeadlineExceeded && exitCode < 0 {
 				return nil, fmt.Errorf(
 					"openant: the invoke deadline fired after %v — the phase "+
 						"was killed mid-run. Completed units are checkpointed "+
