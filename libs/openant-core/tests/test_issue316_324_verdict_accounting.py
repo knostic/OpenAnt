@@ -284,9 +284,6 @@ def test_summary_seed_agrees_with_adoption(tmp_path):
     assert completed + errors == 3  # == total: the invariant holds
     # usage accumulates over ALL rows (the spend happened)
     # (usage seeding is exercised below with a usage-bearing checkpoint)
-    import json as _json
-    from utilities.file_io import write_json
-    import os
     ck3 = StepCheckpoint("analyze", str(tmp_path / "s"))
     ck3.save("u", {"id": "u", "result": {"verdict": "SAFE", "finding": "safe"},
                    "usage": {"input_tokens": 10, "output_tokens": 5, "cost_usd": 0.25,
