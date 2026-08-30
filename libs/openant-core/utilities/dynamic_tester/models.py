@@ -35,9 +35,12 @@ class DynamicTestResult:
     generation_input_tokens: int = 0
     generation_output_tokens: int = 0
     retry_count: int = 0
+    # #314: the run-stable identity from the pipeline finding — the join
+    # key the report merge verifies (VULN-NNN is positional, not stable).
+    identity_key: str = ""
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "finding_id": self.finding_id,
             "status": self.status,
             "details": self.details,
@@ -51,3 +54,6 @@ class DynamicTestResult:
             "generation_output_tokens": self.generation_output_tokens,
             "retry_count": self.retry_count,
         }
+        if self.identity_key:
+            d["identity_key"] = self.identity_key
+        return d
