@@ -423,7 +423,10 @@ def run_single_container(
 
         if generation.get("docker_compose") and generation.get("needs_attacker_server"):
             # Multi-service: use docker compose with explicit project name
-            result = _run_compose(work_dir, safe_id, container_timeout, build_timeout)
+            # (#315: the run_id prefix — the parallel-run collision guard
+            # the :408 comment names — now on the project name too)
+            result = _run_compose(work_dir, compose_project_name(run_id, safe_id),
+                                  container_timeout, build_timeout)
         else:
             # Single container: docker build + run
             result = _run_single(work_dir, image_tag, network_name,
@@ -498,6 +501,18 @@ def _run_single(
     return result
 
 
+def compose_project_name(run_id: str, safe_id: str) -> str:
+    """#315: the compose project name carries the per-run UUID prefix.
+
+    The run_id exists precisely to prevent parallel-run collisions (the
+    comment below states it); the image tag and the network name carry it,
+    but the project name received only safe_id — identical across runs —
+    so `docker compose down` (scoped by -p) reached a concurrent run's
+    containers and `up -d` recreated them. Same prefix, all three names.
+    """
+    return f"openant-{run_id}-{safe_id}"
+
+
 def _run_compose(
     work_dir: str,
     project_name: str,
@@ -546,7 +561,12 @@ def _run_compose(
     finally:
         # Always tear down
         _run_command(
-            compose_base + ["down", "--volumes", "--remove-orphans"],
+            # --rmi local (review finding): down --volumes does NOT remove
+            # images; with the per-run UUID project name, every run leaves
+            # uniquely-named openant-<run_id>-<safe_id>-<service> images
+            # accumulating forever. --rmi local removes the images this
+            # compose project built.
+            compose_base + ["down", "--volumes", "--remove-orphans", "--rmi", "local"],
             timeout=30,
             cwd=work_dir,
         )
