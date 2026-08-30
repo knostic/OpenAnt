@@ -186,6 +186,25 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	var stdoutBuf strings.Builder
 	if _, err := io.Copy(&stdoutBuf, stdout); err != nil {
 		_ = cmd.Wait() // reap the child even on read error so it isn't leaked
+		// #161 (jblu42): when the deadline fired, the watchdog's close of
+		// the read-ends surfaces as the cryptic "read |0: file already
+		// closed" — the exact error the reporter hit against a local
+		// Ollama model (~1 min/unit; the 30m deadline fires after ~20-40
+		// entries, killing the enhance phase and discarding its output).
+		// Name the cause and both recovery paths instead. The gate is
+		// ctx.Err() == DeadlineExceeded — never error text/type — so every
+		// surface of the kill (pipe close, ExitError, a descendant-held
+		// pipe tripping WaitDelay) converges on the same diagnosis.
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf(
+				"openant: the invoke deadline fired after %v — the phase "+
+					"was killed mid-run and its output discarded. Completed "+
+					"units are checkpointed (a re-run resumes from them); to "+
+					"finish a long run outright, raise the budget via "+
+					"OPENANT_INVOKE_TIMEOUT (e.g. OPENANT_INVOKE_TIMEOUT=2h). "+
+					"Underlying read error: %w",
+				resolveInvokeTimeout(), err)
+		}
 		return nil, fmt.Errorf("failed to read stdout: %w", err)
 	}
 
@@ -198,6 +217,24 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	if exitErr != nil {
 		if ee, ok := exitErr.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
+			// #161: a deadline kill can surface here first (the race
+			// with the pipe-close path above) — the same diagnosis.
+			// Review finding: gate on the KILL ITSELF (ExitCode < 0, a
+			// signal death), not ctx.Err() alone. A child that finished
+			// legitimately with exit 1 ("vulnerabilities found") in the
+			// window just before the deadline hit must keep its envelope —
+			// the #313 principle: a fully-parsed envelope MUST win over a
+			// late/expired context. ctx.Err() == DeadlineExceeded alone
+			// misdiagnosed that natural finish as a kill and discarded a
+			// complete scan result.
+			if ctx.Err() == context.DeadlineExceeded && exitCode < 0 {
+				return nil, fmt.Errorf(
+					"openant: the invoke deadline fired after %v — the phase "+
+						"was killed mid-run. Completed units are checkpointed "+
+						"(a re-run resumes from them); raise the budget via "+
+						"OPENANT_INVOKE_TIMEOUT to finish a long run outright",
+					resolveInvokeTimeout())
+			}
 		} else {
 			return nil, fmt.Errorf("failed waiting for Python process: %w", exitErr)
 		}
