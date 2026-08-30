@@ -36,7 +36,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
 
 CORE = str(Path(__file__).resolve().parents[2])  # libs/openant-core
 if CORE not in sys.path:
@@ -284,9 +283,6 @@ def test_summary_seed_agrees_with_adoption(tmp_path):
     errors = 0 + 1
     assert completed + errors == 3  # == total: the invariant holds
     # usage accumulates over ALL rows (the spend happened)
-    ck2 = _write_checkpoint(tmp_path / "u", [
-        ("good", {"verdict": "SAFE", "finding": "safe"}),
-    ])
     # (usage seeding is exercised below with a usage-bearing checkpoint)
     import json as _json
     from utilities.file_io import write_json
@@ -360,16 +356,14 @@ def _tool_binding():
 def _correct(raw_response, extracted, monkeypatch):
     """Run attempt_correction with a stubbed extractor LLM (monkeypatched —
     a bare assignment would leak module state into later tests)."""
-    import utilities.json_corrector as jc
-
     def fake_simple_text(binding, prompt, **kwargs):
         return json.dumps(extracted)
 
-    monkeypatch.setattr(jc, "simple_text", fake_simple_text)
-    return JSONCorrector(_tool_binding()).attempt_correction(raw_response)
+    monkeypatch.setattr(_json_corrector, "simple_text", fake_simple_text)
+    return _json_corrector.JSONCorrector(_tool_binding()).attempt_correction(raw_response)
 
 
-from utilities.json_corrector import JSONCorrector  # noqa: E402
+import utilities.json_corrector as _json_corrector  # noqa: E402
 
 
 def test_corrector_unrecognized_finding_becomes_error(monkeypatch):
@@ -410,9 +404,9 @@ def test_corrector_enum_correct_finding_still_recovers(monkeypatch):
 def test_context_corrector_unrecognized_finding_routes_to_error():
     """The third _normalize_result copy (the insufficient-context re-analysis
     path) inherits the same treatment."""
-    from utilities.context_corrector import ContextCorrector
+    import utilities.context_corrector as _context_corrector
 
-    out = ContextCorrector._normalize_result({"finding": "maybe exploitable"})
+    out = _context_corrector.ContextCorrector._normalize_result({"finding": "maybe exploitable"})
     assert out["verdict"] == "ERROR"
 
 
@@ -421,9 +415,9 @@ def test_context_corrector_twin_full_mirror():
     analysis_core._normalize_result — pin the FULL contract, not just the
     verdict (co-stamped finding, raw preserved, non-string guard, the
     neither-key arm, null-verdict validity)."""
-    from utilities.context_corrector import ContextCorrector
+    import utilities.context_corrector as _context_corrector
 
-    nr = ContextCorrector._normalize_result
+    nr = _context_corrector.ContextCorrector._normalize_result
     out = nr({"finding": "maybe exploitable"})
     assert out["verdict"] == "ERROR" and out["finding"] == "error"
     assert out["raw_finding"] == "maybe exploitable"
