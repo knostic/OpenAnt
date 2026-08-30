@@ -24,7 +24,7 @@ class TestEvidence:
 class DynamicTestResult:
     """Result from dynamically testing a single finding."""
     finding_id: str
-    status: str         # CONFIRMED, NOT_REDUCED, BLOCKED, INCONCLUSIVE, ERROR, SKIPPED
+    status: str         # CONFIRMED, NOT_REPRODUCED, BLOCKED, INCONCLUSIVE, ERROR, SKIPPED
     details: str
     evidence: list[TestEvidence] = field(default_factory=list)
     test_code: str = ""       # Generated test script (for reproducibility)

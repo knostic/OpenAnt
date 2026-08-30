@@ -215,7 +215,11 @@ def finding_identity_key(file_path: str, function: str, cwe_id: int) -> str:
     identity, not its position. Short + hex so it stays human-auditable
     alongside the display ID."""
     import hashlib
-    payload = f"{file_path}|{function}|{int(cwe_id or 0)}"
+    try:
+        cwe_val = int(cwe_id or 0)
+    except (TypeError, ValueError):
+        cwe_val = 0
+    payload = f"{file_path}|{function}|{cwe_val}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 

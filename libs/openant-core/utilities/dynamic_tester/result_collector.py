@@ -119,6 +119,12 @@ def collect_result(
 
     return DynamicTestResult(
         finding_id=finding_id,
+        # #314 (review blocker): the SUCCESS path — the only path a real
+        # verdict (CONFIRMED/NOT_REPRODUCED/BLOCKED/INCONCLUSIVE) takes —
+        # must thread the identity key like every other construction, or the
+        # results file serializes keyless and the report merge abstains on
+        # EVERY fresh run (the merge self-disables).
+        identity_key=identity_key,
         status=status,
         details=parsed.get("details", ""),
         evidence=evidence,

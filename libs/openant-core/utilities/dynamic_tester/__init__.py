@@ -194,6 +194,9 @@ def run_dynamic_tests(
         if cp_data and cp_data.get("status") != "ERROR":
             result = DynamicTestResult(
                 finding_id=finding_id,
+                # #314: thread the identity through resume so a checkpointed
+                # verdict merges on the same key as a fresh one.
+                identity_key=finding.get("identity_key", ""),
                 status=cp_data.get("status", "ERROR"),
                 details=cp_data.get("details", ""),
                 elapsed_seconds=cp_data.get("elapsed_seconds", 0),
@@ -227,7 +230,9 @@ def run_dynamic_tests(
         if _skip:
             print(f"\n[{i+1}/{total}] SKIPPED {finding_id}: {_reason}", file=sys.stderr)
             results.append(DynamicTestResult(
-                finding_id=finding_id, status="SKIPPED", details=_reason,
+                finding_id=finding_id,
+                identity_key=finding.get("identity_key", ""),
+                status="SKIPPED", details=_reason,
                 elapsed_seconds=0,
             ))
             continue

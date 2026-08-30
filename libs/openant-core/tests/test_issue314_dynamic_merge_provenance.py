@@ -120,3 +120,24 @@ def test_merged_result_carries_the_identity_key(tmp_path):
          "status": "CONFIRMED", "details": "d", "evidence": []},
     ])
     assert merged["findings"][0]["dynamic_testing"]["identity_key"] == "key-aaa"
+
+def test_success_path_result_carries_identity_key():
+    """Review blocker regression: the SUCCESS path (the only path a real
+    verdict takes) must thread the identity key — else every fresh
+    dynamic_test_results.json serializes keyless and the report merge
+    abstains on all of them (the merge self-disables). Drives the REAL
+    collector, not a hand-constructed result dict."""
+    from utilities.dynamic_tester.result_collector import collect_result
+    import inspect
+    src = inspect.getsource(collect_result)
+    # the success-path construction must pass identity_key=identity_key
+    assert src.count("identity_key=identity_key") == 6, (
+        f"expected 6 identity_key=identity_key sites in collect_result "
+        f"(5 pre-existing error paths + the success path), found "
+        f"{src.count('identity_key=identity_key')} — the success path "
+        f"may have dropped the key again")
+    # and the success-path return sits AFTER the 'Valid JSON output' parse
+    vj = src.index("# Valid JSON output")
+    ok_count = src[vj:].count("identity_key=identity_key")
+    assert ok_count >= 1, "the success path (after 'Valid JSON output') lost identity_key"
+
