@@ -26,7 +26,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# #415: parents[2] from tests/parsers/python/<file> is `tests/` — and tests/parsers
+# is a REGULAR package that outranks the source parsers/ namespace, so every
+# later in-process parsers.* import in the same pytest batch resolved into the
+# TEST directory. The insert needs the CORE root, parents[3].
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
