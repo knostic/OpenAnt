@@ -193,6 +193,14 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
 
         # Get LLM context from dataset (may be None)
         llm_context = unit.get('llm_context') or {}
+        # #321 (wave r1 #4 + r2 #1, the adjacent pre-existing one-sided
+        # reader): the classification lives in agent_context for agentic
+        # scans — the mode the column is named after — and llm_context for
+        # single-shot. Read BOTH, agent_context FIRST (the analyzer.py:59-74
+        # precedence: "Prefer agent_context, fall back to llm_context") —
+        # llm_context-first masked agent_context now that single-shot
+        # always holds a truthy value.
+        agent_context = unit.get('agent_context') or {}
 
         # Get verification data from experiment result
         verification = result.get('verification') or {}
@@ -220,7 +228,11 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
             'stage1_verdict': stage1_verdict,
             'stage1_justification': result.get('reasoning', ''),
             'stage1_confidence': result.get('confidence', ''),
-            'agentic_classification': llm_context.get('security_classification', '')
+            'agentic_classification': (
+                agent_context.get('security_classification')
+                or llm_context.get('security_classification')
+                or ''
+            )
         }
         # Neutralize CSV / formula injection on every cell before writing.
         rows.append({k: _csv_safe(v) for k, v in row.items()})
