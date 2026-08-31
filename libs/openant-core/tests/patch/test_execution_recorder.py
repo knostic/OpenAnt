@@ -17,7 +17,7 @@ from typing import NamedTuple
 
 import pytest
 
-from utilities.autopatcher.execution_recorder import ExecutionRecorder, ExecutionRecorderError, to_jsonable
+from utilities.autopatcher.execution_recorder import ExecutionRecorder, ExecutionRecorderError, from_jsonable, to_jsonable
 from utilities.autopatcher import lineage
 
 
@@ -486,6 +486,132 @@ class TestToJsonable:
         a = to_jsonable({"x", "y", "z"})
         b = to_jsonable(set(["z", "x", "y"]))
         assert a == b
+
+
+# ---------------------------------------------------------------------------
+# from_jsonable() -- the to_jsonable() mirror used by replay handlers to
+# reconstruct real upstream StageExecution artifact content. Regression
+# coverage for a real replay failure: a PEP 604 `X | None`-annotated field
+# (this codebase's `from __future__ import annotations` spelling throughout)
+# evaluates, via typing.get_type_hints(), to a `types.UnionType` instance --
+# a DIFFERENT object from `typing.Union` -- so `origin is typing.Union`
+# alone silently failed to recurse into it, leaving nested dataclasses as
+# raw dicts after reconstruction.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _FJInner:
+    name: str
+
+
+@dataclass
+class _FJOuter:
+    inner: "_FJInner | None" = None
+    items: "list[_FJInner]" = None
+    pair: "tuple[_FJInner, ...]" = None
+    plain: "dict | None" = None
+
+
+class TestFromJsonable:
+    def test_none_round_trips_to_none(self):
+        assert from_jsonable(_FJOuter, None) is None
+
+    def test_pep604_optional_dataclass_field_reconstructs_typed_not_dict(self):
+        """THE core regression: `_FJInner | None` (PEP 604 syntax) must
+        reconstruct to a real _FJInner instance, not remain a dict."""
+        original = _FJOuter(inner=_FJInner(name="x"))
+        rebuilt = from_jsonable(_FJOuter, to_jsonable(original))
+        assert isinstance(rebuilt.inner, _FJInner)
+        assert rebuilt.inner.name == "x"
+
+    def test_pep604_optional_dataclass_field_none_stays_none(self):
+        original = _FJOuter(inner=None)
+        rebuilt = from_jsonable(_FJOuter, to_jsonable(original))
+        assert rebuilt.inner is None
+
+    def test_list_of_dataclass_elements_reconstruct_typed(self):
+        original = _FJOuter(items=[_FJInner(name="a"), _FJInner(name="b")])
+        rebuilt = from_jsonable(_FJOuter, to_jsonable(original))
+        assert all(isinstance(i, _FJInner) for i in rebuilt.items)
+        assert [i.name for i in rebuilt.items] == ["a", "b"]
+
+    def test_tuple_of_dataclass_elements_reconstruct_typed_as_tuple(self):
+        original = _FJOuter(pair=(_FJInner(name="a"), _FJInner(name="b")))
+        rebuilt = from_jsonable(_FJOuter, to_jsonable(original))
+        assert isinstance(rebuilt.pair, tuple)
+        assert all(isinstance(i, _FJInner) for i in rebuilt.pair)
+
+    def test_plain_dict_field_stays_a_dict(self):
+        """A field genuinely typed as `dict | None` (no dataclass to
+        reconstruct into) must still round-trip as a plain dict -- the
+        Union fix must not force dict-typed fields into something else."""
+        original = _FJOuter(plain={"id": "f1", "name": "authenticate"})
+        rebuilt = from_jsonable(_FJOuter, to_jsonable(original))
+        assert rebuilt.plain == {"id": "f1", "name": "authenticate"}
+        assert isinstance(rebuilt.plain, dict)
+
+    def test_real_repository_understanding_round_trip_nested_enrichment_is_typed(self):
+        """The exact real-case failure: RepositoryUnderstanding ->
+        to_jsonable() -> from_jsonable(RepositoryUnderstanding, ...) must
+        leave RepositoryCandidate.enrichment (a `CandidateEnrichment | None`
+        field) as a real CandidateEnrichment instance -- not a dict -- so
+        post_patch_investigation.derive_pre_patch_anchors() can read
+        `enrichment.resolved_function` without an AttributeError."""
+        from utilities.autopatcher.evidence_fusion import RepositoryUnderstanding
+        from utilities.autopatcher.repository_grounding_models import (
+            CandidateEnrichment, DiscoveryEvidence, RepositoryCandidate,
+        )
+
+        evidence = [DiscoveryEvidence(
+            pass_name="symbol_search", tier=3, matched_tokens={"authenticate": 1},
+            total_occurrences=1, hit_line=42, resolution_strategy="exact",
+        )]
+        enrichment = CandidateEnrichment(
+            resolved_function={"id": "f1", "name": "authenticate"},
+            callees=["helper"],
+        )
+        candidate = RepositoryCandidate(
+            path="auth.py", evidence=evidence, best_tier=3, enrichment=enrichment,
+        )
+        original = RepositoryUnderstanding(candidate_evidence=[candidate])
+
+        rebuilt = from_jsonable(RepositoryUnderstanding, to_jsonable(original))
+
+        rebuilt_candidate = rebuilt.candidate_evidence[0]
+        assert isinstance(rebuilt_candidate, RepositoryCandidate)
+        assert isinstance(rebuilt_candidate.enrichment, CandidateEnrichment)
+        assert isinstance(rebuilt_candidate.evidence[0], DiscoveryEvidence)
+        # resolved_function is itself typed `dict | None` (a real dict of
+        # parser-shaped facts, not a dataclass) -- it must stay a dict.
+        assert rebuilt_candidate.enrichment.resolved_function == {"id": "f1", "name": "authenticate"}
+
+    def test_real_repository_understanding_feeds_derive_pre_patch_anchors(self):
+        """The real S4 replay call site: post_patch_investigation.
+        derive_pre_patch_anchors() consuming a from_jsonable()-reconstructed
+        RepositoryUnderstanding must not raise AttributeError."""
+        from utilities.autopatcher.evidence_fusion import RepositoryUnderstanding
+        from utilities.autopatcher.post_patch_investigation import derive_pre_patch_anchors
+        from utilities.autopatcher.repository_grounding_models import (
+            CandidateEnrichment, DiscoveryEvidence, RepositoryCandidate,
+        )
+
+        evidence = [DiscoveryEvidence(
+            pass_name="symbol_search", tier=3, matched_tokens=None,
+            total_occurrences=1, hit_line=42, resolution_strategy="exact",
+        )]
+        enrichment = CandidateEnrichment(
+            resolved_function={"id": "f1", "name": "authenticate"},
+            callees=["helper"],
+        )
+        candidate = RepositoryCandidate(
+            path="auth.py", evidence=evidence, best_tier=3, enrichment=enrichment,
+        )
+        original = RepositoryUnderstanding(candidate_evidence=[candidate])
+
+        rebuilt = from_jsonable(RepositoryUnderstanding, to_jsonable(original))
+
+        anchors = derive_pre_patch_anchors(rebuilt)  # must not raise
+        assert any(a.kind == "resolved_function" for a in anchors)
 
 
 # ---------------------------------------------------------------------------

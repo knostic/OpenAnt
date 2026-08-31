@@ -485,19 +485,20 @@ class TestOutputDirectorySafety:
 
 class TestStageDispatch:
     def test_unsupported_stage_fails_before_llm(self, run_stage, tmp_path, capsys):
-        """"challenger" IS a canonical stage (utilities.autopatcher.
-        stage_registry) but has no run_fn wired up yet in this batch --
+        """"trust_signals_and_recommendation" IS a canonical stage
+        (utilities.autopatcher.stage_registry) but has no run_fn wired up
+        yet (blocked -- fused inside _build_report(), see Batch B6) --
         registered-but-not-replayable, not unknown."""
         exit_code = run_stage.main([
             "--source-run", str(tmp_path / "nonexistent"),
-            "--stage", "challenger",
+            "--stage", "trust_signals_and_recommendation",
             "--output", str(tmp_path / "out"),
         ])
         assert exit_code == 2
         captured = capsys.readouterr()
-        assert "challenger" in captured.err
+        assert "trust_signals_and_recommendation" in captured.err
         assert "not replayable yet" in captured.err
-        assert "test_analysis_and_plan" in captured.err  # currently the only replayable stage
+        assert "test_analysis_and_plan" in captured.err  # one of the currently-replayable stages
         assert not (tmp_path / "out").exists()  # zero work performed
 
     def test_unknown_stage_fails_before_llm(self, run_stage, tmp_path, capsys):

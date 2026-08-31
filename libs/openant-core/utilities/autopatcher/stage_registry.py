@@ -262,7 +262,14 @@ _REPO_ACCESS: "dict[str, bool]" = {
     TEST_ANALYSIS_AND_PLAN: True,
     EXISTING_TEST_COMPARISON: True,
     TRUST_SIGNALS_AND_RECOMMENDATION: False,
-    REPORT_GENERATION: False,
+    # Batch B8 correction: _build_report() (the current, fused S12+S13
+    # implementation) DOES read the repository -- e.g. tests_for_file() for
+    # the Suggested Tests section -- whenever PipelineResult.repo_root is
+    # not None, exactly like every other repo-accessing stage. This was
+    # previously False, presumably from a time before this stage's real
+    # internals were traced this deeply; a real correctness gap for
+    # replay's own repo-identity preflight, not a capability redesign.
+    REPORT_GENERATION: True,
 }
 
 _DOCKER: "dict[str, bool]" = {name: False for name in CANONICAL_STAGE_ORDER}

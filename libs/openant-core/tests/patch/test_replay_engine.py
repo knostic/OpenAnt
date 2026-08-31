@@ -160,13 +160,26 @@ class TestStageDispatch:
         with pytest.raises(ReplayEngineError, match="not replayable yet"):
             replay_stage(
                 source_run=tmp_path / "does-not-exist",
-                stage_name="challenger",
+                stage_name="trust_signals_and_recommendation",
                 output_dir=tmp_path / "out",
             )
         assert not (tmp_path / "out").exists()
 
-    def test_exactly_test_analysis_and_plan_has_a_replay_handler_today(self):
-        assert set(REPLAY_HANDLERS.keys()) == {"test_analysis_and_plan"}
+    def test_exactly_the_batch_b7_stages_have_a_replay_handler_today(self):
+        assert set(REPLAY_HANDLERS.keys()) == {
+            "test_analysis_and_plan",
+            "repository_analysis_and_remediation_planning",
+            "remediation_strategy",
+            "guided_context_acquisition",
+            "patch_generation_and_post_patch_investigation",
+            "challenger",
+            "patch_repair_and_calibration",
+            "patch_review",
+            "confidence_scoring",
+            "impact_and_behavior_analysis",
+            "existing_test_comparison",
+            "report_generation",
+        }
 
     def test_registered_but_no_handler_stage_fails_cleanly_and_lists_what_is_replayable(self, tmp_path, capsys):
         for stage_name in stage_registry.CANONICAL_STAGE_ORDER:
@@ -473,7 +486,7 @@ class TestCapabilityAwarePreflight:
         assert called == [True]
 
     def test_repo_preflight_skipped_for_stage_that_does_not_require_repo_access(self):
-        spec = STAGE_SPECS["report_generation"]
+        spec = STAGE_SPECS["confidence_scoring"]
         assert spec.requires_repo_access is False
         from utilities.autopatcher.stage_replay import SourceProvenance
 
@@ -543,41 +556,45 @@ class TestSyntheticChaining:
     DOWNSTREAM = "remediation_strategy"
 
     def _stub_run_fn(self, tag):
-        def _run_fn(*, repo_root, llm, output_dir, resolved_dependencies):
+        def _run_fn(*, repo_root, llm, output_dir, resolved_dependencies, chain=None):
             artifact_path = output_dir / "artifact.json"
             artifact_path.write_text(json.dumps({"tag": tag}), encoding="utf-8")
             return RunFnResult(outcome="ok", artifact_path=artifact_path, extra_stage_fields={})
         return _run_fn
 
-    def _register_both_stubs(self, upstream_tag="u0", downstream_deps=None):
-        REPLAY_HANDLERS[self.UPSTREAM] = ReplayHandler(
+    def _register_both_stubs(self, monkeypatch, upstream_tag="u0", downstream_deps=None):
+        # Batch B8: both UPSTREAM and DOWNSTREAM now also have REAL
+        # replay handlers (S1/S2) -- monkeypatch.setitem auto-reverts this
+        # temporary stub swap at test teardown, so these synthetic-engine
+        # tests never leak stub handlers into any other test in the suite.
+        monkeypatch.setitem(REPLAY_HANDLERS, self.UPSTREAM, ReplayHandler(
             run_fn=self._stub_run_fn(upstream_tag),
             dependencies=(),
-        )
-        REPLAY_HANDLERS[self.DOWNSTREAM] = ReplayHandler(
+        ))
+        monkeypatch.setitem(REPLAY_HANDLERS, self.DOWNSTREAM, ReplayHandler(
             run_fn=self._stub_run_fn("d0"),
             dependencies=(self.UPSTREAM,) if downstream_deps is None else downstream_deps,
-        )
+        ))
 
     def test_downstream_fails_before_run_fn_when_dependency_missing(self, tmp_path, monkeypatch):
         repo = _make_target_repo(tmp_path)
         source = _write_full_run_trace(tmp_path / "run", repo_root=repo)  # upstream stage never produced
 
         sentinel_called = []
-        REPLAY_HANDLERS[self.DOWNSTREAM] = ReplayHandler(
+        monkeypatch.setitem(REPLAY_HANDLERS, self.DOWNSTREAM, ReplayHandler(
             run_fn=lambda **kw: sentinel_called.append(True) or RunFnResult(outcome="ok", artifact_path=None, extra_stage_fields={}),
             dependencies=(self.UPSTREAM,),
-        )
+        ))
 
         with pytest.raises(ReplayEngineError, match="UNRESOLVED|dependency"):
             replay_stage(source_run=source, stage_name=self.DOWNSTREAM, output_dir=tmp_path / "out")
         assert sentinel_called == []  # run_fn never invoked
         assert not (tmp_path / "out").exists()
 
-    def test_chained_replay_consumes_the_new_upstream_artifact(self, tmp_path):
+    def test_chained_replay_consumes_the_new_upstream_artifact(self, tmp_path, monkeypatch):
         repo = _make_target_repo(tmp_path)
         source = _write_full_run_trace(tmp_path / "run", repo_root=repo)
-        self._register_both_stubs()
+        self._register_both_stubs(monkeypatch)
 
         replay_upstream = tmp_path / "replay-upstream"
         replay_stage(source_run=source, stage_name=self.UPSTREAM, output_dir=replay_upstream)
@@ -588,7 +605,7 @@ class TestSyntheticChaining:
         consumed = _execution_for(result.manifest, self.DOWNSTREAM)["consumed"][self.UPSTREAM]
         assert consumed["run"] == str(replay_upstream)
 
-    def test_downstream_replay_from_original_is_stale_after_upstream_replayed_elsewhere(self, tmp_path):
+    def test_downstream_replay_from_original_is_stale_after_upstream_replayed_elsewhere(self, tmp_path, monkeypatch):
         """Full run has UPSTREAM_0 -> DOWNSTREAM_0. Replay UPSTREAM alone.
         Replaying DOWNSTREAM again directly from the ORIGINAL full run
         (not the new upstream replay) must still work (dependencies are
@@ -598,7 +615,7 @@ class TestSyntheticChaining:
         queried."""
         repo = _make_target_repo(tmp_path)
         source = _write_full_run_trace(tmp_path / "run", repo_root=repo)
-        self._register_both_stubs()
+        self._register_both_stubs(monkeypatch)
 
         replay_upstream = tmp_path / "replay-upstream"
         replay_stage(source_run=source, stage_name=self.UPSTREAM, output_dir=replay_upstream)
@@ -609,10 +626,10 @@ class TestSyntheticChaining:
         resolution = lineage.resolve_effective(chain, self.DOWNSTREAM, {})
         assert resolution.state == lineage.UNRESOLVED
 
-    def test_branch_replays_of_upstream_do_not_interfere(self, tmp_path):
+    def test_branch_replays_of_upstream_do_not_interfere(self, tmp_path, monkeypatch):
         repo = _make_target_repo(tmp_path)
         source = _write_full_run_trace(tmp_path / "run", repo_root=repo)
-        self._register_both_stubs()
+        self._register_both_stubs(monkeypatch)
 
         branch_a = tmp_path / "branch-a"
         branch_b = tmp_path / "branch-b"

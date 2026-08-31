@@ -859,7 +859,7 @@ class TestPersistedWithoutReplayHandler:
         about the former."""
         from utilities.autopatcher import replay_engine
 
-        target_stage = "patch_repair_and_calibration"
+        target_stage = "trust_signals_and_recommendation"
         assert target_stage not in replay_engine.REPLAY_HANDLERS  # sanity: genuinely not replayable today
 
         run = _full_run(tmp_path / "run", executions=[_execution(target_stage, 1, artifact_path="stage6.json")])

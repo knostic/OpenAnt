@@ -3900,724 +3900,27 @@ def _prior_supported_target_files(plan_result, strategy_result) -> "set[str]":
 # ---------------------------------------------------------------------------
 
 
-def run(
-    vulnerability_text: str,
-    api_key: str = "",
-    repo_root: str | Path | None = None,
-    investigation_output_dir: str | Path | None = None,
-    budget_controller: "object | None" = None,
-    compare_existing_tests: bool = False,
-    execution_recorder: "object | None" = None,
-) -> str:
+def _run_patch_generation_and_investigation(
+    *, vulnerability_text, llm, repo_root, code_context, budget_controller,
+    _skip_patch_generation, _edit_readiness, _slice_result, _investigation_context,
+    _pre_patch_anchors, _plan_result, _strategy_result,
+):
+    """Reusable Stage-4 (patch_generation_and_post_patch_investigation)
+    executor -- the COMPLETE current production contract (contract
+    retry, hunk repair, Slice-4 conformance/recovery, hygiene,
+    applicability + its own bounded retry, Post-Patch Investigation),
+    extracted VERBATIM from pipeline.run() (Batch B7) so production and
+    replay share exactly the same implementation -- see
+    replay_engine.py's patch_generation_and_post_patch_investigation
+    ReplayHandler, the other caller. No behavior change: this function's
+    body is byte-identical to what used to be inline in run(); only the
+    function boundary (parameters in, `return locals()` out) is new.
+
+    Returns every local variable this body binds (`locals()`), so the
+    caller (run() or a replay run_fn) picks whichever fields it needs by
+    name -- avoids hand-enumerating an exhaustive, easy-to-drift return
+    signature for ~20 produced values.
     """
-    Execute the full patching pipeline.
-
-    Parameters
-    ----------
-    vulnerability_text:
-        The vulnerability description as a string (Markdown).  The caller is
-        responsible for reading a file or fetching an advisory before calling
-        this function.
-    api_key:
-        Optional OpenAI API key.  When empty the pipeline uses mock responses.
-    investigation_output_dir:
-        Optional run-scoped directory for the deterministic Repository
-        Understanding investigation's parser artifacts (candidate_enrichment.
-        build_investigation_context's analyzer_output.json/call_graph.json).
-        When omitted, investigation still runs (selection + fusion +
-        rendering) but candidate enrichment degrades to its existing
-        file/test/sink-only mode -- no parse/call-graph/reachability -- same
-        as when candidate_enrichment.enrich_candidates() is given
-        context=None. Callers that don't pass this (all existing callers)
-        are unaffected beyond that graceful degradation.
-    budget_controller:
-        Optional utilities.autopatcher.context_budget.ContextBudgetController,
-        threaded unmodified into Slices 2/3/4's own acquisition/recovery
-        calls (run_deterministic_acquisition/run_guided_acquisition/
-        recover_post_patch_source) -- the ONLY thing that lets a soft
-        character budget exhausted purely by capacity (never a safety/
-        verification failure) be extended by one more fixed-size window,
-        with the user's approval, instead of failing the run closed. This
-        is the CLI's responsibility to build (see openant/cli.py's `patch`
-        command --context-budget-policy/--max-context-budget-windows) --
-        `None` (every existing caller, and any library caller) preserves
-        the pre-existing fixed-budget behavior exactly, with zero
-        interactive prompts from this module.
-    compare_existing_tests:
-        Opt-in (default False) for Existing Test Comparison -- see
-        existing_test_regression.py. When True and repo_root/patch are
-        both available, discovers a TestExecutionPlan for the repository
-        (test_plan_discovery.py, one bounded LLM call) and runs it once
-        against an isolated, unpatched copy and once against an isolated,
-        patched copy (Docker-only; see test_executors.py -- never falls
-        back to host execution), and compares results. Adds a new,
-        observability-only Trust Signal and report section; never read by
-        _build_recommendation_v1, never fed back into Challenger or the
-        repair loop in this slice. False (every existing caller) runs
-        neither the LLM Test Plan Discovery call nor Docker, and leaves
-        PipelineResult.existing_test_comparison as None, exactly as
-        before this parameter existed.
-    execution_recorder:
-        Optional utilities.autopatcher.execution_recorder.ExecutionRecorder
-        (Batch B2) -- PURELY OBSERVATIONAL. When given, this function
-        records real StageExecution entries (see lineage.py) for the
-        canonical stages it currently instruments: Stage 1
-        (repository_analysis_and_remediation_planning), Stage 2
-        (remediation_strategy), Stage 3 (guided_context_acquisition), and
-        the INITIAL pass only of Stage 4
-        (patch_generation_and_post_patch_investigation) and Stage 5
-        (challenger). Recording then stops -- the Challenger-driven repair
-        loop (Stage 6 and everything after) is NOT instrumented in this
-        batch and runs completely unmodified/unrecorded, exactly as
-        before. `None` (every existing caller: openant/cli.py, every
-        library caller, every test) makes every recorder call inside this
-        function a guarded no-op -- this parameter changes nothing about
-        prompts, retries, gates, or the report for a normal run. Only
-        tools/run_traced.py constructs one today.
-
-    Returns
-    -------
-    str
-        The formatted Markdown report.
-    """
-
-    # Ensure downstream challenger reads the same API key if provided.
-    os.environ.setdefault("OPENAI_API_KEY", api_key or os.environ.get("OPENAI_API_KEY", ""))
-
-    llm = LLMClient(api_key=api_key)
-    mode = "MOCK" if llm.is_mock else "LIVE"
-    print(f"[pipeline] LLM mode: {mode}", file=sys.stderr)
-
-    # Batch B2: begin recording ONE real StageExecution for canonical Stage 1
-    # (repository_analysis_and_remediation_planning) -- covers everything
-    # from here through the Remediation Planner's own verification bridge
-    # below (finished just before "# Final Strategy"). Purely observational
-    # -- see execution_recorder=None's docstring above; a no-op when None.
-    _s1_handle = None
-    if execution_recorder is not None:
-        _s1_handle = execution_recorder.start(_S_REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING)
-
-    # Experiment H1: plan first, then repo code, then vulnerability pattern guidance.
-    # Previously: repo code → vuln patterns → plan.
-    # H1 hypothesis: placing plan constraints before repo code reduces prior-override failures.
-    _plan_text = _load_experiment_plan(vulnerability_text)
-
-    # Locate relevant code from the target repository (best-effort).
-    _repo_code = ""
-    _grounding: RepositoryGroundingResult | None = None
-    if repo_root:
-        from .repo_locator import ground_repository
-        _grounding = ground_repository(vulnerability_text, Path(repo_root))
-        _repo_code = _grounding.rendered_context
-        if _repo_code:
-            print(f"[pipeline] Code context found ({len(_repo_code)} chars); injecting into patch prompt.", file=sys.stderr)
-        else:
-            print("[pipeline] No code context found in repo; patch will be best-effort.", file=sys.stderr)
-
-    # Phase C.5: inject vulnerability class guidance (canonical patterns + sink coverage).
-    # Pass _repo_code (not the accumulated context) so sink detection scans only source code.
-    _pattern_ctx = ""
-    try:
-        from .vulnerability_patterns import build_vulnerability_pattern_context
-        _pattern_ctx = build_vulnerability_pattern_context(
-            vulnerability_text, _repo_code, Path(repo_root) if repo_root else None
-        )
-        if _pattern_ctx:
-            print(f"[pipeline] Vulnerability class guidance injected ({len(_pattern_ctx)} chars).", file=sys.stderr)
-    except Exception:
-        pass
-
-    # Deterministic Repository Understanding: bounded candidate selection +
-    # enrichment + fusion, reusing the same _grounding computed above (no
-    # second ground_repository() call, no second candidate set). Best-effort
-    # -- any failure degrades to today's existing repo_code/pattern_ctx
-    # context rather than aborting the run. Rendered only when selection
-    # actually found something to select (CandidateSelection.used_fallback
-    # documents this as the caller's cue to fall back to existing behavior).
-    _repository_understanding: RepositoryUnderstanding | None = None
-    _repository_understanding_ctx = ""
-    _pre_patch_anchors: list | None = None
-    _investigation_context = None  # InvestigationContext | None -- only set below when
-    # investigation_output_dir is provided and grounding/selection succeed; kept as a
-    # top-level local so the Post-Patch Investigation block below (which reuses it for
-    # Coverage Analysis) can safely check it without a NameError on every other path.
-    if _grounding is not None:
-        try:
-            from .candidate_enrichment import build_investigation_context, enrich_candidates
-            from .candidate_selection import select_candidates
-            from .evidence_fusion import fuse_evidence, render_repository_understanding
-
-            _selection = select_candidates(_grounding)
-            if not _selection.used_fallback:
-                _investigation_context = None
-                if investigation_output_dir:
-                    _investigation_context = build_investigation_context(
-                        Path(repo_root), Path(investigation_output_dir)
-                    )
-                enrich_candidates(_selection, Path(repo_root), vulnerability_text, _investigation_context)
-                _repository_understanding = fuse_evidence(
-                    _selection, investigation_context_available=_investigation_context is not None
-                )
-                _repository_understanding_ctx = render_repository_understanding(_repository_understanding)
-                if _repository_understanding_ctx:
-                    print(
-                        f"[pipeline] Repository Understanding rendered "
-                        f"({len(_repository_understanding_ctx)} chars).",
-                        file=sys.stderr,
-                    )
-
-                from .post_patch_investigation import derive_pre_patch_anchors
-                _pre_patch_anchors = derive_pre_patch_anchors(_repository_understanding)
-        except Exception as exc:
-            print(
-                f"[pipeline] Repository Understanding unavailable: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-
-    # Experimental: Remediation Planner. One bounded LLM call that asks the
-    # model to commit to a narrow remediation strategy before Patch
-    # Generation runs, using exactly the evidence already assembled above.
-    # Not verified against the repository by itself -- an intentionally
-    # minimal proof-of-concept, not a trust boundary on its own. Skipped
-    # when a hand-authored plan (_plan_text) already exists. Best-effort:
-    # any failure degrades to no plan, same as every other optional
-    # context section.
-    _plan_ctx = ""
-    _planner_evidence_ctx = ""
-    _plan_result = None  # set below only when the Planner actually runs; read again
-    # much further down (as a source of "files already connected via Planner
-    # evidence") by the Final-Target Remediation Slice builder.
-    if not _plan_text:
-        try:
-            from .remediation_planner import build_planner_evidence, generate_remediation_plan
-            _evidence_so_far = "\n\n".join(
-                p for p in [_repo_code, _pattern_ctx, _repository_understanding_ctx] if p and p.strip()
-            )
-            _plan_result = generate_remediation_plan(vulnerability_text, llm, code_context=_evidence_so_far)
-            _plan_ctx = _plan_result.rendered
-            if _plan_ctx:
-                print(f"[pipeline] Remediation plan generated ({len(_plan_ctx)} chars).", file=sys.stderr)
-
-            # Deterministic bridge: verify the Planner's proposed files/symbols
-            # against the real repository, then run only what verifies through
-            # the SAME enrich_candidates/fuse_evidence/render_repository_
-            # understanding chain already used above -- reusing
-            # _investigation_context as-is, never rebuilding it. No new LLM
-            # call happens here. Kept in its own try/except so a failure here
-            # can never suppress the plan text itself, gathered just above.
-            try:
-                _planner_evidence_ctx = build_planner_evidence(
-                    _plan_result, repo_root, vulnerability_text, _investigation_context
-                )
-                if _planner_evidence_ctx:
-                    print(
-                        f"[pipeline] Planner-proposed candidate evidence rendered "
-                        f"({len(_planner_evidence_ctx)} chars).",
-                        file=sys.stderr,
-                    )
-            except Exception as exc:
-                print(f"[pipeline] Planner candidate evidence unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
-        except ModelUnavailableError:
-            # An explicit execution/configuration decision (non-interactive
-            # rejection, or a declined/cancelled interactive reselection),
-            # not ordinary evidence-acquisition failure -- must abort the
-            # run, not degrade to "no plan" like every other failure here.
-            raise
-        except Exception as exc:
-            print(f"[pipeline] Remediation planning unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
-
-    # Batch B2: finish S1's execution -- outcome reflects which of the three
-    # sub-paths above actually settled; the artifact carries the REAL
-    # structured output (never mere presence booleans) a future Stage-4
-    # replay would need: the Planner's own result, Repository Understanding,
-    # and the pre-patch anchors derived from it. Never the raw repository
-    # text/_grounding itself (that stays a run() local, not persisted here --
-    # not owned by this canonical stage's contract; see
-    # RepositoryGroundingResult/_repo_code, which are inputs to this stage,
-    # not its output).
-    _s1_rec = None
-    if execution_recorder is not None:
-        if _plan_result is not None:
-            _s1_outcome = "generated"
-        elif _plan_text:
-            _s1_outcome = "skipped_hand_authored_plan"
-        else:
-            _s1_outcome = "unavailable"
-        _s1_rec = execution_recorder.finish(
-            _s1_handle,
-            outcome=_s1_outcome,
-            artifact={
-                "plan_result": to_jsonable(_plan_result),
-                "repository_understanding": to_jsonable(_repository_understanding),
-                "pre_patch_anchors": to_jsonable(_pre_patch_anchors),
-            },
-        )
-
-    # Final Strategy: a second, distinct Planner call (stage
-    # "remediation_strategy") that runs only once verified Planner evidence
-    # exists -- it receives materially new evidence (the verified structural
-    # facts and source excerpts above) the first call never saw, and is not
-    # a blind retry of it. Skipped entirely (no LLM call) when
-    # _planner_evidence_ctx is empty -- generate_remediation_strategy enforces
-    # this itself. Best-effort: any failure here leaves the Target Discovery
-    # Plan and Planner-Proposed Candidate Evidence exactly as already
-    # gathered, and the pipeline continues without a Final Strategy section.
-    # Batch B2: begin recording S2 (remediation_strategy). consumed=[S1] --
-    # S2 is what actually reads S1's verified evidence (planner_evidence_ctx
-    # etc.), per stage_registry.STAGE_DEPENDENCIES.
-    _s2_handle = None
-    if execution_recorder is not None:
-        _s2_handle = execution_recorder.start(
-            _S_REMEDIATION_STRATEGY, consumed=[_s1_rec] if _s1_rec is not None else [],
-        )
-
-    _strategy_ctx = ""
-    _strategy_result = None  # read again below by the Final-Target Remediation Slice builder
-    if _planner_evidence_ctx:
-        try:
-            from .remediation_planner import generate_remediation_strategy
-            _strategy_result = generate_remediation_strategy(
-                vulnerability_text, llm, repo_root, _investigation_context,
-                repo_grounding_ctx=_repo_code,
-                repository_understanding_ctx=_repository_understanding_ctx,
-                discovery_plan_ctx=_plan_ctx,
-                planner_evidence_ctx=_planner_evidence_ctx,
-            )
-            _strategy_ctx = _strategy_result.rendered
-            if _strategy_ctx:
-                print(
-                    f"[pipeline] Final remediation strategy generated "
-                    f"({len(_strategy_ctx)} chars).",
-                    file=sys.stderr,
-                )
-            if _strategy_result.warnings:
-                print(
-                    f"[pipeline] Final strategy dropped unverified item(s): "
-                    f"{_strategy_result.warnings}",
-                    file=sys.stderr,
-                )
-        except ModelUnavailableError:
-            # See the matching guard around generate_remediation_plan above.
-            raise
-        except Exception as exc:
-            print(f"[pipeline] Final remediation strategy unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
-
-    # Batch B2: finish S2. artifact is the real RemediationStrategyResult
-    # (rendered + target_files/target_symbols/warnings/extended_mechanism/
-    # required_edits/security_invariant) -- the actual structured output a
-    # future Stage-3/Stage-4 replay would need, not a summary.
-    _s2_rec = None
-    if execution_recorder is not None:
-        if _strategy_result is not None:
-            _s2_outcome = "generated"
-        elif not _planner_evidence_ctx:
-            _s2_outcome = "skipped_no_planner_evidence"
-        else:
-            _s2_outcome = "unavailable"
-        _s2_rec = execution_recorder.finish(
-            _s2_handle,
-            outcome=_s2_outcome,
-            artifact={"strategy_result": to_jsonable(_strategy_result)},
-        )
-
-    # Final-Target Remediation Slice: deterministic, bounded exact source
-    # built ONLY from generate_remediation_strategy()'s VERIFIED result --
-    # never the earlier, exploratory Target Discovery candidates, so
-    # source budget is never spent on a candidate the Final Strategy
-    # already rejected. No new LLM call (build_final_target_slice takes no
-    # `llm` parameter), no new repository parse -- reuses
-    # _investigation_context as-is. Best-effort: any failure degrades to a
-    # short note and the pipeline continues with whatever context already
-    # exists; only a genuinely ZERO-coverage Final Strategy result (one
-    # that named targets but produced no usable verified source for any of
-    # them) skips the Patch Generator call itself, per the coverage
-    # contract below -- this never fails the run and never introduces a
-    # new recommendation category.
-    # Batch B2: begin recording S3 (guided_context_acquisition). consumed=
-    # [S1, S2] -- covers the Final-Target Slice, Edit Readiness Gate,
-    # deterministic + guided acquisition, and the target-file fallback,
-    # through the skip-patch-generation decision below.
-    _s3_handle = None
-    if execution_recorder is not None:
-        _s3_handle = execution_recorder.start(
-            _S_GUIDED_CONTEXT_ACQUISITION,
-            consumed=[r for r in (_s1_rec, _s2_rec) if r is not None],
-        )
-
-    _slice_ctx = ""
-    _coverage_warning_ctx = ""
-    _skip_patch_generation = False
-    _edit_readiness = None  # EditReadinessResult | None -- see PipelineResult.edit_readiness
-    _edit_acquisition = None  # AcquisitionResult | None -- see PipelineResult.edit_acquisition
-    _guided_acquisition = None  # GuidedAcquisitionResult | None -- see PipelineResult.guided_acquisition
-    # Minimal compatibility pre-inits for Slice 4 (Patch Target Conformance
-    # Gate + Post-Patch Recovery, much further below in this function): both
-    # are otherwise only ever assigned inside the `if _strategy_result is
-    # not None...` block below, so a run with no Final Strategy (or one
-    # naming no targets) would leave them undefined by the time Slice 4
-    # reads them -- never actually reassigned above, only guaranteed defined.
-    _slice_result = None  # FinalTargetSliceResult | None
-    _intended_edits = []  # list[IntendedEdit]
-    if _strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols):
-        try:
-            from .remediation_planner import build_final_target_slice
-            _planner_evidence_files = list(_plan_result.target_files) if _plan_result is not None else []
-            _slice_result = build_final_target_slice(
-                _strategy_result, repo_root, _investigation_context,
-                planner_evidence_files=_planner_evidence_files,
-            )
-            _slice_ctx = _slice_result.rendered
-            _coverage_warning_ctx = _slice_result.warning_text
-            if _slice_ctx:
-                print(
-                    f"[pipeline] Final-Target Remediation Slice built "
-                    f"({len(_slice_ctx)} chars); covered files={_slice_result.covered_target_files}, "
-                    f"covered symbols={_slice_result.covered_target_symbols}.",
-                    file=sys.stderr,
-                )
-            if not _slice_result.coverage_complete:
-                print(
-                    f"[pipeline] Final-target source coverage incomplete -- "
-                    f"uncovered files={_slice_result.uncovered_target_files}, "
-                    f"uncovered symbols={_slice_result.uncovered_target_symbols}.",
-                    file=sys.stderr,
-                )
-
-            # Edit Readiness Gate (Slice 1) -- replaces the coarse
-            # "has_any_coverage == safe to generate" assumption with a
-            # decision made separately for every intended edit. Reuses only
-            # data build_final_target_slice() already computed above; no
-            # new repository read, no new resolution, no new LLM call.
-            from .remediation_planner import build_intended_edits, check_edit_readiness
-            _intended_edits = build_intended_edits(_strategy_result, _slice_result)
-            _initial_edit_readiness = check_edit_readiness(_intended_edits, _slice_result)
-            print(
-                f"[pipeline] Edit Readiness Gate: strategy_ready={_initial_edit_readiness.strategy_ready}, "
-                f"edit_source_ready={_initial_edit_readiness.edit_source_ready}, "
-                f"{len(_initial_edit_readiness.ready_edits)}/{len(_initial_edit_readiness.intended_edits)} "
-                f"intended edit(s) ready"
-                + (f", failure_reasons={_initial_edit_readiness.failure_reasons}"
-                   if _initial_edit_readiness.unready_edits else ""),
-                file=sys.stderr,
-            )
-
-            # Slice 2 -- Deterministic Pre-Patch Retrieval: attempt
-            # additional verified repository source for whatever is still
-            # unready, deterministically and bounded (see
-            # remediation_planner.run_deterministic_acquisition). No-op
-            # (0 rounds) when the initial readiness above was already
-            # complete. Best-effort: any failure here leaves the initial
-            # readiness/slice exactly as already computed.
-            _edit_readiness = _initial_edit_readiness
-            if not _initial_edit_readiness.edit_source_ready:
-                try:
-                    from .remediation_planner import run_deterministic_acquisition
-                    _edit_acquisition = run_deterministic_acquisition(
-                        _strategy_result, repo_root, _investigation_context,
-                        _slice_result, _initial_edit_readiness,
-                        budget_controller=budget_controller,
-                    )
-                    if _edit_acquisition.rounds_used > 0:
-                        _slice_result = _edit_acquisition.slice_result
-                        _slice_ctx = _slice_result.rendered
-                        _coverage_warning_ctx = _slice_result.warning_text
-                        _edit_readiness = check_edit_readiness(_intended_edits, _slice_result)
-                        print(
-                            f"[pipeline] Deterministic Pre-Patch Retrieval: "
-                            f"{_edit_acquisition.rounds_used} round(s), "
-                            f"{len(_edit_acquisition.attempts)} attempt(s); "
-                            f"edit_source_ready now={_edit_readiness.edit_source_ready} "
-                            f"({len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)} "
-                            f"intended edit(s) ready)"
-                            + (f", failure_reasons={_edit_readiness.failure_reasons}"
-                               if _edit_readiness.unready_edits else ""),
-                            file=sys.stderr,
-                        )
-                except Exception as exc:
-                    print(
-                        f"[pipeline] Deterministic Pre-Patch Retrieval unavailable: "
-                        f"{type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
-
-            # Snapshot for the debug artifact's own "readiness_after_
-            # deterministic_acquisition" key -- BEFORE Slice 3 (below) can
-            # reassign _edit_readiness again.
-            _readiness_after_deterministic = _edit_readiness
-
-            # Slice 3 -- Bounded LLM-guided pre-patch context retrieval:
-            # runs ONLY when Slice 2 above still leaves readiness
-            # incomplete (see remediation_planner.run_guided_acquisition).
-            # At most MAX_GUIDED_ACQUISITION_ROUNDS narrow LLM calls
-            # (stage "guided_context_request") -- never the Patch
-            # Generator, never a Planner/Final Strategy rerun, never the
-            # Challenger. Best-effort: any failure here leaves the
-            # Slice-2 readiness/slice exactly as already computed.
-            if not _edit_readiness.edit_source_ready:
-                try:
-                    from .remediation_planner import run_guided_acquisition
-                    _deterministic_attempts = _edit_acquisition.attempts if _edit_acquisition is not None else []
-                    _guided_acquisition = run_guided_acquisition(
-                        _strategy_result, vulnerability_text, llm, repo_root, _investigation_context,
-                        _slice_result, _edit_readiness, _deterministic_attempts,
-                        budget_controller=budget_controller,
-                    )
-                    if _guided_acquisition.rounds_used > 0:
-                        _slice_result = _guided_acquisition.slice_result
-                        _slice_ctx = _slice_result.rendered
-                        _coverage_warning_ctx = _slice_result.warning_text
-                        _edit_readiness = _guided_acquisition.readiness
-                        print(
-                            f"[pipeline] Guided Context Retrieval: "
-                            f"{_guided_acquisition.rounds_used} round(s), "
-                            f"{len(_guided_acquisition.attempts)} request(s); "
-                            f"edit_source_ready now={_edit_readiness.edit_source_ready} "
-                            f"({len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)} "
-                            f"intended edit(s) ready)"
-                            + (f", failure_reasons={_edit_readiness.failure_reasons}"
-                               if _edit_readiness.unready_edits else ""),
-                            file=sys.stderr,
-                        )
-                except ModelUnavailableError:
-                    # See the matching guard around generate_remediation_plan
-                    # above -- run_guided_acquisition calls
-                    # generate_guided_context_requests without its own
-                    # try/except, so this is the layer that would otherwise
-                    # swallow it.
-                    raise
-                except Exception as exc:
-                    print(
-                        f"[pipeline] Guided Context Retrieval unavailable: "
-                        f"{type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
-
-            # Bounded target-file fallback: a known-verified Final Strategy
-            # target file whose specific symbol never resolved (through
-            # Slice 2's deterministic retries or Slice 3's guided
-            # acquisition above) must not, by itself, force "no patch" --
-            # not when that file's own whole-file source was ALREADY
-            # rendered into the slice as a matter of course (category 5 of
-            # build_final_target_slice, computed the very first time this
-            # file became a target). This re-derives readiness from data
-            # already computed above -- no new file read, no new
-            # resolution, no LLM call -- via check_edit_readiness's own
-            # existing full_file_fallback_covered/identifier_definition_
-            # covered signals, which are themselves fixed by the Final
-            # Strategy's own verified target_files before this ever runs,
-            # so an unverified/LLM-invented file can never qualify. Applied
-            # exactly once, only here, only after guided acquisition has
-            # already been exhausted -- every earlier readiness check
-            # above (Slice 1/2/3) keeps its own exact, stricter semantics
-            # unchanged.
-            _target_file_fallback_used = False
-            if not _edit_readiness.edit_source_ready:
-                _fallback_readiness = check_edit_readiness(
-                    _intended_edits, _slice_result, allow_full_file_fallback_for_symbols=True,
-                )
-                if _fallback_readiness.edit_source_ready:
-                    _target_file_fallback_used = True
-                    print(
-                        "[pipeline] Target-file source fallback: symbol-level acquisition never "
-                        "resolved, but the Final Strategy's own verified target file(s) "
-                        f"{sorted(_slice_result.full_file_fallback_covered)} were already rendered "
-                        "in full -- Patch Generation will proceed using that source.",
-                        file=sys.stderr,
-                    )
-                _edit_readiness = _fallback_readiness
-
-            if os.environ.get("AUTOPATCHER_DEBUG"):
-                try:
-                    import datetime as _dt
-                    import json as _json
-
-                    def _readiness_doc(r):
-                        if r is None:
-                            return None
-                        return {
-                            "strategy_ready": r.strategy_ready,
-                            "edit_source_ready": r.edit_source_ready,
-                            "intended_edits": [{"file": e.file, "symbol": e.symbol} for e in r.intended_edits],
-                            "ready_edits": [
-                                {"file": rd.file, "symbol": rd.symbol, "role": rd.role} for rd in r.ready_edits
-                            ],
-                            "unready_edits": [
-                                {"file": u.edit.file, "symbol": u.edit.symbol, "reason": u.reason}
-                                for u in r.unready_edits
-                            ],
-                            "failure_reasons": r.failure_reasons,
-                        }
-
-                    # Explicit even when Slice 2 never ran at all (initial
-                    # readiness was already complete, or it failed) -- a
-                    # present `null`/empty-list value, never an omitted key.
-                    _deterministic_doc = None
-                    if _edit_acquisition is not None:
-                        _deterministic_doc = {
-                            "rounds": _edit_acquisition.rounds_used,
-                            "source_added": any(a.success for a in _edit_acquisition.attempts),
-                            "attempts": [
-                                {
-                                    "round": a.round,
-                                    "file": a.intended_edit.file,
-                                    "symbol": a.intended_edit.symbol,
-                                    "retrieval_strategy": a.retrieval_strategy,
-                                    "resolved_file": a.resolved_file,
-                                    "resolved_symbol": a.resolved_symbol,
-                                    "start_line": a.start_line,
-                                    "end_line": a.end_line,
-                                    "source_kind": a.source_kind,
-                                    "source_chars": a.source_chars,
-                                    "success": a.success,
-                                    "failure_reason": a.failure_reason,
-                                }
-                                for a in _edit_acquisition.attempts
-                            ],
-                        }
-
-                    # Same explicitness rule for Slice 3: present (as null)
-                    # even when Slice 2 alone already made readiness
-                    # complete, so guided acquisition never ran.
-                    _guided_doc = None
-                    if _guided_acquisition is not None:
-                        _guided_doc = {
-                            "rounds": _guided_acquisition.rounds_used,
-                            "source_added": any(a.verified and a.source_chars > 0 for a in _guided_acquisition.attempts),
-                            "requests": [
-                                {
-                                    "round": a.round,
-                                    "request_type": a.request.request_type,
-                                    "file_hint": a.request.file_hint,
-                                    "symbol": a.request.symbol,
-                                    "identifier": a.request.identifier,
-                                    "reason": a.request.reason,
-                                    "attributed_file": a.request.intended_edit.file if a.request.intended_edit else None,
-                                    "attributed_symbol": a.request.intended_edit.symbol if a.request.intended_edit else None,
-                                }
-                                for a in _guided_acquisition.attempts
-                            ],
-                            "verification_results": [
-                                {
-                                    "round": a.round,
-                                    "schema_valid": a.schema_valid,
-                                    "verified": a.verified,
-                                    "failure_reason": a.failure_reason,
-                                    "resolved_file": a.resolved_file,
-                                    "resolved_symbol": a.resolved_symbol,
-                                    "start_line": a.start_line,
-                                    "end_line": a.end_line,
-                                    "source_kind": a.source_kind,
-                                    "source_chars": a.source_chars,
-                                    "readiness_improved": a.readiness_improved,
-                                }
-                                for a in _guided_acquisition.attempts
-                            ],
-                        }
-
-                    _debug_dir = Path("reports") / "debug"
-                    _debug_dir.mkdir(parents=True, exist_ok=True)
-                    _ts = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
-                    _doc = {
-                        "initial_edit_readiness": _readiness_doc(_initial_edit_readiness),
-                        "deterministic_acquisition": _deterministic_doc,
-                        "readiness_after_deterministic_acquisition": _readiness_doc(_readiness_after_deterministic),
-                        "guided_acquisition": _guided_doc,
-                        "target_file_fallback_used": _target_file_fallback_used,
-                        "final_edit_readiness": _readiness_doc(_edit_readiness),
-                        "patch_generation_skipped": not _edit_readiness.edit_source_ready,
-                        # Best-effort only -- see ContextBudgetController.to_trace_dict();
-                        # None whenever no controller was supplied (policy="never"-equivalent
-                        # library use, or a CLI run that never built one).
-                        "budget_trace": budget_controller.to_trace_dict() if budget_controller is not None else None,
-                    }
-                    (_debug_dir / f"edit_readiness_{_ts}.json").write_text(
-                        _json.dumps(_doc, indent=2), encoding="utf-8"
-                    )
-                except Exception:
-                    pass
-
-            if not _edit_readiness.edit_source_ready:
-                _skip_patch_generation = True
-                print(
-                    "[pipeline] Not every intended edit has verified, patch-ready repository "
-                    f"source -- skipping Patch Generation for this run. "
-                    f"failure_reasons={_edit_readiness.failure_reasons}",
-                    file=sys.stderr,
-                )
-        except Exception as exc:
-            print(f"[pipeline] Final-Target Remediation Slice unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
-
-    # Batch B2: finish S3. Per Final Correction 1: persist the REAL
-    # structured slice/readiness output Stage 4 actually consumes (`.rendered`
-    # source text included) -- Stage 4's own artifact must not become the
-    # only place this exists; never mere presence booleans.
-    _s3_rec = None
-    if execution_recorder is not None:
-        if _slice_result is not None:
-            _s3_outcome = "ready"
-        elif not (_strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols)):
-            _s3_outcome = "skipped_no_strategy_targets"
-        else:
-            _s3_outcome = "unavailable"
-        _s3_rec = execution_recorder.finish(
-            _s3_handle,
-            outcome=_s3_outcome,
-            artifact={
-                "slice_result": to_jsonable(_slice_result),
-                "edit_readiness": to_jsonable(_edit_readiness),
-                "skip_patch_generation": _skip_patch_generation,
-            },
-        )
-
-    # Assemble final context, in order: hand-authored Patch Plan → original
-    # Repository Grounding → vuln patterns → ordinary Repository
-    # Understanding → Target Discovery Plan (exploratory) → Planner-Proposed
-    # Candidate Evidence (deterministically verified) → Final
-    # Evidence-Backed Remediation Strategy → Final-Target Remediation Slice
-    # (the last source-bearing section before Patch Generation) →
-    # final-target source coverage warning, only when incomplete.
-    _ctx_parts = [
-        p for p in [
-            _plan_text, _repo_code, _pattern_ctx, _repository_understanding_ctx,
-            _plan_ctx, _planner_evidence_ctx, _strategy_ctx, _slice_ctx, _coverage_warning_ctx,
-        ]
-        if p and p.strip()
-    ]
-    code_context = "\n\n".join(_ctx_parts)
-
-    # Batch B2: begin recording S4's INITIAL execution only
-    # (patch_generation_and_post_patch_investigation) -- covers contract
-    # retry, hunk repair, Slice-4 conformance/recovery, hygiene,
-    # applicability (+ its own bounded retry), and Post-Patch Investigation,
-    # through where `patch`/the investigation triple settle just before the
-    # Challenger call. consumed=[S1, S2, S3] -- the real dependencies this
-    # stage's own context/conformance/recovery machinery reads (see
-    # stage_registry.STAGE_DEPENDENCIES). Deliberately NOT recorded again
-    # for the Challenger-driven repair loop's own regeneration further below
-    # -- that path is a materially narrower contract (no contract retry, no
-    # conformance gate, no applicability retry, no Post-Patch Investigation)
-    # and is NOT instrumented as a canonical Stage-4 execution in this batch.
-    _s4_handle = None
-    if execution_recorder is not None:
-        _s4_handle = execution_recorder.start(
-            _S_PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
-            consumed=[r for r in (_s1_rec, _s2_rec, _s3_rec) if r is not None],
-        )
-
-    # _patch_validation_skip_reason distinguishes, for observability, WHY
-    # patch/hunk-repair/hygiene/applicability validation is being skipped —
-    # never conflated into a single generic flag. Both reasons converge on
-    # the same downstream behavior (validation machinery never runs; the
-    # already-existing empty-patch/no_patch execution outcome renders), but
-    # the reason itself must stay legible: "no verified final-target
-    # source" (Recommendation-Policy-relevant evidence gap) is a materially
-    # different situation from "the model's response was structurally
-    # invalid" (an LLM output-contract failure) — see the module-level
-    # correction this section implements: an invalid Patch Generator
-    # response must fail closed BEFORE hunk repair/hygiene/git apply
-    # --check/applicability-aware retry, not merely collapse to "" and let
-    # "" flow through that machinery as if it were an ordinary empty patch.
     _patch_validation_skip_reason: str | None = None
     _patch_generation_status: str | None = None  # set only when generation actually ran
     if _skip_patch_generation:
@@ -5212,135 +4515,28 @@ def run(
             _post_patch_coverage = None
             _post_patch_ctx = ""
             _investigated_patch = None
+    return locals()
 
-    # Batch B2: finish S4's INITIAL execution -- `patch` and the full
-    # investigation triple are settled at this exact point (before the
-    # Challenger call below, and well before the repair loop can replace
-    # `patch` further down -- see this stage's start() comment on why the
-    # repair-loop regeneration is deliberately NOT a second S4 execution
-    # yet). `canonical_contract_scope: "full"` records, honestly, that THIS
-    # execution ran every internal mechanic the canonical contract
-    # includes (contract retry, hunk repair, conformance/recovery,
-    # applicability retry, post-patch investigation) -- distinguishing it
-    # from the narrower repair-loop regeneration path, which does not, and
-    # is not recorded as an execution of this canonical stage in this batch.
-    _s4_rec = None
-    if execution_recorder is not None:
-        _s4_outcome = "no_candidate_patch" if _patch_validation_skip_reason is not None or not (patch and patch.strip()) else "settled"
-        _s4_rec = execution_recorder.finish(
-            _s4_handle,
-            outcome=_s4_outcome,
-            artifact={
-                "patch": patch,
-                "original_patch": original_patch,
-                "retry_patch": retry_patch,
-                "retry_attempted": retry_attempted,
-                "retry_succeeded": retry_succeeded,
-                "retry_failed_file": retry_failed_file,
-                "retry_error_before": retry_error_before,
-                "hygiene_findings": to_jsonable(hygiene_findings),
-                "applicability_result": to_jsonable(applicability_result),
-                "final_repair_meta": to_jsonable(_final_repair_meta),
-                "patch_target_conformance": to_jsonable(_patch_target_conformance),
-                "post_patch_recovery": to_jsonable(_post_patch_recovery),
-                "post_patch_observations": to_jsonable(_post_patch_observations),
-                "post_patch_coverage": to_jsonable(_post_patch_coverage),
-                "investigated_patch": _investigated_patch,
-            },
-            extra={"canonical_contract_scope": "full"},
-        )
 
-    challenger_context = code_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else "")
+def _run_patch_repair_and_calibration(
+    *, vulnerability_text, llm, repo_root, code_context, challenger_context,
+    patch, challenger, applicability_result, hygiene_findings, _final_repair_meta,
+    _post_patch_observations, _investigated_patch,
+):
+    """Reusable Stage-6 (patch_repair_and_calibration) executor -- the
+    COMPLETE current production contract (classification, calibration v1,
+    the Challenger-driven repair loop, and the final-calibration
+    fallback), extracted VERBATIM from pipeline.run() (Batch B7) so
+    production and replay share exactly the same implementation -- see
+    replay_engine.py's patch_repair_and_calibration ReplayHandler, the
+    other caller. No behavior change: byte-identical body to what used to
+    be inline in run(); only the function boundary is new. Repair-
+    triggered regeneration/re-challenge remain internal to this one
+    execution, exactly as before -- never migrated to canonical S4#2/S5#2.
 
-    # No-candidate-patch early stop: once Patch Generation has definitively
-    # ended without a valid candidate, every remaining patch-dependent
-    # review stage (Challenger, the Challenger-driven repair loop, Finding
-    # Calibration, the Patch Reviewer, and Confidence Scorer below) must
-    # not run against an empty diff -- there is nothing to challenge,
-    # calibrate, review, or score, and doing so previously produced
-    # internally contradictory output (e.g. "Still vulnerable: No" /
-    # "Adversarial review confirms fix approach" with no patch at all).
-    # `challenger = {}` alone is sufficient to also correctly skip the
-    # repair loop and Finding Calibration below WITHOUT any change to
-    # either's own decision logic: _classify_challenger({}) yields
-    # confirmed_defect_count == 0 and empty classified-finding lists, and
-    # both the repair loop's trigger and the calibration-input filter
-    # already key off exactly those derived values.
-    #
-    # Batch B2: begin recording S5's INITIAL execution only (challenger).
-    # consumed=[S4] -- the ONLY real dependency (stage_registry.
-    # STAGE_DEPENDENCIES[CHALLENGER]). The repair loop's own re-challenge
-    # call further below is NOT recorded as a second S5 execution in this
-    # batch (see this stage's start() comment on S4 for why).
-    _s5_handle = None
-    if execution_recorder is not None:
-        _s5_handle = execution_recorder.start(
-            _S_CHALLENGER, consumed=[_s4_rec] if _s4_rec is not None else [],
-        )
-
-    if patch and patch.strip():
-        print("[pipeline] Step 2/4 – Challenging patch …", file=sys.stderr)
-        challenger = challenge_patch(vulnerability_text, patch, llm, code_context=challenger_context)
-    else:
-        print(
-            "[pipeline] Step 2/4 – Challenging patch skipped (no candidate patch was produced).",
-            file=sys.stderr,
-        )
-        challenger = {}
-
-    # Batch B2: finish S5. Persist the raw Challenger output plus the
-    # deterministic classified result (_classify_challenger) -- the
-    # cleanest canonical Stage-5 output, matching what a future repair-loop
-    # migration's own S5#2 artifact would also carry.
-    _s5_rec = None
-    if execution_recorder is not None:
-        _s5_outcome = "settled" if patch and patch.strip() else "skipped_no_candidate_patch"
-        _s5_rec = execution_recorder.finish(
-            _s5_handle,
-            outcome=_s5_outcome,
-            artifact={
-                "challenger": to_jsonable(challenger),
-                "classified_challenger": to_jsonable(_classify_challenger(challenger)),
-            },
-        )
-
-    # Batch B3: begin recording S6's execution (patch_repair_and_calibration).
-    # consumed=[S4, S5] (stage_registry.STAGE_DEPENDENCIES[PATCH_REPAIR_AND_
-    # CALIBRATION]) -- covers classification, calibration v1, the repair
-    # loop, and the (now-adjacent, see below) final-calibration fallback --
-    # through where `finding_calibration` is FULLY, finally settled, before
-    # Evidence Sufficiency Gate/Existing Test Comparison/Stage 7 begin.
-    # Repair-triggered regeneration/re-challenge remain INTERNAL to this one
-    # S6 execution in this batch -- NOT recorded as canonical S4#2/S5#2 (the
-    # repair-regeneration code path is proven NOT equivalent to Stage 4's
-    # full canonical contract: no contract retry, no conformance/recovery,
-    # no applicability-aware retry, no post-patch investigation -- forcing
-    # symmetry now would misrepresent two different contracts as one).
-    _s6_handle = None
-    if execution_recorder is not None:
-        _s6_handle = execution_recorder.start(
-            _S_PATCH_REPAIR_AND_CALIBRATION,
-            consumed=[r for r in (_s4_rec, _s5_rec) if r is not None],
-        )
-
-    # Phase C: Challenger-driven repair loop.
-    #
-    # Flow: Patch v1 -> Challenger v1 -> raw classification -> Finding
-    # Calibration v1 -> deterministic repair gate (should_auto_repair) ->
-    # optional Repair v2 -> deterministic applicability/hygiene checks ->
-    # Challenger v2 -> Finding Calibration v2 -> deterministic accept/reject
-    # (accept_repair) -> continue.
-    #
-    # Calibration is deliberately run here, early, rather than only after
-    # this block (as before) -- but ONLY when there is at least one raw
-    # confirmed_defect finding to gate on. When there are none
-    # (_orig_defect_count == 0, the common case), this block does nothing
-    # and calibration runs exactly once, later, immediately after this
-    # block (see the "Finding calibration" fallback right below -- moved
-    # here, adjacent, in Batch B3, so ALL of Stage 6's owned computation is
-    # textually contiguous and settles before the S6 execution finishes;
-    # previously this same fallback ran much further down, after Existing
-    # Test Comparison) -- no extra LLM call is added for the all-clear path.
+    Returns every local variable this body binds (`locals()`) -- see
+    _run_patch_generation_and_investigation's docstring for why.
+    """
     _repair_classified = _classify_challenger(challenger)
     _orig_defect_count = _repair_classified["confirmed_defect_count"]
 
@@ -5553,6 +4749,1118 @@ def run(
                 _finding_calibration_source = "fallback"
             except Exception as _exc:
                 print(f"[pipeline] Finding calibration failed (non-fatal): {_exc}", file=sys.stderr)
+    return locals()
+
+
+def _adjust_confidence_score_for_challenger(score_text, challenger):
+    """Reusable Stage-8 (confidence_scoring) deterministic adjustment --
+    extracted VERBATIM from pipeline.run() (Batch B7) so production and
+    replay share exactly the same scoring semantics. Post-processes
+    score_confidence()'s own raw score_text using the Challenger result
+    already consumed via Stage 6 -- no LLM call, no behavior change.
+
+    Returns every local variable this body binds (`locals()`); callers
+    read `orig_score`, `adjusted_score`, `score_text` (the adjusted one).
+    """
+    # Adjust the numeric score based on adversarial challenger results
+    orig_score_str = _extract_score(score_text)
+    try:
+        orig_score = float(orig_score_str)
+    except Exception:
+        orig_score = None
+
+    adjusted_score = orig_score
+    try:
+        still = bool(challenger.get("still_vulnerable"))
+        edge_cases = challenger.get("edge_cases", []) or []
+        potential_issues = challenger.get("potential_issues", []) or []
+    except Exception:
+        still = False
+        edge_cases = []
+        potential_issues = []
+
+    if orig_score is not None:
+        if still:
+            adjusted_score = orig_score * 0.4
+            reason_lines = [
+                "Challenger indicates the vulnerability may still exist; applied strong reduction (0.4x).",
+            ]
+        elif edge_cases or potential_issues:
+            adjusted_score = orig_score * 0.7
+            reason_lines = [
+                "Challenger found edge cases or potential issues; applied moderate reduction (0.7x).",
+            ]
+        else:
+            adjusted_score = orig_score
+            reason_lines = ["No adversarial issues found; score unchanged."]
+
+        adjusted_score_str = f"{adjusted_score:.2f}"
+        orig_score_display = f"{orig_score:.2f}"
+
+        # Build a new score_text that places the adjusted score first so
+        # _extract_score() picks it up when building the report.
+        adjustment_text = (
+            f"**Confidence score:** {adjusted_score_str}\n\n"
+            f"**Original score:** {orig_score_display}\n\n"
+            "**Adjustment reasoning:**\n"
+            + "\n".join(f"- {l}" for l in reason_lines)
+            + "\n\n"
+        )
+
+        # Prepend adjustment summary to the original scorer output for context
+        score_text = adjustment_text + score_text
+    return locals()
+
+
+def _run_repository_analysis_and_remediation_planning(
+    *, vulnerability_text, repo_root, investigation_output_dir, llm
+):
+    """Reusable Stage-1 (repository_analysis_and_remediation_planning)
+    executor -- the COMPLETE current production contract (repo grounding,
+    vulnerability-pattern context, deterministic Repository Understanding,
+    and the Remediation Planner's first LLM call), extracted VERBATIM from
+    pipeline.run() (Batch B7 continuation). Byte-identical to the prior
+    inline block: same prompts, same best-effort try/except degradation,
+    same ModelUnavailableError re-raise. Returns every local variable this
+    body binds (`locals()`), so callers (run() and replay_engine.py) unpack
+    only the specific keys they need.
+    """
+    _plan_text = _load_experiment_plan(vulnerability_text)
+
+    # Locate relevant code from the target repository (best-effort).
+    _repo_code = ""
+    _grounding: RepositoryGroundingResult | None = None
+    if repo_root:
+        from .repo_locator import ground_repository
+        _grounding = ground_repository(vulnerability_text, Path(repo_root))
+        _repo_code = _grounding.rendered_context
+        if _repo_code:
+            print(f"[pipeline] Code context found ({len(_repo_code)} chars); injecting into patch prompt.", file=sys.stderr)
+        else:
+            print("[pipeline] No code context found in repo; patch will be best-effort.", file=sys.stderr)
+
+    # Phase C.5: inject vulnerability class guidance (canonical patterns + sink coverage).
+    # Pass _repo_code (not the accumulated context) so sink detection scans only source code.
+    _pattern_ctx = ""
+    try:
+        from .vulnerability_patterns import build_vulnerability_pattern_context
+        _pattern_ctx = build_vulnerability_pattern_context(
+            vulnerability_text, _repo_code, Path(repo_root) if repo_root else None
+        )
+        if _pattern_ctx:
+            print(f"[pipeline] Vulnerability class guidance injected ({len(_pattern_ctx)} chars).", file=sys.stderr)
+    except Exception:
+        pass
+
+    # Deterministic Repository Understanding: bounded candidate selection +
+    # enrichment + fusion, reusing the same _grounding computed above (no
+    # second ground_repository() call, no second candidate set). Best-effort
+    # -- any failure degrades to today's existing repo_code/pattern_ctx
+    # context rather than aborting the run. Rendered only when selection
+    # actually found something to select (CandidateSelection.used_fallback
+    # documents this as the caller's cue to fall back to existing behavior).
+    _repository_understanding: RepositoryUnderstanding | None = None
+    _repository_understanding_ctx = ""
+    _pre_patch_anchors: list | None = None
+    _investigation_context = None  # InvestigationContext | None -- only set below when
+    # investigation_output_dir is provided and grounding/selection succeed; kept as a
+    # top-level local so the Post-Patch Investigation block below (which reuses it for
+    # Coverage Analysis) can safely check it without a NameError on every other path.
+    if _grounding is not None:
+        try:
+            from .candidate_enrichment import build_investigation_context, enrich_candidates
+            from .candidate_selection import select_candidates
+            from .evidence_fusion import fuse_evidence, render_repository_understanding
+
+            _selection = select_candidates(_grounding)
+            if not _selection.used_fallback:
+                _investigation_context = None
+                if investigation_output_dir:
+                    _investigation_context = build_investigation_context(
+                        Path(repo_root), Path(investigation_output_dir)
+                    )
+                enrich_candidates(_selection, Path(repo_root), vulnerability_text, _investigation_context)
+                _repository_understanding = fuse_evidence(
+                    _selection, investigation_context_available=_investigation_context is not None
+                )
+                _repository_understanding_ctx = render_repository_understanding(_repository_understanding)
+                if _repository_understanding_ctx:
+                    print(
+                        f"[pipeline] Repository Understanding rendered "
+                        f"({len(_repository_understanding_ctx)} chars).",
+                        file=sys.stderr,
+                    )
+
+                from .post_patch_investigation import derive_pre_patch_anchors
+                _pre_patch_anchors = derive_pre_patch_anchors(_repository_understanding)
+        except Exception as exc:
+            print(
+                f"[pipeline] Repository Understanding unavailable: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    # Experimental: Remediation Planner. One bounded LLM call that asks the
+    # model to commit to a narrow remediation strategy before Patch
+    # Generation runs, using exactly the evidence already assembled above.
+    # Not verified against the repository by itself -- an intentionally
+    # minimal proof-of-concept, not a trust boundary on its own. Skipped
+    # when a hand-authored plan (_plan_text) already exists. Best-effort:
+    # any failure degrades to no plan, same as every other optional
+    # context section.
+    _plan_ctx = ""
+    _planner_evidence_ctx = ""
+    _plan_result = None  # set below only when the Planner actually runs; read again
+    # much further down (as a source of "files already connected via Planner
+    # evidence") by the Final-Target Remediation Slice builder.
+    if not _plan_text:
+        try:
+            from .remediation_planner import build_planner_evidence, generate_remediation_plan
+            _evidence_so_far = "\n\n".join(
+                p for p in [_repo_code, _pattern_ctx, _repository_understanding_ctx] if p and p.strip()
+            )
+            _plan_result = generate_remediation_plan(vulnerability_text, llm, code_context=_evidence_so_far)
+            _plan_ctx = _plan_result.rendered
+            if _plan_ctx:
+                print(f"[pipeline] Remediation plan generated ({len(_plan_ctx)} chars).", file=sys.stderr)
+
+            # Deterministic bridge: verify the Planner's proposed files/symbols
+            # against the real repository, then run only what verifies through
+            # the SAME enrich_candidates/fuse_evidence/render_repository_
+            # understanding chain already used above -- reusing
+            # _investigation_context as-is, never rebuilding it. No new LLM
+            # call happens here. Kept in its own try/except so a failure here
+            # can never suppress the plan text itself, gathered just above.
+            try:
+                _planner_evidence_ctx = build_planner_evidence(
+                    _plan_result, repo_root, vulnerability_text, _investigation_context
+                )
+                if _planner_evidence_ctx:
+                    print(
+                        f"[pipeline] Planner-proposed candidate evidence rendered "
+                        f"({len(_planner_evidence_ctx)} chars).",
+                        file=sys.stderr,
+                    )
+            except Exception as exc:
+                print(f"[pipeline] Planner candidate evidence unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+        except ModelUnavailableError:
+            # An explicit execution/configuration decision (non-interactive
+            # rejection, or a declined/cancelled interactive reselection),
+            # not ordinary evidence-acquisition failure -- must abort the
+            # run, not degrade to "no plan" like every other failure here.
+            raise
+        except Exception as exc:
+            print(f"[pipeline] Remediation planning unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return locals()
+
+
+def _run_guided_context_acquisition(
+    *, vulnerability_text, llm, repo_root, budget_controller,
+    _strategy_result, _plan_result, _investigation_context,
+):
+    """Reusable Stage-3 (guided_context_acquisition) executor -- the
+    COMPLETE current production contract (Final-Target Remediation Slice,
+    Edit Readiness Gate, Slice 2 deterministic acquisition, Slice 3
+    LLM-guided acquisition, the bounded target-file fallback, and the
+    skip-patch-generation decision), extracted VERBATIM from pipeline.run()
+    (Batch B8). Byte-identical to the prior inline block: same budgeting,
+    same retry/fallback order, same LLM ordering (guided_context_request
+    only, bounded), same best-effort try/except degradation. Returns every
+    local variable this body binds (`locals()`), so callers (run() and
+    replay_engine.py) unpack only the specific keys they need.
+    """
+    _slice_ctx = ""
+    _coverage_warning_ctx = ""
+    _skip_patch_generation = False
+    _edit_readiness = None  # EditReadinessResult | None -- see PipelineResult.edit_readiness
+    _edit_acquisition = None  # AcquisitionResult | None -- see PipelineResult.edit_acquisition
+    _guided_acquisition = None  # GuidedAcquisitionResult | None -- see PipelineResult.guided_acquisition
+    # Minimal compatibility pre-inits for Slice 4 (Patch Target Conformance
+    # Gate + Post-Patch Recovery, much further below in this function): both
+    # are otherwise only ever assigned inside the `if _strategy_result is
+    # not None...` block below, so a run with no Final Strategy (or one
+    # naming no targets) would leave them undefined by the time Slice 4
+    # reads them -- never actually reassigned above, only guaranteed defined.
+    _slice_result = None  # FinalTargetSliceResult | None
+    _intended_edits = []  # list[IntendedEdit]
+    if _strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols):
+        try:
+            from .remediation_planner import build_final_target_slice
+            _planner_evidence_files = list(_plan_result.target_files) if _plan_result is not None else []
+            _slice_result = build_final_target_slice(
+                _strategy_result, repo_root, _investigation_context,
+                planner_evidence_files=_planner_evidence_files,
+            )
+            _slice_ctx = _slice_result.rendered
+            _coverage_warning_ctx = _slice_result.warning_text
+            if _slice_ctx:
+                print(
+                    f"[pipeline] Final-Target Remediation Slice built "
+                    f"({len(_slice_ctx)} chars); covered files={_slice_result.covered_target_files}, "
+                    f"covered symbols={_slice_result.covered_target_symbols}.",
+                    file=sys.stderr,
+                )
+            if not _slice_result.coverage_complete:
+                print(
+                    f"[pipeline] Final-target source coverage incomplete -- "
+                    f"uncovered files={_slice_result.uncovered_target_files}, "
+                    f"uncovered symbols={_slice_result.uncovered_target_symbols}.",
+                    file=sys.stderr,
+                )
+
+            # Edit Readiness Gate (Slice 1) -- replaces the coarse
+            # "has_any_coverage == safe to generate" assumption with a
+            # decision made separately for every intended edit. Reuses only
+            # data build_final_target_slice() already computed above; no
+            # new repository read, no new resolution, no new LLM call.
+            from .remediation_planner import build_intended_edits, check_edit_readiness
+            _intended_edits = build_intended_edits(_strategy_result, _slice_result)
+            _initial_edit_readiness = check_edit_readiness(_intended_edits, _slice_result)
+            print(
+                f"[pipeline] Edit Readiness Gate: strategy_ready={_initial_edit_readiness.strategy_ready}, "
+                f"edit_source_ready={_initial_edit_readiness.edit_source_ready}, "
+                f"{len(_initial_edit_readiness.ready_edits)}/{len(_initial_edit_readiness.intended_edits)} "
+                f"intended edit(s) ready"
+                + (f", failure_reasons={_initial_edit_readiness.failure_reasons}"
+                   if _initial_edit_readiness.unready_edits else ""),
+                file=sys.stderr,
+            )
+
+            # Slice 2 -- Deterministic Pre-Patch Retrieval: attempt
+            # additional verified repository source for whatever is still
+            # unready, deterministically and bounded (see
+            # remediation_planner.run_deterministic_acquisition). No-op
+            # (0 rounds) when the initial readiness above was already
+            # complete. Best-effort: any failure here leaves the initial
+            # readiness/slice exactly as already computed.
+            _edit_readiness = _initial_edit_readiness
+            if not _initial_edit_readiness.edit_source_ready:
+                try:
+                    from .remediation_planner import run_deterministic_acquisition
+                    _edit_acquisition = run_deterministic_acquisition(
+                        _strategy_result, repo_root, _investigation_context,
+                        _slice_result, _initial_edit_readiness,
+                        budget_controller=budget_controller,
+                    )
+                    if _edit_acquisition.rounds_used > 0:
+                        _slice_result = _edit_acquisition.slice_result
+                        _slice_ctx = _slice_result.rendered
+                        _coverage_warning_ctx = _slice_result.warning_text
+                        _edit_readiness = check_edit_readiness(_intended_edits, _slice_result)
+                        print(
+                            f"[pipeline] Deterministic Pre-Patch Retrieval: "
+                            f"{_edit_acquisition.rounds_used} round(s), "
+                            f"{len(_edit_acquisition.attempts)} attempt(s); "
+                            f"edit_source_ready now={_edit_readiness.edit_source_ready} "
+                            f"({len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)} "
+                            f"intended edit(s) ready)"
+                            + (f", failure_reasons={_edit_readiness.failure_reasons}"
+                               if _edit_readiness.unready_edits else ""),
+                            file=sys.stderr,
+                        )
+                except Exception as exc:
+                    print(
+                        f"[pipeline] Deterministic Pre-Patch Retrieval unavailable: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+
+            # Snapshot for the debug artifact's own "readiness_after_
+            # deterministic_acquisition" key -- BEFORE Slice 3 (below) can
+            # reassign _edit_readiness again.
+            _readiness_after_deterministic = _edit_readiness
+
+            # Slice 3 -- Bounded LLM-guided pre-patch context retrieval:
+            # runs ONLY when Slice 2 above still leaves readiness
+            # incomplete (see remediation_planner.run_guided_acquisition).
+            # At most MAX_GUIDED_ACQUISITION_ROUNDS narrow LLM calls
+            # (stage "guided_context_request") -- never the Patch
+            # Generator, never a Planner/Final Strategy rerun, never the
+            # Challenger. Best-effort: any failure here leaves the
+            # Slice-2 readiness/slice exactly as already computed.
+            if not _edit_readiness.edit_source_ready:
+                try:
+                    from .remediation_planner import run_guided_acquisition
+                    _deterministic_attempts = _edit_acquisition.attempts if _edit_acquisition is not None else []
+                    _guided_acquisition = run_guided_acquisition(
+                        _strategy_result, vulnerability_text, llm, repo_root, _investigation_context,
+                        _slice_result, _edit_readiness, _deterministic_attempts,
+                        budget_controller=budget_controller,
+                    )
+                    if _guided_acquisition.rounds_used > 0:
+                        _slice_result = _guided_acquisition.slice_result
+                        _slice_ctx = _slice_result.rendered
+                        _coverage_warning_ctx = _slice_result.warning_text
+                        _edit_readiness = _guided_acquisition.readiness
+                        print(
+                            f"[pipeline] Guided Context Retrieval: "
+                            f"{_guided_acquisition.rounds_used} round(s), "
+                            f"{len(_guided_acquisition.attempts)} request(s); "
+                            f"edit_source_ready now={_edit_readiness.edit_source_ready} "
+                            f"({len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)} "
+                            f"intended edit(s) ready)"
+                            + (f", failure_reasons={_edit_readiness.failure_reasons}"
+                               if _edit_readiness.unready_edits else ""),
+                            file=sys.stderr,
+                        )
+                except ModelUnavailableError:
+                    # See the matching guard around generate_remediation_plan
+                    # above -- run_guided_acquisition calls
+                    # generate_guided_context_requests without its own
+                    # try/except, so this is the layer that would otherwise
+                    # swallow it.
+                    raise
+                except Exception as exc:
+                    print(
+                        f"[pipeline] Guided Context Retrieval unavailable: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+
+            # Bounded target-file fallback: a known-verified Final Strategy
+            # target file whose specific symbol never resolved (through
+            # Slice 2's deterministic retries or Slice 3's guided
+            # acquisition above) must not, by itself, force "no patch" --
+            # not when that file's own whole-file source was ALREADY
+            # rendered into the slice as a matter of course (category 5 of
+            # build_final_target_slice, computed the very first time this
+            # file became a target). This re-derives readiness from data
+            # already computed above -- no new file read, no new
+            # resolution, no LLM call -- via check_edit_readiness's own
+            # existing full_file_fallback_covered/identifier_definition_
+            # covered signals, which are themselves fixed by the Final
+            # Strategy's own verified target_files before this ever runs,
+            # so an unverified/LLM-invented file can never qualify. Applied
+            # exactly once, only here, only after guided acquisition has
+            # already been exhausted -- every earlier readiness check
+            # above (Slice 1/2/3) keeps its own exact, stricter semantics
+            # unchanged.
+            _target_file_fallback_used = False
+            if not _edit_readiness.edit_source_ready:
+                _fallback_readiness = check_edit_readiness(
+                    _intended_edits, _slice_result, allow_full_file_fallback_for_symbols=True,
+                )
+                if _fallback_readiness.edit_source_ready:
+                    _target_file_fallback_used = True
+                    print(
+                        "[pipeline] Target-file source fallback: symbol-level acquisition never "
+                        "resolved, but the Final Strategy's own verified target file(s) "
+                        f"{sorted(_slice_result.full_file_fallback_covered)} were already rendered "
+                        "in full -- Patch Generation will proceed using that source.",
+                        file=sys.stderr,
+                    )
+                _edit_readiness = _fallback_readiness
+
+            if os.environ.get("AUTOPATCHER_DEBUG"):
+                try:
+                    import datetime as _dt
+                    import json as _json
+
+                    def _readiness_doc(r):
+                        if r is None:
+                            return None
+                        return {
+                            "strategy_ready": r.strategy_ready,
+                            "edit_source_ready": r.edit_source_ready,
+                            "intended_edits": [{"file": e.file, "symbol": e.symbol} for e in r.intended_edits],
+                            "ready_edits": [
+                                {"file": rd.file, "symbol": rd.symbol, "role": rd.role} for rd in r.ready_edits
+                            ],
+                            "unready_edits": [
+                                {"file": u.edit.file, "symbol": u.edit.symbol, "reason": u.reason}
+                                for u in r.unready_edits
+                            ],
+                            "failure_reasons": r.failure_reasons,
+                        }
+
+                    # Explicit even when Slice 2 never ran at all (initial
+                    # readiness was already complete, or it failed) -- a
+                    # present `null`/empty-list value, never an omitted key.
+                    _deterministic_doc = None
+                    if _edit_acquisition is not None:
+                        _deterministic_doc = {
+                            "rounds": _edit_acquisition.rounds_used,
+                            "source_added": any(a.success for a in _edit_acquisition.attempts),
+                            "attempts": [
+                                {
+                                    "round": a.round,
+                                    "file": a.intended_edit.file,
+                                    "symbol": a.intended_edit.symbol,
+                                    "retrieval_strategy": a.retrieval_strategy,
+                                    "resolved_file": a.resolved_file,
+                                    "resolved_symbol": a.resolved_symbol,
+                                    "start_line": a.start_line,
+                                    "end_line": a.end_line,
+                                    "source_kind": a.source_kind,
+                                    "source_chars": a.source_chars,
+                                    "success": a.success,
+                                    "failure_reason": a.failure_reason,
+                                }
+                                for a in _edit_acquisition.attempts
+                            ],
+                        }
+
+                    # Same explicitness rule for Slice 3: present (as null)
+                    # even when Slice 2 alone already made readiness
+                    # complete, so guided acquisition never ran.
+                    _guided_doc = None
+                    if _guided_acquisition is not None:
+                        _guided_doc = {
+                            "rounds": _guided_acquisition.rounds_used,
+                            "source_added": any(a.verified and a.source_chars > 0 for a in _guided_acquisition.attempts),
+                            "requests": [
+                                {
+                                    "round": a.round,
+                                    "request_type": a.request.request_type,
+                                    "file_hint": a.request.file_hint,
+                                    "symbol": a.request.symbol,
+                                    "identifier": a.request.identifier,
+                                    "reason": a.request.reason,
+                                    "attributed_file": a.request.intended_edit.file if a.request.intended_edit else None,
+                                    "attributed_symbol": a.request.intended_edit.symbol if a.request.intended_edit else None,
+                                }
+                                for a in _guided_acquisition.attempts
+                            ],
+                            "verification_results": [
+                                {
+                                    "round": a.round,
+                                    "schema_valid": a.schema_valid,
+                                    "verified": a.verified,
+                                    "failure_reason": a.failure_reason,
+                                    "resolved_file": a.resolved_file,
+                                    "resolved_symbol": a.resolved_symbol,
+                                    "start_line": a.start_line,
+                                    "end_line": a.end_line,
+                                    "source_kind": a.source_kind,
+                                    "source_chars": a.source_chars,
+                                    "readiness_improved": a.readiness_improved,
+                                }
+                                for a in _guided_acquisition.attempts
+                            ],
+                        }
+
+                    _debug_dir = Path("reports") / "debug"
+                    _debug_dir.mkdir(parents=True, exist_ok=True)
+                    _ts = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+                    _doc = {
+                        "initial_edit_readiness": _readiness_doc(_initial_edit_readiness),
+                        "deterministic_acquisition": _deterministic_doc,
+                        "readiness_after_deterministic_acquisition": _readiness_doc(_readiness_after_deterministic),
+                        "guided_acquisition": _guided_doc,
+                        "target_file_fallback_used": _target_file_fallback_used,
+                        "final_edit_readiness": _readiness_doc(_edit_readiness),
+                        "patch_generation_skipped": not _edit_readiness.edit_source_ready,
+                        # Best-effort only -- see ContextBudgetController.to_trace_dict();
+                        # None whenever no controller was supplied (policy="never"-equivalent
+                        # library use, or a CLI run that never built one).
+                        "budget_trace": budget_controller.to_trace_dict() if budget_controller is not None else None,
+                    }
+                    (_debug_dir / f"edit_readiness_{_ts}.json").write_text(
+                        _json.dumps(_doc, indent=2), encoding="utf-8"
+                    )
+                except Exception:
+                    pass
+
+            if not _edit_readiness.edit_source_ready:
+                _skip_patch_generation = True
+                print(
+                    "[pipeline] Not every intended edit has verified, patch-ready repository "
+                    f"source -- skipping Patch Generation for this run. "
+                    f"failure_reasons={_edit_readiness.failure_reasons}",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(f"[pipeline] Final-Target Remediation Slice unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return locals()
+
+
+def _run_impact_and_behavior_analysis(*, patch, challenger, repo_root):
+    """Reusable Stage-9 (impact_and_behavior_analysis) executor -- the
+    COMPLETE current production contract (Impact Surface analysis +
+    Behavior summary, both deterministic), extracted VERBATIM from
+    pipeline.run() (Batch B8). Byte-identical to the prior inline block.
+    Returns every local variable this body binds (`locals()`).
+    """
+    impact_dict = None
+    behavior = None
+    _detected_language = "python"
+    if repo_root:
+        try:
+            repo_root_for_context = Path(repo_root)
+            repo_context = TargetRepoContext(repo_root_for_context)
+            _detected_language = detect_language(repo_root_for_context)
+
+            analyzer = LightweightImpactAnalyzer()
+            impact = analyzer.analyze(
+                patch,
+                adversarial_findings=challenger,
+                repo_context=repo_context,
+                repo_language=_detected_language,
+            )
+            # attach deterministic annotations to challenger for reporting
+            enhance_findings_with_impact(challenger, impact.to_dict())
+            impact_dict = impact.to_dict()
+        except Exception:
+            pass
+
+    # Behavior summary (minimal deterministic analyzer) -- operates purely
+    # on the diff text (see behavior_summary.py: it never reads repository
+    # files despite accepting a repo_context parameter), so unlike Impact
+    # Surface above it is not repository-dependent and always runs.
+    try:
+        behavior = BehaviorAnalyzer().analyze(patch)
+    except Exception:
+        behavior = None
+    return locals()
+
+
+def run(
+    vulnerability_text: str,
+    api_key: str = "",
+    repo_root: str | Path | None = None,
+    investigation_output_dir: str | Path | None = None,
+    budget_controller: "object | None" = None,
+    compare_existing_tests: bool = False,
+    execution_recorder: "object | None" = None,
+) -> str:
+    """
+    Execute the full patching pipeline.
+
+    Parameters
+    ----------
+    vulnerability_text:
+        The vulnerability description as a string (Markdown).  The caller is
+        responsible for reading a file or fetching an advisory before calling
+        this function.
+    api_key:
+        Optional OpenAI API key.  When empty the pipeline uses mock responses.
+    investigation_output_dir:
+        Optional run-scoped directory for the deterministic Repository
+        Understanding investigation's parser artifacts (candidate_enrichment.
+        build_investigation_context's analyzer_output.json/call_graph.json).
+        When omitted, investigation still runs (selection + fusion +
+        rendering) but candidate enrichment degrades to its existing
+        file/test/sink-only mode -- no parse/call-graph/reachability -- same
+        as when candidate_enrichment.enrich_candidates() is given
+        context=None. Callers that don't pass this (all existing callers)
+        are unaffected beyond that graceful degradation.
+    budget_controller:
+        Optional utilities.autopatcher.context_budget.ContextBudgetController,
+        threaded unmodified into Slices 2/3/4's own acquisition/recovery
+        calls (run_deterministic_acquisition/run_guided_acquisition/
+        recover_post_patch_source) -- the ONLY thing that lets a soft
+        character budget exhausted purely by capacity (never a safety/
+        verification failure) be extended by one more fixed-size window,
+        with the user's approval, instead of failing the run closed. This
+        is the CLI's responsibility to build (see openant/cli.py's `patch`
+        command --context-budget-policy/--max-context-budget-windows) --
+        `None` (every existing caller, and any library caller) preserves
+        the pre-existing fixed-budget behavior exactly, with zero
+        interactive prompts from this module.
+    compare_existing_tests:
+        Opt-in (default False) for Existing Test Comparison -- see
+        existing_test_regression.py. When True and repo_root/patch are
+        both available, discovers a TestExecutionPlan for the repository
+        (test_plan_discovery.py, one bounded LLM call) and runs it once
+        against an isolated, unpatched copy and once against an isolated,
+        patched copy (Docker-only; see test_executors.py -- never falls
+        back to host execution), and compares results. Adds a new,
+        observability-only Trust Signal and report section; never read by
+        _build_recommendation_v1, never fed back into Challenger or the
+        repair loop in this slice. False (every existing caller) runs
+        neither the LLM Test Plan Discovery call nor Docker, and leaves
+        PipelineResult.existing_test_comparison as None, exactly as
+        before this parameter existed.
+    execution_recorder:
+        Optional utilities.autopatcher.execution_recorder.ExecutionRecorder
+        (Batch B2) -- PURELY OBSERVATIONAL. When given, this function
+        records real StageExecution entries (see lineage.py) for the
+        canonical stages it currently instruments: Stage 1
+        (repository_analysis_and_remediation_planning), Stage 2
+        (remediation_strategy), Stage 3 (guided_context_acquisition), and
+        the INITIAL pass only of Stage 4
+        (patch_generation_and_post_patch_investigation) and Stage 5
+        (challenger). Recording then stops -- the Challenger-driven repair
+        loop (Stage 6 and everything after) is NOT instrumented in this
+        batch and runs completely unmodified/unrecorded, exactly as
+        before. `None` (every existing caller: openant/cli.py, every
+        library caller, every test) makes every recorder call inside this
+        function a guarded no-op -- this parameter changes nothing about
+        prompts, retries, gates, or the report for a normal run. Only
+        tools/run_traced.py constructs one today.
+
+    Returns
+    -------
+    str
+        The formatted Markdown report.
+    """
+
+    # Ensure downstream challenger reads the same API key if provided.
+    os.environ.setdefault("OPENAI_API_KEY", api_key or os.environ.get("OPENAI_API_KEY", ""))
+
+    llm = LLMClient(api_key=api_key)
+    mode = "MOCK" if llm.is_mock else "LIVE"
+    print(f"[pipeline] LLM mode: {mode}", file=sys.stderr)
+
+    # Batch B2: begin recording ONE real StageExecution for canonical Stage 1
+    # (repository_analysis_and_remediation_planning) -- covers everything
+    # from here through the Remediation Planner's own verification bridge
+    # below (finished just before "# Final Strategy"). Purely observational
+    # -- see execution_recorder=None's docstring above; a no-op when None.
+    _s1_handle = None
+    if execution_recorder is not None:
+        _s1_handle = execution_recorder.start(_S_REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING)
+
+    # Experiment H1: plan first, then repo code, then vulnerability pattern guidance.
+    # Previously: repo code → vuln patterns → plan.
+    # H1 hypothesis: placing plan constraints before repo code reduces prior-override failures.
+    # Batch B7: S1 body now lives in _run_repository_analysis_and_remediation_planning
+    # (reusable executor shared with replay_engine.py) -- extracted verbatim,
+    # called here with run()'s own inputs, unpacking only what downstream code needs.
+    _s1_result = _run_repository_analysis_and_remediation_planning(
+        vulnerability_text=vulnerability_text,
+        repo_root=repo_root,
+        investigation_output_dir=investigation_output_dir,
+        llm=llm,
+    )
+    _plan_text = _s1_result["_plan_text"]
+    _repo_code = _s1_result["_repo_code"]
+    _grounding = _s1_result["_grounding"]
+    _pattern_ctx = _s1_result["_pattern_ctx"]
+    _repository_understanding = _s1_result["_repository_understanding"]
+    _repository_understanding_ctx = _s1_result["_repository_understanding_ctx"]
+    _pre_patch_anchors = _s1_result["_pre_patch_anchors"]
+    _investigation_context = _s1_result["_investigation_context"]
+    _plan_ctx = _s1_result["_plan_ctx"]
+    _planner_evidence_ctx = _s1_result["_planner_evidence_ctx"]
+    _plan_result = _s1_result["_plan_result"]
+
+    # Batch B2: finish S1's execution -- outcome reflects which of the three
+    # sub-paths above actually settled; the artifact carries the REAL
+    # structured output (never mere presence booleans) a future Stage-4
+    # replay would need: the Planner's own result, Repository Understanding,
+    # and the pre-patch anchors derived from it. Never the raw repository
+    # text/_grounding itself (that stays a run() local, not persisted here --
+    # not owned by this canonical stage's contract; see
+    # RepositoryGroundingResult/_repo_code, which are inputs to this stage,
+    # not its output).
+    _s1_rec = None
+    if execution_recorder is not None:
+        if _plan_result is not None:
+            _s1_outcome = "generated"
+        elif _plan_text:
+            _s1_outcome = "skipped_hand_authored_plan"
+        else:
+            _s1_outcome = "unavailable"
+        _s1_rec = execution_recorder.finish(
+            _s1_handle,
+            outcome=_s1_outcome,
+            artifact={
+                "plan_result": to_jsonable(_plan_result),
+                "repository_understanding": to_jsonable(_repository_understanding),
+                "pre_patch_anchors": to_jsonable(_pre_patch_anchors),
+                # Batch B7: minimal additive fields -- the ORIGINAL run-level
+                # input (not stage-owned output, but not persisted ANYWHERE
+                # else either, and genuinely indispensable for replaying S4+
+                # -- see replay_engine.py's patch_generation_and_post_patch_
+                # investigation ReplayHandler) and Repository Understanding's
+                # own rendered text (so replay can reconstruct code_context
+                # without needing to re-render the structured object itself).
+                # Zero behavior change: purely additive artifact content.
+                # planner_evidence_ctx/plan_ctx/repo_code are ALSO needed by S2
+                # replay (generate_remediation_strategy is a no-op LLM call
+                # without a non-empty planner_evidence_ctx -- see its own
+                # docstring) -- same additive-field rationale as above.
+                "vulnerability_text": vulnerability_text,
+                "repository_understanding_ctx": _repository_understanding_ctx,
+                "planner_evidence_ctx": _planner_evidence_ctx,
+                "plan_ctx": _plan_ctx,
+                "repo_code": _repo_code,
+                # Batch B8: minimal additive field -- the raw
+                # RepositoryGroundingResult (_grounding) itself. Needed by the
+                # combined trust_signals_and_recommendation+report_generation
+                # replay unit: _build_report() renders result.grounding
+                # (Repository Context section) directly, and nothing else
+                # already persists this object (repository_understanding
+                # above is a DIFFERENT, derived object). Zero behavior
+                # change: purely additive artifact content.
+                "grounding": to_jsonable(_grounding),
+            },
+        )
+
+    # Final Strategy: a second, distinct Planner call (stage
+    # "remediation_strategy") that runs only once verified Planner evidence
+    # exists -- it receives materially new evidence (the verified structural
+    # facts and source excerpts above) the first call never saw, and is not
+    # a blind retry of it. Skipped entirely (no LLM call) when
+    # _planner_evidence_ctx is empty -- generate_remediation_strategy enforces
+    # this itself. Best-effort: any failure here leaves the Target Discovery
+    # Plan and Planner-Proposed Candidate Evidence exactly as already
+    # gathered, and the pipeline continues without a Final Strategy section.
+    # Batch B2: begin recording S2 (remediation_strategy). consumed=[S1] --
+    # S2 is what actually reads S1's verified evidence (planner_evidence_ctx
+    # etc.), per stage_registry.STAGE_DEPENDENCIES.
+    _s2_handle = None
+    if execution_recorder is not None:
+        _s2_handle = execution_recorder.start(
+            _S_REMEDIATION_STRATEGY, consumed=[_s1_rec] if _s1_rec is not None else [],
+        )
+
+    _strategy_ctx = ""
+    _strategy_result = None  # read again below by the Final-Target Remediation Slice builder
+    if _planner_evidence_ctx:
+        try:
+            from .remediation_planner import generate_remediation_strategy
+            _strategy_result = generate_remediation_strategy(
+                vulnerability_text, llm, repo_root, _investigation_context,
+                repo_grounding_ctx=_repo_code,
+                repository_understanding_ctx=_repository_understanding_ctx,
+                discovery_plan_ctx=_plan_ctx,
+                planner_evidence_ctx=_planner_evidence_ctx,
+            )
+            _strategy_ctx = _strategy_result.rendered
+            if _strategy_ctx:
+                print(
+                    f"[pipeline] Final remediation strategy generated "
+                    f"({len(_strategy_ctx)} chars).",
+                    file=sys.stderr,
+                )
+            if _strategy_result.warnings:
+                print(
+                    f"[pipeline] Final strategy dropped unverified item(s): "
+                    f"{_strategy_result.warnings}",
+                    file=sys.stderr,
+                )
+        except ModelUnavailableError:
+            # See the matching guard around generate_remediation_plan above.
+            raise
+        except Exception as exc:
+            print(f"[pipeline] Final remediation strategy unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    # Batch B2: finish S2. artifact is the real RemediationStrategyResult
+    # (rendered + target_files/target_symbols/warnings/extended_mechanism/
+    # required_edits/security_invariant) -- the actual structured output a
+    # future Stage-3/Stage-4 replay would need, not a summary.
+    _s2_rec = None
+    if execution_recorder is not None:
+        if _strategy_result is not None:
+            _s2_outcome = "generated"
+        elif not _planner_evidence_ctx:
+            _s2_outcome = "skipped_no_planner_evidence"
+        else:
+            _s2_outcome = "unavailable"
+        _s2_rec = execution_recorder.finish(
+            _s2_handle,
+            outcome=_s2_outcome,
+            artifact={"strategy_result": to_jsonable(_strategy_result)},
+        )
+
+    # Final-Target Remediation Slice: deterministic, bounded exact source
+    # built ONLY from generate_remediation_strategy()'s VERIFIED result --
+    # never the earlier, exploratory Target Discovery candidates, so
+    # source budget is never spent on a candidate the Final Strategy
+    # already rejected. No new LLM call (build_final_target_slice takes no
+    # `llm` parameter), no new repository parse -- reuses
+    # _investigation_context as-is. Best-effort: any failure degrades to a
+    # short note and the pipeline continues with whatever context already
+    # exists; only a genuinely ZERO-coverage Final Strategy result (one
+    # that named targets but produced no usable verified source for any of
+    # them) skips the Patch Generator call itself, per the coverage
+    # contract below -- this never fails the run and never introduces a
+    # new recommendation category.
+    # Batch B2: begin recording S3 (guided_context_acquisition). consumed=
+    # [S1, S2] -- covers the Final-Target Slice, Edit Readiness Gate,
+    # deterministic + guided acquisition, and the target-file fallback,
+    # through the skip-patch-generation decision below.
+    _s3_handle = None
+    if execution_recorder is not None:
+        _s3_handle = execution_recorder.start(
+            _S_GUIDED_CONTEXT_ACQUISITION,
+            consumed=[r for r in (_s1_rec, _s2_rec) if r is not None],
+        )
+
+    # Batch B8: S3 body now lives in _run_guided_context_acquisition
+    # (reusable executor shared with replay_engine.py) -- extracted verbatim,
+    # called here with run()'s own inputs, unpacking only what downstream code needs.
+    _s3_result = _run_guided_context_acquisition(
+        vulnerability_text=vulnerability_text,
+        llm=llm,
+        repo_root=repo_root,
+        budget_controller=budget_controller,
+        _strategy_result=_strategy_result,
+        _plan_result=_plan_result,
+        _investigation_context=_investigation_context,
+    )
+    _slice_ctx = _s3_result["_slice_ctx"]
+    _coverage_warning_ctx = _s3_result["_coverage_warning_ctx"]
+    _skip_patch_generation = _s3_result["_skip_patch_generation"]
+    _edit_readiness = _s3_result["_edit_readiness"]
+    _edit_acquisition = _s3_result["_edit_acquisition"]
+    _guided_acquisition = _s3_result["_guided_acquisition"]
+    _slice_result = _s3_result["_slice_result"]
+    _intended_edits = _s3_result["_intended_edits"]
+
+    # Batch B2: finish S3. Per Final Correction 1: persist the REAL
+    # structured slice/readiness output Stage 4 actually consumes (`.rendered`
+    # source text included) -- Stage 4's own artifact must not become the
+    # only place this exists; never mere presence booleans.
+    _s3_rec = None
+    if execution_recorder is not None:
+        if _slice_result is not None:
+            _s3_outcome = "ready"
+        elif not (_strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols)):
+            _s3_outcome = "skipped_no_strategy_targets"
+        else:
+            _s3_outcome = "unavailable"
+        _s3_rec = execution_recorder.finish(
+            _s3_handle,
+            outcome=_s3_outcome,
+            artifact={
+                "slice_result": to_jsonable(_slice_result),
+                "edit_readiness": to_jsonable(_edit_readiness),
+                "skip_patch_generation": _skip_patch_generation,
+            },
+        )
+
+    # Assemble final context, in order: hand-authored Patch Plan → original
+    # Repository Grounding → vuln patterns → ordinary Repository
+    # Understanding → Target Discovery Plan (exploratory) → Planner-Proposed
+    # Candidate Evidence (deterministically verified) → Final
+    # Evidence-Backed Remediation Strategy → Final-Target Remediation Slice
+    # (the last source-bearing section before Patch Generation) →
+    # final-target source coverage warning, only when incomplete.
+    _ctx_parts = [
+        p for p in [
+            _plan_text, _repo_code, _pattern_ctx, _repository_understanding_ctx,
+            _plan_ctx, _planner_evidence_ctx, _strategy_ctx, _slice_ctx, _coverage_warning_ctx,
+        ]
+        if p and p.strip()
+    ]
+    code_context = "\n\n".join(_ctx_parts)
+
+    # Batch B2: begin recording S4's INITIAL execution only
+    # (patch_generation_and_post_patch_investigation) -- covers contract
+    # retry, hunk repair, Slice-4 conformance/recovery, hygiene,
+    # applicability (+ its own bounded retry), and Post-Patch Investigation,
+    # through where `patch`/the investigation triple settle just before the
+    # Challenger call. consumed=[S1, S2, S3] -- the real dependencies this
+    # stage's own context/conformance/recovery machinery reads (see
+    # stage_registry.STAGE_DEPENDENCIES). Deliberately NOT recorded again
+    # for the Challenger-driven repair loop's own regeneration further below
+    # -- that path is a materially narrower contract (no contract retry, no
+    # conformance gate, no applicability retry, no Post-Patch Investigation)
+    # and is NOT instrumented as a canonical Stage-4 execution in this batch.
+    _s4_handle = None
+    if execution_recorder is not None:
+        _s4_handle = execution_recorder.start(
+            _S_PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
+            consumed=[r for r in (_s1_rec, _s2_rec, _s3_rec) if r is not None],
+        )
+
+    # _patch_validation_skip_reason distinguishes, for observability, WHY
+    # patch/hunk-repair/hygiene/applicability validation is being skipped —
+    # never conflated into a single generic flag. Both reasons converge on
+    # the same downstream behavior (validation machinery never runs; the
+    # already-existing empty-patch/no_patch execution outcome renders), but
+    # the reason itself must stay legible: "no verified final-target
+    # source" (Recommendation-Policy-relevant evidence gap) is a materially
+    # different situation from "the model's response was structurally
+    # invalid" (an LLM output-contract failure) — see the module-level
+    # correction this section implements: an invalid Patch Generator
+    # response must fail closed BEFORE hunk repair/hygiene/git apply
+    # --check/applicability-aware retry, not merely collapse to "" and let
+    # "" flow through that machinery as if it were an ordinary empty patch.
+    _s4 = _run_patch_generation_and_investigation(
+        vulnerability_text=vulnerability_text, llm=llm, repo_root=repo_root, code_context=code_context,
+        budget_controller=budget_controller, _skip_patch_generation=_skip_patch_generation,
+        _edit_readiness=_edit_readiness, _slice_result=_slice_result, _investigation_context=_investigation_context,
+        _pre_patch_anchors=_pre_patch_anchors, _plan_result=_plan_result, _strategy_result=_strategy_result,
+    )
+    patch = _s4["patch"]
+    _patch_generation_status = _s4["_patch_generation_status"]
+    _patch_validation_skip_reason = _s4["_patch_validation_skip_reason"]
+    _final_repair_meta = _s4["_final_repair_meta"]
+    _relocation_telemetry = _s4["_relocation_telemetry"]
+    _patch_target_conformance = _s4["_patch_target_conformance"]
+    _regenerated_patch_target_conformance = _s4["_regenerated_patch_target_conformance"]
+    _post_patch_recovery = _s4["_post_patch_recovery"]
+    _slice_result = _s4["_slice_result"]
+    hygiene_findings = _s4["hygiene_findings"]
+    applicability_result = _s4["applicability_result"]
+    original_patch = _s4["original_patch"]
+    retry_patch = _s4["retry_patch"]
+    retry_attempted = _s4["retry_attempted"]
+    retry_succeeded = _s4["retry_succeeded"]
+    retry_failed_file = _s4["retry_failed_file"]
+    retry_error_before = _s4["retry_error_before"]
+    _post_patch_observations = _s4["_post_patch_observations"]
+    _post_patch_coverage = _s4["_post_patch_coverage"]
+    _post_patch_ctx = _s4["_post_patch_ctx"]
+    _investigated_patch = _s4["_investigated_patch"]
+
+    # Batch B2: finish S4's INITIAL execution -- `patch` and the full
+    # investigation triple are settled at this exact point (before the
+    # Challenger call below, and well before the repair loop can replace
+    # `patch` further down -- see this stage's start() comment on why the
+    # repair-loop regeneration is deliberately NOT a second S4 execution
+    # yet). `canonical_contract_scope: "full"` records, honestly, that THIS
+    # execution ran every internal mechanic the canonical contract
+    # includes (contract retry, hunk repair, conformance/recovery,
+    # applicability retry, post-patch investigation) -- distinguishing it
+    # from the narrower repair-loop regeneration path, which does not, and
+    # is not recorded as an execution of this canonical stage in this batch.
+    _s4_rec = None
+    if execution_recorder is not None:
+        _s4_outcome = "no_candidate_patch" if _patch_validation_skip_reason is not None or not (patch and patch.strip()) else "settled"
+        _s4_rec = execution_recorder.finish(
+            _s4_handle,
+            outcome=_s4_outcome,
+            artifact={
+                "patch": patch,
+                "original_patch": original_patch,
+                "retry_patch": retry_patch,
+                "retry_attempted": retry_attempted,
+                "retry_succeeded": retry_succeeded,
+                "retry_failed_file": retry_failed_file,
+                "retry_error_before": retry_error_before,
+                "hygiene_findings": to_jsonable(hygiene_findings),
+                "applicability_result": to_jsonable(applicability_result),
+                "final_repair_meta": to_jsonable(_final_repair_meta),
+                "patch_target_conformance": to_jsonable(_patch_target_conformance),
+                "post_patch_recovery": to_jsonable(_post_patch_recovery),
+                "post_patch_observations": to_jsonable(_post_patch_observations),
+                "post_patch_coverage": to_jsonable(_post_patch_coverage),
+                "investigated_patch": _investigated_patch,
+                # Batch B7: minimal additive fields -- the exact context
+                # string this execution used, and the Challenger-ready
+                # variant (code_context + post-patch-investigation text),
+                # so S5's replay can consume S4's own artifact directly
+                # instead of needing to reconstruct S1-S3's context itself.
+                # Zero behavior change: purely additive artifact content.
+                "code_context": code_context,
+                "challenger_context": code_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else ""),
+                "vulnerability_text": vulnerability_text,
+            },
+            extra={"canonical_contract_scope": "full"},
+        )
+
+    challenger_context = code_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else "")
+
+    # No-candidate-patch early stop: once Patch Generation has definitively
+    # ended without a valid candidate, every remaining patch-dependent
+    # review stage (Challenger, the Challenger-driven repair loop, Finding
+    # Calibration, the Patch Reviewer, and Confidence Scorer below) must
+    # not run against an empty diff -- there is nothing to challenge,
+    # calibrate, review, or score, and doing so previously produced
+    # internally contradictory output (e.g. "Still vulnerable: No" /
+    # "Adversarial review confirms fix approach" with no patch at all).
+    # `challenger = {}` alone is sufficient to also correctly skip the
+    # repair loop and Finding Calibration below WITHOUT any change to
+    # either's own decision logic: _classify_challenger({}) yields
+    # confirmed_defect_count == 0 and empty classified-finding lists, and
+    # both the repair loop's trigger and the calibration-input filter
+    # already key off exactly those derived values.
+    #
+    # Batch B2: begin recording S5's INITIAL execution only (challenger).
+    # consumed=[S4] -- the ONLY real dependency (stage_registry.
+    # STAGE_DEPENDENCIES[CHALLENGER]). The repair loop's own re-challenge
+    # call further below is NOT recorded as a second S5 execution in this
+    # batch (see this stage's start() comment on S4 for why).
+    _s5_handle = None
+    if execution_recorder is not None:
+        _s5_handle = execution_recorder.start(
+            _S_CHALLENGER, consumed=[_s4_rec] if _s4_rec is not None else [],
+        )
+
+    if patch and patch.strip():
+        print("[pipeline] Step 2/4 – Challenging patch …", file=sys.stderr)
+        challenger = challenge_patch(vulnerability_text, patch, llm, code_context=challenger_context)
+    else:
+        print(
+            "[pipeline] Step 2/4 – Challenging patch skipped (no candidate patch was produced).",
+            file=sys.stderr,
+        )
+        challenger = {}
+
+    # Batch B2: finish S5. Persist the raw Challenger output plus the
+    # deterministic classified result (_classify_challenger) -- the
+    # cleanest canonical Stage-5 output, matching what a future repair-loop
+    # migration's own S5#2 artifact would also carry.
+    _s5_rec = None
+    if execution_recorder is not None:
+        _s5_outcome = "settled" if patch and patch.strip() else "skipped_no_candidate_patch"
+        _s5_rec = execution_recorder.finish(
+            _s5_handle,
+            outcome=_s5_outcome,
+            artifact={
+                "challenger": to_jsonable(challenger),
+                "classified_challenger": to_jsonable(_classify_challenger(challenger)),
+            },
+        )
+
+    # Batch B3: begin recording S6's execution (patch_repair_and_calibration).
+    # consumed=[S4, S5] (stage_registry.STAGE_DEPENDENCIES[PATCH_REPAIR_AND_
+    # CALIBRATION]) -- covers classification, calibration v1, the repair
+    # loop, and the (now-adjacent, see below) final-calibration fallback --
+    # through where `finding_calibration` is FULLY, finally settled, before
+    # Evidence Sufficiency Gate/Existing Test Comparison/Stage 7 begin.
+    # Repair-triggered regeneration/re-challenge remain INTERNAL to this one
+    # S6 execution in this batch -- NOT recorded as canonical S4#2/S5#2 (the
+    # repair-regeneration code path is proven NOT equivalent to Stage 4's
+    # full canonical contract: no contract retry, no conformance/recovery,
+    # no applicability-aware retry, no post-patch investigation -- forcing
+    # symmetry now would misrepresent two different contracts as one).
+    _s6_handle = None
+    if execution_recorder is not None:
+        _s6_handle = execution_recorder.start(
+            _S_PATCH_REPAIR_AND_CALIBRATION,
+            consumed=[r for r in (_s4_rec, _s5_rec) if r is not None],
+        )
+
+    # Phase C: Challenger-driven repair loop.
+    #
+    # Flow: Patch v1 -> Challenger v1 -> raw classification -> Finding
+    # Calibration v1 -> deterministic repair gate (should_auto_repair) ->
+    # optional Repair v2 -> deterministic applicability/hygiene checks ->
+    # Challenger v2 -> Finding Calibration v2 -> deterministic accept/reject
+    # (accept_repair) -> continue.
+    #
+    # Calibration is deliberately run here, early, rather than only after
+    # this block (as before) -- but ONLY when there is at least one raw
+    # confirmed_defect finding to gate on. When there are none
+    # (_orig_defect_count == 0, the common case), this block does nothing
+    # and calibration runs exactly once, later, immediately after this
+    # block (see the "Finding calibration" fallback right below -- moved
+    # here, adjacent, in Batch B3, so ALL of Stage 6's owned computation is
+    # textually contiguous and settles before the S6 execution finishes;
+    # previously this same fallback ran much further down, after Existing
+    # Test Comparison) -- no extra LLM call is added for the all-clear path.
+    _s6 = _run_patch_repair_and_calibration(
+        vulnerability_text=vulnerability_text, llm=llm, repo_root=repo_root, code_context=code_context,
+        challenger_context=challenger_context, patch=patch, challenger=challenger,
+        applicability_result=applicability_result, hygiene_findings=hygiene_findings,
+        _final_repair_meta=_final_repair_meta, _post_patch_observations=_post_patch_observations,
+        _investigated_patch=_investigated_patch,
+    )
+    patch = _s6["patch"]
+    challenger = _s6["challenger"]
+    applicability_result = _s6["applicability_result"]
+    hygiene_findings = _s6["hygiene_findings"]
+    _final_repair_meta = _s6["_final_repair_meta"]
+    finding_calibration = _s6["finding_calibration"]
+    _repair_classified = _s6["_repair_classified"]
+    _orig_defect_count = _s6["_orig_defect_count"]
+    repair_attempted = _s6["repair_attempted"]
+    repair_succeeded = _s6["repair_succeeded"]
+    repair_patch_content = _s6["repair_patch_content"]
+    repair_challenger_result = _s6["repair_challenger_result"]
+    repair_defect_count = _s6["repair_defect_count"]
+    repair_rechallenged = _s6["repair_rechallenged"]
+    _r_hygiene = _s6["_r_hygiene"]
+    _r_app = _s6["_r_app"]
+    _r_applicable = _s6["_r_applicable"]
+    _post_patch_evidence_current = _s6["_post_patch_evidence_current"]
+    _finding_calibration_source = _s6["_finding_calibration_source"]
 
     # Batch B3: finish S6. `consumed` stays strictly {S4#1, S5#1} -- the
     # exact canonical candidate this execution evaluated -- regardless of
@@ -5623,6 +5931,22 @@ def run(
                 "finding_calibration": to_jsonable(finding_calibration),
                 "finding_calibration_source": _finding_calibration_source,
                 "authoritative_candidate": _authoritative_candidate,
+                # Batch B7: minimal additive field -- relays vulnerability_text
+                # forward so S7/S8's replay can consume it from S6's own
+                # artifact without declaring a non-canonical dependency on S1.
+                "vulnerability_text": vulnerability_text,
+                # Batch B8: minimal additive field -- the FINAL, RAW challenger
+                # dict this execution settled on (repair_challenger_result when
+                # repair_succeeded, otherwise the untouched original S5
+                # challenger) -- same shape challenge_patch()/S5's own artifact
+                # produce. `authoritative_candidate` deliberately omits
+                # challenger identity (see the comment above it), and
+                # `original_candidate_evaluated.challenger` is the CLASSIFIED
+                # (not raw) shape -- neither is the value S9 (impact_and_
+                # behavior_analysis) actually needs. Relayed here so S9's
+                # replay can consume it from S6's own artifact without
+                # declaring a non-canonical dependency on S5.
+                "challenger": to_jsonable(challenger),
             },
         )
 
@@ -5844,53 +6168,10 @@ def run(
                 _S_CONFIDENCE_SCORING, consumed=[r for r in (_s6_rec, _s7_rec) if r is not None],
             )
 
-    # Adjust the numeric score based on adversarial challenger results
-    orig_score_str = _extract_score(score_text)
-    try:
-        orig_score = float(orig_score_str)
-    except Exception:
-        orig_score = None
-
-    adjusted_score = orig_score
-    try:
-        still = bool(challenger.get("still_vulnerable"))
-        edge_cases = challenger.get("edge_cases", []) or []
-        potential_issues = challenger.get("potential_issues", []) or []
-    except Exception:
-        still = False
-        edge_cases = []
-        potential_issues = []
-
-    if orig_score is not None:
-        if still:
-            adjusted_score = orig_score * 0.4
-            reason_lines = [
-                "Challenger indicates the vulnerability may still exist; applied strong reduction (0.4x).",
-            ]
-        elif edge_cases or potential_issues:
-            adjusted_score = orig_score * 0.7
-            reason_lines = [
-                "Challenger found edge cases or potential issues; applied moderate reduction (0.7x).",
-            ]
-        else:
-            adjusted_score = orig_score
-            reason_lines = ["No adversarial issues found; score unchanged."]
-
-        adjusted_score_str = f"{adjusted_score:.2f}"
-        orig_score_display = f"{orig_score:.2f}"
-
-        # Build a new score_text that places the adjusted score first so
-        # _extract_score() picks it up when building the report.
-        adjustment_text = (
-            f"**Confidence score:** {adjusted_score_str}\n\n"
-            f"**Original score:** {orig_score_display}\n\n"
-            "**Adjustment reasoning:**\n"
-            + "\n".join(f"- {l}" for l in reason_lines)
-            + "\n\n"
-        )
-
-        # Prepend adjustment summary to the original scorer output for context
-        score_text = adjustment_text + score_text
+    _s8_adj = _adjust_confidence_score_for_challenger(score_text, challenger)
+    orig_score = _s8_adj["orig_score"]
+    adjusted_score = _s8_adj["adjusted_score"]
+    score_text = _s8_adj["score_text"]
 
     # Batch B4: finish S8. The deterministic score-adjustment above is part
     # of Confidence Scoring's own settled output (it post-processes only
@@ -5923,36 +6204,12 @@ def run(
     # which _resolve_impact_level() already reads as "unavailable" and the
     # existing trust policy (F-23/F-24) already renders as Not Verified
     # rather than a false-positive "low risk".
-    impact_dict = None
-    behavior = None
-    _detected_language = "python"
-    if repo_root:
-        try:
-            repo_root_for_context = Path(repo_root)
-            repo_context = TargetRepoContext(repo_root_for_context)
-            _detected_language = detect_language(repo_root_for_context)
-
-            analyzer = LightweightImpactAnalyzer()
-            impact = analyzer.analyze(
-                patch,
-                adversarial_findings=challenger,
-                repo_context=repo_context,
-                repo_language=_detected_language,
-            )
-            # attach deterministic annotations to challenger for reporting
-            enhance_findings_with_impact(challenger, impact.to_dict())
-            impact_dict = impact.to_dict()
-        except Exception:
-            pass
-
-    # Behavior summary (minimal deterministic analyzer) -- operates purely
-    # on the diff text (see behavior_summary.py: it never reads repository
-    # files despite accepting a repo_context parameter), so unlike Impact
-    # Surface above it is not repository-dependent and always runs.
-    try:
-        behavior = BehaviorAnalyzer().analyze(patch)
-    except Exception:
-        behavior = None
+    # Batch B8: S9 body now lives in _run_impact_and_behavior_analysis
+    # (reusable executor shared with replay_engine.py) -- extracted verbatim.
+    _s9_result = _run_impact_and_behavior_analysis(patch=patch, challenger=challenger, repo_root=repo_root)
+    impact_dict = _s9_result["impact_dict"]
+    behavior = _s9_result["behavior"]
+    _detected_language = _s9_result["_detected_language"]
 
     # Batch B4: finish S9. Always "settled" -- both analyzers are
     # best-effort (their own try/except already degrades to None on

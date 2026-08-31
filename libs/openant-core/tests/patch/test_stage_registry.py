@@ -124,10 +124,16 @@ class TestCapabilityMetadata:
     def test_report_generation_never_requires_docker(self):
         assert STAGE_SPECS["report_generation"].requires_docker is False
 
-    def test_report_generation_requires_no_repo_access_or_llm(self):
+    def test_report_generation_requires_no_llm(self):
         spec = STAGE_SPECS["report_generation"]
-        assert spec.requires_repo_access is False
         assert spec.requires_llm_provider is False
+
+    def test_report_generation_requires_repo_access(self):
+        # Batch B8 correction: _build_report() reads the repository (e.g.
+        # tests_for_file() for Suggested Tests) whenever repo_root is not
+        # None -- previously declared False, a real capability-metadata gap.
+        spec = STAGE_SPECS["report_generation"]
+        assert spec.requires_repo_access is True
 
     def test_only_existing_test_comparison_requires_docker(self):
         docker_stages = [n for n in CANONICAL_STAGE_ORDER if STAGE_SPECS[n].requires_docker]

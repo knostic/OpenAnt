@@ -68,6 +68,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import types
+import typing
 from pathlib import Path
 from typing import Optional
 
@@ -162,6 +164,61 @@ def to_jsonable(obj):
         f"for this shape, or stop passing it, rather than recording a "
         f"non-reconstructible artifact."
     )
+
+
+def from_jsonable(cls, data):
+    """Reconstruct one instance of dataclass/NamedTuple `cls` from a dict
+    previously produced by to_jsonable(cls_instance) -- the mirror
+    operation, used by replay handlers (Batch B7) to reconstruct real
+    upstream StageExecution artifact content (e.g. Stage 3's persisted
+    EditReadinessResult/FinalTargetSliceResult, Stage 1's persisted
+    RepositoryUnderstanding/RemediationPlanResult) as real Python objects,
+    so a shared production/replay executor can consume them exactly as
+    production does -- never a parallel, replay-only reimplementation.
+
+    Uses `cls`'s own type hints (via typing.get_type_hints, which resolves
+    the `from __future__ import annotations`-deferred string annotations
+    this codebase uses throughout) to recurse into nested dataclasses/
+    NamedTuples/Optional/list/tuple fields. `data=None` returns `None`
+    (mirrors to_jsonable(None) -> None). A field present in `data` but not
+    in `cls`'s hints, or vice versa, is simply not set/read -- this is a
+    reconstruction convenience, not a strict schema validator.
+    """
+    if data is None:
+        return None
+    hints = typing.get_type_hints(cls)
+    kwargs = {}
+    for field_name, field_type in hints.items():
+        if field_name in data:
+            kwargs[field_name] = _from_jsonable_value(data[field_name], field_type)
+    return cls(**kwargs)
+
+
+def _from_jsonable_value(value, type_hint):
+    origin = typing.get_origin(type_hint)
+    args = typing.get_args(type_hint)
+    if origin is typing.Union or origin is types.UnionType:
+        # Covers Optional[X]/typing.Union[...] (origin is typing.Union) AND
+        # the PEP 604 `X | None` spelling this codebase's `from __future__
+        # import annotations` string annotations evaluate to on Python
+        # 3.10+ (origin is types.UnionType -- a DIFFERENT object from
+        # typing.Union; get_type_hints() never normalizes one into the
+        # other). Missing the second form was exactly the bug: any `X |
+        # None`-annotated dataclass field (e.g. RepositoryCandidate.
+        # enrichment: "CandidateEnrichment | None") fell through every
+        # branch below untouched, leaving a nested dataclass as a raw
+        # dict after replay reconstruction.
+        non_none = [a for a in args if a is not type(None)]
+        if value is None or not non_none:
+            return value
+        return _from_jsonable_value(value, non_none[0])
+    if origin in (list, tuple):
+        elem_type = args[0] if args else None
+        items = [_from_jsonable_value(v, elem_type) if elem_type else v for v in (value or [])]
+        return tuple(items) if origin is tuple else items
+    if isinstance(type_hint, type) and (dataclasses.is_dataclass(type_hint) or hasattr(type_hint, "_fields")):
+        return from_jsonable(type_hint, value)
+    return value
 
 
 def _strip_call_record(call: dict) -> dict:

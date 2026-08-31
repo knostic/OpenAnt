@@ -132,16 +132,62 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import lineage
+from .confidence_scorer import score_confidence
+from .evidence_fusion import RepositoryUnderstanding
+from .execution_recorder import from_jsonable, to_jsonable
+from .existing_test_regression import (
+    ExistingTestComparisonResult,
+    evaluate_existing_test_comparison_with_plan,
+    not_verified_result,
+)
 from .llm_call_tracing import LLMCallCapture
+from .post_patch_evaluation import AnchorObservation, CoverageResult
+from .repository_grounding_models import RepositoryGroundingResult
 from .llm_client import LLMClient, ensure_provider_configured
+from .patch_challenger import challenge_patch
+from .patch_reviewer import review_patch
+from .pipeline import (
+    PipelineResult,
+    _adjust_confidence_score_for_challenger,
+    _build_report,
+    _classify_challenger,
+    _run_constraint_signals,
+    _run_guided_context_acquisition,
+    _run_impact_and_behavior_analysis,
+    _run_patch_generation_and_investigation,
+    _run_patch_repair_and_calibration,
+    _run_remediation_signals,
+    _run_repository_analysis_and_remediation_planning,
+    _STATIC_SIGNALS_AVAILABLE,
+)
+from .post_patch_investigation import derive_pre_patch_anchors
+from .remediation_planner import (
+    EditReadinessResult,
+    FinalTargetSliceResult,
+    RemediationPlanResult,
+    RemediationStrategyResult,
+    generate_remediation_strategy,
+)
 from .run_metadata import collect_full_commit_sha, find_openant_root, is_worktree_clean
 from .stage_registry import (
     CANONICAL_STAGE_ORDER,
+    CHALLENGER,
+    CONFIDENCE_SCORING,
+    EXISTING_TEST_COMPARISON,
+    GUIDED_CONTEXT_ACQUISITION,
+    IMPACT_AND_BEHAVIOR_ANALYSIS,
+    PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
+    PATCH_REPAIR_AND_CALIBRATION,
+    PATCH_REVIEW,
+    REMEDIATION_STRATEGY,
+    REPORT_GENERATION,
+    REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING,
     STAGE_SPECS,
     TEST_ANALYSIS_AND_PLAN,
     StageSpec,
     is_canonical_stage,
 )
+from .test_execution_models import TestExecutionPlan
 from .stage_replay import (  # noqa: F401 -- reused verbatim, see module docstring
     SourceProvenance,
     StageReplayError,
@@ -228,23 +274,21 @@ def _assert_llm_ownership(calls: "list[dict]", stage_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# test_analysis_and_plan -- transitional run_fn (see module docstring)
+# Shared helpers -- used by every run_fn below (Batch B7 additions), not
+# just the transitional test_analysis_and_plan handler.
 # ---------------------------------------------------------------------------
 
 
-def _run_test_analysis_and_plan(
-    *,
-    repo_root: "Optional[Path]",
-    llm: "Optional[LLMClient]",
-    output_dir: Path,
-    resolved_dependencies: dict,
-) -> RunFnResult:
-    rejection_reason: "list[str]" = []
-    with LLMCallCapture() as capture:
-        plan = discover_test_plan(repo_root, llm, rejection_reason=rejection_reason)
-
+def _write_llm_calls_for_stage(calls: "list[dict]", output_dir: Path) -> "list[dict]":
+    """Write each captured call's prompt/response to disk and return the
+    ordered, pointer-only record list a RunFnResult.llm_calls expects --
+    extracted from _run_test_analysis_and_plan (Batch A) so every run_fn
+    added since (Batch B7: patch_generation_and_post_patch_investigation/
+    challenger/patch_repair_and_calibration/patch_review/
+    confidence_scoring) shares this exact, already-proven logic instead of
+    each reimplementing it."""
     llm_call_records: "list[dict]" = []
-    for call in capture.calls:
+    for call in calls:
         seq = call["seq"]
         tag = call["stage"]
         prompt_path = output_dir / f"{seq:03d}_{tag}.prompt.txt"
@@ -257,6 +301,39 @@ def _run_test_analysis_and_plan(
             "prompt_file": prompt_path.name,
             "response_file": response_path.name,
         })
+    return llm_call_records
+
+
+def _load_json_artifact(resolution: "lineage.Resolution") -> dict:
+    """Read and parse an upstream execution's own persisted JSON artifact
+    -- the mechanism every run_fn below uses to reconstruct real upstream
+    state (never rediscovering/regenerating it)."""
+    if resolution.artifact_path is None:
+        raise ReplayEngineError(
+            f"Cannot replay: dependency resolved at {resolution.run_dir!r} "
+            f"has no artifact_path -- nothing to reconstruct from."
+        )
+    return json.loads(Path(resolution.artifact_path).read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# test_analysis_and_plan -- transitional run_fn (see module docstring)
+# ---------------------------------------------------------------------------
+
+
+def _run_test_analysis_and_plan(
+    *,
+    repo_root: "Optional[Path]",
+    llm: "Optional[LLMClient]",
+    output_dir: Path,
+    resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    rejection_reason: "list[str]" = []
+    with LLMCallCapture() as capture:
+        plan = discover_test_plan(repo_root, llm, rejection_reason=rejection_reason)
+
+    llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
 
     _assert_llm_ownership(capture.calls, TEST_ANALYSIS_AND_PLAN)
 
@@ -283,10 +360,811 @@ def _run_test_analysis_and_plan(
 
 
 # ---------------------------------------------------------------------------
+# repository_analysis_and_remediation_planning (Stage 1) -- Batch B8.
+#
+# Calls the SAME shared executor production uses
+# (pipeline._run_repository_analysis_and_remediation_planning, extracted
+# verbatim from pipeline.run() in this same batch). S1 is the pipeline's
+# genesis stage -- stage_registry.STAGE_DEPENDENCIES[S1] == (), so there is
+# no upstream canonical stage to resolve `vulnerability_text` (S1's own
+# real run-level input) from. Instead this run_fn resolves S1's OWN nearest
+# PRIOR execution from `chain` (the same lineage.build_chain(source_run)
+# object replay_stage() already built to resolve every declared
+# dependency) via the same lineage.resolve_effective() every other handler
+# uses -- never a new resolution mechanism, just applied to this stage's
+# own name instead of a dependency's. That prior execution's artifact
+# already carries vulnerability_text (a Batch B7 additive field). This
+# always succeeds when replaying S1: `source_run` is always either a full
+# run (which always ran S1 first) or a prior replay whose OWN parent chain
+# traces back to one.
+#
+# KNOWN, HONEST LIMITATION: `investigation_output_dir` is passed as None
+# (matching S4 replay's already-accepted `_investigation_context=None`
+# limitation -- a real, already-supported production code path, not a
+# replay-only simplification).
+# ---------------------------------------------------------------------------
+
+
+def _run_replay_repository_analysis_and_remediation_planning(
+    *,
+    repo_root,
+    llm,
+    output_dir: Path,
+    resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    if chain is None:
+        raise ReplayEngineError(
+            "Cannot replay repository_analysis_and_remediation_planning: no "
+            "lineage chain was supplied to resolve its own prior execution."
+        )
+    self_resolution = lineage.resolve_effective(chain, REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING, {})
+    if not self_resolution.is_resolved:
+        raise ReplayEngineError(
+            f"Cannot replay repository_analysis_and_remediation_planning: no "
+            f"prior execution of this stage exists in this lineage "
+            f"({self_resolution.state}: {self_resolution.reason})."
+        )
+    s1_prior = _load_json_artifact(self_resolution)
+    vulnerability_text = s1_prior["vulnerability_text"]
+
+    with LLMCallCapture() as capture:
+        s1_locals = _run_repository_analysis_and_remediation_planning(
+            vulnerability_text=vulnerability_text,
+            repo_root=repo_root,
+            investigation_output_dir=None,
+            llm=llm,
+        )
+
+    llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
+    _assert_llm_ownership(capture.calls, REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING)
+
+    plan_result = s1_locals["_plan_result"]
+    plan_text = s1_locals["_plan_text"]
+    if plan_result is not None:
+        outcome = "generated"
+    elif plan_text:
+        outcome = "skipped_hand_authored_plan"
+    else:
+        outcome = "unavailable"
+
+    artifact = {
+        "plan_result": to_jsonable(plan_result),
+        "repository_understanding": to_jsonable(s1_locals["_repository_understanding"]),
+        "pre_patch_anchors": to_jsonable(s1_locals["_pre_patch_anchors"]),
+        "vulnerability_text": vulnerability_text,
+        "repository_understanding_ctx": s1_locals["_repository_understanding_ctx"],
+        "planner_evidence_ctx": s1_locals["_planner_evidence_ctx"],
+        "plan_ctx": s1_locals["_plan_ctx"],
+        "repo_code": s1_locals["_repo_code"],
+        "grounding": to_jsonable(s1_locals["_grounding"]),
+    }
+    artifact_path = output_dir / "repository_analysis_and_remediation_planning.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+
+    return RunFnResult(
+        outcome=outcome,
+        artifact_path=artifact_path,
+        llm_calls=llm_call_records,
+        extra_stage_fields={
+            "canonical_contract_scope": "full",
+            "replay_limitations": {"investigation_context": "not reconstructed (None) -- see run_fn docstring"},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# remediation_strategy (Stage 2) -- Batch B8. generate_remediation_strategy()
+# is already a pure, standalone production function; this adapter only
+# resolves S1's real persisted evidence and wraps the call -- no extraction
+# from pipeline.py needed (same pattern as challenger/patch_review).
+# ---------------------------------------------------------------------------
+
+
+def _run_replay_remediation_strategy(
+    *,
+    repo_root,
+    llm,
+    output_dir: Path,
+    resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    s1 = _load_json_artifact(resolved_dependencies[REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING])
+    vulnerability_text = s1["vulnerability_text"]
+    repository_understanding_ctx = s1.get("repository_understanding_ctx") or ""
+    planner_evidence_ctx = s1.get("planner_evidence_ctx") or ""
+    plan_ctx = s1.get("plan_ctx") or ""
+    repo_code = s1.get("repo_code") or ""
+
+    with LLMCallCapture() as capture:
+        strategy_result = generate_remediation_strategy(
+            vulnerability_text, llm, repo_root, None,
+            repo_grounding_ctx=repo_code,
+            repository_understanding_ctx=repository_understanding_ctx,
+            discovery_plan_ctx=plan_ctx,
+            planner_evidence_ctx=planner_evidence_ctx,
+        )
+
+    llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
+    _assert_llm_ownership(capture.calls, REMEDIATION_STRATEGY)
+
+    outcome = "generated" if strategy_result is not None and strategy_result.rendered else (
+        "skipped_no_planner_evidence" if not planner_evidence_ctx else "unavailable"
+    )
+    artifact = {"strategy_result": to_jsonable(strategy_result)}
+    artifact_path = output_dir / "remediation_strategy.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+
+    return RunFnResult(
+        outcome=outcome,
+        artifact_path=artifact_path,
+        llm_calls=llm_call_records,
+        extra_stage_fields={
+            "replay_limitations": {"investigation_context": "not reconstructed (None) -- see S4 run_fn docstring"},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# guided_context_acquisition (Stage 3) -- Batch B8. Calls the SAME shared
+# executor production uses (pipeline._run_guided_context_acquisition,
+# extracted verbatim from pipeline.run() in this same batch) -- the Final-
+# Target Slice, Edit Readiness Gate, Slice 2 deterministic + Slice 3
+# LLM-guided acquisition, and the target-file fallback, all preserved
+# exactly. KNOWN, HONEST LIMITATION: `_investigation_context` is None
+# (same already-accepted limitation as S4/S2 replay above) and
+# `budget_controller` is None (fixed-budget default).
+# ---------------------------------------------------------------------------
+
+
+def _run_replay_guided_context_acquisition(
+    *,
+    repo_root,
+    llm,
+    output_dir: Path,
+    resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    s1 = _load_json_artifact(resolved_dependencies[REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING])
+    s2 = _load_json_artifact(resolved_dependencies[REMEDIATION_STRATEGY])
+
+    vulnerability_text = s1["vulnerability_text"]
+    plan_result = from_jsonable(RemediationPlanResult, s1.get("plan_result"))
+    strategy_result = from_jsonable(RemediationStrategyResult, s2.get("strategy_result"))
+
+    with LLMCallCapture() as capture:
+        s3_locals = _run_guided_context_acquisition(
+            vulnerability_text=vulnerability_text, llm=llm, repo_root=repo_root, budget_controller=None,
+            _strategy_result=strategy_result, _plan_result=plan_result, _investigation_context=None,
+        )
+
+    llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
+    _assert_llm_ownership(capture.calls, GUIDED_CONTEXT_ACQUISITION)
+
+    slice_result = s3_locals["_slice_result"]
+    edit_readiness = s3_locals["_edit_readiness"]
+    skip_patch_generation = s3_locals["_skip_patch_generation"]
+    has_targets = strategy_result is not None and (strategy_result.target_files or strategy_result.target_symbols)
+    outcome = "ready" if slice_result is not None else ("skipped_no_strategy_targets" if not has_targets else "unavailable")
+
+    artifact = {
+        "slice_result": to_jsonable(slice_result),
+        "edit_readiness": to_jsonable(edit_readiness),
+        "skip_patch_generation": skip_patch_generation,
+    }
+    artifact_path = output_dir / "guided_context_acquisition.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+
+    return RunFnResult(
+        outcome=outcome,
+        artifact_path=artifact_path,
+        llm_calls=llm_call_records,
+        extra_stage_fields={
+            "replay_limitations": {"investigation_context": "not reconstructed (None) -- see run_fn docstring"},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # The explicit replay-handler mapping -- a plain dict literal, built once,
 # NEVER mutated by importing this or any other module. This is the ONLY
 # place "is stage X replayable today" is decided.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# patch_generation_and_post_patch_investigation (Stage 4) -- Batch B7.
+#
+# Calls the SAME shared executor production uses
+# (pipeline._run_patch_generation_and_investigation, extracted verbatim
+# from pipeline.run() in this same batch) -- this run_fn is a thin adapter
+# reconstructing that function's real inputs from upstream artifacts, never
+# a parallel reimplementation of Stage 4's own logic.
+#
+# KNOWN, HONEST LIMITATION: `_investigation_context` (a repo-parser cache
+# object, never persisted as JSON -- see build_investigation_context) is
+# passed as None, exactly like a real production run that never received
+# an investigation_output_dir (an already-supported, real production code
+# path -- not a replay-only simplification of Stage 4's OWN contract).
+# `budget_controller` is likewise None (fixed-budget behavior, the default
+# for most production callers already). Every other input (vulnerability_
+# text, the Planner/Strategy/Slice structured results, Edit Readiness) is
+# reconstructed from real upstream artifacts via execution_recorder.
+# from_jsonable() and used exactly as production does.
+# ---------------------------------------------------------------------------
+
+
+def _run_replay_patch_generation_and_investigation(
+    *, repo_root, llm, output_dir: Path, resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    s1 = _load_json_artifact(resolved_dependencies[REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING])
+    s2 = _load_json_artifact(resolved_dependencies[REMEDIATION_STRATEGY])
+    s3 = _load_json_artifact(resolved_dependencies[GUIDED_CONTEXT_ACQUISITION])
+
+    vulnerability_text = s1["vulnerability_text"]
+    plan_result = from_jsonable(RemediationPlanResult, s1.get("plan_result"))
+    repository_understanding = from_jsonable(RepositoryUnderstanding, s1.get("repository_understanding"))
+    repository_understanding_ctx = s1.get("repository_understanding_ctx") or ""
+    pre_patch_anchors = (
+        derive_pre_patch_anchors(repository_understanding) if repository_understanding is not None else None
+    )
+
+    strategy_result = from_jsonable(RemediationStrategyResult, s2.get("strategy_result"))
+
+    edit_readiness = from_jsonable(EditReadinessResult, s3.get("edit_readiness"))
+    slice_result = from_jsonable(FinalTargetSliceResult, s3.get("slice_result"))
+    skip_patch_generation = bool(s3.get("skip_patch_generation"))
+
+    # Reconstructed the same way pipeline.run() assembles it -- concatenating
+    # each upstream stage's own rendered text, in the same order, skipping
+    # empty parts. Real, persisted content; not an approximation of VALUES,
+    # only of the (unpersisted) _repo_code/_pattern_ctx/_planner_evidence_ctx
+    # sections production also includes -- see this function's docstring.
+    code_context = "\n\n".join(
+        p for p in [
+            plan_result.rendered if plan_result else "",
+            repository_understanding_ctx,
+            strategy_result.rendered if strategy_result else "",
+            slice_result.rendered if slice_result else "",
+        ] if p and p.strip()
+    )
+
+    with LLMCallCapture() as capture:
+        s4_locals = _run_patch_generation_and_investigation(
+            vulnerability_text=vulnerability_text, llm=llm, repo_root=repo_root, code_context=code_context,
+            budget_controller=None, _skip_patch_generation=skip_patch_generation,
+            _edit_readiness=edit_readiness, _slice_result=slice_result, _investigation_context=None,
+            _pre_patch_anchors=pre_patch_anchors, _plan_result=plan_result, _strategy_result=strategy_result,
+        )
+
+    llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
+    _assert_llm_ownership(capture.calls, PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION)
+
+    patch = s4_locals["patch"]
+    outcome = (
+        "no_candidate_patch"
+        if s4_locals["_patch_validation_skip_reason"] is not None or not (patch and patch.strip())
+        else "settled"
+    )
+    _post_patch_ctx = s4_locals["_post_patch_ctx"]
+    artifact = {
+        "patch": patch,
+        "original_patch": s4_locals["original_patch"],
+        "retry_patch": s4_locals["retry_patch"],
+        "retry_attempted": s4_locals["retry_attempted"],
+        "retry_succeeded": s4_locals["retry_succeeded"],
+        "retry_failed_file": s4_locals["retry_failed_file"],
+        "retry_error_before": s4_locals["retry_error_before"],
+        "hygiene_findings": to_jsonable(s4_locals["hygiene_findings"]),
+        "applicability_result": to_jsonable(s4_locals["applicability_result"]),
+        "final_repair_meta": to_jsonable(s4_locals["_final_repair_meta"]),
+        "patch_target_conformance": to_jsonable(s4_locals["_patch_target_conformance"]),
+        "post_patch_recovery": to_jsonable(s4_locals["_post_patch_recovery"]),
+        "post_patch_observations": to_jsonable(s4_locals["_post_patch_observations"]),
+        "post_patch_coverage": to_jsonable(s4_locals["_post_patch_coverage"]),
+        "investigated_patch": s4_locals["_investigated_patch"],
+        "code_context": code_context,
+        "challenger_context": code_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else ""),
+        "vulnerability_text": vulnerability_text,
+    }
+    artifact_path = output_dir / "patch_generation_and_post_patch_investigation.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+
+    return RunFnResult(
+        outcome=outcome,
+        artifact_path=artifact_path,
+        llm_calls=llm_call_records,
+        extra_stage_fields={
+            "canonical_contract_scope": "full",
+            "replay_limitations": {"investigation_context": "not reconstructed (None) -- see run_fn docstring"},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# challenger (Stage 5) -- Batch B7. challenge_patch() is already a pure,
+# standalone production function; this adapter only resolves S4's real
+# persisted patch/context and wraps the call.
+# ---------------------------------------------------------------------------
+
+
+def _run_replay_challenger(
+    *, repo_root, llm, output_dir: Path, resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    s4 = _load_json_artifact(resolved_dependencies[PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION])
+    vulnerability_text = s4["vulnerability_text"]
+    patch = s4["patch"]
+    challenger_context = s4.get("challenger_context") or ""
+
+    with LLMCallCapture() as capture:
+        challenger = challenge_patch(vulnerability_text, patch, llm, code_context=challenger_context)
+
+    llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
+    _assert_llm_ownership(capture.calls, CHALLENGER)
+
+    outcome = "settled" if (patch and patch.strip()) else "skipped_no_candidate_patch"
+    artifact = {
+        "challenger": to_jsonable(challenger),
+        "classified_challenger": to_jsonable(_classify_challenger(challenger)),
+    }
+    artifact_path = output_dir / "challenger.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+
+    return RunFnResult(outcome=outcome, artifact_path=artifact_path, llm_calls=llm_call_records)
+
+
+# ---------------------------------------------------------------------------
+# patch_repair_and_calibration (Stage 6) -- Batch B7. Calls the SAME shared
+# executor production uses (pipeline._run_patch_repair_and_calibration,
+# extracted verbatim in this same batch). Repair regeneration/re-challenge
+# remain internal to this one execution, exactly as production -- never
+# migrated to canonical S4#2/S5#2 in this MVP.
+# ---------------------------------------------------------------------------
+
+
+def _run_replay_patch_repair_and_calibration(
+    *, repo_root, llm, output_dir: Path, resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    s4 = _load_json_artifact(resolved_dependencies[PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION])
+    s5 = _load_json_artifact(resolved_dependencies[CHALLENGER])
+
+    vulnerability_text = s4["vulnerability_text"]
+    patch = s4["patch"]
+    code_context = s4.get("code_context") or ""
+    challenger_context = s4.get("challenger_context") or ""
+    applicability_result = s4.get("applicability_result") or {}
+    hygiene_findings = s4.get("hygiene_findings") or []
+    final_repair_meta = s4.get("final_repair_meta")
+    post_patch_observations = s4.get("post_patch_observations")
+    investigated_patch = s4.get("investigated_patch")
+    challenger = s5["challenger"]
+
+    with LLMCallCapture() as capture:
+        s6_locals = _run_patch_repair_and_calibration(
+            vulnerability_text=vulnerability_text, llm=llm, repo_root=repo_root, code_context=code_context,
+            challenger_context=challenger_context, patch=patch, challenger=challenger,
+            applicability_result=applicability_result, hygiene_findings=hygiene_findings,
+            _final_repair_meta=final_repair_meta, _post_patch_observations=post_patch_observations,
+            _investigated_patch=investigated_patch,
+        )
+
+    llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
+    _assert_llm_ownership(capture.calls, PATCH_REPAIR_AND_CALIBRATION)
+
+    final_patch = s6_locals["patch"]
+    repair_attempted = s6_locals["repair_attempted"]
+    outcome = "no_candidate_patch" if not (final_patch and final_patch.strip()) and not repair_attempted else "settled"
+
+    if not repair_attempted:
+        repair_outcome = "not_triggered_no_defects" if s6_locals["_orig_defect_count"] == 0 else "not_triggered_gate_declined"
+    elif s6_locals["_r_applicable"] is None:
+        repair_outcome = "attempted_failed"
+    elif s6_locals["_r_applicable"] is False:
+        repair_outcome = "attempted_inapplicable"
+    elif s6_locals["repair_succeeded"]:
+        repair_outcome = "attempted_applicable_accepted"
+    elif s6_locals["repair_rechallenged"]:
+        repair_outcome = "attempted_applicable_rejected"
+    else:
+        repair_outcome = "attempted_failed"
+
+    authoritative_candidate = {
+        "source": "internal_repair" if s6_locals["repair_succeeded"] else "original",
+        "patch": final_patch,
+        "applicability_result": to_jsonable(s6_locals["applicability_result"]),
+        "hygiene_findings": to_jsonable(s6_locals["hygiene_findings"]),
+    }
+    artifact = {
+        "original_candidate_evaluated": {
+            "patch": patch,
+            "challenger": to_jsonable(s6_locals["_repair_classified"]),
+        },
+        "repair_attempted": repair_attempted,
+        "repair_regeneration": (
+            {
+                "patch": s6_locals["repair_patch_content"],
+                "hygiene_findings": to_jsonable(s6_locals["_r_hygiene"]) if repair_attempted else None,
+                "applicability_result": to_jsonable(s6_locals["_r_app"]) if repair_attempted else None,
+            } if repair_attempted else None
+        ),
+        "repair_rechallenge": (
+            {
+                "challenger": to_jsonable(s6_locals["repair_challenger_result"]),
+                "confirmed_defect_count": s6_locals["repair_defect_count"],
+            } if s6_locals["repair_rechallenged"] else None
+        ),
+        "repair_outcome": repair_outcome,
+        "finding_calibration": to_jsonable(s6_locals["finding_calibration"]),
+        "finding_calibration_source": s6_locals["_finding_calibration_source"],
+        "authoritative_candidate": authoritative_candidate,
+        "vulnerability_text": vulnerability_text,
+        # Batch B8: same additive field as production -- see pipeline.py's
+        # S6 finish-block comment. s6_locals["challenger"] is the SAME
+        # local var _run_patch_repair_and_calibration() returns from
+        # locals() -- final, raw, post-repair-decision.
+        "challenger": to_jsonable(s6_locals["challenger"]),
+    }
+    artifact_path = output_dir / "patch_repair_and_calibration.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+
+    return RunFnResult(outcome=outcome, artifact_path=artifact_path, llm_calls=llm_call_records)
+
+
+# ---------------------------------------------------------------------------
+# patch_review (Stage 7) -- Batch B7. review_patch() is already a pure,
+# standalone production function; this adapter uses S6's own AUTHORITATIVE
+# candidate (original or accepted-repair, whichever S6 actually selected).
+# ---------------------------------------------------------------------------
+
+
+def _run_replay_patch_review(
+    *, repo_root, llm, output_dir: Path, resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    s6 = _load_json_artifact(resolved_dependencies[PATCH_REPAIR_AND_CALIBRATION])
+    vulnerability_text = s6["vulnerability_text"]
+    patch = s6["authoritative_candidate"]["patch"]
+
+    outcome = "skipped_no_candidate_patch"
+    review = ""
+    llm_call_records: "list[dict]" = []
+    if patch and patch.strip():
+        with LLMCallCapture() as capture:
+            review = review_patch(vulnerability_text, patch, llm)
+        llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
+        _assert_llm_ownership(capture.calls, PATCH_REVIEW)
+        outcome = "settled"
+
+    artifact_path = output_dir / "patch_review.json"
+    artifact_path.write_text(json.dumps({"review": review}, indent=2), encoding="utf-8")
+
+    return RunFnResult(outcome=outcome, artifact_path=artifact_path, llm_calls=llm_call_records)
+
+
+# ---------------------------------------------------------------------------
+# confidence_scoring (Stage 8) -- Batch B7. score_confidence() plus the
+# SAME shared deterministic adjustment production uses
+# (pipeline._adjust_confidence_score_for_challenger, extracted verbatim in
+# this same batch) -- never a duplicated reimplementation of the 0.4x/0.7x
+# adjustment logic.
+# ---------------------------------------------------------------------------
+
+
+def _run_replay_confidence_scoring(
+    *, repo_root, llm, output_dir: Path, resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    s6 = _load_json_artifact(resolved_dependencies[PATCH_REPAIR_AND_CALIBRATION])
+    s7 = _load_json_artifact(resolved_dependencies[PATCH_REVIEW])
+    vulnerability_text = s6["vulnerability_text"]
+    patch = s6["authoritative_candidate"]["patch"]
+    # Batch B8 fix: `original_candidate_evaluated.challenger` is the
+    # CLASSIFIED shape (_classify_challenger's own keys -- confirmed_defect_
+    # count/classified_edge_cases/...), not the RAW shape
+    # _adjust_confidence_score_for_challenger() actually reads
+    # (still_vulnerable/edge_cases/potential_issues) -- using it here always
+    # silently fell through to "no adjustment" regardless of the real
+    # Challenger verdict. `s6["challenger"]` (added this batch for S9's own
+    # need) is the FINAL, RAW, post-repair-decision challenger -- the
+    # correct input, matching what production's own S8 call reads.
+    challenger = s6["challenger"]
+    review = s7["review"]
+
+    outcome = "skipped_no_candidate_patch"
+    score_text = ""
+    llm_call_records: "list[dict]" = []
+    orig_score = None
+    adjusted_score = None
+    if patch and patch.strip():
+        with LLMCallCapture() as capture:
+            score_text = score_confidence(vulnerability_text, patch, review, llm, code_context="")
+        llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
+        _assert_llm_ownership(capture.calls, CONFIDENCE_SCORING)
+        adj = _adjust_confidence_score_for_challenger(score_text, challenger)
+        orig_score = adj["orig_score"]
+        adjusted_score = adj["adjusted_score"]
+        score_text = adj["score_text"]
+        outcome = "settled"
+
+    artifact = {"score_text": score_text, "orig_score": orig_score, "adjusted_score": adjusted_score}
+    artifact_path = output_dir / "confidence_scoring.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+
+    return RunFnResult(
+        outcome=outcome,
+        artifact_path=artifact_path,
+        llm_calls=llm_call_records,
+        extra_stage_fields={
+            # Known, honest limitation: CONFIDENCE_SCORING's declared
+            # dependencies are (patch_repair_and_calibration, patch_review)
+            # only (stage_registry) -- production's own code_context choice
+            # for this call (challenger_context vs. plain code_context,
+            # gated on post-patch-evidence staleness) is Stage-4-derived
+            # state this stage does not canonically depend on, so replay
+            # uses "" rather than reaching into a non-canonical dependency.
+            # The deterministic 0.4x/0.7x adjustment (this stage's own
+            # decision) is identical to production either way -- it never
+            # reads code_context, only `challenger`.
+            "replay_limitations": {"code_context": "empty -- see run_fn docstring"},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# impact_and_behavior_analysis (Stage 9) -- Batch B8. Calls the SAME shared
+# executor production uses (pipeline._run_impact_and_behavior_analysis,
+# extracted verbatim from pipeline.run() in this same batch). Depends ONLY
+# on patch_repair_and_calibration (stage_registry.STAGE_DEPENDENCIES),
+# matching the real dataflow: both analyzers read only S6-settled
+# `patch`/`challenger`, never patch_review/confidence_scoring. No LLM work
+# -- both analyzers are purely deterministic.
+# ---------------------------------------------------------------------------
+
+
+def _run_replay_impact_and_behavior_analysis(
+    *, repo_root, llm, output_dir: Path, resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    s6 = _load_json_artifact(resolved_dependencies[PATCH_REPAIR_AND_CALIBRATION])
+    patch = s6["authoritative_candidate"]["patch"]
+    challenger = s6["challenger"]
+
+    s9_locals = _run_impact_and_behavior_analysis(patch=patch, challenger=challenger, repo_root=repo_root)
+
+    artifact = {
+        "impact": to_jsonable(s9_locals["impact_dict"]),
+        "behavior": to_jsonable(s9_locals["behavior"]),
+        "detected_language": s9_locals["_detected_language"],
+    }
+    artifact_path = output_dir / "impact_and_behavior_analysis.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+
+    return RunFnResult(outcome="settled", artifact_path=artifact_path, llm_calls=[])
+
+
+# ---------------------------------------------------------------------------
+# existing_test_comparison (Stage 11) -- Batch B8.
+# evaluate_existing_test_comparison_with_plan() is already a pure,
+# standalone production function (the COMPARISON half of the Batch B5
+# discovery/comparison split) -- this adapter resolves S10's own resolved
+# plan and S6's own settled patch, and calls it directly. It MUST NOT call
+# discover_test_plan/discover_test_plan_for_comparison itself -- doing so
+# would rediscover S10's plan instead of consuming the one already
+# resolved, which is exactly the bug the B5 split exists to prevent.
+#
+# `executor=None`: an already-supported, real production code path (see
+# evaluate_existing_test_comparison_with_plan's own docstring -- "When
+# omitted... this function selects and preflights its own, same as before
+# this module's discovery/comparison split") -- NOT a replay-only
+# simplification. The ALREADY-preflighted executor discover_test_plan_for_
+# comparison() builds is a live process/Docker handle, never JSON-
+# serializable, so it cannot be threaded through S10's persisted artifact
+# -- this costs one extra (harmless) preflight call, nothing else.
+#
+# When S10 was itself REJECTED (no plan discovered), production's S11
+# truthfully never attempts comparison (the fused function's own original
+# behavior) -- this handler replicates that via the SAME not_verified_
+# result() constructor pipeline.py itself uses for its early-exit checks,
+# never inventing a new "skipped" shape.
+# ---------------------------------------------------------------------------
+
+
+def _run_replay_existing_test_comparison(
+    *, repo_root, llm, output_dir: Path, resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    s6 = _load_json_artifact(resolved_dependencies[PATCH_REPAIR_AND_CALIBRATION])
+    s10 = _load_json_artifact(resolved_dependencies[TEST_ANALYSIS_AND_PLAN])
+    patch = s6["authoritative_candidate"]["patch"]
+
+    if "setup_commands" not in s10:
+        # S10 was rejected (no TestExecutionPlan) -- matches production's
+        # "no plan -> S11 truthfully never attempts comparison" branch.
+        reason = s10.get("reason") or "no test execution plan was discovered"
+        result = not_verified_result(reason)
+        outcome = "skipped_no_plan"
+    else:
+        plan = from_jsonable(TestExecutionPlan, s10)
+        result = evaluate_existing_test_comparison_with_plan(repo_root, patch, plan, executor=None)
+        outcome = "settled"
+
+    artifact = to_jsonable(result)
+    artifact_path = output_dir / "existing_test_comparison.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+
+    return RunFnResult(outcome=outcome, artifact_path=artifact_path, llm_calls=[])
+
+
+# ---------------------------------------------------------------------------
+# report_generation -- Batch B8. ONE COMBINED replay unit for the current
+# terminal tail (trust_signals_and_recommendation + report_generation),
+# per this batch's explicit instruction: _build_report()'s own internals
+# fuse Trust Signals/Recommendation computation with pure rendering too
+# deeply to cleanly separate as two canonical executions (see B6's
+# investigation) -- rather than force an artificial split, this handler
+# reconstructs a REAL PipelineResult from every upstream stage's own
+# persisted artifact and calls _build_report() DIRECTLY, UNMODIFIED. No
+# recommendation-policy or report-rendering logic is duplicated here --
+# _compute_trust_signals/_build_recommendation_v1/every render_* helper
+# are invoked exactly once, inside _build_report() itself.
+#
+# Registered under report_generation ONLY (not also trust_signals_and_
+# recommendation) -- there is no real, separate execution of "just the
+# trust signals half" to replay; report_generation's own approved
+# dependency set (stage_registry.STAGE_DEPENDENCIES: all 12 other stages)
+# is also the only one broad enough to honestly cover every artifact this
+# reconstruction actually reads. This is "the smallest honest
+# representation" of one fused unit, not two pretended-independent ones.
+#
+# Batch B8 correction: stage_registry._REPO_ACCESS[REPORT_GENERATION] was
+# changed True (see that module) -- _build_report() DOES read the
+# repository (tests_for_file(), Suggested Tests section) whenever
+# repo_root is not None, exactly like every other repo-accessing stage.
+#
+# Fields NEVER read by _build_report() (verified by exhaustive grep of
+# `result.<field>` across pipeline.py) get an honest None here, never a
+# fabricated value: relocation_telemetry, edit_readiness, edit_acquisition,
+# guided_acquisition, patch_target_conformance, post_patch_recovery. Only
+# `security_invariant` (read by build_validation_plan) needs S2's artifact
+# among the "observability-only slice" fields.
+#
+# constraint_signals/remediation_signals: recomputed via the SAME
+# production functions (pipeline._run_constraint_signals/
+# _run_remediation_signals) directly on the final `patch` + `repo_root` --
+# cheap, deterministic, no LLM -- exactly as production's own call site
+# does; never persisted anywhere upstream, so recomputation (not
+# duplication of POLICY, just of a pure function call) is the honest
+# option, matching the S1 constraint/remediation-signals rationale used
+# elsewhere in this batch.
+# ---------------------------------------------------------------------------
+
+
+def _run_replay_report_generation(
+    *, repo_root, llm, output_dir: Path, resolved_dependencies: dict,
+    chain=None,
+) -> RunFnResult:
+    s1 = _load_json_artifact(resolved_dependencies[REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING])
+    s2 = _load_json_artifact(resolved_dependencies[REMEDIATION_STRATEGY])
+    s4 = _load_json_artifact(resolved_dependencies[PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION])
+    s6 = _load_json_artifact(resolved_dependencies[PATCH_REPAIR_AND_CALIBRATION])
+    s7 = _load_json_artifact(resolved_dependencies[PATCH_REVIEW])
+    s8 = _load_json_artifact(resolved_dependencies[CONFIDENCE_SCORING])
+    s9 = _load_json_artifact(resolved_dependencies[IMPACT_AND_BEHAVIOR_ANALYSIS])
+
+    # existing_test_comparison is genuinely OPTIONAL (compare_existing_tests
+    # defaults False in production) -- resolved directly via `chain` (the
+    # SAME lineage.resolve_effective() every declared dependency above
+    # already used), never through handler.dependencies, so its absence
+    # never fails this replay -- matches production's own `None` default.
+    s11 = None
+    if chain is not None:
+        s11_resolution = lineage.resolve_effective(chain, EXISTING_TEST_COMPARISON, {})
+        if s11_resolution.is_resolved:
+            s11 = _load_json_artifact(s11_resolution)
+
+    strategy_result = from_jsonable(RemediationStrategyResult, s2.get("strategy_result"))
+    grounding = from_jsonable(RepositoryGroundingResult, s1.get("grounding"))
+
+    authoritative = s6["authoritative_candidate"]
+    patch = authoritative["patch"]
+    repair_succeeded = authoritative["source"] == "internal_repair"
+    repair_regeneration = s6.get("repair_regeneration")
+    repair_rechallenge = s6.get("repair_rechallenge")
+    original_challenger_defect_count = s6["original_candidate_evaluated"]["challenger"]["confirmed_defect_count"]
+
+    post_patch_observations = (
+        [from_jsonable(AnchorObservation, o) for o in s4["post_patch_observations"]]
+        if s4.get("post_patch_observations") is not None else None
+    )
+    post_patch_coverage = (
+        from_jsonable(CoverageResult, s4["post_patch_coverage"])
+        if s4.get("post_patch_coverage") is not None else None
+    )
+
+    existing_test_comparison = from_jsonable(ExistingTestComparisonResult, s11) if s11 else None
+
+    constraint_signals = None
+    remediation_signals = None
+    if _STATIC_SIGNALS_AVAILABLE and repo_root:
+        try:
+            constraint_signals = _run_constraint_signals(patch, Path(repo_root))
+        except Exception:
+            pass
+        try:
+            remediation_signals = _run_remediation_signals(patch, Path(repo_root))
+        except Exception:
+            pass
+
+    result = PipelineResult(
+        vulnerability_text=s6["vulnerability_text"],
+        patch=patch,
+        review=s7["review"],
+        score_text=s8["score_text"],
+        challenger=s6["challenger"],
+        impact=s9.get("impact"),
+        final_score=s8.get("adjusted_score"),
+        orig_score=s8.get("orig_score"),
+        behavior=s9.get("behavior"),
+        repo_root=Path(repo_root) if repo_root else None,
+        hygiene=authoritative.get("hygiene_findings"),
+        applicability=authoritative.get("applicability_result"),
+        original_patch=s4.get("original_patch", ""),
+        retry_patch=s4.get("retry_patch"),
+        retry_attempted=bool(s4.get("retry_attempted")),
+        retry_succeeded=bool(s4.get("retry_succeeded")),
+        retry_failed_file=s4.get("retry_failed_file"),
+        retry_error_before=s4.get("retry_error_before"),
+        repair_attempted=bool(s6.get("repair_attempted")),
+        repair_succeeded=repair_succeeded,
+        repair_patch=repair_regeneration.get("patch") if repair_regeneration else None,
+        repair_challenger=repair_rechallenge.get("challenger") if repair_rechallenge else None,
+        repair_defect_count=repair_rechallenge.get("confirmed_defect_count", 0) if repair_rechallenge else 0,
+        repair_rechallenged=repair_rechallenge is not None,
+        original_challenger_defect_count=original_challenger_defect_count,
+        constraint_signals=constraint_signals,
+        remediation_signals=remediation_signals,
+        detected_language=s9.get("detected_language") or "python",
+        finding_calibration=s6.get("finding_calibration"),
+        grounding=grounding,
+        repository_understanding=from_jsonable(RepositoryUnderstanding, s1.get("repository_understanding")),
+        post_patch_observations=post_patch_observations,
+        post_patch_investigated_patch=s4.get("investigated_patch"),
+        post_patch_coverage=post_patch_coverage,
+        # Never read by _build_report() -- see this run_fn's own docstring.
+        relocation_telemetry=None,
+        source_verification=None,
+        existing_test_comparison=existing_test_comparison,
+        edit_readiness=None,
+        edit_acquisition=None,
+        guided_acquisition=None,
+        patch_target_conformance=None,
+        post_patch_recovery=None,
+        security_invariant=(strategy_result.security_invariant if strategy_result else None),
+    )
+
+    report_markdown = _build_report(result)
+
+    artifact = {"report_markdown": report_markdown, "pipeline_result": to_jsonable(result)}
+    artifact_path = output_dir / "report_generation.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+    (output_dir / "report.md").write_text(report_markdown, encoding="utf-8")
+
+    return RunFnResult(
+        outcome="settled",
+        artifact_path=artifact_path,
+        llm_calls=[],
+        extra_stage_fields={
+            "canonical_contract_scope": "combined_trust_signals_and_recommendation+report_generation",
+            "replay_limitations": {
+                "relocation_telemetry": "not reconstructed (None) -- never persisted, never read by _build_report()",
+                "source_verification": "not reconstructed (None) -- never persisted upstream; observability-only, not read by _build_recommendation_v1",
+                "edit_readiness/edit_acquisition/guided_acquisition/patch_target_conformance/post_patch_recovery": "not reconstructed (None) -- never read by _build_report() (verified by exhaustive grep)",
+            },
+        },
+    )
+
 
 REPLAY_HANDLERS: "dict[str, ReplayHandler]" = {
     TEST_ANALYSIS_AND_PLAN: ReplayHandler(
@@ -294,6 +1172,76 @@ REPLAY_HANDLERS: "dict[str, ReplayHandler]" = {
         # Narrower than the approved final {patch_repair_and_calibration,
         # impact_and_behavior_analysis} -- see module docstring.
         dependencies=(),
+    ),
+    # Batch B8: S1 (genesis stage -- no declared dependency; resolves its
+    # own prior execution via `chain`, see run_fn docstring) and S2 (thin
+    # adapter around the already-standalone generate_remediation_strategy).
+    REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING: ReplayHandler(
+        run_fn=_run_replay_repository_analysis_and_remediation_planning,
+        dependencies=(),
+    ),
+    REMEDIATION_STRATEGY: ReplayHandler(
+        run_fn=_run_replay_remediation_strategy,
+        dependencies=(REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING,),
+    ),
+    GUIDED_CONTEXT_ACQUISITION: ReplayHandler(
+        run_fn=_run_replay_guided_context_acquisition,
+        dependencies=(REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING, REMEDIATION_STRATEGY),
+    ),
+    # Batch B7: full approved dependency sets (stage_registry.
+    # STAGE_DEPENDENCIES) -- all now genuinely resolvable, since S1-S3's
+    # own persisted artifacts carry what these handlers need.
+    PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION: ReplayHandler(
+        run_fn=_run_replay_patch_generation_and_investigation,
+        dependencies=(REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING, REMEDIATION_STRATEGY, GUIDED_CONTEXT_ACQUISITION),
+    ),
+    CHALLENGER: ReplayHandler(
+        run_fn=_run_replay_challenger,
+        dependencies=(PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,),
+    ),
+    PATCH_REPAIR_AND_CALIBRATION: ReplayHandler(
+        run_fn=_run_replay_patch_repair_and_calibration,
+        dependencies=(PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION, CHALLENGER),
+    ),
+    PATCH_REVIEW: ReplayHandler(
+        run_fn=_run_replay_patch_review,
+        dependencies=(PATCH_REPAIR_AND_CALIBRATION,),
+    ),
+    CONFIDENCE_SCORING: ReplayHandler(
+        run_fn=_run_replay_confidence_scoring,
+        dependencies=(PATCH_REPAIR_AND_CALIBRATION, PATCH_REVIEW),
+    ),
+    # Batch B8.
+    IMPACT_AND_BEHAVIOR_ANALYSIS: ReplayHandler(
+        run_fn=_run_replay_impact_and_behavior_analysis,
+        dependencies=(PATCH_REPAIR_AND_CALIBRATION,),
+    ),
+    EXISTING_TEST_COMPARISON: ReplayHandler(
+        run_fn=_run_replay_existing_test_comparison,
+        dependencies=(PATCH_REPAIR_AND_CALIBRATION, TEST_ANALYSIS_AND_PLAN),
+    ),
+    # Batch B8: ONE combined replay unit for the current fused
+    # trust_signals_and_recommendation + report_generation terminal tail --
+    # see _run_replay_report_generation's own docstring for why this is
+    # registered under report_generation only.
+    REPORT_GENERATION: ReplayHandler(
+        run_fn=_run_replay_report_generation,
+        dependencies=(
+            REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING,
+            REMEDIATION_STRATEGY,
+            PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
+            PATCH_REPAIR_AND_CALIBRATION,
+            PATCH_REVIEW,
+            CONFIDENCE_SCORING,
+            IMPACT_AND_BEHAVIOR_ANALYSIS,
+            # existing_test_comparison is DELIBERATELY not declared here --
+            # it is a genuinely OPTIONAL upstream (compare_existing_tests
+            # defaults False in production; most runs never record a real
+            # execution of it at all) -- see _run_replay_report_generation's
+            # own docstring for how it resolves this stage optionally, via
+            # the same `chain` every other run_fn already receives, never
+            # failing the whole replay when it is legitimately absent.
+        ),
     ),
 }
 
@@ -451,6 +1399,19 @@ def replay_stage(
         llm=llm,
         output_dir=output_dir,
         resolved_dependencies=resolved_dependencies,
+        # `chain` is the SAME lineage.build_chain(source_run) object used to
+        # resolve every declared dependency above -- handed to run_fn ONLY so
+        # a genesis-like stage (repository_analysis_and_remediation_planning,
+        # which has NO upstream canonical dependency of its own) can look up
+        # its own nearest prior execution via lineage.resolve_effective(),
+        # to re-derive the run-level input (vulnerability_text) it was
+        # originally seeded with. This is not a new dependency-resolution
+        # mechanism -- it is the existing resolver, called on a stage's own
+        # name instead of one of its declared dependencies, which is why it
+        # cannot go through handler.dependencies (validated as a strict
+        # subset of stage_registry.STAGE_DEPENDENCIES -- a stage is never
+        # its own dependency there). Every run_fn accepts and may ignore it.
+        chain=chain,
     )
     finished_at = datetime.now(timezone.utc)
 
