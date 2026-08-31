@@ -233,6 +233,27 @@ type Finding struct {
 	// SARIF region can anchor the alert to the real row (0 = unknown: emit
 	// no region, never a synthetic line).
 	StartLine int `json:"start_line"`
+	// #215: a rankable severity (critical/high/medium/low; empty = unknown
+	// — old artifacts) + its provenance (model | derived).
+	Severity       string `json:"severity"`
+	SeveritySource string `json:"severity_source"`
+}
+
+// SeverityColor returns the badge color for the severity. Unknown values
+// fall back to the neutral gray (the badge itself is conditional on
+// Severity being one of the canonical labels).
+func (f Finding) SeverityColor() string {
+	switch f.Severity {
+	case "critical":
+		return "#721c24"
+	case "high":
+		return "#dc3545"
+	case "medium":
+		return "#fd7e14"
+	case "low":
+		return "#6c757d"
+	}
+	return "#6c757d"
 }
 
 // HasDynamicTest returns true if this finding has dynamic test results.

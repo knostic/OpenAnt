@@ -199,6 +199,11 @@ def _compact_for_summary(pipeline_data: dict) -> dict:
             "cwe_name": f.get("cwe_name"),
             "stage1_verdict": f.get("stage1_verdict"),
             "stage2_verdict": f.get("stage2_verdict"),
+            # #215: the stamped severity + its provenance reach the summary
+            # LLM — without these the "Severity" column in the template is
+            # model-guessed, not read from the scan.
+            "severity": f.get("severity"),
+            "severity_source": f.get("severity_source"),
             "dynamic_testing": f.get("dynamic_testing"),
             "impact": f.get("impact"),
         })

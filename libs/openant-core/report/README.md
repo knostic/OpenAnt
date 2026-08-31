@@ -93,6 +93,8 @@ The module expects a JSON file with the following structure:
       "cwe_name": "Authorization Bypass Through User-Controlled Key",
       "stage1_verdict": "vulnerable",
       "stage2_verdict": "vulnerable",
+      "severity": "high",
+      "severity_source": "model",
       "dynamic_testing": true,
       "description": "Brief description of the vulnerability.",
       "vulnerable_code": "code snippet here",

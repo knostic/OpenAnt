@@ -40,6 +40,39 @@ def _output_json(data: dict):
     sys.stdout.write("\n")
 
 
+from core.verdict_taxonomy import (SEVERITIES as _SEVERITY_ORDER, SEVERITY_FINDING_VERDICTS,
+                                   severity_display_verdict)
+
+
+def _severity_for_result(result: dict, displayed_verdict: str = None) -> str:
+    """#215: the severity for one report-data finding — FINDING-ONLY (empty
+    for non-findings: no badge, no SARIF severity), computed from the
+    DISPLAYED verdict (wave round-2: the "Max iterations reached" downgrade
+    must not leave a CRITICAL badge on an inconclusive row). A model value
+    keeps; corrected/derived re-derive from that verdict."""
+    verdict = (displayed_verdict if displayed_verdict is not None
+               else severity_display_verdict(result))
+    verdict = verdict.strip().lower()
+    if verdict not in SEVERITY_FINDING_VERDICTS:
+        return ""
+    sev = result.get("severity")
+    src = result.get("severity_source")
+    if sev in _SEVERITY_ORDER and src == "model":
+        return sev
+    return "high" if verdict == "vulnerable" else "medium"
+
+
+def _severity_source_for_result(result: dict, displayed_verdict: str = None) -> str:
+    """The provenance matching _severity_for_result (empty when no severity)."""
+    if _severity_for_result(result, displayed_verdict) == "":
+        return ""
+    sev = result.get("severity")
+    src = result.get("severity_source")
+    if sev in _SEVERITY_ORDER and src == "model":
+        return "model"
+    return src if src in ("corrected", "derived") else "derived"
+
+
 def _unit_start_line(unit: dict) -> int:
     """#305 (the adjacent finding in the issue comment): the parsers emit
     ``start_line`` inside ``code.primary_origin`` and it survives
@@ -1014,6 +1047,13 @@ def cmd_report_data(args):
                 if justification.strip() == "Max iterations reached":
                     verdict = "inconclusive"
 
+                # #215: computed from the DISPLAYED verdict (the downgrade
+                # above must strip severity too — an inconclusive row with a
+                # CRITICAL badge, ranked critical in Code Scanning, is the
+                # exact non-finding leak the finding-only gate exists for).
+                _sev = _severity_for_result(result, verdict)
+                _sev_src = _severity_source_for_result(result, verdict)
+
                 verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
 
                 # Track worst verdict per file
@@ -1039,6 +1079,13 @@ def cmd_report_data(args):
                     "function": func_name,
                     "attack_vector": result.get("attack_vector", "") or "",
                     "analysis": justification,
+                    # #215: a rankable severity on every finding — the
+                    # stamped/model value, else the reporter's conservative
+                    # derivation, so the HTML/SARIF surfaces rank old scans
+                    # too. The sort below stays VERDICT-primary (epistemic
+                    # status); severity is display/filter metadata.
+                    "severity": _sev,
+                    "severity_source": _sev_src,
                     "dynamic_test_status": dt_status,
                     "dynamic_test_details": dt_details,
                     "start_line": _unit_start_line(unit),

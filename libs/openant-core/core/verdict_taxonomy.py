@@ -41,6 +41,19 @@ FINDING_VERDICT_ORDER = (
 # / ``finding == "error"``). Not part of the ordered display list.
 ERROR_VERDICT = "error"
 
+# --- #215: finding severity ---------------------------------------------------
+# The canonical severity enum — the same four levels the JSON corrector's
+# legacy _VULN_SCHEMA has carried since inception. FINDING-ONLY: a row whose
+# verdict is not a finding verdict carries NO severity. Lives here (a leaf
+# module) so every importer — analysis_core, reporter, csv_export, cli, the
+# context corrector twin — shares one definition without pulling the LLM
+# stack into a standalone exporter.
+SEVERITIES = ("critical", "high", "medium", "low")
+_SEVERITIES = frozenset(SEVERITIES)
+
+# The verdicts that carry a severity (see SEVERITIES above).
+SEVERITY_FINDING_VERDICTS = ("vulnerable", "bypassable")
+
 # --- Stage-2 verification verdicts -------------------------------------------
 # ``core/reporter.py`` maps the Stage-2 ``verification`` dict onto these.
 STAGE2_VERDICTS = frozenset({
@@ -100,3 +113,29 @@ DYNAMIC_TESTABLE = frozenset({
     "agreed",
     "vulnerable",
 })
+
+
+def severity_display_verdict(result: dict) -> str:
+    """#215 (panel round-3): the verdict the severity sites gate on.
+
+    The FINAL verdict with the "Max iterations reached" downgrade applied —
+    the same justification read openant/cli.py performs for its displayed
+    verdict (explanation first, reasoning fallback). Factored here (a leaf
+    module every severity site already imports) so pipeline findings, CSV,
+    and report-data emit the SAME severity for the same row: before this,
+    report-data downgraded a max-iterations verification to inconclusive and
+    stripped its severity, while the CSV/reporter sites gated on the raw
+    (preserved) vulnerable verdict and kept a CRITICAL rank on the very row
+    the HTML/SARIF displayed as unrankable.
+    """
+    verdict = str(result.get("finding") or result.get("verdict") or "").strip().lower()
+    if verdict not in SEVERITY_FINDING_VERDICTS:
+        return verdict
+    verification = result.get("verification") or {}
+    justification = (verification.get("explanation", "")
+                     if isinstance(verification, dict) else "")
+    if not justification:
+        justification = result.get("reasoning", "")
+    if str(justification).strip() == "Max iterations reached":
+        return "inconclusive"
+    return verdict
