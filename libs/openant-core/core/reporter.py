@@ -404,6 +404,16 @@ def build_pipeline_output(
     call_graph_path = os.path.join(
         os.path.dirname(os.path.abspath(results_path)), "call_graph.json"
     )
+    # #423: the pre-dedup count is over the SAME population `vulnerable`
+    # counts (the confirmed findings list) — NOT the analyze-stage metrics.
+    # Stage-2 adjudication can retain/create vulnerabilities Stage-1
+    # detection did not flag (a live run: detect 0 vulnerable, verify 2 that
+    # stayed), so the metrics population and the findings population diverge
+    # and the #289/#381 reconciliation contract (before >= after) broke,
+    # emitting `"deduplicated": -2` — a count that can never be explained as
+    # deduplication. Deriving both from one list makes the delta a TRUE
+    # dedup delta.
+    confirmed_before_dedup = len(confirmed)
     confirmed = _dedup_caller_callee(confirmed, all_results, call_graph_path)
 
     # Build findings in PipelineOutput schema
@@ -726,9 +736,14 @@ def build_pipeline_output(
             # report 183 in results.vulnerable alongside 175 entries in
             # findings. The pre-dedup count and the dedup delta are
             # explicit so the difference is explainable, not contradictory.
+            # #423: before_dedup counts the SAME list's PRE-dedup length
+            # (captured above _dedup_caller_callee), so the delta is a true
+            # dedup delta — never negative (the analyze-metrics population
+            # diverges from the findings population when Stage-2 retains
+            # vulnerabilities Stage-1 did not flag).
             "vulnerable": len(findings_data),
-            "vulnerable_before_dedup": metrics.get("vulnerable", 0) + metrics.get("bypassable", 0),
-            "deduplicated": (metrics.get("vulnerable", 0) + metrics.get("bypassable", 0)) - len(findings_data),
+            "vulnerable_before_dedup": confirmed_before_dedup,
+            "deduplicated": confirmed_before_dedup - len(findings_data),
             # #289: protected is its OWN key — the lossy safe-fold destroyed
             # a verdict the pipeline computes and the template has a row for.
             "safe": metrics.get("safe", 0),
