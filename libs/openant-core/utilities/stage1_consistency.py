@@ -18,6 +18,15 @@ from utilities.llm_client import TokenTracker
 from utilities.llm import PhaseBinding, simple_text
 from core.verdict_taxonomy import DISCLOSURE_DROPPED, SEVERITY_FINDING_VERDICTS
 
+# #425: the verdict vocabulary a Stage-1 consistency correction may write —
+# the canonical Stage-1 verdicts (analysis_core._normalize_result's
+# finding_to_verdict map, uppercased). Values outside it are rejected at the
+# validity gate below (producer discipline, per #316/#324).
+_CORRECTABLE_STAGE1_VERDICTS = frozenset({
+    "VULNERABLE", "SAFE", "PROTECTED", "BYPASSABLE", "INCONCLUSIVE",
+    "INSUFFICIENT_CONTEXT",
+})
+
 # Uppercase mirror of the canonical disclosure-dropped set (this module compares
 # verdicts .upper()'d). Keyed off core.verdict_taxonomy so the guard's block-set
 # cannot drift from the partition — the same canonical-reference fix #243 applied to
@@ -265,6 +274,35 @@ def run_stage1_consistency_check(
                     new_verdict = raw_should_be.strip().upper() if isinstance(raw_should_be, str) else ""
 
                     if not new_verdict:
+                        continue
+
+                    # #425: VALIDITY gate — the F-KB-1a block below is a
+                    # downgrade guard, not a validity gate, so anything
+                    # outside _DISCLOSURE_DROPPED_UPPER ("MAYBE VULNERABLE",
+                    # "probably fine") landed in result["verdict"] verbatim,
+                    # after _normalize_result's gates had already run — the
+                    # same escape #316/#324 closed at the OTHER producers.
+                    # new_verdict is unconstrained LLM `should_be` output: a
+                    # value outside the Stage-1 verdict vocabulary (the
+                    # _normalize_result finding_to_verdict map, uppercased) is
+                    # model noise. REJECT the proposal with an audit record —
+                    # the row keeps its valid pre-consistency verdict, and
+                    # overwriting it with garbage (or with ERROR) would
+                    # destroy a valid verdict this pass did not earn the
+                    # authority to replace.
+                    if new_verdict not in _CORRECTABLE_STAGE1_VERDICTS:
+                        for result in results:
+                            if result.get("route_key") == route_key:
+                                result["stage1_consistency_invalid_verdict_blocked"] = {
+                                    "from": result.get("verdict", "UNKNOWN"),
+                                    "proposed": new_verdict,
+                                    "reason": update.get("reason"),
+                                    "pattern": consistency_result.pattern_identified,
+                                }
+                                log("warning",
+                                    f"Blocked Stage-1 consistency correction to "
+                                    f"unrecognized verdict: {new_verdict!r}",
+                                    step="detect", unit_id=route_key)
                         continue
 
                     for result in results:
