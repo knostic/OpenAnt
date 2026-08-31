@@ -825,6 +825,42 @@ class CallGraphBuilder:
                             sites.append({"text": dotted, "labels": labels,
                                           "arity": arity, "trailing": trailing,
                                           "unlabeled_trailing": unlabeled_trailing, "member": True})
+                    elif callee.type in ("additive_expression", "multiplicative_expression"):
+                        # #327: `f() + g()` — tree-sitter makes the `+`-expression
+                        # the callee of the OUTER call_expression and hoists g's
+                        # parens into the outer call_suffix, so neither existing
+                        # branch matched and g's site was never emitted (the
+                        # `+ - * / %` matrix in the issue). Attribute ONLY the
+                        # rightmost postfix-callable operand — the one the hoisted
+                        # suffix belongs to. The left operand is a VALUE: emitting
+                        # it fabricates an edge (`scale + t()` where `scale` is a
+                        # local Int would phantom-edge the real `scale` function).
+                        # Deeper chains (`c + tA() * lA()`) NEST — the inner
+                        # call_expression is re-walked below and fires this same
+                        # branch — so only the outermost rightmost is attributed
+                        # here; a rightmost arithmetic node is descended, not
+                        # attributed. Labels come from the OUTER node (the hoisted
+                        # argument list is the rightmost operand's).
+                        last = callee.children[-1] if callee.children else None
+                        while (last is not None
+                               and last.type in ("additive_expression",
+                                                 "multiplicative_expression")
+                               and last.children):
+                            last = last.children[-1]
+                        if last is not None and last.type == "simple_identifier":
+                            labels, arity, trailing, unlabeled_trailing = self._call_labels(node, source)
+                            sites.append({"text": self._text(last, source),
+                                          "labels": labels, "arity": arity,
+                                          "trailing": trailing,
+                                          "unlabeled_trailing": unlabeled_trailing})
+                        elif last is not None and last.type == "navigation_expression":
+                            dotted = self._navigation_text(last, source)
+                            if dotted:
+                                labels, arity, trailing, unlabeled_trailing = self._call_labels(node, source)
+                                sites.append({"text": dotted, "labels": labels,
+                                              "arity": arity, "trailing": trailing,
+                                              "unlabeled_trailing": unlabeled_trailing,
+                                              "member": True})
                 self._collect_arg_refs(node, source, arg_refs)
             elif node.type == "constructor_expression":
                 # `Box<Int>(value: 1)` — callee is a `user_type`; the base nominal is
