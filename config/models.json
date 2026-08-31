@@ -523,39 +523,6 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET openrouter.ai/api/v1/models, 2026-09-01: google/gemini-3.7-flash $0.75/$3.75 per 1M) and Google's own pricing page, which agrees (#434)",
       "retrieved": "2026-09-01"
-    },
-    {
-      "id": "qwen3.8:27b",
-      "provider": "ollama",
-      "status": "current",
-      "price": {
-        "input": 0.0,
-        "output": 0.0
-      },
-      "source": "verified on ollama.com/library/qwen3.8 (18GB, 256K ctx); local inference is free — $0 by definition, not an unverified vendor price",
-      "retrieved": "2026-08-27"
-    },
-    {
-      "id": "qwen3.5:9b",
-      "provider": "ollama",
-      "status": "current",
-      "price": {
-        "input": 0.0,
-        "output": 0.0
-      },
-      "source": "modest-hardware alternative; verified on ollama.com/library/qwen3.5 (6.6GB); local inference is free — $0 by definition",
-      "retrieved": "2026-08-27"
-    },
-    {
-      "id": "mistral-small3.2:latest",
-      "provider": "ollama",
-      "status": "current",
-      "price": {
-        "input": 0.0,
-        "output": 0.0
-      },
-      "source": "verified live end-to-end: planted-vuln scan, both CWE-89 findings detected (2026-08-25); local inference is free — $0 by definition",
-      "retrieved": "2026-08-27"
     }
   ]
 }

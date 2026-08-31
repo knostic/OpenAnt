@@ -92,7 +92,7 @@ Wizard defaults reflect the project's per-phase recommendations (stronger reason
 | `openrouter` | [openrouter.ai](https://openrouter.ai/settings/keys) | Gateway to many providers with one key and one prepaid balance (also reads `OPENROUTER_API_KEY`). Model IDs are `vendor/model` slugs (`anthropic/claude-sonnet-4.6`, `openai/gpt-4o-mini`, ...) — browse them at [openrouter.ai/models](https://openrouter.ai/models). Offered by `openant setup llm` (leave the base URL blank for the OpenRouter default) — full guide: [`utilities/llm/providers/OPENROUTER.md`](libs/openant-core/utilities/llm/providers/OPENROUTER.md). |
 | `ollama` | — (local server) | Local models via [Ollama](https://ollama.com). No `api_key`: leave it blank (a placeholder is sent automatically); base URL defaults to `http://localhost:11434/v1`. Models must be pulled first (`ollama pull <model>`); model IDs are exactly what `ollama list` shows. Local inference is free — $0 cost reporting. Offered by `openant setup llm` — full guide: [`utilities/llm/providers/OLLAMA.md`](libs/openant-core/utilities/llm/providers/OLLAMA.md). |
 
-All five support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop. For Ollama, pick a tools-capable model for those phases — very small local models may not handle tool calls reliably.
+All of them support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop. For Ollama, pick a tools-capable model for those phases — very small local models may not handle tool calls reliably.
 
 #### Quick path for Anthropic-only setups
 

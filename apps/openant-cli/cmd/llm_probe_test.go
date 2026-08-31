@@ -403,3 +403,24 @@ func TestProbeChatCompletionsAt_TimeoutIsItsOwnKind(t *testing.T) {
 		t.Errorf("a probe timeout must be its own kind (cold-load hint), got %q", pe.Kind)
 	}
 }
+
+// hunt r4 (sonnet): the round-3 network-kind layering — a refused connection
+// must carry the "ollama serve" hint (parity with the Python adapter).
+func TestProbeOllama_NetworkErrorGetsServeHint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("never reached — the connection is refused below")
+	}))
+	url := server.URL
+	server.Close() // refuse connections
+	err := probeOllama("", url, "x")
+	pe, ok := asProbeError(err)
+	if !ok {
+		t.Fatalf("expected AnthropicProbeError, got %T", err)
+	}
+	if pe.Kind != "network" {
+		t.Errorf("expected network kind, got %q", pe.Kind)
+	}
+	if !strings.Contains(pe.Message, "ollama serve") {
+		t.Errorf("a refused connection must carry the serve hint, got: %s", pe.Message)
+	}
+}

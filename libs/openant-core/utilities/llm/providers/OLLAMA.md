@@ -85,6 +85,19 @@ registry (any custom tag) deliberately still takes the unknown-model warn
 path: an arbitrary tag is genuinely unknown, and the loud marker is honest
 about it.
 
+## Model quality — an honest note (the round-2 adjudication)
+
+A scanner is only as strong as the model behind it. Local models trade
+capability for privacy: a small or base (non-instruct) model can produce
+false-clean scans — a report that says "safe" is the MODEL'S verdict, and
+a 9B local model's verdict is weaker evidence than a frontier model's.
+Use the biggest tool-capable model your hardware fits for the
+tool-calling phases (`enhance`, `verify`), pick chat/instruct models over
+base ones, and treat a clean result from a small local model as "not
+obviously vulnerable" rather than "audited". The confidence fields on
+findings reflect the model's own self-assessment, calibrated for frontier
+models.
+
 ## Troubleshooting
 
 - **Connection refused / could not reach** → the daemon isn't running.
