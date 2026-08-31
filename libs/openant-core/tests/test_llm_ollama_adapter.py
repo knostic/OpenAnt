@@ -333,14 +333,21 @@ class TestCostPath:
                               model="qwen3.8:27b", provider_name="ollama")
         assert lookup_pricing(binding) == {"input": 0.0, "output": 0.0}
 
-    def test_unknown_local_model_takes_the_warn_path(self):
-        """A custom tag absent from the registry is genuinely unknown — the
-        lookup misses (the loud marker fires downstream), it must NOT invent
-        a $0."""
+    def test_unknown_local_model_contrasts_with_the_shipped_entries(self):
+        """hunt r1 (sonnet): a bare `lookup is None` assert was vacuous — it
+        passes whether or not the pricing attribute exists. The DISCRIMINATING
+        pin is the CONTRAST: the same map that resolves the three shipped $0
+        entries must NOT invent a rate for an arbitrary custom tag (the loud
+        unknown-model warn path fires downstream for exactly that tag)."""
         from utilities.llm import PhaseBinding
         from utilities.llm.helpers import lookup_pricing
         from utilities.llm.providers.ollama import OllamaAdapter
 
-        binding = PhaseBinding(phase="analyze", adapter=OllamaAdapter(),
+        adapter = OllamaAdapter()
+        binding = PhaseBinding(phase="analyze", adapter=adapter,
                               model="my-custom-tag", provider_name="ollama")
+        # the contrast, both sides in one test
         assert lookup_pricing(binding) is None
+        for shipped in ("qwen3.8:27b", "qwen3.5:9b", "mistral-small3.2:latest"):
+            assert adapter.pricing.get(shipped) == {"input": 0.0, "output": 0.0}, (
+                f"the map that misses the custom tag must still carry {shipped}")

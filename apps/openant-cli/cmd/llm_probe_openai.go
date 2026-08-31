@@ -58,6 +58,14 @@ func probeOpenRouter(apiKey, baseURL, model string) error {
 // Package var so tests can point at httptest.
 var ollamaAPIBase = "http://localhost:11434/v1"
 
+// The canonical not-pulled body markers — MUST mirror the Python
+// adapter's _NOT_PULLED_MARKERS in utilities/llm/providers/ollama.py
+// (hunt r1: the two halves of the same live-verified gate had drifted).
+const (
+	notPulledMarkerA = "not found"
+	notPulledMarkerB = "try pulling it"
+)
+
 // probeClientTimeout bounds each wizard probe request — package var so the
 // timeout test can shrink it (the established openaiAPIURL pattern).
 var probeClientTimeout = 15 * time.Second
@@ -80,6 +88,12 @@ func probeOllama(apiKey, baseURL, model string) error {
 	if err == nil {
 		return nil
 	}
+	// hunt r1 (sonnet): a timeout on the OLLAMA probe is most often a cold
+	// model load (15GB+ models take minutes on first inference) — layer the
+	// specific advice on the shared neutral timeout.
+	if pe, ok := err.(*AnthropicProbeError); ok && pe.Kind == "timeout" {
+		pe.Message = pe.Message + " — if the model was cold, its first load can take minutes: retry the probe (or pre-warm it with a tiny request)"
+	}
 	// Rewrite the generic 404 wording into the fixable `ollama pull` hint —
 	// GATED on the captured body (review should-fix #346): only a 404 whose
 	// body actually says the model is unpulled gets the pull advice; a
@@ -87,7 +101,10 @@ func probeOllama(apiKey, baseURL, model string) error {
 	// endpoint path is wrong — e.g. missing /v1) and gets that hint instead.
 	if pe, ok := err.(*AnthropicProbeError); ok && pe.Kind == "model_not_found" {
 		lowered := strings.ToLower(pe.Body)
-		if strings.Contains(lowered, "not found") && strings.Contains(lowered, "pull") {
+		// hunt r1 (sonnet): ONE canonical marker set, mirroring the Python
+		// adapter's _NOT_PULLED_MARKERS ("not found", "try pulling it") —
+		// two hand-copied variants of the same live-verified gate drift.
+		if strings.Contains(lowered, notPulledMarkerA) && strings.Contains(lowered, notPulledMarkerB) {
 			pe.Message = fmt.Sprintf("model %q not pulled into Ollama — run `ollama pull %s` (or `ollama list` to see what's installed)", model, model)
 		} else {
 			pe.Message = fmt.Sprintf("HTTP 404 from Ollama (body: %q) but it does not say the model is unpulled — check the base_url: Ollama's OpenAI-compatible API is at http://<host>:11434/v1 (the /v1 segment included)", truncateBody(pe.Body))
@@ -136,9 +153,13 @@ func probeChatCompletionsAt(apiKey, endpoint, model string) error {
 		// server — a cold 15GB+ model's first load takes minutes, and the
 		// wizard said "could not reach" while Ollama was busy loading.
 		if os.IsTimeout(err) || errors.Is(err, context.DeadlineExceeded) {
+			// hunt r1 (sonnet): this probe is SHARED by the OpenAI and
+			// OpenRouter wrappers — the shared message stays provider-
+			// NEUTRAL; the Ollama wrapper layers its cold-load advice on
+			// this kind below.
 			return &AnthropicProbeError{
 				Kind:    "timeout",
-				Message: fmt.Sprintf("probe to %s timed out after %s: if the model was cold, its first load can take minutes — retry the probe (or pre-warm it with a tiny request); if it still times out, check that %s is reachable", endpoint, probeClientTimeout, endpoint),
+				Message: fmt.Sprintf("probe to %s timed out after %s — the provider may be slow to respond; retry, and check that %s is reachable", endpoint, probeClientTimeout, endpoint),
 			}
 		}
 		return &AnthropicProbeError{
