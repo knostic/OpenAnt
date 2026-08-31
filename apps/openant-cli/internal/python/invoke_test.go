@@ -1,7 +1,6 @@
 package python
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -263,20 +262,35 @@ func TestInvoke_TimeoutErrorNamesTheDeadline(t *testing.T) {
 	// C2: shrink the deadline via the PUBLIC override — no test hooks.
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "1") // 1 second
 
-	_, err := Invoke(hang, []string{"parse", "."}, "", true, "")
+	_, err := Invoke(hang, []string{"analyze", "."}, "", true, "")
 	if err == nil {
 		t.Fatalf("expected the deadline to fire on a hung subprocess")
 	}
 	msg := err.Error()
+	// The checkpoint clause belongs here: analyze checkpoints (a re-run
+	// resumes). The follow-up fix gated the clause on the subcommand —
+	// parse/generate-context/build-output/report*/checkpoint-status write
+	// none, and the hint is false-in-context for them (that gating has its
+	// own test).
 	for _, want := range []string{"invoke deadline", "OPENANT_INVOKE_TIMEOUT", "checkpoint"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("the timeout error must name %q; got: %s", want, msg)
 		}
 	}
 	// C5.6: the effective deadline (the override's 1s) must appear —
-	// confirms to an override user that their setting took effect.
-	if !strings.Contains(msg, "1s") {
+	// confirms to an override user that their setting took effect. Word-
+	// bounded so "1s" cannot match "11s".
+	if !strings.Contains(msg, "after 1s ") && !strings.HasSuffix(msg, "after 1s") && !strings.Contains(msg, "after 1s.") {
 		t.Errorf("the error must show the effective deadline value; got: %s", msg)
+	}
+	// Round-4 pin (confirm#3): the wrapped cause must be the honest one —
+	// "signal: killed" — not the watchdog's own read-end close, the exact
+	// cryptic artifact this fix exists to stop headlining.
+	if strings.Contains(msg, "file already closed") {
+		t.Errorf("the read-end close artifact must not be the wrapped cause; got: %s", msg)
+	}
+	if !strings.Contains(msg, "signal: killed") {
+		t.Errorf("the wrapped cause must name the kill; got: %s", msg)
 	}
 }
 
@@ -285,18 +299,37 @@ func TestInvoke_NonDeadlineDeathDoesNotClaimADeadline(t *testing.T) {
 	// expired must NOT be mis-diagnosed as a timeout — a false "you hit
 	// the deadline" is worse than no diagnosis. Also pins the #313
 	// interaction: a non-timeout death keeps its own semantics.
-	dir := t.TempDir()
-	script := filepath.Join(dir, "failer.py")
-	if err := os.WriteFile(script, []byte("import sys; sys.exit(3)\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// Strengthened (wave finding): the exit-3 child surfaces as the
+	// no-output ERROR ENVELOPE (err == nil), so an `if err != nil` guard
+	// asserted nothing — the check must look at the result.
+	// Wave round-3 repair: the old shape passed "-c <prog>" — Invoke
+	// prepends "-P -m openant", so -c never ran and the child exited 1/2,
+	// never 3; and the Errors-scan could not fail (the diagnosis is only
+	// ever a returned error, never an envelope Errors entry). Use the
+	// package's sh-script idiom and assert what actually happens.
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "600") // far beyond this test's run
+	s := writeScript(t, "exit 3\n")
 
-	_, err := Invoke("python3", []string{"-c", fmt.Sprintf(
-		"import runpy,sys; sys.argv=['failer']; runpy.run_path(%q)", script)}, "", true, "")
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
 	if err != nil {
 		if strings.Contains(err.Error(), "invoke deadline") {
 			t.Errorf("a non-deadline death must not claim a deadline; got: %s", err)
 		}
+		return
+	}
+	if res == nil {
+		t.Fatal("expected the no-output error envelope, got nil result and nil error")
+	}
+	if res.Envelope.Status != "error" {
+		t.Fatalf("status = %q, want error", res.Envelope.Status)
+	}
+	if len(res.Envelope.Errors) == 0 || !strings.Contains(res.Envelope.Errors[0], "no output") {
+		t.Fatalf("want the no-output error envelope, got %+v", res.Envelope.Errors)
+	}
+	// normalizeExit's documented policy preserves a high natural code on an
+	// error envelope (see TestNormalizeExit) — assert it so a silent change
+	// of that policy is seen here too.
+	if res.ExitCode != 3 {
+		t.Fatalf("exit = %d, want 3 (the natural code, preserved)", res.ExitCode)
 	}
 }
