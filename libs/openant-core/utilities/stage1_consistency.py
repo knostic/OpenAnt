@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from utilities.llm_client import TokenTracker
 from utilities.llm import PhaseBinding, simple_text
-from core.verdict_taxonomy import DISCLOSURE_DROPPED
+from core.verdict_taxonomy import DISCLOSURE_DROPPED, DISCLOSURE_ELIGIBLE
 
 # Uppercase mirror of the canonical disclosure-dropped set (this module compares
 # verdicts .upper()'d). Keyed off core.verdict_taxonomy so the guard's block-set
@@ -296,6 +296,28 @@ def run_stage1_consistency_check(
                                 continue
                             if old_verdict_norm != new_verdict:
                                 result["verdict"] = new_verdict
+                                # #331: canonical downstream reads are
+                                # finding-first (`str(r.get("finding") or
+                                # r.get("verdict", "")).lower()`,
+                                # core/verifier.py:118) and ingestion ALWAYS
+                                # sets a lowercase finding (core/analyzer.py:
+                                # 149-152), so writing only `verdict` leaves
+                                # the correction shadowed by the stale finding
+                                # — a safe->VULNERABLE correction was counted
+                                # safe, filtered out of Stage 2, and absent
+                                # from disclosure. GATE the write on
+                                # disclosure-eligibility: `new_verdict` is
+                                # unvalidated model output (the :281 comment),
+                                # and the :287 block-list covers only
+                                # DISCLOSURE_DROPPED — an unrecognised
+                                # downgrade (VULNERABLE -> INSUFFICIENT_CONTEXT)
+                                # passes unblocked, and the stale finding is
+                                # currently the ACCIDENTAL SAFETY NET keeping
+                                # the row disclosed. An ungated write would
+                                # remove that net and drop a disclosed
+                                # vulnerability (measured in #331).
+                                if str(new_verdict).lower() in DISCLOSURE_ELIGIBLE:
+                                    result["finding"] = str(new_verdict).lower()
                                 result["stage1_consistency_update"] = {
                                     "from": old_verdict,
                                     "to": new_verdict,
