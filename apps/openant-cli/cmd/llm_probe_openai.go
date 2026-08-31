@@ -92,7 +92,7 @@ func probeOllama(apiKey, baseURL, model string) error {
 	// model load (15GB+ models take minutes on first inference) — layer the
 	// specific advice on the shared neutral timeout.
 	if pe, ok := err.(*AnthropicProbeError); ok && pe.Kind == "timeout" {
-		pe.Message = pe.Message + " — if the model was cold, its first load can take minutes: retry the probe (or pre-warm it with a tiny request)"
+		pe.Message = pe.Message + " — if the model was cold, its first load can take minutes; pre-warm it with a tiny request"
 	}
 	// Rewrite the generic 404 wording into the fixable `ollama pull` hint —
 	// GATED on the captured body (review should-fix #346): only a 404 whose

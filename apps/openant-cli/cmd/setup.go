@@ -48,8 +48,9 @@ var setupLLMPhases = []phaseSpec{
 	{name: "report", short: "Disclosure + summary + remediation generation."},
 }
 
-// Provider adapter types the wizard offers in the picker. All three
-// ship with a Python adapter (anthropic, openai, google) — see
+// Provider adapter types the wizard offers in the picker. All of them
+// ship with a Python adapter (anthropic, openai, google, bedrock,
+// openrouter, ollama) — see
 // “libs/openant-core/utilities/llm/providers/__init__.py“ — so a
 // completed wizard config runs without further changes. The wizard
 // probes each provider+model pair against the real provider API

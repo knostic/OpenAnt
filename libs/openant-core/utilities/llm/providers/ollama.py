@@ -142,10 +142,10 @@ def _classify_error(exc: Exception, *, report_429: bool) -> Exception:
     # user to `ollama pull` for a config typo actively misleads. The old
     # catch-all branch made _is_not_pulled dead: both branches returned
     # the identical hint.
-    if (
-        isinstance(exc, openai.NotFoundError)
-        or getattr(exc, "status_code", None) == 404
-    ) and _is_not_pulled(lowered):
+    # hunt r2 (sonnet): the status_code==404 disjunct was DEAD — the live
+    # openai SDK always constructs a NotFoundError for a real HTTP 404
+    # (_make_status_error_from_response), and nothing non-SDK reaches here.
+    if isinstance(exc, openai.NotFoundError) and _is_not_pulled(lowered):
         return LLMNotFoundError(message + _PULL_HINT)
     if isinstance(exc, openai.NotFoundError):
         return LLMNotFoundError(message + _BASE_URL_HINT)
