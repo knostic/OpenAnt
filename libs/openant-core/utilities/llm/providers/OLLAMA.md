@@ -1,7 +1,10 @@
 # Ollama Provider Guide
 
 Run OpenAnt entirely on local models via [Ollama](https://ollama.com). No API
-key, no per-token cost — source code never leaves the machine.
+key, no per-token cost — with the default `base_url`, source code never
+leaves the machine. (The endpoint is overridable for LAN/remote
+Ollama-compatible gateways — see "Remote / LAN Ollama" below: what leaves
+the machine, and to where, is then exactly your configuration.)
 
 ## Setup
 
@@ -71,9 +74,16 @@ gateway, set `api_key` on the provider entry — it is forwarded verbatim.
 
 ## Cost accounting
 
-Local inference is free; Ollama models report $0 token cost. There is no
-pricing table shipped for this adapter — nothing to keep current, no silent
-cross-provider price guessing (issue #65).
+Local inference is free. The three shipped Ollama models carry explicit
+`{"input": 0, "output": 0}` records in the shared registry
+(`config/models.json`, the `_LOCAL_PROVIDERS` exemption in
+`core/model_registry.py`): their cost reporting is DEFINED — $0 with
+`cost_complete`, never the unknown-model warning. Nothing to keep current
+(no vendor rates to track — free is a fact, not a quote) and no silent
+cross-provider price guessing (issue #65). A local model ABSENT from the
+registry (any custom tag) deliberately still takes the unknown-model warn
+path: an arbitrary tag is genuinely unknown, and the loud marker is honest
+about it.
 
 ## Troubleshooting
 

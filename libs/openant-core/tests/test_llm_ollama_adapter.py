@@ -118,7 +118,10 @@ class TestConstructor:
         default and not a crash."""
         captured = self._patched(monkeypatch)
         OllamaAdapter()
-        assert captured["api_key"]  # non-empty (SDK requirement)
+        # Review minor (#346): pinned to the exact placeholder — a bare
+        # truthiness assert passed on ANY non-empty key, including a real
+        # credential; the contract is the literal "ollama" placeholder.
+        assert captured["api_key"] == "ollama"
 
     def test_no_env_fallback_for_keys(self, monkeypatch):
         """A foreign provider key in the env must NEVER be picked up for
@@ -304,3 +307,40 @@ class TestRateLimiter:
         with pytest.raises(LLMRateLimitError):
             adapter.validate(model="qwen3:14b")
         assert not get_rate_limiter().is_in_backoff()
+
+
+class TestCostPath:
+    """Review blocker (#346): the PR shipped explicit-$0 models.json entries
+    + the _LOCAL_PROVIDERS exemption, but the adapter never wired `pricing` —
+    every run warned and reported cost_incomplete. These tests pin the wiring
+    so the registry work can never silently go dead again."""
+
+    def test_pricing_attribute_resolves_the_shipped_zero_entries(self):
+        from utilities.llm.providers.ollama import OllamaAdapter
+
+        pricing = OllamaAdapter().pricing
+        # the three shipped local models: explicit $0, present in the map
+        assert pricing.get("qwen3.8:27b") == {"input": 0.0, "output": 0.0}
+        assert pricing.get("qwen3.5:9b") == {"input": 0.0, "output": 0.0}
+        assert pricing.get("mistral-small3.2:latest") == {"input": 0.0, "output": 0.0}
+
+    def test_lookup_pricing_resolves_a_local_binding(self):
+        from utilities.llm import PhaseBinding
+        from utilities.llm.helpers import lookup_pricing
+        from utilities.llm.providers.ollama import OllamaAdapter
+
+        binding = PhaseBinding(phase="analyze", adapter=OllamaAdapter(),
+                              model="qwen3.8:27b", provider_name="ollama")
+        assert lookup_pricing(binding) == {"input": 0.0, "output": 0.0}
+
+    def test_unknown_local_model_takes_the_warn_path(self):
+        """A custom tag absent from the registry is genuinely unknown — the
+        lookup misses (the loud marker fires downstream), it must NOT invent
+        a $0."""
+        from utilities.llm import PhaseBinding
+        from utilities.llm.helpers import lookup_pricing
+        from utilities.llm.providers.ollama import OllamaAdapter
+
+        binding = PhaseBinding(phase="analyze", adapter=OllamaAdapter(),
+                              model="my-custom-tag", provider_name="ollama")
+        assert lookup_pricing(binding) is None

@@ -7,7 +7,9 @@ import "testing"
 // old hardcoded maps. They never touch a provider API (the interactive wizard's
 // probeAnthropic/etc. issue real billed requests; none of that runs here).
 
-var testProviderTypes = []string{"anthropic", "openai", "google"}
+// Review blocker (#346): ollama was missing — every (provider, phase) the
+// wizard can prefill must resolve, including the local provider.
+var testProviderTypes = []string{"anthropic", "openai", "google", "ollama"}
 
 // Every (provider, phase) the wizard can prefill must resolve to a NON-EMPTY id
 // whose registry record is "current" — never retired/unknown, which is exactly

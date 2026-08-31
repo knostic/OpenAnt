@@ -20,9 +20,14 @@ top is exactly the Ollama-specific surface:
   (still overridable for a LAN/remote Ollama host). Like OpenRouter's,
   this base already carries the ``/v1`` segment.
 
-* **Local = free.** Local inference costs nothing, so no pricing table is
-  shipped: models absent from the shared registry report $0 via the
-  documented "adapter without ``pricing``" path.
+* **Local = free — explicit $0 entries.** Local inference costs nothing,
+  and the three shipped Ollama models carry explicit
+  ``{"input": 0, "output": 0}`` records in the shared registry (the
+  ``_LOCAL_PROVIDERS`` exemption in ``core/model_registry.py``): cost
+  reporting is DEFINED for them ($0, ``cost_complete``), never the
+  unknown-model warn path. A local model ABSENT from the registry still
+  takes that warn path deliberately — an arbitrary tag like ``my-model``
+  is genuinely unknown, and the loud marker is honest there.
 
 * **Error deltas** (verified against Ollama's OpenAI-compat docs and live
   server behavior, 2026-08):
@@ -61,6 +66,7 @@ from ..adapter import (
     Message,
     ToolDef,
 )
+from .._pricing import LazyProviderPricing
 from ._ratelimit import report_rate_limit, wait_for_rate_limit
 from .openai import (
     _messages_to_openai,
@@ -89,6 +95,17 @@ _NOT_RUNNING_HINT = (
     "non-default host/port)"
 )
 
+_MODEL_LOADING_HINT = (
+    " — the request timed out. If the model was cold, its first load can "
+    "take minutes (15GB+ models do); retry, or pre-warm it with a tiny "
+    "1-token request."
+)
+_BASE_URL_HINT = (
+    " — the server answered 404 but the body does not say the model is "
+    "unpulled, so the ENDPOINT is probably wrong: check base_url "
+    "(Ollama's OpenAI-compatible API is http://<host>:11434/v1 — the "
+    "/v1 segment included)."
+)
 _PULL_HINT = (
     " (model not pulled into Ollama — run `ollama pull <model>`, or list "
     "installed models with `ollama list`)"
@@ -105,6 +122,13 @@ def _classify_error(exc: Exception, *, report_429: bool) -> Exception:
     message = redact_secrets(str(exc))
     lowered = message.lower()
 
+    # Review should-fix (#346): APITimeoutError is an APIConnectionError
+    # SUBCLASS (verified against the installed SDK's MRO) — without this
+    # branch first, a cold model's minutes-long first load got the "start
+    # it with `ollama serve`" hint while the server was in fact running
+    # and loading.
+    if isinstance(exc, openai.APITimeoutError):
+        return LLMConnectionError(message + _MODEL_LOADING_HINT)
     if isinstance(exc, openai.APIConnectionError):
         return LLMConnectionError(message + _NOT_RUNNING_HINT)
     if isinstance(exc, openai.RateLimitError):
@@ -112,13 +136,19 @@ def _classify_error(exc: Exception, *, report_429: bool) -> Exception:
         if report_429:
             report_rate_limit(retry_after)
         return LLMRateLimitError(message, retry_after=retry_after)
+    # Review should-fix (#346): the pull hint is GATED on the not-pulled
+    # body markers — a marker-less 404 is usually a base_url misconfig
+    # (the endpoint path is wrong, e.g. missing /v1), and telling the
+    # user to `ollama pull` for a config typo actively misleads. The old
+    # catch-all branch made _is_not_pulled dead: both branches returned
+    # the identical hint.
     if (
         isinstance(exc, openai.NotFoundError)
         or getattr(exc, "status_code", None) == 404
     ) and _is_not_pulled(lowered):
         return LLMNotFoundError(message + _PULL_HINT)
     if isinstance(exc, openai.NotFoundError):
-        return LLMNotFoundError(message + _PULL_HINT)
+        return LLMNotFoundError(message + _BASE_URL_HINT)
     if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
         # Only reachable against key-checking Ollama-compatible gateways;
         # stock Ollama never returns these.
@@ -136,6 +166,11 @@ class OllamaAdapter:
     OpenAI-compatible endpoint via ``openai.OpenAI``."""
 
     name = "ollama"
+
+    # Review blocker (#346): without this attribute, lookup_pricing returns
+    # None and every run warns + reports cost_incomplete — the registry's
+    # explicit-$0 entries stayed dead. Every sibling adapter sets it.
+    pricing = LazyProviderPricing("ollama")
     supports_tools = True
 
     def __init__(

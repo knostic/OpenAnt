@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -339,5 +340,66 @@ func TestProbeOllama_UnpulledModel404GetsPullHint(t *testing.T) {
 		t.Fatalf("kind = %v, want model_not_found; err = %v", err, err)
 	} else if !strings.Contains(pe.Message, "ollama pull") {
 		t.Errorf("message = %q, want an `ollama pull` hint", pe.Message)
+	}
+}
+
+// Review fixes (#346): the Ollama 404 gate discriminates the genuine
+// not-pulled body from a base_url misconfiguration, and a probe timeout
+// is a cold-load hint, not "could not reach".
+func TestProbeOllama_GatesPullHintOnBody(t *testing.T) {
+	// genuine not-pulled: Ollama's live body shape
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"message":"model 'x' not found, try pulling it first"}}`))
+	}))
+	defer server.Close()
+	err := probeOllama("", server.URL, "x")
+	pe, ok := asProbeError(err)
+	if !ok {
+		t.Fatalf("expected AnthropicProbeError, got %T", err)
+	}
+	if !strings.Contains(pe.Message, "ollama pull") {
+		t.Errorf("genuine not-pulled 404 must keep the pull hint, got: %s", pe.Message)
+	}
+
+	// marker-less 404 (a base_url misconfig: wrong path, empty/foreign body)
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`404 page not found`))
+	}))
+	defer server2.Close()
+	err2 := probeOllama("", server2.URL, "x")
+	pe2, ok2 := asProbeError(err2)
+	if !ok2 {
+		t.Fatalf("expected AnthropicProbeError, got %T", err2)
+	}
+	if !strings.Contains(pe2.Message, "check the base_url") {
+		t.Errorf("a marker-less 404 is a base_url misconfig, not a pull case, got: %s", pe2.Message)
+	}
+}
+
+func TestProbeChatCompletionsAt_TimeoutIsItsOwnKind(t *testing.T) {
+	// A server that never answers: the probe's 15s client timeout is long,
+	// so bind a shorter one by making the handler sleep past a reduced
+	// client timeout — reuse the package var if the timeout is exported
+	// elsewhere; here we assert the classification on a hanging endpoint
+	// with the client's own deadline overridden via the context path used
+	// by the wizard probe. Simplest: hang the handler longer than the probe
+	// budget is not feasible at 15s in a unit test; assert the KIND mapping
+	// via the http.Client error shape instead.
+	orig := probeClientTimeout
+	defer func() { probeClientTimeout = orig }()
+	probeClientTimeout = 100 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+	}))
+	defer server.Close()
+	err := probeChatCompletionsAt("k", server.URL, "m")
+	pe, ok := asProbeError(err)
+	if !ok {
+		t.Fatalf("expected AnthropicProbeError, got %T", err)
+	}
+	if pe.Kind != "timeout" {
+		t.Errorf("a probe timeout must be its own kind (cold-load hint), got %q", pe.Kind)
 	}
 }
