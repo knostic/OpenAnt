@@ -1033,51 +1033,91 @@ class TypeScriptAnalyzer {
   }
 
   /**
-   * Emit a synthetic unit when a file's top-level statements are dominated by
-   * a bare side-effect call (e.g. an Electron preload script that only calls
-   * contextBridge.exposeInMainWorld({...})). Without this, such files yield
-   * zero units even though they carry analysable behaviour.
+   * #330: emit ONE synthetic `<file>:module` unit per file holding the module
+   * top-level code — IIFEs, callbacks passed to top-level calls, bare driver
+   * calls, initialiser calls — which belongs to no emitted unit. The call
+   * graph scans only emitted units' code, so in any file with >=1 real unit
+   * those calls (including calls to sinks) never became edges: a sink
+   * reachable through bootstrap code alone got no incoming edge from it
+   * (the false-negative direction). The previous capture fired only on
+   * files with ZERO units.
+   *
+   * The residual is masked by EMITTED UNIT LINE RANGES — the Python
+   * extractor's :__module__ precedent, which wrote down why: exclusion by
+   * whole-STATEMENT containment drops the class/object-literal boundary and
+   * leaks member bodies in, attributing their calls to module load, which is
+   * not when they run (with module_level entry-point seeding, fabricated
+   * reachability). Emitted only when the residual contains a call. This
+   * subsumes the old empty-file fallback, whose receiver-naming also
+   * fabricated callee labels (`x.js:[1].forEach`).
    */
   _extractTopLevelSideEffects(sourceFile, relativePath) {
-    // Only synthesise when the regular extractors produced nothing for this
-    // file — otherwise we'd duplicate real functions/methods.
+    const functionId = `${relativePath}:module`;
+    // A real unit named `module` wins — never clobber it.
+    if (this.functions[functionId]) return;
+
     const filePrefix = `${relativePath}:`;
-    const hasAny = Object.keys(this.functions).some((id) =>
-      id.startsWith(filePrefix),
-    );
-    if (hasAny) return;
-
-    for (const statement of sourceFile.getStatements()) {
-      if (statement.getKindName() !== "ExpressionStatement") continue;
-      const expr = statement.getExpression();
-      if (!expr || expr.getKindName() !== "CallExpression") continue;
-
-      const callee = expr.getExpression();
-      let label = "module";
-      if (callee && callee.getKindName() === "PropertyAccessExpression") {
-        const obj = callee.getExpression
-          ? callee.getExpression().getText()
-          : "";
-        const member = callee.getName ? callee.getName() : "";
-        label = member ? `${obj}.${member}` : obj || "module";
-      } else if (callee && callee.getKindName() === "Identifier") {
-        label = callee.getText();
+    const covered = new Set();
+    for (const [id, fd] of Object.entries(this.functions)) {
+      if (!id.startsWith(filePrefix)) continue;
+      const s = fd.startLine;
+      const e = fd.endLine;
+      if (Number.isInteger(s) && Number.isInteger(e)) {
+        for (let ln = s; ln <= e; ln++) covered.add(ln);
       }
-
-      const functionId = `${relativePath}:${label}`;
-      if (this.functions[functionId]) continue;
-      const code = statement.getFullText();
-      this.functions[functionId] = {
-        name: label,
-        code: code,
-        isExported: false,
-        unitType: "module_level",
-        startLine: statement.getStartLineNumber(),
-        endLine: statement.getEndLineNumber(),
-      };
-      // One synthetic unit per file is enough to make the file analysable.
-      return;
     }
+
+    const lines = sourceFile.getFullText().split("\n");
+    const residual = [];
+    let first = null;
+    let last = null;
+    for (let i = 0; i < lines.length; i++) {
+      const ln = i + 1;
+      if (covered.has(ln)) continue;
+      const stripped = lines[i].trim();
+      if (
+        !stripped ||
+        stripped.startsWith("//") ||
+        stripped.startsWith("/*") ||
+        stripped.startsWith("*")
+      ) {
+        continue;
+      }
+      residual.push(lines[i]);
+      if (first === null) first = ln;
+      last = ln;
+    }
+    if (first === null || !residual.length) return;
+
+    const code = residual.join("\n");
+    if (!this._residualContainsCall(code)) return;
+
+    this.functions[functionId] = {
+      name: "module",
+      code: code,
+      isExported: false,
+      unitType: "module_level",
+      startLine: first,
+      endLine: last,
+    };
+  }
+
+  /**
+   * True when text contains a function call — `foo(..)`, `obj.method(..)`,
+   * `new C(..)` — excluding keyword openers (if/for/while/switch/catch/
+   * function), which are not calls. #330's emit gate: a file whose residual is
+   * imports and assignments only yields no module unit.
+   */
+  _residualContainsCall(text) {
+    const KEYWORDS = new Set([
+      "if", "for", "while", "switch", "catch", "function",
+    ]);
+    const re = /([A-Za-z_$][\w$]*)\s*\(/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      if (!KEYWORDS.has(m[1])) return true;
+    }
+    return false;
   }
 
   /**
