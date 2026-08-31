@@ -377,3 +377,25 @@ class TestMarkerless404BaseURLHint:
             response=_fake_http_resp(404), body=None)
         out = _classify_error(not_pulled, report_429=False)
         assert _PULL_HINT in str(out)
+
+
+class TestColdLoadTimeoutOrdering:
+    """hunt r5 (sonnet): the APITimeoutError branch must stay BEFORE its
+    APIConnectionError parent — a swap makes every cold model load read
+    "start it with `ollama serve`" while the server is in fact loading.
+    The hunter proved the order was un-pinned: swapping it left all 18
+    tests green. This test fails on the swap."""
+
+    def test_timeout_gets_the_loading_hint_not_the_serve_hint(self):
+        from utilities.llm.providers.ollama import (
+            _MODEL_LOADING_HINT, _NOT_RUNNING_HINT, _classify_error)
+
+        # httpx.TimeoutException under the SDK's APITimeoutError; construct
+        # via the SDK's own error path (message + response are enough here)
+        err = openai.APITimeoutError(request=_fake_http_resp(404).request)
+        out = _classify_error(err, report_429=False)
+        assert _MODEL_LOADING_HINT in str(out), (
+            "a cold-load timeout must get the loading hint")
+        assert _NOT_RUNNING_HINT not in str(out), (
+            "the serve hint here says 'start ollama serve' to a server that "
+            "IS running and loading — the exact misclassification")
