@@ -48,20 +48,26 @@ func writeScript(t *testing.T, body string) string {
 }
 
 // A complete success envelope was written and the child exited 0, but a
-// descendant holds the stdout write-end past the deadline: the envelope MUST
-// be recovered, not discarded.
+// descendant holds the stdout write-end: the envelope MUST be recovered, not
+// discarded. #431 changed the recovery mechanism: with managed writers,
+// WaitDelay bounds the held write-end at child-exit + 5s — the invoke
+// DEADLINE never fires for this shape (the pre-#431 shape waited for the
+// watchdog's deadline close, 30s on this budget, and printed the recovery
+// notice keyed on deadlineFired). The new contract: the envelope is returned
+// within ~WaitDelay, the notice does NOT print (no deadline fired to report),
+// and the run is a clean success.
 func TestInvoke_DeadlineRecoversCompleteEnvelope_StdoutHeld(t *testing.T) {
+	start := time.Now()
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "30s")
 	s := writeScript(t, `printf '{"status":"success","errors":[]}'
 sleep 60 &
 exec >&-
 exit 0
 `)
-	// quiet=false + stderr capture: the recovery NOTICE is the assertion
-	// that the deadline actually fired — without it this test cannot tell
-	// "recovered after a kill" from "nothing happened" (if the deadline
-	// ever stopped firing, io.Copy would just wait for sleep 30 and the
-	// test would still pass, green and meaningless, 30s later).
+	// quiet=false + stderr capture: the notice must NOT print under the
+	// #431 mechanism (the deadline did not fire — WaitDelay resolved the
+	// held write-end; a notice keyed on a deadline that never fired would
+	// be a lie).
 	r, w, _ := os.Pipe()
 	old := os.Stderr
 	os.Stderr = w
@@ -70,7 +76,7 @@ exit 0
 	w.Close()
 	b, _ := io.ReadAll(r)
 	if err != nil {
-		t.Fatalf("a complete envelope must win over the deadline: %v", err)
+		t.Fatalf("a complete envelope must win over the held write-end: %v", err)
 	}
 	if res.Envelope.Status != "success" {
 		t.Fatalf("envelope status = %q, want success", res.Envelope.Status)
@@ -78,8 +84,11 @@ exit 0
 	if res.ExitCode != 0 {
 		t.Fatalf("exit code = %d, want 0", res.ExitCode)
 	}
-	if !strings.Contains(string(b), "result envelope was recovered") {
-		t.Fatalf("the recovery notice must be visible on stderr when not quiet; got: %q", string(b))
+	if strings.Contains(string(b), "result envelope was recovered") {
+		t.Fatalf("the recovery notice printed without a fired deadline: %q", string(b))
+	}
+	if elapsed := time.Since(start); elapsed > 12*time.Second {
+		t.Fatalf("recovery took %v — the held write-end was bounded by the deadline, not WaitDelay (want ~5s)", elapsed)
 	}
 }
 

@@ -1,44 +1,37 @@
 package python
 
 import (
-	"bytes"
-	"io"
-	"os"
 	"strings"
 	"testing"
 )
 
-// TestStreamStderrLongLine guards against truncation of a stderr line that
+// TestLineWriterLongLine guards against truncation of a stderr line that
 // exceeds bufio.Scanner's default 64k token buffer. A long Python traceback
-// on a single line must reach os.Stderr in full, not be silently dropped.
-func TestStreamStderrLongLine(t *testing.T) {
+// on a single line must reach the terminal in full, not be silently dropped.
+// (#431: the guarantee moved from streamStderr's bufio.Reader to the managed
+// lineWriter that replaced it — a single partial line is buffered whole and
+// flushed after Wait, with a 1MB cap for pathologically long lines.)
+func TestLineWriterLongLine(t *testing.T) {
 	const size = 200 * 1024 // > 64k default scanner buffer
 	long := strings.Repeat("x", size)
-	input := long + "\n"
 
-	oldStderr := os.Stderr
-	pr, pw, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
+	var got []string
+	lw := &lineWriter{onLog: func(s string) { got = append(got, s) }}
+	// delivered in small Write chunks, as os/exec's copy goroutine does
+	for len(long) > 0 {
+		n := 4096
+		if n > len(long) {
+			n = len(long)
+		}
+		if _, err := lw.Write([]byte(long[:n])); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		long = long[n:]
 	}
-	os.Stderr = pw
+	lw.flush()
 
-	var buf bytes.Buffer
-	copyDone := make(chan struct{})
-	go func() {
-		defer close(copyDone)
-		_, _ = io.Copy(&buf, pr)
-	}()
-
-	streamStderr(strings.NewReader(input), false)
-
-	_ = pw.Close()
-	os.Stderr = oldStderr
-	<-copyDone
-	_ = pr.Close()
-
-	got := strings.TrimRight(buf.String(), "\n")
-	if len(got) != size {
-		t.Fatalf("stderr line truncated: got %d bytes, want %d", len(got), size)
+	if len(got) != 1 || len(got[0]) != size {
+		t.Fatalf("stderr line truncated: got %d line(s), first len %d, want one line of %d",
+			len(got), len(got[0]), size)
 	}
 }
