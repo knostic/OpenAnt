@@ -31,7 +31,8 @@ import os
 import sys
 from utilities.file_io import normalize_results, read_json
 
-from core.verdict_taxonomy import SEVERITIES as _SEVERITIES, SEVERITY_FINDING_VERDICTS
+from core.verdict_taxonomy import (SEVERITIES as _SEVERITIES, SEVERITY_FINDING_VERDICTS,
+                                  severity_display_verdict)
 
 
 def _severity_source_for(result: dict) -> str:
@@ -48,8 +49,12 @@ def _severity_for(result: dict) -> str:
     """#215: the severity for one CSV row — FINDING-ONLY (empty for
     non-findings, so severity=low does not return safe/ERROR units); a
     model value keeps; a derived value RE-DERIVES from the final verdict
-    (Stage 2 reclassifies; a stale Stage-1 stamp must not outrank it)."""
-    verdict = str(result.get("finding") or result.get("verdict") or "").strip().lower()
+    (Stage 2 reclassifies; a stale derived/corrected stamp must not
+    outrank it). Gates on the SHARED displayed verdict (panel round-3):
+    a "Max iterations reached" verification downgrades the row to
+    inconclusive and strips its severity, matching report-data and the
+    reporter — one row, one rank, every surface."""
+    verdict = severity_display_verdict(result)
     if verdict not in SEVERITY_FINDING_VERDICTS:
         return ""
     sev = result.get("severity")

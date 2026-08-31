@@ -456,3 +456,52 @@ def test_report_data_projection_wires_severity():
     block = src[i:i+1200]
     assert '"severity": _sev' in block and '"severity_source": _sev_src' in block, (
         "the report-data projection must wire severity + severity_source")
+
+
+def test_max_iterations_downgrade_strips_severity_csv():
+    """Panel round-3 (sonnet item 1): the CSV site applies the SAME "Max
+    iterations reached" downgrade as report-data — the row that the
+    HTML/SARIF displays as inconclusive must not rank critical in the CSV
+    (one row, one rank, every surface)."""
+    from report.csv_export import _severity_for, _severity_source_for
+
+    row = {"finding": "vulnerable", "severity": "critical",
+           "severity_source": "model",
+           "verification": {"explanation": "Max iterations reached"}}
+    assert _severity_for(row) == ""
+    assert _severity_source_for(row) == ""
+    # without the downgrade: the model value keeps
+    ok = dict(row, verification={"explanation": "stage 2 agreed"})
+    assert _severity_for(ok) == "critical"
+
+
+def test_max_iterations_downgrade_strips_severity_reporter():
+    """Panel round-3 (sonnet item 1): the reporter site (pipeline_output
+    findings, the summary prompt's input) applies the SAME downgrade —
+    no severity on the row report-data displays as inconclusive."""
+    from core.reporter import _severity_fields
+
+    row = {"finding": "vulnerable", "severity": "critical",
+           "severity_source": "model",
+           "verification": {"explanation": "Max iterations reached"}}
+    assert _severity_fields(row) == {}
+    ok = dict(row, verification={"explanation": "stage 2 agreed"})
+    assert _severity_fields(ok) == {"severity": "critical",
+                                   "severity_source": "model"}
+
+
+def test_max_iterations_downgrade_shared_helper_matches_cli():
+    """The shared severity_display_verdict reproduces cli.py's displayed
+    verdict for the downgrade shape — the three sites cannot drift again."""
+    from core.verdict_taxonomy import severity_display_verdict
+
+    row = {"finding": "vulnerable", "severity": "critical",
+           "severity_source": "model",
+           "verification": {"explanation": "Max iterations reached"}}
+    assert severity_display_verdict(row) == "inconclusive"
+    # explanation absent, reasoning carries the string: same downgrade
+    row2 = {"finding": "vulnerable", "verification": {},
+            "reasoning": "Max iterations reached"}
+    assert severity_display_verdict(row2) == "inconclusive"
+    # non-finding rows pass through untouched
+    assert severity_display_verdict({"finding": "safe"}) == "safe"

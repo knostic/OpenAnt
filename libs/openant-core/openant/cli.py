@@ -40,7 +40,8 @@ def _output_json(data: dict):
     sys.stdout.write("\n")
 
 
-from core.verdict_taxonomy import SEVERITIES as _SEVERITY_ORDER, SEVERITY_FINDING_VERDICTS
+from core.verdict_taxonomy import (SEVERITIES as _SEVERITY_ORDER, SEVERITY_FINDING_VERDICTS,
+                                   severity_display_verdict)
 
 
 def _severity_for_result(result: dict, displayed_verdict: str = None) -> str:
@@ -50,7 +51,7 @@ def _severity_for_result(result: dict, displayed_verdict: str = None) -> str:
     must not leave a CRITICAL badge on an inconclusive row). A model value
     keeps; corrected/derived re-derive from that verdict."""
     verdict = (displayed_verdict if displayed_verdict is not None
-               else str(result.get("finding") or result.get("verdict") or ""))
+               else severity_display_verdict(result))
     verdict = verdict.strip().lower()
     if verdict not in SEVERITY_FINDING_VERDICTS:
         return ""

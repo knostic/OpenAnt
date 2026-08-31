@@ -22,7 +22,8 @@ from pathlib import Path
 from core.schemas import ReportResult
 from core.language_registry import fence_for_path
 from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
-from core.verdict_taxonomy import SEVERITIES, SEVERITY_FINDING_VERDICTS
+from core.verdict_taxonomy import (SEVERITIES, SEVERITY_FINDING_VERDICTS,
+                                   severity_display_verdict)
 from utilities.child_interp import child_interpreter_env
 from utilities.file_io import normalize_results, open_utf8, read_json, write_json
 
@@ -265,7 +266,11 @@ def _severity_fields(finding: dict) -> dict:
     Stage-1 stamp must not outrank the final verdict. Old artifacts that
     carry no severity at all land in the same derivation.
     """
-    verdict = str(finding.get("finding") or finding.get("verdict") or "").strip().lower()
+    # Panel round-3: gates on the SHARED displayed verdict — a "Max
+    # iterations reached" verification downgrades the row to inconclusive
+    # (stripping its severity) exactly as report-data does, so pipeline
+    # findings, CSV, and HTML/SARIF emit one rank for one row.
+    verdict = severity_display_verdict(finding)
     if verdict not in SEVERITY_FINDING_VERDICTS:
         return {}
     sev = finding.get("severity")
@@ -276,6 +281,14 @@ def _severity_fields(finding: dict) -> dict:
     # reclassified the row — both re-derive from the FINAL verdict, with
     # their provenance labels preserved.
     if sev in SEVERITIES and source == "model":
+        # Why "model" is exempt from re-derivation and derived/corrected
+        # are not (panel doc item): "model" is the analysis-time LLM's own
+        # impact assessment — exactly what the field records, so it cannot
+        # go stale by a later verdict change the way a DERIVED stamp (a
+        # verdict-mapped fallback the reclassification invalidated) or a
+        # CORRECTED stamp (the repair prompt may have fabricated the
+        # field) can. The "stale Stage-1 stamp" wording above names the
+        # derived/corrected paths only, by design.
         return {"severity": sev, "severity_source": "model"}
     derived = "high" if verdict == "vulnerable" else "medium"
     return {"severity": derived,
@@ -539,10 +552,12 @@ def build_pipeline_output(
             **({"json_corrected": finding["json_corrected"]}
                if finding.get("json_corrected") is not None else {}),
             # #215: a rankable severity on EVERY finding. Present-only for a
-            # model/stamped value; the READ-TIME derivation covers OLD
-            # artifacts (pre-#215 results_verified.json, resumed pre-PR
-            # checkpoints) so every scan ranks on the new surfaces — with
-            # severity_source recording which happened.
+            # model/stamped value. Two coverage paths, distinct (panel doc
+            # item): OLD results_verified.json artifacts are covered by the
+            # READ-TIME derivation above for free; resumed PRE-PR checkpoint
+            # rows are NOT — they are covered upstream by the prompt-template
+            # fingerprint invalidation (the analysis prompt changed, so the
+            # rows are re-analyzed, not adopted), not by this read-time path.
             **_severity_fields(finding),
             "description": description,
             "vulnerable_code": vulnerable_code,
