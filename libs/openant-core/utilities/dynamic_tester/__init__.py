@@ -405,7 +405,14 @@ def run_dynamic_tests(
     except KeyboardInterrupt:
         print("\n[Dynamic Test] Interrupted — progress saved to checkpoints",
               file=sys.stderr, flush=True)
-        return results
+        # #419 (the #417 class): `return results` here swallowed the
+        # interrupt AND handed the caller partial results, which then wrote
+        # DYNAMIC_TEST_RESULTS.md as a completion artifact for an
+        # interrupted run. The checkpoints hold the progress (every
+        # completed finding is saved as it completes — the resume story);
+        # the interrupt itself PROPAGATES so the CLI exits 130 with an
+        # interrupted envelope, never a success one.
+        raise
 
     # Generate report
     total_cost = tracker.total_cost_usd
