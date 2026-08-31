@@ -118,6 +118,10 @@ def disambiguated_checkpoint_path(ckpt_dir: str, unit_id: str) -> str:
             # files provably hold this unit's id.
             if os.path.exists(home) and _holds_this_unit(home):
                 try:
+                    # TIE-BREAK: equal mtimes (one clock tick on Windows)
+                    # fall through to the bare overwrite — both files
+                    # provably hold this unit's id, so the dual state heals
+                    # either way; only WHICH copy survives is arbitrary.
                     if os.path.getmtime(home) > os.path.getmtime(bare):
                         _atomic_unlink(bare)
                         return home

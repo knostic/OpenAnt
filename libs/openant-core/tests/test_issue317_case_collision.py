@@ -522,10 +522,15 @@ def test_dual_same_id_files_self_heal_to_the_newer(tmp_path):
     stem = safe[: 255 - len(".json") - len(h) - 1]
     home = _os.path.join(d, f"{stem}_{h}.json")
 
-    # home newer, bare stale: consolidation keeps home, removes bare
+    # home newer, bare stale: consolidation keeps home, removes bare.
+    # EXPLICIT mtimes (panel round-3 flake): on Windows the three writes can
+    # land inside one clock tick (the merge-commit CI run observed EQUAL
+    # st_mtime values), so wall-clock ordering is nondeterministic — set
+    # the times directly.
     _write(bare, {"id": unit, "result": "STALE"})
     _write(home, {"id": unit, "result": "FRESH"})
-    _os.utime(home, None)
+    _os.utime(bare, (1_700_000_000, 1_700_000_000))
+    _os.utime(home, (1_700_010_000, 1_700_010_000))
     path = _ck.disambiguated_checkpoint_path(d, unit)
     assert path == home, "the newer home must win"
     assert not _os.path.exists(bare), "the superseded stale twin must be removed"
@@ -534,7 +539,8 @@ def test_dual_same_id_files_self_heal_to_the_newer(tmp_path):
     # bare newer, home stale: keeps bare, removes home
     _write(bare, {"id": unit, "result": "FRESH2"})
     _write(home, {"id": unit, "result": "STALE2"})
-    _os.utime(bare, None)
+    _os.utime(home, (1_700_000_000, 1_700_000_000))
+    _os.utime(bare, (1_700_010_000, 1_700_010_000))
     path = _ck.disambiguated_checkpoint_path(d, unit)
     assert path == bare, "the newer bare must win"
     assert not _os.path.exists(home), "the superseded stale twin must be removed"
