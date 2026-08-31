@@ -709,11 +709,21 @@ def _ensure_js_parser_dependencies() -> None:
             "[Parser] Installing JS parser dependencies (first run, this may take a minute)...",
             file=sys.stderr,
         )
+        # #325: PR #135 bounded the parse subprocesses and named this call
+        # as a deferred follow-up ("a separate unbounded subprocess... a
+        # tracked follow-up, out of scope here") — the follow-up. A stalled
+        # npm (a blocking postinstall script, a registry stall outlasting
+        # npm's own retry budget) hung its process indefinitely AND every
+        # concurrent parse behind the lock it holds. The parse steps use
+        # timeout=1800; the bootstrap gets the same convention. The named
+        # diagnosis (not a bare TimeoutExpired traceback): the bound + the
+        # manual recovery.
         result = subprocess.run(
             [npm, "install"],
             cwd=str(_JS_PARSER_DIR),
             stdout=sys.stderr,
             stderr=sys.stderr,
+            timeout=1800,  # 30 min — the parse-step convention (PR #135)
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -741,7 +751,9 @@ def _file_lock(lock_path: Path):
             import msvcrt
 
             f.seek(0)
-            # LK_LOCK blocks (with retries) until the byte range is exclusive.
+            # LK_LOCK blocks (with retries) until the byte range is
+            # exclusive. #325: bounded — LK_LOCK's retry budget is ~10s
+            # then raises OSError, i.e. already deadline-bounded here.
             msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
             try:
                 yield
@@ -750,8 +762,32 @@ def _file_lock(lock_path: Path):
                 msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
+            import time
 
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            # #325: a bare blocking LOCK_EX waits without limit behind a
+            # wedged holder (a stalled npm holding this lock hung EVERY
+            # concurrent parse process). Non-blocking acquisition in a
+            # retry loop with a deadline — the bounded wait the issue asks
+            # for; a timeout raises a named diagnosis, not an infinite
+            # hang. The deadline must outlast a legitimate install (the
+            # bounded npm install inside the lock holds it for up to 30
+            # minutes), so the retry budget is the install bound + 5
+            # minutes of slack.
+            _lock_deadline = time.monotonic() + 1800 + 300
+            while True:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= _lock_deadline:
+                        raise RuntimeError(
+                            f"the npm-install bootstrap lock at {lock_path} "
+                            "was not acquired within 2100s (a concurrent "
+                            "install is wedged — a stall beyond the 1800s "
+                            "install bound). Re-run; if it persists, remove "
+                            "the stalled process or the lockfile."
+                        )
+                    time.sleep(1.0)
             try:
                 yield
             finally:
