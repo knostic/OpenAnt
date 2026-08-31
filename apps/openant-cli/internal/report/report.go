@@ -15,6 +15,36 @@ var templateFS embed.FS
 //go:embed templates/report-reskin.gohtml
 var reskinFS embed.FS
 
+// #332: the report templates' third-party scripts (tailwindcss, chart.js,
+// chartjs-plugin-datalabels) are VENDORED at pinned versions — the CDN tags
+// carried no SRI, chart.js no version at all, and cdn.tailwindcss.com is a
+// mutable runtime generator. The report is served AND written to disk for
+// direct file:// opening, so the scripts are INLINED at render time (template
+// func returning template.JS): self-contained in every mode — served,
+// standalone, air-gapped — with no route coupling.
+//
+//go:embed vendor/tailwindcss-3.4.16.js vendor/chart-4.4.7.umd.min.js vendor/chartjs-plugin-datalabels-2.2.0.min.js
+var vendorFS embed.FS
+
+// vendorScripts holds the embedded script contents. A wrong name in a
+// template is a compile-time failure (go:embed), so the map is built once
+// and the read cannot fail.
+var vendorScripts = func() map[string]template.JS {
+	m := make(map[string]template.JS, 3)
+	for _, n := range []string{
+		"tailwindcss-3.4.16.js",
+		"chart-4.4.7.umd.min.js",
+		"chartjs-plugin-datalabels-2.2.0.min.js",
+	} {
+		b, err := vendorFS.ReadFile("vendor/" + n)
+		if err != nil {
+			panic("vendored report script missing: " + n)
+		}
+		m[n] = template.JS(b)
+	}
+	return m
+}()
+
 var (
 	overviewTmpl *template.Template
 	reskinTmpl   *template.Template
@@ -28,6 +58,11 @@ func init() {
 		},
 		"even": func(i int) bool {
 			return i%2 == 0
+		},
+		// #332: inline a vendored, pinned script by file name — the rendered
+		// report carries its own dependencies (no CDN, no SRI negotiation).
+		"vendorJS": func(name string) template.JS {
+			return vendorScripts[name]
 		},
 	}
 
