@@ -196,11 +196,56 @@ USER_INPUT_PATTERNS = [
     # Rust CLI / stdin / env input surfaces: a function that reads these IS a
     # user-input entry point even when it carries no route/main marker of its
     # own (e.g. a helper called from `main` via `std::env::args()`).
+    # #355: std::env::var — the ORDINARY env read — was missing (args was
+    # listed; var was not), so a Rust config reader seeded through neither
+    # route.
     r'std::env::args',
     r'\benv::args\b',
+    r'std::env::var',
+    r'\benv::var\b',
     r'\bstd::io::stdin\b',
     r'\bio::stdin\b',
     r'\bstdin\(\)',
+    # #355: JavaScript/TypeScript CLI / env / stdin — Node reads argv through
+    # process.argv, configuration AND SECRETS through process.env, and stdin
+    # through process.stdin; the argv-parse libraries and readline are the same
+    # surface as Python's argparse/click block above. The JS parser assigns
+    # these units unit_type=function (typescript_analyzer.js) with NO
+    # cli_handler classifier, so without this block NEITHER check seeds them.
+    r'process\.argv',
+    r'process\.env',
+    r'process\.stdin',
+    r'\byargs\b',
+    r'\bcommander\b',
+    r'\bminimist\b',
+    r'\breadline\b',
+    # #355: Go env reads — os.Getenv / os.LookupEnv. argv needs no idiom (the
+    # parser classifies os.Args code as cli_handler, extractor.go:344, so
+    # Check 1 seeds it), but env had no route at all; flag. is the CLI-args
+    # idiom for the flag package (flag.Parse/flag.String).
+    r'\bos\.Getenv\s*\(',
+    r'\bos\.LookupEnv\s*\(',
+    r'\bflag\.',
+    # #355: C CLI / env — getenv( and argc/argv: a non-`main` helper taking
+    # argc/argv is seeded only under apps/ via the parser's cli_handler gate
+    # (c/function_extractor.py:353-356), a property of the DIRECTORY, not of
+    # the code; the idiom closes the gap for every directory. Over-seeding is
+    # the safe direction (a false entry point costs analysis budget; a missing
+    # one silently drops a unit and everything reachable only through it).
+    # `\bgetenv\s*\(` also covers PHP's getenv() — the lists are not
+    # language-scoped (the documented \bgets\b accident above).
+    r'\bgetenv\s*\(',
+    r'\bargv\b',
+    r'\bargc\b',
+    # #355: PHP CLI forms — the web-superglobal pattern covers
+    # $_SERVER['argv'] and $_ENV by accident; the direct CLI forms matched
+    # nothing.
+    r'\$argv\b',
+    # #355: Zig CLI / env — std.process args (one prefix covers args and
+    # argsAlloc) and the env-var reader. The Zig parser assigns
+    # unit_type=function with no cli route.
+    r'std\.process\.args',
+    r'getEnvVarOwned',
 ]
 
 # Patterns that indicate module-level scripts with user input
