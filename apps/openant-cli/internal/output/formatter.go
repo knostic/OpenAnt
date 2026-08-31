@@ -130,6 +130,29 @@ func PrintScanSummary(data map[string]any) {
 		}
 	}
 
+	// #323: the reachability advisory on the terminal summary — the blackout
+	// warning previously reached only an artifact field + an LLM instruction;
+	// the terminal never said anything, so a blacked-out scan looked like a
+	// small clean run. Deterministic (printed from the envelope's block).
+	if reach, ok := data["reachability"].(map[string]any); ok && reach != nil {
+		reachable := intFromAny(reach["reachable_units"])
+		original := intFromAny(reach["original_units"])
+		if original > 0 {
+			pct := 100 - (reachable * 100 / original)
+			PrintKeyValue("Reachability", fmt.Sprintf(
+				"%d of %d units (%d%% reduction)", reachable, original, pct))
+		} else {
+			PrintKeyValue("Reachability", fmt.Sprintf("%d units", reachable))
+		}
+		if warns, ok := reach["reachability_warnings"].([]any); ok {
+			for _, wn := range warns {
+				if s, ok := wn.(string); ok && s != "" {
+					yellow.Printf("  ⚠ %s\n", s)
+				}
+			}
+		}
+	}
+
 	fmt.Println()
 
 	// Final verdict
@@ -440,6 +463,29 @@ func PrintScanSummaryV2(data map[string]any) {
 		}
 		if len(names) > 0 {
 			dim.Printf("  Skipped: %s\n", strings.Join(names, ", "))
+		}
+	}
+
+	// #323: the reachability advisory on the terminal summary — the blackout
+	// warning previously reached only an artifact field + an LLM instruction;
+	// the terminal never said anything, so a blacked-out scan looked like a
+	// small clean run. Deterministic (printed from the envelope's block).
+	if reach, ok := data["reachability"].(map[string]any); ok && reach != nil {
+		reachable := intFromAny(reach["reachable_units"])
+		original := intFromAny(reach["original_units"])
+		if original > 0 {
+			pct := 100 - (reachable * 100 / original)
+			PrintKeyValue("Reachability", fmt.Sprintf(
+				"%d of %d units (%d%% reduction)", reachable, original, pct))
+		} else {
+			PrintKeyValue("Reachability", fmt.Sprintf("%d units", reachable))
+		}
+		if warns, ok := reach["reachability_warnings"].([]any); ok {
+			for _, wn := range warns {
+				if s, ok := wn.(string); ok && s != "" {
+					yellow.Printf("  ⚠ %s\n", s)
+				}
+			}
 		}
 	}
 

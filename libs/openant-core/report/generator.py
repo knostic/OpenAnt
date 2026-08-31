@@ -318,6 +318,39 @@ def _context_provenance_header(pipeline_data: dict) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def _reachability_header(pipeline_data: dict) -> str:
+    """#323: a deterministic banner when the reachability filter warned.
+
+    The blackout advisory ("entry-point seeding found no seeds; the filter was
+    blacked out and ALL units were kept") previously reached only
+    ``pipeline_stats.reachability_warnings`` (an artifact field CI must parse)
+    and a prompt INSTRUCTION (model-discretionary — a hostile prompt could
+    suppress it). Same class of disclosure as
+    ``_context_provenance_header`` ("the scan may have covered nothing"),
+    so it gets the same deterministic treatment: rendered from
+    ``pipeline_output.json`` fields without the LLM, prepended to the
+    summary so steering the report prompt cannot suppress it. Returns "" for
+    a clean run (no warnings).
+    """
+    stats = pipeline_data.get("pipeline_stats")
+    if not isinstance(stats, dict):
+        return ""
+    warnings = stats.get("reachability_warnings")
+    if not warnings:
+        return ""
+    lines = ["> **⚠ Reachability advisory.**"]
+    reachable = stats.get("reachable_units")
+    original = stats.get("original_units")
+    if isinstance(reachable, int) and isinstance(original, int):
+        lines.append(f"> Units in scope: {reachable} of {original} analyzed.")
+    for w in warnings:
+        if isinstance(w, str) and w.strip():
+            lines.append(f"> - {w.strip()}")
+    lines.append(
+        "> Treat the scan's coverage as only as trustworthy as this advisory.")
+    return "\n".join(lines) + "\n\n"
+
+
 def generate_summary_report(
     pipeline_data: dict,
     binding: PhaseBinding,
@@ -367,8 +400,9 @@ def generate_summary_report(
             "summary report generation returned empty output; refusing to write "
             "a summary-free SUMMARY_REPORT.md"
         )
-    # Prepend the provenance banner deterministically (see helper docstring).
-    text = _context_provenance_header(pipeline_data) + text
+    # Prepend the provenance banner + the reachability advisory
+    # deterministically (see the helper docstrings).
+    text = _context_provenance_header(pipeline_data) + _reachability_header(pipeline_data) + text
     return text, _extract_usage(
         result.input_tokens,
         result.output_tokens,
