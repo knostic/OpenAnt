@@ -1,5 +1,9 @@
 {
+<<<<<<< HEAD
   "_comment": "Provider-model registry: the single source of truth for model IDs and pricing, read by BOTH the Python engine (core/model_registry.py) and the Go CLI (internal/models). status is OpenAnt's shipped claim; source+retrieved are its provenance. price is null for any model that must not be auto-dispatched (retired/unknown) so it never resolves to a silent $0 in cost accounting. Prices are OpenAnt's shipped rates and are NOT verified against live provider pricing in the build environment \u2014 see each record's source. Recency of `retrieved` is an operational/CI concern, not asserted in the unit tests. INVARIANT (test_models_price_cross_check.py): records for the same model family across providers must agree on price unless the diverging record carries an explicit `price_diverges` reason string (#344).",
+=======
+  "_comment": "Provider-model registry: the single source of truth for model IDs and pricing, read by BOTH the Python engine (core/model_registry.py) and the Go CLI (internal/models). status is OpenAnt's shipped claim; source+retrieved are its provenance. price is null for any model that must not be auto-dispatched (retired/unknown) so it never resolves to a silent $0 in cost accounting. Prices are OpenAnt's shipped rates and are NOT verified against live provider pricing in the build environment — see each record's source. Recency of `retrieved` is an operational/CI concern, not asserted in the unit tests.",
+>>>>>>> d168b60 (fix(models): a model spelled any conventional way keeps its cost accounting (#434))
   "schema_version": 1,
   "models": [
     {
@@ -305,6 +309,17 @@
       "retrieved": "2026-07-23"
     },
     {
+      "id": "gemini-3.7-flash",
+      "provider": "google",
+      "status": "current",
+      "price": {
+        "input": 0.75,
+        "output": 3.75
+      },
+      "source": "verified against Google's own pricing page (ai.google.dev/gemini-api/docs/pricing: gemini-3.7-flash $0.75/$3.75 per 1M, 2026-09-01 — the page documents a scheduled step to $1.50/$7.50 on 2027-01-01; revisit then) and the live OpenRouter catalogue (google/gemini-3.7-flash $0.75/$3.75) — both live sources agree (#434's stale-family gap)",
+      "retrieved": "2026-09-01"
+    },
+    {
       "id": "anthropic/claude-opus-4.8",
       "provider": "openrouter",
       "status": "current",
@@ -501,6 +516,17 @@
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
       "retrieved": "2026-08-27"
+    },
+    {
+      "id": "google/gemini-3.7-flash",
+      "provider": "openrouter",
+      "status": "current",
+      "price": {
+        "input": 0.75,
+        "output": 3.75
+      },
+      "source": "verified against the live OpenRouter catalogue (GET openrouter.ai/api/v1/models, 2026-09-01: google/gemini-3.7-flash $0.75/$3.75 per 1M) and Google's own pricing page, which agrees (#434)",
+      "retrieved": "2026-09-01"
     }
   ]
 }

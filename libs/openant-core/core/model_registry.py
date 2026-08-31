@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -129,24 +130,93 @@ def pricing_map(provider: str) -> dict[str, dict[str, float]]:
     emitted as a zero-valued dict. A caller that looks up an omitted model gets
     ``None`` and routes to the tracker's unknown-model warn path, exactly as an
     entirely-absent model does today. Raises loudly if the config is missing.
+
+    #434: each priced record is ALSO emitted under its conventional ALIAS
+    spellings (vendor-prefixed and bare, dotted and dashed versions, date
+    stamp stripped — OpenRouter accepts the same model under several
+    spellings and configs spell models bare: a live run on claude-haiku-4-5
+    lost ALL cost accounting because only anthropic/claude-haiku-4.5 was
+    priced). Exact keys are emitted FIRST and an alias only fills an ABSENT
+    key, so an exact record always wins; same-family records agree on price
+    by the #344 cross-check, so an alias landing on a sibling record is
+    cost-safe by construction. A family with NO priced record still misses
+    — cost_incomplete (#216's marker) stays honest.
     """
+    recs = [
+        rec for rec in require_models()
+        if rec.get("provider") == provider and rec.get("price")
+    ]
     out: dict[str, dict[str, float]] = {}
-    for rec in require_models():
-        if rec.get("provider") != provider:
-            continue
-        price = rec.get("price")
-        if not price:  # null / missing → NOT a $0 entry
-            continue
+    for rec in recs:  # pass 1: exact keys win
+        price = rec["price"]
         out[rec["id"]] = {"input": float(price["input"]), "output": float(price["output"])}
+    for rec in recs:  # pass 2: aliases fill absent keys only
+        entry = out[rec["id"]]
+        for alias in _alias_spellings(rec["id"]):
+            if alias not in out:
+                out[alias] = entry
+    return out
+
+
+def _alias_spellings(model_id: str) -> list[str]:
+    """The conventional alternate spellings of a model id (#434's enumerated
+    set): a vendor slug prefix may be present or absent, an Anthropic
+    -YYYYMMDD date stamp may be present or absent, and the trailing version
+    may be dotted or dashed. The id itself is never returned."""
+    vendor = model_id.split("/", 1)[0] if "/" in model_id else None
+    bare = re.sub(r"^[a-z]+/", "", model_id)
+    bare = re.sub(r"-\d{8}$", "", bare)  # the Anthropic date stamp
+    m = re.search(r"-(\d+)-(\d+)$", bare)
+    if m:  # ...-4-5 → also ...-4.5
+        dotted = bare[:m.start()] + f"-{m.group(1)}.{m.group(2)}"
+        dashed = bare
+    else:
+        m = re.search(r"-(\d+)\.(\d+)$", bare)
+        if m:  # ...-4.5 → also ...-4-5
+            dotted = bare
+            dashed = bare[:m.start()] + f"-{m.group(1)}-{m.group(2)}"
+        else:
+            dotted = dashed = None
+    bases = [b for b in (bare, dashed, dotted) if b]
+    out = []
+    for b in bases:
+        if b != model_id:
+            out.append(b)
+        if vendor and f"{vendor}/{b}" != model_id:
+            out.append(f"{vendor}/{b}")
     return out
 
 
 def find_model(model_id: str) -> dict | None:
-    """The record for a model id, or ``None``. Non-raising (for structural use)."""
+    """The record for a model id, or ``None``. Non-raising (for structural use).
+
+    #434: an exact match first, then the family-normalized fallback — strip
+    the vendor slug, the Anthropic date stamp, and unify dotted/dashed
+    versions (the same conventions pricing_map's aliases use, so structural
+    lookups and pricing agree on which record a spelling means).
+    """
     for rec in load_models():
         if rec.get("id") == model_id:
             return rec
+    fam = _family_key(model_id)
+    if fam is not None:
+        for rec in load_models():
+            if _family_key(rec.get("id", "")) == fam:
+                return rec
     return None
+
+
+def _family_key(model_id: str) -> str | None:
+    """The #344 family conventions: vendor slug stripped, date stamp
+    stripped, version unified to dashed."""
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    s = re.sub(r"^[a-z]+/", "", model_id)
+    s = re.sub(r"-\d{8}$", "", s)
+    m = re.search(r"-(\d+)\.(\d+)$", s)
+    if m:
+        s = s[:m.start()] + f"-{m.group(1)}-{m.group(2)}"
+    return s
 
 
 def model_status(model_id: str) -> str | None:
