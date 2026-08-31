@@ -40,22 +40,29 @@ def _reachability_envelope_block(pipeline_output: dict) -> dict | None:
     The blackout advisory reaches ``pipeline_stats.reachability_warnings``
     (pipeline_output.json) but previously no CI-visible surface — the
     envelope carried nothing, so a blacked-out scan read as a clean small
-    run. Mirrors the diff-block surfacing: present-only (None when no
-    filter data or no warnings... actually the counts themselves are the
-    receipt — the block rides whenever a filter was applied).
+    run. The block rides whenever a filter was applied OR a warning was
+    recorded (wave r1, three axes): the NO-RECORD warning class
+    ("filtering was requested but no reachability_filter record was found;
+    reachable_units falls back to total_units and may overstate
+    reachability") fires exactly when ``reachability_filter_applied`` is
+    False — gating on the flag alone would silence the warning that
+    overstates coverage, the exact class this fix closes.
     """
     stats = pipeline_output.get("pipeline_stats")
     if not isinstance(stats, dict):
         return None
-    if not stats.get("reachability_filter_applied"):
+    warnings = stats.get("reachability_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    warnings = [str(w) for w in warnings if isinstance(w, str) and w.strip()]
+    if not stats.get("reachability_filter_applied") and not warnings:
         return None
     block = {
         "reachable_units": stats.get("reachable_units"),
         "original_units": stats.get("original_units"),
     }
-    warnings = stats.get("reachability_warnings")
-    if isinstance(warnings, list):
-        block["reachability_warnings"] = [str(w) for w in warnings if isinstance(w, str) and w.strip()]
+    if warnings:
+        block["reachability_warnings"] = warnings
     pct = stats.get("reachability_reduction_percentage")
     if isinstance(pct, (int, float)):
         block["reachability_reduction_percentage"] = pct

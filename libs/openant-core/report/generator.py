@@ -342,7 +342,11 @@ def _reachability_header(pipeline_data: dict) -> str:
     reachable = stats.get("reachable_units")
     original = stats.get("original_units")
     if isinstance(reachable, int) and isinstance(original, int):
-        lines.append(f"> Units in scope: {reachable} of {original} analyzed.")
+        # "in scope" (the filter's kept/original counts), NOT "analyzed"
+        # (wave r1 fable): the analyzed count is total_units — a --limit
+        # run would otherwise print "120 of 120 analyzed" directly above a
+        # warning saying only a subset was analyzed.
+        lines.append(f"> Units in scope: {reachable} of {original} ({stats.get('reachability_reduction_percentage', 0)}% reduction)")
     for w in warnings:
         if isinstance(w, str) and w.strip():
             lines.append(f"> - {w.strip()}")

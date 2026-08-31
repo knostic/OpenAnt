@@ -18,6 +18,7 @@ The fix (the issue's suggestions):
   report prose.
 """
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -102,7 +103,9 @@ func TestReachabilityLineZZ(t *testing.T) {
 	data := map[string]any{}
 	json.Unmarshal([]byte(`{
 		"metrics": {"total": 3, "vulnerable": 0, "bypassable": 0, "protected": 0, "safe": 3, "inconclusive": 0, "errors": 0},
-		"reachability": {"reachable_units": 120, "original_units": 120, "reachability_warnings": ["entry-point seeding found no seeds; the filter was blacked out"]}
+		"reachability": {"reachable_units": 120, "original_units": 120,
+			"reachability_reduction_percentage": 33.3,
+			"reachability_warnings": ["entry-point seeding found no seeds; the filter was blacked out"]}
 	}`), &data)
 	var buf bytes.Buffer
 	oldOut := os.Stdout
@@ -119,8 +122,8 @@ func TestReachabilityLineZZ(t *testing.T) {
 	if !strings.Contains(out, "Reachability") {
 		t.Fatalf("no reachability line: %q", out)
 	}
-	if !strings.Contains(out, "120 of 120 units") {
-		t.Fatalf("the counts missing: %q", out)
+	if !strings.Contains(out, "120 of 120 units in scope (33.3% reduction)") {
+		t.Fatalf("the counts/pct missing: %q", out)
 	}
 	if !strings.Contains(out, "blacked out") {
 		t.Fatalf("the warning missing: %q", out)
@@ -153,9 +156,27 @@ def test_envelope_carries_the_reachability_block():
     assert blk["reachable_units"] == 120 and blk["original_units"] == 120
     assert any("blacked out" in w for w in blk["reachability_warnings"])
 
-    # no filter applied -> no block (the clean path stays clean)
+    # no filter applied AND no warnings -> no block (the clean path stays clean)
     po_clean = {"pipeline_stats": {"reachability_filter_applied": False}}
     assert cli_mod._reachability_envelope_block(po_clean) is None
+    # wave r1 (three axes): the NO-RECORD warning class fires exactly when
+    # filter_applied is False (reporter.py:659-664) — gating on the flag alone
+    # silenced the warning that overstates coverage. Warnings carry the block.
+    po_norec = {"pipeline_stats": {"reachability_filter_applied": False,
+                                   "reachable_units": 10, "original_units": 10,
+                                   "reachability_warnings": [
+                                       "Reachability filtering was requested but no "
+                                       "reachability_filter record was found; reachable_units "
+                                       "falls back to total_units and may overstate reachability."]}}
+    blk3 = cli_mod._reachability_envelope_block(po_norec)
+    assert blk3 is not None, "the overstate-reachability warning must reach the envelope"
+    assert any("overstate reachability" in w for w in blk3["reachability_warnings"])
+    # a clean filtered scan's EMPTY warning list never rides as a bare [] key
+    po_empty = {"pipeline_stats": {"reachability_filter_applied": True,
+                                   "reachable_units": 5, "original_units": 5,
+                                   "reachability_warnings": []}}
+    blk4 = cli_mod._reachability_envelope_block(po_empty)
+    assert blk4 is not None and "reachability_warnings" not in blk4
 
     # the counts-only shape (warnings absent) still rides present-only
     po_counts = {"pipeline_stats": {"reachability_filter_applied": True,
