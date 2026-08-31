@@ -351,3 +351,29 @@ class TestCostPath:
         for shipped in ("qwen3.8:27b", "qwen3.5:9b", "mistral-small3.2:latest"):
             assert adapter.pricing.get(shipped) == {"input": 0.0, "output": 0.0}, (
                 f"the map that misses the custom tag must still carry {shipped}")
+
+
+class TestMarkerless404BaseURLHint:
+    """hunt r3 (sonnet): the Python gate's marker-less arm — a 404 whose body
+    does NOT say not-pulled is a base_url misconfiguration and must get the
+    base_url hint, never the pull advice (the Go mirror tests both arms;
+    this pins the Python half)."""
+
+    def test_markerless_404_gets_base_url_hint_not_pull(self):
+        from utilities.llm.providers.ollama import _BASE_URL_HINT, _PULL_HINT, _classify_error
+
+        markerless = openai.NotFoundError(
+            message="Error code: 404 - {'error': 'page not found'}",
+            response=_fake_http_resp(404), body=None)
+        out = _classify_error(markerless, report_429=False)
+        assert _BASE_URL_HINT in str(out)
+        assert _PULL_HINT not in str(out)
+
+    def test_not_pulled_404_keeps_pull_hint(self):
+        from utilities.llm.providers.ollama import _PULL_HINT, _classify_error
+
+        not_pulled = openai.NotFoundError(
+            message="model 'x' not found, try pulling it first",
+            response=_fake_http_resp(404), body=None)
+        out = _classify_error(not_pulled, report_429=False)
+        assert _PULL_HINT in str(out)

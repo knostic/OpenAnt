@@ -88,6 +88,12 @@ func probeOllama(apiKey, baseURL, model string) error {
 	if err == nil {
 		return nil
 	}
+	// hunt r3 (sonnet): parity with the Python adapter — a refused
+	// connection on localhost is almost always a stopped daemon, not a
+	// network fault; layer the same "start it with `ollama serve`" hint.
+	if pe, ok := err.(*AnthropicProbeError); ok && pe.Kind == "network" {
+		pe.Message = pe.Message + " — start the server with `ollama serve` and retry"
+	}
 	// hunt r1 (sonnet): a timeout on the OLLAMA probe is most often a cold
 	// model load (15GB+ models take minutes on first inference) — layer the
 	// specific advice on the shared neutral timeout.
