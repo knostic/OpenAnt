@@ -255,6 +255,27 @@ class FunctionExtractor:
                     return None  # first real arg is not a constant
         return None
 
+    @staticmethod
+    def _definitions_wrapped_by(call_node):
+        """Method/singleton_method nodes passed as arguments to a call (#329).
+
+        Covers `private def x`, `private(def x)` and `private def self.x` — the
+        inline-visibility forms tree-sitter parses as a call whose argument
+        (direct child or inside an argument_list) is the definition itself.
+        """
+        out = []
+        for c in call_node.children:
+            if c.type in ('method', 'singleton_method'):
+                out.append(c)
+            elif c.type == 'argument_list':
+                out.extend(gc for gc in c.children
+                           if gc.type in ('method', 'singleton_method'))
+        return out
+
+    def _call_wraps_a_definition(self, node) -> bool:
+        """True when this call's arguments contain a method definition (#329)."""
+        return bool(self._definitions_wrapped_by(node))
+
     def _call_receiver_and_method(self, node, source: bytes):
         """For a 'call' node, return (method_name, [literal positional args]).
 
@@ -469,7 +490,14 @@ class FunctionExtractor:
                     # the named symbol(s), NOT subsequent defs. Consume it here
                     # (without descending) so its inner `private` identifier does
                     # not leak into the bare-marker toggle below.
-                    handled = True
+                    # #329: the inline-def form `private def foo` is ALSO a call
+                    # named `private`, but its argument is a method node —
+                    # consuming that without descending drops the definition
+                    # (a missing call-graph node: a tainted path THROUGH the
+                    # method disappears). Descend exactly when the call wraps
+                    # a definition; the arg-form keeps its no-descent behaviour
+                    # (descending would emit phantom units from the symbols).
+                    handled = not self._call_wraps_a_definition(node)
                 if not handled:
                     for child in reversed(node.children):
                         stack.append((child, class_name, module_name, vis_state))
@@ -607,6 +635,17 @@ class FunctionExtractor:
                 method_name, args = self._call_receiver_and_method(child, source)
                 if method_name in ('define_method', 'alias_method') and args:
                     methods.append(args[0])
+                # #329: `private def x` / `private def self.x` — the roster must
+                # not disagree with `functions` (both are part of the emitted
+                # artifact); the singleton carries the `self.` prefix like the
+                # singleton_method case above.
+                for defn in self._definitions_wrapped_by(child):
+                    mname = self._get_method_name(defn, source)
+                    if mname:
+                        if defn.type == 'singleton_method':
+                            methods.append(f"self.{mname}")
+                        else:
+                            methods.append(mname)
         return methods
 
     @staticmethod
