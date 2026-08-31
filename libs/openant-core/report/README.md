@@ -95,7 +95,7 @@ The module expects a JSON file with the following structure:
       "stage2_verdict": "vulnerable",
       "severity": "high",
       "severity_source": "model",
-      "dynamic_testing": true,
+      "dynamic_testing": {"status": "CONFIRMED", "tested": "Docker container, <Month Year>"}, // #319: ONLY for a CONFIRMED test; every other status carries "dynamic_testing_attempted" (status/details/evidence/attempted) — never a verification
       "description": "Brief description of the vulnerability.",
       "vulnerable_code": "code snippet here",
       "impact": [
