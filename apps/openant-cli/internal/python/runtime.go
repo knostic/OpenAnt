@@ -238,13 +238,9 @@ func EnsureRuntime() (*RuntimeInfo, error) {
 	}
 
 	// After CheckOpenantInstalled, the venv may have been created.
-	// Re-detect to pick up the venv Python if it was just created.
-	vp := venvPython()
-	if rt.Path != vp && fileExists(vp) && isOpenantImportable(vp) {
-		if info, err := checkPython(vp); err == nil {
-			rt = info
-		}
-	}
+	// Re-detect to pick up the venv Python if it was just created —
+	// unless the active runtime IS the explicit OPENANT_PYTHON override.
+	rt = preferVenv(rt)
 
 	// Check if dependencies have changed since last install.
 	if err := CheckDepsStale(rt.Path); err != nil {
@@ -252,6 +248,29 @@ func EnsureRuntime() (*RuntimeInfo, error) {
 	}
 
 	return rt, nil
+}
+
+// preferVenv is EnsureRuntime's post-install re-detect: after
+// CheckOpenantInstalled the managed venv may have just been created, so the
+// venv Python is picked up — EXCEPT when the active runtime is the explicit
+// OPENANT_PYTHON override. #437: with the venv present (the normal install
+// state) this block silently replaced a valid, explicitly-set override with
+// the venv interpreter, no warning — inverting the README's documented
+// precedence ("Takes precedence over the managed venv at ~/.openant/venv/ and
+// any Python on PATH") and doing exactly what DetectRuntime's own comment
+// forbids ("never silently using a different interpreter behind the
+// caller's back") for a USABLE override. The override wins.
+func preferVenv(rt *RuntimeInfo) *RuntimeInfo {
+	if override := os.Getenv("OPENANT_PYTHON"); override != "" && rt.Path == override {
+		return rt
+	}
+	vp := venvPython()
+	if rt.Path != vp && fileExists(vp) && isOpenantImportable(vp) {
+		if info, err := checkPython(vp); err == nil {
+			return info
+		}
+	}
+	return rt
 }
 
 // depsHashPath returns the path to the stored dependency hash inside the venv.
