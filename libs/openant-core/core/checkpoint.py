@@ -28,7 +28,7 @@ import threading
 import sys
 from datetime import datetime, timezone
 
-from utilities.safe_filename import safe_filename
+from utilities.safe_filename import SAFE_FILENAME_MAX_LEN, safe_filename
 from utilities.file_io import read_json, write_json
 from core.backend_identity import FINGERPRINT_FILE
 from pathlib import Path
@@ -48,7 +48,11 @@ _RESERVED_FILES = frozenset({SUMMARY_FILE, FINGERPRINT_FILE})
 # and both write it (last wins — the collision for that run). A module-level
 # lock held across resolve+write; microseconds against multi-second LLM
 # calls. Covers every phase — the verifier and dynamic tester save through
-# StepCheckpoint.save too.
+# StepCheckpoint.save too. SINGLE-PROCESS SCOPE (panel round-3): this is a
+# threading lock — two CONCURRENT CLI invocations writing the same checkpoint
+# dir (an unsupported shape: they would also race every results file in the
+# output dir) are NOT serialized by it. Within one process (the supported
+# shape: a single run's worker pools) it fully orders resolve+write.
 _save_lock = threading.Lock()
 
 
@@ -73,7 +77,7 @@ def disambiguated_checkpoint_path(ckpt_dir: str, unit_id: str) -> str:
     fixed, resurrected (wave round-1 finding).
     """
     safe = safe_filename(unit_id)
-    if len(safe) > 233:
+    if len(safe) > SAFE_FILENAME_MAX_LEN:
         # The truncated regime: safe_filename already appended the
         # case-sensitive hash (name -> prefix[:233] + _ + 16 hex of the FULL
         # id), so the name is INJECTIVE — a different unit cannot reach it.
@@ -104,6 +108,22 @@ def disambiguated_checkpoint_path(ckpt_dir: str, unit_id: str) -> str:
             existing = None
         existing_id = existing.get("id") if isinstance(existing, dict) else None
         if existing_id == unit_id:
+            # Panel round-3 (self-heal): if BOTH the bare name and this
+            # unit's suffixed home hold the same id (a dual-stale-file
+            # state — fable judged it code-unreachable, sonnet asked for
+            # the class to self-heal "however it arises"), consolidate to
+            # the NEWER file and delete the superseded twin — otherwise
+            # the id-keyed restore's last-wins could keep serving the
+            # stale one indefinitely. mtime decides freshness; both
+            # files provably hold this unit's id.
+            if os.path.exists(home) and _holds_this_unit(home):
+                try:
+                    if os.path.getmtime(home) > os.path.getmtime(bare):
+                        _atomic_unlink(bare)
+                        return home
+                    _atomic_unlink(home)
+                except OSError:
+                    pass  # best-effort: the ordinary overwrite still lands
             return bare  # its own file — overwrite in place
         if existing_id is not None:
             return home  # a sibling's — this unit's disambiguated home
@@ -120,6 +140,15 @@ def disambiguated_checkpoint_path(ckpt_dir: str, unit_id: str) -> str:
     if os.path.exists(home) and _holds_this_unit(home):
         return home
     return bare
+
+
+def _atomic_unlink(path: str) -> None:
+    """Best-effort remove; a missing file (case-insensitive fs aliasing,
+    concurrent cleanup) is success. Under _save_lock at every caller."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 
 def save_checkpoint_under_lock(ckpt_dir: str, unit_id: str, data: dict) -> str:

@@ -495,3 +495,47 @@ def test_corrupt_sibling_bare_file_keeps_home_stability():
         assert len(foo_files) == 1, foo_files  # still ONE foo file: the home
         loaded = ck.load()
         assert loaded["pkg/foo.py:run"]["result"]["v"] == 2
+
+
+def test_dual_same_id_files_self_heal_to_the_newer(tmp_path):
+    """Panel round-3 (sonnet item 1): a dual-stale-file state — the bare
+    name AND the suffixed home both holding this unit's id — consolidates
+    on the next disambiguated save: the NEWER file wins, the superseded twin
+    is removed, and the id-keyed restore can no longer serve the stale one."""
+    import hashlib
+    import json as _json
+    import os as _os
+
+    import core.checkpoint as _ck
+
+    d = str(tmp_path / "cp")
+    _os.makedirs(d, exist_ok=True)
+    unit = "pkg/Foo.py:run"
+
+    def _write(p, data):
+        with open(p, "w") as f:
+            _json.dump(data, f)
+
+    safe = _ck.safe_filename(unit)
+    bare = _os.path.join(d, safe + ".json")
+    h = hashlib.sha256(unit.encode()).hexdigest()[:16]
+    stem = safe[: 255 - len(".json") - len(h) - 1]
+    home = _os.path.join(d, f"{stem}_{h}.json")
+
+    # home newer, bare stale: consolidation keeps home, removes bare
+    _write(bare, {"id": unit, "result": "STALE"})
+    _write(home, {"id": unit, "result": "FRESH"})
+    _os.utime(home, None)
+    path = _ck.disambiguated_checkpoint_path(d, unit)
+    assert path == home, "the newer home must win"
+    assert not _os.path.exists(bare), "the superseded stale twin must be removed"
+    assert _ck.id_keyed_checkpoint_map(d)[unit] == home
+
+    # bare newer, home stale: keeps bare, removes home
+    _write(bare, {"id": unit, "result": "FRESH2"})
+    _write(home, {"id": unit, "result": "STALE2"})
+    _os.utime(bare, None)
+    path = _ck.disambiguated_checkpoint_path(d, unit)
+    assert path == bare, "the newer bare must win"
+    assert not _os.path.exists(home), "the superseded stale twin must be removed"
+    assert _ck.id_keyed_checkpoint_map(d)[unit] == bare
