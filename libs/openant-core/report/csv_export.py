@@ -191,16 +191,28 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
         else:
             unit_code = str(code_field) if code_field else ''
 
-        # Get LLM context from dataset (may be None)
-        llm_context = unit.get('llm_context') or {}
-        # #321 (wave r1 #4 + r2 #1, the adjacent pre-existing one-sided
-        # reader): the classification lives in agent_context for agentic
-        # scans — the mode the column is named after — and llm_context for
-        # single-shot. Read BOTH, agent_context FIRST (the analyzer.py:59-74
-        # precedence: "Prefer agent_context, fall back to llm_context") —
-        # llm_context-first masked agent_context now that single-shot
-        # always holds a truthy value.
+        # #326: read BOTH context keys — agentic mode (the default on both
+        # entry points) writes agent_context, single-shot writes llm_context;
+        # this exporter read llm_context only, so unit_description was empty
+        # for every unit of an agentically enhanced dataset, and the enhancer's
+        # own "error" classification marker (written to agent_context "so the
+        # CSV shows honestly") never reached the CSV it was written for. The
+        # analyzer's precedence: agent_context first, llm_context fallback.
         agent_context = unit.get('agent_context') or {}
+        llm_context = unit.get('llm_context') or {}
+        # The key names differ: agentic's context text is
+        # classification_reasoning, single-shot's is reasoning. Map both —
+        # a naive two-key fallback would leave the column empty in agentic mode.
+        unit_description = (
+            agent_context.get('classification_reasoning')
+            or llm_context.get('reasoning')
+            or '')
+        if len(unit_description) > 500:
+            unit_description = unit_description[:500]
+        agentic_classification = (
+            agent_context.get('security_classification')
+            or llm_context.get('security_classification')
+            or '')
 
         # Get verification data from experiment result
         verification = result.get('verification') or {}
@@ -216,7 +228,7 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
         row = {
             'file': extract_file(route_key),
             'unit_id': route_key,
-            'unit_description': llm_context.get('reasoning', '')[:500] if llm_context.get('reasoning') else '',
+            'unit_description': unit_description,
             'unit_code': unit_code,
             # #215: the rankable severity — the stamped/model value, or the
             # same conservative derivation the reporter applies (so an old
@@ -228,11 +240,7 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
             'stage1_verdict': stage1_verdict,
             'stage1_justification': result.get('reasoning', ''),
             'stage1_confidence': result.get('confidence', ''),
-            'agentic_classification': (
-                agent_context.get('security_classification')
-                or llm_context.get('security_classification')
-                or ''
-            )
+            'agentic_classification': agentic_classification
         }
         # Neutralize CSV / formula injection on every cell before writing.
         rows.append({k: _csv_safe(v) for k, v in row.items()})
