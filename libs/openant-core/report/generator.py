@@ -117,9 +117,18 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
     # never calls `.get()` on a bare string/number.
     normalize_results(dynamic_data)
     results_by_id = {}
+    duplicate_ids = 0
     for result in dynamic_data.get("results", []):
         fid = result.get("finding_id")
         if fid:
+            if fid in results_by_id:
+                # verify-wave (sonnet, state-machine axis — F2): a duplicate
+                # finding_id silently last-wins with zero visibility — the
+                # exact anti-pattern this merge's own "what happened is
+                # SURFACED, never silent" rule exists to stop. Counted and
+                # warned below; the last-wins order is unchanged (documented
+                # behavior, not silently chosen).
+                duplicate_ids += 1
             results_by_id[fid] = result
 
     if not results_by_id:
@@ -159,6 +168,21 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
         if r_key != f_key:
             refused_count += 1
             continue
+        # verify-wave (opus, consumers axis — F1, reproduced): a finding
+        # can enter the merge carrying a PRE-EXISTING dynamic_testing block
+        # (a stale one from an earlier run, or a forged one — pipeline_output
+        # is model-supplied per fa18). The merge previously only ADDED, so a
+        # forged CONFIRMED block coexisted with a fresh ERROR result and
+        # every consumer's dynamic_testing-first preference rendered
+        # "Verified via dynamic testing" — the exact false verification
+        # this fix exists to remove, re-entering through the artifact
+        # channel. The merge is the single authority for a finding's
+        # dynamic-verification state: clear both block keys on every
+        # matched finding BEFORE attaching, so the "cannot render a failed
+        # test as a verification by omission" contract holds
+        # unconditionally for every finding the merge touched.
+        finding.pop("dynamic_testing", None)
+        finding.pop("dynamic_testing_attempted", None)
         # fa17 hardening (wave r2 + the deep-refute): the results file is
         # model-supplied — ANY status outside the harness's own VALID set
         # (exact-case) normalises to UNKNOWN: a non-string, a lowercase
@@ -226,6 +250,9 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
               f"identity_key disagrees with the finding — a stale results file "
               f"from a previous run; re-run the dynamic tests to regenerate",
               file=sys.stderr)
+    if duplicate_ids:
+        print(f"  [Warning] {duplicate_ids} duplicate finding_id(s) in {dynamic_path.name} "
+              f"— the LAST entry for each id was used", file=sys.stderr)
     if abstained_count:
         print(f"  [Warning] Skipped {abstained_count} dynamic test result(s) with "
               f"no identity_key (a legacy results file); re-run the dynamic "

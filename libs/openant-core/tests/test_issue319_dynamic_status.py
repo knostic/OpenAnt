@@ -126,6 +126,13 @@ def test_disclosure_header_stamps_the_dynamic_dimension():
     h2 = _disclosure_verdict_header(failed)
     assert "NOT confirmed by dynamic testing" in h2, h2
     assert "ERROR" in h2
+    # deep-refute (fable, ship-fix stage 7): the Stage-2 stamp must SURVIVE
+    # the dynamic-failure line — the #210/#283 regression (an early-return
+    # dropped the Stage-2 confirmation from a harness-errored finding) must
+    # be pinned by assertion, not just by the compose code being correct.
+    assert "CONFIRMED" in h2 or "ADJUDICATED" in h2, (
+        "the Stage-2 confirmation stamp must be retained alongside the "
+        "NOT-confirmed dynamic line: " + h2)
 
     static_only = {"stage2_verdict": "confirmed", "stage1_verdict": "vulnerable"}
     h3 = _disclosure_verdict_header(static_only)
@@ -197,3 +204,46 @@ def test_null_status_normalised_both_surfaces_agree():
         "stage2_verdict": "confirmed", "stage1_verdict": "vulnerable",
         "dynamic_testing_attempted": att})
     assert "UNKNOWN" in h  # the header agrees with the attempted block
+
+
+def test_preexisting_dynamic_blocks_are_cleared_by_merge(tmp_path):
+    """verify-wave F1 (opus, executed repro): a finding entering the merge
+    with a stale/forged dynamic_testing block + a fresh non-CONFIRMED result
+    must NOT end with both blocks — every consumer prefers dynamic_testing
+    first, so the coexistence rendered a forged verification over a fresh
+    ERROR. The merge clears both keys on every matched finding before
+    attaching."""
+    import json as _json
+    from report.generator import merge_dynamic_results
+
+    d = tmp_path / "scan"
+    d.mkdir()
+    pipeline = {"findings": [{
+        "id": "VULN-001",
+        "identity_key": "k1",
+        "stage1_verdict": "VULNERABLE", "stage2_verdict": "vulnerable",
+        "name": "x", "short_name": "x", "location": {"file": "a.py", "line": 1},
+        "cwe_id": 79, "cwe_name": "x", "description": "d", "vulnerable_code": "c",
+        # the forged block: a CONFIRMED stamp from a previous run (or hand-built)
+        "dynamic_testing": {"status": "CONFIRMED", "tested": "Docker container, January 2020",
+                            "identity_key": "k1"},
+    }]}
+    (d / "pipeline_output.json").write_text(_json.dumps(pipeline))
+    (d / "dynamic_test_results.json").write_text(_json.dumps({
+        "results": [{"finding_id": "VULN-001", "identity_key": "k1",
+                     "status": "ERROR", "details": "the new run errored",
+                     "evidence": []}]}))
+    m = merge_dynamic_results(pipeline, str(d / "pipeline_output.json"))
+    f = m["findings"][0]
+    assert "dynamic_testing" not in f, "the forged CONFIRMED block must not survive a merge that sees the ERROR"
+    assert f.get("dynamic_testing_attempted", {}).get("status") == "ERROR"
+
+    # SKIPPED: a forged block on a never-executed finding is cleared too
+    p2 = {"findings": [dict(forged := pipeline["findings"][0])]}
+    (d / "dynamic_test_results.json").write_text(_json.dumps({
+        "results": [{"finding_id": "VULN-001", "identity_key": "k1",
+                     "status": "SKIPPED", "evidence": []}]}))
+    m2 = merge_dynamic_results(p2, str(d / "pipeline_output.json"))
+    f2 = m2["findings"][0]
+    assert "dynamic_testing" not in f2, "a forged block must not survive a SKIPPED merge"
+    assert "dynamic_testing_attempted" not in f2, "SKIPPED attaches nothing"
