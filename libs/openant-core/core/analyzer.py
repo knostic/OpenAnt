@@ -220,11 +220,19 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
             print(f"[Detect] Restored {len(checkpointed)} units from checkpoints",
                   file=sys.stderr, flush=True)
 
-    progress = ProgressReporter("Detect", total, tracker=tracker, completed=len(checkpointed))
+    # #435: done/remaining come from the ERROR-FILTERED count — the same
+    # predicate the retry queue below is built from (_cp_is_error). The raw
+    # restored count counted an errored row as done in the narration while
+    # the queue retried it at the same time: a resume with errored units
+    # printed "0 units to process (2 already done)" and then "Done: 3/2
+    # units" — a counter past its denominator, and an understated
+    # units-to-process by exactly the error count.
+    _done = sum(1 for cp in checkpointed.values() if not _cp_is_error(cp))
+    progress = ProgressReporter("Detect", total, tracker=tracker, completed=_done)
 
     mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
-    remaining = total - len(checkpointed)
-    print(f"[Detect] Mode: {mode}, {remaining} units to process ({len(checkpointed)} already done)",
+    remaining = total - _done
+    print(f"[Detect] Mode: {mode}, {remaining} units to process ({_done} already done)",
           file=sys.stderr, flush=True)
 
     # Pre-populate results from checkpoints, but ONLY for successfully-completed
