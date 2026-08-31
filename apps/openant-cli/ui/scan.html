@@ -317,6 +317,12 @@ function onDone(status) {
       if (r.ok) document.getElementById('btn-summary').classList.add('ready');
     });
     loadDisclosures();
+  } else if (status === 'timeout') {
+    // #320: the invoke deadline killed the run — a distinct state with the
+    // operator escape hatch named, not a generic failure.
+    dot.classList.add('error');
+    text.textContent = 'Scan timed out — raise OPENANT_INVOKE_TIMEOUT to finish a long run';
+    document.getElementById('error-banner').style.display = 'block';
   } else {
     dot.classList.add('error');
     text.textContent = 'Scan failed';

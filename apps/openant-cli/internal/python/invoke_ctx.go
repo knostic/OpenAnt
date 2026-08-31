@@ -3,13 +3,23 @@ package python
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"time"
 )
+
+// ErrInvokeDeadline is returned when the invoke's own deadline (the
+// OPENANT_INVOKE_TIMEOUT budget, default 30m — #320: the server/web-UI path
+// previously ran with NO deadline at all, so a wedged subprocess held one of
+// four server scan slots forever) fires. The server maps it to a distinct
+// "timeout" status; a CANCELLED parent context keeps the silent ("", -1,
+// nil) contract.
+var ErrInvokeDeadline = errors.New("the invoke deadline fired")
 
 // lineWriter forwards complete stderr lines to onLog as they arrive. Used as
 // cmd.Stderr (a managed io.Writer) instead of a StderrPipe scanner so os/exec
@@ -68,7 +78,60 @@ func InvokeCtxCapture(ctx context.Context, pythonPath string, args []string, wor
 	return invokeCtxInner(ctx, pythonPath, args, workDir, apiKey, onLog, true)
 }
 
+// deadlineOutcome is the #320 deadline surface, with the #433
+// envelope-wins rule: a COMPLETE captured envelope beats the deadline (a
+// child that wrote its result then lingered in teardown is a completed
+// run, not a kill) — only when the buffer carries no usable envelope is it
+// a deadline kill, reported with the distinct named cause + the operator
+// override.
+func deadlineOutcome(stdoutBuf *bytes.Buffer, invokeTimeout time.Duration, onLog func(string)) (string, int, error) {
+	if s := stdoutBuf.String(); s != "" && json.Valid([]byte(s)) {
+		var probe struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal([]byte(s), &probe) == nil && probe.Status != "" {
+			// #320 (wave r3/r4): the recovered envelope must NOT hand the
+			// server the kill's exit artifact — the Unix signal death
+			// reports -1 (read as a generic error) and the Windows
+			// TerminateProcess reports 1 (read as "vulnerabilities found").
+			// The SERVER's own contract differs from the CLI's here (the
+			// CLI conservatively fails a killed run; the server has the
+			// on-disk results and builds its report from them, and a
+			// conservative 2 would route to setError and lose BOTH the
+			// report and the timeout state): the envelope's status drives
+			// the code so the server continues down its normal result
+			// path — success -> 0; anything else -> 2.
+			code := 2
+			if probe.Status == "success" {
+				code = 0
+			}
+			if onLog != nil {
+				onLog("[openant] the invoke deadline fired after " + invokeTimeout.String() +
+					", but a complete result envelope was recovered — returning it" +
+					" (the run may be incomplete; raise OPENANT_INVOKE_TIMEOUT for long runs)")
+			}
+			return s, code, nil
+		}
+	}
+	return stdoutBuf.String(), -1, fmt.Errorf(
+		"openant: the invoke deadline fired after %v — the run was "+
+			"killed and no complete result was recovered. To finish a "+
+			"long run outright, raise the budget via "+
+			"OPENANT_INVOKE_TIMEOUT (e.g. OPENANT_INVOKE_TIMEOUT=2h): %w",
+		invokeTimeout, ErrInvokeDeadline)
+}
+
 func invokeCtxInner(ctx context.Context, pythonPath string, args []string, workDir, apiKey string, onLog func(string), captureStdout bool) (string, int, error) {
+	// #320: bound the subprocess with the operator-tunable invoke deadline —
+	// the same budget the CLI's Invoke applies (invoke.go:91). Derived from
+	// the CALLER's context so the job cancel still propagates (the parent);
+	// the deadline is the local bound the maintainers' own pattern gives
+	// every other runaway subprocess (DNS 5s, git clone 15m). Resolved ONCE
+	// into a local (the invalid-override warning prints a single time —
+	// resolving again in the diagnosis would print it twice).
+	invokeTimeout := resolveInvokeTimeout()
+	ctx, cancel := context.WithTimeout(ctx, invokeTimeout)
+	defer cancel()
 	// -P keeps the process working directory off sys.path so a hostile openant/
 	// package inside the scanned, untrusted repo can't shadow the real module on
 	// import. The web UI is the untrusted-repo-scanning path, so it needs the same
@@ -114,7 +177,40 @@ func invokeCtxInner(ctx context.Context, pythonPath string, args []string, workD
 
 	if exitErr != nil {
 		if ee, ok := exitErr.(*exec.ExitError); ok {
+			// #320 (the #413 lesson, mirrored — including its #433 Windows
+			// fix): the kill can surface as an ExitError FIRST (the race
+			// with the pipe-close path). Gate on the KILL ITSELF under the
+			// fired deadline — a child that finished legitimately in the
+			// window just before the deadline keeps its envelope. On Unix a
+			// signal death reports a NEGATIVE code; on Windows
+			// TerminateProcess yields exit code 1 (never negative — the exact
+			// gap the CLI's #433 fix closed by branching on GOOS).
+			killUnderDeadline := false
+			if ctx.Err() == context.DeadlineExceeded {
+				if runtime.GOOS == "windows" {
+					killUnderDeadline = true
+				} else {
+					killUnderDeadline = ee.ExitCode() < 0
+				}
+			}
+			if killUnderDeadline {
+				return deadlineOutcome(&stdoutBuf, invokeTimeout, onLog)
+			}
 			return stdoutBuf.String(), ee.ExitCode(), nil
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			// The kill tripped the pipe-close path instead. The zombie-kill
+			// window (invoke.go:274-285's #319): the child already exited —
+			// SUCCESSFULLY — and only a descendant held a pipe; the
+			// watchdog's Cancel fired on the reaped zombie. A usable
+			// envelope wins; only when there is none is it a deadline kill.
+			if cmd.ProcessState != nil && cmd.ProcessState.Success() {
+				// (deep-refute: Success() alone — the Len()>0 conjunct made
+				// the discard-stdout InvokeCtx mode report a successful
+				// exit-0 child as a deadline kill)
+				return stdoutBuf.String(), cmd.ProcessState.ExitCode(), nil
+			}
+			return deadlineOutcome(&stdoutBuf, invokeTimeout, onLog)
 		}
 		if ctx.Err() != nil {
 			return "", -1, nil

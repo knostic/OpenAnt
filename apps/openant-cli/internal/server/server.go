@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -38,13 +39,20 @@ const (
 	StatusRunning = "running"
 	StatusDone    = "done"
 	StatusError   = "error"
+	// #320: a job whose Python subprocess was killed by the invoke deadline
+	// (OPENANT_INVOKE_TIMEOUT) — a distinct terminal state so the UI can say
+	// "timed out, raise the budget" instead of a generic failure (and so the
+	// slot-release story is visible).
+	StatusTimeout = "timeout"
 )
 
-// jobMeta is the on-disk metadata written immediately on job creation.
+// jobMeta is the on-disk metadata written immediately on job creation, and
+// (per #320) amended at terminal time with the job's final status.
 type jobMeta struct {
 	ID        string    `json:"id"`
 	Repo      string    `json:"repo"`
 	StartedAt time.Time `json:"started_at"`
+	Status    string    `json:"status,omitempty"`
 }
 
 // Job represents a single scan job.
@@ -70,6 +78,7 @@ type Job struct {
 	dynamicTest bool
 	ctx         context.Context
 	done        chan struct{} // closed by runJob after it stops touching the job dir
+	outDir      string        // #320: the job's scan dir (the meta.json persist target)
 }
 
 func (j *Job) addLog(line string) {
@@ -107,8 +116,58 @@ func (j *Job) setDone(reportPath, summaryPath string, disclosurePaths []string) 
 
 func (j *Job) setError() {
 	j.mu.Lock()
-	defer j.mu.Unlock()
-	j.Status = StatusError
+	transitioned := j.Status == StatusRunning
+	if transitioned {
+		j.Status = StatusError
+	}
+	j.mu.Unlock()
+	if transitioned {
+		j.persistTerminalStatus(StatusError)
+	}
+}
+
+// persistTerminalStatus records the job's terminal state in its meta.json
+// (#320 wave r2): the restore path (recoverJobs) infers a reloaded job's
+// status from report.html alone — without this, a timed-out or errored job
+// that never reached report.html reloads as a generic error and the
+// distinct timeout state is lost across a server restart.
+func (j *Job) persistTerminalStatus(status string) {
+	if j.outDir == "" {
+		return
+	}
+	metaPath := filepath.Join(j.outDir, "meta.json")
+	meta := map[string]any{}
+	if data, err := os.ReadFile(metaPath); err == nil {
+		if err := json.Unmarshal(data, &meta); err != nil {
+			meta = map[string]any{}
+		}
+	}
+	meta["status"] = status
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(metaPath, data, 0640)
+}
+
+// setTimeout marks the job timed-out (#320): the Python subprocess was
+// killed by the invoke deadline — the operator escape hatch is
+// OPENANT_INVOKE_TIMEOUT, surfaced in the log the same moment. The
+// terminal status is persisted to meta.json so the distinct state
+// survives a server restart (the reload path otherwise infers from
+// report.html alone and a timed-out job reappears as a generic error).
+func (j *Job) setTimeout() {
+	j.mu.Lock()
+	transitioned := j.Status == StatusRunning
+	if transitioned {
+		j.Status = StatusTimeout
+	}
+	j.mu.Unlock()
+	// (wave r4 finding 3): persist only on the actual transition — a job
+	// already terminal in memory must not have its disk state rewritten.
+	if transitioned {
+		j.persistTerminalStatus(StatusTimeout)
+	}
 }
 
 // manager is the in-memory job store.
@@ -247,11 +306,13 @@ func (s *Server) recoverJobs() {
 		job := &Job{ID: id}
 
 		// Try to read meta.json.
+		var persistedStatus string
 		if data, err := os.ReadFile(filepath.Join(jobDir, "meta.json")); err == nil {
 			var m jobMeta
 			if json.Unmarshal(data, &m) == nil {
 				job.Repo = m.Repo
 				job.StartedAt = m.StartedAt
+				persistedStatus = m.Status
 			}
 		}
 
@@ -284,6 +345,12 @@ func (s *Server) recoverJobs() {
 			job.DisclosurePaths = findDisclosures(jobDir)
 		} else {
 			job.Status = StatusError
+		}
+		// #320 (wave r3): the persisted terminal status wins over the
+		// report.html inference — a timed-out job reloaded as a generic
+		// error loses the distinct state the UI renders.
+		if persistedStatus == StatusTimeout {
+			job.Status = StatusTimeout
 		}
 
 		// Load persisted logs if available. Sanitize each line the same way
@@ -1069,6 +1136,9 @@ func (s *Server) runJob(job *Job) {
 	defer close(job.done)
 
 	outDir := filepath.Join(s.outDir, job.ID)
+	job.mu.Lock()
+	job.outDir = outDir
+	job.mu.Unlock()
 
 	defer func() {
 		// Panic recovery — log rather than silently dropping the goroutine.
@@ -1154,6 +1224,14 @@ func (s *Server) runJob(job *Job) {
 		return // cancelled — don't mark error
 	}
 	if err != nil {
+		// #320: the deadline kill is a DISTINCT terminal state — the slot is
+		// recovered and the UI can say "timed out" with the fix named, not a
+		// generic failure.
+		if errors.Is(err, python.ErrInvokeDeadline) {
+			job.addLog("[timeout] " + err.Error())
+			job.setTimeout()
+			return
+		}
 		job.addLog("[error] scan failed to start: " + err.Error())
 		job.setError()
 		return
