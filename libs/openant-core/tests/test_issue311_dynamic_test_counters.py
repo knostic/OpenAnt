@@ -49,7 +49,9 @@ def test_generation_failure_counts_as_error():
     counts = _summary_counts_from_checkpoints({
         "f1": _cp("ERROR", details="Test generation failed — LLM did not return valid test code"),
     })
-    assert counts == {"completed": 0, "errors": 1}
+    # #432 added error_breakdown (derived in the same pass — the categories
+    # are pinned in test_issue432_error_breakdown).
+    assert counts == {"completed": 0, "errors": 1, "error_breakdown": {"generation": 1}}
 
 
 def test_mixed_statuses_disjoint():
@@ -58,12 +60,14 @@ def test_mixed_statuses_disjoint():
         "f2": _cp("ERROR"),
         "f3": _cp("INCONCLUSIVE"),
     })
-    assert counts == {"completed": 2, "errors": 1}
+    assert counts["completed"] == 2 and counts["errors"] == 1
 
 
 def test_empty_and_absent():
-    assert _summary_counts_from_checkpoints({}) == {"completed": 0, "errors": 0}
-    assert _summary_counts_from_checkpoints(None) == {"completed": 0, "errors": 0}
+    counts = _summary_counts_from_checkpoints({})
+    assert counts["completed"] == 0 and counts["errors"] == 0
+    counts = _summary_counts_from_checkpoints(None)
+    assert counts["completed"] == 0 and counts["errors"] == 0
 
 
 def test_summary_json_consistent_with_unit_files(tmp_path, monkeypatch):
