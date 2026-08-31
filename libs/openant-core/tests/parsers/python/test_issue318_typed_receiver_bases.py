@@ -975,3 +975,113 @@ def test_param_named_like_a_class_is_not_a_ctor_call():
     parameter named like a class fabricated the inherited __init__ edge."""
     b = _build(_PARAM_CTOR)
     assert _edges_to(b, "f") == [], _edges_to(b, "f")
+
+
+# --- panel round-4 (both panels): the scope-mismatch merge ------------------
+# Sonnet: in the module-after-local order, existing['bases'] was reset
+# BEFORE local_side.get('bases') was read — and local_side IS existing —
+# so the local declaration's bases were silently dropped from all_bases.
+# Fable: rebuilding all_bases from bases alone discarded the PRE-EXISTING
+# all_bases on a third same-named declaration (local -> module -> local),
+# severing the first local's self/super dispatch.
+
+_SCOPE_MISMATCH_LOCAL_FIRST = '''
+class BaseA:
+    def meth_a(self): return 1
+
+class BaseB:
+    def meth_b(self): return 1
+
+def make():
+    class Combo(BaseA):            # local declaration, arrives FIRST
+        def local_a(self):
+            return self.meth_a()   # self-walk must survive the module merge
+    return Combo()
+
+class Combo(BaseB):                # module-level namesake, arrives SECOND
+    def mod_b(self):
+        return BaseB.meth_b(self)  # class-name receiver through the module bases
+
+def use_local_instance():
+    c = Combo()
+    return c.meth_b()              # M1: instance receiver -> module bases
+'''
+
+
+def test_scope_mismatch_local_first_keeps_local_bases_in_all_bases():
+    b = _build(_SCOPE_MISMATCH_LOCAL_FIRST)
+    # the local declaration's self-walk survives: local_a -> meth_a
+    assert "app.py:BaseA.meth_a" in _edges_to(b, "local_a"), (
+        "the local declaration's bases were dropped from all_bases (sonnet "
+        "aliasing: existing['bases'] reset before local_side was read)")
+    # the module side wins the file-scope bases: M1 resolves through BaseB
+    assert "app.py:BaseB.meth_b" in _edges_to(b, "use_local_instance"), (
+        "the merged entry's file-scope bases must be the module side's")
+    # the module-level class-name receiver resolves too
+    assert "app.py:BaseB.meth_b" in _edges_to(b, "mod_b")
+
+
+_SCOPE_MISMATCH_MODULE_FIRST = '''
+class BaseA:
+    def meth_a(self): return 1
+
+class BaseB:
+    def meth_b(self): return 1
+
+class Combo(BaseB):                # module declaration, arrives FIRST
+    def mod_b(self):
+        return BaseB.meth_b(self)
+
+def make():
+    class Combo(BaseA):            # local namesake, arrives SECOND
+        def local_a(self):
+            return self.meth_a()
+    return Combo()
+'''
+
+
+def test_scope_mismatch_module_first_unions_the_local_bases():
+    b = _build(_SCOPE_MISMATCH_MODULE_FIRST)
+    assert "app.py:BaseA.meth_a" in _edges_to(b, "local_a"), (
+        "the late local declaration's bases must join all_bases")
+    assert "app.py:BaseB.meth_b" in _edges_to(b, "mod_b"), (
+        "the module side's bases must stay the file-scope bases")
+
+
+_THREE_DECLARATIONS = '''
+class BaseA:
+    def meth_a(self): return 1
+
+class BaseB:
+    def meth_b(self): return 1
+
+class BaseC:
+    def meth_c(self): return 1
+
+def first():
+    class Combo(BaseA):            # local 1
+        def local_a(self):
+            return self.meth_a()
+    return Combo()
+
+class Combo(BaseB):                # module
+    def mod_b(self):
+        return BaseB.meth_b(self)
+
+def third():
+    class Combo(BaseC):            # local 2
+        def local_c(self):
+            return self.meth_c()
+    return Combo()
+'''
+
+
+def test_three_declarations_keep_every_local_base():
+    b = _build(_THREE_DECLARATIONS)
+    # fable: the third merge must not discard the FIRST local's bases
+    assert "app.py:BaseA.meth_a" in _edges_to(b, "local_a"), (
+        "the first local's bases vanished from all_bases on the third "
+        "declaration (all_bases rebuilt from bases alone)")
+    assert "app.py:BaseC.meth_c" in _edges_to(b, "local_c")
+    assert "app.py:BaseB.meth_b" in _edges_to(b, "mod_b"), (
+        "the module side must stay the file-scope bases across both mismatches")

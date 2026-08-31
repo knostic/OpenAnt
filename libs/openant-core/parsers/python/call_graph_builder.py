@@ -1008,6 +1008,11 @@ class CallGraphBuilder:
             return None
 
         # Check if obj_name is an imported module/class
+        # (panel r4 note): receiver_is_local_var deliberately does NOT gate
+        # this import branch — a local variable whose name matches an
+        # IMPORTED symbol still resolves through the import (the pre-
+        # existing over-seed direction; a local-var gate here would drop
+        # real imported-symbol calls that only happen to share a name).
         file_imports = self.imports.get(caller_file, {})
         if obj_name in file_imports:
             import_path = file_imports[obj_name]

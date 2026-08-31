@@ -616,22 +616,35 @@ class FunctionExtractor:
             self._process_function_tree(method_node, file_path, content, class_name=method_class_name)
 
         # Recurse into nested classes so their methods are extracted.
+        # (panel r4): forward function_local — a class nested inside a
+        # function-local class is itself function-local; dropping the flag
+        # here mis-keyed the nested declaration as module-level.
         for item in node.body:
             if isinstance(item, ast.ClassDef):
-                self._process_class_tree(item, file_path, content, outer_qualifier=qualified_class)
+                self._process_class_tree(item, file_path, content,
+                                          outer_qualifier=qualified_class,
+                                          function_local=function_local)
         # defs/classes wrapped in a block inside the class body (e.g. an
         # `if TYPE_CHECKING:` block declaring conditional members). Thread the
         # class so a block-nested def stays a method of this class.
         self._descend_into_blocks(node.body, file_path, content,
-                                  enclosing_class=qualified_class)
+                                  enclosing_class=qualified_class,
+                                  function_local=function_local)
 
     @staticmethod
     def _merge_class_data(existing: Dict, new: Dict) -> None:
         """Union a second declaration of a same-keyed class into the first.
 
-        Only additive: bases/methods/decorators are unioned (order-preserving),
-        the line range is widened, and a missing docstring is backfilled. Never
-        drops data the existing declaration already carried.
+        Additive for methods/decorators/line-range/docstring. ``bases`` is
+        the ONE reset-union split (wave r4, both panels): on a scope
+        mismatch the file-scope ``bases`` RESETS to the module-level side's
+        (the merged entry under a file-scope key is the module-level class
+        the name binds to at every other call site), while ``all_bases``
+        UNIONS everything — the module side's bases, the local side's
+        bases, and any ``all_bases`` the existing entry already carried
+        (a third same-named declaration must not discard the first local's
+        bases), preserving the self/super walks inside the function-local
+        declaration's methods.
         """
         new_local = bool(new.get('function_local'))
         old_local = bool(existing.get('function_local'))
@@ -651,9 +664,18 @@ class FunctionExtractor:
             # wrong regression the parent's union did not have).
             module_side = new if not new_local else existing
             local_side = existing if not new_local else new
+            # Sonnet (panel r4): local_side IS existing in the
+            # module-after-local order — capture its bases BEFORE the
+            # reset, or the aliasing silently reads the post-reset module
+            # bases twice and the local declaration's bases vanish from
+            # the union.
+            local_bases = list(local_side.get('bases', []))
             existing['bases'] = list(module_side.get('bases', []))
-            all_bases = list(module_side.get('bases', []))
-            for item in local_side.get('bases', []):
+            # Fable (panel r4): union the PRE-EXISTING all_bases too — a
+            # third same-named declaration (local -> module -> local) must
+            # not discard the first local's bases.
+            all_bases = list(existing.get('all_bases', []))
+            for item in list(existing['bases']) + local_bases:
                 if item not in all_bases:
                     all_bases.append(item)
             existing['all_bases'] = all_bases
