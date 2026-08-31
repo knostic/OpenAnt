@@ -20,7 +20,7 @@ import json
 from typing import TYPE_CHECKING
 from datetime import datetime
 
-from core.verdict_taxonomy import SEVERITIES, _SEVERITIES
+from core.verdict_taxonomy import SEVERITIES, _SEVERITIES, STAGE1_VERDICTS
 
 from prompts.prompt_selector import get_analysis_prompt
 from prompts.vulnerability_analysis import get_system_prompt as get_stage1_system_prompt
@@ -43,6 +43,24 @@ def _normalize_result(result: dict) -> dict:
     # with the key present (a null verdict crashed _count_verdicts' fallback).
     verdict = result.get("verdict")
     has_verdict = isinstance(verdict, str) and verdict.strip() != ""
+    # #427: an unrecognized NON-EMPTY verdict string ({"verdict": "SAY WHAT"},
+    # {"verdict": "weird"} — the same untrusted model-JSON class #316's
+    # garbage findings came from) previously passed through unchanged and
+    # failed OPEN at every accounting sink: dropped from all _count_verdicts
+    # buckets (sum < total), analyze_result_is_error -> False (adopted as
+    # complete on resume, never retried), counted as completed by the
+    # summary seeding, never in the disclosure set. The same garbage class
+    # failed CLOSED for the FINDING key (#426) and OPEN for the verdict key —
+    # close the asymmetry with the matching whitelist: known verdicts pass;
+    # anything else routes to the error accounting with the raw preserved.
+    if has_verdict and verdict.strip().upper() not in STAGE1_VERDICTS:
+        result["raw_verdict"] = verdict
+        if isinstance(result.get("finding"), str) and result["finding"].strip():
+            # The finding beside the garbage verdict is preserved raw too
+            # (it may itself be valid — the row is what routes to error).
+            result["raw_finding"] = result["finding"]
+        result["verdict"] = "ERROR"
+        result["finding"] = "error"
     if not has_verdict and "finding" in result:
         finding = result["finding"]
         if not isinstance(finding, str):

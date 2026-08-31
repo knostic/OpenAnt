@@ -89,10 +89,14 @@ def test_neither_key_stamps_error():
 
 
 def test_verdict_present_passthrough_unchanged():
-    """Guard: a reply that already carries a verdict keeps it (the residual
-    for unrecognized VERDICT strings is #324's documented gap, unchanged)."""
+    """Guard: a reply that already carries a CANONICAL verdict keeps it.
+    #427 closed the residual this test used to pin ("weird" passing through
+    as "WEIRD" — the verdict-key asymmetry where the same garbage-reply class
+    failed CLOSED for the finding key and OPEN for the verdict key): an
+    unrecognized non-empty verdict now routes to the error accounting with
+    the raw preserved (see test_issue427_verdict_whitelist)."""
     assert _normalize_result({"verdict": "SAFE"})["verdict"] == "SAFE"
-    assert _normalize_result({"verdict": "weird"})["verdict"] == "WEIRD"
+    assert _normalize_result({"verdict": "INSUFFICIENT_CONTEXT"})["verdict"] == "INSUFFICIENT_CONTEXT"
 
 
 def test_nonstring_finding_stamps_error_shape():
