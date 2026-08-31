@@ -40,6 +40,14 @@ import (
 // OPENANT_INVOKE_TIMEOUT without recompiling.
 var defaultInvokeTimeout = 30 * time.Minute
 
+// stderrDrainGrace bounds how long the normal exit path waits on the stderr
+// drain AFTER the child's stdout already closed (i.e. the child has exited):
+// a descendant holding ONLY the stderr write-end would otherwise keep the
+// streamer blocked until the deadline's watchdog fired — the full
+// OPENANT_INVOKE_TIMEOUT hang for a result that was already in hand. Package
+// var so tests can shrink it, mirroring defaultInvokeTimeout.
+var stderrDrainGrace = 5 * time.Second
+
 // resolveInvokeTimeout returns the invoke deadline, honoring the
 // OPENANT_INVOKE_TIMEOUT env override. The value is either a Go duration
 // (e.g. "2h", "90m") or a bare positive integer interpreted as seconds. An
@@ -216,7 +224,22 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 		exitErr = cmd.Wait()
 		<-stderrDone
 	} else {
+		// Round-3 panel finding (executed probe): the stdout read is
+		// bounded by the child's exit, but this drain was bounded only
+		// by the deadline — a descendant holding ONLY the stderr
+		// write-end kept <-stderrDone blocked until ctx.Done() fired
+		// the watchdog: a 0.1s child with a complete envelope in hand
+		// hung the FULL OPENANT_INVOKE_TIMEOUT (15s probe on a 15s
+		// budget) and returned under a spurious "deadline fired"
+		// recovery note. Grace-close the stderr read-end
+		// stderrDrainGrace after the child's stdout closed (mirroring
+		// cmd.WaitDelay's own bound): a streamer still blocked by then
+		// is reading an EMPTY kernel buffer — the real output drained
+		// the moment it arrived — so closing loses nothing and
+		// unblocks the drain.
+		stderrGrace := time.AfterFunc(stderrDrainGrace, func() { _ = stderr.Close() })
 		<-stderrDone
+		stderrGrace.Stop()
 		exitErr = cmd.Wait()
 	}
 
@@ -307,6 +330,21 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 		exitCode := 0
 		if ee, ok := exitErr.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
+		}
+		if exitErrIsKillArtifact {
+			// Round-3 panel finding: the exit code here is the KILL's
+			// artifact, not the run's outcome — Unix a negative signal
+			// code, Windows TerminateProcess's exit 1, which is the
+			// SAME code as a legitimate vulnerabilities-found exit, so
+			// a killed Windows run surfaced exit 1 ("vulnerabilities
+			// found") for a recovered envelope. The envelope cannot
+			// distinguish clean from vulns-found (both travel as the
+			// success envelope; the distinction lived in the intended
+			// exit code the kill destroyed), so the honest uniform
+			// mapping is the conservative error code: the run was
+			// killed. Unix already behaved this way through the
+			// negative code; Windows now matches.
+			exitCode = -1
 		}
 		return &InvokeResult{
 			Envelope: envelope,
