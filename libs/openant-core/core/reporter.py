@@ -309,6 +309,11 @@ def build_pipeline_output(
     context_source: str = "none",
     threat_model_sha256: str | None = None,
     threat_model_warnings: list | None = None,
+    # #322: the manual-override receipt fields (the R5 pattern — stderr is
+    # discarded by CI; the artifact is the receipt). Present-only.
+    manual_exclusions: int | None = None,
+    manual_override_warnings: list | None = None,
+    manual_override_filename: str = "",
     skipped_steps: list | None = None,
     skipped_step_reasons: dict | None = None,
     # #307: the multi-language coverage fields the CHANGELOG (2026-07-22)
@@ -702,6 +707,12 @@ def build_pipeline_output(
         # Over-permissive-model warnings (previously stderr-only). Emitted as a
         # list so the report header can render them; empty list when none.
         "threat_model_warnings": list(threat_model_warnings or []),
+        **({"manual_exclusions": manual_exclusions}
+           if manual_exclusions is not None else {}),
+        **({"manual_override_warnings": list(manual_override_warnings or [])}
+           if manual_override_warnings else {}),
+        **({"manual_override_filename": manual_override_filename}
+           if manual_override_filename else {}),
         "pipeline_stats": {
             "total_units": total_units,
             "reachable_units": reachable_units,

@@ -487,10 +487,31 @@ def scan_repository(
                     )
                     save_context(context, Path(app_context_path))
                     result.app_context_path = app_context_path
-                    result.context_source = "generated"
+                    # #322: the manual-override branch (OPENANT.json /
+                    # OPENANT.md authored by the SCANNED repo) is a distinct
+                    # source — recording "generated" suppressed the
+                    # deterministic provenance banner, which exists precisely
+                    # to disclose a repo-controlled security model in a way
+                    # a hostile file cannot steer. Carry the exclusion
+                    # volume + warnings onto the result (the R5 pattern).
+                    if getattr(context, "source", "") == "manual":
+                        result.context_source = "repo_manual"
+                        result.manual_exclusions = len(
+                            context.not_a_vulnerability or [])
+                        result.manual_override_warnings = list(
+                            context.override_warnings or [])
+                        result.manual_override_filename = (
+                            context.override_filename or "")
+                        print(
+                            "  Using repo-committed override "
+                            f"({result.manual_exclusions} exclusion(s))",
+                            file=sys.stderr,
+                        )
+                    else:
+                        result.context_source = "generated"
                     ctx.summary = {
                         "application_type": context.application_type,
-                        "context_source": "generated",
+                        "context_source": result.context_source,
                     }
                     ctx.outputs = {"app_context_path": app_context_path}
                     print(f"  App type: {context.application_type}", file=sys.stderr)
@@ -1110,6 +1131,12 @@ def scan_repository(
             context_source=result.context_source,
             threat_model_sha256=result.threat_model_sha256,
             threat_model_warnings=result.threat_model_warnings,
+            # #322: the manual-override receipt fields reach the deliverable.
+            manual_exclusions=getattr(result, "manual_exclusions", None),
+            manual_override_warnings=list(
+                getattr(result, "manual_override_warnings", []) or []),
+            manual_override_filename=getattr(
+                result, "manual_override_filename", "") or "",
             # #307: the CHANGELOG-claimed coverage fields reach the
             # deliverable (the report generator and dynamic tester read
             # only this file).
@@ -1512,6 +1539,24 @@ def _write_scan_report(
                 else {}
             ),
             "threat_model_warnings": result.threat_model_warnings,
+            # #322 (wave r3): the manual-override receipt in scan.report.json
+            # too (the R5 pattern; the threat-model analogues are here).
+            # Present-only: None/empty stays absent.
+            **(
+                {"manual_exclusions": result.manual_exclusions}
+                if result.manual_exclusions is not None
+                else {}
+            ),
+            **(
+                {"manual_override_warnings": list(result.manual_override_warnings or [])}
+                if result.manual_override_warnings
+                else {}
+            ),
+            **(
+                {"manual_override_filename": result.manual_override_filename}
+                if result.manual_override_filename
+                else {}
+            ),
             # Aggregate of what the walker refused (symlinks) or could not read
             # (directories), summed across languages from each scan-result file.
             "coverage": _collect_coverage(result),

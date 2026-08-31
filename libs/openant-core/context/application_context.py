@@ -129,6 +129,14 @@ class ApplicationContext:
     confidence: float = 0.0
     evidence: list[str] = field(default_factory=list)
     source: str = "llm"  # "llm", "manual", "merged", or "threat_model"
+    # #322 (wave r1): the manual-override receipt rides the context itself —
+    # stderr is discarded by CI; the field IS the receipt. Set by
+    # _application_context_from_override (the warnings it printed) so the
+    # scanner can carry them onto the result and the deliverable.
+    override_warnings: list = field(default_factory=list)
+    # the OVERRIDE FILE that matched (e.g. ".openant.json") — the banner
+    # names the file actually present in the repo, not a generic guess.
+    override_filename: str = ""
 
     # --- Custom threat-model extension (schema v1, see context/threat_model.py) ---
     #
@@ -253,6 +261,20 @@ MANUAL_OVERRIDE_FILES = [
     ".openant.md",
     ".openant.json",
 ]
+
+# #322: the manual-override path (authored by the SCANNED repository — the
+# trust boundary the source itself documents) had no bound on
+# not_a_vulnerability, unlike the threat-model path (which caps file bytes
+# and warns on the criteria ratio). Every entry splices into the Stage-1
+# prompt under "Do NOT flag as vulnerable" — an unbounded list silently
+# narrows what the analyser will report. Cap it and WARN (never silently
+# truncate without a receipt).
+MAX_MANUAL_EXCLUSIONS = 50
+
+# The count-keyed permissive warning (this path has no criteria for a ratio,
+# so count-keyed). The threshold is well under the cap so a hostile-but-
+# plausible list still warns even when it fits.
+MANUAL_EXCLUSIONS_WARN_THRESHOLD = 25
 
 # Priority files to read for context generation
 CONTEXT_FILES = [
@@ -502,7 +524,62 @@ def _application_context_from_override(data: Any, filename: str) -> ApplicationC
     """
     if not isinstance(data, dict):
         raise ValueError(f"manual override is not a mapping (got {type(data).__name__})")
+    # #322 (wave r1 #2): the cap was keyed on isinstance(nav, list) — a repo
+    # committing a bare STRING skipped both the cap and the warning, and the
+    # splice site then iterated the string PER CHARACTER (one "Do NOT flag"
+    # bullet per character). Coerce/validate at the boundary: a str is a
+    # common one-entry mistake (coerce + warn); any other non-list is
+    # dropped with a warning (never a silent per-character splice).
+    nav = data.get("not_a_vulnerability")
+    override_warnings: list = []
+    if isinstance(nav, str):
+        override_warnings.append(
+            f"not_a_vulnerability was a bare string — coerced to a "
+            f"one-entry list (the splice emits one bullet per item; a bare "
+            f"string would otherwise become one bullet per CHARACTER)")
+        print(f"Warning: {filename} {override_warnings[-1]}", file=sys.stderr)
+        data["not_a_vulnerability"] = [nav]
+        nav = data["not_a_vulnerability"]
+    elif nav is not None and not isinstance(nav, list):
+        override_warnings.append(
+            f"not_a_vulnerability had type {type(nav).__name__} (expected a "
+            f"list) — ignored; it would otherwise be spliced per item/character")
+        print(f"Warning: {filename} {override_warnings[-1]}", file=sys.stderr)
+        data["not_a_vulnerability"] = []
+        nav = data["not_a_vulnerability"]
     data = {**data, "source": "manual"}
+    # #322: bound the repo-supplied exclusion list. The splice site
+    # (build_application_context_prompt) emits every entry as a
+    # "Do NOT flag as vulnerable" bullet — an arbitrarily long list from the
+    # SCANNED repo (the attacker-authored path per the block comment above)
+    # silently narrows the analyzer's scope. Truncate to the cap and WARN
+    # with the original count — AND collect the warning onto the context
+    # (wave r1 #1: stderr-only warnings never reach the receipt).
+    if isinstance(nav, list) and len(nav) > MAX_MANUAL_EXCLUSIONS:
+        override_warnings.append(
+            f"not_a_vulnerability had {len(nav)} entries (the cap is "
+            f"{MAX_MANUAL_EXCLUSIONS}) — truncated to the cap; a scanned "
+            f"repo authored this list")
+        print(
+            f"Warning: {filename} not_a_vulnerability has {len(nav)} entries "
+            f"(the cap is {MAX_MANUAL_EXCLUSIONS}) — a scanned repo is "
+            f"authoring this list; truncating to the cap. Raise the cap "
+            f"deliberately if more are genuinely needed.",
+            file=sys.stderr,
+        )
+        data["not_a_vulnerability"] = nav[:MAX_MANUAL_EXCLUSIONS]
+    elif isinstance(nav, list) and len(nav) > MANUAL_EXCLUSIONS_WARN_THRESHOLD:
+        override_warnings.append(
+            f"not_a_vulnerability has {len(nav)} entries — a permissive "
+            f"exclusion list authored by the scanned repo")
+        print(
+            f"Warning: {filename} not_a_vulnerability has {len(nav)} entries "
+            f"— a permissive exclusion list authored by the scanned repo; "
+            f"treat the findings' scope as only as trustworthy as that file.",
+            file=sys.stderr,
+        )
+    data["override_warnings"] = override_warnings
+    data["override_filename"] = filename
     known = {f.name for f in fields(ApplicationContext)}
     unknown = [k for k in data if k not in known]
     if unknown:

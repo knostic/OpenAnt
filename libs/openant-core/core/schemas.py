@@ -62,10 +62,20 @@ class ParseResult:
     # not only visible in a stderr line that CI discards.
     excluded_languages: dict = field(default_factory=dict)
     # Which path supplied the application context: "threat_model" (a file in
-    # the scanned repo), "generated" (the built-in LLM generator), or "none".
+    # the scanned repo), "repo_manual" (an OPENANT.json/OPENANT.md committed
+    # by the scanned repo — #322: a distinct source so the provenance banner
+    # discloses it), "generated" (the built-in LLM generator), or "none".
     # Recorded because a scan run under the WRONG security model looks
     # identical to a correct one unless the source is stated.
     context_source: str = "none"
+    # #322: the manual-override exclusion volume + warnings (the R5 pattern:
+    # stderr is discarded by CI; the artifact is the receipt). Carried when
+    # context_source == "repo_manual".
+    manual_exclusions: int | None = None
+    manual_override_warnings: list = field(default_factory=list)
+    # the OVERRIDE FILE that actually matched (OPENANT.json / .openant.md /
+    # ...) — the banner names the file present in the repo, not a guess.
+    manual_override_filename: str = ""
 
     @property
     def degraded(self) -> bool:
@@ -200,10 +210,20 @@ class ScanResult:
     # not only visible in a stderr line that CI discards.
     excluded_languages: dict = field(default_factory=dict)
     # Which path supplied the application context: "threat_model" (a file in
-    # the scanned repo), "generated" (the built-in LLM generator), or "none".
+    # the scanned repo), "repo_manual" (an OPENANT.json/OPENANT.md committed
+    # by the scanned repo — #322: a distinct source so the provenance banner
+    # discloses it), "generated" (the built-in LLM generator), or "none".
     # Recorded because a scan run under the WRONG security model looks
     # identical to a correct one unless the source is stated.
     context_source: str = "none"
+    # #322: the manual-override exclusion volume + warnings (the R5 pattern:
+    # stderr is discarded by CI; the artifact is the receipt). Carried when
+    # context_source == "repo_manual".
+    manual_exclusions: int | None = None
+    manual_override_warnings: list = field(default_factory=list)
+    # the OVERRIDE FILE that actually matched (OPENANT.json / .openant.md /
+    # ...) — the banner names the file present in the repo, not a guess.
+    manual_override_filename: str = ""
     # Provenance for a repo-supplied threat model (context_source ==
     # "threat_model"). sha256 is over the raw file bytes so a scan can be tied
     # to the exact file that shaped it; None (never the empty-string hash) when
@@ -251,6 +271,16 @@ class ScanResult:
             "context_source": self.context_source,
             "threat_model_sha256": self.threat_model_sha256,
             "threat_model_warnings": self.threat_model_warnings,
+            # #322 (wave r3): the manual-override receipt reaches the machine-
+            # readable JSON envelope too (the R5 pattern — the threat-model
+            # analogues above are here; the manual ones were dropped by this
+            # hand-maintained dict). Present-only: None/empty stays absent.
+            **({"manual_exclusions": self.manual_exclusions}
+               if self.manual_exclusions is not None else {}),
+            **({"manual_override_warnings": self.manual_override_warnings}
+               if self.manual_override_warnings else {}),
+            **({"manual_override_filename": self.manual_override_filename}
+               if self.manual_override_filename else {}),
             "degraded": self.degraded,
         }
 
