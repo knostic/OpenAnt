@@ -442,12 +442,13 @@ class ContextEnhancer:
             )
             os.makedirs(checkpoint_dir, exist_ok=True)
             processed_ids = self._load_completed_units(checkpoint_dir, context_key="llm_context")
+            _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
             # Restore llm_context for already-completed units.
             for unit in units:
                 unit_id = unit.get("id")
                 if unit_id in processed_ids:
-                    cp_file = os.path.join(checkpoint_dir, f"{self._safe_filename(unit_id)}.json")
-                    if os.path.exists(cp_file):
+                    cp_file = _ckpt_map.get(unit_id)
+                    if cp_file:
                         cp_data = read_json(cp_file)
                         unit["llm_context"] = cp_data.get("llm_context", {})
                         if "code" in cp_data:
@@ -631,13 +632,14 @@ class ContextEnhancer:
 
             # Load completed unit IDs from per-unit checkpoint files
             processed_ids = self._load_completed_units(checkpoint_dir)
+            _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
 
             # Restore agent_context from checkpoint files into units
             for unit in units:
                 unit_id = unit.get("id")
                 if unit_id in processed_ids:
-                    cp_file = os.path.join(checkpoint_dir, f"{self._safe_filename(unit_id)}.json")
-                    if os.path.exists(cp_file):
+                    cp_file = _ckpt_map.get(unit_id)
+                    if cp_file:
                         cp_data = read_json(cp_file)
                         unit["agent_context"] = cp_data.get("agent_context", {})
                         if "code" in cp_data:
@@ -674,10 +676,11 @@ class ContextEnhancer:
             _summary_cp.dir = checkpoint_dir
 
             # Count errors and sum usage from already-loaded checkpoints
+            _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
             for unit in units:
                 uid = unit.get("id", "")
-                cp_file = os.path.join(checkpoint_dir, f"{self._safe_filename(uid)}.json")
-                if not os.path.exists(cp_file):
+                cp_file = _ckpt_map.get(uid)
+                if not cp_file:
                     continue
                 try:
                     cp_data = read_json(cp_file)
@@ -967,9 +970,15 @@ class ContextEnhancer:
         return dataset
 
     @staticmethod
-    def _safe_filename(unit_id: str) -> str:
-        from utilities.safe_filename import safe_filename
-        return safe_filename(unit_id)
+    def _id_keyed_checkpoint_map(checkpoint_dir: str) -> dict:
+        """#317: {unit_id: checkpoint path} keyed by the id INSIDE each file
+        (one listdir+read pass) — restoration must not compute filenames:
+        a computed lookup strands old-scheme files (detected complete,
+        restore no-ops -> empty contexts -> fewer findings) and restores
+        the WRONG unit's data when the computed name is taken by a
+        case-only sibling."""
+        from core.checkpoint import id_keyed_checkpoint_map
+        return id_keyed_checkpoint_map(checkpoint_dir)
 
     def _save_unit_checkpoint(self, unit: dict, checkpoint_dir: str, context_key: str = "agent_context"):
         """Save a single unit's result to its own checkpoint file.
@@ -979,8 +988,6 @@ class ContextEnhancer:
         The key is recorded so resume knows where to restore.
         """
         unit_id = unit.get("id", "unknown")
-        filename = self._safe_filename(unit_id) + ".json"
-        filepath = os.path.join(checkpoint_dir, filename)
         ctx = unit.get(context_key, {})
         cp_data = {
             "id": unit_id,
@@ -998,7 +1005,11 @@ class ContextEnhancer:
                 "output_tokens": meta.get("output_tokens", 0),
                 "cost_usd": meta.get("cost_usd", 0.0),
             }
-        write_json(filepath, cp_data)
+        # #317: collision-safe AND under the save lock (this runs in a
+        # ThreadPoolExecutor worker — the resolve+write pair must be
+        # serialized against a case sibling in flight).
+        from core.checkpoint import save_checkpoint_under_lock
+        save_checkpoint_under_lock(checkpoint_dir, unit_id, cp_data)
 
     def _load_completed_units(self, checkpoint_dir: str, context_key: str = "agent_context") -> set:
         """Load the set of completed unit IDs from per-unit checkpoint files.
