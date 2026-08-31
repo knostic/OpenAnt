@@ -173,6 +173,15 @@ def run_dynamic_tests(
     # Use the global tracker so step_context captures dynamic-test cost in
     # dynamic-test.report.json (same as enhance/analyze/verify).
     tracker = get_global_tracker()
+    # #333: the tracker is SHARED with the earlier LLM phases of a full scan,
+    # so a raw read at the end is the whole RUN's cost. Snapshot now — at step
+    # entry, BEFORE the checkpoint prior-usage injection below (those injected
+    # costs are this step's OWN spend from earlier attempts, meant to show
+    # "total cost across runs") — and report the delta, mirroring
+    # core/step_report.py:63. The markdown `**Total Cost:**` line and
+    # dynamic_test_results.json were the two of the step's three cost outputs
+    # still reading the cumulative (#280 fixed the console lines only).
+    _baseline_cost_usd = tracker.total_cost_usd
 
     # Inject prior usage from ALL existing checkpoints (both successful and
     # errored) so the report shows total cost across runs. The errored
@@ -408,7 +417,10 @@ def run_dynamic_tests(
         return results
 
     # Generate report
-    total_cost = tracker.total_cost_usd
+    # #333: the STEP's cost (the entry-snapshot delta), not the run's
+    # cumulative — prior-phase spend on the shared tracker must not appear
+    # here (the JSON step-report on the same run already reads the delta).
+    total_cost = tracker.total_cost_usd - _baseline_cost_usd
     report_md = generate_report(results, repo_info["name"], total_cost)
 
     report_path = os.path.join(output_dir, "DYNAMIC_TEST_RESULTS.md")
