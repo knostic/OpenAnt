@@ -427,8 +427,12 @@ def apply_reachability_filter(
 
     For ``codeql`` and ``exploitable`` levels the reachability filter is
     still applied (it is a prerequisite), but the additional CodeQL /
-    LLM-classification filters are not yet wired into the Python path
-    and a warning is printed.
+    LLM-classification filters are not yet wired into the Python path.
+    The fallback is fail-safe (the skipped filters are narrowing), and is
+    RECORDED, not just printed: the filter metadata carries
+    ``level_fallback_warning``, ``requested_processing_level`` and
+    ``effective_processing_level`` so the emitted artifact never silently
+    claims the requested level (#328).
 
     Args:
         dataset: The full, unfiltered dataset dict (mutated in place).
@@ -585,19 +589,29 @@ def apply_reachability_filter(
         _rf["orphan_advisory"] = _orphan_advisory
         print(f"  [Advisory] {_orphan_advisory}", file=sys.stderr)
 
-    # Warn about unimplemented higher-level filters
-    if processing_level == "codeql":
-        print(
-            "  [Warning] CodeQL filter not yet wired into the Python parser path. "
-            "Returning reachable units only.",
-            file=sys.stderr,
-        )
-    elif processing_level == "exploitable":
-        print(
-            "  [Warning] Exploitable filter (CodeQL + LLM classification) not yet "
-            "wired into the Python parser path. Returning reachable units only.",
-            file=sys.stderr,
-        )
+    # Record the level that actually ran, so the artifact answers "what
+    # filtering was applied?" even when no fallback happened (#328).
+    _rf["effective_processing_level"] = "reachable"
+
+    # Warn about unimplemented higher-level filters (#328: the warning now
+    # reaches the RESULT STRUCTURE the way the asymmetry warning above does,
+    # in its OWN key — the reserved ``warning`` slot may already hold the
+    # blackout text, and dropping the fallback note there would be the same
+    # silent drop this fixes — and the request is recorded beside it. The
+    # fallback itself is fail-safe (the unapplied filters are narrowing:
+    # more units analysed than the label implies, none dropped); the defect
+    # being fixed is the artifact silently claiming the requested level.)
+    if processing_level in ("codeql", "exploitable"):
+        if processing_level == "codeql":
+            _fb = ("CodeQL filter not yet wired into the Python parser path. "
+                   "Returning reachable units only.")
+        else:
+            _fb = ("Exploitable filter (CodeQL + LLM classification) not yet "
+                   "wired into the Python parser path. Returning reachable "
+                   "units only.")
+        _rf["level_fallback_warning"] = _fb
+        _rf["requested_processing_level"] = processing_level
+        print(f"  [Warning] {_fb}", file=sys.stderr)
 
     return dataset
 
