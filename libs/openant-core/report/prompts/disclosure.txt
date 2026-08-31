@@ -49,7 +49,7 @@ OUTPUT FORMAT:
 
 ---
 
-Verified via {"dynamic testing" if dynamic_testing else "attacker simulation (Stage 2)" if stage2_verdict in ("confirmed", "agreed") else "static analysis"}.
+Verified via {"dynamic testing" if dynamic_testing else "dynamic test FAILED (status: " + dynamic_testing_attempted.status + ") — NOT verified by it" if dynamic_testing_attempted else "attacker simulation (Stage 2)" if stage2_verdict in ("confirmed", "agreed") else "static analysis"}.
 
 ---
 
@@ -57,7 +57,7 @@ INSTRUCTIONS:
 - Keep summary under 50 words
 - Do NOT include a "## Vulnerable Code" section — it is added automatically after your output is generated. Do NOT emit code fences with the vulnerable source code. If you need to reference the vulnerable code, refer to the function name and describe the issue in prose.
 - Other code snippets (Suggested Fix): show only the minimal change needed, not entire files
-- Steps to Reproduce: if dynamic_testing data exists, use those steps; otherwise write "[REQUIRES DYNAMIC TESTING]" for each step
+- Steps to Reproduce: if dynamic_testing data exists, use those steps; if only dynamic_testing_attempted exists (the test ran but did not confirm), still write "[REQUIRES DYNAMIC TESTING]" — the attempted evidence is diagnostic, not a reproduction; otherwise write "[REQUIRES DYNAMIC TESTING]" for each step
 - Impact: 3-5 bullet points, no sub-bullets
 - Suggested Fix: show minimal code change, use comments to indicate what was added
 - Do not include CVSS scores or severity ratings

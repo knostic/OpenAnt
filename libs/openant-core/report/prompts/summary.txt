@@ -72,7 +72,7 @@ OUTPUT FORMAT:
 
 | # | Vulnerability | Location | CWE | Severity | Verified |
 |---|--------------|----------|-----|----------|----------|
-| 1 | {short_name} | {file:function} | CWE-{n} | {severity} | {static|verified|dynamic} |
+| 1 | {short_name} | {file:function} | CWE-{n} | {severity} | {static|verified|dynamic|dynamic test failed (<status>)} |
 
 ## False Positives Eliminated
 
@@ -97,7 +97,7 @@ INSTRUCTIONS:
 - Fill in all {placeholders} from the input data
 - If a count is zero, still show "0" in the table
 - Keep "Reason" column under 15 words
-- "Verified" column: "dynamic" if dynamic_testing exists for that finding, "verified" if stage2_verdict is "confirmed" or "agreed" (Stage 2 attacker simulation passed), else "static"
+- "Verified" column, in priority order: "dynamic" if dynamic_testing exists for that finding (a CONFIRMED Docker test); "dynamic test failed (<status>)" if dynamic_testing_attempted exists (the test ran but did not confirm — NEVER render this as verified); "verified" if stage2_verdict is "confirmed" or "agreed" (Stage 2 attacker simulation passed); else "static"
 - "Severity" column: the finding's `severity` field from the input data (critical / high / medium / low); if absent, write the empty cell
 - Language comes from repository.language
 - Commit SHA comes from repository.commit_sha; if null or missing, write "Not available"

@@ -142,6 +142,8 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
     #     (never silently fall back to the positional ID: that is the
     #     defect)
     merged_count = 0
+    attempted_count = 0
+    skipped_count = 0
     refused_count = 0
     abstained_count = 0
     for finding in pipeline_data.get("findings", []):
@@ -157,18 +159,68 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
         if r_key != f_key:
             refused_count += 1
             continue
-        finding["dynamic_testing"] = {
-            "status": r.get("status"),
-            "details": r.get("details"),
-            "evidence": r.get("evidence", []),
-            "tested": f"Docker container, {date_str}",
-            # the join is auditable after the fact
-            "identity_key": r_key,
-        }
-        merged_count += 1
+        # fa17 hardening (wave r2 + the deep-refute): the results file is
+        # model-supplied — ANY status outside the harness's own VALID set
+        # (exact-case) normalises to UNKNOWN: a non-string, a lowercase
+        # "confirmed" (which would self-contradict the banner), whitespace,
+        # or a newline-bearing string must not leak into the
+        # externally-facing banner. The allowlist is the harness's own.
+        from utilities.dynamic_tester.models import VALID_STATUSES
+        _raw_status = r.get("status")
+        if (not isinstance(_raw_status, str)
+                or _raw_status not in VALID_STATUSES):
+            status = "UNKNOWN"
+        else:
+            status = _raw_status
+        # #319 (wave r1): SKIPPED is "never executed" (models.py: "distinct
+        # from ERROR (a test ran and failed)") — the harness had no Docker
+        # template for the finding's language. Attaching an ATTEMPTED block
+        # (an attempted date, a "test SKIPPED" failure stamp) would be the
+        # mirror of the defect this issue fixes: asserting a container
+        # action that never happened, inverted. SKIPPED attaches nothing;
+        # it is surfaced in the merge's stderr line like the abstain count.
+        if status == "SKIPPED":
+            skipped_count += 1
+            continue
+        # #319: the verification block attaches ONLY for a CONFIRMED test —
+        # an ERRORED or NOT_REPRODUCED test rendered as "Verified via
+        # dynamic testing" in the disclosure (both consumers keyed on the
+        # block's EXISTENCE), and the unconditional `tested` Docker string
+        # asserted a container run that never happened. Every other status
+        # attaches a separate ATTEMPTED block: the transparency (status,
+        # details, evidence, the date-stamped ATTEMPT) without the
+        # verification claim — a template cannot render a failed test as a
+        # verification by omission.
+        if status == "CONFIRMED":
+            finding["dynamic_testing"] = {
+                "status": status,
+                "details": r.get("details"),
+                "evidence": r.get("evidence", []),
+                "tested": f"Docker container, {date_str}",
+                # the join is auditable after the fact
+                "identity_key": r_key,
+            }
+            merged_count += 1
+        else:
+            finding["dynamic_testing_attempted"] = {
+                "status": status,
+                "details": r.get("details"),
+                "evidence": r.get("evidence", []),
+                # NOT `tested`: the container claim is reserved for a test
+                # that ran and confirmed. `attempted` carries the date.
+                "attempted": date_str,
+                "identity_key": r_key,
+            }
+            attempted_count += 1
 
     # #314 suggestion 3: what happened is SURFACED, never silent
     print(f"  Merged {merged_count} dynamic test results from {dynamic_path.name}", file=sys.stderr)
+    if attempted_count:
+        print(f"  [Info] {attempted_count} dynamic test result(s) NOT confirmed "
+              f"(attached as dynamic_testing_attempted — never a verification)", file=sys.stderr)
+    if skipped_count:
+        print(f"  [Info] {skipped_count} dynamic test result(s) SKIPPED — never "
+              f"executed (no harness for the language); nothing attached", file=sys.stderr)
     if refused_count:
         print(f"  [Warning] Refused {refused_count} dynamic test result(s) whose "
               f"identity_key disagrees with the finding — a stale results file "
@@ -205,6 +257,10 @@ def _compact_for_summary(pipeline_data: dict) -> dict:
             "severity": f.get("severity"),
             "severity_source": f.get("severity_source"),
             "dynamic_testing": f.get("dynamic_testing"),
+            # #319 (the e2e-caught gap): the ATTEMPTED block must reach the
+            # summary LLM too — without it a failed test rendered "static"
+            # (safe, but the failure was invisible to the reader).
+            "dynamic_testing_attempted": f.get("dynamic_testing_attempted"),
             "impact": f.get("impact"),
         })
     return compact
@@ -317,6 +373,23 @@ def _disclosure_verdict_header(vulnerability_data: dict) -> str:
     """
     verdict = str(vulnerability_data.get("stage2_verdict") or "").lower()
     stage1 = str(vulnerability_data.get("stage1_verdict") or "").lower()
+    # #319: the dynamic dimension stamps FIRST — a CONFIRMED Docker test is
+    # the strongest verification; an attempted-but-failed one must say NOT
+    # confirmed (never "Verified via dynamic testing" for an ERROR/
+    # NOT_REPRODUCED test).
+    dt = vulnerability_data.get("dynamic_testing")
+    dta = vulnerability_data.get("dynamic_testing_attempted")
+    # #319 (wave r1): the dimensions COMPOSE — the dynamic line ADDS as a
+    # second line, never REPLACES the Stage-2 stamp (the wave's regression:
+    # a Stage-2 CONFIRMED finding whose harness ERRORED read "NOT confirmed
+    # by dynamic testing" with the Stage-2 confirmation DROPPED — the
+    # reader could not distinguish it from a Stage-1-only finding; #283's
+    # ADJUDICATED wording likewise became unreachable).
+    dt_line = ""
+    if isinstance(dt, dict) and dt.get("status") == "CONFIRMED":
+        dt_line = "CONFIRMED by dynamic testing (Docker container)"
+    elif isinstance(dta, dict) and dta.get("status"):
+        dt_line = f"NOT confirmed by dynamic testing (test {dta.get('status')})"
     if verdict in _STAGE2_CONFIRMED:
         status = f"CONFIRMED by Stage-2 attacker simulation ({verdict})"
     elif (verdict in ("vulnerable", "bypassable")
@@ -337,6 +410,8 @@ def _disclosure_verdict_header(vulnerability_data: dict) -> str:
             f"({verdict or 'unknown'})"
         )
     lines = [f"> **Verification:** {status}"]
+    if dt_line:
+        lines.append(f"> **Dynamic testing:** {dt_line}")
     loc = vulnerability_data.get("location")
     if isinstance(loc, dict) and (loc.get("file") or loc.get("function")):
         where = ":".join(str(x) for x in (loc.get("file"), loc.get("function")) if x)
