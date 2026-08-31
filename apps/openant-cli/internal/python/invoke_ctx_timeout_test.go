@@ -150,8 +150,13 @@ func TestInvokeCtx_DiscardStdoutNaturalExitZeroNotADeadline(t *testing.T) {
 	// deep-refute finding 3: the discard-stdout InvokeCtx mode — a
 	// successful exit-0 child (a descendant holding the pipe) must NOT be
 	// reported as a deadline kill.
-	s := writeCtxScript(t, `exit 0
-sleep 30 &`)
+	// deep-refute (fable, vacuous-green finding): the script was
+	// `exit 0` THEN `sleep 30 &` — the shell exits on line 1 and the
+	// descendant never spawns, so the test exercised nothing but a clean
+	// exit-0 and passed vacuously. The descendant must spawn BEFORE exit
+	// for the pipe to actually be held.
+	s := writeCtxScript(t, `sleep 30 &
+exit 0`)
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "400ms")
 	code, err := InvokeCtx(context.Background(), s, []string{"x"}, "", "", nil)
 	if err != nil {

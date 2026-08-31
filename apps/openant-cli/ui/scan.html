@@ -53,6 +53,11 @@
   .dot.running { animation: pulse 1.4s ease-in-out infinite; }
   .dot.done    { background: #3fb950; }
   .dot.error   { background: #f85149; }
+  /* #320 (wave round, consumers axis): the amber timeout dot — index.html's
+     deliberate "amber warn, not the red error" for the same state; the scan
+     page previously rendered timeout with the red error dot, contradicting
+     the index badge's design. */
+  .dot.timeout  { background: #9a6700; }
   @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.3} }
   .status-text { font-size: 0.9rem; color: #444; }
 
@@ -319,9 +324,14 @@ function onDone(status) {
     loadDisclosures();
   } else if (status === 'timeout') {
     // #320: the invoke deadline killed the run — a distinct state with the
-    // operator escape hatch named, not a generic failure.
-    dot.classList.add('error');
+    // operator escape hatch named, not a generic failure. The amber dot +
+    // the timeout-specific banner text (wave round: the red error dot and
+    // the generic "Scan failed" banner contradicted index.html's deliberate
+    // amber-not-red timeout design).
+    dot.classList.add('timeout');
     text.textContent = 'Scan timed out — raise OPENANT_INVOKE_TIMEOUT to finish a long run';
+    document.getElementById('error-banner').textContent =
+      'Scan timed out — raise OPENANT_INVOKE_TIMEOUT (e.g. OPENANT_INVOKE_TIMEOUT=2h) to finish a long run.';
     document.getElementById('error-banner').style.display = 'block';
   } else {
     dot.classList.add('error');

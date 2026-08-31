@@ -1277,6 +1277,18 @@ func (s *Server) runJob(job *Job) {
 			if job.ctx.Err() != nil {
 				return
 			}
+			// deep-refute (fable, fall-through finding): a deadline kill on
+			// the report step previously fell through to "no report.html
+			// produced" -> setError, marking a SUCCEEDED scan as failed.
+			// A deadline DID fire on this job's invoke — the timeout state
+			// is the honest outcome (the advice "raise OPENANT_INVOKE_TIMEOUT"
+			// lets the report complete; the scan's own results are on disk
+			// for a manual re-run of the report).
+			if errors.Is(err, python.ErrInvokeDeadline) {
+				job.addLog("[timeout] " + err.Error())
+				job.setTimeout()
+				return
+			}
 			job.addLog("[report] Warning: " + err.Error())
 			// Continue — mark done only if we found something.
 		}
@@ -1309,6 +1321,15 @@ func (s *Server) runJob(job *Job) {
 		sp := filepath.Join(outDir, "SUMMARY_REPORT.md")
 		if err := s.generateSummary(job.ctx, outDir, sp, job.apiKey, job.addLog); err != nil {
 			if job.ctx.Err() != nil {
+				return
+			}
+			// deep-refute (fable, same fall-through as the report step): a
+			// deadline on the summary invoke is the timeout state, not a
+			// warning that leaves the job "done" without its summary nor an
+			// error state that hides the successful scan.
+			if errors.Is(err, python.ErrInvokeDeadline) {
+				job.addLog("[timeout] " + err.Error())
+				job.setTimeout()
 				return
 			}
 			job.addLog("[report] Warning: summary not generated: " + err.Error())

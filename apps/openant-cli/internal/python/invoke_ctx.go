@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -85,7 +86,28 @@ func InvokeCtxCapture(ctx context.Context, pythonPath string, args []string, wor
 // a deadline kill, reported with the distinct named cause + the operator
 // override.
 func deadlineOutcome(stdoutBuf *bytes.Buffer, invokeTimeout time.Duration, onLog func(string)) (string, int, error) {
-	if s := stdoutBuf.String(); s != "" && json.Valid([]byte(s)) {
+	// deep-refute (fable, strictness finding): the whole-buffer single-JSON
+	// requirement is stricter than the server's own noise premise —
+	// envelopeErrors exists because the stream can carry non-JSON log noise
+	// around the envelope. Scan lines bottom-up for the last well-formed
+	// envelope, the same tolerance; only when NO usable envelope exists is
+	// it a deadline kill.
+	recovered := ""
+	for _, line := range strings.Split(stdoutBuf.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var probe struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal([]byte(line), &probe) == nil && probe.Status != "" {
+			recovered = line
+			break
+		}
+	}
+	if recovered != "" {
+		s := recovered
 		var probe struct {
 			Status string `json:"status"`
 		}
