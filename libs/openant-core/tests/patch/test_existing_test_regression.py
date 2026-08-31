@@ -16,6 +16,7 @@ from unittest import mock
 import pytest
 
 import utilities.autopatcher.existing_test_regression as etr
+import utilities.autopatcher.test_executors as test_executors_mod
 from utilities.autopatcher.test_execution_models import (
     ExecutorPreflightResult,
     TestExecutionPlan,
@@ -595,6 +596,59 @@ class TestSamePlanInvariant:
             etr.evaluate_existing_test_comparison(repo, _SOME_PATCH, _DUMMY_LLM)
 
         assert call_order == ["discover", "execute", "execute"]
+
+
+class TestWritableWorkspaceEndToEnd:
+    """Regression coverage for the real urllib3 2.0.5 / CVE-2023-43804
+    failure: baseline and patched both failed before any test ran because
+    `/repo` was read-only inside the container and the repository's own
+    test runner (there, `nox -s test`) tried to create a working file
+    under the repo root.
+
+    Exercises the REAL DockerTestExecutor (not a MagicMock stand-in)
+    through the full evaluate_existing_test_comparison_with_plan
+    orchestration -- temporary_repo_copy, apply_patch, executor.run,
+    _to_test_run_result, compare_runs -- with only the lowest-level
+    `run_docker_command` subprocess call stubbed, exactly like
+    test_test_executors.py's own convention; no real Docker daemon is
+    ever invoked here.
+
+    The stub simulates the exact EROFS failure a read-only `/repo` would
+    produce, so this test is tied to actual behavior, not just flag
+    absence: it would fail the same way the real run did if `--read-only`
+    (or an equivalent restriction) were ever reintroduced. The
+    test_command is a generic shell write, never nox/pytest-specific.
+
+    Isolation properties this does NOT re-test (already covered above by
+    TestEvaluateExistingTestComparison / TestSamePlanInvariant): no host
+    bind mounts, original repository left untouched, baseline/patched
+    workspace independence, workspace cleanup.
+    """
+
+    _WRITE_PLAN = _plan(
+        setup_commands=(), test_command=("sh", "-c", "echo state > repo_local_marker && exit 0"),
+        result_strategy="exit_code", result_output_path=None,
+    )
+
+    @staticmethod
+    def _readonly_aware_stub(cmd, timeout, cwd=None):
+        if cmd[:2] == ["docker", "build"]:
+            return ("built", "", 0, False)
+        assert cmd[:2] == ["docker", "run"]
+        if "--read-only" in cmd:
+            return ("", "OSError: [Errno 30] Read-only file system: '/repo/repo_local_marker'", 1, False)
+        return ("", "", 0, False)
+
+    def test_baseline_and_patched_both_succeed_when_test_command_writes_into_repo(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        real_executor = etr.select_executor("docker")  # the real DockerTestExecutor, never mocked
+        with mock.patch.object(test_executors_mod, "run_docker_command", side_effect=self._readonly_aware_stub):
+            r = etr.evaluate_existing_test_comparison_with_plan(
+                repo, _SOME_PATCH, self._WRITE_PLAN, executor=real_executor,
+            )
+        assert r.status == etr.STATUS_PASS
+        assert r.baseline is not None and r.baseline.status == "COMPLETED"
+        assert r.patched is not None and r.patched.status == "COMPLETED"
 
 
 class TestEnvironmentPreflight:

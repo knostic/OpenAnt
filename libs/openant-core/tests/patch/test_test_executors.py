@@ -365,13 +365,125 @@ class TestDockerTestExecutorRun:
         with mock.patch.object(executors_mod, "run_docker_command", side_effect=stub):
             executors_mod.DockerTestExecutor().run(_plan(), tmp_path)
         run_cmd = next(c for c in calls if c[:2] == ["docker", "run"])
-        assert "--read-only" in run_cmd
         assert "no-new-privileges" in " ".join(run_cmd)
         assert "--pids-limit" in run_cmd
         assert "--memory" in run_cmd
         assert "--cpus" in run_cmd
-        assert "none" in run_cmd  # --network none
         assert "--privileged" not in run_cmd
+
+    def test_repo_workspace_is_writable_in_run_invocation(self, tmp_path: Path):
+        """/repo must NOT be read-only -- a repository's own test tooling
+        (e.g. a nox/tox virtualenv, .pytest_cache, build/, dist/) needs to
+        create working files under the repo root at test-run time. See
+        test_executors.py's module docstring security model: /repo is
+        never a host bind mount and the container is single-use and
+        always removed, so a writable rootfs here does not weaken any
+        isolation guarantee. This is distinct from -- and must never be
+        confused with -- utilities.dynamic_tester.docker_executor, which
+        intentionally keeps a read-only rootfs for its own, genuinely
+        hostile PoC-execution threat model and is not touched by this
+        test or this fix."""
+        stub, calls = _make_docker_command_stub(
+            build_result=("built", "", 0, False),
+            run_result=(_wrapped_result_stdout(_JUNIT_OK), "", 0, False),
+        )
+        with mock.patch.object(executors_mod, "run_docker_command", side_effect=stub):
+            executors_mod.DockerTestExecutor().run(_plan(), tmp_path)
+        run_cmd = next(c for c in calls if c[:2] == ["docker", "run"])
+        assert "--read-only" not in run_cmd
+
+    def test_generic_repo_local_write_survives_without_read_only_flag(self, tmp_path: Path):
+        """Regression test for the real urllib3 2.0.5 / CVE-2023-43804
+        failure: a repository-owned test runner (there, `nox -s test`)
+        tries to create a working file under the repo root and the run
+        failed with `OSError: [Errno 30] Read-only file system: '/repo/...'`
+        because `docker run` passed --read-only. This test never invokes a
+        real Docker daemon (consistent with the rest of this file) -- it
+        instead stubs `run_docker_command` to itself simulate that exact
+        failure mode whenever `--read-only` appears in the `docker run`
+        argv, and simulate success otherwise. This ties the assertion to
+        actual behavior rather than merely re-checking flag absence: if
+        `--read-only` (or an equivalent restriction) were ever
+        reintroduced, this test would fail the same way the real run did.
+        Uses a generic shell command, never pytest/nox-specific."""
+        write_command = ("sh", "-c", "echo state > repo_local_marker && exit 0")
+        plan = _plan(
+            setup_commands=(), test_command=write_command,
+            result_strategy="exit_code", result_output_path=None,
+        )
+
+        def _stub(cmd, timeout, cwd=None):
+            if cmd[:2] == ["docker", "build"]:
+                return ("built", "", 0, False)
+            assert cmd[:2] == ["docker", "run"]
+            if "--read-only" in cmd:
+                return (
+                    "", "OSError: [Errno 30] Read-only file system: '/repo/repo_local_marker'", 1, False,
+                )
+            return (_wrapped_result_stdout(""), "", 0, False)
+
+        with mock.patch.object(executors_mod, "run_docker_command", side_effect=_stub):
+            result = executors_mod.DockerTestExecutor().run(plan, tmp_path)
+
+        assert result.exit_code == 0
+        assert "Read-only file system" not in result.stderr
+
+    def test_repo_test_command_has_normal_network_access_in_run_invocation(self, tmp_path: Path):
+        """The test-run container must NOT be network-isolated -- a
+        repository-owned test entry point (whatever tool it wraps) may
+        perform its own network-dependent dependency provisioning as part
+        of running the test command itself. See test_executors.py's
+        module docstring security model for the accepted trade-off this
+        represents: this test only proves the mechanism (no --network
+        flag at all, i.e. Docker's normal default networking), the same
+        way test_repo_workspace_is_writable_in_run_invocation proves the
+        filesystem mechanism above."""
+        stub, calls = _make_docker_command_stub(
+            build_result=("built", "", 0, False),
+            run_result=(_wrapped_result_stdout(_JUNIT_OK), "", 0, False),
+        )
+        with mock.patch.object(executors_mod, "run_docker_command", side_effect=stub):
+            executors_mod.DockerTestExecutor().run(_plan(), tmp_path)
+        run_cmd = next(c for c in calls if c[:2] == ["docker", "run"])
+        assert "--network" not in run_cmd
+
+    def test_generic_network_dependent_command_survives_without_network_none(self, tmp_path: Path):
+        """Regression test for the general failure class this fixes: a
+        repository-owned test entry point that performs its own
+        network-dependent provisioning (dependency installation, module
+        resolution, etc.) as part of running the test command. The real
+        urllib3 2.0.5 / CVE-2023-43804 run hit this via `nox -s test`
+        installing dev-requirements and failing to resolve pypi.org, but
+        this test models the failure class generically -- a plain DNS
+        resolution failure via a shell command, never nox/pip/pytest --
+        exactly as test_plan_discovery must never learn what a
+        repository-owned entry point does internally.
+
+        Like the read-only regression test above, this never invokes a
+        real Docker daemon -- it stubs `run_docker_command` to simulate
+        the exact DNS-failure mode a `--network` restriction caused
+        whenever any `--network` flag appears in the `docker run` argv,
+        and success otherwise, so a reintroduced network restriction
+        would fail this test the same way the real run failed."""
+        network_command = ("sh", "-c", "getent hosts example.invalid && exit 0")
+        plan = _plan(
+            setup_commands=(), test_command=network_command,
+            result_strategy="exit_code", result_output_path=None,
+        )
+
+        def _stub(cmd, timeout, cwd=None):
+            if cmd[:2] == ["docker", "build"]:
+                return ("built", "", 0, False)
+            assert cmd[:2] == ["docker", "run"]
+            if "--network" in cmd:
+                return ("", "NameResolutionError: Failed to resolve 'example.invalid'", 1, False)
+            return (_wrapped_result_stdout(""), "", 0, False)
+
+        with mock.patch.object(executors_mod, "run_docker_command", side_effect=_stub):
+            result = executors_mod.DockerTestExecutor().run(plan, tmp_path)
+
+        assert result.exit_code == 0
+        assert "NameResolutionError" not in result.stderr
 
     def test_build_context_staged_before_build(self, tmp_path: Path):
         stub, calls = _make_docker_command_stub(
@@ -519,6 +631,10 @@ class TestSecurityDocumentationPrecision:
         doc = executors_mod.__doc__
         assert "never forwarded" in doc
 
-    def test_documents_test_run_network_none(self):
+    def test_documents_test_run_has_normal_networking(self):
+        """The docstring must document CURRENT run-phase networking (this
+        executor no longer uses --network none) and must not claim
+        restricted egress is guaranteed -- see the security model."""
         doc = executors_mod.__doc__
-        assert "--network none" in doc
+        assert "ALSO has normal Docker networking" in doc
+        assert "restricted" in doc.lower() and "NOT" in doc

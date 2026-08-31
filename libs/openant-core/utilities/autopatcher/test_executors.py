@@ -28,8 +28,26 @@ claim, because it is not one:
     host-safety one. It is not a confidentiality risk to OpenAnt's own
     secrets -- see the next two points.
   - The test-run phase (``docker run``, executing ``plan.test_command``)
-    uses ``--network none`` -- no network access at all once setup has
-    completed.
+    ALSO has normal Docker networking (the daemon's default network, same
+    as the build phase) -- deliberately, not an oversight. A
+    repository-owned test entry point (``nox``/``tox`` creating a
+    virtualenv and installing its own dependencies, ``npm``/``go``/
+    ``cargo``/Maven/Gradle resolving packages, etc.) may perform its own
+    network-dependent provisioning as an inherent, unavoidable part of
+    running that command at all -- this executor stays ignorant of which
+    tool is doing it or why, exactly as it already is for setup-phase
+    hooks above. This is a REAL security trade-off, not equivalent to the
+    ``--network none`` this executor used before: arbitrary repository
+    test code can now make outbound connections, resolve DNS, and reach
+    external endpoints during the run. Plain Docker networking does NOT
+    guarantee isolation from Docker-host-adjacent addresses (e.g.
+    ``host.docker.internal`` where supported), RFC1918/LAN destinations,
+    or link-local/metadata endpoints -- restricted (internet-only) egress
+    is explicitly NOT provided here; solving that correctly would need a
+    materially larger, cross-platform networking subsystem this release
+    does not build. What stays unchanged regardless of network policy:
+    no host bind mounts, no host env/secret forwarding, no Docker socket,
+    no privileged mode -- see the points below.
   - The host filesystem is never mounted into the container at any
     phase (no ``-v``/``--mount``/``--volume``) -- only the disposable,
     already-isolated workspace copy is baked into the build context via
@@ -39,19 +57,39 @@ claim, because it is not one:
     ``-e``/``--env`` flag is ever passed to ``docker build``/``docker
     run``; the container's entire environment comes from this module's
     own fixed, hardcoded Dockerfile ``ENV`` line.
+  - The test-run container's rootfs (including ``/repo``) is WRITABLE --
+    deliberately, not an oversight. ``/repo`` is never a host bind mount
+    (see above); it is baked into the image via ``COPY``, the container
+    is single-use, and both the container (``--rm``) and its image are
+    always removed after the run (see the ``finally`` block below). A
+    writable rootfs therefore lets a repository's own test tooling create
+    its normal working files (e.g. a ``nox``/``tox`` virtualenv,
+    ``.pytest_cache``, ``build/``/``dist/``) without ever exposing the
+    original evaluation repository or the host to anything the test run
+    does -- there is no path back to either. Contrast this with
+    ``utilities.dynamic_tester.docker_executor``, which runs
+    attacker-authored exploit PoC code under a genuinely hostile threat
+    model and, for that reason, keeps a read-only rootfs with narrow
+    tmpfs scratch space; that executor is intentionally untouched by this
+    module's choice.
 
 What this containment protects: the HOST machine and OpenAnt's own
 secrets, always. What it does NOT claim to protect: the confidentiality
 of the target repository's own source/dependency-fetch traffic against a
-malicious setup-phase package during the network-enabled setup phase --
-that risk is real and inherent to running arbitrary ecosystem tooling,
-and containment does not eliminate it.
+malicious setup- or run-phase package, nor the wider network against
+whatever an outbound connection from the container can reach -- both
+risks are real and inherent to giving arbitrary, potentially untrusted
+repository code normal network access at all, and containment does not
+eliminate either one.
 
 Preserved from the original pytest-specific Docker runner this was
 refactored from: no host bind mounts, no privileged mode,
-no-new-privileges, memory/CPU/pid limits, read-only rootfs with tmpfs for
-the only paths that need to be writable, bounded build/run timeouts with
-explicit kill-on-timeout, and guaranteed cleanup.
+no-new-privileges, memory/CPU/pid limits, bounded build/run timeouts with
+explicit kill-on-timeout, and guaranteed cleanup. NOT preserved: that
+runner's read-only rootfs -- see the security model above for why a
+writable rootfs is correct for this executor's threat model (running a
+repository's own test suite), even though it remains correct for
+dynamic_tester's PoC-execution executor.
 """
 
 from __future__ import annotations
@@ -105,10 +143,13 @@ APPROVED_IMAGES = {
 _COMMON_APT_PACKAGES = ("make",)
 
 # Per-runtime-family cache-directory redirects, all pointed at the one
-# tmpfs mount this executor provides (/tmp). This lets the container's
-# rootfs stay read-only without this module needing to know about any
-# specific framework's cache directory (e.g. pytest's .pytest_cache) --
-# it only needs to know a handful of well-known ecosystem-level cache
+# tmpfs mount this executor provides (/tmp). The container rootfs is
+# writable now (see the security model above), so this is no longer
+# required for correctness -- but it keeps well-known ecosystem caches
+# off the container's (unbounded) writable layer and onto a fixed-size,
+# always-discarded tmpfs, without this module needing to know about any
+# specific framework's own cache directory (e.g. pytest's .pytest_cache)
+# -- it only needs to know a handful of well-known ecosystem-level cache
 # env vars, which is executor/runtime policy, not test-framework logic.
 _CACHE_ENV_BY_FAMILY = {
     "python": {"PIP_CACHE_DIR": "/tmp/cache/pip", "PYTHONPYCACHEPREFIX": "/tmp/cache/pycache"},
@@ -296,19 +337,40 @@ class DockerTestExecutor:
             # No host bind mounts, no privileged mode, no host env
             # forwarding (no -e/--env flags anywhere in this argv --
             # anything the container needs is baked into the Dockerfile's
-            # own fixed ENV line above), --network none at run time
-            # (setup already had whatever network access it needed at
-            # build time, above; the actual test run does not).
+            # own fixed ENV line above).
+            #
+            # Deliberately no --network flag: this uses Docker's normal
+            # default networking, same as docker build above, so a
+            # repository-owned test entry point (nox/tox creating a venv
+            # and installing dependencies, npm/go/cargo/Maven/Gradle
+            # resolving packages, etc.) can perform its own network-
+            # dependent provisioning as part of running the test command
+            # -- exactly the same kind of ecosystem-tooling network need
+            # setup_commands already has at build time, above. See the
+            # module docstring's security model for the accepted trade-off
+            # this represents (outbound network access for arbitrary
+            # repository test code, with no restricted-egress guarantee).
+            #
+            # Deliberately NOT --read-only: /repo is not a host bind mount
+            # (see module docstring's security model) and this container
+            # is single-use and always removed (--rm, plus explicit
+            # cleanup in `finally` below), so a writable rootfs here lets
+            # the repository's own test tooling create its normal working
+            # files (a nox/tox virtualenv, .pytest_cache, build/, dist/,
+            # etc.) without weakening any isolation guarantee -- there is
+            # no path from this container's filesystem back to the host or
+            # the original evaluation repository, writable or not. The
+            # dynamic_tester executor keeps --read-only for its own,
+            # genuinely hostile PoC-execution threat model; that is a
+            # different executor and is intentionally unaffected.
             r_stdout, r_stderr, r_code, r_timed_out = run_docker_command(
                 [
                     "docker", "run",
                     "--name", container_name,
                     "--rm",
-                    "--network", "none",
                     "--memory", "512m",
                     "--cpus", "1",
                     "--pids-limit", "256",
-                    "--read-only",
                     "--tmpfs", "/tmp:size=512m",
                     "--security-opt", "no-new-privileges",
                     image_tag,
