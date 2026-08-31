@@ -59,6 +59,18 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
         print(f"[{step}] ERROR: {exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         raise
+    except BaseException:
+        # #420 (the #417/#418/#419 contract): an interrupt propagating through
+        # a step must not leave an on-disk artifact claiming success — the
+        # finally below would write the DEFAULT status="success" with an
+        # empty summary. `except Exception` above cannot catch these
+        # (KeyboardInterrupt / SystemExit / GeneratorExit), so a propagating
+        # BaseException marks the step "interrupted": the resume path and
+        # any artifact reader can see the run was cut short. stdout envelope
+        # unaffected — no envelope is emitted on the KI path; the Go
+        # exit-130 contract still works. This is the stderr/file channel.
+        report.status = "interrupted"
+        raise
     finally:
         # Issue #209/#285: a step that records errors via
         # ``ctx.errors.append(...)`` or that counts per-item failures in
@@ -69,7 +81,7 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
         # stays reserved for the propagating-exception path). The scanner's
         # degrade idiom (status="skipped", reason in summary, no errors) is
         # unaffected.
-        if report.status != "error":
+        if report.status not in ("error", "interrupted"):
             _summary = report.summary if isinstance(report.summary, dict) else {}
             _counted = _summary.get("error_count")
             _error_count = _counted if isinstance(_counted, int) and _counted > 0 else 0
