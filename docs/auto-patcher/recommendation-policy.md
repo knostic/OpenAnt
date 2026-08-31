@@ -6,9 +6,20 @@ security engineers who need to know exactly what a recommendation is and is
 not based on before acting on it.
 
 For what Auto Patcher is and how to run it, see the
-[Auto Patcher section of the README](../../README.md#auto-patcher). This document
-goes one level deeper: it describes the evidence-to-decision machinery behind
-the report that command produces.
+[Auto Patcher section of the README](../../README.md#auto-patcher). For the
+complete pipeline/system architecture — every canonical stage, execution
+recording, provenance/lineage, and how replay works — see
+[auto-patcher-architecture.md](auto-patcher-architecture.md). This document
+goes one level deeper than either of those: it describes the evidence-to-
+decision machinery behind the report `openant patch` produces. In the
+architecture document's terms, everything below is the internals of two
+canonical stages — S12 (`trust_signals_and_recommendation`) and, for how the
+recommendation surfaces in the report, S13 (`report_generation`) — which in
+the current implementation are computed together, inside `_build_report`;
+see that document's
+[Terminal reporting architecture](auto-patcher-architecture.md#terminal-reporting-architecture)
+section for exactly what "computed together" means and why S12 has no
+independent execution record of its own.
 
 Everything below is grounded in the current implementation of
 `utilities/autopatcher/pipeline.py` in `libs/openant-core`, plus the stage
@@ -97,7 +108,7 @@ Pipeline execution
                  │    deterministic rule)
                  ▼
              Trust Signals
-                 │   (seven named values; six shown as their own report row)
+                 │   (eight named values; seven shown as their own report row)
                  ▼
           Recommendation Policy
                  │   (a fixed decision tree over four of those signals)
@@ -231,13 +242,29 @@ change *which* patch, and *which* classified-Challenger result, they see.
 
 After the Challenger's final result is classified, a second LLM pass,
 **Finding Calibration** (`finding_calibration.calibrate_findings`), reclassifies
-and rewords the subset of findings classified as `plausible_risk` or
-`generic` — `confirmed_defect` and `validation_gap` findings are never sent
-to it; those already carry unambiguous framing. It reasons over the same
-evidence the Challenger saw (vulnerability text, patch, and the same
-`code_context`, including Post-Patch Investigation findings when still
-current) and sorts each input finding into exactly one of three epistemic
-groups, rewording it to match that group's certainty:
+and rewords a subset of the classified findings. `validation_gap` findings
+are never sent to it in any case — those already carry unambiguous framing.
+Which of the remaining findings are included depends on whether Patch
+Repair's repair loop fires (see [S6](auto-patcher-architecture.md#per-stage-detail)
+in the architecture document for the repair loop itself):
+
+- **No repair fires** (the common case — no raw `confirmed_defect` finding
+  exists): calibration runs once, on only the `plausible_risk`/`generic`
+  findings; `confirmed_defect` findings are excluded here too.
+- **The repair loop fires** (at least one raw `confirmed_defect` finding
+  exists): calibration is deliberately widened to also include
+  `confirmed_defect` findings, alongside `plausible_risk`/`generic`, so the
+  deterministic repair accept/reject decision reads calibration-aware state
+  rather than the raw classifier alone. If a repair patch is generated and
+  re-challenged, calibration runs a second time on the same widened set
+  against the re-challenged findings — and that second pass becomes the
+  run's final, reported calibration if the repair is accepted.
+
+Either way, it reasons over the same evidence the Challenger saw
+(vulnerability text, patch, and the same `code_context`, including
+Post-Patch Investigation findings when still current) and sorts each input
+finding into exactly one of three epistemic groups, rewording it to match
+that group's certainty:
 
 - `observed` — directly backed by the repository evidence or diff actually
   shown to it. Rendered under **Observed Facts**, with a subtitle stating
@@ -391,14 +418,18 @@ and `_build_report`'s `§9c` block.
 ## Trust Signals
 
 `_compute_trust_signals` computes six named signals from the evidence above.
-A seventh, `source_verification`, is merged into the same signals dict
-separately (`source_verification.py`'s Evidence Sufficiency Gate) and is
-**not** part of `_compute_trust_signals`'s own six-signal computation or its
-I1–I6 invariants. Of these seven, six are rendered as their own row in the
-report's Trust Signals table; one — `security_improvement` — is computed but
-not separately displayed (dropped from *display* only, per the code's own
-history: an earlier report design found it a "peer-displayed duplicate" of
-two other rows; the policy still depends on it).
+Two more are merged into the same signals dict separately, each as its own
+dict key, each explicitly outside `_compute_trust_signals`'s own six-signal
+computation and its I1–I6 invariants: `source_verification`
+(`source_verification.py`'s Evidence Sufficiency Gate) and
+`existing_test_comparison` (`existing_test_regression.py`'s
+`classify_existing_test_comparison_signal`, opt-in — see
+[Current limitations](#current-limitations)). Of these eight, seven are
+rendered as their own row in the report's Trust Signals table; one —
+`security_improvement` — is computed but not separately displayed (dropped
+from *display* only, per the code's own history: an earlier report design
+found it a "peer-displayed duplicate" of two other rows; the policy still
+depends on it).
 
 | Signal | Possible values | Computed from | Shown as its own row? | Used by the primary decision? |
 |---|---|---|---|---|
@@ -409,6 +440,7 @@ two other rows; the policy still depends on it).
 | `test_availability` | Tests Available · No Tests Found · Not Verified | Test Support rating | Yes — "Do relevant tests already exist?" | No — secondary caveat only (see below) |
 | `coverage_confidence` | High · Medium · Low | Classified Challenger counts | Yes — "Are there unresolved concerns?" | No — displayed only |
 | `source_verification` | Confirmed · Position Unconfirmed · Unverified · Not Verified | `diff_hunk_repair.repair_hunk_headers`'s hunk-vs-repository relocation records | Yes — "Was the edited content verified against the repository?" | No — displayed only |
+| `existing_test_comparison` | (mirrors `ExistingTestComparisonResult.status`) · Not Verified | Deterministic before/after existing-test-suite delta (S11, `existing_test_comparison` canonical stage) — see [Current limitations](#current-limitations) | Yes — "Were there new test failures after the patch?" | No — displayed only |
 
 Each signal also carries a short human-readable `notes` string explaining the
 specific evidence behind its value (e.g. which hygiene check fired, how many
@@ -419,9 +451,10 @@ review findings remain open).
 `deployment_safety`) are the *only* inputs `_build_recommendation_v1` reads —
 these are the primary recommendation inputs. `test_availability` feeds only
 the secondary consistency caveat (below), never the primary decision.
-`coverage_confidence` and `source_verification` are computed and displayed
-for the reader's benefit but are not consulted by either the primary
-decision or the consistency caveat — `source_verification` explicitly by
+`coverage_confidence`, `source_verification`, and `existing_test_comparison`
+are computed and displayed for the reader's benefit but are not consulted by
+either the primary decision or the consistency caveat — `source_verification`
+explicitly by
 product decision recorded in its own module docstring ("do not yet decide
 how, or whether, it should affect the final recommendation... deferred to a
 later phase"), pending more real-run evidence on how often it fires and
@@ -780,6 +813,14 @@ evidence that shaped its recommendation.
 - **`test_availability`.** Rendered as its own row and does feed the
   secondary consistency-caveat check, but is not one of the four signals the
   primary decision (`_build_recommendation_v1`) gates on.
+- **Existing Test Comparison.** See
+  [Current limitations](#current-limitations) below for what this opt-in
+  feature checks. Its `existing_test_comparison` Trust Signal is rendered as
+  its own row but is explicitly observability-only, exactly like
+  `source_verification` above — never read by `_build_recommendation_v1` or
+  `_check_recommendation_consistency`. A newly-failing existing test after
+  the patch is a factual delta the report surfaces for a human to interpret,
+  not a signal the policy currently acts on.
 
 ## NO PATCH PRODUCED
 
@@ -821,11 +862,12 @@ on directly: the Challenger, and — informationally only — the Confidence
 Scorer, whose output is discarded (see above). Auto Patcher's pipeline runs
 several further LLM-backed stages — remediation planning, remediation
 strategy, a narrow best-effort `guided_context_request` call inside guided
-repository-context acquisition, Patch Generation, Finding Calibration, and
-Patch Review — that assemble evidence or produce report-only text but do not
-themselves feed Trust Signals or the Recommendation Policy; see
-[Evidence](#evidence) for the ones central to this document's evidence
-model.
+repository-context acquisition, Patch Generation, Finding Calibration, Patch
+Review, and — only when Existing Test Comparison is explicitly requested —
+one bounded Test Plan Discovery call — that assemble evidence or produce
+report-only text but do not themselves feed Trust Signals or the
+Recommendation Policy; see [Evidence](#evidence) for the ones central to
+this document's evidence model.
 
 Every one of these calls shares the same configuration story. Auto Patcher does not maintain
 an independent LLM provider/model configuration system for these calls; the
@@ -848,13 +890,26 @@ above is interpreted.
   `deployment_safety` and `test_availability` — currently run meaningfully
   only on Python codebases. On other languages they resolve to "not
   applicable," which the policy treats as "not verified," never as a clean
-  result — so fewer of the seven signals carry real signal on non-Python
+  result — so fewer of the eight signals carry real signal on non-Python
   repositories today.
-- Test Support is a **discovery** check (does a matching test file exist),
-  never an execution check — Auto Patcher does not build the target
-  repository or run its test suite as part of the pipeline. "Tests
-  Available" means relevant tests were found on disk, not that they were run
-  or passed.
+- Test Support (`test_availability`) is a **discovery** check (does a
+  matching test file exist), never an execution check — it never builds the
+  target repository or runs its test suite. "Tests Available" means relevant
+  tests were found on disk, not that they were run or passed. **This is a
+  different feature from Existing Test Comparison** (`existing_test_comparison`,
+  canonical stages S10/S11): that one *does* execute the repository's
+  existing test suite, inside Docker, once against an unpatched copy and
+  once against the patched copy, and reports a deterministic before/after
+  failure delta — but only when explicitly requested
+  (`compare_existing_tests=True`; not currently exposed as a flag on the Go
+  `openant patch` CLI, though the underlying Python entry point and
+  `tools/run_traced.py` both accept `--compare-existing-tests` directly —
+  see TRACING_AND_DEBUGGING.md), only against tests that already
+  exist in the repository (it generates no new tests), and only as a
+  displayed, observability-only signal — never read by
+  `_build_recommendation_v1`. Do not conflate "tests were found" with
+  "tests were run": both signals exist in the same report, and they answer
+  different questions.
 - Patch Reviewer receives no repository evidence in its prompt — only the
   vulnerability report and the final patch — so any specific claim it makes
   about repository state, or about a prior/upstream fix, reflects the

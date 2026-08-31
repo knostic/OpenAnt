@@ -13,14 +13,26 @@ because a debugging session usually starts by opening these files side by
 side.
 
 Everything below was verified against the current working tree of this repo
-(`/Users/goddess/dev/OpenAnt`) on 2026-08-13, branch `auto-patcher`, including
-the uncommitted changes to `diff_hunk_repair.py`, `diff_parsing.py`,
-`pipeline.py` and the `tests/patch/` files shown by `git status`, plus the
-subsequent relocation of this tooling out of the (still gitignored)
-`scripts/local/` into `utilities/autopatcher/tools/` as a tracked Auto
-Patcher development capability. Where behavior recently changed (see the
-LLM-configuration refactor in §3), this document describes **only** the
-current state — not the superseded one.
+(`/Users/goddess/dev/OpenAnt`) on 2026-08-31, including the stage-replay
+execution-graph work landed since this document was last refreshed (see
+§9 and §19-§22 in particular — single-stage replay now covers 12 of the
+13 canonical pipeline stages, generalized well beyond the original
+`test_plan_discovery`-only capability). Where behavior recently changed
+(see the LLM-configuration refactor in §3, and the replay generalization
+in §19), this document describes **only** the current state — not any
+superseded one. If a section number or a specific file:line reference
+below looks wrong, re-verify against source rather than trusting this
+document; it is the kind of thing that goes stale fast in an actively
+developed subsystem.
+
+For the pipeline's overall architecture — every canonical stage, execution
+recording, and how replay shares implementation with production — see
+[docs/auto-patcher/auto-patcher-architecture.md](../../../../../docs/auto-patcher/auto-patcher-architecture.md).
+This document is the operational/debugging companion to that one: it
+assumes the architecture document's vocabulary (canonical stage,
+`StageExecution`, lineage, effective dependency resolution) and focuses on
+*how to run and inspect the system*, not on explaining that vocabulary
+from scratch.
 
 Generic placeholder: `<OPENANT_REPO_ROOT>` stands in for
 `/Users/goddess/dev/OpenAnt` wherever a path is otherwise specific to this
@@ -34,12 +46,17 @@ machine.
 |---|---|
 | `apps/openant-cli` | Go CLI (`openant`). Thin transport layer: parses flags, resolves the active project, and shells out to the Python engine via `python.Invoke`. Does **no** LLM resolution, patch logic, or trace capture of its own. |
 | `libs/openant-core` | The Python engine. Contains `openant/cli.py` (the actual `patch` subcommand argparse + entry point), `core/patch.py` (`run_patch`/`run_patch_cve`, artifact writing), and `utilities/autopatcher/` (the pipeline itself). |
-| `libs/openant-core/utilities/autopatcher/tools/run_traced.py` | In-process tracing wrapper, tracked normally as part of the Auto Patcher subsystem. Calls the same `core.patch.run_patch`/`run_patch_cve` functions the CLI calls, but intercepts every LLM call to record prompt/response to disk. Also the **canonical producer of replay-capable source traces** (see §19) — every trace it writes now carries structured, versioned provenance in `run_manifest.json`, not just prose. |
-| `libs/openant-core/utilities/autopatcher/tools/run_stage.py` | Single-stage debug replay tool (see §19), same directory. Consumes a `run_traced.py` source trace and reruns exactly ONE pipeline stage's CURRENT implementation against that trace's recorded upstream state — never the full pipeline. Phase 1 supports exactly one stage: `test_plan_discovery`. |
-| `libs/openant-core/utilities/autopatcher/stage_replay.py` | The reusable, importable single-stage replay logic `run_stage.py` is a thin CLI wrapper around — trace-loading, provenance/schema resolution, target-repo identity checks, and the `test_plan_discovery` replay lifecycle itself. |
-| `libs/openant-core/utilities/autopatcher/llm_call_tracing.py` | The shared LLM-call-capture mechanism (`LLMCallCapture`) both `run_traced.py`'s `LLMCallTracer` and `stage_replay.py` build on — monkeypatch `call_llm`, record each call in order, restore on exit. |
-| Auto Patcher pipeline (`libs/openant-core/utilities/autopatcher/pipeline.py` + sibling modules) | Orchestrates remediation planning → patch generation → challenger → calibration → review → confidence scoring → Trust Signals → Recommendation. Mix of LLM calls and deterministic Python logic. |
-| Trace output (`<output>/trace/`) | Written only when running via `run_traced.py`. Per-call prompt/response text files, `checkpoints.jsonl`, `run_manifest.json`. |
+| `libs/openant-core/utilities/autopatcher/tools/run_traced.py` | In-process tracing wrapper, tracked normally as part of the Auto Patcher subsystem. Calls the same `core.patch.run_patch`/`run_patch_cve` functions the CLI calls, but intercepts every LLM call to record prompt/response to disk, and wires an `ExecutionRecorder` (see below) into `pipeline.run()`. The **canonical producer of replay-capable source traces** (see §19-§22) — every trace it writes carries a schema-v3 `run_manifest.json` with real, structured `StageExecution` records, not just prose. |
+| `libs/openant-core/utilities/autopatcher/tools/run_stage.py` | Single-stage debug replay tool (see §19), same directory. A thin CLI wrapper around `replay_engine.replay_stage()` — consumes a source run/replay directory and reruns exactly ONE canonical pipeline stage's CURRENT implementation against upstream state resolved from that source's lineage. Accepts any of the 13 canonical stage names; **12 of the 13 currently have a working replay implementation** (every stage except `trust_signals_and_recommendation`, which has no independent execution to replay — see the architecture document's [Terminal reporting architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#terminal-reporting-architecture)). |
+| `libs/openant-core/utilities/autopatcher/replay_engine.py` | The current, stage-registry-driven replay engine `run_stage.py` calls. Owns dependency resolution, capability-aware preflight, stage invocation, and manifest persistence for every replayable stage. Each stage's replay handler calls the *same* production stage-implementation function `pipeline.run()` calls — see the architecture document's [Shared production/replay architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#shared-productionreplay-architecture). |
+| `libs/openant-core/utilities/autopatcher/stage_replay.py` | The Phase-1 predecessor to `replay_engine.py`. No longer the entry point `run_stage.py` calls, but still supplies reused helpers (`SourceProvenance`, `resolve_source_provenance`, `validate_target_repository`, output-directory safety checks) that `replay_engine.py` imports directly. |
+| `libs/openant-core/utilities/autopatcher/stage_registry.py` | The static, side-effect-free catalog of all 13 canonical stages: names, approved dependency graph, capability flags (repo access / Docker / LLM provider), and which `stage=` LLM tags each canonical stage owns. Answers "what IS this stage," never "is it replayable today" (that's `replay_engine.REPLAY_HANDLERS`). |
+| `libs/openant-core/utilities/autopatcher/execution_recorder.py` | `ExecutionRecorder` — passive recording of real `StageExecution` entries during a production run. Strictly opt-in: `pipeline.run()`'s `execution_recorder` parameter defaults to `None`, and only `run_traced.py` constructs one. A plain `openant patch` run records nothing. |
+| `libs/openant-core/utilities/autopatcher/lineage.py` | The manifest schema (v3, `executions: [...]`) and the lineage/dependency-resolution logic (`resolve_effective`, `build_chain`) both production recording and replay share. |
+| `libs/openant-core/utilities/autopatcher/llm_call_tracing.py` | The shared LLM-call-capture mechanism (`LLMCallCapture`) both `run_traced.py`'s `LLMCallTracer` and `stage_replay.py`/`replay_engine.py` build on — monkeypatch `call_llm`, record each call in order, restore on exit. |
+| Auto Patcher pipeline (`libs/openant-core/utilities/autopatcher/pipeline.py` + sibling modules) | Orchestrates the 13 canonical stages (see the architecture document for the full list). Mix of LLM calls and deterministic Python logic. |
+| Trace output (`<output>/trace/`) | Written only when running via `run_traced.py`. Per-call prompt/response text files, `checkpoints.jsonl`, `run_manifest.json`, and an `executions/` directory of per-`StageExecution` JSON artifacts. |
+| Replay output (`<output>/` from `run_stage.py`) | Written only when running via `run_stage.py`. One new `StageExecution`, its own `run_manifest.json` (`kind: "replay"`, `parent` pointing at the source run), and that stage's own artifact file(s). |
 | Debug artifacts (`./reports/debug/*.json`) | Written by the *production* pipeline itself whenever `AUTOPATCHER_DEBUG=1` is set (by hand, or automatically by `run_traced.py`). Observability-only — never fed back into pipeline decisions. |
 | Trust Report (`<patch_dir>/<label>-trust-report.md`) | The final, user-facing artifact. Produced by every run (traced or not). Downstream of everything else — treat it as a claim to verify, not a starting fact. |
 
@@ -147,6 +164,29 @@ patch --help` should show, at minimum, `--finding-id`, `--cve`,
 `--repo-root`, `--output`/`-o`, `--context-budget-policy`, and
 `--max-context-budget-windows`, plus the global `--json`, `--quiet`/`-q`,
 `--api-key`, and `--project`/`-p` flags.
+
+### 2.6 When a Go rebuild is (and isn't) actually necessary
+
+`apps/openant-cli` is pure transport (§1) — it parses flags and shells out
+to the Python engine unmodified. Concretely:
+
+- **A rebuild IS required** when you change anything under
+  `apps/openant-cli/` itself: a flag definition, help text, project/config
+  resolution logic, or how the Go layer invokes the Python subprocess.
+- **A rebuild is NOT required** for a change confined to the Python Auto
+  Patcher core — anything under `libs/openant-core/utilities/autopatcher/`,
+  `libs/openant-core/core/patch.py`, or the tracing/replay tooling in
+  `libs/openant-core/utilities/autopatcher/tools/`. The next `openant
+  patch` invocation picks up a Python-only change immediately, because the
+  Go binary re-invokes the Python interpreter fresh on every run — there is
+  nothing Go-side to recompile.
+- **`run_traced.py` and `run_stage.py` never touch the Go binary at all** —
+  both are pure Python entry points, invoked directly with `python3` (§7,
+  §19), so a Python-only change is visible on your very next invocation of
+  either, with no build step of any kind.
+
+If you're not sure which category a change falls in, check whether the
+diff touches anything under `apps/openant-cli/` — if not, skip the rebuild.
 
 ---
 
@@ -517,6 +557,14 @@ A representative run produces:
     007_confidence_scorer.response.txt
     checkpoints.jsonl
     run_manifest.json
+    executions/
+      001_repository_analysis_and_remediation_planning.json
+      002_remediation_strategy.json
+      003_guided_context_acquisition.json
+      004_patch_generation_and_post_patch_investigation.json
+      005_challenger.json
+      ...                        # one file per recorded StageExecution --
+                                  # see §9's run_manifest.json subsection
 ```
 
 (`reports/debug/*.json`, if `AUTOPATCHER_DEBUG=1` fired any writers, land
@@ -534,12 +582,18 @@ prompt_path = self.trace_dir / f"{seq:03d}_{stage}.prompt.txt"
 response_path = self.trace_dir / f"{seq:03d}_{stage}.response.txt"
 ```
 
-Real pipeline stage names, in normal execution order (from
-`remediation_planner.py`, `patch_generator.py`, `patch_reviewer.py`,
-`patch_challenger.py`, `confidence_scorer.py`, `finding_calibration.py`):
+Real pipeline `stage=` tags, in normal execution order (from
+`remediation_planner.py`, `patch_generator.py`, `patch_challenger.py`,
+`finding_calibration.py`, `patch_reviewer.py`, `confidence_scorer.py`):
 `remediation_planning`, `remediation_strategy`, optionally
-`guided_context_request`, `patch_generation`, `patch_review`, `challenger`,
-`confidence_scorer`, `finding_calibration`.
+`guided_context_request`, `patch_generation` (possibly followed by
+`patch_generation_contract_retry`), `challenger`, optionally
+`finding_calibration` (and, only if the repair loop fires,
+`patch_repair_regeneration` then a second `challenger` then a second
+`finding_calibration`), `patch_review`, `confidence_scorer` — see the
+[architecture document's per-stage detail](../../../../../docs/auto-patcher/auto-patcher-architecture.md#per-stage-detail)
+for exactly which canonical stage owns each tag and when each one is
+conditional.
 
 A run that triggers the applicability-aware retry (§9's `patch_generation`
 discussion, §12) inserts a **second** `patch_generation` call, shifting
@@ -608,8 +662,11 @@ relying on filename position (§8).
 
 ### `run_manifest.json`
 
-Run-level summary, written once at the end. Fields actually present:
+Run-level summary, written once at the end. Two layers of content live in
+the same file:
 
+**The pre-existing flat fields** (unchanged by the execution-recording
+work below):
 - Always: `llm_call_count`, `checkpoints_file`, `autopatcher_debug_artifacts`
   (absolute paths to any `reports/debug/*.json` files that appeared during
   this run — pointers only, not copies).
@@ -619,38 +676,70 @@ Run-level summary, written once at the end. Fields actually present:
 - On failure: `status: "failed"`, `error_type`, `error_message`,
   `context_budget_policy`, `max_context_budget_windows`.
 
-Note: **no provider/model field is in `run_manifest.json`** — for that,
-read the Trust Report's Run Metadata table (§3.5), or `stderr` captured
-during the run.
+Note: **no provider/model field lives in the flat layer** — that's carried
+in the structured `llm` block below instead (or read from the Trust
+Report's Run Metadata table, §3.5, or `stderr` captured during the run).
 
-Use `run_manifest.json` to verify: run identity (`input_type`/`input_id`),
-where the final artifacts landed, whether the run succeeded, and the total
-call count (see §15 for why call count alone isn't diagnostic).
+**The structured, schema-versioned execution-graph layer** — every trace
+`run_traced.py` writes today is schema version 3:
 
-**As of this feature, that "no provider/model field" note above is only
-true of the pre-existing flat fields.** Every NEW trace additionally
-carries structured, versioned replay provenance in the same file:
-
-```json
+```jsonc
 {
-  "schema_version": 1,
+  "schema_version": 3,
+  "kind": "full_run",
+  "parent": null,
   "target_repository": {"repo_root": "/tmp/minimist-eval", "repo_commit": "<full 40-char SHA>"},
   "openant": {"patcher_commit": "<full 40-char SHA of the OpenAnt checkout that produced this trace>"},
-  "llm": {"provider": "anthropic", "model": "claude-..."}
+  "llm": {"provider": "anthropic", "model": "claude-..."},
+  "executions": [
+    {
+      "execution_id": "001_repository_analysis_and_remediation_planning",
+      "canonical_stage": "repository_analysis_and_remediation_planning",
+      "sequence": 1,
+      "invocation_kind": "initial",
+      "consumed": {},
+      "outcome": "settled",
+      "replay_of": null,
+      "invoked_by": null,
+      "artifact_path": "<output>/trace/executions/001_repository_analysis_and_remediation_planning.json",
+      "llm_calls": [{"seq": 1, "stage": "remediation_planning", "prompt_file": "...", "response_file": "..."}],
+      "external_calls": [],
+      "timing": {"started_at": "...", "finished_at": "..."}
+    }
+    // ... one entry per canonical stage the run actually instrumented
+  ]
 }
 ```
 
-merged into the exact same `run_manifest.json`, alongside (never replacing)
-every pre-existing flat field above. This is what makes a trace produced by
-this script **replay-capable by design** — see §19. A trace with no
-`schema_version` key at all is a legacy trace (produced before this
-feature existed); `run_stage.py` still accepts it via a bounded
-compatibility fallback (§19.3), but a legacy trace has no structured
-`target_repository`/`openant`/`llm` block — only the Trust Report's prose
-Run Metadata table (§3.5) has that provenance for a legacy run.
-`checkpoints.jsonl` is unaffected by any of this — it remains exactly what
-§9's own description above says: a per-LLM-call index/history, never a
-source of reconstructable stage state.
+`executions` is **honest and partial by design** — a full run's manifest
+only ever lists the canonical stages `pipeline.run()` was actually asked to
+record (today: S1-S11; S12/S13 are never separately recorded in
+production — see the architecture document's
+[Terminal reporting architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#terminal-reporting-architecture)).
+Absence of a stage from `executions` means "not instrumented in this run,"
+never "did not happen." This is what makes a trace produced by
+`run_traced.py` **replay-capable by design** — see §19-§22. See the
+architecture document's [Execution recording](../../../../../docs/auto-patcher/auto-patcher-architecture.md#execution-recording)
+section for the full field-by-field meaning of each key in an execution
+record — in particular, **do not read `sequence` or the `NNN` prefix of
+`execution_id` as the stage's canonical position**; it is a directory-local
+call-completion counter, unrelated to `CANONICAL_STAGE_ORDER`.
+
+A trace with no `schema_version` key at all is a legacy trace (produced
+before this feature existed); `run_stage.py` still accepts it via a
+bounded compatibility fallback (§19.6), but a legacy trace has no
+structured `executions` list to resolve dependencies from — only the
+Trust Report's prose Run Metadata table (§3.5) has any provenance for a
+legacy run. `checkpoints.jsonl` is unaffected by any of this — it remains
+exactly what §9's own description above says: a per-LLM-call index/
+history, never a source of reconstructable stage state.
+
+Each finished execution's own artifact (e.g.
+`trace/executions/003_patch_generation_and_post_patch_investigation.json`)
+holds that stage's actual output, serialized losslessly
+(`execution_recorder.to_jsonable`) — this is what a replay handler reads
+back and reconstructs into a typed Python object when that stage becomes a
+dependency of something being replayed.
 
 ### `vulnerability.md`
 
@@ -768,7 +857,7 @@ misclassified.**
 | Unexpected second `patch_generation` call | Applicability-aware retry (or Challenger-driven repair loop) | `checkpoints.jsonl` stage sequence, both `patch_generation.response.txt` files | Which of the two distinct retry mechanisms fired (`pipeline.py`'s applicability retry vs. its defect-driven Challenger repair loop) and why |
 | Correct patch, Challenger says still vulnerable | Challenger prompt + evidence completeness | `NNN_challenger.prompt.txt`, `NNN_challenger.response.txt` | Whether the Challenger's prompt actually contained the patched code, or stale/partial evidence |
 | Unsupported inference becomes "Confirmed" | Finding Calibration | `NNN_finding_calibration.*`, the paired `NNN_challenger.*` it was calibrating | Whether Calibration only reclassifies `plausible_risk`/`generic` findings (by design it never touches `confirmed_defect`/`validation_gap`) |
-| Correct findings but wrong final color | Trust Signals / Recommendation Policy | Trust Report's Trust Signals table, `pipeline.py`'s `_compute_trust_signals`/`_build_recommendation_v1` | Which of the six signals (patch_integrity, security_improvement, remediation_alignment, coverage_confidence, test_availability, deployment_safety) drove the mapping |
+| Correct findings but wrong final color | Trust Signals / Recommendation Policy | Trust Report's Trust Signals table, `pipeline.py`'s `_compute_trust_signals`/`_build_recommendation_v1` | Which signal drove the mapping — the six `_compute_trust_signals` computes directly (patch_integrity, security_improvement, remediation_alignment, coverage_confidence, test_availability, deployment_safety), plus the two merged in separately (source_verification, existing_test_comparison) that are also shown in the Trust Signals table |
 | Different result on identical case | Non-determinism / first-divergence analysis | Two full trace directories, compared stage by stage | See §13 — find the *first* differing stage, not just the final report |
 | Report contains a factual statement contradicted by source | Trace backward | Report → calibrated finding → Challenger/Reviewer response → prompt evidence → repository ground truth | Every hop in that chain, in order — don't skip straight from report to source |
 
@@ -1028,230 +1117,427 @@ captured before that edit.
 
 ---
 
-## Section 19 — Single-Stage Debug Replay
+## Section 19 — Stage Replay
 
 This is a second, distinct workflow from everything above. Sections 1–18
 describe **one full traced run**; this section describes **rerunning
-exactly one stage of a run you already have a trace for**, using your
-CURRENT code, without paying for (or waiting on) the rest of the pipeline.
+exactly one canonical pipeline stage's CURRENT code**, against upstream
+state resolved from a prior run's lineage, without paying for (or waiting
+on) the rest of the pipeline. §20-§22 build on this for chained replay,
+failed-stage debugging, and comparing full vs. replay executions.
 
 ### 19.1 The two workflows
 
 ```
-FULL TRACED RUN                         SINGLE-STAGE DEBUG REPLAY
+FULL TRACED RUN                         STAGE REPLAY
 
 run_traced.py                           run_stage.py
-  -> runs the full pipeline                -> consumes a source trace
-  -> creates a replay-capable                 (from run_traced.py)
-     SOURCE TRACE                         -> reruns ONLY the selected
-                                              stage's CURRENT code
-                                          -> creates an isolated
-                                             REPLAY TRACE
+  -> runs the full pipeline                -> consumes a source run/replay
+  -> creates a replay-capable                 directory
+     SOURCE RUN (schema-v3               -> resolves each dependency's
+     run_manifest.json)                     EFFECTIVE execution via
+                                             that source's lineage
+                                          -> reruns ONLY the selected
+                                             stage's CURRENT implementation
+                                          -> creates an isolated new
+                                             REPLAY RUN, itself a valid
+                                             --source-run for a further
+                                             replay (see §20)
 ```
 
-Use `run_traced.py` first, exactly as in §7, to get a source trace. Use
+Use `run_traced.py` first, exactly as in §7, to get a source run. Use
 `run_stage.py` afterward, as many times as you like, each time you change
 a stage's code/prompt and want to see the new result — without rerunning
-remediation planning, patch generation, Challenger, Finding Calibration,
-Patch Review, Confidence Scoring, or Existing Test Comparison again.
+every earlier stage.
 
 ### 19.2 When to use it
 
 You already ran a full traced evaluation (§7), found that one stage
-behaved incorrectly (this release: **`test_plan_discovery`** only — see
-§19.5 for why), and want to test a code/prompt fix to JUST that stage
-against the SAME upstream repository state the original run used —
-without spending tokens on, or waiting on, every other stage.
+behaved incorrectly, and want to test a code/prompt fix to JUST that stage
+against the SAME upstream state the original run used — without spending
+tokens on, or waiting on, every other stage.
 
-### 19.3 Currently supported stage
+### 19.3 Currently replayable stages
 
-**`test_plan_discovery` is the only stage `run_stage.py` supports in this
-release.** Requesting any other `--stage` fails immediately, before any
-file I/O or LLM call:
+`run_stage.py --stage` accepts any of the 13 canonical stage names
+(`repository_analysis_and_remediation_planning`, `remediation_strategy`,
+`guided_context_acquisition`,
+`patch_generation_and_post_patch_investigation`, `challenger`,
+`patch_repair_and_calibration`, `patch_review`, `confidence_scoring`,
+`impact_and_behavior_analysis`, `test_analysis_and_plan`,
+`existing_test_comparison`, `trust_signals_and_recommendation`,
+`report_generation`). **12 of the 13 have a working replay implementation
+today — every stage except `trust_signals_and_recommendation`.** That
+stage's logic has no independent execution to replay in production either
+— it is only ever computed as part of `report_generation`'s combined
+Trust-Signals-and-report rendering; see the architecture document's
+[Terminal reporting architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#terminal-reporting-architecture)
+for exactly why. Requesting it (or any genuinely unknown stage name) fails
+immediately, before any file I/O or LLM call:
 
 ```
-$ python3.12 utilities/autopatcher/tools/run_stage.py --source-trace /tmp/minimist-trace --stage challenger --output /tmp/out
-Stage 'challenger' is not replayable yet. Currently supported: test_plan_discovery.
+$ python3.12 utilities/autopatcher/tools/run_stage.py \
+    --source-run /tmp/minimist-trace --stage trust_signals_and_recommendation --output /tmp/out
+Stage 'trust_signals_and_recommendation' is registered but not replayable yet.
+Currently replayable: repository_analysis_and_remediation_planning, remediation_strategy,
+guided_context_acquisition, patch_generation_and_post_patch_investigation, challenger,
+patch_repair_and_calibration, patch_review, confidence_scoring, impact_and_behavior_analysis,
+test_analysis_and_plan, existing_test_comparison, report_generation.
 ```
 
-It never silently falls back to running the full pipeline instead.
+To replay "the report," pass `--stage report_generation` — its handler
+reconstructs a full `PipelineResult` from every other stage's persisted
+artifact and calls the real, unmodified `_build_report()`, which computes
+both Trust Signals/Recommendation and the report markdown in one call (see
+the architecture document). It never silently falls back to running the
+full pipeline instead of replaying.
+
+`test_analysis_and_plan`'s handler is worth calling out specifically: it is
+still **transitional**. Its full approved contract depends on
+`patch_repair_and_calibration` (S6) and `impact_and_behavior_analysis`
+(S9) — both of which are independently replayable in their own right —
+but this particular handler was never wired to reconstruct either of
+their artifacts as its own inputs, so it declares a narrower dependency
+set and computes only the `TestExecutionPlan` sub-artifact — its manifest
+entry is tagged `"transitional": true` so this is visible, not silently
+understated. See the architecture document's
+[Replay architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#replay-architecture)
+section for the full explanation.
 
 ### 19.4 Usage
 
 ```bash
 cd /Users/goddess/dev/OpenAnt/libs/openant-core
 python3.12 utilities/autopatcher/tools/run_stage.py \
-  --source-trace /tmp/minimist-trace \
-  --stage test_plan_discovery \
-  --output /tmp/minimist-test-plan-debug
+  --source-run /tmp/minimist-trace \
+  --stage patch_review \
+  --output /tmp/minimist-patch-review-debug
 ```
 
-`--source-trace` accepts either the run root (`run_traced.py`'s
-`--output`, e.g. `/tmp/minimist-trace`) or that run's `trace/`
-subdirectory directly — both resolve to the same `run_manifest.json`.
-Resolution is exact-name only, never a recursive/fuzzy search of the
-directory tree.
+Current arguments (`run_stage.py`'s `argparse` setup):
 
-`--repo-root` optionally overrides the target repository path instead of
-the one recorded in the source trace (e.g. a second checkout on this
-machine) — still subject to the identical commit-SHA and clean-worktree
-checks described in §19.6, against the SHA the source trace recorded.
+- **`--source-run`** (required) — path to a `run_traced.py` output
+  directory, OR a prior replay's `--output` directory — either the run
+  root or its `trace/` subdirectory directly. Resolution is exact-name
+  only, never a recursive/fuzzy search. Never modified by this tool.
+  **`--source-trace` is still accepted as a deprecated alias** (same
+  destination) — use `--source-run` in new commands; `--source-trace` is
+  kept only for backward compatibility with older invocations/scripts.
+- **`--stage`** (required) — the canonical stage to replay (§19.3). Known
+  but not-yet-replayable stages fail with a distinct message from
+  genuinely unknown ones — both before any I/O.
+- **`--output`** (required) — an isolated output directory for this
+  replay's artifacts. Must not be the same as, nested inside, or contain
+  `--source-run`.
+- **`--repo-root`** (optional) — overrides the target repository path
+  instead of the one recorded in the source run/replay (e.g. a second
+  checkout on this machine) — still subject to the identical commit-SHA
+  and clean-worktree checks described in §19.5, against the SHA the
+  source recorded.
 
-### 19.5 Why `test_plan_discovery` is the first (and only) supported stage
+On success, `run_stage.py` prints a small JSON summary (`stage`,
+`execution_id`, `outcome`, `output_dir`, `run_manifest`) and exits 0. On a
+handled failure (unknown/not-yet-replayable stage, unsafe output
+directory, unresolved dependency, failed target-repo safety gate) it
+prints the reason to stderr and exits 2.
 
-`discover_test_plan(repo_root, llm)` (`test_plan_discovery.py`) is the one
-Auto Patcher stage whose entire input is a filesystem path plus an LLM
-client — no remediation plan, candidate patch, Challenger result, or
-Finding Calibration output is needed. Its repository evidence
-(`gather_test_plan_evidence`) is gathered fresh, deterministically, from
-`repo_root` itself every time — there is nothing upstream to reconstruct.
-That means replaying it needs **zero earlier LLM stages to run**, which is
-the hard requirement for this feature (§19.7). Every other stage
-(`remediation_planning`, `remediation_strategy`, `patch_generation`,
-`challenger`, `finding_calibration`, `patch_review`) depends on a prior
-stage's LLM output in a way this release does not yet reconstruct — see
-the "Known Phase-1 limitations" note this feature's implementation report
-recorded, and don't assume support for them exists just because the CLI
-shape looks generic.
+### 19.5 The target-repository safety gate
 
-### 19.6 The target-repository safety gate
+This is the most important safety boundary, checked BEFORE any LLM call,
+for every replayable stage that touches the repository:
 
-This is the most important safety boundary, checked BEFORE any LLM call:
-
-1. The target repository (from the source trace, or `--repo-root`) must
+1. The target repository (from the source run, or `--repo-root`) must
    exist and be a git repository.
 2. Its current `HEAD` (full SHA) must **exactly match** the full SHA the
-   source trace recorded.
+   source recorded.
 3. Its working tree must be **clean** (`git status --porcelain` empty).
 
 Any failure stops replay immediately, before any LLM call, with a
 specific message, e.g.:
 
 ```
-Cannot replay test_plan_discovery: target repository HEAD does not match source trace.
+Cannot replay <stage>: target repository HEAD does not match source trace.
 Expected: d9f85a749488188c286cd50606d159874db94d5f
 Actual:   3a1c9e2...
 ```
 
 ```
-Cannot replay test_plan_discovery: target repository contains uncommitted changes.
+Cannot replay <stage>: target repository contains uncommitted changes.
 ```
 
-`run_stage.py` never runs `git checkout`/`reset`/`clean` — it is purely
-observational and never mutates the target repository.
+A stage that declares `requires_repo_access=False` in `stage_registry.py`
+(e.g. `challenger`, `patch_review`, `confidence_scoring`,
+`trust_signals_and_recommendation`) skips this check entirely — this is
+the **capability-aware preflight** the architecture document describes:
+a stage never pays for, or is blocked by, a check its own contract never
+needed. `run_stage.py` never runs `git checkout`/`reset`/`clean` on the
+target repository under any circumstances — it is purely observational.
 
 **This gate applies ONLY to the target repository being analyzed — never
 to the OpenAnt development checkout you're running `run_stage.py` from.**
 The OpenAnt checkout may (and, mid-debugging, usually will) be dirty —
-that's the point: you're testing an uncommitted change to
-`test_plan_discovery.py` or its prompt. `run_stage.py` records which
-OpenAnt commit produced the trace and which one is replaying it
-(`replay_manifest.json`'s `openant` block, §19.8) but never requires them
-to match, and never blocks on the OpenAnt checkout being dirty.
+that's the point: you're testing an uncommitted change to a stage's code
+or prompt. The manifest records which OpenAnt commit produced the source
+and which one is replaying it, but never requires them to match, and
+never blocks on the OpenAnt checkout being dirty.
 
-### 19.7 Provenance: source vs. replay, recorded but never compared
+### 19.6 Provenance: source vs. replay, recorded but never compared
 
-Two identities are recorded on both sides of every replay, and are
+Several identities are recorded on both sides of every replay, and are
 **never required to match** — by design, since the whole point is testing
 a current code change against historical target-repo state:
 
 | | Must match? |
 |---|---|
-| Target repository commit SHA | **Yes, strictly** (§19.6) |
-| Target repository clean working tree | **Yes** (§19.6) |
+| Target repository commit SHA | **Yes, strictly** (§19.5) |
+| Target repository clean working tree | **Yes** (§19.5) |
 | OpenAnt implementation commit (`patcher_commit`) | **No** — recorded on both sides only |
 | LLM provider/model | **No** — recorded on both sides only |
 
-A successful replay makes **exactly one LLM call**, tagged
-`stage=test_plan_discovery` — enforced by tests
-(`tests/patch/test_stage_replay.py`), and structurally guaranteed by
-`stage_replay.py` never importing `pipeline.py` or any other stage module
-(`remediation_planner`, `patch_generator`, `patch_challenger`,
-`finding_calibration`, `patch_reviewer`, `confidence_scorer`) — a replay
-cannot call a function it never imported. The one documented exception:
-`discover_test_plan` itself makes **zero** LLM calls (not an error) when
-the target repository has no test-related evidence at all
-(`gather_test_plan_evidence` found nothing) — that's a legitimate,
-current-implementation rejection, still recorded as a completed replay.
+A successful replay makes LLM calls **only** tagged with a `stage=` value
+the replayed canonical stage owns (`stage_registry.STAGE_OWNED_LLM_TAGS`)
+— any other tag captured during the replay aborts it before any manifest
+is written (an "LLM ownership violation"), so a replay cannot silently
+call into another stage's logic.
 
-### 19.8 Output
+### 19.7 Output
 
 ```
-/tmp/minimist-test-plan-debug/
-  replay_manifest.json
-  001_test_plan_discovery.prompt.txt
-  001_test_plan_discovery.response.txt
-  parsed_result.json          # if the plan was accepted
-  # or, instead:
-  rejection_reason.json       # if the plan was rejected
+/tmp/minimist-patch-review-debug/
+  run_manifest.json                 # kind: "replay", parent: <source_run>
+  001_patch_review.prompt.txt       # only if this stage made an LLM call
+  001_patch_review.response.txt
+  patch_review.json                 # this stage's own artifact — name/shape
+                                     # varies by stage (e.g. test_execution_plan.json
+                                     # for test_analysis_and_plan, report_generation.json
+                                     # for report_generation)
 ```
 
-A rejected plan is a **valid, completed replay** (exit code 0) — the
-current implementation ran, produced a result, and that result was "no
-plan" for a specific, recorded reason (malformed JSON, missing
-execution-critical field, deterministic validation failure, low
-self-reported confidence, ...). This is exactly what you inspect to tell
-whether a prompt/code change fixed the problem. Only an infrastructure
-failure (§19.6's gate, an unsupported `--stage`, an unresolvable LLM
-config, a malformed/incompatible source trace) exits non-zero, and does so
-**before** writing anything to `--output` at all.
+A directory always contains exactly one new execution
+(`execution_id` sequence is always `1` within a replay directory — see
+the architecture document's [Execution recording](../../../../../docs/auto-patcher/auto-patcher-architecture.md#execution-recording)).
+A rejected/negative outcome (e.g. `test_analysis_and_plan` rejecting a
+plan) is still a **valid, completed replay** (exit code 0) — the current
+implementation ran, produced a result, and that result happened to be
+negative for a specific, recorded reason. This is exactly what you inspect
+to tell whether a prompt/code change fixed the problem. Only an
+infrastructure failure (§19.3/§19.5's gates, an unresolvable LLM config, a
+malformed/incompatible source) exits non-zero, and does so **before**
+writing anything to `--output` at all.
 
-`replay_manifest.json` shape:
+See the architecture document's
+[Execution recording](../../../../../docs/auto-patcher/auto-patcher-architecture.md#execution-recording)
+section for the exact `run_manifest.json` field shape — it is the same v3
+schema a full run's manifest uses, just with exactly one entry in
+`executions` and `kind: "replay"`.
 
-```json
-{
-  "schema_version": 1,
-  "stage": "test_plan_discovery",
-  "outcome": "accepted",
-  "source_trace": "/tmp/minimist-trace/trace",
-  "source_provenance_origin": "structured_manifest",
-  "source_run": {"input_type": "cve", "input_id": "CVE-2021-44906"},
-  "target_repository": {"repo_root": "/tmp/minimist-eval", "repo_commit": "<full SHA>"},
-  "openant": {
-    "source_patcher_commit": "<SHA that produced the source trace>",
-    "replay_patcher_commit": "<SHA currently running this replay>",
-    "replay_openant_dirty": true
-  },
-  "llm": {
-    "source_provider": "anthropic", "source_model": "claude-...",
-    "replay_provider": "anthropic", "replay_model": "claude-..."
-  },
-  "llm_call_count": 1,
-  "started_at": "...", "finished_at": "...", "duration_seconds": 4.2
-}
-```
+### 19.8 Legacy traces
 
-### 19.9 Legacy traces
+A trace produced before the execution-graph work existed (no
+`schema_version` key in its `run_manifest.json`) is still usable:
+`run_stage.py` falls back to a **bounded** read of that Trust Report's own
+`## Run Metadata` table (§9's `trust-report.md` section) — ONLY the `Repo
+commit`, `Auto-patcher`, `LLM provider`, and `LLM model` table rows, via
+fixed-shape row patterns, never a general prose scan. If that table is
+missing, ambiguous (e.g. two `Repo commit` rows), or its `Repo commit`
+value is `unknown`, replay fails closed with a specific reason rather than
+guessing. Priority is always: structured manifest fields first, this
+bounded fallback second, fail closed third — **never** silently. A trace
+with a structured manifest never reads the Trust Report at all, for
+anything.
 
-A trace produced before this feature existed (no `schema_version` key in
-its `run_manifest.json`) is still usable: `run_stage.py` falls back to a
-**bounded** read of that Trust Report's own `## Run Metadata` table
-(§9's `trust-report.md` section) — ONLY the `Repo commit`, `Auto-patcher`,
-`LLM provider`, and `LLM model` table rows, via fixed-shape row patterns,
-never a general prose scan. If that table is missing, ambiguous (e.g. two
-`Repo commit` rows), or its `Repo commit` value is `unknown`, replay fails
-closed with a specific reason rather than guessing. Priority is always:
-structured `run_manifest.json` fields first, this bounded fallback second,
-fail closed third — **never** silently. A NEW trace's replay never reads
-the Trust Report at all, for anything (proven by
-`tests/patch/test_stage_replay.py`'s
-`test_structured_manifest_never_touches_trust_report`).
+### 19.9 Source run immutability
 
-### 19.10 Source trace immutability
-
-`run_stage.py` never modifies `--source-trace` in any way — not
+`run_stage.py` never modifies `--source-run` in any way — not
 `run_manifest.json`, not `checkpoints.jsonl`, not any prompt/response
-file, not the Trust Report. All replay output goes only to `--output`,
-which must not be the same path as, nested inside, or contain
-`--source-trace` (checked before any other work). This is enforced by a
-byte-for-byte-unchanged test in `tests/patch/test_stage_replay.py`.
+file, not the Trust Report, not any earlier `StageExecution` artifact. All
+replay output goes only to `--output`, which must not be the same path
+as, nested inside, or contain `--source-run` (checked before any other
+work). This is what makes chained replay (§20) safe to build on: every
+directory in a lineage stays byte-for-byte exactly what it was when it was
+written.
 
-### 19.11 What this is not (yet)
+---
 
-This release replays exactly one stage, once, using the trace's recorded
-upstream state. It does NOT implement (and this document should not be
-read as documenting) `--from-stage`, `--stop-after`, rerunning downstream
-stages after a replay, or evaluating an externally-supplied candidate
-patch. Those are plausible future directions the current design leaves
-room for, but none of them exist yet — don't assume a flag or behavior
-described here extends to them.
+## Section 20 — Chained Replay
+
+**Chained replay means: use one replay's own output directory as the
+`--source-run` for a further replay.** Nothing special has to be enabled
+for this — it falls directly out of how `--source-run`/`--output` are
+wired: every replay's manifest records its `parent` as the exact
+`--source-run` it was invoked with, and the resolver walks `parent`
+pointers transitively.
+
+### 20.1 The workflow
+
+```
+full run                                     (produces S4, S5, S6, S7, ...)
+  → replay S4  --source-run <full run>       --output replay-s4/
+    → replay S5  --source-run replay-s4/     --output replay-s5/
+      → replay S6  --source-run replay-s5/   --output replay-s6/
+        → replay S7  --source-run replay-s6/ --output replay-s7/
+```
+
+```bash
+cd /Users/goddess/dev/OpenAnt/libs/openant-core
+
+python3.12 utilities/autopatcher/tools/run_stage.py \
+  --source-run /tmp/minimist-trace \
+  --stage patch_generation_and_post_patch_investigation \
+  --output /tmp/replay-s4
+
+python3.12 utilities/autopatcher/tools/run_stage.py \
+  --source-run /tmp/replay-s4 \
+  --stage challenger \
+  --output /tmp/replay-s5
+
+python3.12 utilities/autopatcher/tools/run_stage.py \
+  --source-run /tmp/replay-s5 \
+  --stage patch_repair_and_calibration \
+  --output /tmp/replay-s6
+
+python3.12 utilities/autopatcher/tools/run_stage.py \
+  --source-run /tmp/replay-s6 \
+  --stage patch_review \
+  --output /tmp/replay-s7
+```
+
+### 20.2 The resolver obtains dependencies through lineage — the immediate source does not need every dependency itself
+
+This is the important part: **`--source-run` for a replay only needs to
+contain (directly, or reachably through its own `parent` chain) the
+dependency the replayed stage actually needs — it does not need to be, or
+contain, every upstream stage itself.** When replaying S7 with
+`--source-run /tmp/replay-s6`, the resolver:
+
+1. Builds the full lineage chain: `[replay-s6, replay-s5, replay-s4, full run]`.
+2. For S7's one declared dependency (`patch_repair_and_calibration`),
+   finds the closest directory containing a matching execution —
+   `replay-s6` itself — and consumes **that** (the replayed S6), not the
+   original full-run S6.
+3. If S7 needed a dependency that was never replayed anywhere in this
+   chain (in this example, it doesn't — S7 only depends on S6), the
+   resolver would keep walking up the chain and find it in the original
+   `full run`, several hops back — still correctly resolved, with no
+   special handling required at the call site.
+
+Inspect `/tmp/replay-s7/run_manifest.json`'s one execution's `consumed`
+field to see exactly which directory each dependency actually resolved
+from — see §22 for what to look for.
+
+### 20.3 Why this matters
+
+If the resolver instead always used the *original* full run's S6 (ignoring
+the replayed one), chaining a fix through S4→S5→S6→S7 would be pointless
+— S7 would evaluate against the stale, pre-fix S6 every time. The
+closest-ancestor-wins resolution with an exactness check (documented fully
+in the architecture document's
+[Effective dependency resolution](../../../../../docs/auto-patcher/auto-patcher-architecture.md#effective-dependency-resolution))
+is what makes a chained replay actually exercise your change at every
+downstream hop, while still correctly falling back to an original,
+never-replayed upstream execution when there's nothing newer to prefer.
+
+---
+
+## Section 21 — Debugging a Failed Stage
+
+A practical, end-to-end workflow combining everything above:
+
+1. **Run a full trace.**
+   ```bash
+   cd /Users/goddess/dev/OpenAnt/libs/openant-core
+   python3.12 utilities/autopatcher/tools/run_traced.py \
+     --cve CVE-2023-43804 --repo-root /tmp/urllib3-eval --output /tmp/urllib3-trace \
+     --context-budget-policy always --max-context-budget-windows 10
+   ```
+2. **Inspect the failing execution/artifacts.** Open
+   `/tmp/urllib3-trace/trace/run_manifest.json`, find the suspect stage's
+   entry in `executions` (by `canonical_stage`, never by list position —
+   see §9), and read its `artifact_path` (the stage's own settled output)
+   and its `llm_calls` entries' `prompt_file`/`response_file` (§9's
+   `*.prompt.txt`/`*.response.txt` guidance, §11's general debugging
+   walk).
+3. **Make a local code change** to the suspect stage's implementation or
+   prompt (e.g. `patch_reviewer.py`).
+4. **Replay only that stage**, from the original full run:
+   ```bash
+   python3.12 utilities/autopatcher/tools/run_stage.py \
+     --source-run /tmp/urllib3-trace \
+     --stage patch_review \
+     --output /tmp/urllib3-replay-review-v2
+   ```
+5. **Inspect the new artifact/model interaction** — the new
+   `run_manifest.json`, the new `.prompt.txt`/`.response.txt` pair, and
+   the stage's own artifact file — exactly as you would for a full run's
+   equivalent files (§9), asking the same questions (§11): was the
+   evidence actually present in the prompt? did the response change in the
+   way you intended?
+6. **Optionally replay downstream stages from that new run**, chaining
+   forward through whatever stages consume the one you just fixed (§20) —
+   e.g. `--source-run /tmp/urllib3-replay-review-v2 --stage confidence_scoring`
+   — to see the full downstream effect of your change without rerunning
+   remediation planning, patch generation, or the Challenger again.
+
+This is strictly cheaper than re-running the full pipeline for every
+iteration of a code/prompt fix, and — because replay calls the exact same
+stage implementation production does (see the architecture document's
+[Shared production/replay architecture](../../../../../docs/auto-patcher/auto-patcher-architecture.md#shared-productionreplay-architecture))
+— what you observe in a replay is what production would do with the same
+upstream state, not an approximation of it.
+
+---
+
+## Section 22 — Model Prompt/Response Inspection (replay)
+
+The same rules from §9's `*.prompt.txt`/`*.response.txt` subsections apply
+identically to a replay's own prompt/response files — they are written by
+the same underlying capture mechanism (`llm_call_tracing.LLMCallCapture`,
+§1). A replay's prompt/response pair is numbered starting from `001`
+within its own output directory, regardless of what stage or how many
+calls the source run made — never assume the numbering carries over from
+the source.
+
+To relate a replay's LLM call back to its execution record: read the
+replay's one `executions` entry's `llm_calls` list — it holds the same
+`seq`/`stage`/`prompt_file`/`response_file` shape a full run's manifest
+does, with the full prompt/response text stripped (that text is the
+`.prompt.txt`/`.response.txt` files sitting right next to the manifest).
+
+---
+
+## Section 23 — Comparing Full vs. Replay Executions
+
+When comparing a full run's execution of a stage against a later replay of
+that same stage, these `run_manifest.json` fields are the ones that
+matter:
+
+| Field | What it tells you |
+|---|---|
+| `kind` | `"full_run"` vs `"replay"` — which directory produced this manifest. |
+| `invocation_kind` | `"initial"` (production's first pass at this stage), `"retry"`, or `"replay"` — why this specific execution exists. |
+| `replay_of` | For a replay execution: the closest prior execution of the same canonical stage found anywhere in the source lineage — a provenance pointer, not a data dependency (never used by dependency resolution itself). |
+| `consumed` | The exact `{run, execution_id}` this execution actually read for each dependency — compare this between the full run's execution and the replay's execution to see whether the replay picked up a newer (replayed) upstream input or inherited the same original one (§20.2). |
+| `parent` (manifest-level, not per-execution) | Which directory this replay was invoked against — walk it manually, or via `lineage.build_chain`, to reconstruct the full lineage a given replay sits in. |
+| `artifact_path` | Points at each execution's own settled-output JSON — diff the full run's artifact against the replay's artifact directly to see exactly what changed in the stage's output. |
+| `llm_calls` (and the paired `.prompt.txt`/`.response.txt` files) | Diff the full run's prompt/response for this stage against the replay's — isolates whether a difference in behavior came from a prompt change, a code change downstream of the LLM call, or model non-determinism (same technique as §13's first-divergence analysis, applied to exactly two executions instead of two full traces). |
+
+In short: don't just compare Trust Reports or final patches — compare the
+specific execution records and artifacts, which is the whole reason the
+execution-graph/replay infrastructure records what it consumed and where
+its output landed.
+
+---
+
+## Section 24 — What This Is Not (Yet)
+
+Stage replay reruns exactly one canonical stage per `run_stage.py`
+invocation, using dependency state resolved from the source lineage. It
+does **not** implement (and this document should not be read as
+documenting) a single command that replays a whole *range* of stages in
+one invocation (`--from-stage`/`--stop-after`), or evaluating an
+externally-supplied candidate patch as if it were a stage's own output.
+Chaining multiple stages (§20) today means invoking `run_stage.py` once
+per stage, each time pointing `--source-run` at the previous hop's
+`--output` — that is a real, fully-supported workflow, just not a single
+multi-stage command yet. Don't assume a flag or behavior described here
+extends beyond what's shown above.

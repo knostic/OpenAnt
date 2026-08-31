@@ -223,7 +223,12 @@ openant project switch <org/repo> # switch active project
 
 Auto Patcher exists to answer one question: **does this AI-generated patch deserve to be trusted?** Generating a candidate patch is only the first step. Auto Patcher focuses on producing the evidence humans need to decide whether that patch should be trusted and deployed.
 
-Given a known CVE or a specific finding from an OpenAnt scan, it generates a candidate patch and then subjects that patch to independent, adversarial scrutiny, producing a Trust Report that states whether the patch is fit to deploy — backed by the evidence behind that call. It does not autofix your repository: the patch and its Trust Report are written to disk for a human to review, and the target repository is never modified.
+Given a known CVE or a specific finding from an OpenAnt scan, it runs the candidate patch through a multi-stage pipeline — repository grounding and remediation planning, patch generation, adversarial challenge, calibration, review, confidence scoring, deterministic impact/test analysis — and produces a Trust Report that states whether the patch is fit to deploy, backed by the evidence behind that call. It does not autofix your repository: the patch and its Trust Report are written to disk for a human to review, and the target repository is never modified.
+
+**Learn more:**
+- [Auto Patcher architecture](docs/auto-patcher/auto-patcher-architecture.md) — the full pipeline: every stage, execution order, how production and replay share code, and how execution artifacts/provenance work.
+- [Recommendation policy](docs/auto-patcher/recommendation-policy.md) — exactly how the Trust Report's evidence and final recommendation are decided.
+- [Tracing & debugging guide](libs/openant-core/utilities/autopatcher/tools/TRACING_AND_DEBUGGING.md) — running a traced evaluation, inspecting execution manifests, and replaying individual pipeline stages during development.
 
 ### Why AI-generated patches can't be trusted at face value
 
@@ -331,7 +336,7 @@ A clean apply and passing hygiene checks mean the patch is well-formed — not t
 
 - Auto Patcher is an early-stage capability — its own reports are labeled MVP output today.
 - Some evidence signals (impact analysis, existing-test discovery) currently run meaningfully only on Python codebases; on other languages they report as not applicable rather than being silently skipped.
-- Auto Patcher does not build the target repository or execute its test suite. Test availability means relevant existing tests were discovered, not that they were run or passed; suggested tests are recommendations for follow-up validation. Adding test suite run is part of the roadmap. 
+- The Trust Report's "Do relevant tests already exist?" signal is a **discovery** check (does a matching test file exist on disk), not an execution check — it doesn't tell you whether those tests pass. Auto Patcher can optionally also *execute* the repository's existing test suite, in Docker, once before and once after the patch, and report any newly-introduced failures (Existing Test Comparison) — but this is opt-in, not yet exposed as an `openant patch` flag, and its result is informational only: it does not affect the recommendation. See [Existing Test Comparison](docs/auto-patcher/recommendation-policy.md#current-limitations) for the exact distinction.
 - This is a decision aid for a human reviewer, not a replacement for manual security review.
 
 ## Roadmap
