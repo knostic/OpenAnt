@@ -186,6 +186,11 @@ class CallGraphBuilder:
         # Local variable -> constructor-type map, so that `v = ClassName(); v.method()`
         # dispatches to the bound type's method.
         local_types = self._collect_local_types(tree)
+        # #318 (wave r5): the caller's own bound names AND the classes it
+        # defines at its own level (a receiver named for one of those is a
+        # class reference in this caller, not a variable).
+        bound_names = self._collect_bound_names(tree)
+        defined_classes = self._collect_defined_classes(tree)
         # #309 (item 4): a type-annotated parameter carries its receiver
         # type in the signature — consult it (a local Assign binding still
         # wins, matching Python's own scoping).
@@ -231,13 +236,14 @@ class CallGraphBuilder:
                         and isinstance(node.ctx, ast.Load)
                         and value.id in local_types):
                     typed = self._resolve_class_method(
-                        local_types[value.id], node.attr, caller_file)
+                        local_types[value.id], node.attr, caller_file,
+                        defined_classes=defined_classes)
                     if typed:
                         func_data = self.functions.get(typed, {})
                         if func_data.get('unit_type') == 'property':
                             calls.add(typed)
             if isinstance(node, ast.Call):
-                resolved = self._resolve_call_node(node, caller_file, caller_class, local_types, aliases, self_aliases)
+                resolved = self._resolve_call_node(node, caller_file, caller_class, local_types, aliases, self_aliases, bound_names, defined_classes)
                 if resolved:
                     calls.add(resolved)
                 # Higher-order-function callbacks: a function reference passed as an
@@ -324,6 +330,119 @@ class CallGraphBuilder:
                         types[arg.arg] = ann.id
         return types
 
+    def _collect_bound_names(self, tree: ast.AST) -> Set[str]:
+        """#318 (wave r4): every name the CALLER'S OWN scope binds.
+
+        The scope rules (each pinned):
+        - the ROOT def's parameters: YES (they are the caller's own);
+          a NESTED def's parameters: NO (its own scope);
+        - a NESTED def/class NAME (directly in the caller's body): YES
+          (it binds in the caller's scope); deeper names: NO;
+        - Assign/for/with/walrus targets, except-aliases, and match-case
+          captures at the caller's own level: YES; inside any nested
+          def/lambda/class/comprehension body: NO (their own scopes);
+        - ``global X``: NOT collected — the statement declares X NON-local
+          (deliberately no ast.Global branch);
+        - import aliases (``from x import Foo``): NOT collected — an
+          imported name is a REFERENCE (the import check resolves it), not
+          a locally-bound variable.
+        """
+        bound: Set[str] = set()
+
+        def _args_of(args: ast.arguments):
+            out = set()
+            for a in [*args.args, *args.kwonlyargs, *args.posonlyargs]:
+                out.add(a.arg)
+            if args.vararg:
+                out.add(args.vararg.arg)
+            if args.kwarg:
+                out.add(args.kwarg.arg)
+            return out
+
+        def _visit(node, own: bool, root: bool):
+            nonlocal bound
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if root:
+                    bound |= _args_of(node.args)   # the caller's own params
+                    for child in ast.iter_child_nodes(node):
+                        _visit(child, True, False)  # the body: the caller's scope
+                elif own:
+                    bound.add(node.name)            # binds in the caller's scope
+                    for child in ast.iter_child_nodes(node):
+                        _visit(child, False, False) # the body: its own scope
+                else:
+                    for child in ast.iter_child_nodes(node):
+                        _visit(child, False, False)
+                return
+            if isinstance(node, ast.Lambda):
+                for child in ast.iter_child_nodes(node):
+                    _visit(child, False, False)     # the lambda's own scope
+                return
+            if isinstance(node, ast.ClassDef):
+                if own:
+                    bound.add(node.name)            # binds in the caller's scope
+                for child in ast.iter_child_nodes(node):
+                    _visit(child, False, False)     # a class body is its own scope
+                return
+            if isinstance(node, ast.comprehension):
+                return                               # its own scope
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                if own:
+                    bound.add(node.id)
+            elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+                name = getattr(node, 'name', None)
+                if own and name:
+                    bound.add(name)
+            for child in ast.iter_child_nodes(node):
+                _visit(child, own, False)
+
+        # the parsed source is a Module whose single body statement is the
+        # caller's own def — unwrap it so the root-def rules apply
+        if (isinstance(tree, ast.Module)
+                and len(tree.body) == 1
+                and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))):
+            _visit(tree.body[0], True, True)
+        else:
+            _visit(tree, True, True)
+        return bound
+
+    def _collect_defined_classes(self, tree: ast.AST) -> Set[str]:
+        """#318 (wave r5): the classes defined AT the caller's own level.
+
+        A receiver bearing one of these names is a class REFERENCE in this
+        caller (the local class IS what the name binds here), not a
+        variable — the r1 phantom guard must not route it away from the
+        class branch (r4's nested-class-name rule had ``Foo.own()`` inside
+        the defining function lose an edge master resolved).
+        """
+        defined: Set[str] = set()
+
+        def _visit(node, own: bool, root: bool = False):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if root:
+                    # the ROOT def's body IS the caller's level — a class
+                    # defined directly in it binds its name here
+                    for child in ast.iter_child_nodes(node):
+                        _visit(child, True)
+                # a nested def's body: its own scope — no classes of its
+                # count as the caller's
+                return
+            if isinstance(node, ast.ClassDef):
+                if own:
+                    defined.add(node.name)
+                for child in ast.iter_child_nodes(node):
+                    _visit(child, False)
+                return
+            for child in ast.iter_child_nodes(node):
+                _visit(child, own)
+
+        if (isinstance(tree, ast.Module)
+                and len(tree.body) == 1
+                and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))):
+            _visit(tree.body[0], True, root=True)
+        else:
+            _visit(tree, True)
+        return defined
     def _collect_local_types(self, tree: ast.AST) -> Dict[str, str]:
         """Map local variable names to the class name they are constructed from.
 
@@ -577,7 +696,9 @@ class CallGraphBuilder:
     def _resolve_call_node(self, node: ast.Call, caller_file: str, caller_class: Optional[str],
                            local_types: Optional[Dict[str, str]] = None,
                            aliases: Optional[Dict[str, str]] = None,
-                           self_aliases: Optional[Set[str]] = None) -> Optional[str]:
+                           self_aliases: Optional[Set[str]] = None,
+                           bound_names: Optional[Set[str]] = None,
+                           defined_classes: Optional[Set[str]] = None) -> Optional[str]:
         """Resolve an AST Call node to a function ID.
 
         ``self_aliases`` is the set of receiver names that refer to the current
@@ -602,7 +723,8 @@ class CallGraphBuilder:
             # same binding; without it, h() was dropped while h.method() resolved.
             if func_name in local_types:
                 callable_target = self._resolve_class_method(
-                    local_types[func_name], '__call__', caller_file)
+                    local_types[func_name], '__call__', caller_file,
+                    defined_classes=defined_classes)
                 if callable_target:
                     return callable_target
             # A same-file user function with the same name as a stdlib
@@ -634,7 +756,14 @@ class CallGraphBuilder:
             # returns None for a name that isn't a function. Without this fallback
             # the constructor call resolved to no function at all and the
             # __init__ edge was dropped from reachability entirely.
-            return self._resolve_class_method(func_name, '__init__', caller_file)
+            # #318 (deep-refute): the ctor fallback only fires for a
+            # CLASS-NAME call — a receiver the caller's scope BINDS (a
+            # parameter/variable shadowing the class) is not one.
+            if func_name in (bound_names or set()) and \
+                    func_name not in (defined_classes or set()):
+                return None
+            return self._resolve_class_method(func_name, '__init__', caller_file,
+                                                defined_classes=defined_classes)
 
         # Method call: obj.method(...)
         elif isinstance(func, ast.Attribute):
@@ -657,14 +786,32 @@ class CallGraphBuilder:
             # module.func(...) or object.method(...)
             if isinstance(obj, ast.Name):
                 obj_name = obj.id
+                # #318 (wave r5): a receiver the caller's own scope BINDS is
+                # a variable, not a class-name reference — UNLESS it is a
+                # class the caller itself DEFINES at this level (the name
+                # binds to the local class IN THIS CALLER — a class
+                # reference; r4's blanket guard lost ``Foo.own()`` inside
+                # the defining function, an edge master resolved).
+                if obj_name in (bound_names or set()) and \
+                        obj_name not in (defined_classes or set()):
+                    if obj_name in (local_types or {}):
+                        typed = self._resolve_class_method(local_types[obj_name], method_name, caller_file,
+                                                       defined_classes=defined_classes)
+                        if typed:
+                            return typed
+                    return self._resolve_module_call(
+                        obj_name, method_name, caller_file,
+                        receiver_is_local_var=True,
+                        defined_classes=defined_classes)
                 # Local variable of a locally-known type: `v = ClassName(); v.method()`
                 # resolves to the constructed class's method,
                 # which _resolve_module_call (imports / same-file class NAMES only) cannot do.
                 if obj_name in local_types:
-                    typed = self._resolve_class_method(local_types[obj_name], method_name, caller_file)
+                    typed = self._resolve_class_method(local_types[obj_name], method_name, caller_file,
+                                                       defined_classes=defined_classes)
                     if typed:
                         return typed
-                return self._resolve_module_call(obj_name, method_name, caller_file)
+                return self._resolve_module_call(obj_name, method_name, caller_file, defined_classes=defined_classes)
 
             # Chained calls: obj.method1().method2(...)
             # Skip common methods
@@ -727,7 +874,11 @@ class CallGraphBuilder:
                     return func_id
 
             class_data = self.classes.get(class_key, {})
-            for base in class_data.get('bases', []):
+            # #318 (deep-refute): the self/super walks read the UNION
+            # (``all_bases``) — a function-local namesake's merged file-scope
+            # ``bases`` is the module side's, but its OWN methods' self/super
+            # dispatch still follows the local declaration's chain.
+            for base in class_data.get('all_bases', class_data.get('bases', [])):
                 # Only same-file base names are resolvable via our index.
                 base_name = base.split('.')[-1]
                 if base_name not in seen:
@@ -760,7 +911,7 @@ class CallGraphBuilder:
             class_data = self.classes.get(class_key)
             if not class_data:
                 continue
-            for base in class_data.get('bases', []):
+            for base in class_data.get('all_bases', class_data.get('bases', [])):
                 base_simple = base.split('.')[-1]            # 'pkg.Base' -> 'Base'
                 # Find every class (across files) whose simple name matches this base.
                 for cand_key, cand_data in self.classes.items():
@@ -780,20 +931,64 @@ class CallGraphBuilder:
                 return func_id
         return None
 
-    def _resolve_class_method(self, class_name: str, method_name: str, caller_file: str) -> Optional[str]:
+    def _same_file_base_walk(self, class_name: str, method_name: str,
+                             caller_file: str) -> Optional[str]:
+        """#318: walk a class's SAME-FILE bases to the first ancestor that
+        defines ``method_name`` — the C suite's sound floor (Bug [30]),
+        the same own-first FIFO, cycle-guarded order ``_resolve_self_call``
+        uses, so the most-derived definition wins and no derived-override
+        fan-out occurs. Base lookup restricted to the caller's own file:
+        external bases aren't in the index, so they stay unresolved rather
+        than mis-linked (the ``self`` walk's own restriction).
+        """
+        seen: Set[str] = set()
+        queue: List[str] = [class_name.split('.')[-1]]
+        while queue:
+            base_name = queue.pop(0)
+            if base_name in seen:
+                continue
+            seen.add(base_name)
+            class_key = f"{caller_file}:{base_name}"
+            method_id = self._method_in_class(class_key, method_name)
+            if method_id:
+                return method_id
+            for base in self.classes.get(class_key, {}).get('bases', []):
+                base_simple = base.split('.')[-1]
+                if base_simple not in seen:
+                    queue.append(base_simple)
+        return None
+
+    def _resolve_class_method(self, class_name: str, method_name: str, caller_file: str,
+                              defined_classes: Optional[Set[str]] = None) -> Optional[str]:
         """Resolve ``ClassName.method`` to a function id, same-file first then cross-file.
 
         Used to dispatch a call on a local variable whose type is known.
         Same-file resolution is preferred; otherwise the class
         is matched by simple name across all parsed files (unambiguous single match only,
         to avoid binding to an unrelated same-named class).
+
+        #318: an inherited method (declared only on a same-file base) resolves
+        via the same-file base walk BEFORE the cross-file name match — the
+        same-file base is strictly more precise than a cross-file simple name.
         """
         class_simple = class_name.split('.')[-1]
-        # 1. Same file.
+        # 1. Same file: the class's own declaration.
         same_file = self._method_in_class(f"{caller_file}:{class_simple}", method_name)
         if same_file:
             return same_file
-        # 2. Cross-file: exactly one class with this simple name that defines the method.
+        # 2. #318: the same-file base chain (inherited methods — the C
+        # suite's sound floor). A FUNCTION-LOCAL class keyed at file scope
+        # must not hijack an imported namesake (wave r1: ``from x import Foo``
+        # plus a function-local ``class Foo(Base)`` — the module-level binding
+        # at any other call site is the IMPORT, so the cross-file match is
+        # correct and the walk would mis-bind the local Base).
+        class_key = f"{caller_file}:{class_simple}"
+        defined_here = class_simple in (defined_classes or set())
+        if defined_here or not self.classes.get(class_key, {}).get('function_local'):
+            inherited = self._same_file_base_walk(class_simple, method_name, caller_file)
+            if inherited:
+                return inherited
+        # 3. Cross-file: exactly one class with this simple name that defines the method.
         matches = []
         for class_key, class_data in self.classes.items():
             if class_data.get('name') == class_simple:
@@ -804,13 +999,20 @@ class CallGraphBuilder:
             return matches[0]
         return None
 
-    def _resolve_module_call(self, obj_name: str, method_name: str, caller_file: str) -> Optional[str]:
+    def _resolve_module_call(self, obj_name: str, method_name: str, caller_file: str,
+                             receiver_is_local_var: bool = False,
+                             defined_classes: Optional[Set[str]] = None) -> Optional[str]:
         """Resolve a module.function() or object.method() call."""
         # Skip builtin modules
         if self._is_builtin(obj_name):
             return None
 
         # Check if obj_name is an imported module/class
+        # (panel r4 note): receiver_is_local_var deliberately does NOT gate
+        # this import branch — a local variable whose name matches an
+        # IMPORTED symbol still resolves through the import (the pre-
+        # existing over-seed direction; a local-var gate here would drop
+        # real imported-symbol calls that only happen to share a name).
         file_imports = self.imports.get(caller_file, {})
         if obj_name in file_imports:
             import_path = file_imports[obj_name]
@@ -818,13 +1020,36 @@ class CallGraphBuilder:
             return self._resolve_import(import_path, method_name, caller_file)
 
         # Check if obj_name is a class in the same file
+        # #318 (need-check): gate on the CLASS INDEX, not methods_by_class —
+        # a method-less subclass (``class Config(Base): pass; Config.load()``)
+        # — the most common M2 shape — has no methods_by_class entry, and
+        # the old gate skipped the base walk entirely.
+        # #318 (wave r1): a receiver that is a known LOCAL VARIABLE is not
+        # a class-name reference — the typed path already ran and missed;
+        # the class branch here must not bind a same-file class sharing the
+        # variable's name (a fabricated edge).
         class_key = f"{caller_file}:{obj_name}"
-        if class_key in self.methods_by_class:
-            class_methods = self.methods_by_class[class_key]
+        if (not receiver_is_local_var
+                and (class_key in self.classes or class_key in self.methods_by_class)):
+            class_methods = self.methods_by_class.get(class_key, [])
             for func_id in class_methods:
                 func_data = self.functions.get(func_id, {})
                 if func_data.get('name') == method_name:
                     return func_id
+            # #318 (M2): a classmethod (or method) reached by CLASS NAME
+            # resolves through the same-file base chain like one reached
+            # through ``self`` — the C suite's sound floor. A FUNCTION-LOCAL
+            # class keyed at file scope must not fire the walk UNLESS this
+            # caller itself defines it (the name binds to the local class
+            # here — the M1 gate, mirrored, with the defining-caller
+            # exception; the merged module-level namesake's bases are the
+            # module side's, so the walk inside the defining caller can
+            # mis-fire on the merged bases — disclosed).
+            defined_here = obj_name in (defined_classes or set())
+            if defined_here or not self.classes.get(class_key, {}).get('function_local'):
+                inherited = self._same_file_base_walk(obj_name, method_name, caller_file)
+                if inherited:
+                    return inherited
 
         return None
 

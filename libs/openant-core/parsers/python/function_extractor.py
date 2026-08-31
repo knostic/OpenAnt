@@ -527,7 +527,8 @@ class FunctionExtractor:
         return bodies
 
     def _descend_into_blocks(self, stmts: list, file_path: Path, content: str,
-                             enclosing_class: Optional[str] = None) -> None:
+                             enclosing_class: Optional[str] = None,
+                             function_local: bool = False) -> None:
         """Find def/class nodes inside block statements at ANY depth and emit them.
 
         A `def`/`class` inside an `if`/`try`/`for`/`while`/`with`/`match` block is
@@ -552,8 +553,10 @@ class FunctionExtractor:
                                                     class_name=enclosing_class)
                     elif isinstance(child, ast.ClassDef):
                         self._process_class_tree(child, file_path, content,
-                                                 outer_qualifier=enclosing_class)
-                self._descend_into_blocks(body, file_path, content, enclosing_class)
+                                                 outer_qualifier=enclosing_class,
+                                                 function_local=function_local)
+                self._descend_into_blocks(body, file_path, content, enclosing_class,
+                                          function_local=function_local)
 
     def _process_function_tree(self, node: ast.AST, file_path: Path, content: str,
                                class_name: Optional[str] = None) -> None:
@@ -576,19 +579,24 @@ class FunctionExtractor:
                 # function in its own right; do not attribute it to a class.
                 self._process_function_tree(child, file_path, content, class_name=None)
             elif isinstance(child, ast.ClassDef):
-                self._process_class_tree(child, file_path, content, outer_qualifier=None)
+                self._process_class_tree(child, file_path, content,
+                                         outer_qualifier=None,
+                                         function_local=True)
         # defs/classes wrapped in a block inside this function's body
-        self._descend_into_blocks(node.body, file_path, content)
+        self._descend_into_blocks(node.body, file_path, content,
+                                  function_local=True)
 
     def _process_class_tree(self, node: ast.ClassDef, file_path: Path, content: str,
-                            outer_qualifier: Optional[str] = None) -> None:
+                            outer_qualifier: Optional[str] = None,
+                            function_local: bool = False) -> None:
         """Register a class, its methods, and any classes nested within it.
 
         `outer_qualifier` is the dotted prefix of any enclosing class
         (e.g. 'Outer' so an inner class method is keyed 'Outer.Inner.deep').
         """
         class_id, class_data, method_nodes = self.process_class(
-            node, str(file_path), content, outer_qualifier=outer_qualifier
+            node, str(file_path), content, outer_qualifier=outer_qualifier,
+            function_local=function_local
         )
         existing = self.classes.get(class_id)
         if existing is None:
@@ -608,24 +616,77 @@ class FunctionExtractor:
             self._process_function_tree(method_node, file_path, content, class_name=method_class_name)
 
         # Recurse into nested classes so their methods are extracted.
+        # (panel r4): forward function_local — a class nested inside a
+        # function-local class is itself function-local; dropping the flag
+        # here mis-keyed the nested declaration as module-level.
         for item in node.body:
             if isinstance(item, ast.ClassDef):
-                self._process_class_tree(item, file_path, content, outer_qualifier=qualified_class)
+                self._process_class_tree(item, file_path, content,
+                                          outer_qualifier=qualified_class,
+                                          function_local=function_local)
         # defs/classes wrapped in a block inside the class body (e.g. an
         # `if TYPE_CHECKING:` block declaring conditional members). Thread the
         # class so a block-nested def stays a method of this class.
         self._descend_into_blocks(node.body, file_path, content,
-                                  enclosing_class=qualified_class)
+                                  enclosing_class=qualified_class,
+                                  function_local=function_local)
 
     @staticmethod
     def _merge_class_data(existing: Dict, new: Dict) -> None:
         """Union a second declaration of a same-keyed class into the first.
 
-        Only additive: bases/methods/decorators are unioned (order-preserving),
-        the line range is widened, and a missing docstring is backfilled. Never
-        drops data the existing declaration already carried.
+        Additive for methods/decorators/line-range/docstring. ``bases`` is
+        the ONE reset-union split (wave r4, both panels): on a scope
+        mismatch the file-scope ``bases`` RESETS to the module-level side's
+        (the merged entry under a file-scope key is the module-level class
+        the name binds to at every other call site), while ``all_bases``
+        UNIONS everything — the module side's bases, the local side's
+        bases, and any ``all_bases`` the existing entry already carried
+        (a third same-named declaration must not discard the first local's
+        bases), preserving the self/super walks inside the function-local
+        declaration's methods.
         """
-        for key in ('bases', 'methods', 'decorators'):
+        new_local = bool(new.get('function_local'))
+        old_local = bool(existing.get('function_local'))
+        # #318 (wave r3): a function-local declaration's BASES do not belong
+        # to a module-level namesake. The merged entry under a file-scope key
+        # represents the MODULE-LEVEL class (that is what the name binds at
+        # every other call site), so on a scope mismatch the bases RESET to
+        # the module-level side's — whichever direction the declarations
+        # arrived in. Same-scope declarations union.
+        if old_local != new_local:
+            # #318 (deep-refute): the file-scope ``bases`` is the module
+            # side's (the typed-receiver walk's hijack guard), but the
+            # self/super walks read the SAME entry from inside the
+            # function-local declaration's methods — for those, the UNION
+            # survives (``all_bases``): resetting both severed
+            # self.m()/super().m() inside the local class (a correct-to-
+            # wrong regression the parent's union did not have).
+            module_side = new if not new_local else existing
+            local_side = existing if not new_local else new
+            # Sonnet (panel r4): local_side IS existing in the
+            # module-after-local order — capture its bases BEFORE the
+            # reset, or the aliasing silently reads the post-reset module
+            # bases twice and the local declaration's bases vanish from
+            # the union.
+            local_bases = list(local_side.get('bases', []))
+            existing['bases'] = list(module_side.get('bases', []))
+            # Fable (panel r4): union the PRE-EXISTING all_bases too — a
+            # third same-named declaration (local -> module -> local) must
+            # not discard the first local's bases.
+            all_bases = list(existing.get('all_bases', []))
+            for item in list(existing['bases']) + local_bases:
+                if item not in all_bases:
+                    all_bases.append(item)
+            existing['all_bases'] = all_bases
+        else:
+            for item in new.get('bases', []):
+                if item not in existing['bases']:
+                    existing['bases'].append(item)
+            for item in new.get('bases', []):
+                if item not in existing.setdefault('all_bases', list(existing['bases'])):
+                    existing['all_bases'].append(item)
+        for key in ('methods', 'decorators'):
             for item in new.get(key, []):
                 if item not in existing[key]:
                     existing[key].append(item)
@@ -633,6 +694,11 @@ class FunctionExtractor:
         existing['end_line'] = max(existing['end_line'], new['end_line'])
         if not existing.get('docstring'):
             existing['docstring'] = new.get('docstring')
+        # #318 (wave r2): the function-local flag is ANDed — the merged key
+        # is function-local only if EVERY declaration of it is (a module-
+        # level namesake declared after a function-local one must not
+        # inherit the flag, or its inherited methods go unresolved).
+        existing['function_local'] = old_local and new_local
 
     def extract_assigned_lambdas(self, tree: ast.AST, file_path: Path, content: str) -> None:
         """Emit a function unit for each module-level `name = lambda ...`.
@@ -736,7 +802,8 @@ class FunctionExtractor:
         return func_id, func_data
 
     def process_class(self, node: ast.ClassDef, file_path: str, content: str,
-                      outer_qualifier: Optional[str] = None) -> Tuple[str, Dict, List[Tuple]]:
+                      outer_qualifier: Optional[str] = None,
+                      function_local: bool = False) -> Tuple[str, Dict, List[Tuple]]:
         """Process a class definition and extract metadata.
 
         `outer_qualifier` is the dotted name of any enclosing class, so a class
@@ -754,6 +821,16 @@ class FunctionExtractor:
                 bases.append(base.id)
             elif isinstance(base, ast.Attribute):
                 bases.append(self._get_attribute_string(base))
+            elif isinstance(base, ast.Subscript):
+                # #318 (wave r1, both axes): a subscripted base —
+                # ``class Sub(Base[int])``, the Generic idiom — must not
+                # sever the chain: unwrap to the subscripted value
+                # (``Base[int]`` -> ``Base`` / ``pkg.Base``).
+                inner = base.value
+                if isinstance(inner, ast.Name):
+                    bases.append(inner.id)
+                elif isinstance(inner, ast.Attribute):
+                    bases.append(self._get_attribute_string(inner))
 
         decorators = self.extract_decorators(node)
 
@@ -774,6 +851,12 @@ class FunctionExtractor:
             'bases': bases,
             'decorators': decorators,
             'docstring': self.get_docstring(node),
+            # #318 (wave r1): a class defined INSIDE a function is keyed at
+            # file scope (``app.py:Foo``) but its name is only bound within
+            # that function — at any other call site the name resolves to the
+            # module-level binding (an import or a module-level class). The
+            # flag lets the resolver skip the hijack.
+            'function_local': function_local,
         }
 
         return class_id, class_data, [(m, class_name) for m in method_funcs]
