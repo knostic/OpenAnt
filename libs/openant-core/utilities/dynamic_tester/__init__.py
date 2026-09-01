@@ -86,6 +86,7 @@ def run_dynamic_tests(
     repo_path: str | None = None,
     registry: PhaseRegistry | None = None,
     llm_config_name: str | None = None,
+    usage_baseline: dict | None = None,
 ) -> list[DynamicTestResult]:
     """Run dynamic tests for all findings in a pipeline output file.
 
@@ -196,6 +197,19 @@ def run_dynamic_tests(
         _prior_output += _cp.get("generation_output_tokens", 0) or 0
     if _prior_cost > 0 or _prior_input > 0 or _prior_output > 0:
         tracker.add_prior_usage(_prior_input, _prior_output, _prior_cost)
+        # #333 (wave r1 opus): refresh the caller's phase-line baseline AT
+        # the injection — the restored checkpoints' spend was reported by
+        # their ORIGINAL run's console line, and a pre-injection snapshot
+        # double-counted it here (the #281 cross-phase contract, extended to
+        # the dynamic-test step).
+        if usage_baseline is not None:
+            _tot = tracker.get_totals()
+            usage_baseline["cost_usd"] = _tot.get("total_cost_usd",
+                                                 usage_baseline["cost_usd"])
+            usage_baseline["tokens"] = _tot.get("total_tokens",
+                                                usage_baseline["tokens"])
+            usage_baseline["calls"] = _tot.get("total_calls",
+                                               usage_baseline["calls"])
 
     results: list[DynamicTestResult] = []
 

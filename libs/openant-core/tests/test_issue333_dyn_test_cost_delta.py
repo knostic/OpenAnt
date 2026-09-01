@@ -137,3 +137,71 @@ def test_standalone_run_reports_own_total(tmp_path):
     md, js = _run(tmp_path, gen)
     assert abs(_md_total_cost(md) - 0.05) < 0.0005
     assert abs(js["total_cost_usd"] - 0.05) < 1e-6
+
+
+def test_console_phase_line_excludes_the_restored_checkpoints(tmp_path, monkeypatch, capsys):
+    """Wave r1 (opus): the dynamic-test CONSOLE line carried the #281 shape —
+    the phase baseline snapshotted BEFORE the checkpoint injection, so a
+    resumed run's `Dynamic Test:` line double-counted the restored spend
+    (their original run's line already reported it). The baseline holder is
+    refreshed AT the injection site: the line reports only the NEW retry
+    spend."""
+    import core.dynamic_tester as cd
+    tracker = get_global_tracker()
+
+    # 10 restored checkpoints' worth of prior spend, injected by the loop.
+    pipeline = tmp_path / "pipeline_output.json"
+    pipeline.write_text(json.dumps({
+        "repository": {"name": "t", "language": "python"},
+        "application_type": "unknown",
+        "findings": [{
+            "id": "f1", "name": "X", "short_name": "x", "location": "a.py:1",
+            "cwe_id": 79, "stage2_verdict": "confirmed",
+            "vulnerable_code": "eval(x)", "attack_vector": "a",
+            "steps_to_reproduce": "s", "impact": "i", "suggested_fix": "f",
+        }],
+    }))
+    # run_dynamic_tests derives its checkpoint dir from output_dir
+    # (output_dir/dynamic_test_checkpoints) when no explicit path is given —
+    # the step wrapper passes output_dir through.
+    out = tmp_path / "out"
+    out.mkdir()
+    cp = out / "dynamic_test_checkpoints"
+    cp.mkdir()
+    # an ERRORED checkpoint carrying prior spend: its $0.60 is injected (the
+    # loop injects ALL checkpoints) AND the finding is retried (the gen
+    # monkeypatch spends $0.03 on the retry).
+    import json as _json
+    (cp / "f1.json").write_text(_json.dumps({
+        "id": "f1", "status": "ERROR",
+        "generation_cost_usd": 0.60,
+        "generation_input_tokens": 1000, "generation_output_tokens": 500,
+    }))
+    (cp / "_summary.json").write_text(_json.dumps(
+        {"total_units": 1, "completed": 0, "errors": 1}))
+
+    class _FakeRegistry:
+        def get(self, phase):
+            return PhaseBinding(phase=phase, adapter=_NoopAdapter(),
+                                model="m", provider_name="anthropic")
+
+    def gen(*a, **k):
+        tracker.add_prior_usage(0, 0, 0.03)   # the retry's own spend
+        return None
+
+    import utilities.dynamic_tester as dt
+    monkeypatch.setattr(dt, "generate_test", gen)
+    err = capsys.readouterr().err
+    out = tmp_path / "out"
+    # the step wrapper (docker availability is mocked away; the loop's
+    # finding is already restored so no container runs)
+    monkeypatch.setattr(cd.shutil, "which", lambda n: "/usr/bin/docker" if n == "docker" else None)
+    cd.run_tests(
+        pipeline_output_path=str(pipeline), output_dir=str(out),
+        registry=_FakeRegistry())
+    err = capsys.readouterr().err
+    line = next((l for l in err.splitlines() if "Dynamic Test:" in l), None)
+    assert line is not None, err
+    # ONLY the retry's $0.03 — the restored $0.60 stays in its original
+    # run's line (double-counted before: the line read $0.63).
+    assert "$0.0300" in line, f"the console phase line includes restored spend: {line}"
