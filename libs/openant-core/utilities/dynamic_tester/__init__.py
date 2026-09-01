@@ -89,6 +89,16 @@ def _summary_counts_from_checkpoints(checkpointed) -> dict:
             breakdown[cat] = breakdown.get(cat, 0) + 1
         else:
             completed += 1
+            # wave r1 (sonnet): the collector writes "Container execution
+            # timed out" with status INCONCLUSIVE, never ERROR — the timeout
+            # bucket was dead code (real timeouts invisible in BOTH errors
+            # and the breakdown). A timed-out unit is a timeout for triage
+            # regardless of its terminal status: counted here WITHOUT
+            # inflating `errors` (it is not an error; the counts stay the
+            # #311 disjoint semantics).
+            det = cp.get("details")
+            if isinstance(det, str) and det.strip().startswith("Container execution timed out"):
+                breakdown["timeout"] = breakdown.get("timeout", 0) + 1
     return {"completed": completed, "errors": errors, "error_breakdown": breakdown}
 
 

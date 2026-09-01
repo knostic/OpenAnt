@@ -117,3 +117,19 @@ def test_derivation_empty_states():
     assert counts["error_breakdown"] == {}
     counts = _summary_counts_from_checkpoints(None)
     assert counts["error_breakdown"] == {}
+
+
+def test_real_timeout_rows_reach_the_breakdown():
+    """Wave r1 (sonnet): the collector writes "Container execution timed out"
+    with status INCONCLUSIVE, never ERROR — the timeout bucket was DEAD CODE
+    (the old test fabricated a status/details combo production never
+    produces). A real timed-out row counts in the timeout bucket WITHOUT
+    inflating `errors` (the #311 disjoint semantics hold)."""
+    cps = {
+        "u1": {"status": "INCONCLUSIVE", "details": "Container execution timed out"},
+        "u2": {"status": "ERROR", "details": "Docker build failed: exit 1"},
+    }
+    counts = _summary_counts_from_checkpoints(cps)
+    assert counts["completed"] == 1
+    assert counts["errors"] == 1
+    assert counts["error_breakdown"] == {"timeout": 1, "build": 1}
