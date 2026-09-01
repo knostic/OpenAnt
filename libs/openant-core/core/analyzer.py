@@ -356,7 +356,7 @@ def _cp_is_error(cp_data):
     return analyze_result_is_error(res)
 
 
-def _seed_summary(existing: dict) -> dict:
+def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None) -> dict:
     """Seed the _summary.json counters from checkpointed rows.
 
     Counts as completed ONLY the rows adoption will keep: an errored row
@@ -367,6 +367,16 @@ def _seed_summary(existing: dict) -> dict:
     neither-key shape). Usage tokens accumulate over ALL rows — the spend
     happened regardless of the row's fate.
 
+    famD panel (sonnet): when unit_ids is given, a FOREIGN row — a stale
+    checkpoint entry whose id is not in the current units list (units can
+    legitimately shrink on a resume: --limit, --exploitable, the diff
+    filter, a re-parse) — is excluded from the completed seed, the same
+    id-membership predicate the retry queue and the narration now use; the
+    #316/#324 seed would otherwise over-count completed past total. Usage
+    excludes foreign rows too — the summary describes THIS run's units; a
+    prior run's spend on units no longer in the set is not this run's
+    spend (the test pins the consistency both ways).
+
     Returns: completed, input_tokens, output_tokens, cost_usd,
     unpriced_models (the #216 marker).
     """
@@ -375,7 +385,9 @@ def _seed_summary(existing: dict) -> dict:
     output_tokens = 0
     cost_usd = 0.0
     unpriced: set = set()
-    for _cp in existing.values():
+    for _id, _cp in existing.items():
+        if unit_ids is not None and _id not in unit_ids:
+            continue
         if not analyze_result_is_error(_cp.get("result") or {}):
             completed += 1
         _usage = _cp.get("usage", {})
@@ -666,7 +678,7 @@ def run_analysis(
     # verify's verification.incomplete or enhance's INCOMPLETE_CLASSIFICATION.
     # The third bucket stays 0 here but is still emitted for shape consistency.
     _summary_incomplete = 0
-    _seed = _seed_summary(_existing)
+    _seed = _seed_summary(_existing, {u.get("id") for u in units})
     _summary_completed = _seed["completed"]
     _summary_errors = 0  # errored rows are re-analyzed; _summary_callback owns them
     _summary_input_tokens = _seed["input_tokens"]

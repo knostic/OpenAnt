@@ -108,3 +108,33 @@ def test_foreign_checkpoint_rows_cannot_overcount(tmp_path, monkeypatch):
     )
     assert "2/2" in out and "-1" not in out and "3/" not in out
     assert calls["n"] == 1
+
+
+def test_seed_summary_excludes_foreign_rows():
+    """famD panel (sonnet): _seed_summary counts only rows whose id is in
+    the current units list — a stale foreign entry (units shrank on resume:
+    --limit, --exploitable, diff filter, re-parse) must not inflate the
+    completed seed past total, the same id-membership predicate the retry
+    queue and the narration use."""
+    from core.analyzer import _seed_summary
+
+    existing = {
+        "u1": {"result": {"finding": "safe"}},
+        "u2": {"result": {"finding": "safe"}},
+        "stale-foreign": {"result": {"finding": "safe"}},
+    }
+    seeded_all = _seed_summary(existing)
+    assert seeded_all["completed"] == 3
+    seeded = _seed_summary(existing, {"u1", "u2"})
+    assert seeded["completed"] == 2, "the foreign row must not count"
+    # a foreign row's usage is NOT this run's spend either — the summary
+    # describes this run's units, consistently
+    existing["stale-foreign"]["usage"] = {"input_tokens": 7, "output_tokens": 5,
+                                          "cost_usd": 0.1, "unpriced_models": ["m"]}
+    seeded = _seed_summary(existing, {"u1", "u2"})
+    assert seeded["input_tokens"] == 0 and seeded["cost_usd"] == 0.0, "foreign spend is not this run's"
+    # and a KEPT row's usage still counts
+    existing["u1"]["usage"] = {"input_tokens": 3, "output_tokens": 2,
+                               "cost_usd": 0.05, "unpriced_models": []}
+    seeded = _seed_summary(existing, {"u1", "u2"})
+    assert seeded["input_tokens"] == 3 and seeded["cost_usd"] == 0.05
