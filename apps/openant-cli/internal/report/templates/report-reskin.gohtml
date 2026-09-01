@@ -4,12 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{.Title}}</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2"></script>
+    {{/* #332: vendored + pinned + inlined — the report is self-contained (served, standalone, air-gapped); the CDN tags carried no SRI and no version. */}}
+    <script>{{ vendorJS "tailwindcss-3.4.16.js" }}</script>
+    <script>{{ vendorJS "chart-4.4.7.umd.min.js" }}</script>
+    <script>{{ vendorJS "chartjs-plugin-datalabels-2.2.0.min.js" }}</script>
     <script>
         tailwind.config = {
             theme: {
@@ -30,7 +28,7 @@
                         },
                     },
                     fontFamily: {
-                        sans: ['Poppins', 'system-ui', 'sans-serif'],
+                        sans: ['system-ui', 'sans-serif'],
                     },
                     borderRadius: {
                         'card': '20px',
@@ -368,7 +366,7 @@
                 legend: { display: false },
                 datalabels: {
                     color: '#fff',
-                    font: { weight: 'bold', size: 11, family: 'Poppins' },
+                    font: { weight: 'bold', size: 11, family: 'system-ui' },
                     formatter: (value, ctx) => {
                         const total = ctx.chart.data.datasets[0].data.reduce((a, b) => a + b, 0);
                         const pct = Math.round((value / total) * 100);

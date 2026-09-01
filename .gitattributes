@@ -1,0 +1,5 @@
+# #332: the vendored report scripts are BINARY artifacts — Windows
+# autocrlf converted their bytes on checkout and the sha256 enforcement
+# (TestVendoredReportScriptHashes) correctly caught the change. Never
+# convert, never diff-convert.
+apps/openant-cli/internal/report/vendor/*.js -text -diff
