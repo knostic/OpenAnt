@@ -86,6 +86,7 @@ def run_dynamic_tests(
     repo_path: str | None = None,
     registry: PhaseRegistry | None = None,
     llm_config_name: str | None = None,
+    usage_baseline: dict | None = None,
 ) -> list[DynamicTestResult]:
     """Run dynamic tests for all findings in a pipeline output file.
 
@@ -173,6 +174,15 @@ def run_dynamic_tests(
     # Use the global tracker so step_context captures dynamic-test cost in
     # dynamic-test.report.json (same as enhance/analyze/verify).
     tracker = get_global_tracker()
+    # #333: the tracker is SHARED with the earlier LLM phases of a full scan,
+    # so a raw read at the end is the whole RUN's cost. Snapshot now — at step
+    # entry, BEFORE the checkpoint prior-usage injection below (those injected
+    # costs are this step's OWN spend from earlier attempts, meant to show
+    # "total cost across runs") — and report the delta, mirroring
+    # core/step_report.py:63. The markdown `**Total Cost:**` line and
+    # dynamic_test_results.json were the two of the step's three cost outputs
+    # still reading the cumulative (#280 fixed the console lines only).
+    _baseline_cost_usd = tracker.total_cost_usd
 
     # Inject prior usage from ALL existing checkpoints (both successful and
     # errored) so the report shows total cost across runs. The errored
@@ -187,6 +197,19 @@ def run_dynamic_tests(
         _prior_output += _cp.get("generation_output_tokens", 0) or 0
     if _prior_cost > 0 or _prior_input > 0 or _prior_output > 0:
         tracker.add_prior_usage(_prior_input, _prior_output, _prior_cost)
+        # #333 (wave r1 opus): refresh the caller's phase-line baseline AT
+        # the injection — the restored checkpoints' spend was reported by
+        # their ORIGINAL run's console line, and a pre-injection snapshot
+        # double-counted it here (the #281 cross-phase contract, extended to
+        # the dynamic-test step).
+        if usage_baseline is not None:
+            _tot = tracker.get_totals()
+            usage_baseline["cost_usd"] = _tot.get("total_cost_usd",
+                                                 usage_baseline["cost_usd"])
+            usage_baseline["tokens"] = _tot.get("total_tokens",
+                                                usage_baseline["tokens"])
+            usage_baseline["calls"] = _tot.get("total_calls",
+                                               usage_baseline["calls"])
 
     results: list[DynamicTestResult] = []
 
@@ -408,7 +431,10 @@ def run_dynamic_tests(
         return results
 
     # Generate report
-    total_cost = tracker.total_cost_usd
+    # #333: the STEP's cost (the entry-snapshot delta), not the run's
+    # cumulative — prior-phase spend on the shared tracker must not appear
+    # here (the JSON step-report on the same run already reads the delta).
+    total_cost = tracker.total_cost_usd - _baseline_cost_usd
     report_md = generate_report(results, repo_info["name"], total_cost)
 
     report_path = os.path.join(output_dir, "DYNAMIC_TEST_RESULTS.md")
