@@ -30,9 +30,10 @@ from core.model_registry import find_models_config
 
 def _family(model_id: str) -> str:
     """Normalise an id to its model family across every id convention in the file."""
-    s = re.sub(r"^[a-z]+/", "", model_id)              # vendor/ slug (OpenRouter)
-    s = re.sub(r"^(us|global|eu|apac)\.[a-z]+\.", "", s)  # region.vendor. (Bedrock)
+    s = re.sub(r"^[a-z0-9][a-z0-9-]*/", "", model_id)    # vendor/ slug (OpenRouter, hyphens/digits incl.)
+    s = re.sub(r"^(us|global|eu|apac|jp|au|ca|sa)\.[a-z0-9-]+\.", "", s)  # region.vendor. (Bedrock)
     s = re.sub(r"-v\d+:\d+$", "", s)                   # Bedrock version suffix
+    s = re.sub(r":[a-z0-9-]+$", "", s)                   # OpenRouter variant (:free, :thinking, :batch)
     s = re.sub(r"-\d{8}$", "", s)                     # Anthropic date stamp
     return s.replace(".", "-")                        # 4.5 vs 4-5 conventions
 
@@ -47,36 +48,45 @@ def _priced_records(data):
 def test_same_family_prices_agree_across_providers():
     conf = find_models_config()
     assert conf is not None, "config/models.json not locatable (find_models_config)"
-    data = json.loads(conf.read_text())
+    # wave r1 (opus): pin the encoding — the registry loader does, and a
+    # non-UTF-8-default runner would raise UnicodeDecodeError instead of
+    # reporting the invariant.
+    data = json.loads(conf.read_text(encoding="utf-8"))
     fam = defaultdict(list)
     for r in _priced_records(data):
         fam[_family(r["id"])].append(r)
 
     disagreements = []
     for family, recs in sorted(fam.items()):
-        # The escape hatch: an EXPLICIT price_diverges annotation (a reason string)
-        # exempts the family — a gateway may legitimately reprice, but it must say so.
-        if any(isinstance(r.get("price_diverges"), str) and r["price_diverges"].strip()
-               for r in recs):
+        # wave r1 (three axes): compare EVERY record in the family — the
+        # per-provider setdefault kept only the FIRST bedrock record and the
+        # second mirror (us./global. share provider "bedrock") escaped every
+        # comparison: correcting one mirror while the other stayed 15/75 was
+        # GREEN. And the price_diverges hatch exempts only the ANNOTATED
+        # record's own comparisons, not the whole family (an annotated
+        # OpenRouter reprice must not blind the check to the
+        # anthropic-vs-bedrock pairs of the same family).
+        comparable = [r for r in recs
+                      if not (isinstance(r.get("price_diverges"), str)
+                              and r["price_diverges"].strip())]
+        annotated = [r for r in recs
+                     if isinstance(r.get("price_diverges"), str)
+                     and r["price_diverges"].strip()]
+        if len(comparable) + len(annotated) < 2 or not comparable:
             continue
-        providers = {}
-        for r in recs:
-            providers.setdefault(r.get("provider"), r)
-        if len(providers) < 2:
-            continue
-        first = next(iter(providers.values()))
-        base = (first["price"]["input"], first["price"]["output"])
-        for prov, r in sorted(providers.items()):
-            if (r["price"]["input"], r["price"]["output"]) != base:
+        base = comparable[0]
+        b = (base["price"]["input"], base["price"]["output"])
+        for r in comparable[1:]:
+            if (r["price"]["input"], r["price"]["output"]) != b:
                 disagreements.append(
-                    f"{family}: {prov} says {r['price']} but "
-                    f"{first.get('provider')} says {first['price']}"
+                    f"{family}: {r['id']} says {r['price']} but "
+                    f"{base['id']} says {base['price']}"
                 )
     assert not disagreements, (
         "cross-provider price disagreement without a `price_diverges` annotation "
         "(the run's reported cost is off by the ratio depending on routing; "
-        "annotate a legitimate gateway reprice or correct the stale record):\n  "
-        + "\n  ".join(disagreements)
+        "annotate a legitimate gateway/endpoint reprice or correct the stale "
+        "record):\n  " + "\n  ".join(disagreements)
     )
 
 

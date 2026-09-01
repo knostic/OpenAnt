@@ -137,8 +137,11 @@ def test_b_consumers_import_without_cycle():
         importlib.import_module(mod)
 
 
-# --- (c) values are behavior-preserving ------------------------------
-# Snapshot of the exact literals present BEFORE the refactor.
+# --- (c) values mirror config/models.json ---------------------------
+# A hand-maintained mirror of the registry's CURRENT rates (NOT a frozen
+# pre-refactor snapshot: #344 corrected claude-opus-4-8 to the live rate —
+# every deliberate price change is a three-place edit: models.json, this
+# mirror, and any record_call-math pin).
 # Post-cutover, pricing_map("anthropic") OMITS retired/unknown ids (null-priced
 # in config/models.json), so the adapter table and MODEL_PRICING expose only the
 # CURRENT models. The retired ids were priced in the old dict but must never

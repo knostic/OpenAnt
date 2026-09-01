@@ -128,7 +128,13 @@ A model outside that set still works — it just reports `$0` in cost
 accounting with a one-time warning. To price it, add a record to
 `config/models.json` with `"provider": "openrouter"` and the rate shown
 in the catalogue (OpenRouter lists per-token prices; the registry wants
-per-million).
+per-million). **If the gateway rate genuinely differs from the direct
+provider's** (the same model family carries a differently-priced
+direct-provider record), the record must ALSO carry a `price_diverges`
+reason string — the cross-provider invariant
+(`tests/test_models_price_cross_check.py`) requires same-family records
+to agree unless the divergence is annotated on the record that carries
+it (#344).
 
 ## Errors and troubleshooting
 
