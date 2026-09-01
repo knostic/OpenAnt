@@ -78,10 +78,12 @@ def test_safe_to_vulnerable_correction_lands():
 
 def test_unrecognised_downgrade_keeps_disclosure():
     """The issue's regression (2): VULNERABLE -> INSUFFICIENT_CONTEXT is NOT
-    blocked (INSUFFICIENT_CONTEXT is not in DISCLOSURE_DROPPED) — and the row
-    must REMAIN disclosed: the stale finding is the safety net the naive fix
-    would remove."""
-    assert "insufficient_context" not in {v for v in DISCLOSURE_ELIGIBLE}
+    in F-KB-1a's block-set — the row must REMAIN disclosed. On #331 alone the
+    net was the STALE FINDING (verdict moved, finding kept); stacked with
+    #425's validity gate the proposal is REJECTED WHOLESALE — a stronger
+    preservation with no split-brain row (wave r1 fable+sonnet: the pass is
+    never asked for INSUFFICIENT_CONTEXT — its enum is
+    VULNERABLE | SAFE | INCONCLUSIVE)."""
     def resolver(binding, group, code_by_route, tracker):
         return s1.Stage1ConsistencyResult(
             "p", "INSUFFICIENT_CONTEXT",
@@ -89,14 +91,11 @@ def test_unrecognised_downgrade_keeps_disclosure():
               "should_be": "INSUFFICIENT_CONTEXT", "reason": "x"}], "g")
     out = _run(resolver, [INGESTED_VULN, INGESTED_SAFE])
     row = _by_rk(out, VULN_RK)
-    assert row["verdict"] == "INSUFFICIENT_CONTEXT"
-    assert "stage1_consistency_update" in row, "the correction is recorded"
-    # The net: the finding is NOT rewritten to an unrecognised value — the row
-    # still reads 'vulnerable' canonically (disclosed).
+    # the row is preserved UNCHANGED — the strongest form of disclosure.
+    assert row["verdict"] in ("INSUFFICIENT_CONTEXT", "VULNERABLE"), row
     assert row["finding"] == "vulnerable"
     assert _canonical(row) == "vulnerable", (
-        "an ungated write would drop this disclosed vulnerability "
-        "(measured: INSUFFICIENT_CONTEXT moves out of confirmed)"
+        "an ungated write would drop this disclosed vulnerability"
     )
     counts = _count_verdicts(out)
     assert counts["vulnerable"] == 1, (
@@ -147,7 +146,11 @@ def test_stage2_vocabulary_keeps_the_net():
               "should_be": "UNVERIFIED", "reason": "x"}], "g")
     out = _run(resolver, [INGESTED_VULN, INGESTED_SAFE])
     row = _by_rk(out, VULN_RK)
-    assert row["verdict"] == "UNVERIFIED"
+    # (stacked #425: the validity gate REJECTS the Stage-2 vocabulary
+    # outright, so the verdict stays VULNERABLE on this branch; on #331
+    # alone it wrote UNVERIFIED with the finding net. Both keep the row
+    # disclosed — the invariant under test.)
+    assert row["verdict"] in ("UNVERIFIED", "VULNERABLE"), row
     assert row["finding"] == "vulnerable", (
         "the Stage-2 vocabulary must keep the stale-finding net "
         f"(got {row['finding']!r})"

@@ -92,11 +92,14 @@ def test_valid_upgrade_still_lands_both_keys():
     assert "stage1_consistency_update" in row
 
 
-def test_canonical_intermediate_recognized_keeps_the_331_net():
-    """INSUFFICIENT_CONTEXT is IN the vocabulary (the _normalize_result map):
-    the correction is written to verdict, and #331's finding-gate keeps the
-    stale finding (the accidental safety net for the unrecognised-downgrade
-    case)."""
+def test_insufficient_context_is_rejected_not_split_brained():
+    """Wave r1 (fable+sonnet): INSUFFICIENT_CONTEXT is EXCLUDED — the
+    consistency prompt's enum is VULNERABLE | SAFE | INCONCLUSIVE, and
+    admitting it whitelisted a no-evidence downgrade AROUND F-KB-1a (it is
+    in neither block-set), producing a split-brain row: verdict moved off
+    VULNERABLE by pattern similarity while finding stayed vulnerable — a
+    disclosed unit mislabeled in every verdict-keyed surface. The rejection
+    preserves the row UNCHANGED (the stronger, coherent form of the net)."""
     def resolver(binding, group, code_by_route, tracker):
         return s1.Stage1ConsistencyResult(
             "p", "INSUFFICIENT_CONTEXT",
@@ -104,8 +107,33 @@ def test_canonical_intermediate_recognized_keeps_the_331_net():
               "should_be": "INSUFFICIENT_CONTEXT", "reason": "x"}], "g")
     out = _run(resolver, [INGESTED_VULN, INGESTED_SAFE])
     row = _by_rk(out, VULN_RK)
-    assert row["verdict"] == "INSUFFICIENT_CONTEXT", (
-        "a CANONICAL verdict must not be rejected by the validity gate"
+    assert row["verdict"] == "VULNERABLE", (
+        "the proposal is rejected; the row stays as it was"
     )
     assert row["finding"] == "vulnerable", "the #331 net stays"
-    assert "stage1_consistency_update" in row
+    assert "stage1_consistency_invalid_verdict_blocked" in row, (
+        "the rejected proposal is audited"
+    )
+    assert "stage1_consistency_update" not in row
+
+
+def test_rejected_now_lands_at_the_validity_gate():
+    """Wave r1 (fable#2): REJECTED is in F-KB-1a's block-set but NOT in the
+    correctable set — the validity gate fires first, reclassifying the
+    blocked-proposal audit key. Accepted explicitly (the comment at the
+    F-KB-1a branch notes it); pinned so the reclassification is deliberate."""
+    def resolver(binding, group, code_by_route, tracker):
+        return s1.Stage1ConsistencyResult(
+            "p", "REJECTED",
+            [{"route_key": VULN_RK, "original_verdict": "VULNERABLE",
+              "should_be": "REJECTED", "reason": "x"}], "g")
+    out = _run(resolver, [INGESTED_VULN, INGESTED_SAFE])
+    row = _by_rk(out, VULN_RK)
+    assert row["verdict"] == "VULNERABLE", "the row is preserved either way"
+    assert "stage1_consistency_invalid_verdict_blocked" in row, (
+        "REJECTED lands at the validity gate (not in the correctable set)"
+    )
+    assert "stage1_consistency_downgrade_blocked" not in row, (
+        "the F-KB-1a branch no longer fires for REJECTED — the documented "
+        "reclassification"
+    )

@@ -16,16 +16,24 @@ from dataclasses import dataclass
 
 from utilities.llm_client import TokenTracker
 from utilities.llm import PhaseBinding, simple_text
-from core.verdict_taxonomy import DISCLOSURE_DROPPED, SEVERITY_FINDING_VERDICTS
+from core.verdict_taxonomy import (
+    DISCLOSURE_DROPPED, FINDING_VERDICT_ORDER, SEVERITY_FINDING_VERDICTS,
+)
 
 # #425: the verdict vocabulary a Stage-1 consistency correction may write —
-# the canonical Stage-1 verdicts (analysis_core._normalize_result's
-# finding_to_verdict map, uppercased). Values outside it are rejected at the
-# validity gate below (producer discipline, per #316/#324).
-_CORRECTABLE_STAGE1_VERDICTS = frozenset({
-    "VULNERABLE", "SAFE", "PROTECTED", "BYPASSABLE", "INCONCLUSIVE",
-    "INSUFFICIENT_CONTEXT",
-})
+# DERIVED from the canonical taxonomy (wave r1 fable: a third hand-copied
+# set is the drift this module rejected 250 lines earlier, and it already
+# disagreed — INSUFFICIENT_CONTEXT is in neither DISCLOSURE_ELIGIBLE nor
+# DISCLOSURE_DROPPED). INSUFFICIENT_CONTEXT is deliberately EXCLUDED (wave
+# r1, fable+sonnet): the consistency prompt's enum is
+# VULNERABLE | SAFE | INCONCLUSIVE — the pass is never asked for it — and
+# admitting it whitelisted a no-evidence downgrade AROUND F-KB-1a (it is in
+# neither block-set), leaving a split-brain row: verdict moved off
+# VULNERABLE by pattern similarity while finding stayed vulnerable — a
+# disclosed unit mislabeled in verdict-keyed surfaces. Rejection preserves
+# the row unchanged.
+_CORRECTABLE_STAGE1_VERDICTS = frozenset(
+    v.upper() for v in FINDING_VERDICT_ORDER)
 
 # Uppercase mirror of the canonical disclosure-dropped set (this module compares
 # verdicts .upper()'d). Keyed off core.verdict_taxonomy so the guard's block-set
@@ -312,6 +320,11 @@ def run_stage1_consistency_check(
                             # F-KB-1a: pattern-consistency must not silently downgrade a
                             # surfaced Stage-1 finding to safe. At Stage 1 there is no
                             # per-finding exploit evidence, only pattern similarity (the
+                            # #425 note: REJECTED proposals now land at the validity
+                            # gate FIRST (invalid_verdict_blocked — REJECTED is not in
+                            # the correctable set), so this branch fires for the
+                            # DROPPED values the set admits: INCONCLUSIVE, PROTECTED,
+                            # SAFE.
                             # weakest signal); block the downgrade and record it for audit.
                             # F-KB-1a (extends #243's canonical-set fix to Stage-1):
                             # widen the BLOCK-set from the hardcoded {SAFE,PROTECTED} to the
