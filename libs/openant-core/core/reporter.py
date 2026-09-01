@@ -810,7 +810,10 @@ def generate_html_report(
     # precedes site-packages, so the re-pointable shared-venv .pth cannot
     # win). -P keeps the untrusted CWD off sys.path; the env keeps the
     # venv's .pth off the resolution.
-    # #325: the last two unbounded subprocess.run sites (the issue's item 3 —
+    # #325 (wave r1 correction): the last two unbounded subprocess.run sites
+    # IN CORE/ (the issue's item 3; parsers/<lang>/test_pipeline.py and the
+    # file_io.run_utf8 pass-throughs remain unbounded on their DIRECT CLI
+    # invocations, capped only through _parse_via_subprocess's 1800s):
     # the timeout convention PR #135 established for parse steps was never
     # extended to the other call sites). 30 min matches the parse bound; the
     # named diagnosis on expiry, not a bare TimeoutExpired traceback.

@@ -671,6 +671,12 @@ def _js_deps_installed() -> bool:
     return (_JS_PARSER_DIR / "node_modules" / ".package-lock.json").is_file()
 
 
+# #325: the npm-install bootstrap bound — the parse-step convention (PR
+# #135's timeout=1800). Module-level so a test can inject a small bound and
+# EXECUTE the diagnosis path instead of grepping the source for it.
+_NPM_INSTALL_TIMEOUT_S = 1800
+
+
 def _ensure_js_parser_dependencies() -> None:
     """Install the JS parser's Node dependencies on first use.
 
@@ -700,7 +706,11 @@ def _ensure_js_parser_dependencies() -> None:
     # Serialize concurrent bootstraps. The lockfile lives next to package.json so
     # it's always on the same filesystem as the install target.
     lock_path = _JS_PARSER_DIR / ".openant-npm-install.lock"
-    with _file_lock(lock_path):
+    # the wait budget outlasts a legitimate install (the bounded npm install
+    # inside the lock holds it for up to 30 minutes): the install bound + 5
+    # minutes of slack.
+    with _file_lock(lock_path, what="the npm-install bootstrap",
+                    wait_seconds=1800 + 300):
         # Re-check under the lock: another process may have finished while we waited.
         if _js_deps_installed():
             return
@@ -715,46 +725,92 @@ def _ensure_js_parser_dependencies() -> None:
         # npm (a blocking postinstall script, a registry stall outlasting
         # npm's own retry budget) hung its process indefinitely AND every
         # concurrent parse behind the lock it holds. The parse steps use
-        # timeout=1800; the bootstrap gets the same convention. The named
-        # diagnosis (not a bare TimeoutExpired traceback): the bound + the
-        # manual recovery.
-        result = subprocess.run(
+        # timeout=1800; the bootstrap gets the same convention.
+        # Wave r1 (three axes): the named diagnosis is IMPLEMENTED, not
+        # asserted — and the timeout kills npm's whole PROCESS GROUP: a
+        # killed npm leaves its postinstall grandchild writing node_modules
+        # while the lock releases and the next waiter starts a CONCURRENT
+        # install into the same tree — exactly the corruption the lock
+        # exists to prevent. start_new_session puts npm in its own group
+        # so the kill can reach the grandchildren.
+        _npm_proc = subprocess.Popen(
             [npm, "install"],
             cwd=str(_JS_PARSER_DIR),
             stdout=sys.stderr,
             stderr=sys.stderr,
-            timeout=1800,  # 30 min — the parse-step convention (PR #135)
+            start_new_session=(os.name != "nt"),
         )
-        if result.returncode != 0:
+        try:
+            _rc = _npm_proc.wait(timeout=_NPM_INSTALL_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            if os.name != "nt":
+                try:
+                    os.killpg(os.getpgid(_npm_proc.pid), 9)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            _npm_proc.kill()
+            _npm_proc.wait()
+            raise RuntimeError(
+                f"`npm install` (from {_JS_PARSER_DIR}) exceeded the "
+                f"{_NPM_INSTALL_TIMEOUT_S}s install bound and was killed "
+                "with its process group. Re-run the command; if it persists, "
+                "inspect the npm output above for the stalled postinstall step."
+            ) from None
+        if _rc != 0:
             raise RuntimeError(
                 f"`npm install` failed in {_JS_PARSER_DIR} with exit code "
-                f"{result.returncode}. See npm output above for details; you can "
+                f"{_rc}. See npm output above for details; you can "
                 f"reproduce with: npm install (from {_JS_PARSER_DIR})"
             )
 
 
 @contextlib.contextmanager
-def _file_lock(lock_path: Path):
+def _file_lock(lock_path: Path, *, what: str, wait_seconds: float):
     """Cross-platform exclusive file lock as a context manager.
 
-    Uses ``msvcrt`` on Windows and ``fcntl`` elsewhere. Blocks until the lock is
-    acquired, releases on exit. The lockfile itself is left in place; only the
-    OS-level lock matters for mutual exclusion.
+    Uses ``msvcrt`` on Windows and ``fcntl`` elsewhere. Acquires within
+    ``wait_seconds`` and releases on exit. The lockfile itself is left in
+    place; only the OS-level lock matters for mutual exclusion.
+
+    #325 (wave r1, three axes): BOTH platforms take the SAME bounded,
+    # retry-loop wait — the deadline and the caller's ``what`` are
+    # parameters, not baked into this helper (a generic lock must not
+    # carry npm's timeout and message). The POS POSIX branch catches ONLY
+    # BlockingIOError (contention — EAGAIN/EWOULDBLOCK): every other errno
+    # is a hard failure (ENOLCK, EINVAL, EOPNOTSUPP on some container
+    # volume mounts) and re-raises immediately — a blanket ``except
+    # OSError`` turned a fast, accurately-classified os_error into a
+    # 35-minute spin with a false "wedged" diagnosis. The timeout message
+    # states the OBSERVED FACT (lock not acquired within the budget) — it
+    # cannot know WHY (a legitimate fresh install can hold the section
+    # for its own full bound; N waiters can chain N generations).
     """
+    import time
+
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     # "w" (not "a+") so the file pointer is at byte 0 — msvcrt.locking locks a
     # range starting at the *current* file position, so different positions
     # would mean non-overlapping (i.e. non-exclusive) locks.
     f = open_utf8(lock_path, "w")
+    deadline = time.monotonic() + wait_seconds
     try:
         if os.name == "nt":
             import msvcrt
 
-            f.seek(0)
-            # LK_LOCK blocks (with retries) until the byte range is
-            # exclusive. #325: bounded — LK_LOCK's retry budget is ~10s
-            # then raises OSError, i.e. already deadline-bounded here.
-            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+            while True:
+                try:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"{what}: the lock at {lock_path} was not "
+                            f"acquired within {wait_seconds:.0f}s — another "
+                            "process holds it (a first-run install can hold "
+                            "it for its own full bound)."
+                        ) from None
+                    time.sleep(1.0)
             try:
                 yield
             finally:
@@ -762,31 +818,19 @@ def _file_lock(lock_path: Path):
                 msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
-            import time
 
-            # #325: a bare blocking LOCK_EX waits without limit behind a
-            # wedged holder (a stalled npm holding this lock hung EVERY
-            # concurrent parse process). Non-blocking acquisition in a
-            # retry loop with a deadline — the bounded wait the issue asks
-            # for; a timeout raises a named diagnosis, not an infinite
-            # hang. The deadline must outlast a legitimate install (the
-            # bounded npm install inside the lock holds it for up to 30
-            # minutes), so the retry budget is the install bound + 5
-            # minutes of slack.
-            _lock_deadline = time.monotonic() + 1800 + 300
             while True:
                 try:
                     fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
-                except OSError:
-                    if time.monotonic() >= _lock_deadline:
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
                         raise RuntimeError(
-                            f"the npm-install bootstrap lock at {lock_path} "
-                            "was not acquired within 2100s (a concurrent "
-                            "install is wedged — a stall beyond the 1800s "
-                            "install bound). Re-run; if it persists, remove "
-                            "the stalled process or the lockfile."
-                        )
+                            f"{what}: the lock at {lock_path} was not "
+                            f"acquired within {wait_seconds:.0f}s — another "
+                            "process holds it (a first-run install can hold "
+                            "it for its own full bound)."
+                        ) from None
                     time.sleep(1.0)
             try:
                 yield

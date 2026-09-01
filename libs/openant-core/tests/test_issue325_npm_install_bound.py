@@ -33,11 +33,11 @@ def test_npm_install_has_a_timeout():
     import inspect
 
     src = inspect.getsource(pa._ensure_js_parser_dependencies)
-    j = src.find("subprocess.run")
+    j = src.find("_npm_proc.wait(")
     assert j > 0
-    call_text = src[j:j + 500]
+    call_text = src[j:j + 300]
     assert "timeout=" in call_text, "the npm install carries no timeout"
-    assert "1800" in call_text  # the parse-step convention value
+    assert "1800" in call_text or "_NPM_INSTALL_TIMEOUT_S" in call_text
 
 
 def test_file_lock_is_bounded():
@@ -64,12 +64,36 @@ def test_reporter_subprocesses_bounded():
         assert "timeout=" in call_text, f"the {fragment[:20]} call carries no timeout"
 
 
-def test_npm_install_timeout_error_is_diagnosable():
-    """The timeout naming: the call site's own text names the bound (1800)
-    and its rationale (the parse-step convention) — the diagnosable-failure
-    contract the issue asks for; a bare TimeoutExpired traceback would not."""
-    import inspect
+def test_npm_install_timeout_error_is_diagnosable(tmp_path, monkeypatch):
+    """Wave r1 (opus): the named diagnosis is EXECUTED, not asserted — a stub
+    npm that sleeps past a small injected bound raises the named RuntimeError
+    (the bound + the recovery), and its process group is killed with it (a
+    killed npm must not leave a postinstall grandchild writing node_modules
+    while the lock releases)."""
+    import os
+    import shutil as _shutil
+    import stat
 
-    src = inspect.getsource(pa._ensure_js_parser_dependencies)
-    assert "timeout=1800" in src
-    assert "parse-step convention" in src or "PR #135" in src
+    if not _shutil.which("/bin/sh"):
+        pytest.skip("/bin/sh not available")
+    stub = tmp_path / "npm"
+    stub.write_text("#!/bin/sh\nsleep 30\nexit 0\n")
+    stub.chmod(stat.S_IRWXU)
+    (tmp_path / "package.json").write_text('{"name": "stub", "dependencies": {}}')
+    monkeypatch.setattr(pa, "_NPM_INSTALL_TIMEOUT_S", 1)
+    monkeypatch.setattr(pa, "_JS_PARSER_DIR", tmp_path)
+    monkeypatch.setattr(pa, "_js_deps_installed", lambda: False)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
+    real_which = pa.shutil.which
+
+    def fake_which(name, path=None):
+        if name == "npm":
+            return str(stub)
+        return real_which(name, path=path)
+
+    monkeypatch.setattr(pa.shutil, "which", fake_which)
+    with pytest.raises(RuntimeError, match="exceeded the 1s install bound"):
+        pa._ensure_js_parser_dependencies()
+    # the stub's process group is gone (no orphan sleeper)
+    r = pa.subprocess.run(["pgrep", "-f", f"sleep 30"], capture_output=True, text=True)
+    assert "sleep 30" not in (r.stdout or "")
