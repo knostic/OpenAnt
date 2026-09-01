@@ -26,7 +26,12 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+# #415: two ".." from tests/parsers/<lang> inserted `tests/` — and tests/parsers/
+# is a REGULAR package that outranks the source parsers/ namespace, so every
+# later in-process parsers.* import in the same pytest batch resolved into the
+# TEST directory (the rust collection errors, the zig/php shadow binds). The
+# insert only exists so the file runs standalone; it needs the core root.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 from core.parser_adapter import parse_repository  # noqa: E402
 

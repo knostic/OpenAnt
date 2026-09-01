@@ -28,7 +28,13 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+# #415: this header previously inserted `tests/` (two ".." from
+# tests/parsers/swift) — and tests/parsers/ is a REGULAR package, so with it
+# on sys.path every later in-process `parsers.*` import in the same pytest
+# batch resolved into the TEST directory (ModuleNotFoundError: No module
+# named 'parsers.swift.repository_scanner'). The insert only exists so the
+# file runs standalone; it needs the CORE root, three ".." up.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 from core.parser_adapter import parse_repository  # noqa: E402
 
