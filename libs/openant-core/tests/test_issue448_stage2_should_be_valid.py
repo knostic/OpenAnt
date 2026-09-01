@@ -427,3 +427,30 @@ def test_malformed_payload_container_and_elements_never_crash(monkeypatch):
             f"payload {payload!r} moved or crashed a row"
         )
         assert "consistency_update" not in vuln, payload
+
+
+def test_unhashable_verdict_never_crashes_the_detector():
+    """Wave r6 (opus): a non-string correct_finding (a list/dict from a
+    text-mode reply or a checkpoint restore — never type-coerced on the way
+    in) crashed the DETECTOR's set construction: unhashable TypeError, in the
+    code path that ALWAYS runs. The Stage-1 twin coerces to "" — same guard
+    here."""
+    v = _verifier()
+    called = {"n": 0}
+
+    def _fake_resolve(group, cbr):
+        called["n"] += 1
+        return None
+
+    v._resolve_inconsistency = _fake_resolve
+    out = v._check_consistency([
+        {"route_key": VULN_RK, "finding": ["safe"],
+         "verification": {"correct_finding": ["safe"]}},
+        {"route_key": SAFE_RK, "finding": "vulnerable",
+         "verification": {"correct_finding": "vulnerable"}},
+    ], {})
+    # no crash, and the malformed row was NOT treated as equal to the
+    # canonical one ("" from the list, "vulnerable" from the sibling ->
+    # inconsistent -> the resolver was called)
+    assert called["n"] == 1
+    assert all(isinstance(r["finding"], (str, list)) for r in out)

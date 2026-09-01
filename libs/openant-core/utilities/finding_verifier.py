@@ -1038,7 +1038,13 @@ class FindingVerifier:
             def _norm_v(r):
                 v = (r.get("verification", {}).get("correct_finding")
                      or r.get("finding"))
-                return v.strip().lower() if isinstance(v, str) else v
+                # #448 (wave r6 opus): a NON-STRING verdict (a list/dict from a
+                # text-mode reply or a checkpoint restore — never
+                # type-coerced on the way in) must not reach the set()
+                # construction: unhashable values crashed the Verify phase
+                # HERE, in the detector that ALWAYS runs. The Stage-1 twin
+                # coerces to "" on the same line (stage1_consistency.py:224).
+                return v.strip().lower() if isinstance(v, str) else ""
             verdicts = set(_norm_v(r) for r in group)
             if len(verdicts) > 1:
                 inconsistent_groups.append((pattern, group))
