@@ -34,6 +34,41 @@ from core.verdict_taxonomy import FINDING_VERDICT_ORDER
 from utilities.file_io import normalize_results, read_json
 
 
+def _reachability_envelope_block(pipeline_output: dict) -> dict | None:
+    """#323: build the reachability block for the scan exit envelope.
+
+    The blackout advisory reaches ``pipeline_stats.reachability_warnings``
+    (pipeline_output.json) but previously no CI-visible surface — the
+    envelope carried nothing, so a blacked-out scan read as a clean small
+    run. The block rides whenever a filter was applied OR a warning was
+    recorded (wave r1, three axes): the NO-RECORD warning class
+    ("filtering was requested but no reachability_filter record was found;
+    reachable_units falls back to total_units and may overstate
+    reachability") fires exactly when ``reachability_filter_applied`` is
+    False — gating on the flag alone would silence the warning that
+    overstates coverage, the exact class this fix closes.
+    """
+    stats = pipeline_output.get("pipeline_stats")
+    if not isinstance(stats, dict):
+        return None
+    warnings = stats.get("reachability_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    warnings = [str(w) for w in warnings if isinstance(w, str) and w.strip()]
+    if not stats.get("reachability_filter_applied") and not warnings:
+        return None
+    block = {
+        "reachable_units": stats.get("reachable_units"),
+        "original_units": stats.get("original_units"),
+    }
+    if warnings:
+        block["reachability_warnings"] = warnings
+    pct = stats.get("reachability_reduction_percentage")
+    if isinstance(pct, (int, float)):
+        block["reachability_reduction_percentage"] = pct
+    return block
+
+
 def _output_json(data: dict):
     """Write JSON to stdout."""
     json.dump(data, sys.stdout, indent=2)
@@ -209,12 +244,18 @@ def cmd_scan(args):
         # Surface the diff block on the envelope so the Go CLI banner can
         # render an "Incremental: base..head" line on success. The block
         # is the same one written into pipeline_output.json by reporter.py.
+        # #323: the reachability block rides the same pattern — the blackout
+        # advisory previously reached no deterministic human/CI surface (the
+        # terminal was silent, the envelope carried nothing).
         if result.pipeline_output_path and os.path.exists(result.pipeline_output_path):
             try:
                 po = read_json(result.pipeline_output_path)
                 diff_block = po.get("diff")
                 if isinstance(diff_block, dict) and diff_block.get("mode") == "incremental":
                     scan_payload["diff"] = diff_block
+                reach_block = _reachability_envelope_block(po)
+                if reach_block:
+                    scan_payload["reachability"] = reach_block
             except (json.JSONDecodeError, OSError):
                 pass
         _output_json(success(scan_payload))

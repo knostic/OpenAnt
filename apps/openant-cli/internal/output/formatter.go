@@ -386,6 +386,39 @@ func PrintScanSummaryV2(data map[string]any) {
 
 	PrintKeyValue("Total units analyzed", fmt.Sprintf("%d", total))
 
+	// #323: the reachability advisory, in the Scan Results section (wave r1:
+	// it landed under Output Files before — a coverage number beside the
+	// report paths, not beside the unit counts). The blackout warning
+	// previously reached only an artifact field + an LLM instruction; the
+	// terminal never said anything, so a blacked-out scan looked like a
+	// small clean run. Deterministic (printed from the envelope's block).
+	// The reduction uses the envelope's OWN float — the integer recompute
+	// truncated (wave r1: 2/3 printed 34%, the artifacts said 33.3%).
+	if reach, ok := data["reachability"].(map[string]any); ok && reach != nil {
+		reachable := intFromAny(reach["reachable_units"])
+		original := intFromAny(reach["original_units"])
+		if original > 0 {
+			// the envelope's OWN float when present (the exact figure the
+			// artifacts print); the recompute is only the fallback for a
+			// hand-built map without it.
+			pct := float64(100*original-100*reachable) / float64(original)
+			if f, ok := reach["reachability_reduction_percentage"].(float64); ok {
+				pct = f
+			}
+			PrintKeyValue("Reachability", fmt.Sprintf(
+				"%d of %d units in scope (%.1f%% reduction)", reachable, original, pct))
+		} else {
+			PrintKeyValue("Reachability", fmt.Sprintf("%d units in scope", reachable))
+		}
+		if warns, ok := reach["reachability_warnings"].([]any); ok {
+			for _, wn := range warns {
+				if s, ok := wn.(string); ok && s != "" {
+					yellow.Printf("  ⚠ %s\n", s)
+				}
+			}
+		}
+	}
+
 	combined := vulnerable + bypassable
 	if combined > 0 {
 		red.Printf("  Vulnerable: %d\n", combined)
