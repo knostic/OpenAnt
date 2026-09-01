@@ -58,6 +58,8 @@ def test_default_set_is_high_only(monkeypatch):
 
 
 def test_operator_widening_to_medium(monkeypatch, capsys):
+    # (wave r1 opus: capsys now used — a VALID override is silent on stderr;
+    # the resolved-set provenance is the summary test above)
     """OPENANT_PROMOTE_ENTRY_POINT_AT=high,medium: medium promotes (the
     issue's suggested trade-off made the operator's to make), low still not."""
     monkeypatch.setenv("OPENANT_PROMOTE_ENTRY_POINT_AT", "high,medium")
@@ -67,6 +69,7 @@ def test_operator_widening_to_medium(monkeypatch, capsys):
     ds = _one_unit_dataset("low")
     apply_signals(ds, _ep_signal("low"))
     assert ds["units"][0]["is_entry_point"] is False
+    assert "OPENANT_PROMOTE_ENTRY_POINT_AT" not in capsys.readouterr().err
 
 
 def test_explicit_low_is_the_operators_call(monkeypatch):
@@ -91,12 +94,37 @@ def test_invalid_value_falls_back_loudly(monkeypatch, capsys):
     assert "OPENANT_PROMOTE_ENTRY_POINT_AT" in err and "falling back" in err
 
 
-def test_empty_content_falls_back(monkeypatch):
-    """Whitespace-only content is not a tier list: default, warned."""
+def test_empty_content_falls_back(monkeypatch, capsys):
+    """Whitespace-only content is not a tier list: default, warned (wave r1
+    opus: the warning is now ASSERTED, not just claimed by the docstring)."""
     monkeypatch.setenv("OPENANT_PROMOTE_ENTRY_POINT_AT", " , ")
     ds = _one_unit_dataset("medium")
     apply_signals(ds, _ep_signal("medium"))
     assert ds["units"][0]["is_entry_point"] is False
+    err = capsys.readouterr().err
+    assert "OPENANT_PROMOTE_ENTRY_POINT_AT" in err and "falling back" in err
+
+
+def test_blank_but_set_warns_not_silently(monkeypatch, capsys):
+    """Wave r1 (sonnet+opus): OPENANT_PROMOTE_ENTRY_POINT_AT= (blank, the
+    CI-template shape `=$WIDEN` with WIDEN unset) previously fell back with
+    NO warning — the operator believes the widening is live while promotion
+    narrows to the default. Blank-but-set now warns."""
+    monkeypatch.setenv("OPENANT_PROMOTE_ENTRY_POINT_AT", "")
+    ds = _one_unit_dataset("medium")
+    apply_signals(ds, _ep_signal("medium"))
+    assert ds["units"][0]["is_entry_point"] is False
+    err = capsys.readouterr().err
+    assert "set but empty" in err, err
+
+
+def test_resolved_set_reports_in_the_summary(monkeypatch):
+    """Wave r1 (opus): the resolved set is the run's provenance — apply_signals
+    returns it so the step report records which set produced the
+    promotions."""
+    monkeypatch.setenv("OPENANT_PROMOTE_ENTRY_POINT_AT", "high,medium")
+    summary = apply_signals(_one_unit_dataset("medium"), _ep_signal("medium"))
+    assert summary["promote_set"] == ["high", "medium"], summary
 
 
 def test_unset_env_is_silent(monkeypatch, capsys):

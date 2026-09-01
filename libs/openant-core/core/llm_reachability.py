@@ -15,8 +15,10 @@ Pipeline ordering (managed by ``core/scanner.py``):
 
 1. Parse with ``processing_level="all"`` so every unit is available.
 2. ``analyze_reachability`` reviews all units and returns signals.
-3. ``apply_signals`` promotes high-confidence ``entry_point`` signals by
-   setting ``is_entry_point=True`` on the target unit.
+3. ``apply_signals`` promotes ``entry_point`` signals whose confidence is
+   in the promote set (``OPENANT_PROMOTE_ENTRY_POINT_AT``, default
+   ``{high}`` — #345: configurable per run) by setting
+   ``is_entry_point=True`` on the target unit.
 4. The structural reachability filter re-runs with LLM-promoted entry
    points added as extra BFS seeds, yielding a dataset filtered to the
    user's requested ``processing_level`` but expanded by LLM findings.
@@ -29,8 +31,9 @@ Output:
 - ``analyze_reachability(...)`` returns a list of ``ReachabilitySignal``
   dicts.
 - ``apply_signals(dataset, signals)`` mutates the dataset in place so each
-  unit gains an ``llm_reachability_signals`` field, and high-confidence
-  ``entry_point`` signals set ``is_entry_point = True`` on the target unit.
+  unit gains an ``llm_reachability_signals`` field, and ``entry_point``
+  signals in the promote set set ``is_entry_point = True`` on the target unit
+  (the set is configurable — see OPENANT_PROMOTE_ENTRY_POINT_AT).
 
 Usage:
     from core.llm_reachability import analyze_reachability, apply_signals
@@ -506,14 +509,31 @@ def analyze_reachability(
 # issue flags as not reproducible from this repository — widen only after
 # the second-corpus reproduction it names), and low 0.0%.
 _PROMOTE_ENTRY_POINT_AT_DEFAULT = frozenset({"high"})
-_PROMOTE_TIERS = frozenset({"high", "medium", "low"})
+# the tier vocabulary _VALID_CONFIDENCES already declares (parse validates
+# incoming signals against it) — a second hand-rolled copy would drift: a
+# tier added there but not here makes an operator's whole list discard
+# (wave r1 opus), narrowing promotion to the default: the under-seeding
+# direction.
+_PROMOTE_TIERS = frozenset(_VALID_CONFIDENCES)
 _ENV_PROMOTE_ENTRY_POINT_AT = "OPENANT_PROMOTE_ENTRY_POINT_AT"
 
 
 def _promote_entry_point_at() -> frozenset:
     """The tiers that promote, after resolving the env override (#345)."""
     raw = os.environ.get(_ENV_PROMOTE_ENTRY_POINT_AT)
-    if not raw:
+    if raw is None or raw == "":
+        # blank-but-SET (OPENANT_PROMOTE_ENTRY_POINT_AT= — the CI-template
+        # shape, `=$WIDEN` with WIDEN unset) WARNED, not silent: the operator
+        # believes the widening is live while promotion silently narrows to
+        # the default — units dropped from analysis with zero signal (wave
+        # r1, sonnet+opus).
+        if raw == "":
+            print(
+                f"[LLMReach] {_ENV_PROMOTE_ENTRY_POINT_AT} is set but empty; "
+                f"falling back to the shipped default "
+                f"{sorted(_PROMOTE_ENTRY_POINT_AT_DEFAULT)}",
+                file=sys.stderr,
+            )
         return _PROMOTE_ENTRY_POINT_AT_DEFAULT
     wanted = {t.strip().lower() for t in raw.split(",") if t.strip()}
     if not wanted or (wanted - _PROMOTE_TIERS):
@@ -584,6 +604,10 @@ def apply_signals(
         "signals_applied": applied,
         "entry_points_promoted": promoted,
         "units_touched": len(touched),
+        # #345 (wave r1 opus): the resolved set is part of the run's
+        # provenance — two scans under different sets produce different
+        # promotions with byte-identical step reports otherwise.
+        "promote_set": sorted(promote_at),
     }
 
 
