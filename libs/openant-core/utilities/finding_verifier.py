@@ -84,6 +84,21 @@ from prompts.verification_prompts import (
 )
 from core.verdict_taxonomy import DISCLOSURE_DROPPED, FINDING_VERDICT_ORDER
 
+# #448 (wave r1, three axes): the correction targets are the verify `finish`
+# enum — FINDING_VERDICT_ORDER, nothing else. STAGE2_VERDICTS is a DIFFERENT
+# key (the reporter's derived stage2_verdict display field: no producer ever
+# writes confirmed/agreed/unverified/rejected into `finding`, and admitting
+# them re-opened the exact bucket-drop this fix closes — a conformant-looking
+# "confirmed" is a MORE plausible model emission than "MAYBE VULNERABLE").
+# error and insufficient_context are legitimate STATES of `finding` but not
+# legitimate CORRECTION TARGETS: both are outside DISCLOSURE_DROPPED, so
+# admitting them let a pattern-similarity pass move a conclusively-EXPLOITABLE
+# row to an uncounted/unverified shape PAST the F-KB-1b guard (the exact class
+# #195/#243 closed). With FINDING_VERDICT_ORDER alone, every admitted
+# non-DROPPED value is vulnerable/bypassable — the guard's complement is
+# well-defined.
+_CORRECTABLE_STAGE2_FINDINGS = frozenset(FINDING_VERDICT_ORDER)
+
 # Import application context type for type hints
 try:
     from context.application_context import ApplicationContext
@@ -1031,7 +1046,23 @@ class FindingVerifier:
             if len(group) < 2:
                 continue
 
-            verdicts = set(r.get("verification", {}).get("correct_finding") or r.get("finding") for r in group)
+            # #448 (wave r2 opus): normalize HERE — _parse_finish_result stores
+            # correct_finding verbatim, so a group all-vulnerable but stamped
+            # "VULNERABLE"/"vulnerable" read as inconsistent and spent a full
+            # _resolve_inconsistency LLM call on every batch, every run. This
+            # compare ALWAYS runs; the round-1 fix normalized only the (rarely
+            # reachable) apply-side compare.
+            def _norm_v(r):
+                v = (r.get("verification", {}).get("correct_finding")
+                     or r.get("finding"))
+                # #448 (wave r6 opus): a NON-STRING verdict (a list/dict from a
+                # text-mode reply or a checkpoint restore — never
+                # type-coerced on the way in) must not reach the set()
+                # construction: unhashable values crashed the Verify phase
+                # HERE, in the detector that ALWAYS runs. The Stage-1 twin
+                # coerces to "" on the same line (stage1_consistency.py:224).
+                return v.strip().lower() if isinstance(v, str) else ""
+            verdicts = set(_norm_v(r) for r in group)
             if len(verdicts) > 1:
                 inconsistent_groups.append((pattern, group))
 
@@ -1041,18 +1072,124 @@ class FindingVerifier:
 
         # Fix inconsistencies
         for pattern, group in inconsistent_groups:
-            verdicts = [r.get("verification", {}).get("correct_finding") or r.get("finding") for r in group]
+            # #448 (wave r3 opus): the LOG keeps the RAW stamps — a
+            # case/whitespace anomaly in stored data is the same
+            # upstream-bug signal the audit `from` field preserves, and with
+            # the detector now normalized this line is the only surface where
+            # the anomaly is visible for an inconsistent group.
+            verdicts = [
+                (r.get("verification", {}).get("correct_finding") or r.get("finding"))
+                for r in group]
             self._log("warning", f"Inconsistency detected in pattern: {pattern}",
-                      details={"findings": [r.get('route_key') for r in group], "verdicts": verdicts})
+                      details={"findings": [r.get('route_key') for r in group],
+                               "verdicts": verdicts})
 
             # Run consistency check
             consistency_result = self._resolve_inconsistency(group, code_by_route)
 
             if consistency_result:
-                # Apply consistent verdict, but respect exploit path analysis
+                # Apply consistent verdict, but respect exploit path analysis.
+                # #448 (wave r3 opus): an update is scoped to the GROUP that
+                # fired the call — a hallucinated route_key naming any OTHER
+                # row in the batch previously moved that row (or stamped its
+                # audit) regardless of the pattern the model was shown. The
+                # apply gate's threat model (a fully hallucinated
+                # findings_to_update payload) is precisely the case where the
+                # route_key is hallucinated too.
+                _group_rks = {r.get("route_key") for r in group}
                 for finding_update in consistency_result.findings_updated:
+                    # #448 (wave r4 opus): the ELEMENT is guarded — the
+                    # hallucinated payload's members may be strings, numbers,
+                    # or null (the shipped prompt never defines the key's
+                    # shape); .get on a non-dict crashed the Verify phase.
+                    if not isinstance(finding_update, dict):
+                        self._log("warning",
+                                  f"Malformed consistency update "
+                                  f"{finding_update!r}; ignored",
+                                  step="verify")
+                        continue
                     route_key = finding_update.get("route_key")
-                    new_verdict = finding_update.get("should_be")
+                    # #448 (wave r4 fable): a NON-STRING route_key (list/dict)
+                    # must not reach the set membership — r3's in-check raised
+                    # TypeError where the pre-r3 == compare harmlessly missed
+                    # (a hallucinated list-valued route_key IS the threat
+                    # model).
+                    if (not isinstance(route_key, str)
+                            or route_key not in _group_rks):
+                        self._log("warning",
+                                  f"Consistency update named out-of-group route "
+                                  f"{route_key!r}; ignored (the reply is "
+                                  "hallucinated or misaddressed)",
+                                  unit_id=route_key if isinstance(route_key, str) else None)
+                        continue
+                    raw_should_be = finding_update.get("should_be")
+                    # #448 (the #425 escape's Stage-2 twin): should_be is
+                    # unconstrained model output — this site wrote it into
+                    # `finding` VERBATIM (no strip, no validation), the key
+                    # `_count_verdicts` and the disclosure filters read FIRST:
+                    # a garbage value ("MAYBE VULNERABLE") passed the downgrade
+                    # guard (not in DISCLOSURE_DROPPED) and silently dropped a
+                    # real VULNERABLE finding from every count and from
+                    # disclosure; a PADDED value ("  vulnerable  ") landed raw
+                    # and missed every downstream lowercase vocabulary read.
+                    # Normalize (strip/lower — this module's storage
+                    # convention is lowercase `correct_finding`), then validate
+                    # against the canonical `finding` vocabulary; unrecognized
+                    # values are REJECTED with an audit record (the
+                    # #316/#324/#425/#427 producer discipline).
+                    #
+                    # REACHABILITY NOTE (wave r2 opus+fable, re-derived
+                    # twice): the shipped consistency prompt asks only for
+                    # should_be_consistent / consistent_verdict / explanation —
+                    # it NEVER requests findings_to_update, so on a
+                    # prompt-conformant reply this apply loop does not fire
+                    # (findings_updated is empty) and the parsed
+                    # consistent_verdict is unused downstream. The loop IS the
+                    # defense layer for NON-conformant replies, and the
+                    # reachability mechanism is _parse_json_from_text's DIRECT
+                    # brace-slice json.loads (filters NO keys — a hallucinated
+                    # findings_to_update in any well-formed JSON object passes
+                    # straight through). The JSON-corrector branch CANNOT
+                    # deliver the payload for a consistency-shaped reply (it
+                    # requires the verify keys agree/correct_finding/
+                    # explanation and errors out otherwise) — do not cite it as
+                    # the path. The hallucinated-Stage-1-shape reply is the
+                    # exact untrusted-model-output class this gate exists for.
+                    # Wiring consistent_verdict through would ACTIVATE
+                    # pattern-corrections that never ran — a new capability,
+                    # out of scope per the fixes-only rule; recorded as the
+                    # follow-up question.
+                    new_verdict = (raw_should_be.strip().lower()
+                                   if isinstance(raw_should_be, str) else "")
+                    if not new_verdict:
+                        # #448 (wave r2 fable, r3 opus): None or any string
+                        # that normalizes empty (whitespace-only) = "no
+                        # proposal" — silent skip; a NON-STRING (list/dict/
+                        # number) is a MALFORMED proposal — audited, not
+                        # silently dropped (the reject-with-audit contract).
+                        if raw_should_be is not None and not isinstance(raw_should_be, str):
+                            for result in results:
+                                if result.get("route_key") == route_key:
+                                    result["consistency_invalid_verdict_blocked"] = {
+                                        "proposed": raw_should_be,
+                                        "reason": finding_update.get("reason"),
+                                        "pattern": consistency_result.pattern_identified,
+                                    }
+                        continue
+                    if new_verdict not in _CORRECTABLE_STAGE2_FINDINGS:
+                        for result in results:
+                            if result.get("route_key") == route_key:
+                                result["consistency_invalid_verdict_blocked"] = {
+                                    "proposed": raw_should_be,
+                                    "reason": finding_update.get("reason"),
+                                    "pattern": consistency_result.pattern_identified,
+                                }
+                                self._log(
+                                    "warning",
+                                    f"Blocked consistency correction of {route_key} "
+                                    f"to unrecognized verdict: {raw_should_be!r}",
+                                    unit_id=route_key)
+                        continue
 
                     for result in results:
                         if result.get("route_key") == route_key:
@@ -1086,14 +1223,27 @@ class FindingVerifier:
                                 }
                                 continue
 
-                            old_verdict = result.get("verification", {}).get("correct_finding") or result.get("finding")
+                            # #448 (wave r1/r2): the old side is normalized
+                            # for the COMPARE (an uppercase-stamped row vs a
+                            # normalized proposal must not produce a spurious
+                            # record) — but the audit `from` field keeps the RAW
+                            # stored stamp (wave r2 fable+sonnet+opus): a
+                            # case/whitespace anomaly in stored data is itself
+                            # an upstream-bug signal, and experiment.py prints
+                            # this field verbatim. The Stage-1 twin keeps raw
+                            # in `from` while comparing normalized — same
+                            # convention.
+                            raw_old = (result.get("verification", {}).get("correct_finding")
+                                       or result.get("finding"))
+                            old_verdict = (raw_old.strip().lower()
+                                          if isinstance(raw_old, str) else raw_old)
                             if old_verdict != new_verdict:
                                 result["finding"] = new_verdict
                                 if "verification" not in result:
                                     result["verification"] = {}
                                 result["verification"]["correct_finding"] = new_verdict
                                 result["consistency_update"] = {
-                                    "from": old_verdict,
+                                    "from": raw_old,
                                     "to": new_verdict,
                                     "reason": finding_update.get("reason"),
                                     "pattern": consistency_result.pattern_identified
@@ -1217,10 +1367,38 @@ class FindingVerifier:
             result = self._parse_json_from_text(text)
 
             if result:
+                # #448 (wave r2 fable): honor the one conformant field that
+                # says DO NOT APPLY — a reply carrying should_be_consistent
+                # FALSE plus a hallucinated findings_to_update (the exact
+                # non-conformant shape the apply-gate exists for) must not
+                # apply its hallucinated corrections anyway.
+                # #448 (wave r3 fable+opus): the tolerant read — the reply
+                # class this gate exists for is NON-conformant; a
+                # "should_be_consistent": "false" / "no" / 0 must not sail
+                # past an identity check on True/False only.
+                sbc = result.get("should_be_consistent")
+                if sbc is not None and str(sbc).strip().lower() in ("false", "no", "0"):
+                    return None
+                # #448 (wave r4 fable+opus): the payload CONTAINER is coerced —
+                # a hallucinated "findings_to_update": null / string / dict
+                # previously reached the apply loop and crashed the Verify
+                # phase (after every per-unit LLM call was paid for): null
+                # raised TypeError at the for; a string iterated characters
+                # and AttributeError'd at .get. The Stage-1 twin wraps its
+                # apply loop in try/except; this site coerces at the source.
+                ftu = result.get("findings_to_update")
+                if ftu is None:
+                    ftu = []
+                elif not isinstance(ftu, list):
+                    self._log("warning",
+                              f"findings_to_update is not a list "
+                              f"({type(ftu).__name__}); ignored",
+                              step="verify")
+                    ftu = []
                 return ConsistencyCheckResult(
                     pattern_identified=result.get("pattern_identified", "unknown"),
                     consistent_verdict=result.get("consistent_verdict", "inconclusive"),
-                    findings_updated=result.get("findings_to_update", []),
+                    findings_updated=ftu,
                     explanation=result.get("explanation", "")
                 )
 
