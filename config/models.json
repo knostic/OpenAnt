@@ -1,5 +1,5 @@
 {
-  "_comment": "Provider-model registry: the single source of truth for model IDs and pricing, read by BOTH the Python engine (core/model_registry.py) and the Go CLI (internal/models). status is OpenAnt's shipped claim; source+retrieved are its provenance. price is null for any model that must not be auto-dispatched (retired/unknown) so it never resolves to a silent $0 in cost accounting. Prices are OpenAnt's shipped rates and are NOT verified against live provider pricing in the build environment \u2014 see each record's source. Recency of `retrieved` is an operational/CI concern, not asserted in the unit tests.",
+  "_comment": "Provider-model registry: the single source of truth for model IDs and pricing, read by BOTH the Python engine (core/model_registry.py) and the Go CLI (internal/models). status is OpenAnt's shipped claim; source+retrieved are its provenance. price is null for any model that must not be auto-dispatched (retired/unknown) so it never resolves to a silent $0 in cost accounting. Prices are OpenAnt's shipped rates and are NOT verified against live provider pricing in the build environment \u2014 see each record's source. Recency of `retrieved` is an operational/CI concern, not asserted in the unit tests. INVARIANT (test_models_price_cross_check.py): records for the same model family across providers must agree on price unless the diverging record carries an explicit `price_diverges` reason string (#344).",
   "schema_version": 1,
   "models": [
     {
@@ -7,11 +7,11 @@
       "provider": "anthropic",
       "status": "current",
       "price": {
-        "input": 15.0,
-        "output": 75.0
+        "input": 5.0,
+        "output": 25.0
       },
-      "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Anthropic pricing",
-      "retrieved": "2026-07-23"
+      "source": "verified against live Anthropic pricing (Claude Opus 4.8 = $5/$25 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-09-01) and the live OpenRouter catalogue (anthropic/claude-opus-4.8 = $5.00/$25.00 per 1M, openrouter.ai/api/v1/models, 2026-09-01) \u2014 both live sources agree; the prior 15.00/75.00 was the retired Opus 4.1-era shipped-table rate, never re-verified (#344)",
+      "retrieved": "2026-09-01"
     },
     {
       "id": "claude-sonnet-4-6",
@@ -64,21 +64,22 @@
       "provider": "bedrock",
       "status": "current",
       "price": {
-        "input": 15.0,
-        "output": 75.0
+        "input": 5.5,
+        "output": 27.5
       },
-      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-opus-4-8 record (Bedrock Claude token rates match the direct Anthropic API)",
-      "retrieved": "2026-07-31"
+      "source": "regional Bedrock inference profile; liveness via list-inference-profiles (us-east-1, status ACTIVE) on 2026-07-31; price = the direct Anthropic rate x1.1 (the regional-endpoint premium Anthropic's pricing page documents for Claude 4.5+ models), re-derived 2026-09-01",
+      "retrieved": "2026-07-31",
+      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models \u2014 this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
     },
     {
       "id": "global.anthropic.claude-opus-4-8",
       "provider": "bedrock",
       "status": "current",
       "price": {
-        "input": 15.0,
-        "output": 75.0
+        "input": 5.0,
+        "output": 25.0
       },
-      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-opus-4-8 record (Bedrock Claude token rates match the direct Anthropic API)",
+      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-opus-4-8 record, corrected to $5/$25 per #344's live re-verification (Bedrock Claude token rates match the direct Anthropic API); the mirrored direct rate re-verified 2026-09-01 via Anthropic's pricing page (global endpoints: standard pricing)",
       "retrieved": "2026-07-31"
     },
     {
@@ -86,11 +87,12 @@
       "provider": "bedrock",
       "status": "current",
       "price": {
-        "input": 3.0,
-        "output": 15.0
+        "input": 3.3,
+        "output": 16.5
       },
-      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-sonnet-4-6 record (Bedrock Claude token rates match the direct Anthropic API)",
-      "retrieved": "2026-07-31"
+      "source": "regional Bedrock inference profile; liveness via list-inference-profiles (us-east-1, status ACTIVE) on 2026-07-31; price = the direct Anthropic rate x1.1 (the regional-endpoint premium Anthropic's pricing page documents for Claude 4.5+ models), re-derived 2026-09-01",
+      "retrieved": "2026-07-31",
+      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models \u2014 this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
     },
     {
       "id": "global.anthropic.claude-sonnet-4-6",
@@ -100,7 +102,7 @@
         "input": 3.0,
         "output": 15.0
       },
-      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-sonnet-4-6 record (Bedrock Claude token rates match the direct Anthropic API)",
+      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-sonnet-4-6 record (Bedrock Claude token rates match the direct Anthropic API); the mirrored direct rate re-verified 2026-09-01 via Anthropic's pricing page (global endpoints: standard pricing)",
       "retrieved": "2026-07-31"
     },
     {
@@ -108,11 +110,12 @@
       "provider": "bedrock",
       "status": "current",
       "price": {
-        "input": 1.0,
-        "output": 5.0
+        "input": 1.1,
+        "output": 5.5
       },
-      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-haiku-4-5-20251001 record (Bedrock Claude token rates match the direct Anthropic API)",
-      "retrieved": "2026-07-31"
+      "source": "regional Bedrock inference profile; liveness via list-inference-profiles (us-east-1, status ACTIVE) on 2026-07-31; price = the direct Anthropic rate x1.1 (the regional-endpoint premium Anthropic's pricing page documents for Claude 4.5+ models), re-derived 2026-09-01",
+      "retrieved": "2026-07-31",
+      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models \u2014 this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
     },
     {
       "id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -122,7 +125,7 @@
         "input": 1.0,
         "output": 5.0
       },
-      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-haiku-4-5-20251001 record (Bedrock Claude token rates match the direct Anthropic API)",
+      "source": "verified against a live Bedrock account via list-inference-profiles (us-east-1, status ACTIVE); price mirrors the anthropic claude-haiku-4-5-20251001 record (Bedrock Claude token rates match the direct Anthropic API); the mirrored direct rate re-verified 2026-09-01 via Anthropic's pricing page (global endpoints: standard pricing)",
       "retrieved": "2026-07-31"
     },
     {

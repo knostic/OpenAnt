@@ -137,14 +137,20 @@ def test_b_consumers_import_without_cycle():
         importlib.import_module(mod)
 
 
-# --- (c) values are behavior-preserving ------------------------------
-# Snapshot of the exact literals present BEFORE the refactor.
+# --- (c) values mirror config/models.json ---------------------------
+# A hand-maintained mirror of the registry's CURRENT rates (NOT a frozen
+# pre-refactor snapshot: #344 corrected claude-opus-4-8 to the live rate —
+# every deliberate price change is a three-place edit: models.json, this
+# mirror, and any record_call-math pin).
 # Post-cutover, pricing_map("anthropic") OMITS retired/unknown ids (null-priced
 # in config/models.json), so the adapter table and MODEL_PRICING expose only the
 # CURRENT models. The retired ids were priced in the old dict but must never
 # price now (they resolve to warn + $0).
 _EXPECTED_ANTHROPIC_CURRENT = {
-    "claude-opus-4-8": {"input": 15.00, "output": 75.00},
+    # #344: corrected to the live rate — Anthropic's pricing page and the live
+    # OpenRouter catalogue both say $5/$25 per MTok for Opus 4.8; the prior
+    # 15/75 was the retired Opus 4.1-era shipped-table rate.
+    "claude-opus-4-8": {"input": 5.00, "output": 25.00},
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
     "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
 }

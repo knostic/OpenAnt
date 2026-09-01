@@ -72,5 +72,7 @@ class TestTokenTracker:
     def test_opus_pricing(self):
         tracker = TokenTracker()
         result = tracker.record_call("claude-opus-4-8", 1_000_000, 1_000_000)
-        # Opus: $15/M input, $75/M output
-        assert result["cost_usd"] == 90.0
+        # #344: Opus 4.8's live rate — $5/M input, $25/M output (both Anthropic's
+        # pricing page and the OpenRouter catalogue; the prior 15/75 was the
+        # retired Opus 4.1-era shipped-table rate).
+        assert result["cost_usd"] == 30.0
