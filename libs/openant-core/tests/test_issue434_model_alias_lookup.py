@@ -122,3 +122,24 @@ def test_find_model_prefers_the_same_provider():
         f"the same-provider record wins: {rec['id']}"
     )
     assert rec["provider"] == "anthropic"
+
+
+def test_family_fallback_prefers_the_querys_provider():
+    """famD panel (sonnet): a vendor-suffixed query must not resolve to
+    another provider's record for the same family — the first-match-by-
+    list-order fallback could hand an anthropic/ query the bedrock twin
+    (wrong status/source). Same-provider candidates are preferred."""
+    from core.model_registry import find_model, load_models, _family_key
+
+    # an anthropic-suffixed spelling of a family that ALSO exists on bedrock
+    target = "anthropic/claude-opus-4-8"
+    fam = _family_key(target)
+    assert fam is not None
+    family_records = [r for r in load_models() if _family_key(r.get("id", "")) == fam]
+    providers = {r.get("provider") for r in family_records}
+    if {"anthropic", "bedrock"} <= providers or len(providers) > 1:
+        rec = find_model(target)
+        assert rec is not None and rec.get("provider") == "anthropic", (
+            f"a vendor-suffixed anthropic query resolved to {rec.get('id')!r} "
+            f"(provider {rec.get('provider')!r}) — the same-provider "
+            "preference is missing")

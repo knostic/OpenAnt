@@ -203,9 +203,28 @@ def find_model(model_id: str) -> dict | None:
             return rec
     fam = _family_key(model_id)
     if fam is not None:
-        for rec in load_models():
-            if _family_key(rec.get("id", "")) == fam:
-                return rec
+        # famD panel (sonnet): the family fallback previously returned the
+        # FIRST family match by list order — a query carrying a vendor slug
+        # (anthropic/claude-opus-4-8) could resolve to another provider's
+        # record for the same family (a bedrock twin), with that record's
+        # status/source. Prefer same-provider candidates first; cross-
+        # provider family matches remain the last resort (an unsuffixed id
+        # stays order-stable).
+        family_matches = [
+            rec for rec in load_models() if _family_key(rec.get("id", "")) == fam
+        ]
+        if family_matches:
+            vendor = model_id.split("/", 1)[0] if "/" in model_id else ""
+            if vendor:
+                same = [r for r in family_matches if r.get("id", "").startswith(f"{vendor}/")]
+                # the bare (unsuffixed) record is the family's canonical
+                # form — it wins over same-provider suffixed twins
+                bare = [r for r in family_matches if "/" not in r.get("id", "")]
+                if bare:
+                    return bare[0]
+                if same:
+                    return same[0]
+            return family_matches[0]
     return None
 
 
