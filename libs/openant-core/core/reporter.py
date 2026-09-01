@@ -343,7 +343,9 @@ def build_pipeline_output(
         application_type: App type for context (default ``"unknown"`` —
             #304: a caller that omits it gets the honest unknown, never a
             fabricated web_app).
-        processing_level: Processing level used (``"reachable"``, etc.).
+        processing_level: The level REQUESTED on the CLI (``"reachable"``, etc.);
+            ``pipeline_stats.effective_processing_level`` carries the level that
+            actually ran when the Python-path fallback recorded one (#328).
         step_reports: Optional list of step report dicts for duration/cost info.
         context_source: Which path supplied the security model —
             ``"threat_model"`` (a file in the scanned repo), ``"generated"``
@@ -646,6 +648,19 @@ def build_pipeline_output(
         _rf_warning = _reach.get("warning")
         if isinstance(_rf_warning, str) and _rf_warning:
             reachability_warnings.append(_rf_warning)
+        # #328: the Python-path level fallback (codeql/exploitable accepted,
+        # reachability-only run) reaches the artifact instead of dying on
+        # stderr. Present-only forward — records without the key (non-Python
+        # paths, plain reachable) are untouched, so the forward never
+        # fabricates a fallback.
+        _fb_warning = _reach.get("level_fallback_warning")
+        if isinstance(_fb_warning, str) and _fb_warning:
+            reachability_warnings.append(_fb_warning)
+        # The level that actually ran, when the record says one (the Python
+        # path always writes it; per-language records don't, and stay as-is).
+        _eff = _reach.get("effective_processing_level")
+        if isinstance(_eff, str) and _eff:
+            _reach_telemetry["effective_processing_level"] = _eff
         # #301: the prune classification (orphan = missing-edge ROOT
         # candidate; dead_cluster = downstream shadow) previously reached no
         # consumer — forward it present-only so pipeline_output carries the
