@@ -1075,13 +1075,29 @@ class FindingVerifier:
                 # route_key is hallucinated too.
                 _group_rks = {r.get("route_key") for r in group}
                 for finding_update in consistency_result.findings_updated:
+                    # #448 (wave r4 opus): the ELEMENT is guarded — the
+                    # hallucinated payload's members may be strings, numbers,
+                    # or null (the shipped prompt never defines the key's
+                    # shape); .get on a non-dict crashed the Verify phase.
+                    if not isinstance(finding_update, dict):
+                        self._log("warning",
+                                  f"Malformed consistency update "
+                                  f"{finding_update!r}; ignored",
+                                  step="verify")
+                        continue
                     route_key = finding_update.get("route_key")
-                    if route_key not in _group_rks:
+                    # #448 (wave r4 fable): a NON-STRING route_key (list/dict)
+                    # must not reach the set membership — r3's in-check raised
+                    # TypeError where the pre-r3 == compare harmlessly missed
+                    # (a hallucinated list-valued route_key IS the threat
+                    # model).
+                    if (not isinstance(route_key, str)
+                            or route_key not in _group_rks):
                         self._log("warning",
                                   f"Consistency update named out-of-group route "
                                   f"{route_key!r}; ignored (the reply is "
                                   "hallucinated or misaddressed)",
-                                  unit_id=route_key)
+                                  unit_id=route_key if isinstance(route_key, str) else None)
                         continue
                     raw_should_be = finding_update.get("should_be")
                     # #448 (the #425 escape's Stage-2 twin): should_be is
@@ -1340,10 +1356,26 @@ class FindingVerifier:
                 sbc = result.get("should_be_consistent")
                 if sbc is not None and str(sbc).strip().lower() in ("false", "no", "0"):
                     return None
+                # #448 (wave r4 fable+opus): the payload CONTAINER is coerced —
+                # a hallucinated "findings_to_update": null / string / dict
+                # previously reached the apply loop and crashed the Verify
+                # phase (after every per-unit LLM call was paid for): null
+                # raised TypeError at the for; a string iterated characters
+                # and AttributeError'd at .get. The Stage-1 twin wraps its
+                # apply loop in try/except; this site coerces at the source.
+                ftu = result.get("findings_to_update")
+                if ftu is None:
+                    ftu = []
+                elif not isinstance(ftu, list):
+                    self._log("warning",
+                              f"findings_to_update is not a list "
+                              f"({type(ftu).__name__}); ignored",
+                              step="verify")
+                    ftu = []
                 return ConsistencyCheckResult(
                     pattern_identified=result.get("pattern_identified", "unknown"),
                     consistent_verdict=result.get("consistent_verdict", "inconclusive"),
-                    findings_updated=result.get("findings_to_update", []),
+                    findings_updated=ftu,
                     explanation=result.get("explanation", "")
                 )
 

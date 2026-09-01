@@ -383,3 +383,44 @@ def test_whitespace_only_should_be_is_a_silent_no_proposal():
     row = _by_rk(out, VULN_RK)
     assert row["finding"] == "vulnerable"
     assert "consistency_invalid_verdict_blocked" not in row
+
+
+def test_malformed_payload_container_and_elements_never_crash(monkeypatch):
+    """Wave r4 (fable+opus): the hallucinated payload's container and
+    elements are shape-checked — "findings_to_update": null / a string / a
+    dict, and list members that are strings or null, previously crashed the
+    Verify phase AFTER every per-unit LLM call was paid (TypeError at the
+    for; AttributeError at .get). All three shapes now leave every row
+    untouched."""
+    import json as _json
+    import utilities.llm as fv_llm
+    from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+
+    rows = [{"route_key": VULN_RK, "finding": "vulnerable",
+             "verification": {"correct_finding": "vulnerable"}},
+            {"route_key": SAFE_RK, "finding": "safe",
+             "verification": {"correct_finding": "safe"}}]
+    v = _verifier()
+    v.binding = object()
+    v.tracker = None
+    bad_payloads = [
+        None,                                   # null container
+        "all",                                  # a string container
+        {"route": "safe"},                      # a dict container
+        [VULN_RK],                              # a list of strings
+        [None, 3],                              # non-dict elements
+        [{"route_key": ["a", "b"], "should_be": "safe"}],  # unhashable route_key
+    ]
+    for payload in bad_payloads:
+        reply = _json.dumps({"should_be_consistent": True,
+                             "consistent_verdict": "safe",
+                             "explanation": "x",
+                             "findings_to_update": payload})
+        monkeypatch.setattr(fv_llm, "simple_text", lambda *a, r=reply, **k: r)
+        got = v._resolve_inconsistency([dict(r) for r in rows], {})
+        # the resolver must return (None or an empty/ignored payload), never raise
+        out = v._check_consistency([dict(r) for r in rows], {}) if got is None else rows
+        vuln = next(r for r in out if r["route_key"] == VULN_RK)
+        assert vuln["finding"] == "vulnerable", (
+            f"payload {payload!r} moved or crashed a row"
+        )
