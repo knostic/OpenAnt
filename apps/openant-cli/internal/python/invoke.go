@@ -2,12 +2,10 @@
 package python
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -39,14 +37,6 @@ import (
 // resolveInvokeTimeout lets an operator raise the budget via
 // OPENANT_INVOKE_TIMEOUT without recompiling.
 var defaultInvokeTimeout = 30 * time.Minute
-
-// stderrDrainGrace bounds how long the normal exit path waits on the stderr
-// drain AFTER the child's stdout already closed (i.e. the child has exited):
-// a descendant holding ONLY the stderr write-end would otherwise keep the
-// streamer blocked until the deadline's watchdog fired — the full
-// OPENANT_INVOKE_TIMEOUT hang for a result that was already in hand. Package
-// var so tests can shrink it, mirroring defaultInvokeTimeout.
-var stderrDrainGrace = 5 * time.Second
 
 // resolveInvokeTimeout returns the invoke deadline, honoring the
 // OPENANT_INVOKE_TIMEOUT env override. The value is either a Go duration
@@ -115,6 +105,10 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	// WaitDelay tells os/exec to force-close those inherited pipe FDs shortly
 	// after the context is done, and the explicit read-end close in the
 	// watchdog goroutine (below) unblocks the in-flight reads.
+	// famD panel (sonnet): the pre-managed-writers stderrDrainGrace knob
+	// (the old normal-path drain bound) is deleted — its only production
+	// call site was removed by the managed-writers refactor; the tests
+	// ride this WaitDelay bound now.
 	cmd.WaitDelay = 5 * time.Second
 
 	if workDir != "" {
@@ -129,38 +123,32 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 		cmd.Env = setEnv(cmd.Env, "ANTHROPIC_API_KEY", apiKey)
 	}
 
-	// Capture stdout (JSON output)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
-	// Stream stderr to terminal (progress messages)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
+	// #431: route stdout/stderr through MANAGED writers (invoke_ctx.go's
+	// pattern) instead of StdoutPipe/StderrPipe + this function's own copy
+	// goroutines. os/exec runs the copy goroutines itself, Wait drains them,
+	// and WaitDelay bounds them: the pipe read-ends close at child-exit +
+	// WaitDelay (5s) even when a DETACHED descendant holds a write-end —
+	// the engine's subprocesses inherit the Go-side pipes (core/reporter.py,
+	// parser_adapter.py pass stdout/stderr through), so the shape is live.
+	// With manual pipe reads the ordering was forced to read-to-EOF BEFORE
+	// Wait, so Wait — the only thing that starts WaitDelay — was never
+	// reached while a read blocked: a run that completed in seconds
+	// surfaced OPENANT_INVOKE_TIMEOUT later under a deadline note, and the
+	// watchdog's read-end close (not child exit) was the only recovery.
+	var stdoutBuf strings.Builder
+	cmd.Stdout = &stdoutBuf
+	// lineWriter forwards complete stderr lines to the terminal (the
+	// progress stream) as they arrive; a single partial line is capped.
+	stderrLW := &lineWriter{onLog: func(line string) {
+		if !quiet {
+			fmt.Fprintln(os.Stderr, line)
+		}
+	}}
+	cmd.Stderr = stderrLW
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start Python process: %w", err)
 	}
-
-	// Watchdog: when the timeout (or any context cancellation) fires, close
-	// the pipe read-ends so io.Copy(stdout) and streamStderr(stderr) return
-	// promptly instead of blocking on a descendant that still holds the
-	// write-ends open. Without this, the deadline would kill the parser but
-	// the CLI would still hang in io.Copy. watchdogDone stops the goroutine
-	// on the normal (non-timeout) exit path.
-	watchdogDone := make(chan struct{})
-	defer close(watchdogDone)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = stdout.Close()
-			_ = stderr.Close()
-		case <-watchdogDone:
-		}
-	}()
 
 	// Forward SIGINT/SIGTERM to the Python subprocess so Ctrl+C kills it.
 	sigChan := make(chan os.Signal, 1)
@@ -193,55 +181,19 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	}()
 
 	// Stream stderr in a goroutine
-	stderrDone := make(chan struct{})
-	go func() {
-		defer close(stderrDone)
-		streamStderr(stderr, quiet)
-	}()
-
-	// Read all stdout. A read error is CAPTURED, not returned: the buffer
-	// may already hold a complete envelope (a descendant holding the pipe
-	// write-end past the child's exit is exactly the case the watchdog
-	// comment above describes) — the envelope-wins rule below recovers it.
-	var stdoutBuf strings.Builder
-	_, copyErr := io.Copy(&stdoutBuf, stdout)
-
-	// Reap and drain. ORDER MATTERS and differs by path:
-	//   * normal path (no read error): drain stderr FIRST, then Wait —
-	//     StderrPipe's contract is explicit ("It is thus incorrect to call
-	//     Wait before all reads from the pipe have completed"): Wait closes
-	//     the read-end on reap, and a read still pending then fails with
-	//     ErrClosed, dropping whatever is still in the kernel pipe buffer —
-	//     the child's FINAL stderr lines (a traceback's last line is the
-	//     one the operator needs) would be lost.
-	//   * read-error path: the watchdog (or the fd failure) has already
-	//     closed the stdout read-end; Wait FIRST (it reaps the child and
-	//     closes the stderr read-end, which unblocks the streamer — that
-	//     close, not the deadline, is what bounds a descendant holding the
-	//     stderr write-end), then drain.
-	var exitErr error
-	if copyErr != nil {
-		exitErr = cmd.Wait()
-		<-stderrDone
-	} else {
-		// Round-3 panel finding (executed probe): the stdout read is
-		// bounded by the child's exit, but this drain was bounded only
-		// by the deadline — a descendant holding ONLY the stderr
-		// write-end kept <-stderrDone blocked until ctx.Done() fired
-		// the watchdog: a 0.1s child with a complete envelope in hand
-		// hung the FULL OPENANT_INVOKE_TIMEOUT (15s probe on a 15s
-		// budget) and returned under a spurious "deadline fired"
-		// recovery note. Grace-close the stderr read-end
-		// stderrDrainGrace after the child's stdout closed (mirroring
-		// cmd.WaitDelay's own bound): a streamer still blocked by then
-		// is reading an EMPTY kernel buffer — the real output drained
-		// the moment it arrived — so closing loses nothing and
-		// unblocks the drain.
-		stderrGrace := time.AfterFunc(stderrDrainGrace, func() { _ = stderr.Close() })
-		<-stderrDone
-		stderrGrace.Stop()
-		exitErr = cmd.Wait()
-	}
+	// Reap and drain in ONE call: with managed writers, os/exec's own copy
+	// goroutines are drained by Wait, so the StderrPipe ordering hazards
+	// (read-to-EOF before Wait or lose the kernel buffer's final lines)
+	// and the #431 path-split are gone. WaitDelay bounds the drain at
+	// child-exit + 5s for a detached descendant holding a write-end, and a
+	// held write-end surfaces as exec.ErrWaitDelay (NOT an *ExitError) with
+	// ProcessState carrying the child's real exit code — the kill-artifact
+	// logic below keys on ExitError/deadlineFired and does not misread it.
+	exitErr := cmd.Wait()
+	// flush AFTER Wait: os/exec guarantees the copy goroutine finished, so
+	// there is no concurrent Write (lineWriter.flush's contract) — the
+	// child's final, newline-less stderr fragment is delivered too.
+	stderrLW.flush()
 
 	deadlineFired := ctx.Err() == context.DeadlineExceeded
 
@@ -330,6 +282,16 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 		exitCode := 0
 		if ee, ok := exitErr.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
+		} else if cmd.ProcessState != nil {
+			// #431 (wave r1 sonnet): with managed writers, a detached
+			// descendant holding a pipe write-end makes Wait return
+			// exec.ErrWaitDelay INSTEAD of the *exec.ExitError this
+			// branch extracts from — a scan that legitimately exits 1
+			// ("vulnerabilities found") beside a held write-end was
+			// silently reported as exit 0. ProcessState carries the
+			// child's real code on that path (the same translation the
+			// no-envelope path applies below).
+			exitCode = cmd.ProcessState.ExitCode()
 		}
 		if exitErrIsKillArtifact {
 			// Round-3 panel finding: the exit code here is the KILL's
@@ -373,24 +335,28 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	// the diagnosis — the same text on every surface, with the underlying
 	// cause wrapped when there is one.
 	if childKilled {
-		return nil, deadlineDiagnosis(invokeTimeout, args, copyErr, exitErr)
+		// #431: with managed writers there is no manual read error to
+		// report — the underlying cause is the kill itself.
+		return nil, deadlineDiagnosis(invokeTimeout, args, nil, exitErr)
 	}
 
-	// Non-deadline failures, in the original precedence. The watchdog's
-	// read-end close under a fired deadline is an ARTIFACT (os.ErrClosed),
-	// not a real I/O failure — suppressed so the honest
-	// no-output/parse-failure paths below report the child's own outcome.
-	// A genuine non-ErrClosed read error still surfaces, deadline or not.
-	if copyErr != nil && !(deadlineFired && errors.Is(copyErr, os.ErrClosed)) {
-		return nil, fmt.Errorf("failed to read stdout: %w", copyErr)
-	}
 	if exitErr != nil {
 		if _, ok := exitErr.(*exec.ExitError); !ok {
-			// The context-substitution wait error for an
-			// already-successfully-exited child under a fired deadline
-			// is the same artifact class — the honest answer is the
-			// child's own (empty) outcome below, not a wait failure.
-			if !(deadlineFired && cmd.ProcessState != nil && cmd.ProcessState.Success()) {
+			// #431: the managed-writer shape's OWN artifact — the child
+			// exited on its own but a lingering pipe holder tripped
+			// WaitDelay, so Wait returns exec.ErrWaitDelay (NOT an
+			// *ExitError) with ProcessState carrying the real exit. The
+			// scan completed; keep its captured envelope + real exit
+			// code (the same translation the sibling path makes,
+			// invoke_ctx.go:243) — fall through, never a wait failure.
+			if errors.Is(exitErr, exec.ErrWaitDelay) && cmd.ProcessState != nil {
+				naturalExitCode = cmd.ProcessState.ExitCode()
+				exitErr = nil
+			} else if !(deadlineFired && cmd.ProcessState != nil && cmd.ProcessState.Success()) {
+				// The context-substitution wait error for an
+				// already-successfully-exited child under a fired deadline
+				// is the same artifact class — the honest answer is the
+				// child's own (empty) outcome below, not a wait failure.
 				return nil, fmt.Errorf("failed waiting for Python process: %w", exitErr)
 			}
 		}
@@ -512,24 +478,6 @@ func normalizeExit(code int, isError bool) int {
 		return 2
 	}
 	return code
-}
-
-// streamStderr reads stderr line by line and writes to os.Stderr.
-// If quiet is true, stderr output is suppressed.
-func streamStderr(r io.Reader, quiet bool) {
-	// bufio.Reader (not bufio.Scanner) so a stderr line larger than the
-	// scanner's default 64k token buffer is not truncated/dropped — a long
-	// Python traceback on one line can exceed that and would lose diagnostics.
-	br := bufio.NewReader(r)
-	for {
-		line, err := br.ReadString('\n')
-		if len(line) > 0 && !quiet {
-			fmt.Fprint(os.Stderr, line)
-		}
-		if err != nil {
-			return
-		}
-	}
 }
 
 // setEnv sets or replaces an environment variable in a []string env slice.

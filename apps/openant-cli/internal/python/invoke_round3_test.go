@@ -32,13 +32,13 @@ import (
 
 // A complete envelope is in hand and the child has exited, but a descendant
 // holds ONLY the stderr write-end: the invocation must return promptly
-// (bounded by the child's exit + stderrDrainGrace, NOT the deadline), with
-// no deadline ever firing.
+// (bounded by the child's exit + WaitDelay, NOT the deadline), with no
+// deadline ever firing. #431 (wave r1 sonnet): the old stderrDrainGrace
+// mutation was stale — the variable's only production call site was removed
+// by the managed-writers refactor; the test now rides (and pins) the
+// WaitDelay bound itself.
 func TestInvoke_StderrOnlyDescendantDoesNotHang(t *testing.T) {
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "30s")
-	old := stderrDrainGrace
-	stderrDrainGrace = 1 * time.Second
-	t.Cleanup(func() { stderrDrainGrace = old })
 	s := writeScript(t, `printf '{"status":"success","errors":[]}'
 sleep 60 >&2 &
 exit 0
@@ -91,5 +91,31 @@ exec sleep 60
 	}
 	if !strings.Contains(string(b), "result envelope was recovered") {
 		t.Fatalf("the recovery notice must be visible on stderr when not quiet; got: %q", string(b))
+	}
+}
+
+// #431 (wave r1 sonnet): the ENVELOPE path's exit-code extraction missed
+// exec.ErrWaitDelay (the managed-writers shape when a descendant holds a
+// write-end) — a scan that legitimately exits 1 ("vulnerabilities found")
+// beside a held pipe was silently reported as exit 0. ProcessState carries
+// the real code.
+func TestInvoke_Exit1WithHeldPipeKeepsExit1(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script children (the package convention)")
+	}
+	t.Setenv("OPENANT_INVOKE_TIMEOUT", "30s")
+	s := writeScript(t, `printf '{"status":"success","errors":[]}'
+sleep 60 &
+exit 1
+`)
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "")
+	if err != nil {
+		t.Fatalf("the envelope must win over the held write-end: %v", err)
+	}
+	if res.Envelope.Status != "success" {
+		t.Fatalf("envelope status = %q, want success", res.Envelope.Status)
+	}
+	if res.ExitCode != 1 {
+		t.Fatalf("exit code = %d, want 1 (the vulnerabilities-found exit was silently dropped to 0 by the ErrWaitDelay miss)", res.ExitCode)
 	}
 }
