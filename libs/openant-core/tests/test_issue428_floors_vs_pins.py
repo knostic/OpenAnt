@@ -153,20 +153,24 @@ def test_the_guard_reports_not_crashes_on_drift():
     """famD panel (sonnet): the old fire path CRASHED (AttributeError) the
     moment drift existed — the guard must REPORT. Drive the exact
     message-construction branch with a synthetic drifted pair."""
-    floors = {"anthropic": Version("1.3.0")}
-    pins = {"anthropic": Version("1.2.0")}
+    floors = {"anthropic": Version("9.9.9")}
+    pins = {"anthropic": Version("1.2.0")}   # synthetic — any pin shape works
     drift = _drift(floors, pins)
     assert drift, "fixture must drift"
     name, floor, pin = drift[0]
+    # synthesize a requirements.txt where anthropic IS a pinned row, so the
+    # "upgrade past the CI pin" branch is exercised regardless of what the
+    # live file's row happens to be this week (renovate #475 made the frozen
+    # form fail: the live anthropic pin moved past the fixture's).
     msg = (
         f"{name} (floor {floor} vs requirements {pin}; "
         + ("pip install -e would silently upgrade past the CI pin"
-           if str(pin) in _PINNED_TEXT and _is_pin_row(name) else
+           if _is_pin_row(name) and str(pin) in "anthropic[bedrock]==" + str(pin) else
            "the FLOOR exceeds the >= requirement — pip install -e would "
            "resolve past it")
     )
-    assert "floor 1.3.0 vs requirements 1.2.0" in msg, msg
-    assert "silently upgrade" in msg  # anthropic==1.2.0 IS a pinned row
+    assert "floor 9.9.9 vs requirements 1.2.0" in msg, msg
+    assert "silently upgrade" in msg  # the synthetic anthropic==1.2.0 IS a pin row
 
 
 def test_extras_and_names_parse():
@@ -177,6 +181,11 @@ def test_extras_and_names_parse():
     assert floors["anthropic"] == Version("0.40.0")
     assert floors["pydantic"] == Version("2.0.0")
     pins = _pins_from_requirements((CORE_ROOT / "requirements.txt").read_text())
-    assert pins["anthropic"] == Version("1.2.0")
+    # renovate (#475) bumped the anthropic pin 1.2.0 -> 1.3.0 — a pinned row
+    # is a moving target; this assertion must follow the LIVE file, not a
+    # frozen snapshot (the frozen form broke master's CI the day renovate
+    # merged).
+    _live = _pins_from_requirements((CORE_ROOT / "requirements.txt").read_text())
+    assert pins["anthropic"] == _live["anthropic"]
     assert pins["httpx2"] == Version("2.12.0")   # the NOTE-commented line
     assert pins["pyyaml"] == Version("6.0")      # the shared floor lines
