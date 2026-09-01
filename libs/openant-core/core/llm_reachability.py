@@ -15,8 +15,10 @@ Pipeline ordering (managed by ``core/scanner.py``):
 
 1. Parse with ``processing_level="all"`` so every unit is available.
 2. ``analyze_reachability`` reviews all units and returns signals.
-3. ``apply_signals`` promotes high-confidence ``entry_point`` signals by
-   setting ``is_entry_point=True`` on the target unit.
+3. ``apply_signals`` promotes ``entry_point`` signals whose confidence is
+   in the promote set (``OPENANT_PROMOTE_ENTRY_POINT_AT``, default
+   ``{high}`` — #345: configurable per run) by setting
+   ``is_entry_point=True`` on the target unit.
 4. The structural reachability filter re-runs with LLM-promoted entry
    points added as extra BFS seeds, yielding a dataset filtered to the
    user's requested ``processing_level`` but expanded by LLM findings.
@@ -29,8 +31,9 @@ Output:
 - ``analyze_reachability(...)`` returns a list of ``ReachabilitySignal``
   dicts.
 - ``apply_signals(dataset, signals)`` mutates the dataset in place so each
-  unit gains an ``llm_reachability_signals`` field, and high-confidence
-  ``entry_point`` signals set ``is_entry_point = True`` on the target unit.
+  unit gains an ``llm_reachability_signals`` field, and ``entry_point``
+  signals in the promote set set ``is_entry_point = True`` on the target unit
+  (the set is configurable — see OPENANT_PROMOTE_ENTRY_POINT_AT).
 
 Usage:
     from core.llm_reachability import analyze_reachability, apply_signals
@@ -42,6 +45,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, asdict
@@ -484,9 +488,64 @@ def analyze_reachability(
 # ---------------------------------------------------------------------------
 
 
-# Confidences at or above this threshold promote ``entry_point`` signals to
-# ``is_entry_point = True`` on the target unit.
-_PROMOTE_ENTRY_POINT_AT = {"high"}
+# The confidence tiers that promote an ``entry_point`` signal to
+# ``is_entry_point = True`` on the target unit. This is a SET-MEMBERSHIP
+# test, not an "at or above" ordering — no ordering over high/medium/low
+# exists in this module, and the earlier "at or above" comment described
+# semantics the code never implemented (it worked only because the set
+# had one element) — #345.
+#
+# Configurable per run (#345): an operator can trade recall for cost —
+# promotion is promote-only and never demotes, so a wrong promotion costs
+# analysis budget while a missing one silently drops a unit and everything
+# reachable only through it. OPENANT_PROMOTE_ENTRY_POINT_AT is a
+# comma-separated subset of high/medium/low, read at apply time; invalid or
+# empty content falls back to the shipped default WITH a stderr warning —
+# a calibration knob must never crash the scan.
+#
+# The DEFAULT is the deliberate PR #50 calibration, pinned by
+# test_medium_confidence_does_not_promote: medium measured 48% precision
+# on the one audit #345 reports (n=25, 95% CI [30,67], an internal run the
+# issue flags as not reproducible from this repository — widen only after
+# the second-corpus reproduction it names), and low 0.0%.
+_PROMOTE_ENTRY_POINT_AT_DEFAULT = frozenset({"high"})
+# the tier vocabulary _VALID_CONFIDENCES already declares (parse validates
+# incoming signals against it) — a second hand-rolled copy would drift: a
+# tier added there but not here makes an operator's whole list discard
+# (wave r1 opus), narrowing promotion to the default: the under-seeding
+# direction.
+_PROMOTE_TIERS = frozenset(_VALID_CONFIDENCES)
+_ENV_PROMOTE_ENTRY_POINT_AT = "OPENANT_PROMOTE_ENTRY_POINT_AT"
+
+
+def _promote_entry_point_at() -> frozenset:
+    """The tiers that promote, after resolving the env override (#345)."""
+    raw = os.environ.get(_ENV_PROMOTE_ENTRY_POINT_AT)
+    if raw is None or raw == "":
+        # blank-but-SET (OPENANT_PROMOTE_ENTRY_POINT_AT= — the CI-template
+        # shape, `=$WIDEN` with WIDEN unset) WARNED, not silent: the operator
+        # believes the widening is live while promotion silently narrows to
+        # the default — units dropped from analysis with zero signal (wave
+        # r1, sonnet+opus).
+        if raw == "":
+            print(
+                f"[LLMReach] {_ENV_PROMOTE_ENTRY_POINT_AT} is set but empty; "
+                f"falling back to the shipped default "
+                f"{sorted(_PROMOTE_ENTRY_POINT_AT_DEFAULT)}",
+                file=sys.stderr,
+            )
+        return _PROMOTE_ENTRY_POINT_AT_DEFAULT
+    wanted = {t.strip().lower() for t in raw.split(",") if t.strip()}
+    if not wanted or (wanted - _PROMOTE_TIERS):
+        print(
+            f"[LLMReach] {_ENV_PROMOTE_ENTRY_POINT_AT}={raw!r}: expected "
+            f"comma-separated tiers from {sorted(_PROMOTE_TIERS)}; falling "
+            "back to the shipped default "
+            f"{sorted(_PROMOTE_ENTRY_POINT_AT_DEFAULT)}",
+            file=sys.stderr,
+        )
+        return _PROMOTE_ENTRY_POINT_AT_DEFAULT
+    return frozenset(wanted)
 
 
 def apply_signals(
@@ -497,9 +556,11 @@ def apply_signals(
 
     For each unit referenced by a signal:
       - The signal is appended to a per-unit ``llm_reachability_signals`` list.
-      - If the signal kind is ``entry_point`` AND its confidence is in
-        :data:`_PROMOTE_ENTRY_POINT_AT`, the unit's ``is_entry_point`` field
-        is set to ``True`` (never set back to ``False``).
+      - If the signal kind is ``entry_point`` AND its confidence is in the
+        promote set (:func:`_promote_entry_point_at` — the shipped default
+        ``{high}``, configurable via OPENANT_PROMOTE_ENTRY_POINT_AT), the
+        unit's ``is_entry_point`` field is set to ``True`` (never set back
+        to ``False``).
 
     Crucially, this never DEMOTES a unit. ``is_entry_point=True`` set by the
     structural pass remains true regardless of what the LLM said.
@@ -514,6 +575,7 @@ def apply_signals(
     """
     units = dataset.get("units") or []
     by_id = {u.get("id"): u for u in units if u.get("id")}
+    promote_at = _promote_entry_point_at()
 
     promoted = 0
     touched: set = set()
@@ -531,7 +593,7 @@ def apply_signals(
 
         if (
             sig.kind == "entry_point"
-            and sig.confidence in _PROMOTE_ENTRY_POINT_AT
+            and sig.confidence in promote_at
             and not unit.get("is_entry_point", False)
         ):
             unit["is_entry_point"] = True
@@ -542,6 +604,10 @@ def apply_signals(
         "signals_applied": applied,
         "entry_points_promoted": promoted,
         "units_touched": len(touched),
+        # #345 (wave r1 opus): the resolved set is part of the run's
+        # provenance — two scans under different sets produce different
+        # promotions with byte-identical step reports otherwise.
+        "promote_set": sorted(promote_at),
     }
 
 

@@ -858,6 +858,11 @@ def scan_repository(
                         "signals_added": summary["signals_applied"],
                         "entry_points_promoted": summary["entry_points_promoted"],
                         "units_touched": summary["units_touched"],
+                        # #345 (wave r1 opus): the resolved promote set is
+                        # the run's provenance — two scans under different
+                        # sets differ in promotions with byte-identical
+                        # step reports otherwise.
+                        "promote_set": summary.get("promote_set", []),
                         "post_filter_units": post_filter_count,
                         "refilter_supported": refilter_supported,
                         # #294: the honest coverage numbers — units_reviewed
