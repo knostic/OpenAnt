@@ -26,7 +26,11 @@ CORE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _parse_dep(spec):
-    """`name>=floor` -> (name, Version) ; `name[extra]>=floor` -> extras stripped."""
+    """`name>=floor` -> (name, Version) ; `name[extra]>=floor` -> extras stripped.
+    Returns None for UNPARSED specs so the coverage guard below can fail
+    loudly (wave r1 sonnet: a future compound specifier — `httpx>=0.24,<1`
+    — previously made the package VANISH from floors/pins with the guard
+    green: zero protection, silently)."""
     m = re.match(r"^\s*([A-Za-z0-9_.\-]+)\s*(\[[^\]]*\])?\s*>=\s*([0-9][0-9A-Za-z.\-]*)\s*$",
                  spec)
     if m is None:
@@ -72,15 +76,62 @@ def _drift(floors, pins):
 
 def test_pyproject_floors_never_exceed_requirements_pins():
     """The drift guard: the editable install re-resolves pyproject floors, so
-    a floor above a pin silently upgrades past the pin — this fires first."""
+    a floor above a pin silently upgrades past the pin — this fires first.
+    Wave r1 (sonnet): the message is per-package honest — an ==PIN row means
+    pip upgrades past the CI pin; a >=FLOOR row (PyYAML, requests, the
+    tree-sitter grammars — floors copied into requirements, no CI pin)
+    means the FLOOR itself was raised above what requirements allows."""
     floors = _floors_from_pyproject((CORE_ROOT / "pyproject.toml").read_text())
     pins = _pins_from_requirements((CORE_ROOT / "requirements.txt").read_text())
     drift = _drift(floors, pins)
     assert not drift, (
-        "pyproject floors exceed requirements pins — pip install -e silently "
-        "upgrades past the CI pin, and no CI step catches it: "
-        + "; ".join(f"{n}: floor {f} > pin {p}" for n, f, p in drift)
+        "pyproject floor above requirements for: "
+        + "; ".join(
+            f"{n} (floor {f} vs requirements {p}; "
+            + ("pip install -e would silently upgrade past the CI pin"
+               if str(p) in open(CORE_ROOT / "requirements.txt").read_text() and
+               _is_pin_row(n) else
+               "the FLOOR exceeds the >= requirement — pip install -e would "
+               "resolve past it")
+            for n, f, p in drift)
     )
+
+
+def _is_pin_row(name):
+    txt = (CORE_ROOT / "requirements.txt").read_text()
+    return any(
+        re.match(rf"^{re.escape(name)}\s*(\[[^\]]*\])?\s*==", ln.split("#")[0].strip())
+        for ln in txt.splitlines()
+    )
+
+
+def test_every_dependency_spec_parses():
+    """Wave r1 (sonnet): FULL-PARSE COVERAGE — any spec (pyproject or
+    requirements) the parsers fail to consume makes the guard fail loudly
+    instead of silently covering nothing for that package."""
+    data = tomllib.loads((CORE_ROOT / "pyproject.toml").read_text())
+    unparsed_py = [
+        spec for spec in data.get("project", {}).get("dependencies", [])
+        if _parse_dep(spec) is None
+    ]
+    assert not unparsed_py, (
+        f"pyproject dependency specs the guard cannot parse (their packages "
+        f"get ZERO drift protection): {unparsed_py}"
+    )
+    unparsed_req = []
+    for ln in (CORE_ROOT / "requirements.txt").read_text().splitlines():
+        row = ln.split("#")[0].strip()
+        if not row:
+            continue
+        if _parse_dep(row) is None and not re.match(
+                r"^([A-Za-z0-9_.\-]+)\s*(\[[^\]]*\])?\s*==\s*([0-9][0-9A-Za-z.\-]*)\s*$", row):
+            unparsed_req.append(row)
+    assert not unparsed_req, (
+        f"requirements rows the guard cannot parse (no floor, no pin): {unparsed_req}"
+    )
+
+
+
 
 
 def test_the_guard_fires_on_drift():
