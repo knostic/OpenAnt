@@ -71,13 +71,20 @@ MAX_RETRY_ROUNDS = 3
 # Expected JSON shape of an enhancer response — handed to JSONCorrector so a
 # malformed-but-recoverable enhancer reply is repaired into THIS shape (no
 # verdict) rather than the default vuln schema.
+# #321 (wave r1): the corrector's recovery schema carries the classification
+# too — a strictly-schema-following corrector model re-emitted the reply
+# WITHOUT the field, and the validated literal then wrote "unknown": an
+# exploitable unit whose reply needed correction was silently excluded from
+# --exploitable-only, the exact bug class this issue fixes, surviving on the
+# correction sub-path.
 _ENHANCE_JSON_SCHEMA = """{
     "missing_dependencies": [{"name": "functionName", "reason": "why missed", "likely_location": "file or module"}],
     "additional_callers": [{"name": "callerName", "reason": "why it likely calls the target"}],
     "data_flow": {"inputs": [], "outputs": [], "tainted_variables": [], "security_relevant_flows": []},
     "imports": [{"module": "name", "used_for": "purpose"}],
     "reasoning": "Brief explanation of your analysis",
-    "confidence": 0.0
+    "confidence": 0.0,
+    "security_classification": "exploitable | vulnerable_internal | security_control | neutral | unknown"
 }"""
 
 
@@ -211,6 +218,10 @@ Analyze this function and identify:
 2. **Additional Callers**: Functions that likely call this function based on naming patterns
 3. **Data Flow**: What data flows in and out, especially security-relevant data
 4. **Imports**: External modules/files this function depends on
+5. **Security Classification**: whether this unit is exploitable (vulnerable +
+   reachable from user input), vulnerable_internal (vulnerable but not user-reachable),
+   security_control (defensive code), or neutral (no security relevance) — the same
+   enum the agentic enhancer uses; write "unknown" only if you genuinely cannot tell
 
 ## Response Format
 Respond with JSON only:
@@ -236,7 +247,8 @@ Respond with JSON only:
     {{"module": "./utils", "used_for": "helper functions"}}
   ],
   "reasoning": "Brief explanation of your analysis",
-  "confidence": 0.0-1.0
+  "confidence": 0.0-1.0,
+  "security_classification": "exploitable | vulnerable_internal | security_control | neutral | unknown"
 }}
 ```"""
 
@@ -355,13 +367,27 @@ class ContextEnhancer:
                     self.stats["data_flows_extracted"] += 1
 
                 # Add enhancement to unit
+                # #321: security_classification is threaded, VALIDATED to the
+                # agentic enum — the six-key literal dropped it even when the
+                # model volunteered it, so --exploitable-only/-all selected
+                # ZERO units after every single-shot enhance (a total false
+                # negative; analyzer.py:59-74 reads a key nobody wrote). One
+                # shape ALWAYS: an in-enum value verbatim, anything else the
+                # explicit "unknown" — the consumer's contract holds and the
+                # [Enhance] Classifications counter is honest.
+                _cls = analysis.get("security_classification")
                 unit["llm_context"] = {
                     "missing_dependencies": analysis.get("missing_dependencies", []),
                     "additional_callers": analysis.get("additional_callers", []),
                     "data_flow": analysis.get("data_flow", {}),
                     "imports": analysis.get("imports", []),
                     "reasoning": analysis.get("reasoning", ""),
-                    "confidence": analysis.get("confidence", 0.5)
+                    "confidence": analysis.get("confidence", 0.5),
+                    "security_classification": (
+                        _cls if isinstance(_cls, str)
+                        and _cls in ("exploitable", "vulnerable_internal",
+                                     "security_control", "neutral")
+                        else "unknown"),
                 }
             else:
                 # enhancer-failed-context: a parse failure is an error, not a
@@ -450,7 +476,20 @@ class ContextEnhancer:
                     cp_file = _ckpt_map.get(unit_id)
                     if cp_file:
                         cp_data = read_json(cp_file)
-                        unit["llm_context"] = cp_data.get("llm_context", {})
+                        restored_ctx = cp_data.get("llm_context", {})
+                        # #321 (wave r1 finding 2): a checkpoint written by a
+                        # pre-fix run (or the current release resuming a
+                        # pre-fix scan) carries the six-key shape with NO
+                        # security_classification — restored verbatim, those
+                        # units still yield None from the reader and
+                        # --exploitable-only/-limit treat them exactly as
+                        # pre-fix, silently. "One shape ALWAYS" holds across
+                        # resume too: backfill the explicit "unknown" (an
+                        # old artifact is honest about what it knows; the
+                        # unit can be re-enhanced deliberately if needed).
+                        if "security_classification" not in restored_ctx:
+                            restored_ctx["security_classification"] = "unknown"
+                        unit["llm_context"] = restored_ctx
                         if "code" in cp_data:
                             unit["code"] = cp_data["code"]
             if processed_ids:
@@ -1140,7 +1179,13 @@ class ContextEnhancer:
             },
             "imports": [],
             "reasoning": "LLM analysis failed, using static analysis only",
-            "confidence": 0.3
+            "confidence": 0.3,
+            # #321 (wave r2): the error path too carries the one shape — an
+            # explicit "unknown" (never a verification; the reader surfaces
+            # unknown and the errored unit is never selected), so the CSV
+            # and the [Enhance] counters see the same vocabulary as the
+            # success path.
+            "security_classification": "unknown",
         }
         if error is not None:
             ctx["error"] = error
