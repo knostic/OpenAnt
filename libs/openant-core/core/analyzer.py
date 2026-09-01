@@ -220,13 +220,6 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
             print(f"[Detect] Restored {len(checkpointed)} units from checkpoints",
                   file=sys.stderr, flush=True)
 
-    progress = ProgressReporter("Detect", total, tracker=tracker, completed=len(checkpointed))
-
-    mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
-    remaining = total - len(checkpointed)
-    print(f"[Detect] Mode: {mode}, {remaining} units to process ({len(checkpointed)} already done)",
-          file=sys.stderr, flush=True)
-
     # Pre-populate results from checkpoints, but ONLY for successfully-completed
     # units. Errored units are loaded into the "units_to_process" list so they
     # get retried on resume (matches enhance's behavior).
@@ -243,6 +236,24 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
             code_by_route[cp_data.get("route_key", uid)] = cp_data.get("code_for_route", "")
         else:
             units_to_process.append((i, unit))
+
+    # #435 (wave r1, three axes): done/remaining derive from the retry queue
+    # itself — total minus what actually runs — so the narration can never
+    # disagree with the queue by ANY input class. The round-1 fix tallied
+    # non-error rows over checkpointed.values(), but the queue's predicate is
+    # "non-error row whose id IS IN the units list": checkpoint.load()
+    # returns every file in the dir, nothing invalidates stale entries when
+    # units legitimately shrink on a resume (--limit, --exploitable, the
+    # diff filter, a re-parse), so a foreign row overcounted again — the
+    # same 3/2 shape, a different trigger. (finding_verifier.py computes the
+    # same quantity the same way: remaining = len(results_to_verify).)
+    _done = total - len(units_to_process)
+    progress = ProgressReporter("Detect", total, tracker=tracker, completed=_done)
+
+    mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
+    remaining = len(units_to_process)
+    print(f"[Detect] Mode: {mode}, {remaining} units to process ({_done} already done)",
+          file=sys.stderr, flush=True)
 
     def _process_and_save(i, unit):
         out = _process_unit(binding, unit, i, json_corrector, app_context)
@@ -345,7 +356,7 @@ def _cp_is_error(cp_data):
     return analyze_result_is_error(res)
 
 
-def _seed_summary(existing: dict) -> dict:
+def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None) -> dict:
     """Seed the _summary.json counters from checkpointed rows.
 
     Counts as completed ONLY the rows adoption will keep: an errored row
@@ -356,6 +367,16 @@ def _seed_summary(existing: dict) -> dict:
     neither-key shape). Usage tokens accumulate over ALL rows — the spend
     happened regardless of the row's fate.
 
+    famD panel (sonnet): when unit_ids is given, a FOREIGN row — a stale
+    checkpoint entry whose id is not in the current units list (units can
+    legitimately shrink on a resume: --limit, --exploitable, the diff
+    filter, a re-parse) — is excluded from the completed seed, the same
+    id-membership predicate the retry queue and the narration now use; the
+    #316/#324 seed would otherwise over-count completed past total. Usage
+    excludes foreign rows too — the summary describes THIS run's units; a
+    prior run's spend on units no longer in the set is not this run's
+    spend (the test pins the consistency both ways).
+
     Returns: completed, input_tokens, output_tokens, cost_usd,
     unpriced_models (the #216 marker).
     """
@@ -364,7 +385,9 @@ def _seed_summary(existing: dict) -> dict:
     output_tokens = 0
     cost_usd = 0.0
     unpriced: set = set()
-    for _cp in existing.values():
+    for _id, _cp in existing.items():
+        if unit_ids is not None and _id not in unit_ids:
+            continue
         if not analyze_result_is_error(_cp.get("result") or {}):
             completed += 1
         _usage = _cp.get("usage", {})
@@ -659,7 +682,7 @@ def run_analysis(
     # verify's verification.incomplete or enhance's INCOMPLETE_CLASSIFICATION.
     # The third bucket stays 0 here but is still emitted for shape consistency.
     _summary_incomplete = 0
-    _seed = _seed_summary(_existing)
+    _seed = _seed_summary(_existing, {u.get("id") for u in units})
     _summary_completed = _seed["completed"]
     _summary_errors = 0  # errored rows are re-analyzed; _summary_callback owns them
     _summary_input_tokens = _seed["input_tokens"]

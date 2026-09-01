@@ -1,0 +1,140 @@
+"""#435: the resume narration counts what actually runs — an errored row is not done.
+
+Observed on master: an analyze resumed over a checkpoint dir with one intact completed
+SAFE row and one #324-shaped error row (neither verdict nor finding). The unit is
+correctly retried — but the narration counted the error row as done: "0 units to
+process (2 already done)" and, after the retry, "Done: 3/2 units" — a counter past its
+denominator. `_run_detection` computed remaining from the RAW restored count
+(len(checkpointed)) while the retry queue is built from the ERROR-FILTERED count
+(_cp_is_error), so an errored row was done-in-the-narration and retried-in-the-queue at
+the same time; ProgressReporter was seeded with completed=len(checkpointed) too.
+
+The fix derives done/remaining AND the ProgressReporter seed from the same predicate
+the queue uses (_cp_is_error) — "units to process" equals what actually runs, and the
+counter can never exceed its total.
+"""
+import io
+import sys
+from contextlib import redirect_stderr
+from pathlib import Path
+
+_CORE = Path(__file__).resolve().parents[1]
+if str(_CORE) not in sys.path:
+    sys.path.insert(0, str(_CORE))
+
+import core.analyzer as az  # noqa: E402
+from core.checkpoint import StepCheckpoint  # noqa: E402
+
+
+def _fake_process_unit(calls):
+    def f(binding, unit, index, json_corrector, app_context):
+        calls["n"] += 1
+        return {"index": index,
+                "result": {"unit_id": unit["id"], "finding": "safe",
+                           "verdict": "SAFE", "route_key": f"f.py:{unit['id']}"},
+                "route_key": f"f.py:{unit['id']}", "code_for_route": "x",
+                "finding": "safe", "elapsed": 0.1}
+    return f
+
+
+def _resume_two_rows(tmp_path, monkeypatch):
+    """A checkpoint dir with one intact SAFE row + one error row (the #324
+    shape: a result with neither verdict nor finding), then a resume run."""
+    cp = StepCheckpoint("analyze", str(tmp_path))
+    cp.ensure_dir()
+    cp.save("u0", {"result": {"unit_id": "u0", "finding": "safe", "verdict": "SAFE",
+                              "route_key": "f.py:u0"},
+                   "route_key": "f.py:u0", "code_for_route": "x"})
+    # the #324 error shape: a result with neither verdict nor finding
+    cp.save("u1", {"result": {"unit_id": "u1"}, "route_key": "f.py:u1"})
+
+    calls = {"n": 0}
+    monkeypatch.setattr(az, "_process_unit", _fake_process_unit(calls))
+    err = io.StringIO()
+    with redirect_stderr(err):
+        az._run_detection(
+            [{"id": "u0", "code": "x=1"}, {"id": "u1", "code": "x=1"}],
+            binding=object(), json_corrector=None, app_context=None,
+            workers=1, checkpoint=cp)
+    return err.getvalue(), calls
+
+
+def test_resume_narration_counts_the_retry_queue(tmp_path, monkeypatch):
+    """1 already done (the SAFE row), 1 to process (the error row RETRIES) —
+    never "2 already done" with a retry running anyway."""
+    out, calls = _resume_two_rows(tmp_path, monkeypatch)
+    assert "1 units to process (1 already done)" in out, (
+        f"the narration counted the error row as done while the queue "
+        f"retried it: {out!r}"
+    )
+    assert calls["n"] == 1, "only the errored unit runs"
+
+
+def test_final_counter_never_exceeds_total(tmp_path, monkeypatch):
+    """Done: 2/2 — the seeded counter + the retry never passes the total."""
+    out, _ = _resume_two_rows(tmp_path, monkeypatch)
+    assert "3/2" not in out, f"the counter passed its denominator: {out!r}"
+    assert "2/2" in out
+
+
+def test_foreign_checkpoint_rows_cannot_overcount(tmp_path, monkeypatch):
+    """Wave r1 (three axes): a stale/foreign checkpoint row — the units list
+    legitimately shrank on a resume (--limit, --exploitable, the diff
+    filter, a re-parse against the same output_dir) — made the round-1 tally
+    overcount again (units-to-process understated, even negative; the
+    counter past its total). The queue-derived _done cannot: total minus
+    what actually runs."""
+    cp = StepCheckpoint("analyze", str(tmp_path))
+    cp.ensure_dir()
+    cp.save("u0", {"result": {"unit_id": "u0", "finding": "safe",
+                              "verdict": "SAFE", "route_key": "f.py:u0"},
+                   "route_key": "f.py:u0", "code_for_route": "x"})
+    cp.save("u9", {"result": {"unit_id": "u9", "finding": "safe",
+                              "verdict": "SAFE", "route_key": "f.py:u9"},
+                   "route_key": "f.py:u9", "code_for_route": "x"})  # FOREIGN
+
+    calls = {"n": 0}
+    monkeypatch.setattr(az, "_process_unit", _fake_process_unit(calls))
+    err = io.StringIO()
+    with redirect_stderr(err):
+        # the resume runs a SMALLER unit set (only u0 + u1 — u9 is gone)
+        az._run_detection(
+            [{"id": "u0", "code": "x=1"}, {"id": "u1", "code": "x=1"}],
+            binding=object(), json_corrector=None, app_context=None,
+            workers=1, checkpoint=cp)
+    out = err.getvalue()
+    assert "1 units to process (1 already done)" in out, (
+        f"the foreign row shifted the narration: {out!r}"
+    )
+    assert "2/2" in out and "-1" not in out and "3/" not in out
+    assert calls["n"] == 1
+
+
+def test_seed_summary_excludes_foreign_rows():
+    """famD panel (sonnet): _seed_summary counts only rows whose id is in
+    the current units list — a stale foreign entry (units shrank on resume:
+    --limit, --exploitable, diff filter, re-parse) must not inflate the
+    completed seed past total, the same id-membership predicate the retry
+    queue and the narration use."""
+    from core.analyzer import _seed_summary
+
+    existing = {
+        "u1": {"result": {"finding": "safe"}},
+        "u2": {"result": {"finding": "safe"}},
+        "stale-foreign": {"result": {"finding": "safe"}},
+    }
+    seeded_all = _seed_summary(existing)
+    assert seeded_all["completed"] == 3
+    seeded = _seed_summary(existing, {"u1", "u2"})
+    assert seeded["completed"] == 2, "the foreign row must not count"
+    # a foreign row's usage is NOT this run's spend either — the summary
+    # describes this run's units, consistently
+    existing["stale-foreign"]["usage"] = {"input_tokens": 7, "output_tokens": 5,
+                                          "cost_usd": 0.1, "unpriced_models": ["m"]}
+    seeded = _seed_summary(existing, {"u1", "u2"})
+    assert seeded["input_tokens"] == 0 and seeded["cost_usd"] == 0.0, "foreign spend is not this run's"
+    # and a KEPT row's usage still counts
+    existing["u1"]["usage"] = {"input_tokens": 3, "output_tokens": 2,
+                               "cost_usd": 0.05, "unpriced_models": []}
+    seeded = _seed_summary(existing, {"u1", "u2"})
+    assert seeded["input_tokens"] == 3 and seeded["cost_usd"] == 0.05
