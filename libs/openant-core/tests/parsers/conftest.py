@@ -45,7 +45,14 @@ def _is_shadow(name, mod):
         paths.extend(Path(str(entry)) for entry in p)
     if not paths:
         return False
-    return all(_TESTS_TREE == t or _TESTS_TREE in t.parents for t in paths)
+    # wave r1 (sonnet): RESOLVE both sides — a literal `..` never collapses
+    # in Path/Path.parents, so an unresolved `.../<lang>/../../parsers`
+    # carries the tests tree as a lexical ancestor of the REAL module's
+    # file and the check misread the genuine package as a shadow.
+    return all(
+        (lambda rp: _TESTS_TREE == rp or _TESTS_TREE in rp.parents)(t.resolve())
+        for t in paths
+    )
 
 
 def _is_stale_bare_stage_module(name, mod):
@@ -67,12 +74,53 @@ def _is_stale_bare_stage_module(name, mod):
     return False
 
 
+# A sys.path entry under which the REGULAR tests/parsers/ package would
+# shadow the source namespace: ONLY the tests tree itself (wave r1 lesson,
+# measured: the core root and the campaign root contain NO parsers/
+# package — stripping them broke 69 tests whose legitimate imports live
+# there — while tests/parsers/__init__.py makes the tests tree a genuine
+# shadow source). The tests/parsers/<lang>/ inserts the language helpers
+# rely on (runtime `from _helpers import ...`) contain no parsers/ package
+# and stay.
+_SHADOW_PATH_ENTRIES = [_TESTS_TREE]
+
+
+def _strip_shadow_path_entries():
+    """Remove sys.path entries that make tests/parsers shadow the source
+    package (wave r1, fable+sonnet: unbinding the sys.modules shadow alone
+    cannot neutralize the class — the very next parsers.* import re-resolves
+    against the same poisoned path and re-binds it; the shipped repro's
+    self-removing insert was the only shape the old fixture cured). No
+    parser test needs these entries (their headers insert the core root or
+    their own language dir), and the root-level polluters run after the
+    parsers subtree in every collection order (directories first), so the
+    removal cannot break a later test's imports."""
+    removed = []
+    for e in list(sys.path):
+        try:
+            p = Path(e)
+        except (TypeError, ValueError):
+            continue
+        # resolve BOTH sides: `..`-segments never collapse in Path.parents,
+        # and the corrected headers' literal `../../..` entries carried the
+        # tests tree as a LEXICAL ancestor of the real module's __file__
+        # (sonnet) — the shadow check misfired on the genuine package.
+        rp = p.resolve()
+        for shadow_root in _SHADOW_PATH_ENTRIES:
+            if rp == shadow_root:
+                sys.path.remove(e)
+                removed.append(e)
+                break
+    return removed
+
+
 @pytest.fixture(autouse=True)
 def _clean_import_state():
-    """Unbind a stale test-directory `parsers` shadow before and after each
-    test (the shadow is what a directory batch's ModuleNotFoundErrors come
-    from; the real source package stays warm — the full-suite ordering
-    shares it across root-level tests)."""
+    """Unbind a stale test-directory `parsers` shadow and strip the
+    shadow-path sys.path entries before each test (both halves are needed:
+    an unbound shadow re-binds on the next import if the path still
+    carries the poison entry); the real source package stays warm — the
+    full-suite ordering shares it across root-level tests."""
 
     def _unbind_stale():
         for name in [n for n, m in list(sys.modules.items())
@@ -80,5 +128,6 @@ def _clean_import_state():
             del sys.modules[name]
 
     _unbind_stale()
+    _strip_shadow_path_entries()
     yield
     _unbind_stale()

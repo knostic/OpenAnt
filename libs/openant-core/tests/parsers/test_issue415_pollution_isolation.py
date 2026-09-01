@@ -44,15 +44,90 @@ def test_poisoner_inserts_tests_dir_like_the_299_header():
 def test_victim_loads_the_swift_pipeline_after_the_poisoner():
     """Exactly test_swift_prune_telemetry's _load_pipeline: an importlib exec of
     parsers/swift/test_pipeline.py, whose package imports must resolve against
-    the SOURCE parsers/ — not the test-dir shadow the previous test installed."""
+    the SOURCE parsers/. Runs against the FORCED post-poison state (this
+    test's own setup re-installs both halves the way a real off-by-one
+    header would leave them), so the victim exercises the CONFTEST's cleanup
+    in the order the fixture actually fires — order-independent."""
+    # re-install the poison the way a header leaves it (both halves) —
+    # and purge the parsers.* family FIRST: an in-batch run has earlier
+    # tests' REAL modules cached, and the sys.modules cache would serve
+    # them past the shadow (the historical failing state was a process
+    # where no parsers import had run yet — the purge reproduces exactly
+    # that, deterministically, in any batch order).
+    import types
+    for _n in [n for n in list(sys.modules)
+               if n == "parsers" or n.startswith("parsers.")]:
+        del sys.modules[_n]
+    entry = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    shadow = types.ModuleType("parsers")
+    shadow.__file__ = str(Path(entry) / "parsers" / "__init__.py")
+    shadow.__path__ = [str(Path(entry) / "parsers")]
+    sys.path.insert(0, entry)
+    sys.modules["parsers"] = shadow
+    # the poison persists INTO this test (no cleanup) — the fixture at the
+    # NEXT setup clears it; here we verify the victim itself would fail:
     spec = importlib.util.spec_from_file_location(
-        "swift_pipeline_iso_415red", _CORE / "parsers" / "swift" / "test_pipeline.py")
+        "swift_pipeline_iso_415chk", _CORE / "parsers" / "swift" / "test_pipeline.py")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)   # ModuleNotFoundError on a polluted batch
+    try:
+        spec.loader.exec_module(mod)
+        raise AssertionError("the poisoned state did NOT break the load — the repro is vacuous")
+    except ModuleNotFoundError:
+        pass
+    finally:
+        sys.path.remove(entry)
+        for _n in [n for n in list(sys.modules)
+                   if n == "parsers" or n.startswith("parsers.")]:
+            del sys.modules[_n]   # the failed import bound parsers.swift to the shadow too
+    # cleaned state: the load succeeds and resolves against the SOURCE tree
+    spec = importlib.util.spec_from_file_location(
+        "swift_pipeline_iso_415ok", _CORE / "parsers" / "swift" / "test_pipeline.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
     assert hasattr(mod, "main"), "the swift pipeline module did not load"
-    # And the package import resolved against the SOURCE tree.
     from parsers.swift import repository_scanner as rs
     assert str(_CORE / "parsers") in str(rs.__file__), (
         "parsers.swift.repository_scanner resolved against the TEST shadow, "
         f"not the source tree: {rs.__file__}"
     )
+
+
+def test_the_fixture_neutralizes_a_real_header_insert():
+    """Wave r1 (fable, the HIGH finding): the old fixture only cured the
+    SELF-REMOVING poisoner — a real header's tests/ insert persists for the
+    process lifetime, and the very next parsers.* import re-bound the
+    shadow despite the unbind. The fixture now strips the shadow-path ENTRY
+    too: simulate a real header (insert, NO cleanup) and verify the next
+    test's setup state."""
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "parsers_conftest_iso_415", Path(__file__).parent / "conftest.py")
+    _cmod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_cmod)
+    _strip = _cmod._strip_shadow_path_entries
+    import types
+
+    entry = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    sys.path.insert(0, entry)          # a real header leaves this behind
+    shadow = types.ModuleType("parsers")
+    shadow.__file__ = str(Path(entry) / "parsers" / "__init__.py")
+    shadow.__path__ = [str(Path(entry) / "parsers")]
+    sys.modules["parsers"] = shadow    # ...and this
+    try:
+        # the fixture's strip (what the NEXT test's setup runs):
+        removed = _strip()
+        assert entry in [str(r) for r in removed] or entry not in sys.path
+        assert entry not in sys.path, "the poison entry survived the strip"
+        for _n in [n for n in list(sys.modules)
+                   if n == "parsers" or n.startswith("parsers.")]:
+            del sys.modules[_n]
+        import parsers
+        assert "tests" not in str(getattr(parsers, "__file__", "")), (
+            f"the shadow re-bound after the strip: {getattr(parsers, '__file__', None)}"
+        )
+    finally:
+        if entry in sys.path:
+            sys.path.remove(entry)
+        for _n in [n for n in list(sys.modules)
+                   if n == "parsers" or n.startswith("parsers.")]:
+            del sys.modules[_n]
