@@ -153,7 +153,11 @@ def prepare_findings_summary(experiment: dict, dataset: dict) -> list:
     for result in [r for r in experiment.get('results', []) if isinstance(r, dict)]:
         route_key = result.get('route_key', '')
         unit = units_by_id.get(route_key, {})
-        llm_context = unit.get('llm_context') or {}
+        # #326 (wave r1): agentic mode (the default) writes agent_context;
+        # read both keys with the analyzer's precedence, mapping the
+        # agentic key name (classification_reasoning).
+        ctx = unit.get('agent_context') or unit.get('llm_context') or {}
+        unit_desc = str(ctx.get('classification_reasoning') or ctx.get('reasoning') or '')
         verification = result.get('verification') or {}
 
         findings.append({
@@ -165,7 +169,7 @@ def prepare_findings_summary(experiment: dict, dataset: dict) -> list:
             'attack_vector': result.get('attack_vector', ''),
             'stage1_reasoning': result.get('reasoning') or '',
             'stage2_explanation': verification.get('explanation', ''),
-            'description': llm_context.get('reasoning', '')[:300] if llm_context.get('reasoning') else ''
+            'description': unit_desc[:300]
         })
 
     # Sort by priority
@@ -333,7 +337,11 @@ def generate_html_report(
         verdict = str(result.get('finding') or result.get('verdict', '')).lower()
         file_path = extract_file(route_key)
         unit = units_by_id.get(route_key, {})
-        llm_context = unit.get('llm_context') or {}
+        # #326 (wave r1): agentic mode (the default) writes agent_context;
+        # read both keys with the analyzer's precedence, mapping the
+        # agentic key name (classification_reasoning).
+        ctx = unit.get('agent_context') or unit.get('llm_context') or {}
+        unit_desc = str(ctx.get('classification_reasoning') or ctx.get('reasoning') or '')
         verification = result.get('verification') or {}
 
         verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
@@ -352,7 +360,7 @@ def generate_html_report(
             'priority': get_verdict_priority(verdict),
             'color': get_verdict_color(verdict),
             'attack_vector': html.escape(result.get('attack_vector', '') or ''),
-            'description': html.escape(llm_context.get('reasoning', '')[:200] if llm_context.get('reasoning') else ''),
+            'description': html.escape(unit_desc[:200]),
             'justification': html.escape(verification.get('explanation', '')[:300] if verification.get('explanation') else (result.get('reasoning') or '')[:300])
         })
 

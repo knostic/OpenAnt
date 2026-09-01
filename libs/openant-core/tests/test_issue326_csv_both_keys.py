@@ -21,7 +21,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-CORE = str(Path(__file__).resolve().parents[2])  # libs/openant-core
+# parents[1] — from tests/<file>, parents[2] is libs/ (the wrong dir;
+# masked only by PYTHONPATH in the suite run) (wave r1 fable).
+CORE = str(Path(__file__).resolve().parents[1])
 if CORE not in sys.path:
     sys.path.insert(0, CORE)
 
@@ -117,3 +119,56 @@ def test_both_keys_precedence():
     }
     rows = _run_export([both])
     assert rows[0]["unit_description"] == "the fresh agentic"
+
+
+# --- wave r1 (three axes): the same key-name class beyond the CSV ------------
+
+def test_stage1_prompt_keeps_the_agentic_justification():
+    """analysis_core read agent_context['reasoning'] — a key that never
+    exists (AgentResult.to_dict emits classification_reasoning), so the
+    Stage-1 prompt silently lost the justification on the default mode for
+    every unit (the live analyze-path instance of the CSV's mismatch)."""
+    import core.analysis_core as ac
+    import inspect
+    src = inspect.getsource(ac)
+    assert 'agent_context.get("classification_reasoning")' in src
+    assert 'agent_context.get("reasoning")' not in src
+
+
+def test_html_report_feeds_the_report_llm_the_agentic_description():
+    """html_report.py:168/:355 carried the byte-for-byte same read (the
+    report LLM saw every finding with NO unit context in agentic mode)."""
+    from report import html_report as hr
+    units = {"app.py:upload": {
+        "agent_context": {"security_classification": "vulnerable",
+                          "classification_reasoning": "unsanitized filename",
+                          "usage_context": "handles upload"}}}
+    experiment = {"results": [{"route_key": "app.py:upload",
+                               "finding": "vulnerable",
+                               "verdict": "VULNERABLE"}],
+                  "units_by_id": units}
+    findings = hr.prepare_findings_summary(experiment, {"units": [
+        {"id": "app.py:upload",
+         "agent_context": units["app.py:upload"]["agent_context"]}]})
+    assert findings, findings
+    assert "unsanitized filename" in findings[0]["description"], findings[0]
+
+
+def test_nonstring_agent_context_degrades_not_crashes():
+    """A hand-edited dataset with a non-dict agent_context exports a blank
+    description rather than raising (the analyzer's guard convention)."""
+    import tempfile as tf
+    import csv as _csv
+    from report.csv_export import export_csv as _ex
+    with tempfile.TemporaryDirectory() as d:
+        exp = Path(d) / "results.json"
+        ds = Path(d) / "dataset.json"
+        exp.write_text(json.dumps({"results": [
+            {"route_key": "app.py:x", "finding": "vulnerable",
+             "verdict": "VULNERABLE"}]}))
+        ds.write_text(json.dumps({"units": [
+            {"id": "app.py:x", "agent_context": "garbage", "code": "x=1"}]}))
+        out = Path(d) / "r.csv"
+        _ex(str(exp), str(ds), str(out))
+        row = list(_csv.DictReader(open(out)))[0]
+        assert row["unit_description"] == ""

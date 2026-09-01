@@ -8,7 +8,8 @@ CSV file suitable for filtering, sorting, and analysis in Excel or Google Sheets
 Output Columns:
     - file: Source file path
     - unit_id: Unique identifier (file:function)
-    - unit_description: What the code does (from LLM context)
+    - unit_description: The LLM's analysis explanation (agentic
+      classification_reasoning / single-shot reasoning)
     - unit_code: Complete source code
     - stage2_verdict: Final verdict after Stage 2 verification
     - stage2_justification: Stage 2 explanation
@@ -198,8 +199,15 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
         # own "error" classification marker (written to agent_context "so the
         # CSV shows honestly") never reached the CSV it was written for. The
         # analyzer's precedence: agent_context first, llm_context fallback.
-        agent_context = unit.get('agent_context') or {}
-        llm_context = unit.get('llm_context') or {}
+        # Wave r1 (fable): a non-dict agent_context (hand-edited / foreign
+        # dataset) degrades to a blank description, never an AttributeError
+        # (the analyzer's guard convention).
+        agent_context = unit.get('agent_context')
+        if not isinstance(agent_context, dict):
+            agent_context = {}
+        llm_context = unit.get('llm_context')
+        if not isinstance(llm_context, dict):
+            llm_context = {}
         # The key names differ: agentic's context text is
         # classification_reasoning, single-shot's is reasoning. Map both —
         # a naive two-key fallback would leave the column empty in agentic mode.

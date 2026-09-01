@@ -334,9 +334,15 @@ def analyze_unit(
         files_included = []
 
     # Extract agent context (security classification from agentic parser)
-    agent_context = unit.get("agent_context", {})
+    # #326 (wave r1 opus): the agentic key is ``classification_reasoning``
+    # (AgentResult.to_dict) — ``reasoning`` never exists in agent_context, so
+    # the Stage-1 prompt silently lost the justification on the default mode
+    # for every unit (the same key-name mismatch the CSV fix describes).
+    agent_context = unit.get("agent_context") or {}
+    if not isinstance(agent_context, dict):
+        agent_context = {}
     security_classification = agent_context.get("security_classification")
-    classification_reasoning = agent_context.get("reasoning")
+    classification_reasoning = agent_context.get("classification_reasoning")
 
     # Get route info
     route = unit.get("route") or {}
