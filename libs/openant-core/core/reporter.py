@@ -821,8 +821,15 @@ def generate_html_report(
     # precedes site-packages, so the re-pointable shared-venv .pth cannot
     # win). -P keeps the untrusted CWD off sys.path; the env keeps the
     # venv's .pth off the resolution.
+    # #325 (wave r1 correction): the last two unbounded subprocess.run sites
+    # IN CORE/ (the issue's item 3; parsers/<lang>/test_pipeline.py and the
+    # file_io.run_utf8 pass-throughs remain unbounded on their DIRECT CLI
+    # invocations, capped only through _parse_via_subprocess's 1800s):
+    # the timeout convention PR #135 established for parse steps was never
+    # extended to the other call sites). 30 min matches the parse bound; the
+    # named diagnosis on expiry, not a bare TimeoutExpired traceback.
     result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr,
-                            env=child_interpreter_env())
+                            env=child_interpreter_env(), timeout=1800)
 
     if result.returncode != 0:
         raise RuntimeError(f"HTML report generation failed (exit code {result.returncode})")
@@ -858,8 +865,9 @@ def generate_csv_report(
     # the installed distribution, not source-tree-relative scripts. Depending on
     # cwd is what made them unrunnable from an installed wheel.
     # #303: same as the HTML path above — explicit resolution for the child.
+    # #325: the CSV twin of the HTML bound above.
     result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr,
-                            env=child_interpreter_env())
+                            env=child_interpreter_env(), timeout=1800)
 
     if result.returncode != 0:
         raise RuntimeError(f"CSV export failed (exit code {result.returncode})")
