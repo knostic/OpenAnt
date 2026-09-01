@@ -82,20 +82,22 @@ from prompts.verification_prompts import (
     get_verification_system_prompt,
     get_consistency_check_prompt
 )
-from core.verdict_taxonomy import (
-    DISCLOSURE_DROPPED, ERROR_VERDICT, FINDING_VERDICT_ORDER, STAGE2_VERDICTS,
-)
+from core.verdict_taxonomy import DISCLOSURE_DROPPED, FINDING_VERDICT_ORDER
 
-# #448: every value `finding`/`correct_finding` can legitimately take — the
-# canonical producer vocabulary (PRODUCER_VERDICTS: FINDING_VERDICT_ORDER +
-# ERROR + the Stage-2 verification verdicts) plus INSUFFICIENT_CONTEXT (the
-# _normalize_result map's sixth value — experiment.py's corrector threads it
-# through `finding` on the re-analysis path). A consistency correction
-# outside this set is model noise, rejected below.
-_CORRECTABLE_STAGE2_FINDINGS = (
-    frozenset(FINDING_VERDICT_ORDER)
-    | {ERROR_VERDICT, "insufficient_context"}
-    | STAGE2_VERDICTS)
+# #448 (wave r1, three axes): the correction targets are the verify `finish`
+# enum — FINDING_VERDICT_ORDER, nothing else. STAGE2_VERDICTS is a DIFFERENT
+# key (the reporter's derived stage2_verdict display field: no producer ever
+# writes confirmed/agreed/unverified/rejected into `finding`, and admitting
+# them re-opened the exact bucket-drop this fix closes — a conformant-looking
+# "confirmed" is a MORE plausible model emission than "MAYBE VULNERABLE").
+# error and insufficient_context are legitimate STATES of `finding` but not
+# legitimate CORRECTION TARGETS: both are outside DISCLOSURE_DROPPED, so
+# admitting them let a pattern-similarity pass move a conclusively-EXPLOITABLE
+# row to an uncounted/unverified shape PAST the F-KB-1b guard (the exact class
+# #195/#243 closed). With FINDING_VERDICT_ORDER alone, every admitted
+# non-DROPPED value is vulnerable/bypassable — the guard's complement is
+# well-defined.
+_CORRECTABLE_STAGE2_FINDINGS = frozenset(FINDING_VERDICT_ORDER)
 
 # Import application context type for type hints
 try:
@@ -1063,6 +1065,23 @@ class FindingVerifier:
                     # against the canonical `finding` vocabulary; unrecognized
                     # values are REJECTED with an audit record (the
                     # #316/#324/#425/#427 producer discipline).
+                    #
+                    # REACHABILITY NOTE (wave r1 opus, re-derived): the shipped
+                    # consistency prompt asks only for should_be_consistent /
+                    # consistent_verdict / explanation — it NEVER requests
+                    # findings_to_update, so on a prompt-conformant reply this
+                    # apply loop does not fire (findings_updated is empty) and
+                    # the parsed consistent_verdict is unused downstream. The
+                    # loop IS the defense layer for NON-conformant replies: the
+                    # JSON-corrector requires only agree/correct_finding/
+                    # explanation and passes EXTRA keys through, so an
+                    # unconstrained model CAN hallucinate the Stage-1 shape
+                    # (findings_to_update with should_be) into the reply — the
+                    # exact untrusted-model-output class this gate exists for.
+                    # Wiring consistent_verdict through the loop would ACTIVATE
+                    # pattern-corrections that never ran before — a new
+                    # capability, out of scope per the campaign's fixes-only
+                    # rule; recorded as the follow-up question.
                     new_verdict = (raw_should_be.strip().lower()
                                    if isinstance(raw_should_be, str) else "")
                     if not new_verdict:
@@ -1114,7 +1133,15 @@ class FindingVerifier:
                                 }
                                 continue
 
-                            old_verdict = result.get("verification", {}).get("correct_finding") or result.get("finding")
+                            # #448 (wave r1 fable): the old side is normalized
+                            # too — _parse_finish_result stores correct_finding
+                            # verbatim, so an uppercase-stamped row vs a
+                            # normalized proposal produced a spurious
+                            # consistency_update record.
+                            old_verdict = (result.get("verification", {}).get("correct_finding")
+                                           or result.get("finding"))
+                            old_verdict = (old_verdict.strip().lower()
+                                          if isinstance(old_verdict, str) else old_verdict)
                             if old_verdict != new_verdict:
                                 result["finding"] = new_verdict
                                 if "verification" not in result:

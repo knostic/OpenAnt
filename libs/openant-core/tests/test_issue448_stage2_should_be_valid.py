@@ -141,3 +141,62 @@ def test_conclusive_exploitable_guard_unchanged():
     row = _by_rk(out, VULN_RK)
     assert row["finding"] == "vulnerable", "the conclusive-exploitable guard was disturbed"
     assert "consistency_downgrade_blocked" in row
+
+
+def test_stage2_vocabulary_is_rejected_not_written():
+    """Wave r1 (three axes): STAGE2_VERDICTS is the reporter's DERIVED
+    stage2_verdict key — no producer ever writes confirmed/agreed/unverified/
+    rejected into `finding`. The round-1 gate admitted them, and a
+    conformant-looking "confirmed" (a MORE plausible model emission than the
+    garbage string) reproduced the exact bucket-drop: _count_verdicts' F13
+    else-branch + the reporter's disclosure filter. Rejected now."""
+    for token in ("confirmed", "agreed", "unverified", "rejected"):
+        out = _run(_verifier(), token)
+        row = _by_rk(out, VULN_RK)
+        assert row["finding"] == "vulnerable", (
+            f"{token!r} — a stage2_verdict value — was written into finding: {row}"
+        )
+        assert "consistency_invalid_verdict_blocked" in row, token
+
+
+def test_error_is_not_a_correction_target_on_conclusive_rows():
+    """Wave r1 (fable, the F-KB-1b bypass): error is a legitimate STATE of
+    finding but not a legitimate CORRECTION TARGET — it is outside
+    DISCLOSURE_DROPPED, so admitting it let a pattern-similarity pass move a
+    conclusively-EXPLOITABLE row to the error shape PAST the guard (the exact
+    class #195/#243 closed)."""
+    v = _verifier()
+    rows = [
+        {"route_key": VULN_RK, "finding": "vulnerable",
+         "verification": {"correct_finding": "vulnerable",
+                          "exploit_path": {"entry_point": "h", "sink_reached": True,
+                                           "attacker_control_at_sink": "full",
+                                           "path_broken_at": None}}},
+        {"route_key": SAFE_RK, "finding": "safe",
+         "verification": {"correct_finding": "safe"}},
+    ]
+    for token in ("error", "insufficient_context"):
+        out = _run(v, token, rows=[dict(r) for r in rows])
+        row = _by_rk(out, VULN_RK)
+        assert row["finding"] == "vulnerable", (
+            f"{token!r} moved a conclusively-exploitable row past the guard: {row}"
+        )
+        assert "consistency_invalid_verdict_blocked" in row, token
+
+
+def test_uppercase_old_verdict_compare_is_normalized():
+    """Wave r1 (fable): _parse_finish_result stores correct_finding verbatim —
+    an uppercase-stamped row vs a normalized proposal previously produced a
+    spurious consistency_update record. The old side is normalized too."""
+    out = _run(_verifier(), "vulnerable",
+               rows=[{"route_key": VULN_RK, "finding": "vulnerable",
+                      "verification": {"correct_finding": "VULNERABLE"}},
+                     {"route_key": SAFE_RK, "finding": "safe",
+                      "verification": {"correct_finding": "safe"}}])
+    row = _by_rk(out, VULN_RK)
+    assert "consistency_update" not in row, (
+        f"a case-only difference produced a spurious update record: {row}"
+    )
+    # no update fired — the row's stored stamp is untouched (the write site
+    # never runs on a normalized-equal compare; readers lowercase on read)
+    assert row["verification"]["correct_finding"] == "VULNERABLE"

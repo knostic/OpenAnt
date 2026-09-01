@@ -52,19 +52,29 @@ def test_exploitable_not_downgraded_to_inconclusive():
 
 
 def test_exploitable_not_downgraded_to_rejected():
+    # #448 (wave r1): "rejected" is now rejected by the VALIDITY gate first
+    # (it is not in FINDING_VERDICT_ORDER — no producer writes it into
+    # `finding`), so the breadcrumb is consistency_invalid_verdict_blocked;
+    # the outcome contract is unchanged — preserved + audited.
     got = _run_downgrade("rejected")
     verdict = got.get("verification", {}).get("correct_finding") or got.get("finding")
     assert verdict == "vulnerable", f"exploitable finding was dropped to {verdict!r}"
-    assert "consistency_downgrade_blocked" in got
+    assert ("consistency_downgrade_blocked" in got
+            or "consistency_invalid_verdict_blocked" in got)
 
 
 def test_exploitable_not_downgraded_to_any_disclosure_dropped_verdict():
     # Full sweep: no verdict in DISCLOSURE_DROPPED may silently drop the finding.
+    # #448 (wave r1): values NOT in the correctable vocabulary (rejected) now
+    # take the invalid-verdict branch — either breadcrumb satisfies the
+    # preserved+audited contract.
     for dv in sorted(DISCLOSURE_DROPPED):
         got = _run_downgrade(dv)
         verdict = got.get("verification", {}).get("correct_finding") or got.get("finding")
         assert verdict == "vulnerable", f"downgrade to {dv!r} silently dropped the finding"
-        assert "consistency_downgrade_blocked" in got, f"no audit breadcrumb for {dv!r}"
+        assert ("consistency_downgrade_blocked" in got
+                or "consistency_invalid_verdict_blocked" in got), (
+            f"no audit breadcrumb for {dv!r}")
 
 
 def test_non_exploitable_downgrade_still_applies():
