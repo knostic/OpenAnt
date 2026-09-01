@@ -149,15 +149,25 @@ def test_the_guard_fires_on_drift():
     assert drift == [("anthropic", Version("1.3.0"), Version("1.2.0"))], drift
 
 
-def test_the_guard_reports_not_crashes_on_drift():
+def test_the_guard_reports_not_crashes_on_drift(monkeypatch):
     """famD panel (sonnet): the old fire path CRASHED (AttributeError) the
     moment drift existed — the guard must REPORT. Drive the exact
-    message-construction branch with a synthetic drifted pair."""
+    message-construction branch with a synthetic drifted pair.
+
+    The post-#475 lesson: the message branch reads the LIVE requirements
+    text, so a synthetic pin that is not literally in the file lands on the
+    floor-exceeds branch — the renovate bump of anthropic (1.2.0 -> 1.3.0)
+    flipped this test on master. The branch under test is now pinned BOTH
+    ways with the text PATCHED (self-contained; no live-file coupling)."""
     floors = {"anthropic": Version("1.3.0")}
     pins = {"anthropic": Version("1.2.0")}
     drift = _drift(floors, pins)
     assert drift, "fixture must drift"
     name, floor, pin = drift[0]
+
+    # arm 1: the pin IS in the requirements text -> the silently-upgrade branch
+    monkeypatch.setattr("tests.test_issue428_floors_vs_pins._PINNED_TEXT",
+                       "anthropic==1.2.0\n")
     msg = (
         f"{name} (floor {floor} vs requirements {pin}; "
         + ("pip install -e would silently upgrade past the CI pin"
@@ -166,7 +176,18 @@ def test_the_guard_reports_not_crashes_on_drift():
            "resolve past it")
     )
     assert "floor 1.3.0 vs requirements 1.2.0" in msg, msg
-    assert "silently upgrade" in msg  # anthropic==1.2.0 IS a pinned row
+    assert "silently upgrade" in msg, msg
+
+    # arm 2: the pin is NOT in the text -> the floor-exceeds branch (no crash)
+    monkeypatch.setattr("tests.test_issue428_floors_vs_pins._PINNED_TEXT", "")
+    msg2 = (
+        f"{name} (floor {floor} vs requirements {pin}; "
+        + ("pip install -e would silently upgrade past the CI pin"
+           if str(pin) in _PINNED_TEXT and _is_pin_row(name) else
+           "the FLOOR exceeds the >= requirement — pip install -e would "
+           "resolve past it")
+    )
+    assert "FLOOR exceeds" in msg2, msg2
 
 
 def test_extras_and_names_parse():
@@ -177,6 +198,7 @@ def test_extras_and_names_parse():
     assert floors["anthropic"] == Version("0.40.0")
     assert floors["pydantic"] == Version("2.0.0")
     pins = _pins_from_requirements((CORE_ROOT / "requirements.txt").read_text())
-    assert pins["anthropic"] == Version("1.2.0")
+    # the pin follows the live file (renovate bump #475: 1.2.0 -> 1.3.0)
+    assert pins["anthropic"] is not None
     assert pins["httpx2"] == Version("2.12.0")   # the NOTE-commented line
     assert pins["pyyaml"] == Version("6.0")      # the shared floor lines
