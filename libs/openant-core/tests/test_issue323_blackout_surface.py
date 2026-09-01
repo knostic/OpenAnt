@@ -22,6 +22,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import pytest
+
 CORE = str(Path(__file__).resolve().parents[2])  # libs/openant-core
 if CORE not in sys.path:
     sys.path.insert(0, CORE)
@@ -83,9 +85,33 @@ def test_go_formatter_prints_the_reachability_line():
     """The Go CLI's terminal summary: a Reachability line (reachable /
     original / reduction %) + the warnings. Drives the real
     PrintScanSummaryV2 with the envelope's data map shape."""
+    import re
     import subprocess
+    import tempfile
 
-    go_out = Path(__file__).resolve().parents[3] / "apps" / "openant-cli"
+    src = Path(__file__).resolve().parents[3] / "apps" / "openant-cli"
+    if not shutil.which("go"):
+        pytest.skip("Go toolchain not available")
+    # the python-test CI runners carry a PATH `go` OLDER than the module's
+    # directive (ubuntu: 1.21 vs go.mod's 1.25.8, GOTOOLCHAIN=local) — skip
+    # rather than fail: the Go CI jobs exercise the package with a proper
+    # toolchain.
+    ver = subprocess.run(["go", "version"], capture_output=True, text=True).stdout
+    vm = re.search(r"go(\d+(?:\.\d+)+)", ver)
+    want = re.search(r"^go\s+(\d+(?:\.\d+)*)",
+                     (src / "go.mod").read_text(), re.M)
+
+    def _vt(v):
+        return tuple(int(x) for x in v.split("."))
+    if vm and want and _vt(vm.group(1)) < _vt(want.group(1)):
+        pytest.skip(f"go {vm.group(1)} older than the module's go {want.group(1)}")
+    # wave r1: the package is COPIED to a temp dir — a SIGKILL/timeout mid-run
+    # can no longer leave a stray _test.go in the source tree (the repo's
+    # conformance/test_F1 precedent).
+    go_out = Path(tempfile.mkdtemp()) / "pkg"
+    shutil.copytree(src, go_out,
+                    ignore=shutil.ignore_patterns("__pycache__", "node_modules",
+                                                  "*.pyc"))
     probe = '''
 package output
 
