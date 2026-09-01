@@ -26,9 +26,20 @@ func TestRenderedReportHasNoCDNScripts(t *testing.T) {
 			t.Fatalf("%s render: %v", name, err)
 		}
 		out := b.String()
-		if strings.Contains(out, "https://cdn.") {
-			t.Fatalf("%s: the rendered report still references a CDN script", name)
+		// wave r1 (three axes): NO external origin at all — the previous
+		// "https://cdn." pattern was shaped to miss fonts.googleapis.com
+		// (the reskin's Google Fonts link survived the vendoring while the
+		// commit claimed air-gapped self-containment; every open — including
+		// file:// — pinged Google). The knostic.ai anchor links are the only
+		// allowed externals (navigation, not a dependency).
+		for _, bad := range []string{"https://cdn.", "https://fonts.", "https://unpkg", "http://cdn.", "//cdn.", "https://ajax."} {
+			if strings.Contains(out, bad) {
+				t.Fatalf("%s: the rendered report still references an external origin (%s)", name, bad)
+			}
 		}
+		// (the vendored blobs themselves contain https:// strings — source
+		// URLs in banner comments — so a raw COUNT would false-fire; the
+		// PREFIX blacklist above is the dependency-class check.)
 		// The vendored scripts must be PRESENT, not merely the CDN absent —
 		// markers come from the pinned files themselves (version banners),
 		// which the templates' own inline config blocks cannot provide.

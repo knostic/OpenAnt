@@ -2,5 +2,19 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "#332: the vendored report scripts — versions live in the file names, the go:embed list, and the template literals; nothing else would look at them.",
+      "fileMatch": ["^apps/openant-cli/internal/report/templates/.*\\.gohtml$", "^apps/openant-cli/internal/report/report_vendor_test\\.go$", "^apps/openant-cli/internal/report/vendor/SOURCES\\.txt$"],
+      "matchStrings": [
+        "(?<depName>tailwindcss)-(?<currentValue>[0-9.]+)\\.js",
+        "chart-(?<currentValue>[0-9.]+)\\.umd\\.min\\.js",
+        "chartjs-plugin-datalabels-(?<currentValue>[0-9.]+)\\.min\\.js"
+      ],
+      "datasourceTemplate": "npm",
+      "packageNameTemplate": "{{#if matches.1}}tailwindcss{{else if matches.2}}chart.js{{else}}chartjs-plugin-datalabels{{/if}}"
+    }
   ]
 }

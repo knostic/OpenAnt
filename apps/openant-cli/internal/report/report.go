@@ -3,6 +3,7 @@ package report
 import (
 	"embed"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"io"
 	"os"
@@ -61,8 +62,18 @@ func init() {
 		},
 		// #332: inline a vendored, pinned script by file name — the rendered
 		// report carries its own dependencies (no CDN, no SRI negotiation).
-		"vendorJS": func(name string) template.JS {
-			return vendorScripts[name]
+		// Wave r1 (three axes): return an ERROR on an unknown name — a map
+		// miss returned the zero template.JS and the report rendered
+		// unstyled/chartless SILENTLY (go:embed validates the directive's
+		// patterns, not the string literal a template passes; a rename that
+		// missed one of the template call sites compiled clean). template
+		// execution now fails loud instead.
+		"vendorJS": func(name string) (template.JS, error) {
+			js, ok := vendorScripts[name]
+			if !ok {
+				return "", fmt.Errorf("report: no vendored script %q (vendor/ is missing the file, or the template's literal is stale)", name)
+			}
+			return js, nil
 		},
 	}
 
