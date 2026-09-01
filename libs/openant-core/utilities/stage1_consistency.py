@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from utilities.llm_client import TokenTracker
 from utilities.llm import PhaseBinding, simple_text
-from core.verdict_taxonomy import DISCLOSURE_DROPPED, DISCLOSURE_ELIGIBLE
+from core.verdict_taxonomy import DISCLOSURE_DROPPED, SEVERITY_FINDING_VERDICTS
 
 # Uppercase mirror of the canonical disclosure-dropped set (this module compares
 # verdicts .upper()'d). Keyed off core.verdict_taxonomy so the guard's block-set
@@ -305,19 +305,35 @@ def run_stage1_consistency_check(
                                 # the correction shadowed by the stale finding
                                 # — a safe->VULNERABLE correction was counted
                                 # safe, filtered out of Stage 2, and absent
-                                # from disclosure. GATE the write on
-                                # disclosure-eligibility: `new_verdict` is
-                                # unvalidated model output (the :281 comment),
-                                # and the :287 block-list covers only
-                                # DISCLOSURE_DROPPED — an unrecognised
-                                # downgrade (VULNERABLE -> INSUFFICIENT_CONTEXT)
-                                # passes unblocked, and the stale finding is
-                                # currently the ACCIDENTAL SAFETY NET keeping
-                                # the row disclosed. An ungated write would
-                                # remove that net and drop a disclosed
-                                # vulnerability (measured in #331).
-                                if str(new_verdict).lower() in DISCLOSURE_ELIGIBLE:
+                                # from disclosure. GATE the write on the
+                                # Stage-1 FINDING verdicts (wave r1, three
+                                # axes): `new_verdict` is unvalidated model
+                                # output (the :281 comment), and
+                                # DISCLOSURE_ELIGIBLE admitted Stage-2
+                                # vocabulary (unverified/confirmed/agreed/
+                                # error) that every finding-first reader
+                                # REJECTS — writing finding="unverified" on a
+                                # VULNERABLE row dropped it from Stage-2
+                                # input, confirmed_findings, and disclosure:
+                                # the net's own failure mode reintroduced
+                                # through the gate. The set that matches the
+                                # readers is {vulnerable, bypassable} —
+                                # SEVERITY_FINDING_VERDICTS. The :287
+                                # block-list covers only DISCLOSURE_DROPPED,
+                                # so an unrecognised downgrade
+                                # (VULNERABLE -> INSUFFICIENT_CONTEXT) passes
+                                # unblocked and the stale finding remains
+                                # the ACCIDENTAL SAFETY NET keeping the row
+                                # disclosed.
+                                if str(new_verdict).lower() in SEVERITY_FINDING_VERDICTS:
                                     result["finding"] = str(new_verdict).lower()
+                                    # wave r1 (fable): a promoted ERRORED row
+                                    # carries a stale `error` key (the adapter
+                                    # raise that errored it) — one row would
+                                    # count as BOTH a confirmed finding and an
+                                    # error. The correction asserts a finding;
+                                    # the error key is cleared with it.
+                                    result.pop("error", None)
                                 result["stage1_consistency_update"] = {
                                     "from": old_verdict,
                                     "to": new_verdict,

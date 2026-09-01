@@ -132,3 +132,57 @@ def test_verdict_only_row_counts_via_verdict_fallback():
     ])
     assert counts["vulnerable"] == 1
     assert counts["errors"] == 1
+
+
+def test_stage2_vocabulary_keeps_the_net():
+    """Wave r1 (three axes, one root cause): DISCLOSURE_ELIGIBLE admitted
+    Stage-2 vocabulary the finding-first readers REJECT — a
+    VULNERABLE -> UNVERIFIED correction wrote finding="unverified" and
+    dropped a disclosed vulnerability from Stage-2 input, confirmed_findings,
+    and disclosure: the net's own failure mode reintroduced through the gate."""
+    def resolver(binding, group, code_by_route, tracker):
+        return s1.Stage1ConsistencyResult(
+            "p", "UNVERIFIED",
+            [{"route_key": VULN_RK, "original_verdict": "VULNERABLE",
+              "should_be": "UNVERIFIED", "reason": "x"}], "g")
+    out = _run(resolver, [INGESTED_VULN, INGESTED_SAFE])
+    row = _by_rk(out, VULN_RK)
+    assert row["verdict"] == "UNVERIFIED"
+    assert row["finding"] == "vulnerable", (
+        "the Stage-2 vocabulary must keep the stale-finding net "
+        f"(got {row['finding']!r})"
+    )
+    for token in ("CONFIRMED", "AGREED", "ERROR"):
+        def r2(binding, group, code_by_route, tracker, _tok=token):
+            return s1.Stage1ConsistencyResult(
+                "p", _tok,
+                [{"route_key": VULN_RK, "original_verdict": "VULNERABLE",
+                  "should_be": _tok, "reason": "x"}], "g")
+        out = _run(r2, [INGESTED_VULN, INGESTED_SAFE])
+        assert _by_rk(out, VULN_RK)["finding"] == "vulnerable", token
+
+
+def test_promoted_errored_row_clears_the_stale_error_key():
+    """Wave r1 (fable): a promoted ERROR row kept its stale `error` key —
+    one row counted as BOTH a confirmed finding (finding-first) and an error
+    (r.get("error")). The gated write clears it."""
+    errored = dict(INGESTED_SAFE)
+    errored["verdict"] = "ERROR"
+    errored["finding"] = "error"
+    errored["error"] = "LLMConnectionError: DNS lookup failed"
+    errored["route_key"] = VULN_RK
+
+    def resolver(binding, group, code_by_route, tracker):
+        return s1.Stage1ConsistencyResult(
+            "p", "VULNERABLE",
+            [{"route_key": VULN_RK, "original_verdict": "ERROR",
+              "should_be": "VULNERABLE", "reason": "pattern matches sibling"}],
+            "g")
+    out = _run(resolver, [errored, INGESTED_SAFE])
+    row = _by_rk(out, VULN_RK)
+    assert row["verdict"] == "VULNERABLE"
+    assert row["finding"] == "vulnerable"
+    assert "error" not in row, (
+        f"the stale error key makes the promoted row count as both a finding "
+        f"and an error: {row}"
+    )
