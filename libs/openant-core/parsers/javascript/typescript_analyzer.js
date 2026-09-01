@@ -1066,19 +1066,44 @@ class TypeScriptAnalyzer {
         for (let ln = s; ln <= e; ln++) covered.add(ln);
       }
     }
+    // #330 (wave r1 opus): CLASS DECLARATION RANGES are masked whole — the
+    // Python :__module__ precedent covers ast.ClassDef bodies, and class
+    // field initializers (`private repo = new Repo();`, `cache =
+    // buildCache();`) are on NO unit's line range, so they leaked into the
+    // residual and their calls were attributed to module load — fabricated
+    // reachability from a synthetic root, the exact defect the b.js guard
+    // asserts against, one class field away.
+    for (const cls of sourceFile.getDescendantsOfKind(
+        ts.SyntaxKind.ClassDeclaration)) {
+      for (let ln = cls.getStartLineNumber(); ln <= cls.getEndLineNumber(); ln++) {
+        covered.add(ln);
+      }
+    }
 
     const lines = sourceFile.getFullText().split("\n");
     const residual = [];
     let first = null;
     let last = null;
+    // #330 (wave r1 sonnet): track multi-line /* ... */ blocks — an interior
+    // line without a leading * is still comment content, and commented-out
+    // code must not fabricate module-load edges (the resolver extracts the
+    // module unit's edges from this text with plain regexes).
+    let inBlockComment = false;
     for (let i = 0; i < lines.length; i++) {
       const ln = i + 1;
       if (covered.has(ln)) continue;
       const stripped = lines[i].trim();
+      if (inBlockComment) {
+        if (stripped.endsWith("*/")) inBlockComment = false;
+        continue;
+      }
+      if (stripped.startsWith("/*")) {
+        if (!stripped.endsWith("*/")) inBlockComment = true;
+        continue;
+      }
       if (
         !stripped ||
         stripped.startsWith("//") ||
-        stripped.startsWith("/*") ||
         stripped.startsWith("*")
       ) {
         continue;
@@ -1100,6 +1125,61 @@ class TypeScriptAnalyzer {
       startLine: first,
       endLine: last,
     };
+
+    // #330 (wave r1 opus, the headline): the Pattern-A companion — every
+    // other synthetic emit pairs the unit with real callGraph edges, and the
+    // analyzer's callGraph is what call_graph.json (and therefore the
+    // reachability pipeline) consumes. Without this, the module unit existed
+    // with [] edges in the graph that gates reachability: the issue's false
+    // negative survived behind the resolver's second graph (which only
+    // bundles the dataset).
+    this.callGraph[functionId] = this._moduleUnitEdges(
+      sourceFile, covered, relativePath);
+  }
+
+  /**
+   * The module unit's outgoing edges: the CallExpression/NewExpression
+   * descendants that start on UNCOVERED lines (the residual's own calls —
+   * the same shape extractCallsFromFunction derives from a function node,
+   * filtered to the lines the unit actually carries).
+   */
+  _moduleUnitEdges(sourceFile, covered, relativePath) {
+    const calls = [];
+    const seen = new Set();
+    const pushName = (name, dynamic, member = false) => {
+      const key = `${name} ${dynamic ? 1 : 0}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      calls.push({ resolved: false, name: name, dynamic: dynamic, member: member });
+    };
+    const callExprs = sourceFile.getDescendantsOfKind(
+      ts.SyntaxKind.CallExpression,
+    );
+    for (const callExpr of callExprs) {
+      if (covered.has(callExpr.getStartLineNumber())) continue;
+      const callee = callExpr.getExpression();
+      const normalized = this._normalizeCallName(callee);
+      if (normalized) {
+        pushName(normalized, false,
+                 !!callee && callee.getKindName() === "PropertyAccessExpression");
+      } else {
+        const raw = callee ? callee.getText().replace(/\s+/g, " ").trim() : "";
+        pushName(raw, true);
+      }
+      for (const arg of callExpr.getArguments()) {
+        if (arg.getKindName() === "Identifier") {
+          pushName(arg.getText(), false);
+        }
+      }
+    }
+    const newExprs = sourceFile.getDescendantsOfKind(
+      ts.SyntaxKind.NewExpression,
+    );
+    for (const newExpr of newExprs) {
+      if (covered.has(newExpr.getStartLineNumber())) continue;
+      pushName(newExpr.getExpression().getText(), false);
+    }
+    return calls;
   }
 
   /**
@@ -1109,8 +1189,13 @@ class TypeScriptAnalyzer {
    * imports and assignments only yields no module unit.
    */
   _residualContainsCall(text) {
+    // #330 (wave r1 opus): `require(...)`/`import(...)` are module-system
+    // plumbing, not bootstrap behaviour — the Python precedent skips
+    // import lines before deciding to emit, and a plain CJS header
+    // (`const fs = require('fs');`) otherwise emitted a zero-edge module
+    // unit for nearly every file in a corpus.
     const KEYWORDS = new Set([
-      "if", "for", "while", "switch", "catch", "function",
+      "if", "for", "while", "switch", "catch", "function", "require", "import",
     ]);
     const re = /([A-Za-z_$][\w$]*)\s*\(/g;
     let m;

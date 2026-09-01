@@ -154,3 +154,85 @@ def test_no_module_unit_without_a_residual_call(tmp_path):
     assert "x.js:module" not in out["functions"], (
         f"no residual call — module unit must not be emitted: {list(out['functions'])}"
     )
+
+
+def _analyze_only(repo_path, file_path):
+    cmd = ["node", str(ANALYZER_JS), str(repo_path), str(file_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, (
+        f"analyzer failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+    return json.loads(result.stdout)
+
+
+def test_module_unit_edges_reach_the_reachability_graph(tmp_path):
+    """Wave r1 (opus, the headline): the analyzer's own callGraph gates
+    call_graph.json — the reachability pipeline never reads the resolver's
+    second graph. Without the Pattern-A companion the unit existed with []
+    edges: the issue's false negative survived behind the unit's presence."""
+    repo = tmp_path / "m330g"
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "x.js").write_text(X_JS)
+    out = _analyze_only(repo, repo / "x.js")
+    mod = out.get("callGraph", {}).get("x.js:module", [])
+    names = {e.get("name") for e in mod}
+    assert "sink" in names, f"the module unit's edges are missing from the graph that gates reachability: {mod}"
+    assert "main" in names, mod
+
+
+def test_class_field_initializers_do_not_leak(tmp_path):
+    """Wave r1 (opus): class field initializers are on NO unit's line range
+    (the Python precedent covers whole ClassDef bodies) — buildCache() ran at
+    instantiation but was attributed to module load: fabricated reachability
+    from a synthetic root, one class field away from the b.js guard."""
+    src = """function buildCache() { return 1; }
+function bootstrapCall() { return 3; }
+class Svc {
+  cache = buildCache();
+}
+bootstrapCall();
+"""
+    repo = tmp_path / "m330f"
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "f.js").write_text(src)
+    out = _analyze_only(repo, repo / "f.js")
+    mod = out.get("callGraph", {}).get("f.js:module", [])
+    names = {e.get("name") for e in mod}
+    assert "bootstrapCall" in names, mod
+    assert "buildCache" not in names, f"class-field initializer attributed to module load: {mod}"
+
+
+def test_require_only_header_does_not_emit(tmp_path):
+    """Wave r1 (opus): `const fs = require('fs')` is module-system plumbing,
+    not bootstrap behaviour (the Python precedent skips import lines before
+    deciding) — a CJS header alone must not emit a zero-edge module unit."""
+    src = "const fs = require('fs');\nconst path = require('path');\n"
+    repo = tmp_path / "m330c"
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "c.js").write_text(src)
+    out = _analyze_only(repo, repo / "c.js")
+    assert "c.js:module" not in out["functions"], list(out["functions"])
+
+
+def test_commented_out_code_fabricates_no_edges(tmp_path):
+    """Wave r1 (sonnet): interior lines of a /* ... */ block without a
+    leading * leaked into the residual — commented-out calls must not
+    fabricate module-load edges."""
+    src = """function realHelper() { return 1; }
+function legacyMigrate() { return 2; }
+/*
+realHelper();
+legacyMigrate();
+*/
+"""
+    repo = tmp_path / "m330k"
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / "k.js").write_text(src)
+    out = _analyze_only(repo, repo / "k.js")
+    mod = out.get("callGraph", {}).get("k.js:module")
+    if mod is not None:
+        names = {e.get("name") for e in mod}
+        assert "realHelper" not in names and "legacyMigrate" not in names, mod
+    # and the residual gate: a file whose only "call" is commented out
+    # emits no module unit at all (no uncovered call).
+    assert "k.js:module" not in out["functions"], list(out["functions"])
