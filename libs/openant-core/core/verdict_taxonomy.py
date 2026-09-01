@@ -54,6 +54,17 @@ _SEVERITIES = frozenset(SEVERITIES)
 # The verdicts that carry a severity (see SEVERITIES above).
 SEVERITY_FINDING_VERDICTS = ("vulnerable", "bypassable")
 
+# --- Stage-1 verdict vocabulary ----------------------------------------------
+# Every verdict a Stage-1 result may carry (the `_normalize_result`
+# finding_to_verdict map, plus ERROR). #427: `_normalize_result`'s verdict
+# whitelist — a non-empty verdict outside this set is unrecognized model
+# output and routes to the error accounting (mirroring the finding-key fix
+# #426 applied to the same garbage-reply class).
+STAGE1_VERDICTS = frozenset({
+    "VULNERABLE", "SAFE", "PROTECTED", "BYPASSABLE", "INCONCLUSIVE",
+    "INSUFFICIENT_CONTEXT", "ERROR",
+})
+
 # --- Stage-2 verification verdicts -------------------------------------------
 # ``core/reporter.py`` maps the Stage-2 ``verification`` dict onto these.
 STAGE2_VERDICTS = frozenset({

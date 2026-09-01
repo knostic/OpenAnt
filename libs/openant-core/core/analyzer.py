@@ -418,7 +418,11 @@ def _count_verdicts(results):
             # half-stamped row): agree with analyze_result_is_error, which
             # classifies it as an error.
             counts["errors"] += 1
-        # else: an unrecognized verdict — the documented F13 gap (dropped).
+        # #427: an unrecognized verdict is a malformed model reply — the
+        # error bucket (the F13 partition closes; the sink-side
+        # analyze_result_is_error agrees, so resume retries the row too).
+        else:
+            counts["errors"] += 1
     return counts
 
 

@@ -14,6 +14,8 @@ import json
 import os
 import subprocess
 import sys
+
+from core.verdict_taxonomy import STAGE1_VERDICTS
 from pathlib import Path
 from typing import Optional
 
@@ -629,6 +631,31 @@ class ContextCorrector:
         """
         verdict = result.get("verdict")
         has_verdict = isinstance(verdict, str) and verdict.strip() != ""
+        # #427 (wave r1, opus+fable): the unrecognized-VERDICT branch,
+        # mirrored — the twin's passthrough adopted a garbage verdict as
+        # "Correction successful! New verdict: SAY WHAT" and returned it to
+        # experiment.py as the analysis result. The finding-kept redesign
+        # applies here too: the garbage verdict is discarded (raw
+        # preserved); a usable canonical finding is KEPT; only an
+        # absent/unusable finding routes to the error shape.
+        if has_verdict and verdict.strip().upper() not in STAGE1_VERDICTS:
+            result["raw_verdict"] = verdict
+            _finding = result.get("finding")
+            from core.verdict_taxonomy import FINDING_VERDICT_ORDER as _FVO
+            _canonical = frozenset(_FVO) | {"error"}
+            if not (isinstance(_finding, str)
+                    and _finding.strip().lower() in _canonical):
+                if _finding is not None and (
+                        not isinstance(_finding, str) or _finding.strip()):
+                    result["raw_finding"] = _finding
+                result["verdict"] = "ERROR"
+                result["finding"] = "error"
+            else:
+                # famBCR panel (sonnet): the KEPT verdict must be normalized
+                # to match the kept finding — the severity stamping keys on
+                # `verdict`, and the garbage "SAY WHAT" left in place
+                # silently dropped severity for exactly these rows.
+                result["verdict"] = _finding.strip().upper()
         if not has_verdict and "finding" in result:
             finding = result["finding"]
             mapping = {
@@ -651,7 +678,7 @@ class ContextCorrector:
             result["verdict"] = "ERROR"
             result["finding"] = "error"
         if "verdict" in result and isinstance(result["verdict"], str):
-            result["verdict"] = result["verdict"].upper()
+            result["verdict"] = result["verdict"].strip().upper()
         # #215 mirror: the finding-gated severity stamp, AFTER the uppercase
         # fold (core's order — stamping before it lost a model severity on a
         # lowercase-verdict reply, wave round-2). The shared enum comes from

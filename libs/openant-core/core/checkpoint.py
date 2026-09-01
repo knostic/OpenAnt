@@ -212,9 +212,12 @@ def analyze_result_is_error(res) -> bool:
     finding-first — a legacy ``{"verdict": "ERROR", "finding": "vulnerable"}``
     row is an error here (retried) but counted vulnerable there; the retried
     outcome replaces it, so the disagreement is transient. An
-    unrecognized-but-effective verdict (``"SAY WHAT"``) is NOT an error here
-    — that drop is the documented F13 partition gap, deliberately out of
-    scope (#316/#324).
+    unrecognized-but-effective verdict (``"SAY WHAT"``) IS an error here
+    (#427, wave r1 fable): the producer whitelist now routes fresh rows to
+    the error shape at ingestion, and this sink-side closure makes the
+    ON-DISK population — rows the buggy producer persisted — retried on
+    resume too, instead of adopted as complete with a verdict every
+    finding-first sink drops.
     """
     if not isinstance(res, dict):
         # A hand-edited/corrupt "result": null row must not crash the
@@ -226,7 +229,14 @@ def analyze_result_is_error(res) -> bool:
         return True
     has_verdict = isinstance(verdict, str) and verdict.strip() != ""
     has_finding = isinstance(finding, str) and finding.strip() != ""
-    return not (has_verdict or has_finding)
+    if not (has_verdict or has_finding):
+        return True
+    # #427: an unrecognized-but-effective verdict is a malformed model reply
+    # — retried, never adopted (the shared STAGE1_VERDICTS vocabulary).
+    from core.verdict_taxonomy import STAGE1_VERDICTS
+    if has_verdict and verdict.strip().upper() not in STAGE1_VERDICTS:
+        return True
+    return False
 
 
 class StepCheckpoint:
