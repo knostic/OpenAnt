@@ -171,6 +171,26 @@ def test_imported_base_with_external_origin_abstains():
     assert "a.py:Base.m" not in edges, (
         f"an external-origin base bound to the unrelated local namesake: {edges}"
     )
+    # famBCR panel (sonnet, non-discriminating): the negative alone passes on
+    # master too (the pre-#440 walk never resolved imports — no edge either
+    # way). The POSITIVE control pins the discriminator: a LOCAL import of
+    # the same name MUST produce the edge (the walk followed the import
+    # map), which fails on the pre-PR code.
+    cg2 = _cg({
+        "a.py": ("class Base:\n"
+                 "    def m(self):\n"
+                 "        return 1\n"),
+        "b.py": ("from a import Base\n"
+                 "class Sub(Base):\n"
+                 "    pass\n"
+                 "def go(s):\n"
+                 "    v = Sub()\n"
+                 "    return v.m()\n"),
+    })
+    edges2 = cg2.get("b.py:go", [])
+    assert "a.py:Base.m" in edges2, (
+        f"the positive control: a local import base must resolve - "
+        f"without it the abstain test passes on pre-#440 code: {edges2}")
 
 
 def test_hijack_guard_holds_one_level_deep():
