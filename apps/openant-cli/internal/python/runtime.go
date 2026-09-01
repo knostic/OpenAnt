@@ -420,6 +420,16 @@ func installOpenantCmds(pythonPath, corePath string) []*exec.Cmd {
 	// then the editable install (which must not upgrade what was pinned — pip
 	// does not downgrade pinned deps unless the pin conflicts, and
 	// pyproject's floors are compatible with the pins by construction).
+	//
+	// #428: the honest boundary of "deterministic" — the LLM-SDK chain
+	// (anthropic/openai/google-genai/pydantic/httpx and their transitive
+	// pins) is EXACTLY locked; the shared floor lines (PyYAML, requests, the
+	// eight tree-sitter grammars) and anthropic[bedrock]'s extra (boto3/
+	// botocore, unpinned — botocore releases ~daily) resolve at whatever the
+	// floor admits. The drift hazard this leaves — a pyproject floor raised
+	// ABOVE a requirements pin would silently upgrade past the pin on the
+	// editable install — is guarded by
+	// libs/openant-core/tests/test_issue428_floors_vs_pins.py.
 	reqs := filepath.Join(corePath, "requirements.txt")
 	cmds := []*exec.Cmd{}
 	if _, err := os.Stat(reqs); err == nil {

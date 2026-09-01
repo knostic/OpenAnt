@@ -11,6 +11,11 @@ import (
 // deterministic — requirements.txt (the exact pins CI uses) is installed
 // first, then the editable install; the deps staleness hash covers BOTH
 // files so a change to either triggers a reinstall.
+//
+// #428: "deterministic" is exact for the LLM-SDK chain; the shared floor
+// lines and the bedrock extra's boto3/botocore resolve at whatever the floor
+// admits — and the pyproject-floors-vs-pins drift hazard is guarded on the
+// Python side (test_issue428_floors_vs_pins.py).
 // ---------------------------------------------------------------------------
 
 func TestInstallCommandRunsRequirementsThenEditable(t *testing.T) {
