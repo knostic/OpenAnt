@@ -220,21 +220,6 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
             print(f"[Detect] Restored {len(checkpointed)} units from checkpoints",
                   file=sys.stderr, flush=True)
 
-    # #435: done/remaining come from the ERROR-FILTERED count — the same
-    # predicate the retry queue below is built from (_cp_is_error). The raw
-    # restored count counted an errored row as done in the narration while
-    # the queue retried it at the same time: a resume with errored units
-    # printed "0 units to process (2 already done)" and then "Done: 3/2
-    # units" — a counter past its denominator, and an understated
-    # units-to-process by exactly the error count.
-    _done = sum(1 for cp in checkpointed.values() if not _cp_is_error(cp))
-    progress = ProgressReporter("Detect", total, tracker=tracker, completed=_done)
-
-    mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
-    remaining = total - _done
-    print(f"[Detect] Mode: {mode}, {remaining} units to process ({_done} already done)",
-          file=sys.stderr, flush=True)
-
     # Pre-populate results from checkpoints, but ONLY for successfully-completed
     # units. Errored units are loaded into the "units_to_process" list so they
     # get retried on resume (matches enhance's behavior).
@@ -251,6 +236,24 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
             code_by_route[cp_data.get("route_key", uid)] = cp_data.get("code_for_route", "")
         else:
             units_to_process.append((i, unit))
+
+    # #435 (wave r1, three axes): done/remaining derive from the retry queue
+    # itself — total minus what actually runs — so the narration can never
+    # disagree with the queue by ANY input class. The round-1 fix tallied
+    # non-error rows over checkpointed.values(), but the queue's predicate is
+    # "non-error row whose id IS IN the units list": checkpoint.load()
+    # returns every file in the dir, nothing invalidates stale entries when
+    # units legitimately shrink on a resume (--limit, --exploitable, the
+    # diff filter, a re-parse), so a foreign row overcounted again — the
+    # same 3/2 shape, a different trigger. (finding_verifier.py computes the
+    # same quantity the same way: remaining = len(results_to_verify).)
+    _done = total - len(units_to_process)
+    progress = ProgressReporter("Detect", total, tracker=tracker, completed=_done)
+
+    mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
+    remaining = len(units_to_process)
+    print(f"[Detect] Mode: {mode}, {remaining} units to process ({_done} already done)",
+          file=sys.stderr, flush=True)
 
     def _process_and_save(i, unit):
         out = _process_unit(binding, unit, i, json_corrector, app_context)

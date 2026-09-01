@@ -75,3 +75,36 @@ def test_final_counter_never_exceeds_total(tmp_path, monkeypatch):
     out, _ = _resume_two_rows(tmp_path, monkeypatch)
     assert "3/2" not in out, f"the counter passed its denominator: {out!r}"
     assert "2/2" in out
+
+
+def test_foreign_checkpoint_rows_cannot_overcount(tmp_path, monkeypatch):
+    """Wave r1 (three axes): a stale/foreign checkpoint row — the units list
+    legitimately shrank on a resume (--limit, --exploitable, the diff
+    filter, a re-parse against the same output_dir) — made the round-1 tally
+    overcount again (units-to-process understated, even negative; the
+    counter past its total). The queue-derived _done cannot: total minus
+    what actually runs."""
+    cp = StepCheckpoint("analyze", str(tmp_path))
+    cp.ensure_dir()
+    cp.save("u0", {"result": {"unit_id": "u0", "finding": "safe",
+                              "verdict": "SAFE", "route_key": "f.py:u0"},
+                   "route_key": "f.py:u0", "code_for_route": "x"})
+    cp.save("u9", {"result": {"unit_id": "u9", "finding": "safe",
+                              "verdict": "SAFE", "route_key": "f.py:u9"},
+                   "route_key": "f.py:u9", "code_for_route": "x"})  # FOREIGN
+
+    calls = {"n": 0}
+    monkeypatch.setattr(az, "_process_unit", _fake_process_unit(calls))
+    err = io.StringIO()
+    with redirect_stderr(err):
+        # the resume runs a SMALLER unit set (only u0 + u1 — u9 is gone)
+        az._run_detection(
+            [{"id": "u0", "code": "x=1"}, {"id": "u1", "code": "x=1"}],
+            binding=object(), json_corrector=None, app_context=None,
+            workers=1, checkpoint=cp)
+    out = err.getvalue()
+    assert "1 units to process (1 already done)" in out, (
+        f"the foreign row shifted the narration: {out!r}"
+    )
+    assert "2/2" in out and "-1" not in out and "3/" not in out
+    assert calls["n"] == 1
