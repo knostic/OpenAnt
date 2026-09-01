@@ -178,6 +178,10 @@ _EXPECTED_GOOGLE = {
     "gemini-2.0-flash-lite": {"input": 0.075, "output": 0.30},
     "gemini-1.5-pro": {"input": 1.25, "output": 5.00},
     "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
+    # #434: the stale-family gap closed — live-verified on BOTH sources
+    # (Google's pricing page and the OpenRouter catalogue agree at
+    # $0.75/$3.75; the page documents a Jan-1-2027 step to $1.50/$7.50).
+    "gemini-3.7-flash": {"input": 0.75, "output": 3.75},
 }
 _EXPECTED_PHASE_MODELS = {
     "analyze": "claude-opus-4-8",
@@ -194,14 +198,30 @@ _EXPECTED_LEGACY_ENHANCE = "claude-sonnet-4-20250514"
 def test_c_pricing_maps_match_pre_refactor_snapshot():
     # Values are now sourced from config/models.json via core.model_registry.
     # Behavior-preserving for CURRENT models; retired/unknown ids are omitted.
-    from core.model_registry import pricing_map
+    # #434: the maps now ALSO carry each record's conventional alias
+    # spellings (bare/dotted/dashed — a config that spells a model any
+    # conventional way keeps its cost accounting). The snapshot holds as a
+    # SUBSET: every exact key keeps its exact value; every additional key
+    # must be an alias of a snapshot record, never a new price.
+    from core.model_registry import pricing_map, _alias_spellings
 
-    anthropic = pricing_map("anthropic")
-    assert anthropic == _EXPECTED_ANTHROPIC_CURRENT
+    def _assert_snapshot(provider, expected):
+        got = pricing_map(provider)
+        for k, v in expected.items():
+            assert got[k] == v, (provider, k, got.get(k), v)
+        allowed_alias_keys = set()
+        for rid in expected:
+            allowed_alias_keys.update(_alias_spellings(rid))
+        for k in got:
+            if k not in expected:
+                assert k in allowed_alias_keys, (provider, k)
+                assert got[k] in expected.values(), (provider, k, got[k])
+
+    _assert_snapshot("anthropic", _EXPECTED_ANTHROPIC_CURRENT)
     for retired in _RETIRED_OR_UNKNOWN_ANTHROPIC:
-        assert retired not in anthropic, f"{retired} must be omitted, not priced"
-    assert pricing_map("openai") == _EXPECTED_OPENAI
-    assert pricing_map("google") == _EXPECTED_GOOGLE
+        assert retired not in pricing_map("anthropic"), f"{retired} must be omitted, not priced"
+    _assert_snapshot("openai", _EXPECTED_OPENAI)
+    _assert_snapshot("google", _EXPECTED_GOOGLE)
 
 
 def test_c_consumers_resolve_to_pre_refactor_values():
@@ -212,10 +232,15 @@ def test_c_consumers_resolve_to_pre_refactor_values():
     from utilities.llm.builtins import OPENANT_DEFAULT
     from utilities.context_enhancer import CONTEXT_ENHANCEMENT_MODEL_LEGACY
 
-    assert MODEL_PRICING == _EXPECTED_ANTHROPIC_CURRENT
-    assert AnthropicAdapter.pricing == _EXPECTED_ANTHROPIC_CURRENT
-    assert OpenAIAdapter.pricing == _EXPECTED_OPENAI
-    assert GoogleAdapter.pricing == _EXPECTED_GOOGLE
+    # #434: subset semantics — the maps gained alias spellings; the exact
+    # keys keep their exact values.
+    for k, v in _EXPECTED_ANTHROPIC_CURRENT.items():
+        assert MODEL_PRICING[k] == v, k
+        assert AnthropicAdapter.pricing[k] == v, k
+    for k, v in _EXPECTED_OPENAI.items():
+        assert OpenAIAdapter.pricing[k] == v, k
+    for k, v in _EXPECTED_GOOGLE.items():
+        assert GoogleAdapter.pricing[k] == v, k
     assert CONTEXT_ENHANCEMENT_MODEL_LEGACY == _EXPECTED_LEGACY_ENHANCE
 
     resolved = {p: OPENANT_DEFAULT.phases[p].model for p in _EXPECTED_PHASE_MODELS}
