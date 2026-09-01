@@ -24,6 +24,11 @@ from packaging.version import Version
 
 CORE_ROOT = Path(__file__).resolve().parents[1]
 
+# famD panel (sonnet, reject-grade): the fire path CRASHED — open(...)
+# returns a file object and read_text() is a Path method, so a firing guard
+# reported AttributeError instead of the drift. Read once, module-level.
+_PINNED_TEXT = (CORE_ROOT / "requirements.txt").read_text()
+
 
 def _parse_dep(spec):
     """`name>=floor` -> (name, Version) ; `name[extra]>=floor` -> extras stripped.
@@ -89,8 +94,7 @@ def test_pyproject_floors_never_exceed_requirements_pins():
         + "; ".join(
             f"{n} (floor {f} vs requirements {p}; "
             + ("pip install -e would silently upgrade past the CI pin"
-               if str(p) in open(CORE_ROOT / "requirements.txt").read_text() and
-               _is_pin_row(n) else
+               if str(p) in _PINNED_TEXT and _is_pin_row(n) else
                "the FLOOR exceeds the >= requirement — pip install -e would "
                "resolve past it")
             for n, f, p in drift)
@@ -98,7 +102,7 @@ def test_pyproject_floors_never_exceed_requirements_pins():
 
 
 def _is_pin_row(name):
-    txt = (CORE_ROOT / "requirements.txt").read_text()
+    txt = _PINNED_TEXT
     return any(
         re.match(rf"^{re.escape(name)}\s*(\[[^\]]*\])?\s*==", ln.split("#")[0].strip())
         for ln in txt.splitlines()
@@ -143,6 +147,26 @@ def test_the_guard_fires_on_drift():
     pins = _pins_from_requirements("anthropic[bedrock]==1.2.0\npydantic==2.13.5\n")
     drift = _drift(floors, pins)
     assert drift == [("anthropic", Version("1.3.0"), Version("1.2.0"))], drift
+
+
+def test_the_guard_reports_not_crashes_on_drift():
+    """famD panel (sonnet): the old fire path CRASHED (AttributeError) the
+    moment drift existed — the guard must REPORT. Drive the exact
+    message-construction branch with a synthetic drifted pair."""
+    floors = {"anthropic": Version("1.3.0")}
+    pins = {"anthropic": Version("1.2.0")}
+    drift = _drift(floors, pins)
+    assert drift, "fixture must drift"
+    name, floor, pin = drift[0]
+    msg = (
+        f"{name} (floor {floor} vs requirements {pin}; "
+        + ("pip install -e would silently upgrade past the CI pin"
+           if str(pin) in _PINNED_TEXT and _is_pin_row(name) else
+           "the FLOOR exceeds the >= requirement — pip install -e would "
+           "resolve past it")
+    )
+    assert "floor 1.3.0 vs requirements 1.2.0" in msg, msg
+    assert "silently upgrade" in msg  # anthropic==1.2.0 IS a pinned row
 
 
 def test_extras_and_names_parse():
