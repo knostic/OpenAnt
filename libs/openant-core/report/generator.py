@@ -302,20 +302,43 @@ def _context_provenance_header(pipeline_data: dict) -> str:
     hostile file can suppress by steering the report prompt. Returns "" for the
     built-in/generated path so the banner never fires on a trusted context.
     """
-    if pipeline_data.get("context_source") != "threat_model":
-        return ""
-    lines = [
-        "> **⚠ Security model supplied by a repo-controlled file.**",
-        "> This scan's attacker model came from `OPENANT.THREATMODEL.md` inside "
-        "the scanned repository, which is attacker-influenceable. Treat the "
-        "findings' scope as only as trustworthy as that file.",
-    ]
-    sha = pipeline_data.get("threat_model_sha256")
-    if sha:
-        lines.append(f"> Threat-model sha256: `{sha}`")
-    for warning in pipeline_data.get("threat_model_warnings") or []:
-        lines.append(f"> - {warning}")
-    return "\n".join(lines) + "\n\n"
+    source = pipeline_data.get("context_source")
+    if source == "threat_model":
+        lines = [
+            "> **⚠ Security model supplied by a repo-controlled file.**",
+            "> This scan's attacker model came from `OPENANT.THREATMODEL.md` inside "
+            "the scanned repository, which is attacker-influenceable. Treat the "
+            "findings' scope as only as trustworthy as that file.",
+        ]
+        sha = pipeline_data.get("threat_model_sha256")
+        if sha:
+            lines.append(f"> Threat-model sha256: `{sha}`")
+        for warning in pipeline_data.get("threat_model_warnings") or []:
+            lines.append(f"> - {warning}")
+        return "\n".join(lines) + "\n\n"
+    if source == "repo_manual":
+        # #322: the manual-override branch (OPENANT.json / OPENANT.md
+        # committed by the scanned repo) was recorded as "generated", so
+        # this banner never fired for the path a hostile file actually
+        # controls. Disclose it the same deterministic way.
+        fname = pipeline_data.get("manual_override_filename") or ""
+        named = ("`" + fname + "`") if fname else "a repo-committed override file"
+        lines = [
+            "> **⚠ Security override supplied by a repo-committed file.**",
+            "> This scan honored " + named + " committed inside "
+            "the scanned repository, which is attacker-influenceable — its "
+            "`not_a_vulnerability` entries suppress findings. Treat the "
+            "findings' scope as only as trustworthy as that file.",
+        ]
+        n = pipeline_data.get("manual_exclusions")
+        if isinstance(n, int):
+            lines.append(
+                f"> Active repo-supplied exclusions: {n} "
+                "(the findings they suppress are not reported)")
+        for warning in pipeline_data.get("manual_override_warnings") or []:
+            lines.append(f"> - {warning}")
+        return "\n".join(lines) + "\n\n"
+    return ""
 
 
 def generate_summary_report(
