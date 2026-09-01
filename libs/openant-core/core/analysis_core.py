@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from datetime import datetime
 
 from core.verdict_taxonomy import (
-    FINDING_VERDICT_ORDER, SEVERITIES, _SEVERITIES, STAGE1_VERDICTS,
+    FINDING_VERDICT_ORDER, _SEVERITIES, STAGE1_VERDICTS,
 )
 
 # the canonical lowercase finding strings a garbage-verdict row may keep
