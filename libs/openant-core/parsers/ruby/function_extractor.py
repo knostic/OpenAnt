@@ -498,6 +498,24 @@ class FunctionExtractor:
                     # a definition; the arg-form keeps its no-descent behaviour
                     # (descending would emit phantom units from the symbols).
                     handled = not self._call_wraps_a_definition(node)
+                    if not handled:
+                        # Wave r1 (three axes, one root cause): descend into
+                        # the call's children EXCEPT its own visibility-keyword
+                        # identifier — the generic descend re-visited `private`
+                        # as a standalone node, tripped the bare-marker toggle
+                        # below, and leaked the visibility onto EVERY
+                        # subsequent sibling `def` in the class body (a
+                        # genuinely public method following an inline-visibility
+                        # def was misclassified and dropped as a route-handler
+                        # — the entry-point false-negative direction this fix
+                        # set out to close, reintroduced through a side channel).
+                        kw = method_name
+                        for child in node.children:
+                            if child.type == 'identifier' and \
+                                    self._node_text(child, source) == kw:
+                                continue
+                            stack.append((child, class_name, module_name, vis_state))
+                        handled = True
                 if not handled:
                     for child in reversed(node.children):
                         stack.append((child, class_name, module_name, vis_state))

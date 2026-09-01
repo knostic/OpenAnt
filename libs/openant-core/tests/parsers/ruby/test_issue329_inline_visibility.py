@@ -122,3 +122,45 @@ def test_arg_form_visibility_keeps_no_descent(tmp_path):
     )
     roster = result["classes"]["n.rb:D"]["methods"]
     assert "g" in roster and "h" in roster
+
+
+def test_inline_visibility_does_not_leak_onto_siblings(tmp_path):
+    """Wave r1 (three axes, one root cause): the descend re-visited the call's
+    own `private` identifier, tripping the bare-marker toggle and leaking the
+    visibility onto every subsequent sibling def — a genuinely public method
+    after an inline-visibility def was misclassified and dropped as a
+    route-handler (the entry-point false-negative direction)."""
+    result = _extract(
+        tmp_path,
+        "leak.rb",
+        "class C\n"
+        "  private def a; end\n"
+        "  def plain; end\n"
+        "end\n",
+    )
+    names = _names(result)
+    assert "a" in names and "plain" in names, names
+    plain = next(fd for fd in result["functions"].values() if fd["name"] == "plain")
+    leaked = plain.get("visibility")
+    assert leaked in (None, "public"), (
+        f"the inline `private def` leaked onto the sibling: plain.visibility={leaked!r}"
+    )
+
+
+def test_arg_form_still_does_not_toggle(tmp_path):
+    """The arg form `private :g` must not toggle the class-body visibility
+    either (the no-descent path never re-visits the identifier — pinned)."""
+    result = _extract(
+        tmp_path,
+        "noleak.rb",
+        "class D\n"
+        "  def g; end\n"
+        "  private :g\n"
+        "  def h; end\n"
+        "end\n",
+    )
+    h = next(fd for fd in result["functions"].values() if fd["name"] == "h")
+    leaked = h.get("visibility")
+    assert leaked in (None, "public"), (
+        f"the arg-form toggled a sibling: h.visibility={leaked!r}"
+    )
