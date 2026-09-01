@@ -107,11 +107,25 @@ def test_sarif_gate_treats_interrupted_as_failure_class():
     consumer-level pin lives in the Go suite
     (sarif_interrupted_test.go: TestSarifInterruptedStepIsFailure); this
     Python-side companion asserts the Go suite carries it and passes."""
+    import re as _re
     import shutil as _sh
     import subprocess
     from pathlib import Path as _P
     if not _sh.which("go"):
         pytest.skip("Go toolchain not available")
+    # the python-test CI runners carry a PATH `go` OLDER than the module's
+    # directive (ubuntu: 1.21 vs go.mod's 1.25.8, GOTOOLCHAIN=local) — skip:
+    # the Go CI jobs exercise the gate with a proper toolchain.
+    _src = _P(__file__).resolve().parents[3] / "apps" / "openant-cli"
+    _ver = subprocess.run(["go", "version"], capture_output=True,
+                          text=True).stdout
+    _vm = _re.search(r"go(\d+(?:\.\d+)+)", _ver)
+    _want = _re.search(r"^go\s+(\d+(?:\.\d+)*)",
+                       (_src / "go.mod").read_text(), _re.M)
+    if _vm and _want:
+        _vt = lambda v: tuple(int(x) for x in v.split("."))
+        if _vt(_vm.group(1)) < _vt(_want.group(1)):
+            pytest.skip(f"go {_vm.group(1)} older than the module's go {_want.group(1)}")
     out = subprocess.run(
         ["go", "test", "./internal/report/", "-run",
          "TestSarifInterruptedStepIsFailure", "-count=1", "-v"],
