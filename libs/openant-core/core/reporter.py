@@ -411,7 +411,27 @@ def build_pipeline_output(
     call_graph_path = os.path.join(
         os.path.dirname(os.path.abspath(results_path)), "call_graph.json"
     )
+    # #423: the pre-dedup count is over the SAME population `vulnerable`
+    # counts (the confirmed findings list) — NOT the analyze-stage metrics.
+    # Stage-2 adjudication can retain/create vulnerabilities Stage-1
+    # detection did not flag (a live run: detect 0 vulnerable, verify 2 that
+    # stayed), so the metrics population and the findings population diverge
+    # and the #289/#381 reconciliation contract (before >= after) broke,
+    # emitting `"deduplicated": -2` — a count that can never be explained as
+    # deduplication. Deriving both from one list makes the delta a TRUE
+    # dedup delta.
+    confirmed_before_dedup = len(confirmed)
     confirmed = _dedup_caller_callee(confirmed, all_results, call_graph_path)
+    # #423 (wave r1): the disclosure/metrics overlap, split by the recount's
+    # own predicates (verifier.py:497-513) — the confirmed rows the recount
+    # ALSO buckets into errors / needs_review, counted once (in vulnerable,
+    # via the findings list) and subtracted from those buckets.
+    _k_overlap_error = sum(1 for c in confirmed if c.get("error"))
+    _k_overlap_needs = sum(
+        1 for c in confirmed
+        if not c.get("error")
+        and isinstance(c.get("verification"), dict)
+        and c["verification"].get("incomplete"))
 
     # Build findings in PipelineOutput schema
     findings_data = []
@@ -752,21 +772,40 @@ def build_pipeline_output(
             # report 183 in results.vulnerable alongside 175 entries in
             # findings. The pre-dedup count and the dedup delta are
             # explicit so the difference is explainable, not contradictory.
+            # #423: before_dedup counts the SAME list's PRE-dedup length
+            # (captured above _dedup_caller_callee), so the delta is a true
+            # dedup delta — never negative (the analyze-metrics population
+            # diverges from the findings population when Stage-2 retains
+            # vulnerabilities Stage-1 did not flag).
             "vulnerable": len(findings_data),
-            "vulnerable_before_dedup": metrics.get("vulnerable", 0) + metrics.get("bypassable", 0),
-            "deduplicated": (metrics.get("vulnerable", 0) + metrics.get("bypassable", 0)) - len(findings_data),
+            "vulnerable_before_dedup": confirmed_before_dedup,
+            "deduplicated": confirmed_before_dedup - len(findings_data),
             # #289: protected is its OWN key — the lossy safe-fold destroyed
             # a verdict the pipeline computes and the template has a row for.
             "safe": metrics.get("safe", 0),
             "protected": metrics.get("protected", 0),
             "inconclusive": metrics.get("inconclusive", 0),
-            # F13: errored units are part of `total` (see units_analyzed above), so the
-            # results buckets must include them or they cannot reconcile to `total`.
-            "errors": metrics.get("errors", 0),
-            # #284 (wave catch): incomplete verifications are ALSO part of total —
-            # the partition must carry needs_review or the buckets cannot reconcile
-            # on any scan with incomplete units (the F13 invariant, extended).
-            "needs_review": metrics.get("needs_review", 0),
+            # #423 (wave r1, three axes — the F13 partition): the metrics
+            # recount and the disclosure list are TWO populations that
+            # deliberately overlap (verifier.py's #284 note keeps
+            # errored/incomplete rows whose Stage-1 finding is vulnerable in
+            # confirmed_findings; the recount buckets those same rows into
+            # errors/needs_review first). With `vulnerable` counting the
+            # disclosure list, the overlap rows are counted ONCE here and
+            # their metrics-bucket entries are subtracted below — otherwise
+            # the partition over-sums total by exactly the overlap (the
+            # pre-round fix traded the negative `deduplicated` for this
+            # silent +k on the live run's own shape).
+            # F13: errored units are part of `total` (see units_analyzed
+            # above), so the results buckets must include them or they
+            # cannot reconcile to `total` — MINUS the overlap already
+            # counted in `vulnerable`.
+            "errors": max(0, metrics.get("errors", 0) - _k_overlap_error),
+            # #284 (wave catch): incomplete verifications are ALSO part of
+            # total — the partition must carry needs_review or the buckets
+            # cannot reconcile (the F13 invariant, extended) — minus the
+            # same overlap.
+            "needs_review": max(0, metrics.get("needs_review", 0) - _k_overlap_needs),
             "total": total_units,
         },
         "findings": findings_data,
