@@ -43,11 +43,25 @@ def test_propagating_ki_writes_interrupted_status(tmp_path):
     )
 
 
-def test_propagating_system_exit_writes_interrupted_status(tmp_path):
+def test_propagating_system_exit_writes_error_with_the_code(tmp_path):
+    """Wave r1 (opus): SystemExit is not an interrupt — it is how
+    deterministic error exits are signalled. A non-zero code is ERROR with
+    the cause recorded (mapping it to "interrupted" erased the validation
+    error and contradicted the exit code: the Go contract reads
+    "interrupted" as 130); a ZERO code is a deliberate early exit."""
     with pytest.raises(SystemExit):
         with step_context("t_step", str(tmp_path)):
             raise SystemExit(2)
-    assert _read(tmp_path)["status"] == "interrupted"
+    rep = _read(tmp_path)
+    assert rep["status"] == "error", (
+        "SystemExit(2) is an error exit, not an interrupt"
+    )
+    assert any("SystemExit: 2" in e for e in rep["errors"]), rep
+
+    with pytest.raises(SystemExit):
+        with step_context("t_step2", str(tmp_path)):
+            raise SystemExit(0)
+    assert _read(tmp_path, "t_step2")["status"] == "interrupted"
 
 
 def test_propagating_exception_stays_error(tmp_path):
@@ -70,6 +84,41 @@ def test_interrupted_with_errors_is_not_downgraded_to_partial(tmp_path):
             ctx.errors.append("unit 7 failed before the interrupt")
             raise KeyboardInterrupt
     assert _read(tmp_path)["status"] == "interrupted"
+    # wave r1 (opus): the pre-interrupt errors SURVIVE into the artifact —
+    # what distinguishes an interrupted-after-failures step from a bare one.
+    assert any("unit 7 failed" in e for e in _read(tmp_path)["errors"])
+
+
+def test_generator_exit_writes_interrupted_status(tmp_path):
+    """The GeneratorExit case named in the comment, pinned (wave r1 opus)."""
+    def _gen():
+        with step_context("t_step", str(tmp_path)):
+            yield
+            raise AssertionError("unreachable")
+    g = _gen()
+    next(g)
+    g.close()   # GeneratorExit fires INSIDE the body at the yield; close()
+                # itself does not raise when the generator cooperates
+    assert _read(tmp_path)["status"] == "interrupted"
+
+
+def test_sarif_gate_treats_interrupted_as_failure_class():
+    """Wave r1 (fable+opus): the SARIF executionSuccessful gate — the
+    consumer-level pin lives in the Go suite
+    (sarif_interrupted_test.go: TestSarifInterruptedStepIsFailure); this
+    Python-side companion asserts the Go suite carries it and passes."""
+    import shutil as _sh
+    import subprocess
+    from pathlib import Path as _P
+    if not _sh.which("go"):
+        pytest.skip("Go toolchain not available")
+    out = subprocess.run(
+        ["go", "test", "./internal/report/", "-run",
+         "TestSarifInterruptedStepIsFailure", "-count=1", "-v"],
+        capture_output=True, text=True,
+        cwd=str(_P(__file__).resolve().parents[3] / "apps" / "openant-cli"),
+        timeout=300)
+    assert "PASS" in out.stdout, out.stdout + out.stderr
 
 
 def test_normal_and_partial_derivations_unchanged(tmp_path):

@@ -1453,7 +1453,11 @@ def _write_scan_report(
     total_duration = sum(sr.get("duration_seconds", 0) for sr in step_reports)
     # #285: aggregate the per-step status and errors — the scan report must
     # be at least as informative as the per-step files it summarises.
-    _STATUS_RANK = {"success": 0, "skipped": 1, "partial": 2, "error": 3}
+    # #420 (wave r1, fable+opus): "interrupted" ranks with the failure
+    # class — the .get(..., 0) default silently ranked it as success, and
+    # the aggregate scan status fed to the envelope stayed green.
+    _STATUS_RANK = {"success": 0, "skipped": 1, "partial": 2, "error": 3,
+                    "interrupted": 4}
     _worst_status = "success"
     for sr in step_reports:
         _st = str(sr.get("status", "success") or "success").lower()

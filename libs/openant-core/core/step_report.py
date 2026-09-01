@@ -59,16 +59,36 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
         print(f"[{step}] ERROR: {exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         raise
-    except BaseException:
+    except KeyboardInterrupt:
         # #420 (the #417/#418/#419 contract): an interrupt propagating through
         # a step must not leave an on-disk artifact claiming success — the
         # finally below would write the DEFAULT status="success" with an
-        # empty summary. `except Exception` above cannot catch these
-        # (KeyboardInterrupt / SystemExit / GeneratorExit), so a propagating
-        # BaseException marks the step "interrupted": the resume path and
-        # any artifact reader can see the run was cut short. stdout envelope
+        # empty summary. `except Exception` above cannot catch it, so a
+        # propagating KI marks the step "interrupted": the resume path and
+        # the artifact readers can see the run was cut short. stdout envelope
         # unaffected — no envelope is emitted on the KI path; the Go
         # exit-130 contract still works. This is the stderr/file channel.
+        report.status = "interrupted"
+        raise
+    except SystemExit as exc:
+        # wave r1 (opus): SystemExit is NOT an interrupt — it is how
+        # deterministic error exits are signalled (report/generator.py's
+        # validation sys.exit(1), generate_context's unsupported-type
+        # sys.exit(2)). Mapping it to "interrupted" erased the cause and
+        # contradicted the exit code (the Go contract reads "interrupted"
+        # as 130). Non-zero codes are ERROR with the cause recorded;
+        # a zero code is a deliberate early exit (interrupted, no error).
+        code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
+        if code != 0:
+            report.status = "error"
+            report.errors.append(f"SystemExit: {code}")
+            print(f"[{step}] ERROR: SystemExit({code})", file=sys.stderr)
+        else:
+            report.status = "interrupted"
+        raise
+    except BaseException:
+        # GeneratorExit / anything else non-Exception: the run was cut
+        # short, not failed — same artifact contract as the KI branch.
         report.status = "interrupted"
         raise
     finally:
