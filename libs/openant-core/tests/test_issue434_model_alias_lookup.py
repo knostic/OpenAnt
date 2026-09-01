@@ -87,3 +87,38 @@ def test_unknown_family_still_misses_honestly():
     assert find_model("totally-unknown-model-9") is None
     assert pricing_map("openrouter").get("totally-unknown-model-9") is None
     assert pricing_map("google").get("gemini-9.9-nano") is None
+
+
+def test_suffix_versions_get_aliases():
+    """Wave r1 (sonnet): _alias_spellings only built the dotted/dashed pair
+    when the version was the TRAILING token — every id with a tier suffix
+    (gemini-3.7-flash, gpt-4.1-mini, gemini-1.5-pro — most of the registry)
+    got ZERO aliases, reproducing the exact silent-$0 bug for a dash-spelled
+    config (gemini-3-7-flash)."""
+    or_map = pricing_map("openrouter")
+    or_map.update(pricing_map("google"))
+    for slashed, dashed in [
+        ("google/gemini-3.7-flash", "gemini-3-7-flash"),
+        ("openai/gpt-4.1-mini", "gpt-4-1-mini"),
+        ("google/gemini-1.5-pro", "gemini-1-5-pro"),
+    ]:
+        if slashed in or_map:  # the record must exist for the alias to apply
+            assert or_map.get(dashed) == or_map[slashed], (slashed, dashed)
+            bare = slashed.split("/", 1)[1]
+            assert or_map.get(bare) == or_map[slashed], (slashed, bare)
+
+
+def test_find_model_prefers_the_same_provider():
+    """Wave r1 (sonnet): the family fallback returned the FIRST array match
+    regardless of provider — a cross-provider-divergent family (the exact
+    #344 shape) silently resolves a queried id to a wrong-priced sibling.
+    The same-provider record wins when the family holds one."""
+    # claude-opus-4-8 family: anthropic + 2 bedrock + openrouter records.
+    # The query's vendor slug is anthropic -> the ANTHROPIC record wins (the
+    # wrong-priced sibling — whichever landed first in the array — won before).
+    rec = find_model("anthropic/claude-opus-4-8")
+    assert rec is not None
+    assert rec["id"] == "claude-opus-4-8", (
+        f"the same-provider record wins: {rec['id']}"
+    )
+    assert rec["provider"] == "anthropic"

@@ -166,15 +166,18 @@ def _alias_spellings(model_id: str) -> list[str]:
     vendor = model_id.split("/", 1)[0] if "/" in model_id else None
     bare = re.sub(r"^[a-z]+/", "", model_id)
     bare = re.sub(r"-\d{8}$", "", bare)  # the Anthropic date stamp
-    m = re.search(r"-(\d+)-(\d+)$", bare)
-    if m:  # ...-4-5 → also ...-4.5
-        dotted = bare[:m.start()] + f"-{m.group(1)}.{m.group(2)}"
+    # wave r1 (sonnet): the version may carry a TIER SUFFIX after the
+    # number (gemini-3.7-flash, gpt-4.1-mini — most of the registry); the
+    # dotted/dashed pair is built on the version wherever it sits.
+    m = re.search(r"-(\d+)-(\d+)(?=($|-[a-z]))", bare)
+    if m:  # ...-4-5 (with or without a suffix) -> also ...-4.5
+        dotted = bare[:m.start()] + f"-{m.group(1)}.{m.group(2)}" + bare[m.end():]
         dashed = bare
     else:
-        m = re.search(r"-(\d+)\.(\d+)$", bare)
-        if m:  # ...-4.5 → also ...-4-5
+        m = re.search(r"-(\d+)\.(\d+)(?=($|-[a-z]))", bare)
+        if m:  # ...-4.5 -> also ...-4-5
             dotted = bare
-            dashed = bare[:m.start()] + f"-{m.group(1)}-{m.group(2)}"
+            dashed = bare[:m.start()] + f"-{m.group(1)}-{m.group(2)}" + bare[m.end():]
         else:
             dotted = dashed = None
     bases = [b for b in (bare, dashed, dotted) if b]
@@ -213,9 +216,11 @@ def _family_key(model_id: str) -> str | None:
         return None
     s = re.sub(r"^[a-z]+/", "", model_id)
     s = re.sub(r"-\d{8}$", "", s)
-    m = re.search(r"-(\d+)\.(\d+)$", s)
+    # wave r1: suffix-aware — gemini-3.7-flash and gemini-3-7-flash are
+    # one family
+    m = re.search(r"-(\d+)\.(\d+)(?=($|-[a-z]))", s)
     if m:
-        s = s[:m.start()] + f"-{m.group(1)}-{m.group(2)}"
+        s = s[:m.start()] + f"-{m.group(1)}-{m.group(2)}" + s[m.end():]
     return s
 
 
