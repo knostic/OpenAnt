@@ -952,6 +952,12 @@ class FindingVerifier:
         except KeyboardInterrupt:
             print("[Verify] Interrupted — progress saved to checkpoints",
                   file=sys.stderr, flush=True)
+            # #419 (the #417 class): the checkpoints hold the progress (every
+            # completed unit is saved as it completes) — the interrupt itself
+            # PROPAGATES so the CLI exits 130 with an interrupted envelope.
+            # Falling through made the scan continue with partially-verified
+            # results and complete with a SUCCESS envelope.
+            raise
 
     def _verify_batch_parallel(self, results, code_by_route, progress_callback, workers,
                                 checkpoint=None, summary_callback=None):
@@ -990,7 +996,18 @@ class FindingVerifier:
             executor.shutdown(wait=False, cancel_futures=True)
             print("[Verify] Progress saved to checkpoints",
                   file=sys.stderr, flush=True)
-            return
+            # #419 (the #417 class): a bare `return` here swallowed the
+            # interrupt on the parallel path — the scan completed with a
+            # success envelope, no exit 130. Propagate (the checkpoints hold
+            # the completed units). Wave r1 (opus) residual, documented:
+            # cancel_futures cancels only QUEUED work — the <=workers
+            # in-flight verification loops keep running in non-daemon
+            # threads, and under the Go CLI the raise is bounded by the 5s
+            # SIGKILL; a DIRECT python -m openant invocation blocks in
+            # interpreter shutdown until they finish. Not a regression, and
+            # their results are not checkpointed (the save loop has exited)
+            # — the retry owns them on resume.
+            raise
         executor.shutdown(wait=False)
 
     def _check_consistency(

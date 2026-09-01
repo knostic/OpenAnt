@@ -115,8 +115,7 @@ func BuildSARIF(data ReportData, opts SARIFOptions) map[string]any {
 		if sr.Step == "scan" {
 			continue
 		}
-		if sr.ErrorCount > 0 || len(sr.Errors) > 0 ||
-			sr.Status == "error" || sr.Status == "partial" {
+		if stepReportIsFailure(sr) {
 			execOK = false
 			if sr.ErrorCount > 0 || len(sr.Errors) > 0 {
 				detail := fmt.Sprintf("step %s: %d unit error(s)", sr.Step, sr.ErrorCount)
@@ -160,6 +159,18 @@ func BuildSARIF(data ReportData, opts SARIFOptions) map[string]any {
 // verdict (vulnerable, bypassable, …) since OpenAnt findings are not yet
 // keyed by a stable per-rule taxonomy. Categories from ReportData supply
 // the rule descriptions.
+// stepReportIsFailure is the SARIF gate's failure-class predicate (#420
+// wave r1, fable+opus): a step row fails the run when it carries unit
+// errors OR a failure-class status — error, partial, AND interrupted (the
+// #420 status carries empty errors/summary, so before the gate knew the
+// word it matched no disjunct and read executionSuccessful: true — the
+// exact false-green shape #285/#305 exist to close).
+func stepReportIsFailure(sr StepReport) bool {
+	return sr.ErrorCount > 0 || len(sr.Errors) > 0 ||
+		sr.Status == "error" || sr.Status == "partial" ||
+		sr.Status == "interrupted"
+}
+
 func sarifRulesFor(data ReportData) ([]map[string]any, map[string]int) {
 	descByVerdict := make(map[string]string, len(data.Categories))
 	for _, c := range data.Categories {
