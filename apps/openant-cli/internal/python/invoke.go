@@ -38,14 +38,6 @@ import (
 // OPENANT_INVOKE_TIMEOUT without recompiling.
 var defaultInvokeTimeout = 30 * time.Minute
 
-// stderrDrainGrace bounds how long the normal exit path waits on the stderr
-// drain AFTER the child's stdout already closed (i.e. the child has exited):
-// a descendant holding ONLY the stderr write-end would otherwise keep the
-// streamer blocked until the deadline's watchdog fired — the full
-// OPENANT_INVOKE_TIMEOUT hang for a result that was already in hand. Package
-// var so tests can shrink it, mirroring defaultInvokeTimeout.
-var stderrDrainGrace = 5 * time.Second
-
 // resolveInvokeTimeout returns the invoke deadline, honoring the
 // OPENANT_INVOKE_TIMEOUT env override. The value is either a Go duration
 // (e.g. "2h", "90m") or a bare positive integer interpreted as seconds. An
@@ -113,6 +105,10 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	// WaitDelay tells os/exec to force-close those inherited pipe FDs shortly
 	// after the context is done, and the explicit read-end close in the
 	// watchdog goroutine (below) unblocks the in-flight reads.
+	// famD panel (sonnet): the pre-managed-writers stderrDrainGrace knob
+	// (the old normal-path drain bound) is deleted — its only production
+	// call site was removed by the managed-writers refactor; the tests
+	// ride this WaitDelay bound now.
 	cmd.WaitDelay = 5 * time.Second
 
 	if workDir != "" {
