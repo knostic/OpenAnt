@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers import build  # noqa: E402
+from _helpers import build, edges  # noqa: E402
 
 
 FIXTURE = """
@@ -141,3 +141,22 @@ def test_labels_come_from_the_outer_node():
     s = arith[0]
     assert s["labels"] == ["x"], s
     assert s["arity"] == 1, s
+
+
+def test_trailing_comment_operand_skipped(tmp_path):
+    """famBCR panel (sonnet): the trailing-comment skip branch
+    (`b /* cached */ + t /* hoisted */ (x)` — step back past the comment
+    to the real operand) had zero coverage. Pinned with the file's own
+    build helper: the callee t must still resolve through the comment."""
+    src = """
+func t() -> Int { return 1 }
+func run() -> Int {
+    let b = 2
+    return b /* cached */ + t /* hoisted */ (x)
+}
+"""
+    _, cg = build(tmp_path, {"app.swift": src})
+    all_edges = edges(cg)
+    assert ("run", "t") in all_edges, (
+        f"the trailing comment must not hide the callee: {all_edges}")
+
