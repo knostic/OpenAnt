@@ -20,7 +20,13 @@ import json
 from typing import TYPE_CHECKING
 from datetime import datetime
 
-from core.verdict_taxonomy import SEVERITIES, _SEVERITIES, STAGE1_VERDICTS
+from core.verdict_taxonomy import (
+    FINDING_VERDICT_ORDER, SEVERITIES, _SEVERITIES, STAGE1_VERDICTS,
+)
+
+# the canonical lowercase finding strings a garbage-verdict row may keep
+# (wave r1 opus: the finding-first sinks key on exactly these).
+_CANONICAL_FINDINGS = frozenset(FINDING_VERDICT_ORDER) | {"error"}
 
 from prompts.prompt_selector import get_analysis_prompt
 from prompts.vulnerability_analysis import get_system_prompt as get_stage1_system_prompt
@@ -53,14 +59,31 @@ def _normalize_result(result: dict) -> dict:
     # failed CLOSED for the FINDING key (#426) and OPEN for the verdict key —
     # close the asymmetry with the matching whitelist: known verdicts pass;
     # anything else routes to the error accounting with the raw preserved.
+    # Wave r1 (opus) — the finding-kept redesign: routing the WHOLE row to
+    # error even when the model's `finding` was a usable canonical string
+    # ("vulnerable") EXCLUDED it from Stage-2 selection and disclosure —
+    # the finding-first sinks were already counting it correctly, so the
+    # erasure was a false negative for a row whose model reply asserted
+    # vulnerable. The garbage VERDICT is discarded (raw preserved); a
+    # USABLE finding is KEPT (the row keeps its finding-driven accounting
+    # and disclosure); only when the finding is absent or itself unusable
+    # does the row route to the error shape.
     if has_verdict and verdict.strip().upper() not in STAGE1_VERDICTS:
         result["raw_verdict"] = verdict
-        if isinstance(result.get("finding"), str) and result["finding"].strip():
-            # The finding beside the garbage verdict is preserved raw too
-            # (it may itself be valid — the row is what routes to error).
-            result["raw_finding"] = result["finding"]
-        result["verdict"] = "ERROR"
-        result["finding"] = "error"
+        _finding = result.get("finding")
+        if isinstance(_finding, str) and _finding.strip().lower() in _CANONICAL_FINDINGS:
+            # keep the canonical finding; the row's accounting is unchanged
+            # (the raw verdict is preserved above for manual review).
+            pass
+        else:
+            if _finding is not None and (
+                    not isinstance(_finding, str) or _finding.strip()):
+                # a non-string or non-empty finding beside the garbage
+                # verdict is preserved raw (wave r1 fable: the #316 branch
+                # preserves non-string raws; erasing them destroyed data).
+                result["raw_finding"] = _finding
+            result["verdict"] = "ERROR"
+            result["finding"] = "error"
     if not has_verdict and "finding" in result:
         finding = result["finding"]
         if not isinstance(finding, str):
@@ -103,9 +126,12 @@ def _normalize_result(result: dict) -> dict:
         result["verdict"] = "ERROR"
         result["finding"] = "error"
 
-    # Ensure verdict is uppercase
+    # Ensure verdict is uppercase (wave r1 fable: STRIPPED too — a "safe "
+    # passed the whitelist's .strip().upper() check and was then stored
+    # unstripped, which the sinks dropped: the exact fail-open the fix
+    # closes, for an input the check had just classified canonical).
     if "verdict" in result and isinstance(result["verdict"], str):
-        result["verdict"] = result["verdict"].upper()
+        result["verdict"] = result["verdict"].strip().upper()
 
     # #215: a rankable severity, FINDING-ONLY — stamped AFTER the verdict
     # decision, and only for the finding verdicts (VULNERABLE/BYPASSABLE).

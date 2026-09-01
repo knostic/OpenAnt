@@ -132,12 +132,15 @@ def test_count_verdicts_neither_key_counts_as_error():
     assert sum(counts.values()) == len(rows)  # the partition closes
 
 
-def test_count_verdicts_unrecognized_verdict_still_dropped():
-    """Residual, pinned: an unrecognized VERDICT string remains the
-    F13-documented gap (see test_results_bucket_reconciliation)."""
+def test_count_verdicts_unrecognized_verdict_now_counts_in_errors():
+    """#427 (wave r1): the F13-documented gap CLOSED — this pin existed so a
+    future fix would update it consciously. An unrecognized VERDICT string
+    is a malformed model reply: the error bucket (the partition reconciles,
+    and the sink-side analyze_result_is_error agrees so resume retries it)."""
     rows = [{"verdict": "SOMETHING_WEIRD"}]
     counts = _count_verdicts(rows)
-    assert sum(counts.values()) == 0
+    assert counts["errors"] == 1
+    assert sum(counts.values()) == 1
 
 
 def test_count_verdicts_producer_error_shape_counts():
@@ -156,12 +159,12 @@ def test_cp_is_error_neither_key_retried():
 
     assert _cp_is_error({"result": {"reasoning": "cannot determine"}}) is True
     assert _cp_is_error({"result": {"verdict": "VULNERABLE"}}) is False
-    # Legacy residual, pinned: a PRE-fix garbage-verdict row (finding present,
-    # unrecognized; verdict neither ERROR nor a bucket) is still adopted —
-    # post-fix runs never write that shape.
+    # #427 (wave r1): a garbage-verdict row — including the ON-DISK
+    # population the pre-fix producer persisted — is RETRIED, never
+    # adopted (the sink-side closure; post-fix runs never write the shape).
     assert _cp_is_error(
         {"result": {"finding": "maybe exploitable", "verdict": "MAYBE EXPLOITABLE"}}
-    ) is False
+    ) is True
 
 
 def test_null_and_empty_verdicts_are_the_error_shape():
@@ -197,10 +200,11 @@ def test_count_verdicts_fallback_shapes_preserved():
     counts = _count_verdicts([
         {"verdict": "SAFE"},             # finding falls back to verdict
         {"finding": "safe"},             # finding direct
-        {"verdict": "SOMETHING_WEIRD"},  # F13-documented drop, still dropped
+        {"verdict": "SOMETHING_WEIRD"},  # #427: the error bucket now
     ])
     assert counts["safe"] == 2
-    assert sum(counts.values()) == 2
+    assert counts["errors"] == 1
+    assert sum(counts.values()) == 3
 
 
 def _write_checkpoint(tmp_path, rows):
@@ -314,18 +318,21 @@ def test_counter_agrees_with_predicate_on_error_finding():
 
 
 def test_both_keys_disagreement_residual_pinned():
-    """Wave round-2 finding (both reviewers): a row with BOTH keys present
-    but disagreeing ({"verdict": "SAFE", "finding": "garbage"}) is adopted
-    (effective verdict short-circuits the finding branch) and counted in no
-    bucket (finding-first counter drops it). PRE-EXISTING family, NOT
-    produced by the fixed producers, deliberately out of scope (#316/#324
-    fix the unrecognized/absent verdicts). Pinned so a future fix updates
-    this consciously — see FOLLOW-UPS."""
+    """Wave round-2 finding, UPDATED by #427's round (the pin existed for
+    this): a row with BOTH keys present but disagreeing
+    ({"verdict": "SAFE", "finding": "garbage"}) — the verdict short-circuits
+    the finding branch (the producer leaves the disagreement; #331 owns the
+    stage-1 producer's co-write), and the finding-first counter now buckets
+    the unrecognized finding as an ERROR (the #427 partition closure — the
+    row was previously dropped from every bucket). Resume adopts it (the
+    VERDICT is canonical — the transient-disagreement semantics in
+    analyze_result_is_error's docstring: the retried outcome replaces the
+    row only if the verdict is also bad)."""
     out = _normalize_result({"verdict": "SAFE", "finding": "garbage"})
     assert out["verdict"] == "SAFE" and out["finding"] == "garbage"
     counts = _count_verdicts([out])
-    assert sum(counts.values()) == 0  # dropped — the documented residual
-    assert analyze_result_is_error(out) is False  # adopted on resume
+    assert counts["errors"] == 1  # the unrecognized finding buckets as error
+    assert analyze_result_is_error(out) is False  # canonical verdict: adopted
 
 
 # ---------------------------------------------------------------------------

@@ -106,20 +106,18 @@ def test_graceful_when_no_errors(metrics, expected_errors):
             + r["protected"] + r["inconclusive"] + r["errors"]) == r["total"]
 
 
-def test_count_verdicts_drops_unrecognized_verdict():
-    """DOCUMENTS the pre-existing partition gap F13 does NOT close: a row with an
-    unrecognized verdict is dropped from every bucket, so the produced metrics
-    already under-sum `total`. Kept as a red-flag guard: if a future change makes
-    _count_verdicts total-preserving, update F13's scope note.
-
-    #316/#324: the NEITHER-KEY shape is now partitioned into `errors` (see the
-    scope note above); the unrecognized-VERDICT drop remains the gap."""
+def test_count_verdicts_partitions_every_row():
+    """#427 (wave r1) — the F13 gap CLOSED (this pin existed as the red-flag
+    guard for exactly this change): an unrecognized verdict is a malformed
+    model reply and buckets as an error, so the produced metrics reconcile
+    to `total` with no dropped rows."""
     rows = [
         {"finding": "vulnerable"},
         {"verdict": "ERROR"},
-        {"verdict": "SOMETHING_WEIRD"},  # neither a bucket nor "ERROR" -> dropped
-        {"reasoning": "no verdict keys"},  # neither-key -> counted as an error (#324)
+        {"verdict": "SOMETHING_WEIRD"},  # #427: buckets as an error now
+        {"reasoning": "no verdict keys"},  # neither-key -> error (#324)
     ]
     counts = _count_verdicts(rows)
-    assert sum(counts.values()) == 3          # 3 of 4 rows partitioned
-    assert sum(counts.values()) < len(rows)   # the unrecognized-verdict gap is real
+    assert sum(counts.values()) == len(rows)   # every row partitioned
+    assert counts["vulnerable"] == 1
+    assert counts["errors"] == 3
