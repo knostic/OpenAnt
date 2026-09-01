@@ -82,7 +82,20 @@ from prompts.verification_prompts import (
     get_verification_system_prompt,
     get_consistency_check_prompt
 )
-from core.verdict_taxonomy import DISCLOSURE_DROPPED, FINDING_VERDICT_ORDER
+from core.verdict_taxonomy import (
+    DISCLOSURE_DROPPED, ERROR_VERDICT, FINDING_VERDICT_ORDER, STAGE2_VERDICTS,
+)
+
+# #448: every value `finding`/`correct_finding` can legitimately take — the
+# canonical producer vocabulary (PRODUCER_VERDICTS: FINDING_VERDICT_ORDER +
+# ERROR + the Stage-2 verification verdicts) plus INSUFFICIENT_CONTEXT (the
+# _normalize_result map's sixth value — experiment.py's corrector threads it
+# through `finding` on the re-analysis path). A consistency correction
+# outside this set is model noise, rejected below.
+_CORRECTABLE_STAGE2_FINDINGS = (
+    frozenset(FINDING_VERDICT_ORDER)
+    | {ERROR_VERDICT, "insufficient_context"}
+    | STAGE2_VERDICTS)
 
 # Import application context type for type hints
 try:
@@ -1035,7 +1048,39 @@ class FindingVerifier:
                 # Apply consistent verdict, but respect exploit path analysis
                 for finding_update in consistency_result.findings_updated:
                     route_key = finding_update.get("route_key")
-                    new_verdict = finding_update.get("should_be")
+                    raw_should_be = finding_update.get("should_be")
+                    # #448 (the #425 escape's Stage-2 twin): should_be is
+                    # unconstrained model output — this site wrote it into
+                    # `finding` VERBATIM (no strip, no validation), the key
+                    # `_count_verdicts` and the disclosure filters read FIRST:
+                    # a garbage value ("MAYBE VULNERABLE") passed the downgrade
+                    # guard (not in DISCLOSURE_DROPPED) and silently dropped a
+                    # real VULNERABLE finding from every count and from
+                    # disclosure; a PADDED value ("  vulnerable  ") landed raw
+                    # and missed every downstream lowercase vocabulary read.
+                    # Normalize (strip/lower — this module's storage
+                    # convention is lowercase `correct_finding`), then validate
+                    # against the canonical `finding` vocabulary; unrecognized
+                    # values are REJECTED with an audit record (the
+                    # #316/#324/#425/#427 producer discipline).
+                    new_verdict = (raw_should_be.strip().lower()
+                                   if isinstance(raw_should_be, str) else "")
+                    if not new_verdict:
+                        continue
+                    if new_verdict not in _CORRECTABLE_STAGE2_FINDINGS:
+                        for result in results:
+                            if result.get("route_key") == route_key:
+                                result["consistency_invalid_verdict_blocked"] = {
+                                    "proposed": raw_should_be,
+                                    "reason": finding_update.get("reason"),
+                                    "pattern": consistency_result.pattern_identified,
+                                }
+                                self._log(
+                                    "warning",
+                                    f"Blocked consistency correction of {route_key} "
+                                    f"to unrecognized verdict: {raw_should_be!r}",
+                                    unit_id=route_key)
+                        continue
 
                     for result in results:
                         if result.get("route_key") == route_key:
