@@ -884,6 +884,12 @@ class CallGraphBuilder:
                 stem = f2[:-len('.py')].replace('/', '.')
                 if mod and (stem == mod or stem.endswith('.' + mod)):
                     return f2
+            # #440 (wave r1 sonnet): the import EXISTS but no candidate file
+            # matches its module path (an external attribute-style base, an
+            # aliased import whose origin is outside the repo) — ABSTAIN.
+            # Falling through to the unambiguous-name fallback fabricated an
+            # edge to an unrelated same-named LOCAL class.
+            return None
         if len(set(cand_files)) == 1:
             return cand_files[0]
         return None
@@ -902,6 +908,9 @@ class CallGraphBuilder:
         if _memo is None:
             _memo, _stack = {}, set()
         key = f"{file}:{name}"
+        if key not in self.classes and "." in name:
+            # a dotted (nested) name keyed unqualified in the index
+            key = f"{file}:{name.split('.')[-1]}"
         memo_key = (key, use_union)
         if memo_key in _memo:
             return _memo[memo_key]
@@ -916,11 +925,29 @@ class CallGraphBuilder:
             bs = b.split('.')[-1]
             bf = self._base_defining_file(file, bs)
             if bf is not None:
-                base_chains.append(self._base_chain(bf, bs, _memo, _stack))
+                # #440 (wave r1, three axes): use_union PROPAGATES — the
+                # round-1 recursion defaulted it back to True, so the typed
+                # path's anti-hijack guard (own bases, not the merged union)
+                # only held at depth 0.
+                base_chains.append(self._base_chain(bf, bs, _memo, _stack,
+                                                    use_union=use_union))
         head = [(file, name)]
-        seqs = [list(c) for c in base_chains]
+        # #440 (wave r1 sonnet): the canonical C3 merge carries the BASE
+        # LIST's own order as a final sequence, so an inconsistent hierarchy
+        # (a base appearing after a class that inherits it) is DETECTED and
+        # takes the FIFO fallback instead of silently reordering.
+        head_order = [
+            (self._base_defining_file(file, b.split('.')[-1]),
+             b.split('.')[-1])
+            for b in bases
+        ]
+        seqs = [list(c) for c in base_chains] + [
+            [n for n in head_order if n[0] is not None]]
         merged = []
         while seqs:
+            seqs = [s for s in seqs if s]   # empty seqs (unresolvable bases) drop out
+            if not seqs:
+                break
             for seq in seqs:
                 candidate = seq[0]
                 if not any(candidate in s[1:] for s in seqs if s):
@@ -942,11 +969,21 @@ class CallGraphBuilder:
 
     def _mro_first_definer(self, caller_file: str, class_name: str,
                            method_name: str, include_own: bool) -> Optional[str]:
-        """The first class in the C3 chain (own class first) defining the method."""
-        chain = self._base_chain(caller_file, class_name.split('.')[-1],
+        """The first class in the C3 chain (own class first) defining the method.
+
+        #440 (wave r1, opus+fable): the class name is NOT stripped here —
+        the extractor keys nested classes with their dotted qualifier
+        (methods_by_class['app.py:Outer.Inner']), and the round-1 entry
+        split('.')[-1] turned every nested class into a key that exists
+        nowhere, dropping the class's OWN self-dispatch and every inherited
+        self-call inside it (pydantic Config, nested exception/helper
+        classes — the exact FN direction this PR removes). Only the BASE
+        names inside _base_chain are simple.
+        """
+        chain = self._base_chain(caller_file, class_name,
                                  use_union=include_own)
         start = 0
-        if not include_own and chain and chain[0] == (caller_file, class_name.split('.')[-1]):
+        if not include_own and chain and chain[0] == (caller_file, class_name):
             start = 1
         for f, n in chain[start:]:
             method_id = self._method_in_class(f"{f}:{n}", method_name)

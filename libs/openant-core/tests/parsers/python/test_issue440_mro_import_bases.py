@@ -129,3 +129,74 @@ def test_external_base_stays_unresolved():
     })
     edges = cg.get("e.py:use", [])
     assert not any("Base.inherited" in e for e in edges), edges
+
+
+def test_nested_class_self_call_still_resolves():
+    """Wave r1 (opus+fable, the regression): the round-1 entry stripped the
+    dotted qualifier — Outer.Inner became 'Inner', a key that exists
+    nowhere — dropping the nested class's OWN self-dispatch and every
+    inherited self-call inside it (the exact FN direction this PR removes)."""
+    cg = _cg({
+        "n.py": ("class Outer:\n"
+                 "    class Inner:\n"
+                 "        def own(self):\n"
+                 "            return 1\n"
+                 "        def go(self):\n"
+                 "            return self.own()\n"),
+    })
+    edges = cg.get("n.py:Outer.Inner.go", [])
+    assert "n.py:Outer.Inner.own" in edges, edges
+
+
+def test_imported_base_with_external_origin_abstains():
+    """Wave r1 (sonnet): the import exists but its module path matches no
+    candidate file (an external attribute-style base) — the round-1
+    unambiguous-name fallback fabricated an edge to an unrelated same-named
+    LOCAL class. Abstain."""
+    cg = _cg({
+        "a.py": ("import some_external_lib\n"
+                 "class Base:\n"          # an unrelated LOCAL Base
+                 "    def m(self):\n"
+                 "        return 1\n"
+                 "def use(x):\n"
+                 "    return x\n"),
+        "b.py": ("from some_external_lib import Base as ExtBase\n"
+                 "class Sub(ExtBase):\n"    # NOT the local Base — external
+                 "    pass\n"
+                 "def go(s):\n"
+                 "    v = Sub()\n"
+                 "    return v.m()\n"),
+    })
+    edges = cg.get("b.py:go", [])
+    assert "a.py:Base.m" not in edges, (
+        f"an external-origin base bound to the unrelated local namesake: {edges}"
+    )
+
+
+def test_hijack_guard_holds_one_level_deep():
+    """Wave r1 (three axes): use_union must PROPAGATE — the round-1
+    recursion defaulted it back to True, so the typed path's anti-hijack
+    guard (own bases, not the merged union) only held at depth 0."""
+    cg = _cg({
+        "h.py": ("class Base:\n"
+                 "    def m(self):\n"
+                 "        return 1\n"
+                 "class Mid(Base):\n"       # the chain: Sub -> Mid -> Base
+                 "    pass\n"
+                 "def maker():\n"
+                 "    class Mid(Base):\n"   # the function-local hijack namesake
+                 "        pass\n"
+                 "    return Mid\n"
+                 "class Sub(Mid):\n"        # module-level Mid — NO bases of its own
+                 "    pass\n"
+                 "def f():\n"
+                 "    v = Sub()\n"
+                 "    return v.m()\n"),
+    })
+    # the union may merge the LOCAL Mid's base into the module Mid; the
+    # typed path must read the MODULE Mid's OWN bases: Base.m resolves
+    # through the Mid chain (hijack or not, Base.m is the real target and
+    # is in BOTH chains here) — the discriminating case: an edge to a
+    # hijack-only target must NOT appear. Keep this a resolution pin:
+    edges = cg.get("h.py:f", [])
+    assert "h.py:Base.m" in edges, edges
