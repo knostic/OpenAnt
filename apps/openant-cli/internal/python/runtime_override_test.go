@@ -10,15 +10,28 @@ import (
 // writeStubPython writes an executable that answers every probe the runtime
 // makes (--version, the -c "from openant import __version__" import probe)
 // the way a real Python would — the issue's own probe harness shape.
+// writeStubPython answers BOTH probes (version + the openant import) — the
+// self-sufficient override shape.
 func writeStubPython(t *testing.T, dir, name, version string) string {
+	return writeStubPythonProbe(t, dir, name, version, true)
+}
+
+// writeStubPythonProbe answers the version probe and, per importable, the
+// openant-import probe — the "version-valid but NOT self-sufficient"
+// override is the documented CI/container pin shape (wave r1, three axes).
+func writeStubPythonProbe(t *testing.T, dir, name, version string, importable bool) string {
 	if _, err := exec.LookPath("/bin/sh"); err != nil {
 		t.Skip("/bin/sh not available")
 	}
+	script := "#!/bin/sh\n" +
+		"case \"$*\" in *--version*) echo \"Python " + version + "\"; exit 0;; esac\n"
+	if importable {
+		script += "echo '3.14.0' # the __version__ probe's answer\nexit 0\n"
+	} else {
+		script += "echo 'ModuleNotFoundError: No module named openant' >&2\nexit 1\n"
+	}
 	p := filepath.Join(dir, name)
-	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+
-		"case \"$*\" in *--version*) echo \"Python "+version+"\"; exit 0;; esac\n"+
-		"echo '3.14.0' # the __version__ probe's answer\n"+
-		"exit 0\n"), 0o755); err != nil {
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return p
@@ -65,5 +78,30 @@ func TestPreferVenvStillPrefersVenvWithoutOverride(t *testing.T) {
 	rt := preferVenv(&RuntimeInfo{Path: "/usr/bin/python3", Major: 3, Minor: 14})
 	if rt.Path == "/usr/bin/python3" {
 		t.Fatalf("the managed venv must still be preferred when no override is active")
+	}
+}
+
+// #437 (wave r1, three axes): a version-valid override WITHOUT openant is
+// the documented CI/container pin shape — CheckOpenantInstalled bootstrapped
+// the managed venv for exactly it (the local pythonPath reassignment cannot
+// reach the caller), and keeping the bare override returned an interpreter
+// that failed EVERY invocation. The venv — built FROM the override's
+// interpreter — wins; the pin is honoured at the base level.
+func TestPreferVenvFallsToVenvForNonImportableOverride(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	venvBin := filepath.Join(home, ".openant", "venv", "bin")
+	if err := os.MkdirAll(venvBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	venvPy := writeStubPython(t, venvBin, "python", "3.14.0") // self-sufficient
+	_ = venvPy
+
+	override := writeStubPythonProbe(t, t.TempDir(), "bare-python", "3.14.0", false)
+	t.Setenv("OPENANT_PYTHON", override)
+
+	rt := preferVenv(&RuntimeInfo{Path: override, Major: 3, Minor: 14})
+	if rt.Path == override {
+		t.Fatalf("a non-importable override was kept: %q — CheckOpenantInstalled bootstrapped the venv for exactly this shape, and keeping the bare path yields ModuleNotFoundError on every run", override)
 	}
 }

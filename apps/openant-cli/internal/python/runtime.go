@@ -243,8 +243,19 @@ func EnsureRuntime() (*RuntimeInfo, error) {
 	rt = preferVenv(rt)
 
 	// Check if dependencies have changed since last install.
-	if err := CheckDepsStale(rt.Path); err != nil {
-		return nil, err
+	// #437 (wave r1, opus): the .deps-hash is VENV-scoped
+	// (depsHashPath -> ~/.openant/venv/.deps-hash) — an override run
+	// (rt.Path is not the venv python) must not pip-install into the
+	// user's pinned interpreter on the venv's stamp: that installed into
+	// the system Python while stamping the venv, and once the override is
+	// unset the venv silently ran the OLD dependencies forever — the exact
+	// staleness failure the #59 hash exists to prevent. The override's
+	// environment is its owner's to manage; the venv's staleness is
+	// checked on the runs that use the venv.
+	if rt.Path == venvPython() {
+		if err := CheckDepsStale(rt.Path); err != nil {
+			return nil, err
+		}
 	}
 
 	return rt, nil
@@ -261,8 +272,20 @@ func EnsureRuntime() (*RuntimeInfo, error) {
 // forbids ("never silently using a different interpreter behind the
 // caller's back") for a USABLE override. The override wins.
 func preferVenv(rt *RuntimeInfo) *RuntimeInfo {
+	// #437 (wave r1, three axes): keep the override only when it is
+	// SELF-SUFFICIENT — isOpenantImportable. DetectRuntime probes --version
+	// only; a version-adequate override WITHOUT openant (the documented
+	// CI/container pin shape) is exactly what CheckOpenantInstalled just
+	// bootstrapped the managed venv FOR (its local pythonPath reassignment
+	// cannot reach the caller), and keeping the bare override returned an
+	// interpreter that failed EVERY subsequent invocation with
+	// ModuleNotFoundError — a regression the pre-fix unconditional
+	// re-detect never had. The venv was built FROM the override's
+	// interpreter, so the pin is still honoured at the base level.
 	if override := os.Getenv("OPENANT_PYTHON"); override != "" && rt.Path == override {
-		return rt
+		if isOpenantImportable(rt.Path) {
+			return rt
+		}
 	}
 	vp := venvPython()
 	if rt.Path != vp && fileExists(vp) && isOpenantImportable(vp) {
