@@ -480,3 +480,23 @@ def test_context_corrector_error_break_stamps_failure(monkeypatch, tmp_path):
     assert out["raw_finding"] == "not sure, maybe"
     assert corrector.correction_stats["failures"] == 1
     assert corrector.correction_stats["successes"] == 0
+
+
+def test_finding_kept_row_normalizes_its_verdict():
+    """famBCR panel (sonnet): a garbage verdict + canonical kept finding must
+    ALSO normalize the verdict to match — the severity stamping keys on
+    `verdict`, and leaving the garbage there silently dropped severity for
+    exactly these rows. Both the analysis_core and context_corrector twins."""
+    from core.analysis_core import _normalize_result as nr_core
+    from utilities.context_corrector import ContextCorrector
+
+    row = {"verdict": "SAY WHAT", "finding": "vulnerable"}
+    out = nr_core(dict(row))
+    assert out["verdict"] == "VULNERABLE", out
+    assert out["finding"] == "vulnerable"
+    assert out.get("severity") in ("high", "medium", "low", "critical"), (
+        f"the severity stamp must fire on the normalized verdict: {out}")
+
+    nr_ctx = ContextCorrector._normalize_result
+    out2 = nr_ctx(dict(row))
+    assert out2["verdict"] == "VULNERABLE", out2

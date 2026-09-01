@@ -74,7 +74,14 @@ def _normalize_result(result: dict) -> dict:
         if isinstance(_finding, str) and _finding.strip().lower() in _CANONICAL_FINDINGS:
             # keep the canonical finding; the row's accounting is unchanged
             # (the raw verdict is preserved above for manual review).
-            pass
+            # famBCR panel (sonnet): the KEPT verdict must be normalized to
+            # MATCH the finding — the downstream severity stamping keys on
+            # `verdict`, and leaving the garbage "SAY WHAT" there silently
+            # dropped severity for exactly these rows (the #436 stamp gates
+            # on VULNERABLE/BYPASSABLE). The row now carries the finding's
+            # canonical verdict uppercase, so every verdict-keyed consumer
+            # agrees with every finding-keyed one.
+            result["verdict"] = _finding.strip().upper()
         else:
             if _finding is not None and (
                     not isinstance(_finding, str) or _finding.strip()):

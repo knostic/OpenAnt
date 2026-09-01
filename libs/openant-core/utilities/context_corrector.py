@@ -650,6 +650,12 @@ class ContextCorrector:
                     result["raw_finding"] = _finding
                 result["verdict"] = "ERROR"
                 result["finding"] = "error"
+            else:
+                # famBCR panel (sonnet): the KEPT verdict must be normalized
+                # to match the kept finding — the severity stamping keys on
+                # `verdict`, and the garbage "SAY WHAT" left in place
+                # silently dropped severity for exactly these rows.
+                result["verdict"] = _finding.strip().upper()
         if not has_verdict and "finding" in result:
             finding = result["finding"]
             mapping = {
