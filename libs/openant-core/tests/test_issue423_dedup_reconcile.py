@@ -108,3 +108,36 @@ def test_manual_filter_path_same_population(tmp_path):
     assert out["vulnerable"] == 1
     assert out["vulnerable_before_dedup"] == 1
     assert out["deduplicated"] == 0
+
+
+def test_overlap_row_counted_once_full_reconciliation(tmp_path):
+    """famBCR panel (sonnet): the overlap-subtraction (a confirmed row that
+    ALSO carries error/incomplete) was completely untested — a row in both
+    the disclosure list AND the metrics errors/needs_review buckets must
+    subtract, so the partition reconciles to total exactly."""
+    # 3 units total; ONE row: Stage-1 vulnerable (kept in confirmed_findings)
+    # whose verification ERRORED — the metrics recount buckets it under
+    # errors; the disclosure list keeps it under vulnerable.
+    res = {
+        "dataset": "t",
+        "code_by_route": {"a.py:f": "r", "a.py:s": "s", "a.py:g": "g"},
+        "metrics": {"total": 3, "errors": 1, "needs_review": 0, "vulnerable": 0,
+                    "bypassable": 0, "safe": 2, "protected": 0, "inconclusive": 0},
+        "results": [
+            {"route_key": "a.py:f", "finding": "vulnerable", "verdict": "VULNERABLE",
+             "cwe_id": 79, "error": "LLMResponseError: filtered"},
+            {"route_key": "a.py:s", "finding": "safe", "verdict": "SAFE"},
+            {"route_key": "a.py:g", "finding": "safe", "verdict": "SAFE"},
+        ],
+        "confirmed_findings": [
+            {"route_key": "a.py:f", "finding": "vulnerable", "verdict": "VULNERABLE",
+             "cwe_id": 79, "error": "LLMResponseError: filtered"},
+        ],
+    }
+    r = _run_build(tmp_path, res)
+    # the overlap row counted ONCE: vulnerable=1 (the disclosure list),
+    # errors=0 after subtracting the overlap already counted in vulnerable
+    assert r["vulnerable"] == 1, r
+    assert r["errors"] == 0, r
+    assert r["safe"] == 2, r
+    assert r["vulnerable"] + r["errors"] + r["safe"] == r["total"] == 3, r
