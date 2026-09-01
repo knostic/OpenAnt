@@ -606,7 +606,13 @@ class StepCheckpoint:
             # Dynamic-test-style: top-level status == "ERROR"
             elif data.get("status") == "ERROR":
                 is_error = True
-                err_type = "test_error"
+                # famD panel (opus): status()'s dynamic-test arm now buckets
+                # by the SAME #432 failure-stage vocabulary the summary
+                # derivation uses (generation/build/timeout/execution/other)
+                # — the old flat "test_error" reintroduced the #311
+                # summary-vs-status drift this PR exists to close.
+                from utilities.dynamic_tester import _error_category
+                err_type = _error_category(data.get("details"))
 
             # #286/#293: a top-level "error" key (the verify adapter-raise
             # marker) beats every other classification — an errored verify

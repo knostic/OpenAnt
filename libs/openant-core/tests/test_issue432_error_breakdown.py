@@ -133,3 +133,30 @@ def test_real_timeout_rows_reach_the_breakdown():
     assert counts["completed"] == 1
     assert counts["errors"] == 1
     assert counts["error_breakdown"] == {"timeout": 1, "build": 1}
+
+
+def test_status_uses_the_same_breakdown_vocabulary():
+    """famD panel (opus): StepCheckpoint.status()'s dynamic-test arm buckets
+    ERROR rows with the SAME #432 stage vocabulary as the summary derivation
+    (generation/build/execution/other) — not a flat 'test_error' that
+    reintroduces the #311 summary-vs-status drift."""
+    import json as _json
+    import tempfile, os
+    from core.checkpoint import StepCheckpoint
+
+    with tempfile.TemporaryDirectory() as d:
+        for name, details in [
+            ("V1", "Test generation raised: filtered"),
+            ("V2", "Docker build failed: no manifest"),
+            ("V3", "Container did not produce valid JSON output"),
+            ("V4", "mystery"),
+        ]:
+            (open(os.path.join(d, f"{name}.json"), "w")).write(_json.dumps(
+                {"id": name, "status": "ERROR", "details": details}))
+        st = StepCheckpoint.status(d)
+        bd = st["error_breakdown"]
+        assert bd.get("generation") == 1, bd
+        assert bd.get("build") == 1, bd
+        assert bd.get("execution") == 1, bd
+        assert bd.get("other") == 1, bd
+        assert "test_error" not in bd, bd

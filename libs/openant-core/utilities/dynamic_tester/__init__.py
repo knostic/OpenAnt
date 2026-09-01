@@ -112,6 +112,13 @@ def _error_category(details) -> str:
     if d.startswith("Docker build failed"):
         return "build"
     if d.startswith("Container execution timed out"):
+        # famD panel (opus, documented-not-deleted): today the collector
+        # writes this details prefix with status INCONCLUSIVE (counted on
+        # the completed side by the wave-r1 timeout bucket, not as an
+        # error) — this branch is unreachable for the CURRENT collector.
+        # Kept as a defensive fallback: if a future collector ever writes
+        # an ERROR row with this prefix, it must bucket to timeout, not
+        # "other".
         return "timeout"
     if (d.startswith("Docker execution was not attempted")
             or d.startswith("Container did not produce valid JSON output")):
