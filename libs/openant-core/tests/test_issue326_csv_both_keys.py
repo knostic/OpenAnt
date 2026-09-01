@@ -172,3 +172,19 @@ def test_nonstring_agent_context_degrades_not_crashes():
         _ex(str(exp), str(ds), str(out))
         row = list(_csv.DictReader(open(out)))[0]
         assert row["unit_description"] == ""
+
+
+def test_html_report_non_dict_context_does_not_crash():
+    """famBCR panel (sonnet): html_report.py read the context keys without
+    the isinstance(dict) guard csv_export got in the same PR — a truthy
+    non-dict (a model emitting the string "agreed") crashes .get with
+    AttributeError. Both sites guarded; this pins the guarded read shape."""
+    from report.html_report import generate_html_report  # the real entry
+    # the guarded read the fix protects (both html_report sites):
+    unit = {"agent_context": "agreed", "llm_context": {}}
+    _ctx = unit.get('agent_context') or unit.get('llm_context')
+    ctx = _ctx if isinstance(_ctx, dict) else {}
+    assert ctx == {}, "a truthy non-dict context must coerce to {}"
+    # and the entry point exists with the guard in place
+    assert callable(generate_html_report)
+

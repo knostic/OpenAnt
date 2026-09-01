@@ -156,7 +156,11 @@ def prepare_findings_summary(experiment: dict, dataset: dict) -> list:
         # #326 (wave r1): agentic mode (the default) writes agent_context;
         # read both keys with the analyzer's precedence, mapping the
         # agentic key name (classification_reasoning).
-        ctx = unit.get('agent_context') or unit.get('llm_context') or {}
+        # famBCR panel (sonnet): the isinstance(dict) guard the same PR
+        # added in csv_export — a truthy non-dict context (a model emitting
+        # the string "agreed") crashes .get here with AttributeError.
+        _ctx = unit.get('agent_context') or unit.get('llm_context')
+        ctx = _ctx if isinstance(_ctx, dict) else {}
         unit_desc = str(ctx.get('classification_reasoning') or ctx.get('reasoning') or '')
         verification = result.get('verification') or {}
 
@@ -340,7 +344,11 @@ def generate_html_report(
         # #326 (wave r1): agentic mode (the default) writes agent_context;
         # read both keys with the analyzer's precedence, mapping the
         # agentic key name (classification_reasoning).
-        ctx = unit.get('agent_context') or unit.get('llm_context') or {}
+        # famBCR panel (sonnet): the isinstance(dict) guard the same PR
+        # added in csv_export — a truthy non-dict context (a model emitting
+        # the string "agreed") crashes .get here with AttributeError.
+        _ctx = unit.get('agent_context') or unit.get('llm_context')
+        ctx = _ctx if isinstance(_ctx, dict) else {}
         unit_desc = str(ctx.get('classification_reasoning') or ctx.get('reasoning') or '')
         verification = result.get('verification') or {}
 
