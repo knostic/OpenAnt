@@ -999,7 +999,14 @@ class FindingVerifier:
             # #419 (the #417 class): a bare `return` here swallowed the
             # interrupt on the parallel path — the scan completed with a
             # success envelope, no exit 130. Propagate (the checkpoints hold
-            # the completed units).
+            # the completed units). Wave r1 (opus) residual, documented:
+            # cancel_futures cancels only QUEUED work — the <=workers
+            # in-flight verification loops keep running in non-daemon
+            # threads, and under the Go CLI the raise is bounded by the 5s
+            # SIGKILL; a DIRECT python -m openant invocation blocks in
+            # interpreter shutdown until they finish. Not a regression, and
+            # their results are not checkpointed (the save loop has exited)
+            # — the retry owns them on resume.
             raise
         executor.shutdown(wait=False)
 

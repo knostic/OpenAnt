@@ -91,10 +91,15 @@ def test_parallel_verify_ki_propagates():
 
 
 def test_dynamic_test_ki_propagates_not_partial_report(tmp_path):
-    """The dynamic-test handler `return results` on KI and the caller then
-    wrote DYNAMIC_TEST_RESULTS.md from PARTIAL results — an interrupted run
-    presented with a completion artifact. The KI must propagate (the
-    checkpoints hold the progress; the envelope must say interrupted)."""
+    """The dynamic-test handler `return results` on KI handed the caller the
+    partial results — they flowed into run_tests' DynamicTestStepResult ->
+    ctx.summary -> dynamic-test.report.json -> the scan continued to the
+    report step -> the SUCCESS envelope (wave r1 fable+opus: the original
+    commit message misdescribed this as a DYNAMIC_TEST_RESULTS.md
+    partial-write — that writer sits AFTER the old return and never ran on
+    the interrupt path; the real pre-fix harm was the swallowed exit). The
+    KI must propagate so the CLI exits 130 and the step report (fixed in
+    #420's PR) says interrupted."""
     pipeline = tmp_path / "pipeline_output.json"
     pipeline.write_text(json.dumps({
         "repository": {"name": "t", "language": "python"},
@@ -127,8 +132,59 @@ def test_dynamic_test_ki_propagates_not_partial_report(tmp_path):
             )
     finally:
         dt.generate_test = orig
-    # No partial-results completion artifact from an interrupted run.
-    assert not (tmp_path / "out" / "DYNAMIC_TEST_RESULTS.md").exists(), (
-        "an interrupted dynamic-test run must not write the completion report "
-        "from partial results"
-    )
+    # (shape pin — wave r1: green on pristine too; the writer sits after the
+    # old return. The pre-fix harm was the swallowed exit, above.)
+    assert not (tmp_path / "out" / "DYNAMIC_TEST_RESULTS.md").exists()
+
+
+def test_dynamic_test_ki_saves_the_completed_unit_first(tmp_path):
+    """Wave r1 (fable): the resume story's other half — a KI arriving after
+    one finding COMPLETED leaves its checkpoint saved (the raise must not
+    land before the completed unit's save; e.g. a re-nested try would)."""
+    pipeline = tmp_path / "pipeline_output.json"
+    pipeline.write_text(json.dumps({
+        "repository": {"name": "t", "language": "python"},
+        "application_type": "unknown",
+        "findings": [
+            {"id": "f1", "name": "X", "short_name": "x", "location": "a.py:1",
+             "cwe_id": 79, "stage2_verdict": "confirmed",
+             "vulnerable_code": "eval(x)", "attack_vector": "a",
+             "steps_to_reproduce": "s", "impact": "i", "suggested_fix": "f"},
+            {"id": "f2", "name": "Y", "short_name": "y", "location": "b.py:1",
+             "cwe_id": 79, "stage2_verdict": "confirmed",
+             "vulnerable_code": "eval(y)", "attack_vector": "a",
+             "steps_to_reproduce": "s", "impact": "i", "suggested_fix": "f"},
+        ],
+    }))
+    cp = tmp_path / "cp"
+    seen = {"n": 0}
+
+    def gen(finding=None, *a, **k):
+        seen["n"] += 1
+        if seen["n"] == 2:
+            raise KeyboardInterrupt
+        # a COMPLETED first finding: the real loop saves its checkpoint
+        return None
+
+    class _FakeRegistry:
+        def get(self, phase):
+            return PhaseBinding(phase=phase, adapter=_ToolsAdapter(),
+                                model="m", provider_name="anthropic")
+
+    orig = dt.generate_test
+    dt.generate_test = gen
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            dt.run_dynamic_tests(
+                pipeline_output_path=str(pipeline),
+                output_dir=str(tmp_path / "out"),
+                checkpoint_path=str(cp),
+                registry=_FakeRegistry(),
+            )
+    finally:
+        dt.generate_test = orig
+    import json as _json
+    f1 = cp / "f1.json"
+    assert f1.exists(), "the completed finding's checkpoint must survive the interrupt"
+    saved = _json.loads(f1.read_text())
+    assert saved.get("id") == "f1", saved
