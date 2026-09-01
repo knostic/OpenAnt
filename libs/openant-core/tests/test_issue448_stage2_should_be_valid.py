@@ -394,7 +394,6 @@ def test_malformed_payload_container_and_elements_never_crash(monkeypatch):
     untouched."""
     import json as _json
     import utilities.llm as fv_llm
-    from core.verdict_taxonomy import FINDING_VERDICT_ORDER
 
     rows = [{"route_key": VULN_RK, "finding": "vulnerable",
              "verification": {"correct_finding": "vulnerable"}},
@@ -417,10 +416,14 @@ def test_malformed_payload_container_and_elements_never_crash(monkeypatch):
                              "explanation": "x",
                              "findings_to_update": payload})
         monkeypatch.setattr(fv_llm, "simple_text", lambda *a, r=reply, **k: r)
-        got = v._resolve_inconsistency([dict(r) for r in rows], {})
-        # the resolver must return (None or an empty/ignored payload), never raise
-        out = v._check_consistency([dict(r) for r in rows], {}) if got is None else rows
+        # (wave r5 fable+opus: the r4 ternary was a TAUTOLOGY — got is never
+        # None for a well-formed reply, so _check_consistency was never
+        # called and the guards had zero coverage. The apply loop is driven
+        # unconditionally here — _check_consistency invokes the patched
+        # resolver itself.)
+        out = v._check_consistency([dict(r) for r in rows], {})
         vuln = next(r for r in out if r["route_key"] == VULN_RK)
         assert vuln["finding"] == "vulnerable", (
             f"payload {payload!r} moved or crashed a row"
         )
+        assert "consistency_update" not in vuln, payload
