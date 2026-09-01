@@ -65,16 +65,24 @@ def test_exploitable_not_downgraded_to_rejected():
 
 def test_exploitable_not_downgraded_to_any_disclosure_dropped_verdict():
     # Full sweep: no verdict in DISCLOSURE_DROPPED may silently drop the finding.
-    # #448 (wave r1): values NOT in the correctable vocabulary (rejected) now
-    # take the invalid-verdict branch — either breadcrumb satisfies the
-    # preserved+audited contract.
+    # #448 (wave r2 fable+opus): PER-VERDICT branch precision — the values IN
+    # the correctable vocabulary (safe/protected/inconclusive) MUST reach the
+    # F-KB-1b guard's downgrade_blocked branch (a later change that swallowed
+    # them into the validity gate would otherwise keep this sweep green while
+    # the #195/#243 defense never fired); the out-of-vocabulary value
+    # (rejected) takes the invalid-verdict branch.
+    from core.verdict_taxonomy import FINDING_VERDICT_ORDER
     for dv in sorted(DISCLOSURE_DROPPED):
         got = _run_downgrade(dv)
         verdict = got.get("verification", {}).get("correct_finding") or got.get("finding")
         assert verdict == "vulnerable", f"downgrade to {dv!r} silently dropped the finding"
-        assert ("consistency_downgrade_blocked" in got
-                or "consistency_invalid_verdict_blocked" in got), (
-            f"no audit breadcrumb for {dv!r}")
+        if dv in FINDING_VERDICT_ORDER:
+            assert "consistency_downgrade_blocked" in got, (
+                f"{dv!r} is in the correctable vocabulary — the F-KB-1b guard "
+                "must be the branch that fires")
+        else:
+            assert "consistency_invalid_verdict_blocked" in got, (
+                f"{dv!r} is out-of-vocabulary — the validity gate fires")
 
 
 def test_non_exploitable_downgrade_still_applies():
