@@ -479,10 +479,14 @@ def test_subscripted_base_resolves():
 
 
 def test_diamond_pinned_to_the_fifo_semantics():
-    """Wave r1 (C#5): the either-answer pin was a tautology — the FIFO
-    semantics pinned EXACTLY so a future MRO change is a conscious decision."""
+    """Wave r1 (C#5) pinned the FIFO pick EXACTLY so a future MRO change would
+    be a conscious decision — this is it: #440 changed the walk to the C3
+    linearization because the FIFO pick was genuine-but-WRONG (``C(A, B)`` with
+    ``A(X)``, ``X.m`` and ``B.m``: Python runs ``X.m``; the FIFO edge to B.m
+    left X.m with an empty caller set and it was pruned — the FN direction
+    #318 was filed to remove)."""
     b = _build(_DIAMOND)
-    assert _edges_to(b, "call_c") == ["app.py:B.m"], _edges_to(b, "call_c")
+    assert _edges_to(b, "call_c") == ["app.py:X.m"], _edges_to(b, "call_c")
 
 
 def test_dotted_base_pinned_exactly():

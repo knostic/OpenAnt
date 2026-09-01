@@ -850,41 +850,157 @@ class CallGraphBuilder:
 
         return None
 
-    def _resolve_self_call(self, method_name: str, caller_file: str, caller_class: str) -> Optional[str]:
-        """Resolve a self.method() call within a class or its (same-file) bases.
+    # #440: the base-chain walk — import-aware and C3-ordered. Shared by
+    # _resolve_self_call and the typed-receiver path (both were FIFO over
+    # same-file bases only). Two fixes:
+    #   1. IMPORTED IN-REPO BASES: a base module + subclass elsewhere is the
+    #      most common real layout, and the same-file anchor never resolved
+    #      it — the walk now follows the import map the resolver already
+    #      holds (plus the cross-file unambiguous match). External bases
+    #      (no import entry, no repo class) stay unresolved — never a
+    #      fabricated edge.
+    #   2. THE C3 ORDER: a diamond (`C(A, B)`, `A(X)`, `X.m` and `B.m`) made
+    #      the FIFO pick B.m while Python runs X.m — X.m kept an empty
+    #      caller set and was pruned (the FN direction #318 was filed to
+    #      remove). The walk now computes the C3 linearization over the
+    #      extractor's base lists (FIFO fallback when a merge fails —
+    #      inconsistent hierarchies still resolve).
+    def _base_defining_file(self, file: str, base_simple: str) -> Optional[str]:
+        """The file a base class of a class in ``file`` is defined in.
 
-        Walks the class first, then its base classes transitively (breadth-first,
-        cycle-guarded), so a method inherited from a base resolves. Base lookup
-        is restricted to classes defined in the caller's own file -- external
-        base classes aren't in our index, so they're left unresolved rather than
-        mis-linked.
-        """
-        seen: Set[str] = set()
-        queue: List[str] = [caller_class]
-        while queue:
-            class_name = queue.pop(0)
-            if class_name in seen:
-                continue
-            seen.add(class_name)
-
-            class_key = f"{caller_file}:{class_name}"
-            for func_id in self.methods_by_class.get(class_key, []):
-                func_data = self.functions.get(func_id, {})
-                if func_data.get('name') == method_name:
-                    return func_id
-
-            class_data = self.classes.get(class_key, {})
-            # #318 (deep-refute): the self/super walks read the UNION
-            # (``all_bases``) — a function-local namesake's merged file-scope
-            # ``bases`` is the module side's, but its OWN methods' self/super
-            # dispatch still follows the local declaration's chain.
-            for base in class_data.get('all_bases', class_data.get('bases', [])):
-                # Only same-file base names are resolvable via our index.
-                base_name = base.split('.')[-1]
-                if base_name not in seen:
-                    queue.append(base_name)
-
+        Same-file first, then the import map (``self.imports[file]``), then a
+        cross-file UNAMBIGUOUS simple-name match (step 3's shape). None =
+        external/unknown — abstain."""
+        if f"{file}:{base_simple}" in self.classes:
+            return file
+        cand_files = [k.rsplit(':', 1)[0] for k, v in self.classes.items()
+                      if v.get('name') == base_simple]
+        if not cand_files:
+            return None
+        imported = self.imports.get(file, {}).get(base_simple)
+        if imported:
+            mod = imported.rsplit('.', 1)[0] if '.' in imported else None
+            for f2 in cand_files:
+                stem = f2[:-len('.py')].replace('/', '.')
+                if mod and (stem == mod or stem.endswith('.' + mod)):
+                    return f2
+            # #440 (wave r1 sonnet): the import EXISTS but no candidate file
+            # matches its module path (an external attribute-style base, an
+            # aliased import whose origin is outside the repo) — ABSTAIN.
+            # Falling through to the unambiguous-name fallback fabricated an
+            # edge to an unrelated same-named LOCAL class.
+            return None
+        if len(set(cand_files)) == 1:
+            return cand_files[0]
         return None
+
+    def _base_chain(self, file: str, name: str, _memo=None, _stack=None,
+                    use_union: bool = True) -> List[Tuple[str, str]]:
+        """The (file, simple_name) C3 linearization of a class's base graph.
+
+        ``use_union``: the self/super walks read ``all_bases`` (#318: a
+        function-local namesake's merged file-scope bases is the module
+        side's, but its OWN methods' dispatch follows the local chain);
+        the TYPED path from OUTSIDE reads the entry's OWN ``bases`` — the
+        union would let a function-local declaration's base hijack a
+        module-level namesake (the #318 wave-r3 finding, preserved here).
+        """
+        if _memo is None:
+            _memo, _stack = {}, set()
+        key = f"{file}:{name}"
+        if key not in self.classes and "." in name:
+            # a dotted (nested) name keyed unqualified in the index
+            key = f"{file}:{name.split('.')[-1]}"
+        memo_key = (key, use_union)
+        if memo_key in _memo:
+            return _memo[memo_key]
+        if key in _stack:  # a malformed cycle: tolerate, the node alone
+            return [(file, name)]
+        _stack = _stack | {key}
+        class_data = self.classes.get(key, {})
+        bases = (class_data.get('all_bases', class_data.get('bases', []))
+                 if use_union else class_data.get('bases', []))
+        base_chains = []
+        for b in bases:
+            bs = b.split('.')[-1]
+            bf = self._base_defining_file(file, bs)
+            if bf is not None:
+                # #440 (wave r1, three axes): use_union PROPAGATES — the
+                # round-1 recursion defaulted it back to True, so the typed
+                # path's anti-hijack guard (own bases, not the merged union)
+                # only held at depth 0.
+                base_chains.append(self._base_chain(bf, bs, _memo, _stack,
+                                                    use_union=use_union))
+        head = [(file, name)]
+        # #440 (wave r1 sonnet): the canonical C3 merge carries the BASE
+        # LIST's own order as a final sequence, so an inconsistent hierarchy
+        # (a base appearing after a class that inherits it) is DETECTED and
+        # takes the FIFO fallback instead of silently reordering.
+        head_order = [
+            (self._base_defining_file(file, b.split('.')[-1]),
+             b.split('.')[-1])
+            for b in bases
+        ]
+        seqs = [list(c) for c in base_chains] + [
+            [n for n in head_order if n[0] is not None]]
+        merged = []
+        while seqs:
+            seqs = [s for s in seqs if s]   # empty seqs (unresolvable bases) drop out
+            if not seqs:
+                break
+            for seq in seqs:
+                candidate = seq[0]
+                if not any(candidate in s[1:] for s in seqs if s):
+                    merged.append(candidate)
+                    for s in seqs:
+                        if s and s[0] == candidate:
+                            del s[0]
+                    seqs = [s for s in seqs if s]
+                    break
+            else:  # an inconsistent hierarchy: the FIFO fallback
+                for s in seqs:
+                    for c in s:
+                        if c not in merged:
+                            merged.append(c)
+                break
+        chain = head + [c for c in merged if c not in head]
+        _memo[memo_key] = chain
+        return chain
+
+    def _mro_first_definer(self, caller_file: str, class_name: str,
+                           method_name: str, include_own: bool) -> Optional[str]:
+        """The first class in the C3 chain (own class first) defining the method.
+
+        #440 (wave r1, opus+fable): the class name is NOT stripped here —
+        the extractor keys nested classes with their dotted qualifier
+        (methods_by_class['app.py:Outer.Inner']), and the round-1 entry
+        split('.')[-1] turned every nested class into a key that exists
+        nowhere, dropping the class's OWN self-dispatch and every inherited
+        self-call inside it (pydantic Config, nested exception/helper
+        classes — the exact FN direction this PR removes). Only the BASE
+        names inside _base_chain are simple.
+        """
+        chain = self._base_chain(caller_file, class_name,
+                                 use_union=include_own)
+        start = 0
+        if not include_own and chain and chain[0] == (caller_file, class_name):
+            start = 1
+        for f, n in chain[start:]:
+            method_id = self._method_in_class(f"{f}:{n}", method_name)
+            if method_id:
+                return method_id
+        return None
+
+    def _resolve_self_call(self, method_name: str, caller_file: str, caller_class: str) -> Optional[str]:
+        """Resolve a self.method() call within a class or its bases.
+
+        #440: the walk is the unified import-aware C3 chain (see
+        _base_chain) — the caller's own class first, then bases in C3
+        order, following in-repo imports; external bases stay unresolved
+        rather than mis-linked.
+        """
+        return self._mro_first_definer(caller_file, caller_class, method_name,
+                                       include_own=True)
 
     def _resolve_super_call(self, method_name: str, caller_file: str, caller_class: str) -> Optional[str]:
         """Resolve a ``super().method(...)`` call to the inherited parent method.
@@ -933,30 +1049,23 @@ class CallGraphBuilder:
 
     def _same_file_base_walk(self, class_name: str, method_name: str,
                              caller_file: str) -> Optional[str]:
-        """#318: walk a class's SAME-FILE bases to the first ancestor that
-        defines ``method_name`` — the C suite's sound floor (Bug [30]),
-        the same own-first FIFO, cycle-guarded order ``_resolve_self_call``
-        uses, so the most-derived definition wins and no derived-override
-        fan-out occurs. Base lookup restricted to the caller's own file:
-        external bases aren't in the index, so they stay unresolved rather
-        than mis-linked (the ``self`` walk's own restriction).
+        """#318: walk a class's bases to the first ancestor that defines
+        ``method_name`` — the C suite's sound floor (Bug [30]), own-first,
+        so the most-derived definition wins and no derived-override
+        fan-out occurs.
+
+        #440: the walk is no longer same-file-ONLY — it is the unified
+        import-aware C3 chain (see _base_chain): the most common real
+        layout (a base module + subclasses elsewhere, identified by the
+        import map the resolver already holds) now resolves, and a diamond
+        picks the C3 ancestor, not a FIFO genuine-but-wrong one. The
+        caller's OWN class is excluded here — this walk is reached from
+        _resolve_class_method AFTER its same-file own-definition check
+        missed, and the include_own=False start keeps that precedence.
+        External bases still abstain rather than mis-link.
         """
-        seen: Set[str] = set()
-        queue: List[str] = [class_name.split('.')[-1]]
-        while queue:
-            base_name = queue.pop(0)
-            if base_name in seen:
-                continue
-            seen.add(base_name)
-            class_key = f"{caller_file}:{base_name}"
-            method_id = self._method_in_class(class_key, method_name)
-            if method_id:
-                return method_id
-            for base in self.classes.get(class_key, {}).get('bases', []):
-                base_simple = base.split('.')[-1]
-                if base_simple not in seen:
-                    queue.append(base_simple)
-        return None
+        return self._mro_first_definer(caller_file, class_name, method_name,
+                                       include_own=False)
 
     def _resolve_class_method(self, class_name: str, method_name: str, caller_file: str,
                               defined_classes: Optional[Set[str]] = None) -> Optional[str]:
