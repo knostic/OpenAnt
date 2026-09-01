@@ -15,9 +15,6 @@ RIGHTMOST postfix-callable operand is attributed, with the outer node's labels.
 import sys
 from pathlib import Path
 
-CORE = str(Path(__file__).resolve().parents[3])  # libs/openant-core
-if CORE not in sys.path:
-    sys.path.insert(0, CORE)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers import build  # noqa: E402
@@ -47,10 +44,6 @@ func noFabrication() -> Int { let scale = 3; return scale + tAdd() }
 """
 
 
-def _callers_of(fn):
-    return fn
-
-
 def _run(src):
     import tempfile
     with tempfile.TemporaryDirectory() as d:
@@ -65,6 +58,10 @@ def test_arith_right_operand_resolves():
     for fn in ("binAdd", "binSub", "binMul", "binDiv", "binMod"):
         edges = b.get(f"A.swift:{fn}", [])
         assert "A.swift:tAdd" in edges, (fn, edges)
+        # wave r1 (three axes): the LEFT operand's own call was asserted
+        # nowhere — a change that stopped pushing the additive's children
+        # would keep every matrix test green.
+        assert "A.swift:lhsA" in edges, (fn, edges)
 
 
 def test_control_still_resolves():
@@ -77,6 +74,11 @@ def test_left_side_call_also_survives():
     b = _run(FIXTURE)
     edges = b.get("A.swift:binNav", [])
     assert "A.swift:Helper.m" in edges, edges
+    # wave r1 (all axes): mk — the call nested in the right operand's
+    # navigation chain — was asserted NOWHERE (the test only checked the
+    # already-green Helper.m, pristine-safe; the docstring claimed this).
+    assert "A.swift:mk" in edges, edges
+    assert "A.swift:lhsA" in edges, edges
 
 
 def test_no_phantom_left_operand():
@@ -94,3 +96,48 @@ def test_two_calls_both_resolve():
     edges = b.get("A.swift:twoCalls", [])
     assert "A.swift:tAdd" in edges, edges
     assert "A.swift:lhsA" in edges, edges
+
+
+def test_navigation_right_operand_self_receiver():
+    """Wave r1 (fable): `1 + self.m()` — the reachable navigation shape (the
+    early reduction makes the outer callee the navigation_expression the
+    pre-existing branch handles; pins that the fix did not break it)."""
+    src = """
+struct S {
+    func m() -> Int { return 1 }
+    func n() -> Int { return 1 + self.m() }
+}
+"""
+    b = _run(src)
+    edges = b.get("A.swift:S.n", [])
+    assert "A.swift:S.m" in edges, edges
+
+
+def test_prefix_rightmost_operand_is_called():
+    """Wave r1 (probed + confirmed): `a + -f()` — the hoisted suffix applies
+    to the whole `-f()`, so the prefix's operand IS the callee (f is genuinely
+    called). RED before this round (the site was silently lost)."""
+    src = """
+func f() -> Int { return 1 }
+func pre() -> Int { return a + -f() }
+"""
+    b = _run(src)
+    edges = b.get("A.swift:pre", [])
+    assert "A.swift:f" in edges, edges
+
+
+def test_labels_come_from_the_outer_node():
+    """Wave r1 (opus): the commit's central design claim — labels/arity come
+    from the OUTER node (the hoisted argument list) — was untested (every
+    fixture was zero-arity). Pinned at the SITE level: the arithmetic-callee
+    site carries the x label and arity 1 (reading the callee instead would
+    yield labels=[] / arity=0 — the additive has no call_suffix)."""
+    from _helpers import CallGraphBuilder
+    src = "func pick() -> Int { return 2 + over(x: 1) }"
+    bld = CallGraphBuilder({"functions": {}, "classes": {}, "files": {}})
+    sites, _refs = bld._find_calls_in_code(src)
+    arith = [s for s in sites if s["text"] == "over"]
+    assert arith, sites
+    s = arith[0]
+    assert s["labels"] == ["x"], s
+    assert s["arity"] == 1, s

@@ -841,12 +841,46 @@ class CallGraphBuilder:
                         # here; a rightmost arithmetic node is descended, not
                         # attributed. Labels come from the OUTER node (the hoisted
                         # argument list is the rightmost operand's).
+                        #
+                        # Wave r1 (probed with tree-sitter, documented so the
+                        # next reader does not re-derive):
+                        # - bitwise (`x | f()`), custom-infix (`a <> f()`) and
+                        #   range (`0..<f()`) do NOT hoist — the call is an
+                        #   ordinary inner node the walk already resolves; the
+                        #   arithmetic-only scope of #327 HOLDS.
+                        # - a trailing COMMENT child (`a + b /* x */ (...)`)
+                        #   is stepped back past, not mistaken for the operand.
+                        # - `a + -f()` (a prefix_expression rightmost): the
+                        #   hoisted suffix applies to the whole `-f()`, so the
+                        #   prefix's OPERAND is the postfix-callable callee —
+                        #   descend into it (f is genuinely called).
+                        # - KNOWN RESIDUAL: a subscript rightmost (`a +
+                        #   tbl[i]()`) abstains — attributing `tbl` would
+                        #   fabricate a call on a possibly-array base; the #299
+                        #   alias-gated container path owns that dispatch.
+                        # - The navigation sub-branch below is defensive: the
+                        #   reachable `a + obj.m()` shapes reduce EARLY (the
+                        #   outer callee is already the navigation_expression
+                        #   the pre-existing branch handles); kept for grammar
+                        #   variance at no cost (the issue's item 3).
                         last = callee.children[-1] if callee.children else None
                         while (last is not None
                                and last.type in ("additive_expression",
-                                                 "multiplicative_expression")
+                                                 "multiplicative_expression",
+                                                 "prefix_expression")
                                and last.children):
-                            last = last.children[-1]
+                            if last.type == "prefix_expression":
+                                # the operand follows the operator: the LAST
+                                # non-operator child is the postfix-callable one
+                                last = last.children[-1]
+                            else:
+                                last = last.children[-1]
+                        if last is not None and last.type == "comment" and callee.children:
+                            # `a + b /* cached */ (x)`: step back past a
+                            # trailing comment to the real operand
+                            real = [c for c in callee.children
+                                    if c.type != "comment"]
+                            last = real[-1] if real else None
                         if last is not None and last.type == "simple_identifier":
                             labels, arity, trailing, unlabeled_trailing = self._call_labels(node, source)
                             sites.append({"text": self._text(last, source),
