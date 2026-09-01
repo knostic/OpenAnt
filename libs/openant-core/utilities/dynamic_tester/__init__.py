@@ -64,18 +64,66 @@ def _summary_counts_from_checkpoints(checkpointed) -> dict:
     source `status()` reads makes the two structurally incapable of
     drifting. The retry contract is unchanged: an ERROR checkpoint is
     still classified not-done and retried on resume.
+
+    #432: also derive error_breakdown — the error_type -> count dict the
+    summary schema supports and the analyze pipeline populates, which this
+    stage hardcoded to {} (a live content-filtered run produced 5 errors
+    with an EMPTY breakdown, forcing a post-mortem to open every unit file
+    to learn they were all generation failures). The category comes from
+    the details prefixes result_collector.py writes: `Test generation ...`
+    -> generation; `Docker build failed` -> build; `Container execution
+    timed out` -> timeout; the remaining execution shapes -> execution;
+    anything else (including absent details) -> other.
     """
     if not checkpointed:
-        return {"completed": 0, "errors": 1 if checkpointed is False else 0}
+        return {"completed": 0, "errors": 1 if checkpointed is False else 0,
+                "error_breakdown": {}}
     completed = errors = 0
+    breakdown: dict = {}
     for cp in checkpointed.values():
         if not isinstance(cp, dict):
             continue
         if cp.get("status") == "ERROR":
             errors += 1
+            cat = _error_category(cp.get("details"))
+            breakdown[cat] = breakdown.get(cat, 0) + 1
         else:
             completed += 1
-    return {"completed": completed, "errors": errors}
+            # wave r1 (sonnet): the collector writes "Container execution
+            # timed out" with status INCONCLUSIVE, never ERROR — the timeout
+            # bucket was dead code (real timeouts invisible in BOTH errors
+            # and the breakdown). A timed-out unit is a timeout for triage
+            # regardless of its terminal status: counted here WITHOUT
+            # inflating `errors` (it is not an error; the counts stay the
+            # #311 disjoint semantics).
+            det = cp.get("details")
+            if isinstance(det, str) and det.strip().startswith("Container execution timed out"):
+                breakdown["timeout"] = breakdown.get("timeout", 0) + 1
+    return {"completed": completed, "errors": errors, "error_breakdown": breakdown}
+
+
+def _error_category(details) -> str:
+    """Bucket an ERROR unit file by its failure stage (#432)."""
+    if not isinstance(details, str) or not details:
+        return "other"
+    d = details.strip()
+    if d.startswith("Test generation"):
+        return "generation"
+    if d.startswith("Docker build failed"):
+        return "build"
+    if d.startswith("Container execution timed out"):
+        # famD panel (opus, documented-not-deleted): today the collector
+        # writes this details prefix with status INCONCLUSIVE (counted on
+        # the completed side by the wave-r1 timeout bucket, not as an
+        # error) — this branch is unreachable for the CURRENT collector.
+        # Kept as a defensive fallback: if a future collector ever writes
+        # an ERROR row with this prefix, it must bucket to timeout, not
+        # "other".
+        return "timeout"
+    if (d.startswith("Docker execution was not attempted")
+            or d.startswith("Container did not produce valid JSON output")):
+        return "execution"
+    return "other"
 
 
 def run_dynamic_tests(
@@ -225,7 +273,7 @@ def run_dynamic_tests(
     _completed = _counts["completed"]
     _errors = _counts["errors"]
     checkpoint.ensure_dir()
-    checkpoint.write_summary(total, _completed, _errors, {}, phase="in_progress")
+    checkpoint.write_summary(total, _completed, _errors, _counts["error_breakdown"], phase="in_progress")
 
     print(f"Dynamic testing {total} findings from {repo_info['name']} "
           f"({restored} already done, {remaining} remaining)",
@@ -334,7 +382,7 @@ def run_dynamic_tests(
                 _counts = _summary_counts_from_checkpoints(checkpoint.load())
                 _completed = _counts["completed"]
                 _errors = _counts["errors"]
-                checkpoint.write_summary(total, _completed, _errors, {},
+                checkpoint.write_summary(total, _completed, _errors, _counts["error_breakdown"],
                                          phase="in_progress")
             continue
 
@@ -421,7 +469,7 @@ def run_dynamic_tests(
             _counts = _summary_counts_from_checkpoints(checkpoint.load())
             _completed = _counts["completed"]
             _errors = _counts["errors"]
-            checkpoint.write_summary(total, _completed, _errors, {}, phase="in_progress")
+            checkpoint.write_summary(total, _completed, _errors, _counts["error_breakdown"], phase="in_progress")
 
         print(f"  Result: {result.status} ({result.elapsed_seconds:.1f}s)",
               file=sys.stderr)
@@ -467,6 +515,6 @@ def run_dynamic_tests(
         # authoritative record, structurally identical to status().
         _counts = _summary_counts_from_checkpoints(checkpoint.load())
         checkpoint.write_summary(total, _counts["completed"],
-                                 _counts["errors"], {}, phase="done")
+                                 _counts["errors"], _counts["error_breakdown"], phase="done")
 
     return results
