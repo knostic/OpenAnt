@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -103,5 +104,42 @@ func TestPreferVenvFallsToVenvForNonImportableOverride(t *testing.T) {
 	rt := preferVenv(&RuntimeInfo{Path: override, Major: 3, Minor: 14})
 	if rt.Path == override {
 		t.Fatalf("a non-importable override was kept: %q — CheckOpenantInstalled bootstrapped the venv for exactly this shape, and keeping the bare path yields ModuleNotFoundError on every run", override)
+	}
+}
+
+// famD panel (sonnet): the deps-hash skip for an active override is
+// end-to-end pinned — a STALE venv hash must not drive an install into the
+// override interpreter (the hash is the venv's, not the override's).
+func TestEnsureRuntime_SkipsDepsForOverride(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix venv-python path shape")
+	}
+	// a stale hash at the venv location that does NOT match the real one
+	venv := t.TempDir()
+	t.Setenv("HOME", filepath.Dir(venv)) // venvPython() = $HOME/.openant/venv
+	fakeVenv := filepath.Join(filepath.Dir(venv), ".openant", "venv")
+	_ = os.MkdirAll(fakeVenv, 0o755)
+	_ = os.WriteFile(filepath.Join(fakeVenv, ".deps-hash"), []byte("stale-deadbeef"), 0o644)
+
+	// an override that is a REAL usable python (the test binary's own interpreter is not available; use python3 from PATH if present)
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	t.Setenv("OPENANT_PYTHON", py)
+	// the import probe must find the openant engine relative to this test's
+	// own checkout (the repo layout), not require a pip install.
+	if core := os.Getenv("OPENANT_CORE_PATH"); core == "" {
+		t.Skip("OPENANT_CORE_PATH not set (repo-layout-dependent e2e)")
+	}
+
+	_, rterr := EnsureRuntime()
+	if rterr != nil {
+		t.Fatalf("EnsureRuntime with an override must not fail: %v", rterr)
+	}
+	// the stale venv hash must be UNTOUCHED (no install ran against it)
+	h, _ := os.ReadFile(filepath.Join(fakeVenv, ".deps-hash"))
+	if string(h) != "stale-deadbeef" {
+		t.Fatalf("the venv hash must not be rewritten under an override: %q", h)
 	}
 }
