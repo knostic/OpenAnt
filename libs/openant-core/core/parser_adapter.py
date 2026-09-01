@@ -512,7 +512,7 @@ def apply_reachability_filter(
             "Use --library-mode to seed the exported public API surface."
         )
         print(f"  [Warning] {warning}", file=sys.stderr)
-        dataset.setdefault("metadata", {})["reachability_filter"] = {
+        _rec = {
             "original_units": original_count,
             "entry_points": len(entry_points),
             "reachable_units": original_count,
@@ -520,6 +520,16 @@ def apply_reachability_filter(
             "reduction_percentage": 0,
             "warning": warning,
         }
+        # #328 (wave r1, opus+fable): the effective level on the pass-through
+        # path is "all" — nothing was pruned — and this is the case where
+        # recording it matters MOST: without it the record looks identical to
+        # "no fallback happened". The request is recorded beside it; the
+        # blackout warning prose already carries the "NOT applied" message, so
+        # no redundant level_fallback_warning key rides this branch.
+        _rec["effective_processing_level"] = "all"
+        if processing_level in ("codeql", "exploitable"):
+            _rec["requested_processing_level"] = processing_level
+        dataset.setdefault("metadata", {})["reachability_filter"] = _rec
         return dataset
 
     # Compute reachable set (BFS forward from entry points)
@@ -603,12 +613,12 @@ def apply_reachability_filter(
     # being fixed is the artifact silently claiming the requested level.)
     if processing_level in ("codeql", "exploitable"):
         if processing_level == "codeql":
-            _fb = ("CodeQL filter not yet wired into the Python parser path. "
-                   "Returning reachable units only.")
+            _fb = ("CodeQL filter not yet wired into the core reachability "
+                   "filter path. Returning reachable units only.")
         else:
             _fb = ("Exploitable filter (CodeQL + LLM classification) not yet "
-                   "wired into the Python parser path. Returning reachable "
-                   "units only.")
+                   "wired into the core reachability filter path. Returning "
+                   "reachable units only.")
         _rf["level_fallback_warning"] = _fb
         _rf["requested_processing_level"] = processing_level
         print(f"  [Warning] {_fb}", file=sys.stderr)

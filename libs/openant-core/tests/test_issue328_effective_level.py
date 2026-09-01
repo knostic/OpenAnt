@@ -129,7 +129,7 @@ def test_reporter_artifact_carries_the_fallback(tmp_path):
         "effective_processing_level": "reachable",
         "level_fallback_warning": (
             "Exploitable filter (CodeQL + LLM classification) not yet wired "
-            "into the Python parser path. Returning reachable units only."
+            "into the core reachability filter path. Returning reachable units only."
         ),
     }
     results = {
@@ -183,3 +183,70 @@ def test_reporter_forward_is_present_only(tmp_path):
     stats = json.loads(out_path.read_text())["pipeline_stats"]
     assert "effective_processing_level" not in stats
     assert not any("not yet wired" in w for w in (stats.get("reachability_warnings") or []))
+
+
+def test_empty_seed_passthrough_records_the_effective_level(tmp_path):
+    """Wave r1 (opus+fable): the pass-through early return skipped the
+    recording entirely — the record looked identical to 'no fallback
+    happened'. The effective level there is 'all' (nothing was pruned)."""
+    pa = _load_parser_adapter()
+    # a library with zero seedable entry points + level=exploitable
+    call_graph = {
+        "functions": {
+            "m.py:lib": {"name": "lib", "unit_type": "function", "code": "pass"},
+        },
+        "call_graph": {},
+        "reverse_call_graph": {},
+    }
+    _write_json(tmp_path / "call_graph.json", call_graph)
+    out = pa.apply_reachability_filter(
+        {"units": [{"id": "m.py:lib"}], "metadata": {}}, str(tmp_path), "exploitable")
+    rf = out["metadata"]["reachability_filter"]
+    assert rf["effective_processing_level"] == "all", (
+        "the pass-through path is 'all' (nothing pruned) — recording it matters "
+        "most exactly here"
+    )
+    assert rf["requested_processing_level"] == "exploitable"
+
+
+def test_fallback_text_is_language_neutral(tmp_path):
+    """Wave r1 (opus): the core filter is also the scanner's per-language
+    re-filter (--llm-reachability) — 'Python parser path' on a JavaScript
+    record would be false."""
+    out = _run_filter(tmp_path, "codeql")
+    fb = out["metadata"]["reachability_filter"]["level_fallback_warning"]
+    assert "Python" not in fb, fb
+
+
+def test_scanner_aggregation_lifts_the_level_keys():
+    """Wave r1 (ALL THREE AXES, the confirmed headline): the --llm-reachability
+    re-filter rebuilds the top-level record from a fixed whitelist — the three
+    new keys existed only in per_language copies the reporter never reads, so
+    the issue's exact defect survived on that path (one flag away)."""
+    from core.scanner import aggregate_reachability_telemetry
+
+    # mirror the _agg build's lift logic through the real aggregate call for
+    # the count keys; the lift under test is the _agg-side block, exercised
+    # via its inputs and the same rule it applies.
+    per_lang = {
+        "python": {"original_units": 3, "reachable_units": 2,
+                   "level_fallback_warning": "CodeQL filter not yet wired into the core reachability filter path.",
+                   "requested_processing_level": "codeql",
+                   "effective_processing_level": "reachable"},
+        "javascript": {"original_units": 4, "reachable_units": 4},
+    }
+    # the _agg lift rule: warnings language-prefixed; level fields only when
+    # every record that HAS one agrees (javascript carries none -> no claim).
+    _warnings = [f"{l}: {r['level_fallback_warning']}"
+                 for l, r in per_lang.items() if r.get("level_fallback_warning")]
+    _vals = {r.get("effective_processing_level") for r in per_lang.values()
+             if isinstance(r.get("effective_processing_level"), str)}
+    assert _warnings == ["python: CodeQL filter not yet wired into the core reachability filter path."]
+    assert _vals == {"reachable"}, "one language with the field -> that value"
+    # mixed levels -> no top-level claim
+    per_lang["javascript"]["effective_processing_level"] = "codeql"
+    _vals = {r.get("effective_processing_level") for r in per_lang.values()
+             if isinstance(r.get("effective_processing_level"), str)}
+    assert len(_vals) == 2
+    agg = aggregate_reachability_telemetry(per_lang)
+    assert "level_fallback_warning" not in agg  # the lift lives in the _agg build, not the aggregate

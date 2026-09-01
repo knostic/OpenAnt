@@ -765,6 +765,34 @@ def scan_repository(
                                 ]
                                 if _warnings:
                                     _agg["warning"] = "; ".join(_warnings)
+                                # #328 (wave r1, three axes): the fixed
+                                # whitelist above dropped the three new level
+                                # keys — the issue's exact defect survived on
+                                # the --llm-reachability path (the record the
+                                # reporter reads is rebuilt from this _agg,
+                                # and the per-language copies never surface).
+                                # Lift the fallback warnings language-prefixed
+                                # (the same shape as the warning lift); the
+                                # LEVEL fields only when every per-language
+                                # record that has one AGREES (a multi-language
+                                # scan with mixed levels claims nothing).
+                                _fb = [
+                                    f"{_lang}: {_r['level_fallback_warning']}"
+                                    for _lang, _r in _per_lang.items()
+                                    if _r.get("level_fallback_warning")
+                                ]
+                                if _fb:
+                                    _agg["level_fallback_warning"] = "; ".join(_fb)
+                                for _lk in ("requested_processing_level",
+                                            "effective_processing_level"):
+                                    _vals = {
+                                        _r.get(_lk)
+                                        for _r in _per_lang.values()
+                                        if isinstance(_r, dict)
+                                        and isinstance(_r.get(_lk), str) and _r.get(_lk)
+                                    }
+                                    if len(_vals) == 1:
+                                        _agg[_lk] = next(iter(_vals))
 
                                 _new_md["reachability_filter"] = _agg
                             else:
