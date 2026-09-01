@@ -286,6 +286,16 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 		exitCode := 0
 		if ee, ok := exitErr.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
+		} else if cmd.ProcessState != nil {
+			// #431 (wave r1 sonnet): with managed writers, a detached
+			// descendant holding a pipe write-end makes Wait return
+			// exec.ErrWaitDelay INSTEAD of the *exec.ExitError this
+			// branch extracts from — a scan that legitimately exits 1
+			// ("vulnerabilities found") beside a held write-end was
+			// silently reported as exit 0. ProcessState carries the
+			// child's real code on that path (the same translation the
+			// no-envelope path applies below).
+			exitCode = cmd.ProcessState.ExitCode()
 		}
 		if exitErrIsKillArtifact {
 			// Round-3 panel finding: the exit code here is the KILL's
