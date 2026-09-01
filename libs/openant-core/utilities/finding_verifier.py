@@ -1049,21 +1049,40 @@ class FindingVerifier:
 
         # Fix inconsistencies
         for pattern, group in inconsistent_groups:
+            # #448 (wave r3 opus): the LOG keeps the RAW stamps — a
+            # case/whitespace anomaly in stored data is the same
+            # upstream-bug signal the audit `from` field preserves, and with
+            # the detector now normalized this line is the only surface where
+            # the anomaly is visible for an inconsistent group.
             verdicts = [
                 (r.get("verification", {}).get("correct_finding") or r.get("finding"))
                 for r in group]
             self._log("warning", f"Inconsistency detected in pattern: {pattern}",
                       details={"findings": [r.get('route_key') for r in group],
-                               "verdicts": [v.strip().lower() if isinstance(v, str) else v
-                                            for v in verdicts]})
+                               "verdicts": verdicts})
 
             # Run consistency check
             consistency_result = self._resolve_inconsistency(group, code_by_route)
 
             if consistency_result:
-                # Apply consistent verdict, but respect exploit path analysis
+                # Apply consistent verdict, but respect exploit path analysis.
+                # #448 (wave r3 opus): an update is scoped to the GROUP that
+                # fired the call — a hallucinated route_key naming any OTHER
+                # row in the batch previously moved that row (or stamped its
+                # audit) regardless of the pattern the model was shown. The
+                # apply gate's threat model (a fully hallucinated
+                # findings_to_update payload) is precisely the case where the
+                # route_key is hallucinated too.
+                _group_rks = {r.get("route_key") for r in group}
                 for finding_update in consistency_result.findings_updated:
                     route_key = finding_update.get("route_key")
+                    if route_key not in _group_rks:
+                        self._log("warning",
+                                  f"Consistency update named out-of-group route "
+                                  f"{route_key!r}; ignored (the reply is "
+                                  "hallucinated or misaddressed)",
+                                  unit_id=route_key)
+                        continue
                     raw_should_be = finding_update.get("should_be")
                     # #448 (the #425 escape's Stage-2 twin): should_be is
                     # unconstrained model output — this site wrote it into
@@ -1104,11 +1123,12 @@ class FindingVerifier:
                     new_verdict = (raw_should_be.strip().lower()
                                    if isinstance(raw_should_be, str) else "")
                     if not new_verdict:
-                        # #448 (wave r2 fable): None/empty = "no proposal"
-                        # (silent skip is right); a NON-STRING (list/dict/
+                        # #448 (wave r2 fable, r3 opus): None or any string
+                        # that normalizes empty (whitespace-only) = "no
+                        # proposal" — silent skip; a NON-STRING (list/dict/
                         # number) is a MALFORMED proposal — audited, not
                         # silently dropped (the reject-with-audit contract).
-                        if raw_should_be is not None and raw_should_be != "":
+                        if raw_should_be is not None and not isinstance(raw_should_be, str):
                             for result in results:
                                 if result.get("route_key") == route_key:
                                     result["consistency_invalid_verdict_blocked"] = {
@@ -1313,7 +1333,12 @@ class FindingVerifier:
                 # FALSE plus a hallucinated findings_to_update (the exact
                 # non-conformant shape the apply-gate exists for) must not
                 # apply its hallucinated corrections anyway.
-                if result.get("should_be_consistent") is False:
+                # #448 (wave r3 fable+opus): the tolerant read — the reply
+                # class this gate exists for is NON-conformant; a
+                # "should_be_consistent": "false" / "no" / 0 must not sail
+                # past an identity check on True/False only.
+                sbc = result.get("should_be_consistent")
+                if sbc is not None and str(sbc).strip().lower() in ("false", "no", "0"):
                     return None
                 return ConsistencyCheckResult(
                     pattern_identified=result.get("pattern_identified", "unknown"),

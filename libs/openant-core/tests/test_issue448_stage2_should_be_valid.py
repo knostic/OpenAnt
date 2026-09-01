@@ -203,23 +203,22 @@ def test_uppercase_old_verdict_compare_is_normalized():
 
 
 def test_the_correctable_set_equals_the_finish_enum():
-    """Wave r2 (fable+opus): the gate depends on a coincidence across four
-    independently-maintained copies (the finish tool's enum, _VERIFY_JSON_SCHEMA,
-    json_corrector's schema, the display tuple). A conformance test ties the
-    correctable set to the finish enum so a change to either surfaces here —
-    the drift class verdict_taxonomy exists to prevent."""
-    import inspect
-    import utilities.finding_verifier as fv
+    """Wave r2 (fable+opus) + wave r3 (all three axes): the round-2 pin located
+    the PROSE copy (_VERIFY_JSON_SCHEMA's docstring) — appending a value to
+    the finish TOOL'S enum left it green, and the set-against-its-definition
+    assertion was a tautology. The real pin: read VERIFICATION_TOOLS, select
+    the finish entry, and assert its correct_finding ENUM as a set equals the
+    correctable set — a change to either copy now surfaces HERE."""
     from core.verdict_taxonomy import FINDING_VERDICT_ORDER
-    src = inspect.getsource(fv)
-    # the finish tool's correct_finding enum (the model-facing declaration)
-    assert '"safe | protected | bypassable | vulnerable | inconclusive"' in src or \
-        '"safe | protected | vulnerable | bypassable | inconclusive"' in src, (
-            "the finish tool's enum text not found — update this conformance pin "
-            "deliberately if the enum wording changed")
-    assert fv._CORRECTABLE_STAGE2_FINDINGS == frozenset(FINDING_VERDICT_ORDER), (
-        "the correctable set drifted from FINDING_VERDICT_ORDER — the gate "
-        "must stay exactly the finish enum"
+    import utilities.finding_verifier as fv
+    finish = next(t for t in fv.VERIFICATION_TOOLS if t["name"] == "finish")
+    enum_vals = set(finish["input_schema"]["properties"]["correct_finding"]["enum"])
+    assert enum_vals == set(FINDING_VERDICT_ORDER), (
+        f"the finish tool's enum drifted from FINDING_VERDICT_ORDER: {enum_vals}"
+    )
+    assert fv._CORRECTABLE_STAGE2_FINDINGS == enum_vals, (
+        "the correctable set drifted from the finish tool's enum — the gate "
+        "must stay exactly the model-facing declaration"
     )
 
 
@@ -277,21 +276,110 @@ def test_malformed_nonstring_proposal_is_audited():
     assert row["consistency_invalid_verdict_blocked"]["proposed"] == ["VULNERABLE"]
 
 
-def test_hallucinated_updates_do_not_apply_when_consistency_is_false():
-    """Wave r2 (fable): should_be_consistent=FALSE plus a hallucinated
-    findings_to_update — the one conformant field that says DO NOT APPLY
-    must win over the hallucinated payload."""
+def test_hallucinated_updates_do_not_apply_when_consistency_is_false(monkeypatch):
+    """Wave r2 (fable) + wave r3 (all three axes): should_be_consistent=FALSE
+    plus a hallucinated findings_to_update — the one conformant field that
+    says DO NOT APPLY must win over the hallucinated payload. Driven through
+    the REAL _resolve_inconsistency parse path (the round-2 test stubbed the
+    resolver and degenerated into a duplicate of the apply control)."""
+    import json as _json
+    import utilities.llm as fv_llm
     v = _verifier()
-    v._resolve_inconsistency = lambda group, cbr: None  # not reached
-    # drive through _resolve_inconsistency's parse path: stub the model text
-    # is heavier than the unit needs — the contract is pinned at the parse:
-    # simulate via the None-return shape and assert the apply loop's guard
-    # by calling _check_consistency with a stubbed resolver that returns the
-    # hallucinated result (the should_be_consistent gate lives one layer up;
-    # its unit is the _resolve_inconsistency parse — pin the composition:
-    # the resolver returns None when the reply says False).
-    out = _run(v, "safe")   # the False-gated path returns None -> no update
-    row = _by_rk(out, VULN_RK)
-    assert row["finding"] == "safe", (
-        "control: the non-gated path still applies"
+    v.binding = object()
+    v.tracker = None            # the method passes tracker= to simple_text
+
+    the_reply = _json.dumps({
+        "should_be_consistent": False,
+        "consistent_verdict": "safe",
+        "explanation": "not actually the same",
+        "findings_to_update": [{"route_key": VULN_RK, "should_be": "safe"}],
+    })
+    monkeypatch.setattr(fv_llm, "simple_text", lambda *a, **k: the_reply)
+    got = v._resolve_inconsistency(
+        [{"route_key": VULN_RK, "finding": "vulnerable",
+          "verification": {"correct_finding": "vulnerable"}},
+         {"route_key": SAFE_RK, "finding": "safe",
+          "verification": {"correct_finding": "safe"}}], {})
+    assert got is None, (
+        "a FALSE should_be_consistent must gate its hallucinated payload"
     )
+    # the tolerant read (wave r3): the string "false" and 0 gate too
+    for falsy in ("false", 0, "no"):
+        reply = _json.dumps({
+            "should_be_consistent": falsy,
+            "consistent_verdict": "safe",
+            "explanation": "x",
+            "findings_to_update": [{"route_key": VULN_RK, "should_be": "safe"}],
+        })
+        monkeypatch.setattr(fv_llm, "simple_text", lambda *a, r=reply, **k: r)
+        got = v._resolve_inconsistency(
+            [{"route_key": VULN_RK, "finding": "vulnerable",
+              "verification": {"correct_finding": "vulnerable"}},
+             {"route_key": SAFE_RK, "finding": "safe",
+              "verification": {"correct_finding": "safe"}}], {})
+        assert got is None, f"should_be_consistent={falsy!r} must gate"
+    # the control: a TRUE reply still parses its payload
+    reply = _json.dumps({
+        "should_be_consistent": True,
+        "consistent_verdict": "safe",
+        "explanation": "x",
+        "findings_to_update": [{"route_key": VULN_RK, "should_be": "safe"}],
+    })
+    monkeypatch.setattr(fv_llm, "simple_text", lambda *a, r=reply, **k: r)
+    got = v._resolve_inconsistency(
+        [{"route_key": VULN_RK, "finding": "vulnerable",
+          "verification": {"correct_finding": "vulnerable"}},
+         {"route_key": SAFE_RK, "finding": "safe",
+          "verification": {"correct_finding": "safe"}}], {})
+    assert got is not None and got.findings_updated, (
+        "control: a TRUE reply's payload still flows"
+    )
+
+
+def test_out_of_group_route_key_is_ignored():
+    """Wave r3 (opus): an update is scoped to the GROUP that fired the call —
+    a hallucinated route_key naming any OTHER row in the batch previously
+    moved that row (or stamped its audit) regardless of the pattern the
+    model was shown. The apply gate's threat model is precisely the
+    fully-hallucinated payload."""
+    OTHER_RK = f"{FILE}:otherFn.json"
+
+    def resolver(group, code_by_route):
+        return ConsistencyCheckResult(
+            "logger json emitter", "safe",
+            [{"route_key": OTHER_RK, "should_be": "safe", "reason": "x"}], "g")
+
+    rows = _rows() + [{"route_key": OTHER_RK, "finding": "vulnerable",
+                       "verification": {"correct_finding": "vulnerable"}}]
+    v = _verifier()
+    v._resolve_inconsistency = resolver
+    out = v._check_consistency(rows, {})
+    other = _by_rk(out, OTHER_RK)
+    assert other["finding"] == "vulnerable", (
+        f"an out-of-group route_key was moved: {other}"
+    )
+    assert "consistency_invalid_verdict_blocked" not in other
+    assert "consistency_update" not in other
+
+
+def test_group_route_key_still_applies():
+    """The group scoping must not over-block: an update naming an IN-group
+    row still applies."""
+    def resolver(group, code_by_route):
+        return ConsistencyCheckResult(
+            "logger json emitter", "safe",
+            [{"route_key": VULN_RK, "should_be": "safe", "reason": "x"}], "g")
+
+    v = _verifier()
+    v._resolve_inconsistency = resolver
+    out = v._check_consistency(_rows(), {})
+    assert _by_rk(out, VULN_RK)["finding"] == "safe"
+
+
+def test_whitespace_only_should_be_is_a_silent_no_proposal():
+    """Wave r3 (opus): '   ' normalizes empty — a no-proposal, not a
+    malformed-structured audit (the comment and the code agree now)."""
+    out = _run(_verifier(), "   ")
+    row = _by_rk(out, VULN_RK)
+    assert row["finding"] == "vulnerable"
+    assert "consistency_invalid_verdict_blocked" not in row
