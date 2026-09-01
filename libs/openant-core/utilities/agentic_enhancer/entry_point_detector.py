@@ -200,9 +200,12 @@ USER_INPUT_PATTERNS = [
     # listed; var was not), so a Rust config reader seeded through neither
     # route.
     r'std::env::args',
-    r'\benv::args\b',
+    r'\benv::args(?:_os)?\b',
     r'std::env::var',
-    r'\benv::var\b',
+    # wave r1 (fable): the trailing \b rejected env::var_os / env::vars —
+    # after `use std::env;` (the idiomatic import) the short forms were
+    # unseeded through BOTH routes while the fully-qualified form matched.
+    r'\benv::var(?:s|_os)?\b',
     r'\bstd::io::stdin\b',
     r'\bio::stdin\b',
     r'\bstdin\(\)',

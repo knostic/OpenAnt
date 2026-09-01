@@ -41,6 +41,10 @@ CASES = [
      "fn parse_args() -> Vec<String> {\n    std::env::args().collect()\n}\n"),
     ("rust|env", "function",
      'fn cfg() -> String {\n    std::env::var("TOKEN").unwrap()\n}\n'),
+    ("rust|env_short_os", "function",
+     'fn cfg() -> Option<std::ffi::OsString> {\n    use std::env;\n    env::var_os("TOKEN")\n}\n'),
+    ("rust|args_short_os", "function",
+     'fn cfg() {\n    use std::env;\n    let a: Vec<_> = env::args_os().collect();\n}\n'),
     ("php|argv_server", "function",
      "function parseArgs() {\n    return $_SERVER['argv'][1];\n}\n"),
     ("php|argv", "function", "function parseArgs() {\n    return $argv[1];\n}\n"),
@@ -48,8 +52,14 @@ CASES = [
     ("php|env_getenv", "function", "function cfg() {\n    return getenv('TOKEN');\n}\n"),
     ("go|argv", "cli_handler", "func parseArgs() []string {\n    return os.Args[1:]\n}\n"),
     ("go|env", "function", 'func cfg() string {\n    return os.Getenv("TOKEN")\n}\n'),
+    # wave r1 (fable+sonnet): the row previously contained flag.Parse() —
+    # the real Go extractor classifies any function containing it as
+    # cli_handler (extractor.go isCLIHandler), so the type carried here was
+    # NOT what the parser assigns and the RED count was inflated by a
+    # manufactured failure. The honest residual: the flag DECLARATION in a
+    # helper with Parse() living in main.
     ("go|flag", "function",
-     'func parseFlags() {\n    v := flag.String("v", "", "verbose")\n    flag.Parse()\n}\n'),
+     'func verboseFlag() string {\n    v := flag.String("v", "", "verbose")\n    return *v\n}\n'),
     ("c|argv_apps", "cli_handler",
      "int run(int argc, char **argv) {\n    return atoi(argv[1]);\n}\n"),
     ("c|argv_elsewhere", "function",
@@ -96,6 +106,11 @@ def test_go_and_c_argv_still_seed_via_unit_type():
     det = _detect()
     assert "f:go|argv" in det.entry_points
     assert "f:c|argv_apps" in det.entry_points
+    # wave r1 (fable): the unit_type route itself, not the accidental idiom
+    # match (the c row's code contains `argv`, so the new idiom seeds it
+    # regardless of cli_handler membership).
+    reasons = det.entry_point_details["f:c|argv_apps"]["reasons"]
+    assert any(r.startswith("unit_type:") for r in reasons), reasons
 
 
 def test_c_gets_cross_language_match_keeps_firing():
