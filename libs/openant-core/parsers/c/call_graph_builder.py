@@ -41,7 +41,7 @@ from typing import Dict, List, Optional, Set
 import tree_sitter_c as tsc
 import tree_sitter_cpp as tscpp
 from tree_sitter import Language, Parser
-from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import read_json, open_utf8
 
 
 C_LANGUAGE = Language(tsc.language())
@@ -756,7 +756,6 @@ class CallGraphBuilder:
 
         # 4. If prototype exists, try to find the definition
         if call_name in self.prototypes:
-            proto = self.prototypes[call_name]
             # Look for a definition (non-header)
             for func_id in candidates:
                 func_data = self.functions.get(func_id, {})

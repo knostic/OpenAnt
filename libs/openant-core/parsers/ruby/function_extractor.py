@@ -34,15 +34,14 @@ Output (JSON):
 """
 
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional
 
 import tree_sitter_ruby as ts_ruby
 from tree_sitter import Language, Parser
-from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import read_json, open_utf8
 from utilities.path_filters import should_exclude_directory
 
 

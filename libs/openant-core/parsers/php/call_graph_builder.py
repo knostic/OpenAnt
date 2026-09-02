@@ -35,12 +35,11 @@ import json
 import os
 import re
 import sys
-from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import tree_sitter_php as ts_php
 from tree_sitter import Language, Parser
-from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import read_json, open_utf8
 
 
 # Use the tagless grammar variant: function bodies are re-parsed WITHOUT their <?php tag (func_data

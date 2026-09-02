@@ -32,7 +32,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
-from utilities.file_io import read_json, write_json, open_utf8, safe_to_read
+from utilities.file_io import open_utf8, safe_to_read
 
 
 class RepositoryScanner:

@@ -13,7 +13,6 @@ standardized metadata (timing, cost, inputs, outputs).
 import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any
 
 from utilities.file_io import write_json
 

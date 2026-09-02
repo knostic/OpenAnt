@@ -36,9 +36,8 @@ import json
 import re
 import sys
 import textwrap
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
-from utilities.file_io import read_json, write_json, open_utf8
+from typing import Dict, List, Optional, Set, Tuple
+from utilities.file_io import read_json, open_utf8
 
 
 class CallGraphBuilder:
@@ -1176,7 +1175,6 @@ class CallGraphBuilder:
 
             if potential_file in self.functions_by_file:
                 # Found a matching file
-                file_funcs = self.functions_by_file[potential_file]
 
                 # Look for the function
                 target_name = func_name

@@ -7,7 +7,6 @@ Run BEFORE any expensive LLM operations.
 """
 
 from core.file_boundary import has_boundary
-import json
 import sys
 from utilities.file_io import read_json
 

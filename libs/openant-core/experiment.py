@@ -28,24 +28,23 @@ Output:
 """
 
 import argparse
-import json
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
 
 from utilities.llm_client import get_global_tracker
 from utilities.llm import (
-    PhaseBinding,
     build_phase_registry,
     load_config_file,
     probe_registry_or_raise,
     resolve_llm_config,
-    simple_text,
 )
 from utilities.file_io import read_json, write_json
 from prompts.prompt_selector import get_analysis_prompt
-from prompts.vulnerability_analysis import get_system_prompt as get_stage1_system_prompt
+# RE-EXPORT, not unused: tests/test_cwe_tagging.py imports _normalize_result
+# FROM experiment (the from-import re-export form of the #482 trap — the
+# third instance in this sweep). Keep + noqa.
+from core.analysis_core import _normalize_result as _normalize_result  # noqa: F401
 from utilities.context_corrector import ContextCorrector
 from utilities.json_corrector import JSONCorrector
 from utilities.ground_truth_challenger import GroundTruthChallenger, print_challenge_report
@@ -53,9 +52,9 @@ from utilities.context_reviewer import ContextReviewer
 
 # Moved into core/ so the shipped package no longer depends on this research
 # harness. Re-exported here so existing experiment.py callers keep working.
-from core.analysis_core import analyze_unit, parse_response, _normalize_result
+from core.analysis_core import analyze_unit
 from utilities.finding_verifier import FindingVerifier
-from utilities.agentic_enhancer.repository_index import RepositoryIndex, load_index_from_file
+from utilities.agentic_enhancer.repository_index import load_index_from_file
 
 # Import application context (optional - for reducing false positives)
 try:
@@ -426,10 +425,10 @@ def run_experiment(
                 route = unit.get("route") or {}
                 if route:
                     route_key = f"{route.get('method', 'GET')}:{route.get('path', '/unknown')}"
-                    handler = route.get("handler", "main")
+                    route.get("handler", "main")  # dead: the handler name was never consumed
                 else:
                     route_key = unit.get("id", "unknown")
-                    handler = route_key.split(":")[-1] if ":" in route_key else route_key
+                    route_key.rsplit(":", 1)[-1] if ":" in route_key else route_key  # dead: never consumed
 
                 # Language defaults to "code" for generic code block formatting
                 language = "code"

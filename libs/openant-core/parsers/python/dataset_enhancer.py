@@ -8,8 +8,6 @@ function calls and gathering related code.
 
 import ast
 import json
-import os
-import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -32,7 +30,7 @@ class PythonDependencyResolver:
             try:
                 with open_utf8(file_path, errors="replace") as _f:
                     self.file_cache[path_str] = _f.read()
-            except Exception as e:
+            except Exception:
                 self.file_cache[path_str] = ""
         return self.file_cache[path_str]
 

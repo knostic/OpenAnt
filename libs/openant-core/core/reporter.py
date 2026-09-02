@@ -949,7 +949,6 @@ def generate_summary_report(
     Returns:
         ReportResult with the output path and usage info.
     """
-    import json
     from report.generator import generate_summary_report as _generate_summary, merge_dynamic_results
     from report.schema import validate_pipeline_output, ValidationError
     from utilities.llm import (
@@ -1042,7 +1041,6 @@ def generate_disclosure_docs(
     Returns:
         ReportResult with the output directory path and usage info.
     """
-    import json
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from report.generator import generate_disclosure as _generate_disclosure, _merge_usage, merge_dynamic_results
     from report.schema import validate_pipeline_output, ValidationError

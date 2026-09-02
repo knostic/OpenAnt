@@ -4,7 +4,6 @@ Stage 1: Repository Scanner for Swift
 Enumerates all Swift source files in a repository.
 """
 
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional

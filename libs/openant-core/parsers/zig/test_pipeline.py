@@ -17,7 +17,6 @@ Usage:
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from utilities.file_io import write_json

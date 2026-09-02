@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 from core.schemas import (
-    ScanResult, AnalysisMetrics, UsageInfo, StepReport, verify_step_summary,
+    ScanResult, AnalysisMetrics, StepReport, verify_step_summary,
 )
 from core.step_report import step_context
 from core import tracking

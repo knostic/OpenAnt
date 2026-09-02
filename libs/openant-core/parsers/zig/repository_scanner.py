@@ -4,7 +4,6 @@ Stage 1: Repository Scanner for Zig
 Enumerates all Zig source files in a repository.
 """
 
-import os
 from core.repo_walk import walk_repository
 from datetime import datetime
 from pathlib import Path

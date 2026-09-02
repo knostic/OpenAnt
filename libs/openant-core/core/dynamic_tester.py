@@ -5,7 +5,6 @@ Runs Docker-isolated exploit tests against confirmed vulnerabilities.
 Wraps ``utilities.dynamic_tester.run_dynamic_tests()``.
 """
 
-import json
 import os
 import shutil
 import sys

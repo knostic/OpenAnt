@@ -29,7 +29,6 @@ import argparse
 import csv
 import json
 import os
-import sys
 from utilities.file_io import normalize_results, read_json
 
 from core.verdict_taxonomy import (SEVERITIES as _SEVERITIES, SEVERITY_FINDING_VERDICTS,

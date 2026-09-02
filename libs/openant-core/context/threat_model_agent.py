@@ -23,7 +23,7 @@ import json
 from pathlib import Path
 
 from utilities.file_io import read_repo_file, repo_path_state, write_repo_file
-from utilities.llm import PhaseBinding, simple_text
+from utilities.llm import simple_text
 
 from context.repo_explorer import explore_repository
 

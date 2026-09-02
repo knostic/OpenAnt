@@ -8,7 +8,6 @@ which the Go CLI streams to the terminal in real-time.
 import sys
 import threading
 import time
-from typing import Optional
 
 
 def _fmt_duration(seconds: float) -> str:

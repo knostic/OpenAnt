@@ -52,8 +52,8 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
-from utilities.file_io import read_json, write_json, open_utf8
+from typing import Dict, List, Optional, Set
+from utilities.file_io import read_json, open_utf8
 from core.file_boundary import neutralize_boundaries
 
 

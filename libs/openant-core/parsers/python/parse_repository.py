@@ -45,14 +45,13 @@ See Also:
 import argparse
 import json
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from repository_scanner import RepositoryScanner
 from function_extractor import FunctionExtractor
 from call_graph_builder import CallGraphBuilder
 from unit_generator import UnitGenerator
-from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import write_json, open_utf8
 
 
 def generate_analyzer_output(extractor_result: dict, call_graph_result: dict | None = None) -> dict:

@@ -59,13 +59,12 @@ Output (JSON):
 
 import ast
 import json
-import os
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
-from utilities.file_io import read_json, write_json, open_utf8
+from typing import Dict, List, Optional, Set, Tuple
+from utilities.file_io import read_json, open_utf8
 
 
 class FunctionExtractor:
