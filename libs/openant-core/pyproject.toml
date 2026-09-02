@@ -51,7 +51,7 @@ target-version = "py311"
 [tool.ruff.lint]
 # Bug-catching rules apply everywhere; the style/dead-code rules (F401
 # unused-import, F841 unused-local) cover the WHOLE repo now — the prod
-# residue (92 findings: the refactor leftovers in the older c/php/ruby
+# residue (92 findings: the refactor leftovers in the c/php/ruby/python
 # parser import blocks + the core/utilities refactor residue, re-export-
 # adjudicated with 0 cross-file traps) was cleaned in the same commit the
 # scope expanded (the #481 prod half — the #483 test half preceded it).

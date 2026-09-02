@@ -425,10 +425,10 @@ def run_experiment(
                 route = unit.get("route") or {}
                 if route:
                     route_key = f"{route.get('method', 'GET')}:{route.get('path', '/unknown')}"
-                    route.get("handler", "main")  # dead: the handler name was never consumed
+                    # (the handler name was never consumed here)
                 else:
                     route_key = unit.get("id", "unknown")
-                    route_key.rsplit(":", 1)[-1] if ":" in route_key else route_key  # dead: never consumed
+                    pass
 
                 # Language defaults to "code" for generic code block formatting
                 language = "code"
