@@ -69,6 +69,7 @@ select = ["F821", "F811", "F823", "F401", "F841"]
 "report/**" = ["F401", "F841"]
 "prompts/**" = ["F401", "F841"]
 "openant/**" = ["F401", "F841"]
+"github_scanner/**" = ["F401", "F841"]
 # root-level dev scripts (experiment.py etc.) keep the bug-only choice too
 "experiment.py" = ["F401", "F841"]
 "validate_dataset_schema.py" = ["F401", "F841"]
