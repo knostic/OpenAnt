@@ -77,10 +77,6 @@ def test_write_test_files_stages_source(tmp_path):
         "requirements": "flask",
     }
 
-    finding = {
-        "location": {"file": "app.py", "function": "app.py:vuln"},
-    }
-
     work_dir = str(tmp_path / "work")
     os.makedirs(work_dir)
 

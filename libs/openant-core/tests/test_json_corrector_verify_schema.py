@@ -15,7 +15,6 @@ so a real verification result was silently dropped (mis-corrected/rejected).
 """
 import json
 
-import pytest
 
 from utilities.json_corrector import JSONCorrector
 

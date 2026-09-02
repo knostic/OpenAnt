@@ -37,7 +37,6 @@ findings to ERROR):
 import sys
 from pathlib import Path
 
-import pytest
 
 CORE = str(Path(__file__).resolve().parents[2])  # libs/openant-core
 if CORE not in sys.path:
@@ -133,7 +132,6 @@ def test_corrector_schema_carries_severity_top_level():
     # puts it — otherwise a corrected reply and a clean reply carry severity
     # in two shapes.
     assert '"severity"' in _VULN_SCHEMA
-    import json as _json
     top = _VULN_SCHEMA
     assert top.index('"severity"') < top.index('"vulnerabilities"'), \
         "severity must appear at the top level, before the nested array"
@@ -170,7 +168,6 @@ def _finding_row(severity=None, source=None, **extra):
 
 
 def test_pipeline_output_finding_record_carries_severity():
-    from core.reporter import build_pipeline_output
 
     po = _build_po([_finding_row(severity="high", source="model")])
     recs = po["findings"]
@@ -182,7 +179,6 @@ def test_pipeline_output_finding_record_carries_severity():
 def test_pipeline_output_derives_severity_for_old_artifacts():
     """The read-time derivation site: pre-PR results carry no severity —
     the reporter derives + marks, so old scans rank in the new surfaces."""
-    from core.reporter import build_pipeline_output
 
     po = _build_po([_finding_row()])  # no severity anywhere
     assert po["findings"][0]["severity"] == "high"
@@ -434,7 +430,7 @@ def test_the_one_severity_enum_everywhere():
     import importlib
     import openant.cli as cli
     import report.csv_export as csvx
-    from core import analysis_core, reporter
+    from core import analysis_core
     from core.verdict_taxonomy import SEVERITIES
 
     assert analysis_core.SEVERITIES is SEVERITIES

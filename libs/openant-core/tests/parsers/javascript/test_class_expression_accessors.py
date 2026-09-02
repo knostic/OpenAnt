@@ -9,7 +9,6 @@ import json
 import os
 import tempfile
 
-import pytest
 
 from core.parser_adapter import parse_repository
 

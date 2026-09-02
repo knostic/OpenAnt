@@ -239,7 +239,6 @@ def test_merge_usage_no_details_no_key():
 def test_verifier_real_loop_persists_usage_details():
     """Integration: the REAL Stage-2 loop records per-turn details to the
     tracker AND serializes them into the unit's verification record."""
-    import json
     from utilities.finding_verifier import FindingVerifier
     from utilities.llm.adapter import TextBlock, ToolUseBlock
     from utilities.llm.registry import PhaseBinding

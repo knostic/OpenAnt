@@ -1,5 +1,5 @@
 """Tests for TokenTracker."""
-from utilities.llm_client import TokenTracker, MODEL_PRICING
+from utilities.llm_client import TokenTracker
 
 
 class TestTokenTracker:

@@ -18,7 +18,6 @@ allowed to skip work; they are not allowed to do it quietly.
 import json
 from pathlib import Path
 
-import pytest
 
 from openant.cli import build_parser, resolve_language_selection
 

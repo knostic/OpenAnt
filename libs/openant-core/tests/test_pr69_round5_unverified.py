@@ -62,7 +62,7 @@ sys.path.insert(0, str(_CORE_ROOT))
 # that ``import anthropic`` for its real ``_exceptions`` types.
 
 from utilities.agentic_enhancer.repository_index import RepositoryIndex
-from utilities.finding_verifier import MAX_ITERATIONS, FindingVerifier, VerificationResult
+from utilities.finding_verifier import FindingVerifier, VerificationResult
 from utilities.llm import PhaseBinding, TextBlock, ToolUseBlock
 from utilities.llm.adapter import CompletionResult
 from utilities.llm_client import reset_warning_state

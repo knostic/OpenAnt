@@ -382,9 +382,8 @@ def test_behavioral_restore_case_pair_via_enhance(monkeypatch, tmp_path):
     The real path: a case-pair dataset resumed through the actual
     single-shot enhance loop — each unit must get its OWN context (the
     B-not-A hazard), and no unit may be re-enhanced."""
-    import sys as _sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))  # for the helpers
-    from test_enhance_resilience import _fake_binding, _dataset
+    from test_enhance_resilience import _fake_binding
     from utilities.context_enhancer import ContextEnhancer
 
     cp_dir = str(tmp_path / "enhance_checkpoints")

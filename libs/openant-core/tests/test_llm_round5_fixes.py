@@ -32,7 +32,6 @@ Everything here stubs the SDK boundary; nothing hits the network.
 from __future__ import annotations
 
 import traceback
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import anthropic

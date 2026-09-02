@@ -157,7 +157,6 @@ def test_html_report_feeds_the_report_llm_the_agentic_description():
 def test_nonstring_agent_context_degrades_not_crashes():
     """A hand-edited dataset with a non-dict agent_context exports a blank
     description rather than raising (the analyzer's guard convention)."""
-    import tempfile as tf
     import csv as _csv
     from report.csv_export import export_csv as _ex
     with tempfile.TemporaryDirectory() as d:

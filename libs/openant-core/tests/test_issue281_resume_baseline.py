@@ -31,7 +31,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core import tracking  # noqa: E402
-from utilities.llm_client import TokenTracker  # noqa: E402
 
 
 def _capture_usage_line(prefix="Stage 1", baseline=None):
@@ -108,7 +107,6 @@ def test_analyzer_resnapshot_is_placed_after_injection():
     """Source-placement contract: the analyzer's baseline re-snapshot must
     sit AFTER the add_prior_usage call (the mutation smoke's target —
     simulation tests can't catch a placement regression)."""
-    import re
     src = Path(__file__).parent.parent / "core" / "analyzer.py"
     text = src.read_text()
     # ORDER-SENSITIVE (wave catch: the old test was order-insensitive —

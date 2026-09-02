@@ -23,7 +23,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pytest
 
 CORE = str(Path(__file__).resolve().parents[2])  # libs/openant-core
 if CORE not in sys.path:
@@ -239,7 +238,7 @@ def test_preexisting_dynamic_blocks_are_cleared_by_merge(tmp_path):
     assert f.get("dynamic_testing_attempted", {}).get("status") == "ERROR"
 
     # SKIPPED: a forged block on a never-executed finding is cleared too
-    p2 = {"findings": [dict(forged := pipeline["findings"][0])]}
+    p2 = {"findings": [dict(pipeline["findings"][0])]}
     (d / "dynamic_test_results.json").write_text(_json.dumps({
         "results": [{"finding_id": "VULN-001", "identity_key": "k1",
                      "status": "SKIPPED", "evidence": []}]}))

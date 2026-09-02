@@ -33,7 +33,6 @@ normalization unit-test on a representative camelCase record still runs.
 """
 
 import json
-import os
 import shutil
 import subprocess
 import sys

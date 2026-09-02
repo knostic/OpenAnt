@@ -208,7 +208,6 @@ def test_canonical_interface_methods_present(tmp_path):
     """PR-lessons NEW-4 (sibling lockstep): Swift builder has get_dependencies/
     get_callers like the Zig/C builders."""
     from _helpers import CallGraphBuilder, FunctionExtractor, RepositoryScanner  # noqa
-    import tempfile, os
     d = str(tmp_path)
     (tmp_path / "a.swift").write_text("func a(){ b() }\nfunc b(){ c() }\nfunc c(){}")
     b = CallGraphBuilder(FunctionExtractor(d, RepositoryScanner(d).scan()).extract())

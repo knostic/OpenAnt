@@ -194,7 +194,6 @@ def test_analyzer_resume_restores_marker(tmp_path, monkeypatch):
     """The analyzer's checkpoint-restore path re-injects unpriced models
     from per-unit records into the tracker."""
     import json
-    from core import checkpoint as cp_mod
     from core import tracking
     from utilities.file_io import write_json
     import tempfile, os

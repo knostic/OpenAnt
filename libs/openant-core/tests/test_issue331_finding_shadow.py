@@ -22,7 +22,6 @@ finding (still disclosed via the net) with the correction recorded in
 `stage1_consistency_update`.
 """
 from core.analyzer import _count_verdicts
-from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
 from utilities import stage1_consistency as s1
 
 VULN_RK = "libs/a/client_utils.py:build_async_httpx_client"

@@ -102,7 +102,6 @@ def test_step_context_swallow_path_records_skipped_status(tmp_path: Path):
     status='skipped' on the step report — not the default 'success' — so the
     HTML step table (success->green, else->grey) stops rendering a crashed
     verify as green. Mirrors the scanner pattern without running a full scan."""
-    import os
     from core.step_report import step_context
     with step_context("verify", str(tmp_path)) as ctx:
         # simulate run_verification raising and being caught locally (no re-raise)
