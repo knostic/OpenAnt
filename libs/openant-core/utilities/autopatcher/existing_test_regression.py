@@ -16,7 +16,7 @@ call (test_plan_discovery.py) -> an immutable, validated TestExecutionPlan
 (test_plan_validation.py) -> the SAME plan executed against an isolated,
 unpatched copy (baseline) and an isolated copy with the FINAL candidate
 patch applied (patched), via a generic executor (test_executors.py) ->
-deterministic JUnit/TAP/exit-code comparison. A baseline does not need to
+deterministic JUnit/TAP/runner-summary/exit-code comparison. A baseline does not need to
 be green; a pre-existing failure is never attributed to the patch. JUnit
 and TAP are both normalized into the SAME per-test result shape
 (result_parsers.ParsedTestCounts) before reaching this module's own
@@ -48,6 +48,7 @@ not verdict" semantics, and those are what changed.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -70,6 +71,8 @@ STATUS_NOT_VERIFIED = "NOT_VERIFIED"
 STATUS_TEST_EXECUTION_ERROR = "TEST_EXECUTION_ERROR"
 
 _MAX_EXCERPT_CHARS = 4_000
+_EXCERPT_HEAD_CHARS = _MAX_EXCERPT_CHARS // 2
+_EXCERPT_TAIL_CHARS = _MAX_EXCERPT_CHARS - _EXCERPT_HEAD_CHARS
 
 
 def preflight_test_comparison_environment():
@@ -97,10 +100,153 @@ def preflight_test_comparison_environment():
 
 
 def _excerpt(text: "str | None") -> str:
+    """Bound `text` to _MAX_EXCERPT_CHARS TOTAL, keeping both the
+    beginning AND the end -- never head-only. Many tools' actionable
+    summary (pytest's final pass/fail counts and failure list included)
+    is printed at the END of a long run, not the start; a head-only
+    excerpt discards exactly that content. This makes no assumption about
+    ANY specific tool's output format -- it is a fixed, generic
+    head+tail/omit-the-middle shape applied identically regardless of
+    what produced `text`.
+
+    Operates on the executor's full, untruncated capture (see
+    test_executors.py -- this is now the ONLY truncation point in the
+    whole pipeline), so the tail this keeps is the REAL tail of the
+    stream, not the tail of some earlier, unrelated size cut.
+
+    Below the total budget, `text` is returned byte-for-byte unchanged."""
     text = text or ""
     if len(text) <= _MAX_EXCERPT_CHARS:
         return text
-    return text[:_MAX_EXCERPT_CHARS] + f"\n[… {len(text) - _MAX_EXCERPT_CHARS} more char(s) truncated]"
+    head = text[:_EXCERPT_HEAD_CHARS]
+    tail = text[-_EXCERPT_TAIL_CHARS:]
+    omitted = len(text) - _EXCERPT_HEAD_CHARS - _EXCERPT_TAIL_CHARS
+    return f"{head}\n[… {omitted} character(s) omitted from the middle …]\n{tail}"
+
+
+# ---------------------------------------------------------------------------
+# Runner-summary counts -- a fallback evidence tier for the wrapper-command
+# class of test entry point (nox/tox/Make/etc.), where no structured
+# junit/tap report exists at all. Deterministic and generic: it recognizes
+# generic OUTCOME WORDS immediately adjacent to a number on a SINGLE line,
+# never any specific runner's exact phrasing or name -- consistent with
+# this module's "no tool-specific knowledge" rule (see module docstring).
+#
+# Validated empirically against the real urllib3 CVE-2023-43804 capture
+# (recovered the true 103->104 failed / 1639->1638 passed / 563 skipped
+# delta cleanly, with zero competing candidates) and stress-tested against
+# warning prose, progress lines, exception text, timing/percentage noise,
+# and a synthetic multi-session capture (correctly failed closed on all of
+# them) -- see the architecture investigation this implements.
+#
+# Deliberately NOT attempted, per that investigation's own conclusions:
+#   - multi-line summary stitching (single-line candidates only)
+#   - a "Tests run: N" tolerance for Maven/Surefire's real phrasing (its
+#     label and number are separated by an extra word -- accepting that
+#     would mean special-casing that exact phrase)
+#   - deriving a PASSED count from a TOTAL count by subtraction
+# All three would add either runner-specific knowledge or a first
+# arithmetic-inference step this feature has never needed anywhere else.
+# ---------------------------------------------------------------------------
+
+_SUMMARY_TAIL_LINES = 300
+
+# FAILED and ERRORED are kept as separate buckets, not merged as synonyms.
+# pytest itself reports them separately when both occur ("1 failed, 1
+# error, 8 passed"), and Maven/Surefire's "Failures: N, Errors: M" is a
+# real, non-synonymous convention -- merging them (tried during
+# investigation) caused Maven's own legitimate shape to be rejected as
+# "conflicting counts for one bucket."
+_SUMMARY_BUCKETS = {
+    "FAILED":  r'fail(?:s|ed|ure|ures)?',
+    "ERRORED": r'error(?:s|ed)?',
+    "PASSED":  r'pass(?:es|ed)?|success(?:es)?',
+    "SKIPPED": r'skip(?:s|ped)?|xfail(?:ed)?|ignored',
+    "TOTAL":   r'tests?',
+}
+_SUMMARY_LABEL_ALT = "|".join(f"(?P<{name}>{pattern})" for name, pattern in _SUMMARY_BUCKETS.items())
+
+# "103 failed", "1639 passed" -- a count immediately followed by a label.
+_NUM_THEN_LABEL_RE = re.compile(
+    rf'(?<![\d.])(?P<count>\d{{1,7}})\s+(?:{_SUMMARY_LABEL_ALT})\b', re.IGNORECASE,
+)
+# "Failures: 3", "Tests: 100" -- a label immediately followed by its own
+# count, with only whitespace or a single colon in between. Deliberately
+# strict: an earlier, looser version of this pattern let a label "reach
+# across" a comma into an UNRELATED clause's own number (e.g. "failed,
+# 1639 passed" was misread as failed=1639) -- no intervening punctuation
+# or extra words are allowed between a label and its number.
+_LABEL_THEN_NUM_RE = re.compile(
+    rf'\b(?:{_SUMMARY_LABEL_ALT})\b(?:\s*:\s*|\s+)(?P<count>\d{{1,7}})(?!\d)', re.IGNORECASE,
+)
+
+_SUMMARY_FAIL_SIDE = frozenset({"FAILED", "ERRORED"})
+_SUMMARY_RESOLUTION_SIDE = frozenset({"PASSED", "TOTAL"})
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+
+def _summary_bucket_of(match: "re.Match") -> "str | None":
+    for name in _SUMMARY_BUCKETS:
+        if match.group(name):
+            return name
+    return None
+
+
+def _extract_summary_pairs(line: str) -> "dict[str, int] | None":
+    """(bucket -> count) for ONE already-normalized line, or None if the
+    same bucket would receive two DIFFERENT values on this line -- fails
+    closed on ambiguity rather than picking one."""
+    found: "dict[str, int]" = {}
+    for regex in (_NUM_THEN_LABEL_RE, _LABEL_THEN_NUM_RE):
+        for m in regex.finditer(line):
+            bucket = _summary_bucket_of(m)
+            count = int(m.group("count"))
+            if bucket in found and found[bucket] != count:
+                return None
+            found[bucket] = count
+    return found
+
+
+def _is_plausible_summary(pairs: "dict[str, int] | None") -> bool:
+    """A candidate must report at least two distinct outcome categories
+    AND span both a fail-side bucket (failed/errored) and a resolution-
+    side bucket (passed/total). This is what tells an actual test-run
+    summary line apart from incidental prose that happens to mention two
+    failure-domain words together (e.g. an unrelated warning about "3
+    errors, 4 failures" from an upstream service, which has no
+    resolution-side count at all) -- a real, adversarial case this
+    rejected during investigation."""
+    if not pairs or len(pairs) < 2:
+        return False
+    return bool(_SUMMARY_FAIL_SIDE & pairs.keys()) and bool(_SUMMARY_RESOLUTION_SIDE & pairs.keys())
+
+
+def _find_runner_summary(stdout: "str | None") -> "dict[str, int] | None":
+    """Scan the true TAIL of `stdout` (bounded, and kept near the END of
+    execution, where a final summary conventionally lives -- never the
+    whole stream) for exactly ONE plausible aggregate-count candidate
+    line. Returns that candidate's (bucket -> count) mapping, or None if
+    zero or more than one plausible candidate was found. Never guesses
+    among multiple candidates, never merges or aggregates them -- a
+    multi-session/multi-interpreter wrapper producing more than one real
+    summary line in the same stream is exactly the ambiguous case this
+    must decline, not silently resolve."""
+    if not stdout:
+        return None
+    lines = stdout.splitlines()[-_SUMMARY_TAIL_LINES:]
+    candidates: "list[dict[str, int]]" = []
+    for raw_line in lines:
+        line = _ANSI_RE.sub('', raw_line)
+        line = re.sub(r'\s+', ' ', line.strip())
+        if not line:
+            continue
+        pairs = _extract_summary_pairs(line)
+        if _is_plausible_summary(pairs):
+            candidates.append(pairs)
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -131,10 +277,18 @@ class TestRunResult:
         OK              -- per-test IDs available (junit, full parse).
         COUNTS_ONLY     -- only aggregate pass/fail/skip/error counts
                            (junit, suite-level-only parse).
+        RUNNER_SUMMARY_COUNTS -- aggregate counts parsed from the test
+                           command's own final summary line via generic
+                           outcome-word/number adjacency, attempted only
+                           when no structured junit/tap report was
+                           available at all (see _find_runner_summary).
+                           Weaker than COUNTS_ONLY -- a real structured
+                           report format is still stronger evidence than
+                           deterministically-parsed free text.
         EXIT_CODE_ONLY  -- only the process exit code (result_strategy
-                           "exit_code", or "junit" declared but
-                           unavailable/unparseable, falling back rather
-                           than discarding real evidence -- see
+                           "exit_code", or "junit"/"tap" declared but
+                           unavailable/unparseable and no runner-summary
+                           candidate found either -- see
                            _to_test_run_result).
         UNAVAILABLE     -- no usable evidence at all.
     """
@@ -249,12 +403,50 @@ def _structured_source_text(plan: TestExecutionPlan, raw: TestExecutionResult) -
     ``result_output_path`` be null for it -- so it is read directly from
     the test command's own normal captured stdout (see
     test_plan_discovery.py's "TAP RESULT SOURCE" policy and
-    tap_parser.py's module docstring)."""
+    tap_parser.py's module docstring).
+
+    ``raw.stdout`` here is the executor's FULL, untruncated capture, not
+    a bounded excerpt -- test_executors.py performs no truncation of its
+    own; _excerpt() below is the one and only place output gets bounded,
+    and it is applied separately, only when building the report-facing
+    TestRunResult, never to the text a structured-result parser reads.
+    This is what lets TAP (like JUnit already did) see the complete
+    stream regardless of its size."""
     if plan.result_strategy == "junit":
         return raw.result_output
     if plan.result_strategy == "tap":
         return raw.stdout
     return None
+
+
+def _build_evidence_from_exit_code(
+    plan: TestExecutionPlan, raw: TestExecutionResult, *, unavailable_reason: "str | None",
+) -> TestRunResult:
+    """Common tail for _to_test_run_result whenever no structured
+    (junit/tap) per-test evidence is available and raw.exit_code IS
+    present: try the generic runner-summary-counts fallback before
+    settling for bare exit-code evidence. `unavailable_reason`, when
+    given, is the declared-but-unavailable explanation for a junit/tap
+    plan that fell through to this point; None for a plain exit_code
+    plan -- preserved verbatim as the EXIT_CODE_ONLY reason when no
+    runner-summary candidate is found, exactly as before this fallback
+    existed."""
+    summary = _find_runner_summary(raw.stdout)
+    if summary is not None:
+        return TestRunResult(
+            command=plan.test_command, status="COMPLETED", exit_code=raw.exit_code,
+            duration_seconds=raw.duration_seconds,
+            passed=summary.get("PASSED"), failed=summary.get("FAILED"),
+            skipped=summary.get("SKIPPED"), errors=summary.get("ERRORED"),
+            failed_test_ids=None, stdout_excerpt=_excerpt(raw.stdout), stderr_excerpt=_excerpt(raw.stderr),
+            timed_out=False, evidence_level="RUNNER_SUMMARY_COUNTS", reason=None,
+        )
+    return TestRunResult(
+        command=plan.test_command, status="COMPLETED", exit_code=raw.exit_code,
+        duration_seconds=raw.duration_seconds, passed=None, failed=None, skipped=None, errors=None,
+        failed_test_ids=None, stdout_excerpt=_excerpt(raw.stdout), stderr_excerpt=_excerpt(raw.stderr),
+        timed_out=False, evidence_level="EXIT_CODE_ONLY", reason=unavailable_reason,
+    )
 
 
 def _to_test_run_result(plan: TestExecutionPlan, raw: TestExecutionResult) -> TestRunResult:
@@ -292,17 +484,18 @@ def _to_test_run_result(plan: TestExecutionPlan, raw: TestExecutionResult) -> Te
         # Structured output was declared but is unavailable/unparseable/
         # empty (for TAP this also covers a parser that fails closed on
         # malformed/truncated/ambiguous input -- see tap_parser.parse_tap)
-        # -- fall back to exit-code-level evidence rather than discarding
-        # the run entirely; a real exit code is still real, if coarser,
-        # evidence. The SAME fallback serves both junit and tap -- see the
-        # module docstring's "reuse the same comparator abstraction".
+        # -- try the generic runner-summary-counts fallback before
+        # settling for bare exit-code evidence; a real exit code is still
+        # real, if coarser, evidence either way. The SAME fallback serves
+        # both junit and tap -- see the module docstring's "reuse the same
+        # comparator abstraction".
         if raw.exit_code is not None:
-            return TestRunResult(
-                command=plan.test_command, status="COMPLETED", exit_code=raw.exit_code,
-                duration_seconds=raw.duration_seconds, passed=None, failed=None, skipped=None, errors=None,
-                failed_test_ids=None, stdout_excerpt=_excerpt(raw.stdout), stderr_excerpt=_excerpt(raw.stderr),
-                timed_out=False, evidence_level="EXIT_CODE_ONLY",
-                reason=f"{label} output was declared but unavailable/unparseable; falling back to exit-code evidence",
+            return _build_evidence_from_exit_code(
+                plan, raw,
+                unavailable_reason=(
+                    f"{label} output was declared but unavailable/unparseable; "
+                    "falling back to exit-code evidence"
+                ),
             )
         return TestRunResult(
             command=plan.test_command, status="UNPARSEABLE", exit_code=raw.exit_code,
@@ -321,12 +514,7 @@ def _to_test_run_result(plan: TestExecutionPlan, raw: TestExecutionResult) -> Te
             timed_out=False, evidence_level="UNAVAILABLE",
             reason="no exit code was captured",
         )
-    return TestRunResult(
-        command=plan.test_command, status="COMPLETED", exit_code=raw.exit_code,
-        duration_seconds=raw.duration_seconds, passed=None, failed=None, skipped=None, errors=None,
-        failed_test_ids=None, stdout_excerpt=_excerpt(raw.stdout), stderr_excerpt=_excerpt(raw.stderr),
-        timed_out=False, evidence_level="EXIT_CODE_ONLY", reason=None,
-    )
+    return _build_evidence_from_exit_code(plan, raw, unavailable_reason=None)
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +527,21 @@ def _to_test_run_result(plan: TestExecutionPlan, raw: TestExecutionResult) -> Te
 # (or vice versa). See the module docstring.
 # ---------------------------------------------------------------------------
 
-_EVIDENCE_LEVEL_RANK = {"UNAVAILABLE": 0, "EXIT_CODE_ONLY": 1, "COUNTS_ONLY": 2, "OK": 3}
+_EVIDENCE_LEVEL_RANK = {
+    "UNAVAILABLE": 0, "EXIT_CODE_ONLY": 1, "RUNNER_SUMMARY_COUNTS": 2, "COUNTS_ONLY": 3, "OK": 4,
+}
+
+
+def _populated_count_buckets(r: TestRunResult) -> "frozenset[str]":
+    """Which of TestRunResult's own count fields this side's evidence
+    actually populated -- used only to decide whether baseline and
+    patched RUNNER_SUMMARY_COUNTS candidates are comparable at all (they
+    must expose the identical set; anything else -- e.g. one side's
+    summary line omitting a zero-count category the other side's line
+    happens to include -- is a reporting-shape mismatch, not something
+    safe to paper over by assuming the missing one means zero)."""
+    fields = {"passed": r.passed, "failed": r.failed, "skipped": r.skipped, "errors": r.errors}
+    return frozenset(name for name, value in fields.items() if value is not None)
 
 
 def _compare_exit_code_only(command, baseline: TestRunResult, patched: TestRunResult) -> ExistingTestComparisonResult:
@@ -374,6 +576,39 @@ def _compare_exit_code_only(command, baseline: TestRunResult, patched: TestRunRe
     )
 
 
+def _compare_by_aggregate_counts(
+    command, baseline: TestRunResult, patched: TestRunResult, *, new_failure_note: str,
+) -> ExistingTestComparisonResult:
+    """Shared count-based comparison for COUNTS_ONLY and
+    RUNNER_SUMMARY_COUNTS -- both reduce to the identical question ('did
+    the aggregate bad-count go up'); only the evidence-tier-appropriate
+    caveat in the NEW_FAILURES_DETECTED reason differs, so a reader never
+    mistakes a heuristic aggregate delta for structured per-test proof."""
+    b_bad = (baseline.failed or 0) + (baseline.errors or 0)
+    p_bad = (patched.failed or 0) + (patched.errors or 0)
+    if p_bad > b_bad:
+        return ExistingTestComparisonResult(
+            status=STATUS_NEW_FAILURES_DETECTED, command=command, baseline=baseline, patched=patched,
+            reason=(
+                f"Failure/error count increased from {b_bad} to {p_bad}; individual "
+                f"newly-failing tests could not be identified ({new_failure_note}) -- "
+                "count-based evidence only."
+            ),
+        )
+    if p_bad > 0:
+        return ExistingTestComparisonResult(
+            status=STATUS_PRE_EXISTING_FAILURES_ONLY, command=command, baseline=baseline, patched=patched,
+            reason=(
+                f"{p_bad} failure(s)/error(s), not more than baseline ({b_bad}); "
+                "count-based comparison only; no new failures indicated."
+            ),
+        )
+    return ExistingTestComparisonResult(
+        status=STATUS_PASS, command=command, baseline=baseline, patched=patched,
+        reason="No failures in either run (count-based comparison only).",
+    )
+
+
 def compare_runs(
     command: "tuple[str, ...]", baseline: TestRunResult, patched: TestRunResult,
 ) -> ExistingTestComparisonResult:
@@ -399,31 +634,26 @@ def compare_runs(
         return _compare_exit_code_only(command, baseline, patched)
 
     if effective_rank == 2:
-        b_bad = (baseline.failed or 0) + (baseline.errors or 0)
-        p_bad = (patched.failed or 0) + (patched.errors or 0)
-        if p_bad > b_bad:
-            return ExistingTestComparisonResult(
-                status=STATUS_NEW_FAILURES_DETECTED, command=command, baseline=baseline, patched=patched,
-                reason=(
-                    f"Failure/error count increased from {b_bad} to {p_bad}; individual "
-                    "newly-failing tests could not be identified (structured per-test IDs "
-                    "were unavailable) -- count-based evidence only."
-                ),
-            )
-        if p_bad > 0:
-            return ExistingTestComparisonResult(
-                status=STATUS_PRE_EXISTING_FAILURES_ONLY, command=command, baseline=baseline, patched=patched,
-                reason=(
-                    f"{p_bad} failure(s)/error(s), not more than baseline ({b_bad}); "
-                    "count-based comparison only; no new failures indicated."
-                ),
-            )
-        return ExistingTestComparisonResult(
-            status=STATUS_PASS, command=command, baseline=baseline, patched=patched,
-            reason="No failures in either run (count-based comparison only).",
+        # RUNNER_SUMMARY_COUNTS -- deterministic aggregate counts parsed
+        # from the final runner-summary line, never structured per-test
+        # output. Baseline and patched must additionally expose the
+        # IDENTICAL set of populated count buckets before being treated
+        # as comparable at all; any mismatch falls back to plain
+        # exit-code comparison rather than guessing which side's shape is
+        # "right".
+        if _populated_count_buckets(baseline) != _populated_count_buckets(patched):
+            return _compare_exit_code_only(command, baseline, patched)
+        return _compare_by_aggregate_counts(
+            command, baseline, patched,
+            new_failure_note="evidence is deterministic aggregate runner-summary counts, not structured per-test output",
         )
 
-    # effective_rank == 3 -- full per-test-ID evidence on both sides
+    if effective_rank == 3:
+        return _compare_by_aggregate_counts(
+            command, baseline, patched, new_failure_note="structured per-test IDs were unavailable",
+        )
+
+    # effective_rank == 4 -- full per-test-ID evidence on both sides
     b_ids = set(baseline.failed_test_ids or [])
     p_ids = set(patched.failed_test_ids or [])
     newly_failing = sorted(p_ids - b_ids)
@@ -825,7 +1055,16 @@ def render_existing_test_comparison(result: "ExistingTestComparisonResult | None
                 "failed after applying the candidate patch.\n"
             )
         else:
-            lines.append("❌ New failures detected after the candidate patch\n")
+            # No named test IDs at this evidence tier (COUNTS_ONLY or
+            # RUNNER_SUMMARY_COUNTS) -- surface the evidence-tier-specific
+            # caveat from `reason` explicitly (it already says, e.g.,
+            # "individual newly-failing tests could not be identified...
+            # count-based evidence only") rather than the bare status
+            # line alone, so a reader can never mistake an aggregate-
+            # count delta for a proven, specific new failure.
+            lines.append("❌ The patched test run showed worse aggregate results.\n\n")
+            if result.reason:
+                lines.append(f"{result.reason}\n")
 
     lines.append(_run_summary_line("Baseline", result.baseline) + "\n")
     lines.append(_run_summary_line("Patched", result.patched) + "\n")

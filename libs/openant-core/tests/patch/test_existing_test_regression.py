@@ -265,6 +265,220 @@ class TestCompareRunsExitCodeOnly:
         assert run_result.status == "COMPLETED"
 
 
+class TestClassificationUnaffectedByEvidenceReshaping:
+    """Evidence-handling changes (untruncated TAP source, head+tail
+    excerpts) must never change classification. exit_code-only,
+    both-sides-nonzero stays exactly the same conservative NOT_VERIFIED,
+    regardless of how large the underlying captured output was."""
+
+    def test_exit_code_only_both_nonzero_with_large_output_stays_not_verified(self):
+        huge_stdout = "line of test output\n" * 50_000  # well past _MAX_EXCERPT_CHARS
+        baseline = etr._to_test_run_result(_EXIT_CODE_PLAN, _exec_result(stdout=huge_stdout, exit_code=1))
+        patched = etr._to_test_run_result(_EXIT_CODE_PLAN, _exec_result(stdout=huge_stdout, exit_code=1))
+        result = etr.compare_runs(_EXIT_CODE_PLAN.test_command, baseline, patched)
+        assert result.status == etr.STATUS_NOT_VERIFIED
+        assert "cannot distinguish" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# Runner-summary counts -- deterministic aggregate-count fallback for the
+# wrapper-command class (no structured junit/tap report available at all).
+# See existing_test_regression.py's own section docstring for the
+# empirical validation (real urllib3 capture) and adversarial cases this
+# was tested against.
+# ---------------------------------------------------------------------------
+
+class TestExtractSummaryPairs:
+    """_extract_summary_pairs / _is_plausible_summary -- the line-level
+    acceptance rules, tested in isolation before any integration."""
+
+    def test_pytest_shaped_line_accepted(self):
+        pairs = etr._extract_summary_pairs("103 failed, 1639 passed, 563 skipped, 163 warnings in 65.69s")
+        assert pairs == {"FAILED": 103, "PASSED": 1639, "SKIPPED": 563}
+        assert etr._is_plausible_summary(pairs)
+
+    def test_rust_shaped_line_accepted(self):
+        pairs = etr._extract_summary_pairs("test result: FAILED. 10 passed; 1 failed; 2 ignored")
+        assert pairs == {"PASSED": 10, "FAILED": 1, "SKIPPED": 2}
+        assert etr._is_plausible_summary(pairs)
+
+    def test_failed_error_passed_counts_remain_separate(self):
+        """pytest's own 'N failed, M error, K passed' shape -- FAILED and
+        ERRORED must never be merged into one bucket (an earlier version
+        of this parser did, and it broke Maven's real, legitimately
+        separate 'Failures: N, Errors: M' convention)."""
+        pairs = etr._extract_summary_pairs("1 failed, 1 error, 8 passed in 0.12s")
+        assert pairs == {"FAILED": 1, "ERRORED": 1, "PASSED": 8}
+
+    def test_warning_prose_with_two_failure_words_is_rejected(self):
+        """Real adversarial case found during investigation: an unrelated
+        warning mentioning two failure-domain words together must not
+        pass, because it has no resolution-side (passed/total) count at
+        all -- exactly what distinguishes incidental prose from an actual
+        test-run summary."""
+        pairs = etr._extract_summary_pairs("WARNING: upstream reported 3 errors, 4 failures in the last hour")
+        assert pairs == {"ERRORED": 3, "FAILED": 4}
+        assert not etr._is_plausible_summary(pairs)
+
+    def test_progress_line_rejected(self):
+        pairs = etr._extract_summary_pairs("test_x FAILED [47%]")
+        assert not etr._is_plausible_summary(pairs)
+
+    def test_exception_text_rejected(self):
+        pairs = etr._extract_summary_pairs(
+            "Failed to establish a new connection: [Errno 111] Connection refused"
+        )
+        assert not etr._is_plausible_summary(pairs)
+
+    def test_timing_percentage_line_rejected(self):
+        pairs = etr._extract_summary_pairs(
+            "5.02s call test/contrib/test_pyopenssl.py::TestSocketSSL::test_x [47%]"
+        )
+        assert not etr._is_plausible_summary(pairs)
+
+    def test_conflicting_counts_for_same_bucket_rejects_the_line(self):
+        assert etr._extract_summary_pairs("3 failed and separately 5 failed were reported") is None
+
+    def test_maven_tests_run_phrasing_is_explicitly_not_supported(self):
+        """Documents the known, deliberate gap from the investigation:
+        Maven/Surefire's real 'Tests run: N' phrasing has an intervening
+        word between the label and its colon, which this generic,
+        adjacency-only parser does not tolerate -- accepting it would
+        mean special-casing that exact phrase. FAILED/ERRORED/SKIPPED
+        still parse; TOTAL does not, and with no PASSED present either,
+        the line correctly fails the resolution-side requirement."""
+        pairs = etr._extract_summary_pairs("Tests run: 100, Failures: 3, Errors: 2, Skipped: 4")
+        assert pairs == {"FAILED": 3, "ERRORED": 2, "SKIPPED": 4}
+        assert not etr._is_plausible_summary(pairs)
+
+
+class TestFindRunnerSummary:
+    """_find_runner_summary -- the bounded-tail scan and multi-candidate
+    fail-closed behavior."""
+
+    def test_zero_candidates_returns_none(self):
+        stdout = "\n".join(f"line {i} with no outcome words" for i in range(50))
+        assert etr._find_runner_summary(stdout) is None
+
+    def test_more_than_one_plausible_candidate_returns_none(self):
+        """Synthetic multi-session capture -- two independently-valid
+        summary lines in one stream (e.g. a wrapper that merges multiple
+        interpreter sessions into one stdout) must never be resolved by
+        picking one or aggregating them."""
+        stdout = (
+            "==== 12 failed, 400 passed, 10 skipped in 40.11s ====\n"
+            "==== 10 failed, 402 passed, 10 skipped in 39.02s ====\n"
+        )
+        assert etr._find_runner_summary(stdout) is None
+
+    def test_exactly_one_candidate_is_returned(self):
+        stdout = "noise\nmore noise\n==== 103 failed, 1639 passed, 563 skipped in 65.69s ====\n"
+        assert etr._find_runner_summary(stdout) == {"FAILED": 103, "PASSED": 1639, "SKIPPED": 563}
+
+    def test_real_urllib3_baseline_and_patched_captures(self):
+        """Direct regression anchor for the real CVE-2023-43804 probe this
+        mechanism was built to improve: the true captured stdout (~1.1M
+        chars) from both sides, reproduced verbatim (trimmed to the
+        relevant tail here) -- must recover the exact validated delta."""
+        baseline_tail = (
+            "FAILED test/with_dummyserver/test_socketlevel.py::TestHeaders::test_request_host_header_ignores_fqdn_dot\n"
+            "==== 103 failed, 1639 passed, 563 skipped, 163 warnings in 65.69s (0:01:05) ====\n"
+            "__OPENANT_RESULT_START__\n__OPENANT_RESULT_END__\n"
+        )
+        patched_tail = (
+            "FAILED test/with_dummyserver/test_socketlevel.py::TestHeaders::test_request_host_header_ignores_fqdn_dot\n"
+            "==== 104 failed, 1638 passed, 563 skipped, 163 warnings in 65.44s (0:01:05) ====\n"
+            "__OPENANT_RESULT_START__\n__OPENANT_RESULT_END__\n"
+        )
+        assert etr._find_runner_summary(baseline_tail) == {"FAILED": 103, "PASSED": 1639, "SKIPPED": 563}
+        assert etr._find_runner_summary(patched_tail) == {"FAILED": 104, "PASSED": 1638, "SKIPPED": 563}
+
+
+class TestRunnerSummaryCountsIntegration:
+    """End-to-end: _to_test_run_result -> compare_runs, exercised through
+    an exit_code plan the same way production reaches this fallback."""
+
+    _SUMMARY_PLAN = _EXIT_CODE_PLAN  # result_strategy="exit_code" -- no structured evidence declared
+
+    def _run_result(self, stdout: str, exit_code: int = 1):
+        return etr._to_test_run_result(self._SUMMARY_PLAN, _exec_result(stdout=stdout, exit_code=exit_code))
+
+    def test_zero_candidates_stays_exit_code_only(self):
+        r = self._run_result("no outcome words here at all\n")
+        assert r.evidence_level == "EXIT_CODE_ONLY"
+        assert r.failed is None and r.passed is None
+
+    def test_accepted_summary_populates_runner_summary_counts(self):
+        r = self._run_result("==== 103 failed, 1639 passed, 563 skipped in 65.69s ====\n")
+        assert r.evidence_level == "RUNNER_SUMMARY_COUNTS"
+        assert r.failed == 103 and r.passed == 1639 and r.skipped == 563
+        assert r.failed_test_ids is None  # never claims identities at this tier
+
+    def test_junit_structured_evidence_still_takes_precedence(self):
+        """A plan declaring junit, with genuinely parseable junit output,
+        must reach OK/COUNTS_ONLY -- the runner-summary fallback is
+        integrated strictly AFTER structured parsing fails, never before,
+        even if the raw stdout ALSO happens to contain a summary-shaped
+        line."""
+        raw = _exec_result(
+            result_output=_junit(passed=5, failed_ids=["t::a"]),
+            stdout="==== 1 failed, 5 passed in 1.0s ====\n",
+            exit_code=1,
+        )
+        result = etr._to_test_run_result(_plan(), raw)
+        assert result.evidence_level == "OK"
+        assert result.failed_test_ids == ["t::a"]
+
+    def test_adverse_delta_produces_new_failures_detected_with_hedged_reason(self):
+        baseline = self._run_result("==== 103 failed, 1639 passed, 563 skipped in 65.69s ====\n")
+        patched = self._run_result("==== 104 failed, 1638 passed, 563 skipped in 65.44s ====\n")
+        result = etr.compare_runs(self._SUMMARY_PLAN.test_command, baseline, patched)
+        assert result.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert result.newly_failing_tests == []  # exact identity remains UNKNOWN at this tier
+        assert "could not be identified" in result.reason
+        assert "runner-summary" in result.reason
+        assert "not structured per-test output" in result.reason
+        # must never imply causal proof
+        assert "introduced" not in result.reason.lower()
+
+    def test_mismatched_bucket_sets_fall_back_to_exit_code_comparison(self):
+        """Baseline's summary omits 'skipped' entirely (some runners drop
+        a zero-count category); patched's includes it. Different
+        populated-bucket shapes must never be treated as comparable."""
+        baseline = self._run_result("==== 3 failed, 100 passed in 1.0s ====\n")
+        patched = self._run_result("==== 3 failed, 100 passed, 2 skipped in 1.0s ====\n")
+        result = etr.compare_runs(self._SUMMARY_PLAN.test_command, baseline, patched)
+        # falls back to plain exit-code comparison -- both sides exited
+        # non-zero here, so this is the conservative NOT_VERIFIED path.
+        assert result.status == etr.STATUS_NOT_VERIFIED
+        assert "cannot distinguish" in result.reason
+
+    def test_report_states_aggregate_evidence_and_unavailable_identity(self):
+        baseline = self._run_result("==== 103 failed, 1639 passed, 563 skipped in 65.69s ====\n")
+        patched = self._run_result("==== 104 failed, 1638 passed, 563 skipped in 65.44s ====\n")
+        result = etr.compare_runs(self._SUMMARY_PLAN.test_command, baseline, patched)
+        out = etr.render_existing_test_comparison(result)
+        assert "worse aggregate results" in out.lower()
+        assert "could not be identified" in out
+        assert "runner-summary" in out
+
+    def test_existing_counts_only_report_also_discloses_its_caveat(self):
+        """The pre-existing report gap this change also closes: a
+        COUNTS_ONLY-tier NEW_FAILURES_DETECTED result (suite-level-only
+        junit parse -- no per-test IDs) must ALSO clearly state that
+        exact test identities are unavailable in the rendered report, not
+        just the bare status headline."""
+        baseline = _run(100, level="COUNTS_ONLY")
+        baseline.failed = 0
+        patched = _run(98, level="COUNTS_ONLY")
+        patched.failed = 2
+        result = etr.compare_runs(("cmd",), baseline, patched)
+        assert result.status == etr.STATUS_NEW_FAILURES_DETECTED
+        out = etr.render_existing_test_comparison(result)
+        assert "could not be identified" in out
+        assert "structured per-test IDs were unavailable" in out
+
+
 # ---------------------------------------------------------------------------
 # _to_test_run_result
 # ---------------------------------------------------------------------------
@@ -325,6 +539,27 @@ class TestTapToTestRunResult:
         raw = _exec_result(result_output=_junit(passed=99), stdout=_tap(passed=2), exit_code=0)
         result = etr._to_test_run_result(_TAP_PLAN, raw)
         assert result.passed == 2  # from stdout's TAP, not result_output's (irrelevant) JUnit
+
+    def test_tap_parses_correctly_when_real_content_sits_far_past_the_excerpt_bound(self):
+        """Regression guard for the general failure class this module's
+        own docstring update documents: TAP structured parsing reads
+        raw.stdout directly (_structured_source_text), which must be the
+        FULL captured stream, never something already bounded by
+        _excerpt -- that bound is applied separately, only when building
+        the report-facing TestRunResult.stdout_excerpt, never to the text
+        a structured-result parser reads. Pads the stream with plain
+        (safely-ignored, per tap_parser's own docstring) comment lines
+        well past _MAX_EXCERPT_CHARS before the real TAP content, and
+        confirms full-fidelity parsing still succeeds. No assumption
+        about any specific tool -- pure TAP-format padding."""
+        padding = "# padding\n" * (etr._MAX_EXCERPT_CHARS // 10 + 50)
+        tap_text = padding + _tap(passed=5, failed_ids=["real_failure_past_the_bound"])
+        assert len(tap_text) > etr._MAX_EXCERPT_CHARS
+        raw = _exec_result(stdout=tap_text, exit_code=1)
+        result = etr._to_test_run_result(_TAP_PLAN, raw)
+        assert result.evidence_level == "OK"
+        assert result.passed == 5
+        assert result.failed_test_ids == ["real_failure_past_the_bound"]
 
     def test_tap_with_no_exit_code_and_unparseable_stdout_is_unparseable(self):
         raw = TestExecutionResult(
@@ -797,14 +1032,33 @@ class TestEnvironmentPreflight:
 # ---------------------------------------------------------------------------
 
 class TestExcerptBounding:
+    """_excerpt() is the ONE place captured stdout/stderr gets bounded
+    (test_executors.py itself no longer truncates -- see its own
+    docstring) -- generic head+tail shaping, no assumption about ANY
+    tool's output format."""
+
     def test_short_text_untouched(self):
         assert etr._excerpt("hello") == "hello"
 
-    def test_long_text_truncated(self):
-        text = "x" * (etr._MAX_EXCERPT_CHARS + 500)
+    def test_text_at_exact_limit_untouched(self):
+        text = "x" * etr._MAX_EXCERPT_CHARS
+        assert etr._excerpt(text) == text
+
+    def test_long_text_keeps_head_and_tail_and_omits_middle(self):
+        head_marker, tail_marker, middle_marker = "HEAD_START", "TAIL_END", "MIDDLE_SHOULD_BE_OMITTED"
+        text = (
+            head_marker + ("a" * etr._MAX_EXCERPT_CHARS)
+            + middle_marker
+            + ("b" * etr._MAX_EXCERPT_CHARS) + tail_marker
+        )
         out = etr._excerpt(text)
-        assert len(out) < len(text)
-        assert "truncated" in out
+        assert out.startswith(head_marker)
+        assert out.endswith(tail_marker)
+        assert middle_marker not in out
+        assert "omitted" in out
+        # Bounded: total size stays close to the fixed budget (plus small,
+        # fixed marker overhead) regardless of how large the input was.
+        assert len(out) <= etr._MAX_EXCERPT_CHARS + 100
 
 
 # ---------------------------------------------------------------------------

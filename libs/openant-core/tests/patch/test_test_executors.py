@@ -428,6 +428,30 @@ class TestDockerTestExecutorRun:
         assert result.exit_code == 0
         assert "Read-only file system" not in result.stderr
 
+    def test_large_captured_output_is_not_truncated(self, tmp_path: Path):
+        """Regression test for the general failure class this fixes: the
+        executor previously truncated its own raw capture (a fixed,
+        head-only size cap) BEFORE constructing TestExecutionResult,
+        silently discarding whatever came after that cap. This matters
+        beyond the report excerpt -- TAP structured parsing reads this
+        SAME raw stdout directly (existing_test_regression.py's
+        _structured_source_text), so truncating it here would silently
+        corrupt TAP evidence for any large enough suite. This executor
+        now performs NO truncation of its own; a single downstream
+        excerpt (existing_test_regression._excerpt) is the only bounding
+        point, applied separately, only for the report-facing excerpt.
+        Uses a large, generic synthetic payload -- no assumption about
+        any specific tool's output format."""
+        huge_payload = "x" * 300_000 + "MEANINGFUL_CONTENT_NEAR_THE_END"
+        stub, calls = _make_docker_command_stub(
+            build_result=("built", "", 0, False),
+            run_result=(huge_payload, "", 0, False),
+        )
+        with mock.patch.object(executors_mod, "run_docker_command", side_effect=stub):
+            result = executors_mod.DockerTestExecutor().run(_plan(), tmp_path)
+        assert result.stdout == huge_payload
+        assert "MEANINGFUL_CONTENT_NEAR_THE_END" in result.stdout
+
     def test_repo_test_command_has_normal_network_access_in_run_invocation(self, tmp_path: Path):
         """The test-run container must NOT be network-isolated -- a
         repository-owned test entry point (whatever tool it wraps) may

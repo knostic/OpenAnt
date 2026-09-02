@@ -116,7 +116,6 @@ DEFAULT_RUN_TIMEOUT = 300    # seconds for the test command itself
 _RESULT_START_MARKER = "__OPENANT_RESULT_START__"
 _RESULT_END_MARKER = "__OPENANT_RESULT_END__"
 
-_MAX_CAPTURED_CHARS = 200_000
 _MAX_RESULT_CHARS = 5_000_000
 
 _DOCKERIGNORE_CONTENT = ".git\n.venv\nvenv\n__pycache__\n*.pyc\nnode_modules\n.tox\n.pytest_cache\n"
@@ -180,13 +179,6 @@ class TestExecutor(Protocol):
         self, plan: TestExecutionPlan, workspace_root: Path,
         setup_timeout: int = DEFAULT_SETUP_TIMEOUT, run_timeout: int = DEFAULT_RUN_TIMEOUT,
     ) -> TestExecutionResult: ...
-
-
-def _truncate(text: "str | None", limit: int = _MAX_CAPTURED_CHARS) -> str:
-    text = text or ""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n[... {len(text) - limit} more char(s) truncated]"
 
 
 def _json_exec_form(argv: "tuple[str, ...]") -> str:
@@ -261,6 +253,18 @@ def _stage_build_context(workspace_root: Path, plan: TestExecutionPlan, image: s
 
 
 def _extract_result(stdout: str) -> "str | None":
+    """Extracts the marker-delimited result_output_path content (junit)
+    from the FULL captured stdout -- called on the untruncated text, same
+    as every other consumer of a run's raw stdout/stderr below. This
+    executor does not truncate its own captured output at all; a single
+    downstream truncation point (existing_test_regression._excerpt) is
+    solely responsible for bounding whatever ends up in a report-facing
+    excerpt. Keeping exactly one truncation point, applied once, is what
+    lets a structured-result reader (this function for junit, or TAP's
+    reader of raw.stdout in existing_test_regression.py) see the complete
+    stream regardless of how large it is, instead of racing an earlier,
+    unrelated size cap that has no knowledge of where useful content
+    actually lives in a given tool's output."""
     try:
         start = stdout.index(_RESULT_START_MARKER)
         end = stdout.index(_RESULT_END_MARKER, start)
@@ -329,8 +333,8 @@ class DockerTestExecutor:
             if b_timed_out or b_code != 0:
                 return TestExecutionResult(
                     ran=False, exit_code=None, timed_out=b_timed_out, setup_failed=True,
-                    setup_error=_truncate(b_stderr) if b_stderr else "docker build timed out",
-                    stdout="", stderr=_truncate(b_stderr), result_output=None,
+                    setup_error=b_stderr if b_stderr else "docker build timed out",
+                    stdout="", stderr=b_stderr, result_output=None,
                     duration_seconds=time.time() - start, executor="docker",
                 )
 
@@ -384,13 +388,13 @@ class DockerTestExecutor:
                 kill_docker_container(container_name)
                 return TestExecutionResult(
                     ran=False, exit_code=None, timed_out=True, setup_failed=False, setup_error="",
-                    stdout=_truncate(r_stdout), stderr=_truncate(r_stderr), result_output=None,
+                    stdout=r_stdout, stderr=r_stderr, result_output=None,
                     duration_seconds=time.time() - start, executor="docker",
                 )
 
             return TestExecutionResult(
                 ran=True, exit_code=r_code, timed_out=False, setup_failed=False, setup_error="",
-                stdout=_truncate(r_stdout), stderr=_truncate(r_stderr),
+                stdout=r_stdout, stderr=r_stderr,
                 result_output=_extract_result(r_stdout),
                 duration_seconds=time.time() - start, executor="docker",
             )
