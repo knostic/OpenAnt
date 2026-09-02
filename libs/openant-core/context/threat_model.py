@@ -60,7 +60,6 @@ from pathlib import Path
 from typing import Any
 
 from context.application_context import ApplicationContext
-from utilities.file_io import open_utf8
 
 # --- Schema v1 constants ------------------------------------------------------
 

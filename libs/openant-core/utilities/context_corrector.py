@@ -12,11 +12,9 @@ Uses LLM-based semantic search instead of keyword matching.
 
 import json
 import os
-import subprocess
 import sys
 
 from core.verdict_taxonomy import STAGE1_VERDICTS
-from pathlib import Path
 from typing import Optional
 
 from .llm_client import TokenTracker, get_global_tracker

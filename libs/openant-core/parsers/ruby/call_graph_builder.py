@@ -36,12 +36,11 @@ import os
 import posixpath
 import re
 import sys
-from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import tree_sitter_ruby as ts_ruby
 from tree_sitter import Language, Parser
-from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import read_json, open_utf8
 
 
 RUBY_LANGUAGE = Language(ts_ruby.language())

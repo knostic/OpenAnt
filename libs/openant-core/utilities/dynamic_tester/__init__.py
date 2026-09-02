@@ -26,7 +26,7 @@ from utilities.llm import (
     load_config_file,
     resolve_llm_config,
 )
-from utilities.file_io import normalize_results, read_json, write_json, open_utf8
+from utilities.file_io import normalize_results, read_json, open_utf8
 
 
 

@@ -40,7 +40,6 @@ import subprocess
 import sys
 from datetime import datetime
 from enum import Enum
-from pathlib import Path
 from typing import Set
 
 # Add parent directory to path so utilities/ imports resolve when this script

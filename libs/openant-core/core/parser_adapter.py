@@ -11,7 +11,6 @@ sys.path hacks in the original code.
 
 import contextlib
 import functools
-import json
 import os
 import shutil
 import subprocess

@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from core.schemas import AnalyzeResult, AnalysisMetrics, UsageInfo
+from core.schemas import AnalyzeResult, AnalysisMetrics
 from core import tracking
 from core.checkpoint import StepCheckpoint, analyze_result_is_error
 from core.progress import ProgressReporter
@@ -36,20 +36,20 @@ from utilities.llm import (
 )
 from utilities.file_io import read_json, write_json
 from utilities.json_corrector import JSONCorrector
-from utilities.rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
+from utilities.rate_limiter import get_rate_limiter, is_retryable_error
 
 # These live in core/ because core is shipped and experiment.py is not: importing
 # them from the research harness made `import core.analyzer` fail in any installed
 # environment (ModuleNotFoundError: no module named 'experiment').
 from core.analysis_core import (
     analyze_unit,
-    parse_response,
-    _normalize_result,
 )
 
 # Import application context (optional)
 try:
-    from context.application_context import ApplicationContext, load_context
+    # ApplicationContext is the availability probe's residue — load_context
+    # alone proves the module imports (the try/except stays honest)
+    from context.application_context import load_context
     HAS_APP_CONTEXT = True
 except ImportError:
     HAS_APP_CONTEXT = False

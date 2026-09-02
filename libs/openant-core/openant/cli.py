@@ -968,7 +968,6 @@ def cmd_report_data(args):
     Outputs a JSON blob with stats, chart data, findings, remediation HTML,
     and step reports — everything display-ready.
     """
-    import html as html_mod
     from core.schemas import success, error
     from core.step_report import step_context
     from utilities.llm_client import get_global_tracker
@@ -1075,7 +1074,6 @@ def cmd_report_data(args):
                 verdict = str(result.get("finding") or result.get("verdict", "")).lower()
                 file_path = route_key.rsplit(":", 1)[0] if ":" in route_key else route_key
                 unit = units_by_id.get(route_key, {})
-                llm_context = unit.get("llm_context") or {}
                 verification = result.get("verification") or {}
 
                 # Justification: prefer stage2, fallback to stage1

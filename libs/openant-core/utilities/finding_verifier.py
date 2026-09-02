@@ -70,14 +70,14 @@ from .agentic_enhancer.tools import ToolExecutor
 # loops cannot drift apart.
 from .agentic_enhancer.agent import (
     MAX_PROMPT_CHARS,
-    # RE-EXPORT, not unused: core/verifier.py imports MAX_TOOL_RESULT_CHARS
-    # from THIS module (it feeds the "max_tool_result_chars" key in the
-    # verify output schema). A same-file usage scan will not see it.
-    MAX_TOOL_RESULT_CHARS,
     cap_tool_result_content,
 )
+# RE-EXPORT, not unused: core/verifier.py imports MAX_TOOL_RESULT_CHARS
+# from THIS module (it feeds the "max_tool_result_chars" key in the
+# verify output schema). A same-file usage scan will not see it — the
+# #482-trap's from-import form. Keep the explicit re-export + noqa.
+from .agentic_enhancer.agent import MAX_TOOL_RESULT_CHARS as MAX_TOOL_RESULT_CHARS  # noqa: F401
 from prompts.verification_prompts import (
-    VERIFICATION_SYSTEM_PROMPT,
     get_verification_prompt,
     get_verification_system_prompt,
     get_consistency_check_prompt

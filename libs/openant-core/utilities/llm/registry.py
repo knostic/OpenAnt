@@ -47,7 +47,6 @@ from .config import (
     ConfigError,
     ConfigFile,
     LLMConfig,
-    PhaseRef,
     PHASES,
     ProviderConfig,
     empty_config,

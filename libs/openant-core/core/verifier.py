@@ -9,18 +9,17 @@ Checkpoints are always enabled. Per-finding results are saved to
 On successful completion the checkpoint dir is removed.
 """
 
-import json
 import os
 import sys
 from pathlib import Path
 
-from core.schemas import VerifyResult, UsageInfo
+from core.schemas import VerifyResult
 from core.verdict_taxonomy import FINDING_VERDICT_ORDER
 from core import tracking
 from core.checkpoint import StepCheckpoint
 from core.progress import ProgressReporter
 
-from utilities.llm_client import TokenTracker, get_global_tracker
+from utilities.llm_client import get_global_tracker
 from utilities.llm import (
     PhaseRegistry,
     build_phase_registry,
@@ -38,7 +37,9 @@ from utilities.agentic_enhancer.repository_index import load_index_from_file
 
 # Import application context (optional)
 try:
-    from context.application_context import ApplicationContext, load_context
+    # ApplicationContext is the availability probe's residue — load_context
+    # alone proves the module imports (the try/except stays honest)
+    from context.application_context import load_context
     HAS_APP_CONTEXT = True
 except ImportError:
     HAS_APP_CONTEXT = False
@@ -282,7 +283,6 @@ def run_verification(
     tracking.log_usage("Stage 2", _phase_baseline["usage"])
 
     # Merge verified results back into the full result set
-    verified_ids = {r.get("unit_id") or r.get("route_key") for r in verified_results}
     merged_results = []
     verified_lookup = {
         (r.get("unit_id") or r.get("route_key")): r for r in verified_results

@@ -31,7 +31,6 @@ from datetime import datetime, timezone
 from utilities.safe_filename import SAFE_FILENAME_MAX_LEN, safe_filename
 from utilities.file_io import read_json, write_json
 from core.backend_identity import FINGERPRINT_FILE
-from pathlib import Path
 
 
 SUMMARY_FILE = "_summary.json"

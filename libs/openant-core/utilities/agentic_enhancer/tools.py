@@ -17,7 +17,6 @@ Classes:
 """
 
 import json
-from typing import Any
 
 from .repository_index import RepositoryIndex
 

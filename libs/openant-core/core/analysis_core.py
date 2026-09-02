@@ -21,8 +21,14 @@ from typing import TYPE_CHECKING
 from datetime import datetime
 
 from core.verdict_taxonomy import (
-    FINDING_VERDICT_ORDER, SEVERITIES, _SEVERITIES, STAGE1_VERDICTS,
+    FINDING_VERDICT_ORDER,
+    _SEVERITIES,
+    STAGE1_VERDICTS,
 )
+# RE-EXPORT, not unused: test_issue215's one-enum-everywhere pin asserts
+# `analysis_core.SEVERITIES is SEVERITIES` — the from-import re-export form
+# of the #482 trap (the second instance in this sweep). Keep + noqa.
+from core.verdict_taxonomy import SEVERITIES as SEVERITIES  # noqa: F401
 
 # the canonical lowercase finding strings a garbage-verdict row may keep
 # (wave r1 opus: the finding-first sinks key on exactly these).

@@ -9,11 +9,10 @@ to ``{output_dir}/enhance_checkpoints/`` so interrupted runs can resume
 automatically. Checkpoints are preserved alongside results (see the scanner's enhance step).
 """
 
-import json
 import os
 import sys
 
-from core.schemas import EnhanceResult, UsageInfo
+from core.schemas import EnhanceResult
 from core import tracking
 from core.progress import ProgressReporter
 from utilities.rate_limiter import configure_rate_limiter

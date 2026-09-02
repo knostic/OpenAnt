@@ -24,11 +24,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .model_config import CLAUDE_SONNET_4_20250514
-from .llm_client import TokenTracker, get_global_tracker, reset_global_tracker
+from .llm_client import TokenTracker, get_global_tracker
 from .llm import (
     LLMAuthError,
     LLMConnectionError,
-    LLMError,
     LLMNotFoundError,
     LLMRateLimitError,
     LLMResponseError,
@@ -36,12 +35,11 @@ from .llm import (
     simple_text,
 )
 from .agentic_enhancer import (
-    RepositoryIndex,
     enhance_unit_with_agent,
     load_index_from_file,
     INCOMPLETE_CLASSIFICATION,
 )
-from .rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
+from .rate_limiter import get_rate_limiter, is_retryable_error
 from .file_io import read_json, write_json
 
 # Avoid circular import — import checkpoint at usage site

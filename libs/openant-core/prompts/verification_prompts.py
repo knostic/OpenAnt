@@ -283,4 +283,3 @@ def get_phase1_exploitability_prompt(code, finding, attack_vector, files_include
 def get_phase2_verdict_prompt(exploitability_analysis, original_finding):
     return ""  # Not used in new approach
 
-import json
