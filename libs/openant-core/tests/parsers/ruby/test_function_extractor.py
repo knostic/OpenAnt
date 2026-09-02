@@ -20,7 +20,6 @@ unambiguously.
 import sys
 from pathlib import Path
 
-import pytest
 
 _CORE_ROOT = Path(__file__).resolve().parents[3]
 if str(_CORE_ROOT) not in sys.path:

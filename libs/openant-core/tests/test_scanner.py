@@ -179,7 +179,6 @@ def test_dynamic_test_failure_does_not_abort_scan(monkeypatch, tmp_path):
     """An exception in the OPTIONAL dynamic-test stage must be caught."""
     _install_minimal_pipeline(monkeypatch, vulnerable=1)
 
-    import shutil as _shutil
     import core.dynamic_tester as dynamic_tester
 
     # Force the "docker present" branch so we reach run_tests.

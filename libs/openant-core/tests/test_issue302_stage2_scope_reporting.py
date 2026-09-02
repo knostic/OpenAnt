@@ -227,7 +227,6 @@ def test_zero_findings_early_return_keeps_denominator():
     units_analyzed_total — a clean scan's persisted scope statement is
     "adjudicated 0 of N", never "0 of 0" beside total_units=N (review finding:
     self-inconsistent artifact in exactly the scan where scope IS the message)."""
-    from core.verifier import VerifyResult
     # drive the REAL early-return path via run_verification with no findings
     import json as _json
     from pathlib import Path as _Path

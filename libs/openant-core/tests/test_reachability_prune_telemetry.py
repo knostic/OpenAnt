@@ -73,22 +73,22 @@ def test_prune_buckets_and_sidecar(tmp_path):
     fns = {k: {} for k in ["a.swift:E", "a.swift:A", "a.swift:B", "b.swift:C", "b.swift:D"]}
     cg = {"a.swift:E": ["a.swift:A"], "b.swift:D": ["b.swift:C"]}
     rcg = {"a.swift:A": ["a.swift:E"], "b.swift:C": ["b.swift:D"]}
-    m = _run(tmp_path, fns, cg, rcg, list(fns), "a.swift:E")
-    assert m["reachable_units"] == 2                       # E, A
-    assert m["filtered_out"] == 3                          # B, C, D
-    assert m["pruned_orphan_count"] == 2                   # B, D (no caller)
-    assert m["pruned_in_dead_cluster_count"] == 1          # C (caller D is pruned)
-    assert m["pruned_forward_called_by_reachable_count"] == 0   # invariant: symmetric graph
+    result = _run(tmp_path, fns, cg, rcg, list(fns), "a.swift:E")
+    assert result["reachable_units"] == 2                       # E, A
+    assert result["filtered_out"] == 3                          # B, C, D
+    assert result["pruned_orphan_count"] == 2                   # B, D (no caller)
+    assert result["pruned_in_dead_cluster_count"] == 1          # C (caller D is pruned)
+    assert result["pruned_forward_called_by_reachable_count"] == 0   # invariant: symmetric graph
     # existing keys must be unchanged (additive only)
     for k in ("original_units", "entry_points", "reachable_units", "filtered_out", "reduction_percentage"):
-        assert k in m
+        assert k in result
     # sidecar written with EVERY pruned unit + classification
-    side = json.loads((tmp_path / m["pruned_units_path"]).read_text())
+    side = json.loads((tmp_path / result["pruned_units_path"]).read_text())
     ids = {u["id"]: u for u in side["units"]}
     assert set(ids) == {"a.swift:B", "b.swift:C", "b.swift:D"}
     assert ids["a.swift:B"]["bucket"] == "orphan"
     assert ids["b.swift:C"]["bucket"] == "dead_cluster"
-    assert "b.swift" in m["pruned_by_file"]
+    assert "b.swift" in result["pruned_by_file"]
 
 
 def test_forward_asymmetry_invariant_fires(tmp_path):
@@ -108,7 +108,6 @@ def test_empty_entrypoints_passthrough_schema_unchanged(tmp_path):
     # No entry points -> early pass-through branch. Telemetry keys must NOT be added there
     # (that branch has its own schema); nothing was pruned.
     fns = {"a:foo": {}, "a:bar": {}}
-    m = _run.__wrapped__ if False else None
     out = tmp_path
     (out / "call_graph.json").write_text(json.dumps(
         {"functions": fns, "call_graph": {}, "reverse_call_graph": {}}))

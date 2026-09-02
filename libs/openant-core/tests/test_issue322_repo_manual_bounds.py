@@ -26,9 +26,8 @@ if CORE not in sys.path:
     sys.path.insert(0, CORE)
 
 from context.application_context import (  # noqa: E402
-    ApplicationContext, check_manual_override, MAX_MANUAL_EXCLUSIONS,
+    check_manual_override, MAX_MANUAL_EXCLUSIONS,
 )
-from core.scanner import ScanResult  # noqa: E402
 from report.generator import _context_provenance_header  # noqa: E402
 
 

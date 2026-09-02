@@ -1,5 +1,4 @@
 """Tests for the agentic enhancer tools, specifically the get_static_dependencies tool."""
-import pytest
 
 from utilities.agentic_enhancer.repository_index import RepositoryIndex
 from utilities.agentic_enhancer.tools import ToolExecutor

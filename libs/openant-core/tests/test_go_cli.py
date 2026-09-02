@@ -7,7 +7,6 @@ so they use parse-only commands that don't require an API key.
 import json
 import os
 import subprocess
-import shutil
 import sys
 from pathlib import Path
 

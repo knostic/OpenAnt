@@ -15,7 +15,6 @@
 import glob
 import os
 import random
-import re
 import time
 
 from parsers.rust.call_graph_builder import (

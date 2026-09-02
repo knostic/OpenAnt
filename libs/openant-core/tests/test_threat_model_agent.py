@@ -7,7 +7,6 @@ Every test here runs against a fake adapter — zero API calls, zero cost.
 """
 
 import json
-from pathlib import Path
 
 from utilities.llm.adapter import CompletionResult, TextBlock, ToolUseBlock
 

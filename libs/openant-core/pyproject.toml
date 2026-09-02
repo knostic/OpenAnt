@@ -49,9 +49,29 @@ build-backend = "hatchling.build"
 target-version = "py311"
 
 [tool.ruff.lint]
-# Only rules that catch actual bugs (will break at runtime)
-# F821: undefined name, F811: redefined unused name, F823: local var referenced before assignment
-select = ["F821", "F811", "F823"]
+# Bug-catching rules apply everywhere; the style/dead-code rules (F401
+# unused-import, F841 unused-local) apply to the TEST TREE only — the
+# comments-corpus sweep (#481) found the test tree carrying 93 unused
+# imports + 6 dead locals, invisible under the bug-only select. Prod keeps
+# the bug-rules-only choice: its 87 F401s live in the parser/idiom modules
+# (function_extractor 14, repository_scanner 12, call_graph_builder 8 ...)
+# where imports are re-export/module-idiom candidates — a separate
+# investigation (#481's prod half), never bulk-autofixed by a chore sweep.
+select = ["F821", "F811", "F823", "F401", "F841"]
+
+[tool.ruff.lint.per-file-ignores]
+# prod packages keep the bug-rules-only choice (the style rules are
+# test-tree-scoped)
+"core/**" = ["F401", "F841"]
+"utilities/**" = ["F401", "F841"]
+"parsers/**" = ["F401", "F841"]
+"context/**" = ["F401", "F841"]
+"report/**" = ["F401", "F841"]
+"prompts/**" = ["F401", "F841"]
+"openant/**" = ["F401", "F841"]
+# root-level dev scripts (experiment.py etc.) keep the bug-only choice too
+"experiment.py" = ["F401", "F841"]
+"validate_dataset_schema.py" = ["F401", "F841"]
 
 [tool.hatch.build.targets.wheel]
 packages = [

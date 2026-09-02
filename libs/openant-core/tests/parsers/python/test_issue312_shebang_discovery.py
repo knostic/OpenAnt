@@ -23,9 +23,7 @@ registry-level behaviour):
 
 from __future__ import annotations
 
-import json
 import os
-import stat
 import sys
 import tempfile
 from pathlib import Path

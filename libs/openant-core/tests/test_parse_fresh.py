@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 
-import pytest
 
 from core import parser_adapter
 from core.schemas import ParseResult

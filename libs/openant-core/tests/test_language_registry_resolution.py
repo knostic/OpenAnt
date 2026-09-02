@@ -11,7 +11,6 @@ degrade rather than die at flag-registration time). These tests hold the
 Python side to the same contract.
 """
 
-from pathlib import Path
 
 import pytest
 

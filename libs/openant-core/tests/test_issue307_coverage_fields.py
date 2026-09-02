@@ -148,7 +148,7 @@ def test_js_camelcase_alias_and_no_test_skip_disclosure():
     language that skips test files WITHOUT counting them (go/rust/swift/zig
     today) is disclosed in languages_without_test_skip_data, never silently
     absent-as-zero."""
-    from core.scanner import _read_coverage_stats, _collect_coverage
+    from core.scanner import _read_coverage_stats
     import json as _json
     import tempfile as _tf
     from pathlib import Path as _Path

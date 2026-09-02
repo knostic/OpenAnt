@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.schemas import AnalysisMetrics, ParseResult  # noqa: E402
+from core.schemas import AnalysisMetrics  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -158,7 +158,6 @@ def test_enhance_limit_slices_diff_selected_population():
     to the enhancer (the post-slice population)."""
     import os
     import tempfile
-    from pathlib import Path
     import unittest.mock as mock
 
     from core.enhancer import enhance_dataset

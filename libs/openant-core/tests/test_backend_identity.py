@@ -9,7 +9,6 @@ re-run, never adopt) and the results.json / preserve-not-destroy behaviour.
 import json
 import os
 
-import pytest
 
 from core import backend_identity as bi
 from core.checkpoint import StepCheckpoint, _RESERVED_FILES, FINGERPRINT_FILE

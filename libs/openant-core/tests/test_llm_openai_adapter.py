@@ -244,7 +244,6 @@ from utilities.llm.providers.openai import (
     _token_param,
     _RESPONSES_MIN_OUTPUT_TOKENS,
     _messages_to_responses,
-    _tool_to_responses,
 )
 
 G5 = "gpt-5.6"
