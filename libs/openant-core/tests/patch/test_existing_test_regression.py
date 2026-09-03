@@ -9,6 +9,7 @@ existing_test_regression module boundary throughout.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from unittest import mock
@@ -138,13 +139,31 @@ _DUMMY_LLM = object()  # never actually used -- discover_test_plan is mocked in 
 # Comparison algorithm
 # ---------------------------------------------------------------------------
 
-def _run(passed, failed_ids=(), errors=0, skipped=0, level="OK", exit_code=None):
+_UNSET = object()
+
+
+def _run(passed, failed_ids=_UNSET, errors=0, skipped=0, level="OK", exit_code=None):
+    """`failed_ids` defaults to matching PRODUCTION discipline (see
+    _to_test_run_result/_build_evidence_from_exit_code): only "OK" (a
+    full structured parse) has a real -- possibly empty -- id list by
+    default; every other level defaults to None (no reliable ids),
+    exactly like COUNTS_ONLY/EXIT_CODE_ONLY/etc. always are in
+    production unless ids were separately, reliably established (see
+    _find_runner_summary_failed_ids). Pass `failed_ids=[...]` explicitly
+    to simulate a level that DOES have reliable ids (e.g. a
+    RUNNER_SUMMARY_COUNTS run with a verified pytest short-summary
+    listing)."""
+    if failed_ids is _UNSET:
+        ids_list = [] if level == "OK" else None
+    else:
+        ids_list = list(failed_ids)
     if exit_code is None:
-        exit_code = 1 if (failed_ids or errors) else 0
+        exit_code = 1 if (ids_list or errors) else 0
     return etr.TestRunResult(
         command=("python", "-m", "pytest"), status="COMPLETED", exit_code=exit_code,
-        duration_seconds=1.0, passed=passed, failed=len(failed_ids), skipped=skipped, errors=errors,
-        failed_test_ids=list(failed_ids), stdout_excerpt="", stderr_excerpt="",
+        duration_seconds=1.0, passed=passed, failed=(len(ids_list) if ids_list is not None else 0),
+        skipped=skipped, errors=errors,
+        failed_test_ids=ids_list, stdout_excerpt="", stderr_excerpt="",
         timed_out=False, evidence_level=level,
     )
 
@@ -458,7 +477,12 @@ class TestRunnerSummaryCountsIntegration:
         patched = self._run_result("==== 104 failed, 1638 passed, 563 skipped in 65.44s ====\n")
         result = etr.compare_runs(self._SUMMARY_PLAN.test_command, baseline, patched)
         out = etr.render_existing_test_comparison(result)
-        assert "worse aggregate results" in out.lower()
+        # Wording updated (LLM Test Failure Evidence Distillation feature):
+        # explicitly says the individual failure "could not be identified
+        # reliably" when no distillation attempt resolved one (none was
+        # attempted here -- this result came straight from compare_runs()).
+        assert "worse aggregate test results" in out.lower()
+        assert "could not be identified reliably" in out.lower()
         assert "could not be identified" in out
         assert "runner-summary" in out
 
@@ -477,6 +501,435 @@ class TestRunnerSummaryCountsIntegration:
         out = etr.render_existing_test_comparison(result)
         assert "could not be identified" in out
         assert "structured per-test IDs were unavailable" in out
+
+
+# ---------------------------------------------------------------------------
+# Pytest short-summary FAILED/ERROR node ID extraction -- the deliberate,
+# narrow exception to this module's "no tool-specific knowledge" rule (see
+# existing_test_regression.py's own section docstring). A real urllib3
+# replay showed reliable per-test identity already present in already-
+# captured pytest output that was being reduced to aggregate counts only.
+# ---------------------------------------------------------------------------
+
+class TestPytestNodeIdFromSummaryLine:
+    """_pytest_node_id_from_summary_line -- single-line acceptance rules,
+    tested in isolation before any integration."""
+
+    def test_failed_line_extracts_node_id(self):
+        assert (
+            etr._pytest_node_id_from_summary_line("FAILED test/test_retry.py::TestRetry::test_x")
+            == "test/test_retry.py::TestRetry::test_x"
+        )
+
+    def test_error_line_extracts_node_id(self):
+        assert (
+            etr._pytest_node_id_from_summary_line("ERROR test/test_connectionpool.py::TestPool::test_y")
+            == "test/test_connectionpool.py::TestPool::test_y"
+        )
+
+    def test_trailing_short_exception_summary_is_stripped(self):
+        line = "FAILED test/test_retry.py::TestRetry::test_x - AssertionError: boom"
+        assert etr._pytest_node_id_from_summary_line(line) == "test/test_retry.py::TestRetry::test_x"
+
+    def test_parameterized_node_id_preserved_exactly(self):
+        line = "FAILED test/test_util.py::test_parse[https://example.com-443]"
+        assert (
+            etr._pytest_node_id_from_summary_line(line)
+            == "test/test_util.py::test_parse[https://example.com-443]"
+        )
+
+    def test_per_test_progress_line_is_not_a_summary_line(self):
+        """"test/foo.py::test_x FAILED [ 47%]" -- the outcome keyword is
+        NOT at the start of the line, so this must never be mistaken for
+        a short-summary entry."""
+        assert etr._pytest_node_id_from_summary_line("test/foo.py::test_x FAILED [ 47%]") is None
+
+    def test_traceback_path_line_is_not_a_summary_line(self):
+        line = '  File "/app/test/test_retry.py", line 42, in test_x'
+        assert etr._pytest_node_id_from_summary_line(line) is None
+
+    def test_prose_mentioning_failed_is_not_a_summary_line(self):
+        assert etr._pytest_node_id_from_summary_line("2 tests FAILED during setup") is None
+
+    def test_line_without_double_colon_is_rejected(self):
+        """Doesn't look like a real pytest node id at all -- never guess."""
+        assert etr._pytest_node_id_from_summary_line("FAILED to connect to database") is None
+
+
+class TestFindRunnerSummaryFailedIds:
+    """_find_runner_summary_failed_ids -- the bounded-tail extraction plus
+    its central safety mechanism, the exact-count reliability gate."""
+
+    def test_expected_count_zero_short_circuits_to_empty_list(self):
+        assert etr._find_runner_summary_failed_ids("anything at all\n", 0) == []
+        assert etr._find_runner_summary_failed_ids(None, 0) == []
+
+    def test_no_stdout_with_nonzero_expected_count_is_none(self):
+        assert etr._find_runner_summary_failed_ids(None, 3) is None
+        assert etr._find_runner_summary_failed_ids("", 3) is None
+
+    def test_exact_match_extracts_all_ids(self):
+        stdout = (
+            "FAILED test/test_a.py::test_1\n"
+            "FAILED test/test_b.py::test_2\n"
+            "ERROR test/test_c.py::test_3\n"
+            "==== 2 failed, 1 error, 10 passed in 1.0s ====\n"
+        )
+        ids = etr._find_runner_summary_failed_ids(stdout, expected_count=3)
+        assert ids == ["test/test_a.py::test_1", "test/test_b.py::test_2", "test/test_c.py::test_3"]
+
+    def test_duplicate_lines_are_deduplicated_and_still_match(self):
+        stdout = (
+            "FAILED test/test_a.py::test_1\n"
+            "FAILED test/test_a.py::test_1\n"  # flushed/printed twice
+            "FAILED test/test_b.py::test_2\n"
+            "==== 2 failed, 10 passed in 1.0s ====\n"
+        )
+        ids = etr._find_runner_summary_failed_ids(stdout, expected_count=2)
+        assert ids == ["test/test_a.py::test_1", "test/test_b.py::test_2"]
+
+    def test_undercount_from_truncated_listing_is_unreliable(self):
+        """Only one FAILED line present but the aggregate says 2 --
+        never return a partial/truncated list."""
+        stdout = "FAILED test/test_a.py::test_1\n==== 2 failed, 10 passed in 1.0s ====\n"
+        assert etr._find_runner_summary_failed_ids(stdout, expected_count=2) is None
+
+    def test_overcount_from_duplicate_distinct_lines_is_unreliable(self):
+        """More distinct-looking FAILED lines than the trusted aggregate
+        count -- e.g. two independent sessions concatenated -- must never
+        be resolved by picking a subset."""
+        stdout = (
+            "FAILED test/test_a.py::test_1\n"
+            "FAILED test/test_b.py::test_2\n"
+            "FAILED test/test_c.py::test_3\n"
+            "==== 2 failed, 10 passed in 1.0s ====\n"
+        )
+        assert etr._find_runner_summary_failed_ids(stdout, expected_count=2) is None
+
+    def test_progress_and_traceback_lines_never_pollute_extraction(self):
+        stdout = (
+            "test/test_a.py::test_1 FAILED [ 50%]\n"  # progress line, not a summary entry
+            '  File "/app/test/test_a.py", line 10, in test_1\n'
+            "  AssertionError: FAILED to match\n"
+            "FAILED test/test_a.py::test_1\n"
+            "==== 1 failed, 10 passed in 1.0s ====\n"
+        )
+        ids = etr._find_runner_summary_failed_ids(stdout, expected_count=1)
+        assert ids == ["test/test_a.py::test_1"]
+
+
+class TestCompareByIdsFromRunnerSummary:
+    """End-to-end: baseline/patched RUNNER_SUMMARY_COUNTS-tier evidence
+    with reliably-extracted pytest node ids drives set-based comparison,
+    exactly like OK-tier structured evidence already does."""
+
+    def _summary_result(self, stdout: str, exit_code: int = 1):
+        return etr._to_test_run_result(_EXIT_CODE_PLAN, _exec_result(stdout=stdout, exit_code=exit_code))
+
+    @staticmethod
+    def _stdout_for(failed_ids, passed=10):
+        lines = [f"FAILED {tid}" for tid in failed_ids]
+        lines.append(f"==== {len(failed_ids)} failed, {passed} passed in 1.0s ====")
+        return "\n".join(lines) + "\n"
+
+    def test_same_failures_both_sides_yields_no_newly_failing(self):
+        stdout = self._stdout_for(["t/a.py::test_1", "t/b.py::test_2"])
+        baseline = self._summary_result(stdout)
+        patched = self._summary_result(stdout)
+        assert baseline.failed_test_ids == ["t/a.py::test_1", "t/b.py::test_2"]
+        r = etr.compare_runs(_EXIT_CODE_PLAN.test_command, baseline, patched)
+        assert r.status == etr.STATUS_PRE_EXISTING_FAILURES_ONLY
+        assert r.newly_failing_tests == []
+        assert sorted(r.pre_existing_failures) == ["t/a.py::test_1", "t/b.py::test_2"]
+
+    def test_patched_adds_one_failure(self):
+        baseline = self._summary_result(self._stdout_for(["t/a.py::test_1"]))
+        patched = self._summary_result(self._stdout_for(["t/a.py::test_1", "t/b.py::test_2"]))
+        r = etr.compare_runs(_EXIT_CODE_PLAN.test_command, baseline, patched)
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.newly_failing_tests == ["t/b.py::test_2"]
+        assert r.pre_existing_failures == ["t/a.py::test_1"]
+
+    def test_patched_removes_one_failure(self):
+        baseline = self._summary_result(self._stdout_for(["t/a.py::test_1", "t/b.py::test_2"]))
+        patched = self._summary_result(self._stdout_for(["t/a.py::test_1"]))
+        r = etr.compare_runs(_EXIT_CODE_PLAN.test_command, baseline, patched)
+        assert r.status == etr.STATUS_PRE_EXISTING_FAILURES_ONLY
+        assert r.newly_passing_tests == ["t/b.py::test_2"]
+        assert r.newly_failing_tests == []
+
+    def test_counts_only_output_with_no_reliable_ids_remains_unresolved_by_identity(self):
+        """No per-test FAILED/ERROR lines at all -- only the aggregate --
+        so failed_test_ids stays None and the existing aggregate-only
+        (never identity-claiming) comparison path is unaffected."""
+        baseline = self._summary_result("==== 1 failed, 10 passed in 1.0s ====\n")
+        patched = self._summary_result("==== 1 failed, 10 passed in 1.0s ====\n")
+        assert baseline.failed_test_ids is None
+        assert patched.failed_test_ids is None
+        r = etr.compare_runs(_EXIT_CODE_PLAN.test_command, baseline, patched)
+        assert r.status == etr.STATUS_PRE_EXISTING_FAILURES_ONLY
+        assert r.newly_failing_tests == []
+
+    def test_both_sides_worse_and_unresolvable_stays_not_verified(self):
+        """Exit-code-only-shaped ambiguity (both sides exited non-zero,
+        no aggregate summary recognized at all) is completely unaffected
+        by this feature -- still the conservative NOT_VERIFIED."""
+        baseline = self._summary_result("no outcome words here at all\n")
+        patched = self._summary_result("no outcome words here at all either\n")
+        assert baseline.evidence_level == "EXIT_CODE_ONLY"
+        r = etr.compare_runs(_EXIT_CODE_PLAN.test_command, baseline, patched)
+        assert r.status == etr.STATUS_NOT_VERIFIED
+
+    def test_junit_and_tap_evidence_paths_unaffected(self):
+        """Structured JUnit/TAP parsing (and their existing None-when-
+        unreliable discipline) must remain byte-for-byte unchanged by the
+        new runner-summary extractor, which only ever runs for the
+        exit_code/no-structured-output fallback path."""
+        raw = _exec_result(result_output=_junit(passed=5, failed_ids=["t::a"]), exit_code=1)
+        result = etr._to_test_run_result(_plan(), raw)
+        assert result.evidence_level == "OK"
+        assert result.failed_test_ids == ["t::a"]
+
+        raw_tap = _exec_result(stdout=_tap(passed=5, failed_ids=["t::b"]), exit_code=1)
+        result_tap = etr._to_test_run_result(_TAP_PLAN, raw_tap)
+        assert result_tap.evidence_level == "OK"
+        assert result_tap.failed_test_ids == ["t::b"]
+
+
+# ---------------------------------------------------------------------------
+# Execution validity -- exit_code == 0 must never by itself justify PASS
+# when explicit runner evidence says the requested execution was declined
+# (real urllib3 replay finding: `nox -s test-3.12` exited 0 having never
+# run any test at all, because the interpreter it needed was missing).
+# ---------------------------------------------------------------------------
+
+class TestExecutionDeclinedReason:
+    """Unit coverage for _execution_declined_reason -- deterministic,
+    generic (never runner-specific), and deliberately narrow: BOTH an
+    explicit decline/non-execution phrase AND an explicit missing-
+    runtime/interpreter phrase must co-occur on the SAME line."""
+
+    def test_real_urllib3_shaped_line_is_detected(self):
+        text = (
+            "nox > Running session test-3.12\n"
+            "nox > uv binary not found.\n"
+            "nox > Nox was installed without the `[pbs]` extra, can't download Python\n"
+            "nox > Missing interpreters will error by default on CI systems.\n"
+            "nox > Session test-3.12 skipped: Python interpreter 3.12 not found.\n"
+        )
+        reason = etr._execution_declined_reason(text)
+        assert reason is not None
+        assert "skipped" in reason
+        assert "interpreter" in reason
+
+    def test_none_or_empty_returns_none(self):
+        assert etr._execution_declined_reason(None) is None
+        assert etr._execution_declined_reason("") is None
+
+    def test_ordinary_aggregate_skipped_count_does_not_trigger(self):
+        """The exact required non-regression: an ORDINARY per-test
+        resolution-side count ("3 skipped") must never be read as a
+        declined execution -- it has no "session/target/suite" nearby and
+        no missing-runtime phrase at all."""
+        assert etr._execution_declined_reason("10 passed, 3 skipped, 1 failed in 0.4s") is None
+
+    def test_unrelated_missing_fixture_does_not_trigger(self):
+        """A per-test "missing" reason (a fixture, a marker) must not
+        trigger this on its own -- it says nothing about the SESSION
+        itself being skipped, and mentions no interpreter/runtime."""
+        assert etr._execution_declined_reason("test_foo SKIPPED (missing fixture 'db')") is None
+
+    def test_missing_runtime_alone_without_decline_word_does_not_trigger(self):
+        assert etr._execution_declined_reason("Python interpreter 3.12 not found, continuing anyway") is None
+
+    def test_decline_word_alone_without_missing_runtime_does_not_trigger(self):
+        assert etr._execution_declined_reason("Session integration-tests skipped: marked xfail") is None
+
+    def test_generic_non_nox_wrapper_phrasing_is_also_detected(self):
+        """Generic across wrappers -- not nox-specific wording."""
+        assert etr._execution_declined_reason(
+            "Target 'test' declined: required runtime is unavailable in this image"
+        ) is not None
+
+    def test_only_scans_the_tail_window(self):
+        """Consistent with _find_runner_summary's own tail-only scan --
+        an unrelated decline-shaped line buried far outside the tail
+        window must not surface."""
+        noise = "\n".join(f"line {i}" for i in range(1000))
+        text = "Session test skipped: interpreter not found.\n" + noise
+        assert etr._execution_declined_reason(text) is None
+
+
+class TestExitCodeZeroDoesNotImplyExecution:
+    """_build_evidence_from_exit_code / _to_test_run_result level:
+    exit_code == 0 must not, by itself, produce EXIT_CODE_ONLY (and
+    therefore eventually PASS) when explicit evidence says the requested
+    execution was declined."""
+
+    _DECLINED_STDOUT = (
+        "nox > Running session test-3.12\n"
+        "nox > Session test-3.12 skipped: Python interpreter 3.12 not found.\n"
+    )
+
+    def test_declined_stdout_yields_unavailable_not_exit_code_only(self):
+        raw = _exec_result(stdout=self._DECLINED_STDOUT, exit_code=0)
+        result = etr._to_test_run_result(_EXIT_CODE_PLAN, raw)
+        assert result.evidence_level == "UNAVAILABLE"
+        assert result.status == "UNPARSEABLE"
+        assert result.exit_code == 0  # preserved for provenance, just not trusted as proof
+        assert "did not actually execute" in result.reason
+
+    def test_declined_stderr_also_detected(self):
+        raw = _exec_result(stdout="", stderr=self._DECLINED_STDOUT, exit_code=0)
+        result = etr._to_test_run_result(_EXIT_CODE_PLAN, raw)
+        assert result.evidence_level == "UNAVAILABLE"
+
+    def test_ordinary_exit_code_zero_success_is_unaffected(self):
+        """The required non-regression: a genuine bespoke command (e.g.
+        `make test`) that exits 0 with no aggregate summary and no
+        decline evidence at all remains EXIT_CODE_ONLY, exactly as
+        before."""
+        raw = _exec_result(stdout="all good, nothing to report\n", exit_code=0)
+        result = etr._to_test_run_result(_EXIT_CODE_PLAN, raw)
+        assert result.evidence_level == "EXIT_CODE_ONLY"
+        assert result.exit_code == 0
+
+    def test_ordinary_exit_code_nonzero_failure_is_unaffected(self):
+        raw = _exec_result(stdout="boom\n", exit_code=1)
+        result = etr._to_test_run_result(_EXIT_CODE_PLAN, raw)
+        assert result.evidence_level == "EXIT_CODE_ONLY"
+        assert result.exit_code == 1
+
+    def test_runner_summary_present_takes_precedence_over_decline_check(self):
+        """A genuine aggregate summary is still checked FIRST -- declined-
+        execution detection only matters when no summary was found at all."""
+        raw = _exec_result(stdout="==== 5 failed, 10 passed, 3 skipped ====\n", exit_code=0)
+        result = etr._to_test_run_result(_EXIT_CODE_PLAN, raw)
+        assert result.evidence_level == "RUNNER_SUMMARY_COUNTS"
+
+    def test_structured_junit_success_is_unaffected(self):
+        raw = _exec_result(result_output=_junit(passed=5))
+        result = etr._to_test_run_result(_plan(), raw)
+        assert result.evidence_level == "OK"
+
+    def test_structured_tap_success_is_unaffected(self):
+        raw = _exec_result(stdout=_tap(passed=5), exit_code=0)
+        result = etr._to_test_run_result(_TAP_PLAN, raw)
+        assert result.evidence_level == "OK"
+
+
+class TestExecutionValidityEndToEnd:
+    """Full evaluate_existing_test_comparison_with_plan()-level regression
+    coverage for the real urllib3 replay finding."""
+
+    _DECLINED_STDOUT = (
+        "nox > Running session test-3.12\n"
+        "nox > uv binary not found.\n"
+        "nox > Missing interpreters will error by default on CI systems.\n"
+        "nox > Session test-3.12 skipped: Python interpreter 3.12 not found.\n"
+    )
+
+    def test_both_sides_declined_is_not_pass(self, tmp_path: Path):
+        """The exact real replay shape: both baseline and patched run the
+        SAME wrapper command, both exit 0, neither actually executes any
+        test. Must NEVER be PASS."""
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout=self._DECLINED_STDOUT, exit_code=0),
+            _exec_result(stdout=self._DECLINED_STDOUT, exit_code=0),
+        ]
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor,
+        )
+        assert r.status != etr.STATUS_PASS
+        assert r.status == etr.STATUS_NOT_VERIFIED
+        assert "did not actually execute" in r.reason
+
+    def test_only_patched_side_declined_is_not_pass(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="all good\n", exit_code=0),
+            _exec_result(stdout=self._DECLINED_STDOUT, exit_code=0),
+        ]
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor,
+        )
+        assert r.status != etr.STATUS_PASS
+        assert r.status == etr.STATUS_NOT_VERIFIED
+
+    def test_only_baseline_side_declined_is_not_pass(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout=self._DECLINED_STDOUT, exit_code=0),
+        ]
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor,
+        )
+        assert r.status != etr.STATUS_PASS
+        assert r.status == etr.STATUS_NOT_VERIFIED
+        assert executor.run.call_count == 1  # patched side never attempted
+
+    def test_ordinary_exit_code_only_success_remains_pass(self, tmp_path: Path):
+        """Required non-regression: genuine exit-code-only success (no
+        decline evidence, no aggregate summary) is still PASS."""
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="all good, nothing to report\n", exit_code=0),
+            _exec_result(stdout="all good, nothing to report\n", exit_code=0),
+        ]
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor,
+        )
+        assert r.status == etr.STATUS_PASS
+
+    def test_ordinary_exit_code_failure_semantics_unaffected(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="all good\n", exit_code=0),
+            _exec_result(stdout="boom, something broke\n", exit_code=1),
+        ]
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor,
+        )
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+
+    def test_unrelated_skipped_word_in_ordinary_output_does_not_invalidate(self, tmp_path: Path):
+        """Required non-regression: an unrelated, ordinary per-test
+        "SKIPPED" mention (not a full aggregate summary line, so it
+        reaches the decline-detection path at all) must not turn a
+        genuine pass into NOT_VERIFIED."""
+        repo = _make_git_repo(tmp_path)
+        ordinary = "test_foo SKIPPED (missing fixture 'db')\nall other checks fine\n"
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout=ordinary, exit_code=0),
+            _exec_result(stdout=ordinary, exit_code=0),
+        ]
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor,
+        )
+        assert r.status == etr.STATUS_PASS
+
+    def test_aggregate_runner_summary_runs_remain_unchanged(self, tmp_path: Path):
+        """Required non-regression: RUNNER_SUMMARY_COUNTS-tier comparison
+        (a real aggregate summary line present) is entirely unaffected by
+        this fix -- it never reaches the decline-detection path."""
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="==== 1 failed, 9 passed in 1.0s ====\n", exit_code=1),
+            _exec_result(stdout="==== 2 failed, 8 passed in 1.0s ====\n", exit_code=1),
+        ]
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor,
+        )
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.baseline.evidence_level == "RUNNER_SUMMARY_COUNTS"
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +969,27 @@ class TestToTestRunResult:
         result = etr._to_test_run_result(_EXIT_CODE_PLAN, raw)
         assert result.status == "UNPARSEABLE"
         assert result.evidence_level == "UNAVAILABLE"
+
+    def test_junit_failure_diagnostic_flows_into_test_run_result(self):
+        xml = (
+            '<testsuites><testsuite name="pytest" tests="1" failures="1">'
+            '<testcase classname="t" name="a"><failure message="boom">trace</failure></testcase>'
+            '</testsuite></testsuites>'
+        )
+        raw = _exec_result(result_output=xml)
+        result = etr._to_test_run_result(_plan(), raw)
+        assert result.failure_diagnostics is not None
+        assert "boom" in result.failure_diagnostics["t::a"]
+
+    def test_no_failures_gives_none_not_empty_dict(self):
+        raw = _exec_result(result_output=_junit(passed=5))
+        result = etr._to_test_run_result(_plan(), raw)
+        assert result.failure_diagnostics is None
+
+    def test_exit_code_only_never_has_diagnostics(self):
+        raw = _exec_result(result_output=None, exit_code=1)
+        result = etr._to_test_run_result(_EXIT_CODE_PLAN, raw)
+        assert result.failure_diagnostics is None
 
 
 class TestTapToTestRunResult:
@@ -1024,7 +1498,564 @@ class TestEnvironmentPreflight:
             assert set(vars(r).keys()) == {
                 "status", "command", "baseline", "patched", "newly_failing_tests",
                 "pre_existing_failures", "newly_passing_tests", "reason", "plan",
+                "distilled_failure_evidence",
             }
+
+
+# ---------------------------------------------------------------------------
+# LLM Test Failure Evidence Distillation
+# ---------------------------------------------------------------------------
+
+class _FakeDistillerLLM:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def complete(self, system_prompt, user_message, stage="unknown"):
+        self.calls.append({"system_prompt": system_prompt, "user_message": user_message, "stage": stage})
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+def _resolved_json(*, test_id="t::new", summary="assertion failed", excerpt="AssertionError: boom"):
+    return json.dumps({
+        "status": "resolved",
+        "candidates": [{"test_id": test_id, "failure_summary": summary, "supporting_excerpt": excerpt}],
+        "reason": "",
+    })
+
+
+def _unresolved_json(reason="could not confidently isolate a failure"):
+    return json.dumps({"status": "unresolved", "candidates": [], "reason": reason})
+
+
+class TestPrefilterFailureRelevantText:
+    """_prefilter_failure_relevant_text -- deterministic, generic,
+    never runner-specific, never a claim of identity by itself."""
+
+    def test_none_or_empty_returns_none(self):
+        assert etr._prefilter_failure_relevant_text(None) is None
+        assert etr._prefilter_failure_relevant_text("") is None
+
+    def test_whitespace_only_returns_none(self):
+        assert etr._prefilter_failure_relevant_text("   \n\n   ") is None
+
+    def test_non_tail_non_cue_lines_are_dropped(self):
+        """Lines with no generic failure cue, past the always-kept
+        (byte-bounded) tail, are filtered out -- proving this is a real
+        filter, not a pass-through. Needs enough TOTAL bytes to exceed
+        _DISTILLATION_TAIL_CHARS -- short inputs are always entirely
+        "tail" (see test_true_tail_is_always_kept_even_without_failure_
+        words below)."""
+        noise = "\n".join(f"progress line {i}" for i in range(1500))
+        assert len(noise) > etr._DISTILLATION_TAIL_CHARS
+        out = etr._prefilter_failure_relevant_text(noise)
+        assert out is not None
+        assert "progress line 0" not in out  # far outside the tail, no failure cue
+        assert "progress line 1499" in out  # true tail always kept
+
+    def test_lines_with_generic_failure_words_are_kept(self):
+        text = "line one\nTraceback (most recent call last):\nAssertionError: boom\nline four"
+        out = etr._prefilter_failure_relevant_text(text)
+        assert out is not None
+        assert "Traceback" in out
+        assert "AssertionError" in out
+
+    def test_true_tail_is_always_kept_even_without_failure_words(self):
+        head = "\n".join(f"line {i}" for i in range(1000))
+        tail = "\n".join(f"tail line {i}" for i in range(50))
+        text = head + "\n" + tail
+        out = etr._prefilter_failure_relevant_text(text)
+        assert out is not None
+        assert "tail line 49" in out
+
+    def test_large_uniform_matching_content_is_bounded_not_rejected(self):
+        """The concrete bug this function's rewrite fixes: a run with
+        MANY keyword-matching lines throughout (e.g. many genuinely
+        failing tests, each contributing traceback lines) used to have
+        its ENTIRE candidate -- including the always-useful tail --
+        discarded once the combined size exceeded the cap. It must now
+        be gracefully bounded to the cap instead, never rejected
+        outright, as long as at least the tail fits on its own."""
+        huge = "\n".join(f"error line with a traceback {i}" for i in range(5000))
+        assert len(huge) > etr._DISTILLATION_INPUT_CAP
+        out = etr._prefilter_failure_relevant_text(huge)
+        assert out is not None
+        assert len(out) <= etr._DISTILLATION_INPUT_CAP
+        assert "error line with a traceback 4999" in out  # true tail preserved
+
+    def test_single_line_exceeding_even_the_tail_budget_is_unresolved(self):
+        """Genuinely pathological case: not even one line fits within
+        either budget -- there is nothing safe to hand to the LLM, so
+        this must still fail closed to None (never truncate mid-line,
+        never guess)."""
+        one_giant_line = "error " * 5_000  # a single line, no newlines at all
+        assert len(one_giant_line) > etr._DISTILLATION_INPUT_CAP
+        assert etr._prefilter_failure_relevant_text(one_giant_line) is None
+
+
+class TestParseDistillationResponse:
+    def test_resolved_with_valid_candidate(self):
+        result = etr._parse_distillation_response(_resolved_json())
+        assert result.status == "resolved"
+        assert result.candidates[0].test_id == "t::new"
+        assert result.candidates[0].source == "llm_distilled"
+
+    def test_unresolved_response(self):
+        result = etr._parse_distillation_response(_unresolved_json("too noisy"))
+        assert result.status == "unresolved"
+        assert result.reason == "too noisy"
+
+    def test_malformed_json_is_unresolved(self):
+        result = etr._parse_distillation_response("not json at all")
+        assert result.status == "unresolved"
+
+    def test_non_object_json_is_unresolved(self):
+        result = etr._parse_distillation_response("[1, 2, 3]")
+        assert result.status == "unresolved"
+
+    def test_unrecognized_status_is_unresolved(self):
+        result = etr._parse_distillation_response(json.dumps({"status": "maybe", "candidates": []}))
+        assert result.status == "unresolved"
+
+    def test_resolved_with_no_candidates_is_unresolved(self):
+        result = etr._parse_distillation_response(json.dumps({"status": "resolved", "candidates": []}))
+        assert result.status == "unresolved"
+
+    def test_resolved_with_all_malformed_candidates_is_unresolved(self):
+        result = etr._parse_distillation_response(
+            json.dumps({"status": "resolved", "candidates": [{"test_id": ""}, {"no_test_id": "x"}]})
+        )
+        assert result.status == "unresolved"
+
+    def test_candidate_missing_test_id_is_dropped_not_invented(self):
+        result = etr._parse_distillation_response(json.dumps({
+            "status": "resolved",
+            "candidates": [
+                {"test_id": "t::good", "failure_summary": "s", "supporting_excerpt": "e"},
+                {"failure_summary": "no id here"},
+            ],
+        }))
+        assert result.status == "resolved"
+        assert [c.test_id for c in result.candidates] == ["t::good"]
+
+    def test_supporting_excerpt_and_summary_are_bounded(self):
+        result = etr._parse_distillation_response(json.dumps({
+            "status": "resolved",
+            "candidates": [{
+                "test_id": "t::a",
+                "failure_summary": "s" * 10_000,
+                "supporting_excerpt": "e" * 10_000,
+            }],
+        }))
+        assert len(result.candidates[0].failure_summary) <= etr._MAX_DISTILLED_SUMMARY_CHARS
+        assert len(result.candidates[0].supporting_excerpt) <= etr._MAX_DISTILLED_EXCERPT_CHARS
+
+    def test_candidates_bounded_to_max_count(self):
+        many = [{"test_id": f"t::{i}", "failure_summary": "s", "supporting_excerpt": "e"} for i in range(50)]
+        result = etr._parse_distillation_response(json.dumps({"status": "resolved", "candidates": many}))
+        assert len(result.candidates) <= etr._MAX_DISTILLED_CANDIDATES
+
+    def test_code_fenced_response_is_stripped(self):
+        fenced = "```json\n" + _resolved_json() + "\n```"
+        result = etr._parse_distillation_response(fenced)
+        assert result.status == "resolved"
+
+
+class TestDistillationGate:
+    """evaluate_existing_test_comparison_with_plan()'s distillation gate:
+    ALL of (llm given, NEW_FAILURES_DETECTED, no deterministic identity)
+    must hold."""
+
+    def test_deterministic_identity_available_distiller_not_called(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(result_output=_junit(passed=10)),
+            _exec_result(result_output=_junit(passed=9, failed_ids=["t::new"])),
+        ]
+        llm = _FakeDistillerLLM(_resolved_json())
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _plan(), executor=executor, llm=llm,
+        )
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.newly_failing_tests == ["t::new"]
+        assert llm.calls == []
+        assert r.distilled_failure_evidence is None
+
+    def test_no_new_failures_distiller_not_called(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(result_output=_junit(passed=10)),
+            _exec_result(result_output=_junit(passed=10)),
+        ]
+        llm = _FakeDistillerLLM(_resolved_json())
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _plan(), executor=executor, llm=llm,
+        )
+        assert r.status == etr.STATUS_PASS
+        assert llm.calls == []
+        assert r.distilled_failure_evidence is None
+
+    def test_no_llm_given_distiller_not_attempted(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="==== 1 failed, 9 passed in 1.0s ====\n", exit_code=1),
+            _exec_result(stdout="==== 2 failed, 8 passed in 1.0s ====\n", exit_code=1),
+        ]
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor,
+        )
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.newly_failing_tests == []
+        assert r.distilled_failure_evidence is None
+
+    def test_aggregate_new_failure_no_identity_triggers_one_distillation_call(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="Traceback shared noise\n==== 1 failed, 9 passed in 1.0s ====\n", exit_code=1),
+            _exec_result(
+                stdout="Traceback shared noise\nAssertionError: new one\n==== 2 failed, 8 passed in 1.0s ====\n",
+                exit_code=1,
+            ),
+        ]
+        llm = _FakeDistillerLLM(_resolved_json(test_id="t::new"))
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor, llm=llm,
+        )
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.newly_failing_tests == []  # deterministic identity fields untouched
+        assert len(llm.calls) == 1
+        assert llm.calls[0]["stage"] == etr._DISTILLATION_LLM_TAG
+        assert r.distilled_failure_evidence is not None
+        assert r.distilled_failure_evidence.status == "resolved"
+        assert r.distilled_failure_evidence.candidates[0].test_id == "t::new"
+        assert r.distilled_failure_evidence.candidates[0].source == "llm_distilled"
+
+    def test_baseline_and_patched_excerpts_both_reach_the_llm(self, tmp_path: Path):
+        """Confirms the distiller is given BOTH sides -- not just the
+        patched one -- so it has a basis to distinguish shared/pre-
+        existing noise from a genuinely new candidate."""
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="AssertionError: baseline_shared_failure\n==== 1 failed, 9 passed ====\n", exit_code=1),
+            _exec_result(
+                stdout=(
+                    "AssertionError: baseline_shared_failure\n"
+                    "AssertionError: patched_only_failure\n"
+                    "==== 2 failed, 8 passed ====\n"
+                ),
+                exit_code=1,
+            ),
+        ]
+        llm = _FakeDistillerLLM(_resolved_json(test_id="t::patched_only"))
+        etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor, llm=llm,
+        )
+        assert len(llm.calls) == 1
+        user_message = llm.calls[0]["user_message"]
+        assert "baseline_shared_failure" in user_message
+        assert "patched_only_failure" in user_message
+        assert "Baseline run" in user_message and "Patched run" in user_message
+
+    def test_ambiguous_evidence_resolves_to_unresolved(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="AssertionError: noise\n==== 1 failed, 9 passed ====\n", exit_code=1),
+            _exec_result(stdout="AssertionError: noise\n==== 2 failed, 8 passed ====\n", exit_code=1),
+        ]
+        llm = _FakeDistillerLLM(_unresolved_json("evidence too ambiguous to isolate a specific test"))
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor, llm=llm,
+        )
+        assert r.distilled_failure_evidence.status == "unresolved"
+        assert r.newly_failing_tests == []
+
+    def test_large_but_boundable_patched_output_still_calls_llm_once(self, tmp_path: Path):
+        """A run whose patched output has MANY keyword-matching lines
+        (well past the raw input cap in total size) must still reach the
+        distiller exactly once, gracefully bounded -- never rejected
+        outright just because more matched elsewhere than fit (the
+        concrete bug _prefilter_failure_relevant_text's rewrite fixes;
+        see TestPrefilterFailureRelevantText.
+        test_large_uniform_matching_content_is_bounded_not_rejected)."""
+        repo = _make_git_repo(tmp_path)
+        huge_patched_stdout = (
+            "\n".join(f"error line with a traceback {i}" for i in range(5000))
+            + "\n==== 2 failed, 8 passed ====\n"
+        )
+        assert len(huge_patched_stdout) > etr._DISTILLATION_INPUT_CAP
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="==== 1 failed, 9 passed ====\n", exit_code=1),
+            _exec_result(stdout=huge_patched_stdout, exit_code=1),
+        ]
+        llm = _FakeDistillerLLM(_resolved_json())
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor, llm=llm,
+        )
+        assert len(llm.calls) == 1
+        assert r.distilled_failure_evidence.status == "resolved"
+
+    def test_genuinely_unboundable_patched_output_is_unresolved_without_calling_llm(self, tmp_path: Path):
+        """Genuinely pathological case: patched output is a SINGLE
+        enormous line (no newlines at all) that doesn't fit within
+        either prefilter budget on its own -- nothing safe to hand to
+        the LLM, so this must fail closed to unresolved without ever
+        calling it. Never chunk, never retry. (No parseable aggregate
+        summary either, so this reaches NEW_FAILURES_DETECTED via the
+        exit-code-only path: clean baseline, non-zero patched.)"""
+        repo = _make_git_repo(tmp_path)
+        one_giant_line = "error " * 5_000
+        assert len(one_giant_line) > etr._DISTILLATION_INPUT_CAP
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="==== 0 failed, 10 passed ====\n", exit_code=0),
+            _exec_result(stdout=one_giant_line, exit_code=1),
+        ]
+        llm = _FakeDistillerLLM(_resolved_json())
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor, llm=llm,
+        )
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert llm.calls == []
+        assert r.distilled_failure_evidence.status == "unresolved"
+
+    def test_malformed_llm_response_is_unresolved_not_a_crash(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="AssertionError: noise\n==== 1 failed, 9 passed ====\n", exit_code=1),
+            _exec_result(stdout="AssertionError: new one\n==== 2 failed, 8 passed ====\n", exit_code=1),
+        ]
+        llm = _FakeDistillerLLM("this is not JSON")
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor, llm=llm,
+        )
+        assert r.distilled_failure_evidence.status == "unresolved"
+
+    def test_llm_call_failure_is_unresolved_not_a_crash(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="AssertionError: noise\n==== 1 failed, 9 passed ====\n", exit_code=1),
+            _exec_result(stdout="AssertionError: new one\n==== 2 failed, 8 passed ====\n", exit_code=1),
+        ]
+        llm = _FakeDistillerLLM(RuntimeError("provider unavailable"))
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor, llm=llm,
+        )
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.distilled_failure_evidence.status == "unresolved"
+
+    def test_distilled_candidates_never_populate_deterministic_identity_fields(self, tmp_path: Path):
+        """The core safety invariant: an LLM-distilled candidate must
+        NEVER be written into newly_failing_tests/failed_test_ids."""
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="AssertionError: noise\n==== 1 failed, 9 passed ====\n", exit_code=1),
+            _exec_result(stdout="AssertionError: new one\n==== 2 failed, 8 passed ====\n", exit_code=1),
+        ]
+        llm = _FakeDistillerLLM(_resolved_json(test_id="t::should_never_be_deterministic"))
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor, llm=llm,
+        )
+        assert r.newly_failing_tests == []
+        assert r.patched.failed_test_ids is None
+        assert r.baseline.failed_test_ids is None
+        assert r.distilled_failure_evidence.candidates[0].test_id == "t::should_never_be_deterministic"
+
+    def test_no_failure_relevant_output_at_all_is_unresolved_without_calling_llm(self, tmp_path: Path):
+        """A clean baseline (exit 0) vs. a failing patched side with
+        completely empty captured stdout -- still deterministically
+        NEW_FAILURES_DETECTED (exit-code-only comparison), but there is
+        nothing at all for the pre-filter to give the distiller."""
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout="==== 0 failed, 10 passed ====\n", exit_code=0),
+            _exec_result(stdout="", exit_code=1),
+        ]
+        llm = _FakeDistillerLLM(_resolved_json())
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor, llm=llm,
+        )
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert llm.calls == []
+        assert r.distilled_failure_evidence.status == "unresolved"
+
+
+def _urllib3_shaped_stdout(*, failed: int, passed: int, skipped: int, extra_failed_id: "str | None" = None) -> str:
+    """Real-shape regression fixture (CVE-2023-43804 replay finding):
+    many shared `FAILED test/...` lines, an optional additional
+    patched-only failure, and the final aggregate summary line -- the
+    exact shape RUNNER_SUMMARY_COUNTS is built to recover, with rich
+    transient failure-relevant output that a naive/buggy prefilter could
+    still fail to surface (see TestUrllib3ShapedDistillationRegression)."""
+    lines = []
+    for i in range(failed - (1 if extra_failed_id else 0)):
+        lines.append(f"FAILED test/with_dummyserver/test_socketlevel.py::TestHeaders::test_shared_{i}")
+    if extra_failed_id:
+        lines.append(f"FAILED {extra_failed_id}")
+    lines.append(f"==== {failed} failed, {passed} passed, {skipped} skipped, 163 warnings in 65.69s (0:01:05) ====")
+    return "\n".join(lines) + "\n"
+
+
+class TestUrllib3ShapedDeterministicIdRegression:
+    """Direct regression anchor for the real replay finding: urllib3
+    2.0.5 / CVE-2023-43804, baseline 102/1640/563 -> patched 103/1639/563,
+    RUNNER_SUMMARY_COUNTS tier, but pytest's own short-summary listing
+    (already present in already-captured output) reliably accounts for
+    every failure -- so comparison is now based on the ACTUAL IDs, not
+    just the aggregate counts. (This class previously exercised the LLM
+    distillation fallback against this exact fixture shape, back when
+    per-test identity was still being reduced to aggregate counts only;
+    now that identity is reliably recoverable here, the distiller is
+    correctly never even reached -- see
+    TestUrllib3ShapedDistillationStillFallsBackWhenIdsAreUnreliable below
+    for the fixture shape that still needs it.)"""
+
+    _BASELINE_STDOUT = _urllib3_shaped_stdout(failed=102, passed=1640, skipped=563)
+    _PATCHED_STDOUT = _urllib3_shaped_stdout(
+        failed=103, passed=1639, skipped=563,
+        extra_failed_id="test/test_retry.py::TestRetry::test_retry_default_remove_headers_on_redirect",
+    )
+
+    def test_comparison_uses_actual_ids_not_counts_alone(self, tmp_path: Path):
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout=self._BASELINE_STDOUT, exit_code=1),
+            _exec_result(stdout=self._PATCHED_STDOUT, exit_code=1),
+        ]
+        # No llm given at all -- proves this resolution is fully
+        # deterministic and needs no LLM call whatsoever.
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor,
+        )
+
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.baseline.evidence_level == "RUNNER_SUMMARY_COUNTS"
+        assert r.patched.evidence_level == "RUNNER_SUMMARY_COUNTS"
+        assert r.baseline.failed == 102 and r.baseline.passed == 1640 and r.baseline.skipped == 563
+        assert r.patched.failed == 103 and r.patched.passed == 1639 and r.patched.skipped == 563
+
+        # The actual point: identity, not just a count delta.
+        assert r.newly_failing_tests == [
+            "test/test_retry.py::TestRetry::test_retry_default_remove_headers_on_redirect",
+        ]
+        assert len(r.pre_existing_failures) == 102
+        assert r.newly_passing_tests == []
+
+        # Never fabricated -- the exact recovered set sizes match the
+        # aggregate counts that were already trusted.
+        assert len(r.baseline.failed_test_ids) == 102
+        assert len(r.patched.failed_test_ids) == 103
+
+    def test_distiller_never_reached_once_ids_are_reliable(self, tmp_path: Path):
+        """Even when an llm IS given, the distillation gate (NEW_FAILURES_
+        DETECTED + no deterministic identity) never fires once identity
+        is reliably available -- the gate's second condition is now
+        false, not merely untested."""
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout=self._BASELINE_STDOUT, exit_code=1),
+            _exec_result(stdout=self._PATCHED_STDOUT, exit_code=1),
+        ]
+        llm = _FakeDistillerLLM(_resolved_json())
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor, llm=llm,
+        )
+        assert llm.calls == []
+        assert r.distilled_failure_evidence is None
+
+
+class TestUrllib3ShapedDistillationStillFallsBackWhenIdsAreUnreliable:
+    """The distillation fallback (see TestDistillationGate) remains
+    necessary and correctly reached for the genuinely unreliable case:
+    real, large, transient runner output where a reliable per-test
+    listing is NOT available (here: no pytest-shaped FAILED/ERROR lines
+    at all, only free-form diagnostic noise) -- as distinct from
+    TestUrllib3ShapedDeterministicIdRegression above, where it now is."""
+
+    def test_prefilter_uses_transient_raw_stdout_not_the_persisted_excerpt(self, tmp_path: Path):
+        """The persisted, bounded stdout_excerpt (4000 chars) is NOT what
+        the distiller sees -- it operates on the raw, untruncated
+        TestExecutionResult.stdout captured during this same S11
+        execution. Proven here by making the patched-only failure line
+        sit far enough into the file that a naive head+tail 4000-char
+        excerpt of the exact same content would very plausibly miss or
+        mis-locate it, while the full transient stdout does not. Uses
+        free-form diagnostic noise (not pytest-shaped FAILED lines) so
+        this genuinely exercises "no reliable deterministic identity",
+        not an accidental count mismatch."""
+        repo = _make_git_repo(tmp_path)
+        shared_noise = "AssertionError: baseline_shared_failure\n" * 102
+        baseline_stdout = shared_noise + "==== 102 failed, 1640 passed, 563 skipped ====\n"
+        padding = "AssertionError: unrelated diagnostic noise\n" * 200
+        patched_stdout = (
+            padding + shared_noise
+            + "AssertionError: test_retry_default_remove_headers_on_redirect failed\n"
+            + "==== 103 failed, 1639 passed, 563 skipped ====\n"
+        )
+        assert len(patched_stdout) > etr._MAX_EXCERPT_CHARS
+
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(stdout=baseline_stdout, exit_code=1),
+            _exec_result(stdout=patched_stdout, exit_code=1),
+        ]
+        llm = _FakeDistillerLLM(_resolved_json(
+            test_id="test/test_retry.py::TestRetry::test_retry_default_remove_headers_on_redirect",
+        ))
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _EXIT_CODE_PLAN, executor=executor, llm=llm,
+        )
+
+        assert r.baseline.failed_test_ids is None
+        assert r.patched.failed_test_ids is None
+        assert len(llm.calls) == 1
+        # The persisted excerpt is still small and bounded, as always --
+        # distillation succeeding is independent of it. (+100 slack for
+        # _excerpt()'s own "[... N omitted ...]" marker overhead -- see
+        # TestExcerptBounding.)
+        assert len(r.patched.stdout_excerpt) <= etr._MAX_EXCERPT_CHARS + 100
+        # No raw full log is ever persisted onto the result itself.
+        assert not any(
+            len(str(v)) > etr._MAX_EXCERPT_CHARS * 2
+            for v in vars(r.patched).values() if isinstance(v, str)
+        )
+
+    def test_inverse_deterministic_identity_present_means_zero_distiller_calls(self, tmp_path: Path):
+        """The exact inverse case requested alongside the urllib3
+        regression: when deterministic identity IS available, the
+        distiller must never be called, even though rich raw runner
+        output also exists on both sides."""
+        repo = _make_git_repo(tmp_path)
+        executor = _ready_executor()
+        executor.run.side_effect = [
+            _exec_result(result_output=_junit(passed=1640, failed_ids=[f"t::shared_{i}" for i in range(102)])),
+            _exec_result(result_output=_junit(
+                passed=1639,
+                failed_ids=[f"t::shared_{i}" for i in range(102)] + ["some/test::id"],
+            )),
+        ]
+        llm = _FakeDistillerLLM(_resolved_json())
+        r = etr.evaluate_existing_test_comparison_with_plan(
+            repo, _SOME_PATCH, _plan(), executor=executor, llm=llm,
+        )
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.newly_failing_tests == ["some/test::id"]
+        assert len(llm.calls) == 0
+        assert r.distilled_failure_evidence is None
 
 
 # ---------------------------------------------------------------------------
@@ -1149,6 +2180,82 @@ class TestRenderExistingTestComparison:
         out = etr.render_existing_test_comparison(r)
         assert "Test plan: discovered from repository evidence" in out
         assert "Execution: Docker" in out
+
+    def test_deterministic_identity_shows_diagnostic_as_fact(self):
+        """A structured (OK-tier) newly-failing test's diagnostic is
+        presented directly under its name -- no hedging, no "candidate"
+        language -- because it IS deterministic evidence."""
+        b = _run(430)
+        p = _run(429, failed_ids=["t::test_new"])
+        p.failure_diagnostics = {"t::test_new": "AssertionError: expected 2 got 1"}
+        r = etr.compare_runs(("cmd",), b, p)
+        out = etr.render_existing_test_comparison(r)
+        assert "t::test_new" in out
+        assert "AssertionError: expected 2 got 1" in out
+        assert "Candidate" not in out
+        assert "Distilled" not in out
+
+    def test_distilled_candidate_is_explicitly_labeled(self):
+        """A distilled candidate must be visually and textually
+        distinguishable from deterministic identity -- never presented as
+        plain fact."""
+        baseline = etr.TestRunResult(
+            command=("make", "test"), status="COMPLETED", exit_code=1, duration_seconds=1.0,
+            passed=9, failed=1, skipped=0, errors=0, failed_test_ids=None,
+            stdout_excerpt="", stderr_excerpt="", timed_out=False, evidence_level="RUNNER_SUMMARY_COUNTS",
+        )
+        patched = etr.TestRunResult(
+            command=("make", "test"), status="COMPLETED", exit_code=1, duration_seconds=1.0,
+            passed=8, failed=2, skipped=0, errors=0, failed_test_ids=None,
+            stdout_excerpt="", stderr_excerpt="", timed_out=False, evidence_level="RUNNER_SUMMARY_COUNTS",
+        )
+        result = etr.ExistingTestComparisonResult(
+            status=etr.STATUS_NEW_FAILURES_DETECTED, command=("make", "test"),
+            baseline=baseline, patched=patched,
+            reason="Failure/error count increased from 1 to 2; individual newly-failing tests could not be identified.",
+            distilled_failure_evidence=etr.DistilledFailureEvidence(
+                status="resolved",
+                candidates=[etr.DistilledFailureCandidate(
+                    test_id="test/test_retry.py::TestRetry::test_x",
+                    failure_summary="assertion on removed headers failed",
+                    supporting_excerpt="AssertionError: {'Cookie'} != set()",
+                )],
+            ),
+        )
+        out = etr.render_existing_test_comparison(result)
+        assert "Candidate newly failing test: test/test_retry.py::TestRetry::test_x" in out
+        assert "Distilled from runner output" in out
+        assert "assertion on removed headers failed" in out
+        assert "AssertionError: {'Cookie'} != set()" in out
+        # Never presented as if it were the deterministic list.
+        assert "**Newly failing:**" not in out
+
+    def test_unresolved_distillation_explains_truthfully(self):
+        result = etr.ExistingTestComparisonResult(
+            status=etr.STATUS_NEW_FAILURES_DETECTED, command=("make", "test"),
+            baseline=_exit_only(1), patched=_exit_only(1),
+            reason="patched run exited non-zero after a clean baseline; exit-code-only evidence.",
+            distilled_failure_evidence=etr.DistilledFailureEvidence(
+                status="unresolved", reason="evidence too ambiguous",
+            ),
+        )
+        out = etr.render_existing_test_comparison(result)
+        assert "could not be identified reliably" in out.lower()
+        assert "Candidate newly failing test" not in out
+
+    def test_no_distillation_attempted_still_explains_truthfully(self):
+        """distilled_failure_evidence is None (never attempted, e.g. no
+        llm was given) -- must render the same honest "could not be
+        identified" explanation, not a blank/misleading section."""
+        baseline = _run(100, level="COUNTS_ONLY")
+        baseline.failed = 0
+        patched = _run(98, level="COUNTS_ONLY")
+        patched.failed = 2
+        r = etr.compare_runs(("cmd",), baseline, patched)
+        assert r.status == etr.STATUS_NEW_FAILURES_DETECTED
+        assert r.distilled_failure_evidence is None
+        out = etr.render_existing_test_comparison(r)
+        assert "could not be identified reliably" in out.lower()
 
 
 class TestFactualWordingNotRegression:

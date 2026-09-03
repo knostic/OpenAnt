@@ -77,7 +77,28 @@ def _canonicalize_literal(value: object) -> object:
     (mutable set/list/dict are not hashable). Shape-preserving: a set-like
     input always canonicalizes to frozenset, list-like to tuple, dict to a
     sorted tuple of (key, value) pairs -- recursively, so nested literal
-    containers are handled too."""
+    containers are handled too.
+
+    Raises TypeError for a bytes/bytearray leaf, at any nesting depth --
+    caught by _evaluate_literal_rhs's own callers (the same "except
+    Exception: non_literal" idiom already used everywhere else in that
+    function), never propagated further. ast.literal_eval happily
+    evaluates a bytes literal (e.g. ``b'#!python'``, a real, ordinary
+    module-level constant shape -- see distlib's own SHEBANG_PYTHON/
+    SHEBANG_PYTHONW, a real urllib3/pip investigation exposed this via
+    execution_recorder.to_jsonable(), which has no bytes representation
+    and, by design, no str()/repr() fallback -- see that module's own
+    docstring). A raw byte string is exactly the kind of value this
+    module's "non_literal" classification already exists for -- the same
+    treatment already given to attribute access, name references, and any
+    other call shape (see _evaluate_literal_rhs's own docstring) --
+    extended here to a literal VALUE ast.literal_eval can produce but this
+    module has no safe representation for, rather than special-casing
+    to_jsonable() or inventing a lossy/irreversible encoding. bytearray is
+    included for symmetry even though ast.literal_eval/this module's own
+    wrapper constructors never actually produce one today."""
+    if isinstance(value, (bytes, bytearray)):
+        raise TypeError(f"unsupported literal value type for candidate enrichment: {type(value).__name__}")
     if isinstance(value, dict):
         return tuple(sorted(
             (_canonicalize_literal(k), _canonicalize_literal(v)) for k, v in value.items()
@@ -86,7 +107,7 @@ def _canonicalize_literal(value: object) -> object:
         return frozenset(_canonicalize_literal(v) for v in value)
     if isinstance(value, (list, tuple)):
         return tuple(_canonicalize_literal(v) for v in value)
-    return value  # str/int/float/bool/bytes/None/complex -- already hashable
+    return value  # str/int/float/bool/None/complex -- already hashable
 
 
 def _evaluate_literal_rhs(node: "ast.AST") -> "tuple[str, str | None, object]":
@@ -103,7 +124,10 @@ def _evaluate_literal_rhs(node: "ast.AST") -> "tuple[str, str | None, object]":
     literal (e.g. ``frozenset(["Authorization"])``) -- the exact shape
     urllib3's own ``DEFAULT_REMOVE_HEADERS_ON_REDIRECT`` declaration uses.
     Any other call, attribute access, name reference, or expression is
-    ``"non_literal"``.
+    ``"non_literal"`` -- as is a syntactically-literal value (at any
+    nesting depth) containing bytes/bytearray, which ``ast.literal_eval``
+    can produce but this module has no safe representation for (see
+    ``_canonicalize_literal``'s own docstring).
     """
     ctor_name: "str | None" = None
     literal_node = node
@@ -138,9 +162,15 @@ def _evaluate_literal_rhs(node: "ast.AST") -> "tuple[str, str | None, object]":
             raw = _LITERAL_WRAPPER_CTORS[ctor_name](raw)
         except Exception:
             return "non_literal", None, None
-        return "literal", f"{ctor_name}_call", _canonicalize_literal(raw)
+        try:
+            return "literal", f"{ctor_name}_call", _canonicalize_literal(raw)
+        except Exception:
+            return "non_literal", None, None
 
-    return "literal", type(literal_node).__name__, _canonicalize_literal(raw)
+    try:
+        return "literal", type(literal_node).__name__, _canonicalize_literal(raw)
+    except Exception:
+        return "non_literal", None, None
 
 
 def _extract_literal_constants(file_text: str) -> "dict[str, dict]":

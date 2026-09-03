@@ -42,11 +42,11 @@ from .stage_registry import (
     REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING as _S_REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING,
     TEST_ANALYSIS_AND_PLAN as _S_TEST_ANALYSIS_AND_PLAN,
 )
+from .existing_test_amendment import evaluate_existing_test_comparison_with_amendment
 from .existing_test_regression import (
     ExistingTestComparisonResult,
     classify_existing_test_comparison_signal,
     discover_test_plan_for_comparison,
-    evaluate_existing_test_comparison_with_plan,
     not_verified_result as _existing_test_comparison_not_verified,
     render_existing_test_comparison,
     test_execution_error_result as _existing_test_comparison_execution_error,
@@ -4245,62 +4245,31 @@ def _run_patch_generation_and_investigation(
         except Exception:
             pass
 
-    # Patch hygiene — deterministic, best-effort, never blocks the pipeline.
-    # Skipped (not merely no-op'd on "") when _patch_validation_skip_reason
+    # Shared generated-diff mechanics -- hygiene, applicability, and
+    # (allow_context_reconstruction=True, preserving this path's existing
+    # behavior exactly) deterministic context reconstruction -- see
+    # generated_patch_processing.py's own module docstring. Skipped
+    # entirely (not merely no-op'd on "") when _patch_validation_skip_reason
     # is set: an invalid Patch Generator response must never reach this —
-    # or the applicability/retry machinery below — as if it were an
+    # or the applicability-aware retry machinery below — as if it were an
     # ordinary empty candidate. See the reason captured at Step 1/4 above.
+    _context_expansion = None
     if _patch_validation_skip_reason is not None:
         hygiene_findings = []
-    else:
-        try:
-            from .patch_hygiene import check_patch
-            hygiene_findings = check_patch(patch)
-        except Exception:
-            hygiene_findings = []
-
-    # Patch applicability — git apply --check, read-only, best-effort.
-    # Same skip as hygiene above: `applicable` is explicitly None (never
-    # False) so the deterministic-context-reconstruction and applicability-
-    # aware-retry blocks below — both gated on `applicable is False` — stay
-    # naturally, correctly inert for this reason, with no changes needed to
-    # either block's own logic.
-    if _patch_validation_skip_reason is not None:
         applicability_result = {
             "applicable": None, "skipped": True,
             "skipped_reason": _patch_validation_skip_reason,
             "error": None, "exit_code": None, "stderr": "",
         }
     else:
-        try:
-            from .patch_applicability import check_applicability
-            applicability_result = check_applicability(patch, repo_root)
-        except Exception:
-            applicability_result = {
-                "applicable": None, "skipped": False, "skipped_reason": None,
-                "error": "applicability check failed unexpectedly",
-                "exit_code": None, "stderr": "",
-            }
-
-    # Deterministic context reconstruction — runs ONLY after the repaired
-    # patch has already failed the applicability check above, and ONLY
-    # before the applicability-aware LLM retry below. Recovers the specific
-    # failure mode repair_hunk_headers doesn't: a hunk that is already
-    # positionally/arithmetically correct but too context-thin for `git
-    # apply` (see diff_hunk_repair.reconstruct_hunk_context's docstring).
-    # On success, updates `patch`/`applicability_result` in place so the
-    # retry gate immediately below simply doesn't fire — no change to the
-    # retry logic itself. On refusal/failure, changes nothing; the retry
-    # gate runs exactly as it did before this feature existed.
-    _context_expansion = None
-    if applicability_result.get("applicable") is False and repo_root:
-        try:
-            from .diff_hunk_repair import reconstruct_hunk_context
-            from .patch_applicability import check_applicability as _check_applicability_for_expansion
-            _reconstructed_patch, _context_expansion = reconstruct_hunk_context(patch, repo_root)
+        from .generated_patch_processing import process_generated_patch
+        _processed = process_generated_patch(patch, repo_root, allow_context_reconstruction=True)
+        patch = _processed.patch
+        hygiene_findings = _processed.hygiene_findings
+        applicability_result = _processed.applicability_result
+        _context_expansion = _processed.context_expansion
+        if _context_expansion is not None:
             if _context_expansion.succeeded:
-                patch = _reconstructed_patch
-                applicability_result = _check_applicability_for_expansion(patch, repo_root)
                 print(
                     f"[pipeline] Deterministic context reconstruction succeeded: "
                     f"{_context_expansion.hunks_expanded} hunk(s) expanded, "
@@ -4315,8 +4284,6 @@ def _run_patch_generation_and_investigation(
                     f"falling through to applicability-aware retry.",
                     file=sys.stderr,
                 )
-        except Exception as exc:
-            print(f"[pipeline] Deterministic context reconstruction unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
 
     # Applicability-aware retry — triggered only on applicable=False with a known repo_root
     original_patch = patch
@@ -4412,20 +4379,20 @@ def _run_patch_generation_and_investigation(
                         else:
                             print("[pipeline] Retry produced an empty patch; keeping original.", file=sys.stderr)
                     else:
-                        _r_repair_meta = None
-                        try:
-                            from .diff_hunk_repair import repair_hunk_headers
-                            r_patch_raw, _r_repair_meta = repair_hunk_headers(r_patch_raw, repo_root=repo_root)
-                        except Exception:
-                            pass
-                        r_hygiene: list = []
-                        try:
-                            from .patch_hygiene import check_patch
-                            r_hygiene = check_patch(r_patch_raw)
-                        except Exception:
-                            pass
-                        from .patch_applicability import check_applicability
-                        r_app = check_applicability(r_patch_raw, repo_root)
+                        # Shared generated-diff mechanics (repair_hunk_headers ->
+                        # check_patch -> check_applicability) -- see
+                        # generated_patch_processing.py's own module docstring.
+                        # allow_context_reconstruction=False here, preserving this
+                        # retry's existing behavior exactly: it never attempted
+                        # context reconstruction before this extraction either.
+                        from .generated_patch_processing import process_generated_patch
+                        _r_processed = process_generated_patch(
+                            r_patch_raw, repo_root, allow_context_reconstruction=False,
+                        )
+                        r_patch_raw = _r_processed.patch
+                        r_hygiene = _r_processed.hygiene_findings
+                        r_app = _r_processed.applicability_result
+                        _r_repair_meta = _r_processed.repair_result
                         retry_patch = r_patch_raw
                         if r_app.get("applicable") is True:
                             retry_succeeded = True
@@ -4617,20 +4584,18 @@ def _run_patch_repair_and_calibration(
                     retry_hint=_r_hint,
                     stage=_REPAIR_REGENERATION_STAGE,
                 )
-                _repair_loop_meta = None
-                try:
-                    from .diff_hunk_repair import repair_hunk_headers
-                    _r_raw, _repair_loop_meta = repair_hunk_headers(_r_raw, repo_root=repo_root)
-                except Exception:
-                    pass
-                _r_hygiene: list = []
-                try:
-                    from .patch_hygiene import check_patch
-                    _r_hygiene = check_patch(_r_raw)
-                except Exception:
-                    pass
-                from .patch_applicability import check_applicability as _check_app
-                _r_app = _check_app(_r_raw, repo_root)
+                # Shared generated-diff mechanics (repair_hunk_headers ->
+                # check_patch -> check_applicability) -- see
+                # generated_patch_processing.py's own module docstring.
+                # allow_context_reconstruction=False here, preserving this
+                # repair loop's existing behavior exactly: it never attempted
+                # context reconstruction before this extraction either.
+                from .generated_patch_processing import process_generated_patch
+                _r_processed = process_generated_patch(_r_raw, repo_root, allow_context_reconstruction=False)
+                _r_raw = _r_processed.patch
+                _repair_loop_meta = _r_processed.repair_result
+                _r_hygiene = _r_processed.hygiene_findings
+                _r_app = _r_processed.applicability_result
                 repair_patch_content = _r_raw
                 _r_applicable = _r_app.get("applicable") is True
                 if _r_applicable:
@@ -5271,6 +5236,28 @@ def _run_guided_context_acquisition(
                 )
         except Exception as exc:
             print(f"[pipeline] Final-Target Remediation Slice unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+    elif _strategy_result is not None and _strategy_result.evaluated:
+        # Final Strategy actually ran (a real, successfully-parsed response
+        # -- see RemediationStrategyResult.evaluated) and named ZERO
+        # verified target_files/target_symbols. This is a real decision
+        # (or a rejected-then-empty one -- see _verify_strategy_targets),
+        # not the absence of one, and it is exactly as unsafe to generate
+        # a patch from as the Edit Readiness Gate's own "not every intended
+        # edit has verified source" conclusion above -- so it reuses the
+        # SAME _skip_patch_generation flag, never a new terminal state.
+        # Deliberately does NOT branch on whether insufficient_evidence
+        # happens to be populated: a real decision with no verified target
+        # is unsafe to build a patch from whether or not the model also
+        # explained itself (see RemediationStrategyResult's own docstring)
+        # -- and deliberately does NOT read `rendered` (presentation
+        # output) for this decision either.
+        _skip_patch_generation = True
+        print(
+            "[pipeline] Final Remediation Strategy ran but selected no evidence-backed "
+            f"target -- skipping Patch Generation for this run. "
+            f"insufficient_evidence={_strategy_result.insufficient_evidence}",
+            file=sys.stderr,
+        )
     return locals()
 
 
@@ -5985,6 +5972,13 @@ def run(
     # falls back to host execution when Docker is unavailable -- that
     # degrades to NOT_VERIFIED, same as every other unsupported case.
     _existing_test_comparison: "ExistingTestComparisonResult | None" = None
+    # Existing Test Amendment (see existing_test_amendment.py): False unless
+    # S11's own bounded amendment-and-rerun cycle below actually accepts an
+    # amended candidate. Declared here (not just inside the branch that can
+    # set it True) so the S7/S8/S9 `consumed` list construction below can
+    # read it unconditionally, including when compare_existing_tests is off.
+    _test_amendment_accepted = False
+    _s11_rec = None
     if compare_existing_tests:
         if not repo_root:
             _existing_test_comparison = _existing_test_comparison_not_verified(
@@ -6051,12 +6045,16 @@ def run(
             # consumed=[S6, S10] (stage_registry.STAGE_DEPENDENCIES[
             # EXISTING_TEST_COMPARISON]) -- matches actual dataflow exactly:
             # evaluate_existing_test_comparison_with_plan() reads
-            # `repo_root`/`patch` (S6) and `plan` (S10), nothing else.
+            # `repo_root`/`patch` (S6) and `plan` (S10). Also consumed=[S2]
+            # now (stage_registry.STAGE_DEPENDENCIES[EXISTING_TEST_
+            # COMPARISON]) -- the Existing Test Amendment step below reads
+            # S2's own `security_invariant` field.
             _s11_handle = None
+            _s11_rec = None
             if execution_recorder is not None:
                 _s11_handle = execution_recorder.start(
                     _S_EXISTING_TEST_COMPARISON,
-                    consumed=[r for r in (_s6_rec, _s10_rec) if r is not None],
+                    consumed=[r for r in (_s6_rec, _s10_rec, _s2_rec) if r is not None],
                 )
 
             if _discovery_early_result is not None:
@@ -6069,31 +6067,84 @@ def run(
                     file=sys.stderr,
                 )
                 if execution_recorder is not None:
-                    execution_recorder.finish(
+                    _s11_rec = execution_recorder.finish(
                         _s11_handle, outcome="skipped_no_plan",
                         artifact=to_jsonable(_existing_test_comparison),
                     )
             else:
                 try:
-                    _existing_test_comparison = evaluate_existing_test_comparison_with_plan(
-                        Path(repo_root), patch, _test_plan, executor=_executor_for_comparison,
+                    # Existing Test Amendment (bounded feedback mechanism):
+                    # evaluate_existing_test_comparison_with_plan() itself
+                    # is called, unchanged, by this shared orchestrator --
+                    # see existing_test_amendment.py's module docstring.
+                    # `security_invariant` is Final Strategy's (S2) own
+                    # already-computed field; passing it here adds no new
+                    # LLM call by itself -- amendment's own bounded call
+                    # only fires when its own gate (NEW_FAILURES_DETECTED
+                    # with deterministic identity, a non-empty invariant,
+                    # and at least one groundable test file) is met.
+                    _amendment_outcome = evaluate_existing_test_comparison_with_amendment(
+                        Path(repo_root), patch, _test_plan,
+                        security_invariant=(_strategy_result.security_invariant if _strategy_result else None),
+                        executor=_executor_for_comparison, llm=llm,
                     )
+                    _existing_test_comparison = _amendment_outcome.result
+                    _test_amendment_accepted = _amendment_outcome.accepted
+                    if _test_amendment_accepted:
+                        # Authoritative-candidate handoff: `patch` is
+                        # reassigned HERE, before the constraint/remediation
+                        # signals and S7/S8/S9 blocks below -- in ACTUAL
+                        # production code order (see this block's own
+                        # comment above) none of those have run yet, so
+                        # they see the amended patch with no further
+                        # plumbing. See this stage's `consumed` list below
+                        # and stage_registry.STAGE_DEPENDENCIES[PATCH_REVIEW/
+                        # CONFIDENCE_SCORING] for the provenance edit this
+                        # new data flow required.
+                        patch = _amendment_outcome.patch
+                        print(
+                            "[pipeline] Existing Test Amendment: accepted -- "
+                            "amended patch is now the authoritative candidate.",
+                            file=sys.stderr,
+                        )
+                    elif _amendment_outcome.amendment.status != "not_attempted":
+                        print(
+                            f"[pipeline] Existing Test Amendment: {_amendment_outcome.amendment.status} "
+                            f"({_amendment_outcome.amendment.reason}) -- original patch kept.",
+                            file=sys.stderr,
+                        )
                     print(
                         f"[pipeline] Existing Test Comparison: {_existing_test_comparison.status}",
                         file=sys.stderr,
                     )
                     if execution_recorder is not None:
-                        execution_recorder.finish(
-                            _s11_handle, outcome="settled",
-                            artifact=to_jsonable(_existing_test_comparison),
-                        )
+                        _s11_artifact = to_jsonable(_existing_test_comparison)
+                        # Additive-only fields -- ExistingTestComparisonResult's
+                        # own schema/semantics are untouched; this is
+                        # observability for the amendment mechanism, recorded
+                        # inside S11's OWN artifact (no new canonical stage),
+                        # mirroring S6's authoritative_candidate/repair_* shape.
+                        _s11_artifact["test_amendment"] = {
+                            "status": _amendment_outcome.amendment.status,
+                            "reason": _amendment_outcome.amendment.reason,
+                            "accepted": _test_amendment_accepted,
+                            "grounded_files": list(_amendment_outcome.amendment.grounded_files),
+                            "ungrounded_ids": list(_amendment_outcome.amendment.ungrounded_ids),
+                        }
+                        if _amendment_outcome.pre_amendment_result is not None:
+                            _s11_artifact["pre_amendment_result"] = to_jsonable(_amendment_outcome.pre_amendment_result)
+                        _s11_artifact["authoritative_candidate"] = {
+                            "source": "existing_test_amendment" if _test_amendment_accepted else "original",
+                            "patch": patch,
+                        }
+                        _s11_rec = execution_recorder.finish(_s11_handle, outcome="settled", artifact=_s11_artifact)
                 except Exception as exc:
                     print(f"[pipeline] Existing Test Comparison failed unexpectedly: {exc}", file=sys.stderr)
                     _existing_test_comparison = _existing_test_comparison_execution_error(
                         f"comparison failed unexpectedly: {type(exc).__name__}: {exc}"
                     )
                     if execution_recorder is not None:
-                        execution_recorder.finish(
+                        _s11_rec = execution_recorder.finish(
                             _s11_handle, outcome="error",
                             artifact=to_jsonable(_existing_test_comparison),
                         )
@@ -6118,12 +6169,18 @@ def run(
     # here.)
 
     # Batch B4: begin recording S7 (patch_review). consumed=[S6] (stage_
-    # registry.STAGE_DEPENDENCIES[PATCH_REVIEW]).
+    # registry.STAGE_DEPENDENCIES[PATCH_REVIEW]) -- PLUS [S11] whenever an
+    # Existing Test Amendment was actually accepted above: `patch` is then
+    # S11's own settled authoritative candidate, not S6's, and `consumed`
+    # must say so truthfully (see existing_test_amendment.py; this is the
+    # one provenance edit this new data flow required -- see stage_
+    # registry.STAGE_DEPENDENCIES[PATCH_REVIEW]'s own updated comment).
     _s7_handle = None
     if execution_recorder is not None:
-        _s7_handle = execution_recorder.start(
-            _S_PATCH_REVIEW, consumed=[_s6_rec] if _s6_rec is not None else [],
-        )
+        _s7_consumed = [_s6_rec] if _s6_rec is not None else []
+        if _test_amendment_accepted and _s11_rec is not None:
+            _s7_consumed.append(_s11_rec)
+        _s7_handle = execution_recorder.start(_S_PATCH_REVIEW, consumed=_s7_consumed)
     _s8_handle = None  # opened right after S7 finishes, in each branch below
 
     # No-candidate-patch early stop (continued -- see the Challenger gate
@@ -6142,9 +6199,10 @@ def run(
             # CONFIDENCE_SCORING]). Must start here, not earlier, so
             # review_patch()'s "patch_review"-tagged call is never inside
             # S8's own cursor window (STAGE_OWNED_LLM_TAGS would reject it).
-            _s8_handle = execution_recorder.start(
-                _S_CONFIDENCE_SCORING, consumed=[r for r in (_s6_rec, _s7_rec) if r is not None],
-            )
+            _s8_consumed = [r for r in (_s6_rec, _s7_rec) if r is not None]
+            if _test_amendment_accepted and _s11_rec is not None:
+                _s8_consumed.append(_s11_rec)
+            _s8_handle = execution_recorder.start(_S_CONFIDENCE_SCORING, consumed=_s8_consumed)
 
         print("[pipeline] Step 4/4 – Evaluating Trust Signals…", file=sys.stderr)
         score_text = score_confidence(
@@ -6164,9 +6222,10 @@ def run(
         score_text = ""
         if execution_recorder is not None:
             _s7_rec = execution_recorder.finish(_s7_handle, outcome="skipped_no_candidate_patch", artifact={"review": review})
-            _s8_handle = execution_recorder.start(
-                _S_CONFIDENCE_SCORING, consumed=[r for r in (_s6_rec, _s7_rec) if r is not None],
-            )
+            _s8_consumed = [r for r in (_s6_rec, _s7_rec) if r is not None]
+            if _test_amendment_accepted and _s11_rec is not None:
+                _s8_consumed.append(_s11_rec)
+            _s8_handle = execution_recorder.start(_S_CONFIDENCE_SCORING, consumed=_s8_consumed)
 
     _s8_adj = _adjust_confidence_score_for_challenger(score_text, challenger)
     orig_score = _s8_adj["orig_score"]
@@ -6192,11 +6251,24 @@ def run(
     # `patch`/`challenger`, both S6-settled values). Owns zero LLM tags
     # (STAGE_OWNED_LLM_TAGS[IMPACT_AND_BEHAVIOR_ANALYSIS] == ()) -- both
     # analyzers are purely deterministic.
+    #
+    # PLUS [S11] here too, `consumed`-only, whenever an Existing Test
+    # Amendment was accepted above: `patch` below is then S11's settled
+    # candidate. Deliberately NOT added to stage_registry.STAGE_DEPENDENCIES
+    # [IMPACT_AND_BEHAVIOR_ANALYSIS] -- doing so would create a cycle
+    # (EXISTING_TEST_COMPARISON already transitively depends on
+    # IMPACT_AND_BEHAVIOR_ANALYSIS via TEST_ANALYSIS_AND_PLAN). `consumed`
+    # is a per-execution runtime record, already allowed to diverge from
+    # the static approved graph (see the S10/S9-ordering comment above) --
+    # recording the real dataflow here truthfully does not require
+    # resolving that separate, pre-existing, explicitly out-of-scope
+    # graph/order mismatch.
     _s9_handle = None
     if execution_recorder is not None:
-        _s9_handle = execution_recorder.start(
-            _S_IMPACT_AND_BEHAVIOR_ANALYSIS, consumed=[_s6_rec] if _s6_rec is not None else [],
-        )
+        _s9_consumed = [_s6_rec] if _s6_rec is not None else []
+        if _test_amendment_accepted and _s11_rec is not None:
+            _s9_consumed.append(_s11_rec)
+        _s9_handle = execution_recorder.start(_S_IMPACT_AND_BEHAVIOR_ANALYSIS, consumed=_s9_consumed)
 
     # Run Impact Surface analysis (lightweight, deterministic).
     # Repository-dependent: skipped entirely when no repo_root is known

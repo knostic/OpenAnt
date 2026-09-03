@@ -155,6 +155,22 @@ def _strip_md_fences(patch: str) -> tuple[str, str, str]:
     return open_fence, "".join(lines), close_fence
 
 
+def strip_markdown_fences(patch: str) -> str:
+    """Public wrapper around ``_strip_md_fences`` -- returns just the
+    fence-free body, discarding the (possibly empty) opening/closing fence
+    lines. Generic, no diff-semantic knowledge: only recognizes a fence as
+    the literal first/last line of `patch`, exactly like `_strip_md_fences`
+    and patch_applicability._strip_fences already do independently.
+
+    Exists so a caller that needs to COMPOSE two diff fragments (e.g.
+    generated_patch_processing.py's fence-safe concatenation) can strip a
+    fence from one fragment without pulling in markdown-parsing logic of
+    its own -- reuses this module's existing, single implementation rather
+    than a third copy of the same four-line check."""
+    _, clean, _ = _strip_md_fences(patch)
+    return clean
+
+
 @dataclass
 class _FileSection:
     header_a: str  # the "--- a/X" line, exactly as first seen for this file

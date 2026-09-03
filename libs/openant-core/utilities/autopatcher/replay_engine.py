@@ -135,9 +135,9 @@ from . import lineage
 from .confidence_scorer import score_confidence
 from .evidence_fusion import RepositoryUnderstanding
 from .execution_recorder import from_jsonable, to_jsonable
+from .existing_test_amendment import evaluate_existing_test_comparison_with_amendment
 from .existing_test_regression import (
     ExistingTestComparisonResult,
-    evaluate_existing_test_comparison_with_plan,
     not_verified_result,
 )
 from .llm_call_tracing import LLMCallCapture
@@ -219,13 +219,25 @@ class RunFnResult:
     stage-name tag, which is what lets two executions of the same
     canonical stage (once production instrumentation lands in a later
     batch) keep their LLM history unambiguous even when their raw
-    `stage=` tags collide."""
+    `stage=` tags collide.
+
+    `extra_consumed`: {canonical_stage: lineage.Resolution} for any
+    dependency this run_fn resolved and genuinely USED on its own,
+    OPTIONALLY, via the `chain` it was given -- never through
+    handler.dependencies (see _resolve_authoritative_candidate). Merged
+    into the written manifest's `consumed` field alongside the mandatory,
+    handler.dependencies-derived entries, so `consumed` stays a truthful
+    record of what this execution actually read, without requiring an
+    optional stage to be a mandatory (and therefore replay-blocking)
+    canonical dependency. Empty by default -- every existing run_fn is
+    unaffected."""
 
     outcome: "Optional[str]"
     artifact_path: "Optional[Path]"
     llm_calls: list = dataclasses.field(default_factory=list)
     external_calls: list = dataclasses.field(default_factory=list)
     extra_stage_fields: dict = dataclasses.field(default_factory=dict)
+    extra_consumed: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -314,6 +326,47 @@ def _load_json_artifact(resolution: "lineage.Resolution") -> dict:
             f"has no artifact_path -- nothing to reconstruct from."
         )
     return json.loads(Path(resolution.artifact_path).read_text(encoding="utf-8"))
+
+
+def _resolve_authoritative_candidate(chain, s6_artifact: dict) -> "tuple[str, dict]":
+    """THE one shared, deterministic rule for which candidate patch a
+    downstream replay stage (patch_review, confidence_scoring,
+    report_generation) must use -- see existing_test_amendment.py's module
+    docstring and stage_registry.py's own comment on why this is
+    deliberately NOT a canonical dependency.
+
+    Resolves EXISTING_TEST_COMPARISON OPTIONALLY, directly via `chain`
+    (the exact same lineage.resolve_effective() idiom
+    _run_replay_report_generation already used for S11 before this
+    feature existed) -- never through handler.dependencies, so a lineage
+    with no existing_test_comparison execution at all (the overwhelming
+    majority: compare_existing_tests defaults False) never fails this
+    resolution; it just falls back.
+
+    Returns (patch, extra_consumed):
+      - S11 resolved AND its own artifact shows an ACCEPTED amendment
+        (authoritative_candidate.source == "existing_test_amendment") ->
+        (S11's amended patch, {EXISTING_TEST_COMPARISON: s11_resolution})
+        -- the caller must merge `extra_consumed` into its RunFnResult so
+        the manifest truthfully records that S11 was actually consumed.
+      - Otherwise (no S11 execution in this lineage, or one exists but
+        never accepted an amendment) -> (S6's own authoritative patch, {})
+        -- extra_consumed is empty; the caller must NOT claim S11 was
+        consumed when it demonstrably wasn't used.
+
+    Never duplicated inline in each of the three call sites -- see module
+    docstring on the Existing Test Amendment feature."""
+    s6_patch = s6_artifact["authoritative_candidate"]["patch"]
+    if chain is None:
+        return s6_patch, {}
+    s11_resolution = lineage.resolve_effective(chain, EXISTING_TEST_COMPARISON, {})
+    if not s11_resolution.is_resolved:
+        return s6_patch, {}
+    s11_artifact = _load_json_artifact(s11_resolution)
+    authoritative = s11_artifact.get("authoritative_candidate")
+    if not authoritative or authoritative.get("source") != "existing_test_amendment":
+        return s6_patch, {}
+    return authoritative["patch"], {EXISTING_TEST_COMPARISON: s11_resolution}
 
 
 # ---------------------------------------------------------------------------
@@ -825,7 +878,7 @@ def _run_replay_patch_review(
 ) -> RunFnResult:
     s6 = _load_json_artifact(resolved_dependencies[PATCH_REPAIR_AND_CALIBRATION])
     vulnerability_text = s6["vulnerability_text"]
-    patch = s6["authoritative_candidate"]["patch"]
+    patch, extra_consumed = _resolve_authoritative_candidate(chain, s6)
 
     outcome = "skipped_no_candidate_patch"
     review = ""
@@ -840,7 +893,9 @@ def _run_replay_patch_review(
     artifact_path = output_dir / "patch_review.json"
     artifact_path.write_text(json.dumps({"review": review}, indent=2), encoding="utf-8")
 
-    return RunFnResult(outcome=outcome, artifact_path=artifact_path, llm_calls=llm_call_records)
+    return RunFnResult(
+        outcome=outcome, artifact_path=artifact_path, llm_calls=llm_call_records, extra_consumed=extra_consumed,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -859,7 +914,7 @@ def _run_replay_confidence_scoring(
     s6 = _load_json_artifact(resolved_dependencies[PATCH_REPAIR_AND_CALIBRATION])
     s7 = _load_json_artifact(resolved_dependencies[PATCH_REVIEW])
     vulnerability_text = s6["vulnerability_text"]
-    patch = s6["authoritative_candidate"]["patch"]
+    patch, extra_consumed = _resolve_authoritative_candidate(chain, s6)
     # Batch B8 fix: `original_candidate_evaluated.challenger` is the
     # CLASSIFIED shape (_classify_challenger's own keys -- confirmed_defect_
     # count/classified_edge_cases/...), not the RAW shape
@@ -909,6 +964,7 @@ def _run_replay_confidence_scoring(
             # reads code_context, only `challenger`.
             "replay_limitations": {"code_context": "empty -- see run_fn docstring"},
         },
+        extra_consumed=extra_consumed,
     )
 
 
@@ -928,7 +984,7 @@ def _run_replay_impact_and_behavior_analysis(
     chain=None,
 ) -> RunFnResult:
     s6 = _load_json_artifact(resolved_dependencies[PATCH_REPAIR_AND_CALIBRATION])
-    patch = s6["authoritative_candidate"]["patch"]
+    patch, extra_consumed = _resolve_authoritative_candidate(chain, s6)
     challenger = s6["challenger"]
 
     s9_locals = _run_impact_and_behavior_analysis(patch=patch, challenger=challenger, repo_root=repo_root)
@@ -941,7 +997,9 @@ def _run_replay_impact_and_behavior_analysis(
     artifact_path = output_dir / "impact_and_behavior_analysis.json"
     artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
 
-    return RunFnResult(outcome="settled", artifact_path=artifact_path, llm_calls=[])
+    return RunFnResult(
+        outcome="settled", artifact_path=artifact_path, llm_calls=[], extra_consumed=extra_consumed,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -968,6 +1026,15 @@ def _run_replay_impact_and_behavior_analysis(
 # behavior) -- this handler replicates that via the SAME not_verified_
 # result() constructor pipeline.py itself uses for its early-exit checks,
 # never inventing a new "skipped" shape.
+#
+# LLM Test Failure Evidence Distillation: `llm=llm` is passed straight
+# through to the SAME production function, wrapped in LLMCallCapture()
+# exactly like every other LLM-owning stage's replay handler below --
+# evaluate_existing_test_comparison_with_plan() itself decides, from the
+# SAME deterministic gate production uses, whether a distillation call
+# happens at all (see that function's own docstring). This stage newly
+# owns the "test_failure_distillation" LLM tag (stage_registry.py) as of
+# this feature.
 # ---------------------------------------------------------------------------
 
 
@@ -975,26 +1042,68 @@ def _run_replay_existing_test_comparison(
     *, repo_root, llm, output_dir: Path, resolved_dependencies: dict,
     chain=None,
 ) -> RunFnResult:
+    s2 = _load_json_artifact(resolved_dependencies[REMEDIATION_STRATEGY])
     s6 = _load_json_artifact(resolved_dependencies[PATCH_REPAIR_AND_CALIBRATION])
     s10 = _load_json_artifact(resolved_dependencies[TEST_ANALYSIS_AND_PLAN])
     patch = s6["authoritative_candidate"]["patch"]
+    strategy_result = from_jsonable(RemediationStrategyResult, s2.get("strategy_result"))
+    security_invariant = strategy_result.security_invariant if strategy_result is not None else None
 
     if "setup_commands" not in s10:
         # S10 was rejected (no TestExecutionPlan) -- matches production's
         # "no plan -> S11 truthfully never attempts comparison" branch.
+        # No test execution happens at all in this branch, so there is
+        # nothing an LLM Test Failure Evidence Distillation/Existing Test
+        # Amendment call could ever be given -- capturing calls here would
+        # be pure overhead for a branch that structurally cannot produce
+        # any.
         reason = s10.get("reason") or "no test execution plan was discovered"
         result = not_verified_result(reason)
         outcome = "skipped_no_plan"
+        llm_call_records: "list[dict]" = []
+        amendment_outcome = None
     else:
         plan = from_jsonable(TestExecutionPlan, s10)
-        result = evaluate_existing_test_comparison_with_plan(repo_root, patch, plan, executor=None)
+        # LLMCallCapture wraps this the same way _run_test_analysis_and_
+        # plan does: the SAME shared orchestrator production uses
+        # (evaluate_existing_test_comparison_with_amendment) is called
+        # here too -- distillation and/or amendment fire or don't based on
+        # the SAME deterministic gates production uses, never a
+        # replay-only decision. capture.calls is simply empty when neither
+        # gate fires, exactly like production would make zero LLM calls in
+        # that case too.
+        with LLMCallCapture() as capture:
+            amendment_outcome = evaluate_existing_test_comparison_with_amendment(
+                repo_root, patch, plan, security_invariant=security_invariant, executor=None, llm=llm,
+            )
+        result = amendment_outcome.result
+        patch = amendment_outcome.patch
+        llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
+        _assert_llm_ownership(capture.calls, EXISTING_TEST_COMPARISON)
         outcome = "settled"
 
     artifact = to_jsonable(result)
+    if amendment_outcome is not None:
+        # Additive-only fields -- same shape as pipeline.py's own S11
+        # artifact (see run()'s S11 finish-block comment) -- kept
+        # byte-for-byte consistent between production and replay.
+        artifact["test_amendment"] = {
+            "status": amendment_outcome.amendment.status,
+            "reason": amendment_outcome.amendment.reason,
+            "accepted": amendment_outcome.accepted,
+            "grounded_files": list(amendment_outcome.amendment.grounded_files),
+            "ungrounded_ids": list(amendment_outcome.amendment.ungrounded_ids),
+        }
+        if amendment_outcome.pre_amendment_result is not None:
+            artifact["pre_amendment_result"] = to_jsonable(amendment_outcome.pre_amendment_result)
+        artifact["authoritative_candidate"] = {
+            "source": "existing_test_amendment" if amendment_outcome.accepted else "original",
+            "patch": patch,
+        }
     artifact_path = output_dir / "existing_test_comparison.json"
     artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
 
-    return RunFnResult(outcome=outcome, artifact_path=artifact_path, llm_calls=[])
+    return RunFnResult(outcome=outcome, artifact_path=artifact_path, llm_calls=llm_call_records)
 
 
 # ---------------------------------------------------------------------------
@@ -1068,7 +1177,13 @@ def _run_replay_report_generation(
     grounding = from_jsonable(RepositoryGroundingResult, s1.get("grounding"))
 
     authoritative = s6["authoritative_candidate"]
-    patch = authoritative["patch"]
+    # THE shared rule for which candidate patch wins (S6's original/internally
+    # -repaired candidate, or S11's accepted existing-test-amended one) -- see
+    # _resolve_authoritative_candidate's own docstring. `repair_succeeded`
+    # below stays S6-sourced on purpose: it answers "did the Challenger-driven
+    # repair loop replace S6's own candidate", a different, S6-only question
+    # from "which candidate is authoritative NOW".
+    patch, extra_consumed = _resolve_authoritative_candidate(chain, s6)
     repair_succeeded = authoritative["source"] == "internal_repair"
     repair_regeneration = s6.get("repair_regeneration")
     repair_rechallenge = s6.get("repair_rechallenge")
@@ -1163,6 +1278,7 @@ def _run_replay_report_generation(
                 "edit_readiness/edit_acquisition/guided_acquisition/patch_target_conformance/post_patch_recovery": "not reconstructed (None) -- never read by _build_report() (verified by exhaustive grep)",
             },
         },
+        extra_consumed=extra_consumed,
     )
 
 
@@ -1218,7 +1334,10 @@ REPLAY_HANDLERS: "dict[str, ReplayHandler]" = {
     ),
     EXISTING_TEST_COMPARISON: ReplayHandler(
         run_fn=_run_replay_existing_test_comparison,
-        dependencies=(PATCH_REPAIR_AND_CALIBRATION, TEST_ANALYSIS_AND_PLAN),
+        # REMEDIATION_STRATEGY added for the Existing Test Amendment
+        # feature -- see stage_registry.STAGE_DEPENDENCIES[
+        # EXISTING_TEST_COMPARISON]'s own comment.
+        dependencies=(PATCH_REPAIR_AND_CALIBRATION, TEST_ANALYSIS_AND_PLAN, REMEDIATION_STRATEGY),
     ),
     # Batch B8: ONE combined replay unit for the current fused
     # trust_signals_and_recommendation + report_generation terminal tail --
@@ -1429,7 +1548,19 @@ def replay_stage(
     else:
         replay_model = _llm_module._cached_model.get(replay_provider) if replay_provider else None
 
-    consumed = {dep: res.as_identity_dict() for dep, res in resolved_dependencies.items()}
+    # Mandatory dependencies (handler.dependencies, always resolved above --
+    # fails the whole replay if any is missing) PLUS any optional, run_fn-
+    # self-resolved extras (see RunFnResult.extra_consumed) -- e.g.
+    # EXISTING_TEST_COMPARISON, resolved only when a downstream stage's
+    # run_fn actually found and used its accepted amendment. The two never
+    # overlap in practice (an optional extra is, by construction, never
+    # also declared in handler.dependencies -- see stage_registry.py's own
+    # comment on why EXISTING_TEST_COMPARISON stays out of PATCH_REVIEW/
+    # CONFIDENCE_SCORING's canonical dependencies); mandatory entries win on
+    # the rare chance of a key collision, since they are already fail-closed
+    # guaranteed to exist.
+    consumed = {dep: res.as_identity_dict() for dep, res in run_result.extra_consumed.items()}
+    consumed.update({dep: res.as_identity_dict() for dep, res in resolved_dependencies.items()})
 
     # replay_of: does a prior execution of THIS SAME canonical stage exist
     # anywhere in the source lineage? Purely a provenance pointer (not a

@@ -401,6 +401,38 @@ class TestExtractLiteralConstants:
         assert result["EMPTY"]["outcome"] == "literal"
         assert result["EMPTY"]["value"] == frozenset()
 
+    def test_direct_bytes_literal_is_non_literal(self):
+        """Regression: pip 19.1.1 (CVE-2019-20916), src/pip/_vendor/
+        distlib/wheel.py -- SHEBANG_PYTHON = b'#!python' is an ordinary
+        module-level bytes-literal assignment. _canonicalize_literal must
+        reject bytes so this never reaches to_jsonable() as a "literal"
+        value (bytes has no supported canonical/JSON representation)."""
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants("MAGIC = b'#!python'\n")
+        assert result["MAGIC"]["outcome"] == "non_literal"
+        assert result["MAGIC"]["value"] is None
+
+    def test_nested_bytes_literal_is_non_literal(self):
+        """A container whose value contains bytes anywhere inside it must
+        also be classified non_literal -- not just bare bytes literals."""
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants('X = {"k": b"v"}\n')
+        assert result["X"]["outcome"] == "non_literal"
+        assert result["X"]["value"] is None
+
+    def test_sibling_normal_literal_unaffected_by_bytes_literal_in_same_file(self):
+        """A bytes-literal assignment must not disturb extraction of an
+        ordinary literal assignment elsewhere in the same source."""
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        result = _extract_literal_constants("MAGIC = b'#!python'\nTIMEOUT = 30\n")
+        assert result["MAGIC"]["outcome"] == "non_literal"
+        assert result["MAGIC"]["value"] is None
+        assert result["TIMEOUT"]["outcome"] == "literal"
+        assert result["TIMEOUT"]["value"] == 30
+
 
 class TestScopeConstantsInEnrichment:
     """_enrich_one's module/class-level scoping rule for scope_constants,
@@ -473,6 +505,27 @@ class TestScopeConstantsInEnrichment:
         assert candidate.enrichment.resolved_function["unitType"] == "module_level"
         names = {e["qualified_name"] for e in candidate.enrichment.scope_constants}
         assert "Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in names
+
+    def test_bytes_literal_constant_cannot_reach_scope_constants(self):
+        """Regression for the pip 19.1.1 (CVE-2019-20916) crash: even if a
+        bytes-valued constant record somehow made it into an
+        InvestigationContext (e.g. from _extract_literal_constants), the
+        enrichment path copies whatever's already been classified. This
+        proves the fix holds end-to-end: because _extract_literal_constants
+        now classifies bytes as non_literal with value=None, no bytes value
+        is ever present in scope_constants -- confirmed by using the real
+        extractor instead of a hand-built record."""
+        from utilities.autopatcher.candidate_enrichment import _extract_literal_constants
+
+        functions = {"a.py:f": {"name": "f", "startLine": 3, "endLine": 4, "unitType": "function", "className": None, "code": ""}}
+        constants = {"a.py": _extract_literal_constants("MAGIC = b'#!python'\nTIMEOUT = 30\n")}
+        candidate = _candidate("a.py", "symbol_search", 2, hit_line=3)
+        enrich_candidates(_selection(candidate), "/nonexistent", "irrelevant vuln text with no sinks", self._ctx_with_constants(functions, constants))
+        by_name = {e["qualified_name"]: e for e in candidate.enrichment.scope_constants}
+        assert by_name["MAGIC"]["outcome"] == "non_literal"
+        assert by_name["MAGIC"]["value"] is None
+        assert not any(isinstance(e["value"], (bytes, bytearray)) for e in candidate.enrichment.scope_constants)
+        assert by_name["TIMEOUT"]["value"] == 30
 
 
 class TestRealIntegration:

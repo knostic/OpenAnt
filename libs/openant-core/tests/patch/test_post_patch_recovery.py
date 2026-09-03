@@ -1824,11 +1824,13 @@ class TestSlice4Genericity:
         pipeline_text = (base / "pipeline.py").read_text(encoding="utf-8")
         pipeline_start_marker = "# Slice 4 -- Patch Target Conformance Gate + Post-Patch Recovery"
         # Bounded to Slice 4's own inserted block only -- the very next
-        # pre-existing section ("Patch hygiene") immediately follows it
-        # and must never be included here: it contains this pipeline's
+        # pre-existing section (hygiene/applicability/context reconstruction,
+        # now routed through generated_patch_processing.process_generated_patch
+        # -- see that extraction's own module docstring) immediately follows
+        # it and must never be included here: it contains this pipeline's
         # own pre-existing, unrelated "applicability-aware retry"
         # terminology (plain English "retry", not urllib3's Retry class).
-        pipeline_end_marker = "# Patch hygiene"
+        pipeline_end_marker = "# Shared generated-diff mechanics"
         pidx = pipeline_text.index(pipeline_start_marker)
         eidx = pipeline_text.index(pipeline_end_marker, pidx)
         pipeline_slice_4_text = pipeline_text[pidx:eidx]

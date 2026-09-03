@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -254,6 +255,36 @@ class TestTestAnalysisAndPlanReplay:
         assert result.outcome == "rejected"
         assert (output_dir / "rejection_reason.json").is_file()
 
+    def test_insufficient_evidence_no_plan_response_rejected_via_engine(self, tmp_path, monkeypatch):
+        """Real urllib3 S10 replay finding: an explicit "no executable
+        plan" response (empty test_command + confidence "low") must
+        replay through the SAME generic "rejected" outcome/artifact shape
+        as any other rejected response -- no new replay-only handling
+        needed, since discover_test_plan's rejection_reason mechanism
+        already threads through unchanged."""
+        repo = _make_target_repo(tmp_path)
+        source = _write_full_run_trace(tmp_path / "run", repo_root=repo)
+        _install_fake_call_llm(monkeypatch, json.dumps({
+            "setup_commands": [],
+            "test_command": [],
+            "result_strategy": "exit_code",
+            "result_output_path": None,
+            "runtime_family": "python",
+            "runtime_version_hint": None,
+            "evidence": ["pyproject.toml"],
+            "reasoning_summary": "No concrete command could be grounded for a matrix-parameterized session.",
+            "confidence": "low",
+        }))
+        output_dir = tmp_path / "replay-out"
+
+        result = replay_stage(source_run=source, stage_name="test_analysis_and_plan", output_dir=output_dir)
+
+        assert result.outcome == "rejected"
+        artifact = json.loads((output_dir / "rejection_reason.json").read_text())
+        assert "insufficient evidence" in artifact["reason"]
+        execution = _execution_for(result.manifest, "test_analysis_and_plan")
+        assert execution["invocation_kind"] == "replay"
+
     def test_transitional_stage_has_zero_declared_dependencies_to_check(self, tmp_path, monkeypatch):
         repo = _make_target_repo(tmp_path)
         source = _write_full_run_trace(tmp_path / "run", repo_root=repo)
@@ -435,6 +466,190 @@ class TestLLMOwnershipEnforcement:
 
     def test_no_calls_at_all_passes(self):
         _assert_llm_ownership([], "test_analysis_and_plan")  # no raise
+
+
+class TestExistingTestComparisonNowOwnsDistillationTag:
+    """existing_test_comparison newly owns the "test_failure_distillation"
+    LLM tag (LLM Test Failure Evidence Distillation) -- a plain registry
+    fact, checked the same way TestLLMOwnershipEnforcement above checks
+    test_analysis_and_plan's."""
+
+    def test_distillation_tag_is_owned(self):
+        _assert_llm_ownership([{"stage": "test_failure_distillation"}], "existing_test_comparison")  # no raise
+
+    def test_foreign_tag_still_rejected(self):
+        with pytest.raises(ReplayEngineError, match="LLM ownership violation"):
+            _assert_llm_ownership([{"stage": "patch_generation"}], "existing_test_comparison")
+
+    def test_stage_now_requires_an_llm_provider(self):
+        """Derived, not hardcoded: stage_registry._LLM_PROVIDER is
+        bool(STAGE_OWNED_LLM_TAGS[name]) -- owning a tag flips this
+        automatically, for both production and replay preflight."""
+        assert STAGE_SPECS["existing_test_comparison"].requires_llm_provider is True
+
+
+class TestExistingTestComparisonReplayDistillationWiring:
+    """Focused, hermetic (no Docker, no real LLM) unit coverage for
+    _run_replay_existing_test_comparison's LLM Test Failure Evidence
+    Distillation wiring: calls the run_fn directly (not through the full
+    replay_stage() engine, which would need real lineage/Docker fixtures)
+    with evaluate_existing_test_comparison_with_plan itself mocked to
+    simulate production making one distillation call -- proving the
+    replay handler captures it, attributes it correctly, and persists
+    only small, bounded files. Whether production actually triggers
+    distillation is separately covered, in full, by
+    test_existing_test_regression.py's TestDistillationGate."""
+
+    @staticmethod
+    def _resolved_dependencies(tmp_path):
+        s2_path = tmp_path / "s2.json"
+        s2_path.write_text(json.dumps({"strategy_result": None}), encoding="utf-8")
+        s6_path = tmp_path / "s6.json"
+        s6_path.write_text(
+            json.dumps({"authoritative_candidate": {"patch": "--- a\n+++ b\n"}}), encoding="utf-8",
+        )
+        s10_path = tmp_path / "s10.json"
+        s10_path.write_text(json.dumps({
+            "setup_commands": [], "test_command": ["make", "test"], "result_strategy": "exit_code",
+            "result_output_path": None, "runtime_family": None, "runtime_version_hint": None,
+            "evidence": ["Makefile"], "reasoning_summary": "r", "confidence": "high", "source": "llm",
+        }), encoding="utf-8")
+
+        class _Resolution:
+            def __init__(self, path):
+                self.artifact_path = path
+
+        from utilities.autopatcher.stage_registry import (
+            PATCH_REPAIR_AND_CALIBRATION,
+            REMEDIATION_STRATEGY,
+            TEST_ANALYSIS_AND_PLAN,
+        )
+        return {
+            REMEDIATION_STRATEGY: _Resolution(s2_path),
+            PATCH_REPAIR_AND_CALIBRATION: _Resolution(s6_path),
+            TEST_ANALYSIS_AND_PLAN: _Resolution(s10_path),
+        }
+
+    def test_distillation_call_is_captured_attributed_and_bounded(self, tmp_path, monkeypatch):
+        from utilities.autopatcher.existing_test_amendment import AmendmentOutcome, AmendmentRerunOutcome
+        from utilities.autopatcher.existing_test_regression import (
+            STATUS_NEW_FAILURES_DETECTED,
+            ExistingTestComparisonResult,
+        )
+        from utilities.autopatcher.llm_client import LLMClient
+
+        def fake_evaluate(repo_root, patch, plan, security_invariant=None, executor=None, llm=None):
+            # Simulate production making exactly one distillation call
+            # (the actual gating logic is tested elsewhere) with an LLM
+            # object that routes through the SAME call_llm() choke point
+            # LLMCallCapture wraps.
+            llm.complete("distiller system prompt", "distiller user message", stage="test_failure_distillation")
+            r1 = ExistingTestComparisonResult(
+                status=STATUS_NEW_FAILURES_DETECTED, command=plan.test_command,
+                baseline=None, patched=None, reason="aggregate delta only",
+            )
+            return AmendmentRerunOutcome(
+                result=r1, patch=patch, accepted=False,
+                amendment=AmendmentOutcome(status="not_attempted", reason="no security invariant"),
+            )
+
+        calls = _install_fake_call_llm(monkeypatch, "(mock distillation response)")
+        fake_llm = LLMClient(api_key="")
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+
+        with mock.patch.object(
+            replay_engine_module, "evaluate_existing_test_comparison_with_amendment", side_effect=fake_evaluate,
+        ):
+            result = replay_engine_module._run_replay_existing_test_comparison(
+                repo_root=tmp_path, llm=fake_llm, output_dir=output_dir,
+                resolved_dependencies=self._resolved_dependencies(tmp_path),
+            )
+
+        assert result.outcome == "settled"
+        assert len(calls) == 1  # the real call_llm() choke point actually fired once
+        assert len(result.llm_calls) == 1
+        assert result.llm_calls[0]["stage"] == "test_failure_distillation"
+
+        artifact = json.loads(Path(result.artifact_path).read_text())
+        assert artifact["status"] == STATUS_NEW_FAILURES_DETECTED
+
+        # Bounded, small files only -- never a giant persisted raw log.
+        prompt_files = list(output_dir.glob("*.prompt.txt"))
+        response_files = list(output_dir.glob("*.response.txt"))
+        assert len(prompt_files) == 1 and len(response_files) == 1
+        assert prompt_files[0].read_text() == "distiller system prompt\n\ndistiller user message"
+        assert prompt_files[0].stat().st_size < 10_000
+        assert response_files[0].stat().st_size < 10_000
+
+    def test_no_distillation_call_means_empty_llm_calls(self, tmp_path, monkeypatch):
+        """When the deterministic gate doesn't fire (production's own
+        decision, simulated here), replay must not fabricate an LLM call
+        -- llm_calls stays empty, exactly like production would."""
+        from utilities.autopatcher.existing_test_amendment import AmendmentOutcome, AmendmentRerunOutcome
+        from utilities.autopatcher.existing_test_regression import STATUS_PASS, ExistingTestComparisonResult
+
+        def fake_evaluate_no_llm_call(repo_root, patch, plan, security_invariant=None, executor=None, llm=None):
+            r1 = ExistingTestComparisonResult(
+                status=STATUS_PASS, command=plan.test_command, baseline=None, patched=None, reason="clean",
+            )
+            return AmendmentRerunOutcome(
+                result=r1, patch=patch, accepted=False,
+                amendment=AmendmentOutcome(status="not_attempted", reason="S11 reported no new failures"),
+            )
+
+        calls = _install_fake_call_llm(monkeypatch, "unused")
+        from utilities.autopatcher.llm_client import LLMClient
+        fake_llm = LLMClient(api_key="")
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+
+        with mock.patch.object(
+            replay_engine_module, "evaluate_existing_test_comparison_with_amendment",
+            side_effect=fake_evaluate_no_llm_call,
+        ):
+            result = replay_engine_module._run_replay_existing_test_comparison(
+                repo_root=tmp_path, llm=fake_llm, output_dir=output_dir,
+                resolved_dependencies=self._resolved_dependencies(tmp_path),
+            )
+
+        assert result.llm_calls == []
+        assert calls == []
+
+    def test_skipped_no_plan_branch_never_touches_llm(self, tmp_path):
+        """The pre-existing "S10 rejected" branch structurally cannot
+        produce a distillation call -- no test execution happens at all
+        -- confirmed by construction (no llm capture attempted), not by
+        behavior alone."""
+        s2_path = tmp_path / "s2.json"
+        s2_path.write_text(json.dumps({"strategy_result": None}), encoding="utf-8")
+        s6_path = tmp_path / "s6.json"
+        s6_path.write_text(json.dumps({"authoritative_candidate": {"patch": "p"}}), encoding="utf-8")
+        s10_path = tmp_path / "s10.json"
+        s10_path.write_text(json.dumps({"reason": "no reliable plan"}), encoding="utf-8")
+
+        class _Resolution:
+            def __init__(self, path):
+                self.artifact_path = path
+
+        from utilities.autopatcher.stage_registry import (
+            PATCH_REPAIR_AND_CALIBRATION,
+            REMEDIATION_STRATEGY,
+            TEST_ANALYSIS_AND_PLAN,
+        )
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+
+        result = replay_engine_module._run_replay_existing_test_comparison(
+            repo_root=tmp_path, llm=None, output_dir=output_dir,
+            resolved_dependencies={
+                REMEDIATION_STRATEGY: _Resolution(s2_path),
+                PATCH_REPAIR_AND_CALIBRATION: _Resolution(s6_path),
+                TEST_ANALYSIS_AND_PLAN: _Resolution(s10_path),
+            },
+        )
+        assert result.outcome == "skipped_no_plan"
+        assert result.llm_calls == []
 
 
 class TestReplayHandlerValidation:

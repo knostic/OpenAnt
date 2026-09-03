@@ -69,6 +69,29 @@ _README_CANDIDATES = ("README.md", "README.rst", "README.txt", "README")
 
 _IGNORED_DIR_NAMES = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", "dist", "build"}
 
+# Generic "does this line look relevant to how tests are EXECUTED"
+# detector -- a small, fixed word-family regex, never a per-ecosystem
+# command table (see module docstring's "framework provider" warning).
+# Reused for BOTH CI-workflow-file and config-file bounded excerpting
+# below (_relevance_filtered_excerpt) -- the same class of problem in
+# both cases: a large file whose test-execution-relevant lines may sit
+# anywhere in it, not necessarily near the beginning.
+_TEST_RELEVANCE_RE = re.compile(
+    r"\btest(?:s|ing)?\b"
+    r"|\bpytest\b|\bnox\b|\btox\b|\bunittest\b"
+    r"|\bnpm\s+test\b|\byarn\s+test\b|\bpnpm\s+test\b"
+    r"|\bcargo\s+test\b|\bgo\s+test\b|\bmvn\s+test\b|\bgradle\w*\s+test\b"
+    r"|\bjest\b|\bvitest\b|\bmocha\b",
+    re.IGNORECASE,
+)
+
+# Bounded surrounding context kept around each relevant line -- a
+# generic-but-necessary allowance since, e.g., a YAML workflow step's
+# actual `run:` command commonly sits a few lines below the `name:` line
+# that mentions "test", or a shell block spans several following lines.
+_RELEVANCE_CONTEXT_BEFORE = 2
+_RELEVANCE_CONTEXT_AFTER = 8
+
 
 @dataclass(frozen=True)
 class EvidenceBundle:
@@ -143,16 +166,114 @@ def _read_bounded_text(path: Path, raw_limit: int = _MAX_RAW_READ_BYTES) -> "str
     return raw.decode("utf-8", errors="replace")
 
 
+def _relevance_filtered_excerpt(text: str, limit: int) -> str:
+    """Bound `text` to `limit` chars, PREFERRING lines relevant to how
+    tests are executed (plus bounded surrounding context around them)
+    over a naive head-only slice.
+
+    Fixes a real, concrete gap: a naive `text[:limit]` slice represents a
+    large file primarily by its BEGINNING, regardless of where its
+    test-execution-relevant content actually lives -- e.g. a CI workflow
+    file's early sections (checkout, matrix setup, permissions, caching)
+    can easily consume the entire per-item budget before the step that
+    actually runs tests is ever reached, silently discarding exactly the
+    evidence Test Plan Discovery needs most.
+
+    GREEDILY accumulates small, individually-bounded context windows
+    (never one large merged block) working NEAREST-TO-THE-END-OF-THE-FILE
+    FIRST -- the same tail/end-priority philosophy
+    existing_test_regression._prefilter_failure_relevant_text uses for
+    runner output, applied here to repository evidence files: a
+    repository's own primary test target (the actual `test` session/job)
+    commonly sits after auxiliary ones (lint, docs, other sessions), not
+    necessarily first. Stops the instant the budget runs out -- it never
+    discards an already-kept window just because more matches existed
+    than fit.
+
+    Processing small, INDIVIDUALLY bounded windows (not a big merged
+    range) matters: a keyword that recurs densely throughout a file for
+    an unrelated, structural reason (e.g. `nox` appearing on every
+    `@nox.session` decorator in a noxfile.py, whether or not that session
+    has anything to do with running tests) must never let one giant
+    merged "relevant" block dominate the budget and then get head-
+    truncated the same way the original naive slice did -- each window
+    stays small and is prioritized independently.
+
+    Falls back to the existing head-only behavior when nothing
+    test-relevant is identifiable anywhere in `text` at all -- never
+    fabricates missing context, never reconstructs a command that isn't
+    literally present, and still guarantees the SAME bounded output size
+    as before."""
+    if len(text) <= limit:
+        return text
+
+    lines = text.splitlines()
+    relevant_indices = [i for i, line in enumerate(lines) if _TEST_RELEVANCE_RE.search(line)]
+    if not relevant_indices:
+        return text[:limit] + "\n... [truncated]"
+
+    marker = "\n... [omitted] ...\n"
+    covered = [False] * len(lines)
+    # (sort_key, piece_text) -- the ACTUAL, already-covered-filtered text
+    # is stored directly (never re-sliced from `lines` afterward): a
+    # window's covered-filtering can carve a non-contiguous gap out of
+    # its own [start, end) range (the middle already claimed by a
+    # nearer-to-end window), which a bare (start, end) tuple cannot
+    # represent -- re-slicing `lines[start:end]` later would silently
+    # re-include lines another window already claimed, duplicating
+    # content and blowing the budget this loop just enforced.
+    kept: "list[tuple[int, str]]" = []
+    budget = limit
+
+    for i in reversed(relevant_indices):
+        if covered[i]:
+            continue
+        start = max(0, i - _RELEVANCE_CONTEXT_BEFORE)
+        end = min(len(lines), i + _RELEVANCE_CONTEXT_AFTER + 1)
+        while start < end and covered[start]:
+            start += 1  # don't pay twice for lines a nearer-to-end window already covers
+        piece_lines = [ln for idx, ln in enumerate(lines[start:end], start=start) if not covered[idx]]
+        if not piece_lines:
+            continue
+        piece = "\n".join(piece_lines)
+        cost = len(piece) + (len(marker) if kept else 0)
+        if cost > budget:
+            continue  # this window doesn't fit -- skip it, keep scanning backward
+        kept.append((start, piece))
+        for idx in range(start, end):
+            covered[idx] = True
+        budget -= cost
+
+    if not kept:
+        # Not even the single smallest window fits -- fall back to a
+        # bounded slice of the one relevant line closest to the end,
+        # rather than return nothing.
+        i = relevant_indices[-1]
+        line = lines[i]
+        return line[:limit] + ("\n... [truncated]" if len(line) > limit else "")
+
+    kept.sort(key=lambda item: item[0])  # restore original file order for readability
+    parts = [piece for _, piece in kept]
+    excerpt = marker.join(parts)
+
+    # Defensive invariant, not expected to fire given the per-window
+    # budgeting above -- truncate rather than discard if it somehow
+    # still does, for the same reason existing_test_regression.py's
+    # analogous backstop does.
+    if len(excerpt) > limit:
+        excerpt = excerpt[:limit] + "\n... [truncated]"
+    return excerpt
+
+
 def _read_bounded(path: Path, limit: int) -> "str | None":
     """Bounded read for direct-inclusion evidence files: reads at most a
-    few times `limit` raw bytes (never the whole file), then truncates
-    the decoded text to exactly `limit` chars."""
+    few times `limit` raw bytes (never the whole file), then bounds the
+    decoded text to `limit` chars via _relevance_filtered_excerpt (never
+    a naive head-only slice -- see that function's docstring)."""
     text = _read_bounded_text(path, raw_limit=limit * 4)
     if text is None:
         return None
-    if len(text) > limit:
-        text = text[:limit] + "\n... [truncated]"
-    return text
+    return _relevance_filtered_excerpt(text, limit)
 
 
 def _package_json_relevant_fields(path: Path) -> "str | None":
@@ -236,7 +357,7 @@ def _gather_ci_snippets(root: Path) -> "tuple[tuple[str, str], ...]":
         if text is None or not _CI_KEYWORD_RE.search(text):
             continue
         rel = f".github/workflows/{p.name}"
-        snippet = text[:_MAX_CI_BYTES] + ("\n... [truncated]" if len(text) > _MAX_CI_BYTES else "")
+        snippet = _relevance_filtered_excerpt(text, _MAX_CI_BYTES)
         out.append((rel, snippet))
     return tuple(out)
 

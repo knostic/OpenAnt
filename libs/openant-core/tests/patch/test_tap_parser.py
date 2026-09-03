@@ -76,6 +76,107 @@ class TestOneFailingLeaf:
         assert parsed.failed_test_ids == ["fails"]
 
 
+class TestFailureDiagnostics:
+    """Bounded diagnostic text from a TAP YAML block (--- ... ...),
+    associated ONLY with the immediately-preceding FAILING test line --
+    never used as identity, never attached to a passing test, never
+    leaked across an unrelated test."""
+
+    def test_diagnostic_block_associated_with_failing_test(self):
+        text = (
+            "TAP version 13\n1..2\n"
+            "ok 1 - passes\n"
+            "not ok 2 - fails\n"
+            "  ---\n"
+            "  operator: equal\n"
+            "  expected: 2\n"
+            "  actual: 1\n"
+            "  ...\n"
+        )
+        parsed = parse_tap(text)
+        assert parsed is not None
+        diag = parsed.failure_diagnostics["fails"]
+        assert "expected: 2" in diag
+        assert "actual: 1" in diag
+
+    def test_passing_test_gets_no_diagnostic_even_with_a_yaml_block(self):
+        text = (
+            "TAP version 13\n1..1\n"
+            "ok 1 - passes\n"
+            "  ---\n"
+            "  note: this is fine\n"
+            "  ...\n"
+        )
+        parsed = parse_tap(text)
+        assert parsed is not None
+        assert parsed.failure_diagnostics == {}
+
+    def test_diagnostic_does_not_leak_to_the_next_test(self):
+        """A diagnostic block always describes the PRECEDING line -- it
+        must never be associated with a later, unrelated test."""
+        text = (
+            "TAP version 13\n1..2\n"
+            "ok 1 - passes\n"
+            "  ---\n"
+            "  note: unrelated to test 2\n"
+            "  ...\n"
+            "not ok 2 - fails_without_diagnostic\n"
+        )
+        parsed = parse_tap(text)
+        assert parsed is not None
+        assert "fails_without_diagnostic" not in parsed.failure_diagnostics
+
+    def test_free_form_comment_is_never_a_diagnostic_or_an_identity(self):
+        """A bare '#' comment (not a YAML block, not a Subtest: marker) is
+        always ignored -- it must never become identity, and this feature
+        must not start mining it for diagnostic text either (only the
+        already-structurally-delimited YAML block construct is safe to
+        use for that -- see the module docstring)."""
+        text = (
+            "TAP version 13\n1..1\n"
+            "not ok 1 - fails\n"
+            "# some free-form comment about the failure\n"
+        )
+        parsed = parse_tap(text)
+        assert parsed is not None
+        assert parsed.failed_test_ids == ["fails"]
+        assert parsed.failure_diagnostics == {}
+
+    def test_diagnostic_is_bounded(self):
+        huge_line = "  detail: " + ("x" * 50_000)
+        text = (
+            "TAP version 13\n1..1\n"
+            "not ok 1 - fails\n"
+            "  ---\n"
+            f"{huge_line}\n"
+            "  ...\n"
+        )
+        parsed = parse_tap(text)
+        assert parsed is not None
+        diag = parsed.failure_diagnostics["fails"]
+        assert len(diag) < 3_000
+        assert "truncated" in diag
+
+    def test_subtest_child_diagnostic_uses_hierarchical_id(self):
+        text = (
+            "TAP version 13\n"
+            "# Subtest: test/parse.js\n"
+            "    ok 1 - parses flags\n"
+            "    not ok 2 - parses negative numbers\n"
+            "      ---\n"
+            "      expected: -1\n"
+            "      actual: 1\n"
+            "      ...\n"
+            "    1..2\n"
+            "not ok 1 - test/parse.js\n"
+            "1..1\n"
+        )
+        parsed = parse_tap(text)
+        assert parsed is not None
+        diag = parsed.failure_diagnostics["test/parse.js > parses negative numbers"]
+        assert "expected: -1" in diag
+
+
 class TestMultipleFailures:
     def test_several_failures_among_passes(self):
         text = "TAP version 13\n1..4\nok 1 - a\nnot ok 2 - b\nnot ok 3 - c\nok 4 - d\n"

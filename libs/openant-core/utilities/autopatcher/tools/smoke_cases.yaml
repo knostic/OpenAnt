@@ -1,0 +1,94 @@
+# Canonical smoke-test pins for scripts/smoke_eval_cases.sh
+#
+# These pins mirror the "Expected pins" table used to catch the class of bug
+# where a Gadi evaluation run silently used the wrong target-repo commit
+# (e.g. a urllib3 checkout that post-dated its own advisory's fix commit,
+# making a correct patch look like it "doesn't apply"). See
+# evaluation/evaluation-cases.md for the narrative writeups these pins back.
+#
+# FORMAT NOTE: this file is intentionally a restricted YAML subset — a flat
+# list of string-only mappings, no nesting/anchors/multiline scalars/inline
+# comments after values. It is parsed by a small stdlib-only Python snippet
+# embedded in scripts/smoke_eval_cases.sh (no PyYAML dependency). Keep new
+# entries in this same flat shape or the parser will reject them.
+#
+# Each case has exactly one of two input fields, mirroring src/main.py's own
+# --ghsa / file-mode mutual exclusivity:
+#   ghsa            - GHSA ID; case is invoked as `main.py --ghsa <id> ...`
+#   advisory_file   - path (relative to repo root) to a Markdown advisory
+#                     file; case is invoked as `main.py <file> ...` (file
+#                     mode). Used for cases whose advisory text was authored
+#                     by hand rather than fetched live (see curl/node-semver
+#                     benchmark packages under evaluation/ for why).
+#
+# expected_outcome is one of:
+#   not_do_not_apply   - recommendation must NOT be "Do Not Apply"
+#   non_blocking       - recommendation must be "Deploy After Validation"
+#                        or "Deploy With Caution"
+#   blocked_or_review  - recommendation must be "Do Not Apply"
+#                        or "Manual Review Required"
+
+cases:
+  - id: urllib3
+    repo: https://github.com/urllib3/urllib3.git
+    ghsa: GHSA-v845-jxx5-vc9f
+    cve: CVE-2023-43804
+    tag: 2.0.5
+    sha: d9f85a749488188c286cd50606d159874db94d5f
+    expected_outcome: non_blocking
+
+  - id: minimist
+    repo: https://github.com/minimistjs/minimist.git
+    ghsa: GHSA-xvch-5gv4-984h
+    cve: CVE-2021-44906
+    tag: v1.2.5
+    sha: aeb3e27dae0412de5c0494e9563a5f10c82cc7a9
+    expected_outcome: blocked_or_review
+
+  - id: pip
+    repo: https://github.com/pypa/pip.git
+    ghsa: GHSA-gpvv-69j7-gwj8
+    cve: CVE-2019-20916
+    tag: 19.1.1
+    sha: 58c93acd4fa7073fbf145a6a7debfff960da0448
+    expected_outcome: non_blocking
+
+  - id: gitpython
+    repo: https://github.com/gitpython-developers/GitPython.git
+    ghsa: GHSA-7545-fcxq-7j24
+    cve: CVE-2026-44243
+    tag: 3.1.47
+    sha: 4199cb89755f705801a4cb241723325b46201f51
+    expected_outcome: blocked_or_review
+
+  - id: pygeoapi
+    repo: https://github.com/geopython/pygeoapi.git
+    ghsa: GHSA-f6pr-83pg-ghh6
+    cve: CVE-2026-42351
+    tag: 0.23.2
+    sha: a6b9b43c822fc8169ee78ef7cba5400d3f1d39aa
+    expected_outcome: blocked_or_review
+
+  - id: curl
+    repo: https://github.com/curl/curl.git
+    # ghsa: GHSA-7xmh-mw7w-rr97  -- informational only; this case is invoked via
+    # advisory_file (file mode), not --ghsa, so it is not a live field (see
+    # INPUT_FIELDS mutual-exclusivity in scripts/smoke_eval_cases.sh and
+    # evaluation/grounding/case_loader.py).
+    advisory_file: examples/curl-cve-2022-27774.md
+    cve: CVE-2022-27774
+    tag: curl-7_82_0
+    sha: 64db5c575d9c5536bd273a890f50777ad1ca7c13
+    expected_outcome: blocked_or_review
+
+  - id: node-semver-cve-2022-25883
+    display_name: node-semver
+    repo: https://github.com/npm/node-semver.git
+    # ghsa: GHSA-c2qf-rxjj-qqgw  -- informational only; see the same
+    # advisory_file/ghsa mutual-exclusivity note as the curl case above.
+    # Also stated inside examples/node-semver-cve-2022-25883.md itself.
+    advisory_file: examples/node-semver-cve-2022-25883.md
+    cve: CVE-2022-25883
+    tag: v7.5.1
+    sha: aa016a67162c195938f7873ea29a73dac47ff9ba
+    expected_outcome: blocked_or_review

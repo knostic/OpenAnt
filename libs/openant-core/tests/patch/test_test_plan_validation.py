@@ -64,6 +64,59 @@ class TestWellFormedPlansAccepted:
         ))
         assert result.valid is True
 
+    def test_bare_pytest_binary_is_recognized(self):
+        """Regression: a real pip tox.ini `[testenv] commands = pytest
+        --timeout 300 []` and a real GitPython CI step both directly
+        invoke bare `pytest`, not `python -m pytest` -- exactly the
+        repository-owned invocation _SYSTEM_PROMPT tells the model to
+        preserve as-is. This must be accepted, not rejected as an
+        unrecognized binary."""
+        result = validate_plan(_plan(
+            test_command=("pytest", "--timeout", "300", "--junitxml=/tmp/openant-result.xml"),
+        ))
+        assert result.valid is True
+
+
+class TestExtraAllowedFirstTokens:
+    """The precomputed, per-call `extra_allowed_first_tokens` parameter
+    validate_plan accepts on top of the static ALLOWED_COMMAND_BINARIES
+    set -- see test_plan_command_provenance.py for who computes this and
+    why. validate_plan itself does no filesystem/evidence work; it only
+    ever checks membership."""
+
+    def test_token_in_extra_set_is_accepted(self):
+        result = validate_plan(
+            _plan(
+                setup_commands=(("./init-tests-after-clone.sh",),),
+                test_command=("pytest", "--junitxml=/tmp/openant-result.xml"),
+            ),
+            extra_allowed_first_tokens=frozenset({"./init-tests-after-clone.sh"}),
+        )
+        assert result.valid is True
+
+    def test_token_not_in_extra_set_is_still_rejected(self):
+        result = validate_plan(
+            _plan(setup_commands=(("./init-tests-after-clone.sh",),)),
+            extra_allowed_first_tokens=frozenset({"./some-other-script.sh"}),
+        )
+        assert result.valid is False
+        assert "unrecognized binary" in result.reason
+
+    def test_default_is_empty_existing_callers_unaffected(self):
+        """No existing call site passes this parameter -- confirms the
+        default preserves prior behavior exactly: a repo-relative token
+        is rejected exactly as before this feature existed."""
+        result = validate_plan(_plan(setup_commands=(("./init-tests-after-clone.sh",),)))
+        assert result.valid is False
+        assert "unrecognized binary" in result.reason
+
+    def test_extra_token_applies_to_test_command_too(self):
+        result = validate_plan(
+            _plan(test_command=("./tools/ci.py",), result_strategy="exit_code", result_output_path=None),
+            extra_allowed_first_tokens=frozenset({"./tools/ci.py"}),
+        )
+        assert result.valid is True
+
 
 class TestMalformedPlansRejected:
     def test_empty_test_command_rejected(self):

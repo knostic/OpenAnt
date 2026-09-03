@@ -20,8 +20,22 @@ from unittest import mock
 import pytest
 
 from utilities.autopatcher.execution_recorder import ExecutionRecorder
+from utilities.autopatcher.existing_test_amendment import AmendmentOutcome, AmendmentRerunOutcome
 from utilities.autopatcher.existing_test_regression import ExistingTestComparisonResult
 from utilities.autopatcher.test_execution_models import TestExecutionPlan
+
+
+def _fixed_pass_amendment_outcome(repo_root, patch, plan, security_invariant=None, executor=None, llm=None):
+    """Fixed PASS result, wrapped as an AmendmentRerunOutcome with no
+    amendment attempted -- used wherever a test just needs S11 to settle
+    cleanly and isn't exercising the amendment mechanism itself."""
+    return AmendmentRerunOutcome(
+        result=ExistingTestComparisonResult(
+            status="PASS", command=plan.test_command, baseline=None, patched=None, reason="ok",
+        ),
+        patch=patch, accepted=False,
+        amendment=AmendmentOutcome(status="not_attempted", reason="test fixture: amendment not exercised"),
+    )
 
 _CLEAN_DIFF = """\
 ```diff
@@ -59,10 +73,18 @@ def _run_with_recorder(
 ):
     """Run pipeline.run() with a real ExecutionRecorder attached.
     discover_test_plan_for_comparison and evaluate_existing_test_comparison_
-    with_plan are mocked at the pipeline.py boundary (same as
+    with_amendment are mocked at the pipeline.py boundary (same as
     test_pipeline_existing_test_regression.py); call_log_side_effect, if
     given, additionally appends a synthetic LLM-call record to the
     recorder's own call_log (proving real attribution mechanics).
+
+    `comparison_return`/`comparison_side_effect` describe the underlying
+    S11 ExistingTestComparisonResult (or an exception) exactly as before
+    the Existing Test Amendment feature -- wrapped into an
+    AmendmentRerunOutcome with accepted=False/amendment.status=
+    "not_attempted" below (this file exercises S10/S11 EXECUTION RECORDING,
+    not the amendment mechanism itself -- see test_existing_test_amendment.py
+    for that).
     """
     call_log = []
     run_dir = str(tmp_path / "run")
@@ -74,6 +96,22 @@ def _run_with_recorder(
         if discover_return is not None:
             return discover_return
         return (_PLAN, None, mock.MagicMock())
+
+    def _amendment_call(repo_root, patch, plan, security_invariant=None, executor=None, llm=None):
+        from utilities.autopatcher.existing_test_amendment import AmendmentOutcome, AmendmentRerunOutcome
+        if comparison_side_effect is not None:
+            if isinstance(comparison_side_effect, BaseException):
+                raise comparison_side_effect
+            return comparison_side_effect(
+                repo_root, patch, plan, security_invariant=security_invariant, executor=executor, llm=llm,
+            )
+        result = comparison_return or ExistingTestComparisonResult(
+            status="PASS", command=_PLAN.test_command, baseline=None, patched=None, reason="ok",
+        )
+        return AmendmentRerunOutcome(
+            result=result, patch=patch, accepted=False,
+            amendment=AmendmentOutcome(status="not_attempted", reason="test fixture: amendment not exercised"),
+        )
 
     with (
         mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
@@ -88,11 +126,8 @@ def _run_with_recorder(
         mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
         mock.patch("utilities.autopatcher.pipeline.discover_test_plan_for_comparison", side_effect=_discover) as mock_discover,
         mock.patch(
-            "utilities.autopatcher.pipeline.evaluate_existing_test_comparison_with_plan",
-            return_value=comparison_return or ExistingTestComparisonResult(
-                status="PASS", command=_PLAN.test_command, baseline=None, patched=None, reason="ok",
-            ),
-            side_effect=comparison_side_effect,
+            "utilities.autopatcher.pipeline.evaluate_existing_test_comparison_with_amendment",
+            side_effect=_amendment_call,
         ) as mock_compare,
     ):
         mock_llm_cls.return_value = mock.MagicMock()
@@ -156,13 +191,19 @@ class TestConsumedIdentities:
         }
 
     def test_s11_consumes_exact_s6_and_s10(self, tmp_path):
+        """Also consumes S2 as of the Existing Test Amendment feature --
+        the amendment step reads S2's own security_invariant field (see
+        stage_registry.STAGE_DEPENDENCIES[EXISTING_TEST_COMPARISON])."""
         _, rec, _, _ = _run_with_recorder(tmp_path)
+        s2 = rec.executions[1]
         s6 = rec.executions[5]
         s10, s11 = _s10_s11(rec)
+        assert s2["canonical_stage"] == "remediation_strategy"
         assert s11["canonical_stage"] == "existing_test_comparison"
         assert s11["consumed"] == {
             "patch_repair_and_calibration": {"run": rec.run_dir, "execution_id": s6["execution_id"]},
             "test_analysis_and_plan": {"run": rec.run_dir, "execution_id": s10["execution_id"]},
+            "remediation_strategy": {"run": rec.run_dir, "execution_id": s2["execution_id"]},
         }
 
 
@@ -283,10 +324,8 @@ class TestRecorderNonePreservesBehavior:
                     return_value=(_PLAN, None, mock.MagicMock()),
                 ),
                 mock.patch(
-                    "utilities.autopatcher.pipeline.evaluate_existing_test_comparison_with_plan",
-                    return_value=ExistingTestComparisonResult(
-                        status="PASS", command=_PLAN.test_command, baseline=None, patched=None, reason="ok",
-                    ),
+                    "utilities.autopatcher.pipeline.evaluate_existing_test_comparison_with_amendment",
+                    side_effect=_fixed_pass_amendment_outcome,
                 ),
             ):
                 mock_llm_cls.return_value = mock.MagicMock()

@@ -173,7 +173,12 @@ class TestIndependentReplay:
         )
         manifest = _manifest(tmp_path / "replay-s11")
         execution = manifest["executions"][0]
-        assert set(execution["consumed"].keys()) == {"patch_repair_and_calibration", "test_analysis_and_plan"}
+        # remediation_strategy added for the Existing Test Amendment
+        # feature -- see stage_registry.STAGE_DEPENDENCIES[
+        # EXISTING_TEST_COMPARISON]'s own comment.
+        assert set(execution["consumed"].keys()) == {
+            "patch_repair_and_calibration", "test_analysis_and_plan", "remediation_strategy",
+        }
         artifact = json.loads(Path(execution["artifact_path"]).read_text())
         assert "status" in artifact
 

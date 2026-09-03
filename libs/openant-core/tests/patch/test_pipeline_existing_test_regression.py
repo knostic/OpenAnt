@@ -89,10 +89,21 @@ def _run_pipeline(
 
     discover_test_plan_for_comparison (Batch B5's S10 half) is mocked to
     succeed by default (a fixture plan, no early_result) so every existing
-    test here reaches evaluate_existing_test_comparison_with_plan() (S11's
-    half, still named `mock_evaluate` for these tests' own purposes)
-    exactly as before the split -- pass discovery_return_value explicitly
-    to exercise a discovery-level early stop instead.
+    test here reaches evaluate_existing_test_comparison_with_amendment()
+    (S11's half plus the Existing Test Amendment orchestration, still
+    named `mock_evaluate` for these tests' own purposes) exactly as before
+    the split -- pass discovery_return_value explicitly to exercise a
+    discovery-level early stop instead.
+
+    `etr_return_value`/`etr_side_effect` describe the underlying S11
+    ExistingTestComparisonResult (or an exception) exactly as they did
+    before the Existing Test Amendment feature -- this helper wraps
+    `etr_return_value` into an AmendmentRerunOutcome with
+    `accepted=False`/`amendment.status="not_attempted"` (these wiring
+    tests are not exercising the amendment mechanism itself; that has its
+    own dedicated coverage in test_existing_test_amendment.py) so every
+    existing test in this file keeps observing the exact same
+    `result.existing_test_comparison` value it always has.
     """
     captured = {}
     import utilities.autopatcher.pipeline as _pipeline_mod
@@ -104,6 +115,17 @@ def _run_pipeline(
 
     if discovery_return_value is None:
         discovery_return_value = (_default_discovered_plan(), None, mock.MagicMock())
+
+    def _amendment_call(repo_root, patch, plan, security_invariant=None, executor=None, llm=None):
+        if etr_side_effect is not None:
+            if isinstance(etr_side_effect, BaseException):
+                raise etr_side_effect
+            return etr_side_effect(repo_root, patch, plan, security_invariant=security_invariant, executor=executor, llm=llm)
+        from utilities.autopatcher.existing_test_amendment import AmendmentOutcome, AmendmentRerunOutcome
+        return AmendmentRerunOutcome(
+            result=etr_return_value, patch=patch, accepted=False,
+            amendment=AmendmentOutcome(status="not_attempted", reason="test fixture: amendment not exercised"),
+        )
 
     with (
         mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
@@ -123,8 +145,8 @@ def _run_pipeline(
             return_value=discovery_return_value,
         ) as mock_discover,
         mock.patch(
-            "utilities.autopatcher.pipeline.evaluate_existing_test_comparison_with_plan",
-            return_value=etr_return_value, side_effect=etr_side_effect,
+            "utilities.autopatcher.pipeline.evaluate_existing_test_comparison_with_amendment",
+            side_effect=_amendment_call,
         ) as mock_evaluate,
     ):
         mock_llm_cls.return_value = mock.MagicMock()

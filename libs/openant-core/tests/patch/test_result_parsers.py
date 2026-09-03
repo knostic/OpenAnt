@@ -58,6 +58,77 @@ class TestParseJunitXml:
         assert parse_junit_xml(xml) is None
 
 
+class TestFailureDiagnostics:
+    """Bounded, per-failed-test diagnostic text preserved from JUnit's own
+    <failure>/<error> message attribute + body -- generic JUnit schema,
+    never runner-specific."""
+
+    def test_failure_message_and_body_are_combined(self):
+        xml = (
+            '<testsuites><testsuite name="pytest" tests="1" failures="1">'
+            '<testcase classname="tests.test_mod" name="test_fail">'
+            '<failure message="assert 1 == 2">Traceback (most recent call last):\n'
+            '    assert 1 == 2\nAssertionError</failure>'
+            '</testcase></testsuite></testsuites>'
+        )
+        parsed = parse_junit_xml(xml)
+        assert parsed is not None
+        diag = parsed.failure_diagnostics["tests.test_mod::test_fail"]
+        assert "assert 1 == 2" in diag
+        assert "AssertionError" in diag
+
+    def test_error_element_diagnostic_is_preserved(self):
+        xml = (
+            '<testsuites><testsuite name="pytest" tests="1" errors="1">'
+            '<testcase classname="tests.test_mod" name="test_err">'
+            '<error message="ImportError: no module named foo">boom</error>'
+            '</testcase></testsuite></testsuites>'
+        )
+        parsed = parse_junit_xml(xml)
+        assert parsed is not None
+        assert "ImportError" in parsed.failure_diagnostics["tests.test_mod::test_err"]
+
+    def test_diagnostic_is_bounded(self):
+        huge = "x" * 50_000
+        xml = (
+            '<testsuites><testsuite name="pytest" tests="1" failures="1">'
+            '<testcase classname="tests.test_mod" name="test_fail">'
+            f'<failure>{huge}</failure>'
+            '</testcase></testsuite></testsuites>'
+        )
+        parsed = parse_junit_xml(xml)
+        assert parsed is not None
+        diag = parsed.failure_diagnostics["tests.test_mod::test_fail"]
+        assert len(diag) < 3_000
+        assert "truncated" in diag
+
+    def test_passing_tests_get_no_diagnostic(self):
+        xml = _junit(passed=2, failed_ids=["tests.test_mod::test_fail"])
+        parsed = parse_junit_xml(xml)
+        assert parsed is not None
+        assert set(parsed.failure_diagnostics.keys()) == {"tests.test_mod::test_fail"}
+        assert "tests.test_mod::test_pass_0" not in parsed.failure_diagnostics
+        assert "tests.test_mod::test_pass_1" not in parsed.failure_diagnostics
+
+    def test_counts_only_mode_has_no_diagnostics(self):
+        xml = '<testsuites><testsuite name="pytest" tests="5" failures="2" errors="0" skipped="0"></testsuite></testsuites>'
+        parsed = parse_junit_xml(xml)
+        assert parsed is not None
+        assert parsed.mode == "counts_only"
+        assert parsed.failure_diagnostics == {}
+
+    def test_no_failure_element_body_or_message_yields_no_diagnostic_entry(self):
+        xml = (
+            '<testsuites><testsuite name="pytest" tests="1" failures="1">'
+            '<testcase classname="tests.test_mod" name="test_fail"><failure/></testcase>'
+            '</testsuite></testsuites>'
+        )
+        parsed = parse_junit_xml(xml)
+        assert parsed is not None
+        assert parsed.failed_test_ids == ["tests.test_mod::test_fail"]
+        assert "tests.test_mod::test_fail" not in parsed.failure_diagnostics
+
+
 class TestParseResultDispatch:
     def test_junit_dispatches_to_junit_parser(self):
         xml = _junit(passed=3)

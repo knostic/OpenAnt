@@ -151,8 +151,21 @@ class TestLLMOwnership:
             assert isinstance(STAGE_OWNED_LLM_TAGS[name], tuple)
 
     def test_deterministic_stages_own_zero_llm_tags(self):
-        for name in ("impact_and_behavior_analysis", "trust_signals_and_recommendation", "report_generation", "existing_test_comparison"):
+        # existing_test_comparison is deliberately EXCLUDED here as of the
+        # LLM Test Failure Evidence Distillation feature: it now owns
+        # exactly one narrow LLM tag (see
+        # test_owns_exactly_the_distillation_tag below) for the case
+        # where deterministic comparison detects new failures with no
+        # deterministic per-test identity. Its DETERMINISTIC comparison
+        # algorithm itself is unchanged -- only this one, gated, narrow
+        # LLM call was added.
+        for name in ("impact_and_behavior_analysis", "trust_signals_and_recommendation", "report_generation"):
             assert STAGE_OWNED_LLM_TAGS[name] == ()
+
+    def test_existing_test_comparison_owns_exactly_the_distillation_and_amendment_tags(self):
+        assert STAGE_OWNED_LLM_TAGS["existing_test_comparison"] == (
+            "test_failure_distillation", "existing_test_amendment",
+        )
 
     def test_stage4_and_stage6_generation_tags_are_distinguishable(self):
         """The exact ambiguity Batch A was asked to fix: Stage 4 (patch

@@ -18,7 +18,32 @@ like" a pass or a failure.
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+# Bounded, generic diagnostic size -- one failed/errored TEST's message+body,
+# not a whole run's output (see existing_test_regression._MAX_EXCERPT_CHARS
+# for that, separate, whole-run budget). A single testcase's traceback can be
+# arbitrarily long; this keeps a per-test diagnostic small enough to persist
+# safely without approaching the whole-run excerpt budget.
+_MAX_DIAGNOSTIC_CHARS = 2_000
+
+
+def _bounded_diagnostic(text: "str | None") -> "str | None":
+    """Bound one test's diagnostic text to a small, fixed size. Generic --
+    used identically by JUnit (this module) and TAP (tap_parser.py) -- never
+    a runner-specific behavior. Returns None for empty/whitespace-only
+    input, never an empty string, so callers can use a plain truthiness
+    check."""
+    if not text:
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    if len(text) <= _MAX_DIAGNOSTIC_CHARS:
+        return text
+    omitted = len(text) - _MAX_DIAGNOSTIC_CHARS
+    return text[:_MAX_DIAGNOSTIC_CHARS] + f"\n[… {omitted} character(s) truncated …]"
 
 
 @dataclass
@@ -29,6 +54,14 @@ class ParsedTestCounts:
     errors: int
     failed_test_ids: "list[str]"
     mode: str  # "full" (per-test IDs available) | "counts_only" (aggregate only)
+    # Bounded, per-failed-test diagnostic text (test_id -> message/body),
+    # populated only where a failed test's own diagnostic is genuinely
+    # available (JUnit's <failure>/<error> message/body; TAP's associated
+    # YAML diagnostic block -- see tap_parser.py). Empty for "counts_only"
+    # mode (no per-test identity to key it by) and for any test this was
+    # simply not available for. Never a claim of identity by itself --
+    # always keyed by an id already present in failed_test_ids.
+    failure_diagnostics: "dict[str, str]" = field(default_factory=dict)
 
 
 def _int_attr(elem: "ET.Element", name: str) -> int:
@@ -36,6 +69,20 @@ def _int_attr(elem: "ET.Element", name: str) -> int:
         return int(elem.get(name, "0"))
     except (TypeError, ValueError):
         return 0
+
+
+def _junit_diagnostic(elem: "ET.Element") -> "str | None":
+    """Standard JUnit XML puts a short human-readable summary in a
+    failure/error element's own ``message`` attribute and a fuller
+    traceback/body in its text content -- both are part of the SAME
+    generic JUnit schema every ecosystem's junit-xml writer emits (pytest
+    natively; jest via jest-junit; go-junit-report; mvn/gradle; cargo2junit
+    -- see this module's own docstring), never a runner-specific
+    extension. Combines whichever of the two are present, bounded."""
+    message = (elem.get("message") or "").strip()
+    body = (elem.text or "").strip()
+    parts = [p for p in (message, body) if p]
+    return _bounded_diagnostic("\n".join(parts)) if parts else None
 
 
 def parse_junit_xml(xml_text: "str | None") -> "ParsedTestCounts | None":
@@ -53,21 +100,32 @@ def parse_junit_xml(xml_text: "str | None") -> "ParsedTestCounts | None":
     if testcases:
         passed = failed = skipped = errors = 0
         failed_ids: "list[str]" = []
+        diagnostics: "dict[str, str]" = {}
         for tc in testcases:
             classname = tc.get("classname", "")
             name = tc.get("name", "")
             test_id = f"{classname}::{name}" if classname else name
-            if tc.find("failure") is not None:
+            failure_elem = tc.find("failure")
+            error_elem = tc.find("error")
+            if failure_elem is not None:
                 failed += 1
                 failed_ids.append(test_id)
-            elif tc.find("error") is not None:
+                diag = _junit_diagnostic(failure_elem)
+                if diag:
+                    diagnostics[test_id] = diag
+            elif error_elem is not None:
                 errors += 1
                 failed_ids.append(test_id)
+                diag = _junit_diagnostic(error_elem)
+                if diag:
+                    diagnostics[test_id] = diag
             elif tc.find("skipped") is not None:
                 skipped += 1
             else:
                 passed += 1
-        return ParsedTestCounts(passed, failed, skipped, errors, failed_ids, mode="full")
+        return ParsedTestCounts(
+            passed, failed, skipped, errors, failed_ids, mode="full", failure_diagnostics=diagnostics,
+        )
 
     # No <testcase> elements. Fall back to suite-level aggregate counts if
     # present -- never invent individual test names in this branch.

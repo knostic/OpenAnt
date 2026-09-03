@@ -19,6 +19,15 @@ structurally unsafe:
     or a backtick has no legitimate reason to appear in an argv array
     either)
   - only a small, fixed set of recognized binaries may start a command
+    -- OR, for a "./"-prefixed repository-relative token only, one that
+    validate_plan's caller has already, separately, proven is a real,
+    contained repository file whose use is grounded in the repository's
+    own test/setup evidence (see test_plan_command_provenance.py and
+    this module's own `extra_allowed_first_tokens` parameter below).
+    validate_plan itself never touches the filesystem or evidence to
+    decide this -- it only ever consults a precomputed set its caller
+    supplies, keeping this function pure and identical regardless of a
+    plan's source, exactly as before.
   - result_output_path, when present, must resolve under the one
     container-internal writable prefix the executor actually mounts
     (``/tmp/``) -- this is a CONTAINER path constraint, not a host
@@ -76,6 +85,18 @@ MAX_COMMAND_CHARS = 500
 # test_executors.is_runtime_supported).
 ALLOWED_COMMAND_BINARIES = frozenset({
     "python", "python3", "pip", "pip3", "uv", "poetry", "tox", "nox",
+    # pytest itself, not just "python -m pytest": a real pip/tox.ini
+    # `[testenv] commands = pytest --timeout 300 []` and a real GitPython
+    # CI step both directly invoke the bare `pytest` entry point -- exactly
+    # the repository-owned invocation _SYSTEM_PROMPT's own "PRESERVE
+    # REPOSITORY-OWNED ENTRY POINTS" / "When a direct command is
+    # appropriate" rules (test_plan_discovery.py) tell the model to
+    # preserve as-is rather than reconstruct as "python -m pytest". No
+    # different in risk profile from tox/nox above -- this is a
+    # well-formedness gate, not a capability gate (see the module comment
+    # above); actual execution safety still comes from Docker containment
+    # and test_executors.is_runtime_supported, not from this list.
+    "pytest",
     "npm", "yarn", "pnpm", "node",
     "go",
     "cargo",
@@ -91,9 +112,22 @@ def _invalid(reason: str) -> PlanValidationResult:
     return PlanValidationResult(valid=False, plan=None, reason=reason)
 
 
-def _valid_command_shape(argv, label: str) -> "str | None":
+def _valid_command_shape(
+    argv, label: str, *, extra_allowed_first_tokens: "frozenset[str]" = frozenset(),
+) -> "str | None":
     """Returns an error string, or None if argv is a well-formed,
-    bounded, safe-looking argv tuple."""
+    bounded, safe-looking argv tuple.
+
+    `extra_allowed_first_tokens`: a precomputed, per-call set of
+    additional argv[0] values to accept, ON TOP OF the fixed
+    ALLOWED_COMMAND_BINARIES set -- always empty unless the caller
+    (test_plan_discovery.discover_test_plan) has already, separately,
+    proven each entry is a real, repository-contained file whose use is
+    grounded in the repository's own evidence (see
+    test_plan_command_provenance.resolve_repository_owned_commands).
+    This function performs no filesystem/evidence work itself and does
+    not know or care WHY a token is in this set -- it only ever checks
+    membership, keeping this function pure."""
     if not isinstance(argv, tuple) or not argv:
         return f"{label} must be a non-empty argv tuple"
     if len(argv) > MAX_TOKENS_PER_COMMAND:
@@ -105,25 +139,36 @@ def _valid_command_shape(argv, label: str) -> "str | None":
             return f"{label} contains a non-string or empty token"
         if _SHELL_METACHAR_RE.search(token):
             return f"{label} token contains a disallowed shell metacharacter: {token!r}"
-    if argv[0] not in ALLOWED_COMMAND_BINARIES:
+    if argv[0] not in ALLOWED_COMMAND_BINARIES and argv[0] not in extra_allowed_first_tokens:
         return f"{label} starts with an unrecognized binary: {argv[0]!r}"
     return None
 
 
-def validate_plan(plan: TestExecutionPlan) -> PlanValidationResult:
+def validate_plan(
+    plan: TestExecutionPlan, *, extra_allowed_first_tokens: "frozenset[str]" = frozenset(),
+) -> PlanValidationResult:
     """Validate a candidate plan. Never raises -- any unexpected shape is
-    a rejection, not a crash."""
+    a rejection, not a crash.
+
+    `extra_allowed_first_tokens` defaults to empty, preserving this
+    function's behavior for every existing caller unchanged -- see
+    _valid_command_shape's own docstring for what it means and who may
+    safely supply a non-empty set."""
     try:
         if len(plan.setup_commands) > MAX_SETUP_COMMANDS:
             return _invalid(
                 f"too many setup_commands ({len(plan.setup_commands)} > {MAX_SETUP_COMMANDS})"
             )
         for i, cmd in enumerate(plan.setup_commands):
-            err = _valid_command_shape(cmd, f"setup_commands[{i}]")
+            err = _valid_command_shape(
+                cmd, f"setup_commands[{i}]", extra_allowed_first_tokens=extra_allowed_first_tokens,
+            )
             if err:
                 return _invalid(err)
 
-        err = _valid_command_shape(plan.test_command, "test_command")
+        err = _valid_command_shape(
+            plan.test_command, "test_command", extra_allowed_first_tokens=extra_allowed_first_tokens,
+        )
         if err:
             return _invalid(err)
 

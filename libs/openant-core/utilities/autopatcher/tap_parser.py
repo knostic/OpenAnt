@@ -73,6 +73,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .result_parsers import ParsedTestCounts
 
+from .result_parsers import _bounded_diagnostic
+
 _TAP_VERSION_RE = re.compile(r"^TAP version\s+\d+\s*$")
 _PLAN_RE = re.compile(r"^\d+\.\.\d+\s*$")
 _SUBTEST_RE = re.compile(r"^#\s*Subtest:\s*(.*)$", re.IGNORECASE)
@@ -157,8 +159,19 @@ def parse_tap(text: "str | None") -> "ParsedTestCounts | None":
     top_level: "list[tuple[str, str]]" = []  # (id, status)
     open_subtest: "dict | None" = None  # {"name": str, "indent": int, "children": list}
     in_yaml_block = False
+    yaml_block_lines: "list[str]" = []
     top_version_seen = False
     saw_any_structure = False
+    diagnostics: "dict[str, str]" = {}
+    # The most recently recorded result's (id, status) -- id already in its
+    # FINAL form (subtest children are qualified "name > child" immediately,
+    # matching what _drain_open_subtest will later append, so a diagnostic
+    # block can be associated correctly even before a subtest closes).
+    # Used ONLY to safely associate a following YAML diagnostic block with
+    # the test it actually diagnoses -- never to influence identity/status
+    # itself.
+    last_result_id: "str | None" = None
+    last_result_status: "str | None" = None
 
     for raw_line in lines:
         line = raw_line.rstrip("\r\n")
@@ -168,6 +181,27 @@ def parse_tap(text: "str | None") -> "ParsedTestCounts | None":
         if in_yaml_block:
             if _YAML_CLOSE_RE.match(content):
                 in_yaml_block = False
+                # Associate this block's bounded text with the most
+                # recently recorded FAILING test only -- a diagnostic
+                # block on a passing test is not failure evidence this
+                # feature needs, and "most recent" is the only safe,
+                # generic way to associate a block with an identity
+                # without parsing the YAML content itself (still opaque
+                # text, never mined for a fake identity of its own). First
+                # block for a given id wins; later blocks for the same
+                # already-diagnosed id are ignored rather than overwritten
+                # or concatenated.
+                if (
+                    last_result_status == "fail"
+                    and last_result_id is not None
+                    and last_result_id not in diagnostics
+                ):
+                    diag = _bounded_diagnostic("\n".join(yaml_block_lines))
+                    if diag:
+                        diagnostics[last_result_id] = diag
+                yaml_block_lines = []
+            else:
+                yaml_block_lines.append(line)
             continue  # opaque diagnostic text -- never mined for test identities
 
         if content == "":
@@ -175,6 +209,7 @@ def parse_tap(text: "str | None") -> "ParsedTestCounts | None":
 
         if _YAML_OPEN_RE.match(content):
             in_yaml_block = True
+            yaml_block_lines = []
             continue
 
         if _TAP_VERSION_RE.match(content):
@@ -199,6 +234,10 @@ def parse_tap(text: "str | None") -> "ParsedTestCounts | None":
                 "children": [],
             }
             saw_any_structure = True
+            # Prevent a diagnostic block inside the subtest's own preamble
+            # (before its first child line) from being misattributed to
+            # whatever test line preceded the subtest entirely.
+            last_result_id, last_result_status = None, None
             continue
 
         if content.startswith("#"):
@@ -212,16 +251,20 @@ def parse_tap(text: "str | None") -> "ParsedTestCounts | None":
         description, status = parsed
         if open_subtest is not None and indent > open_subtest["indent"]:
             open_subtest["children"].append((description, status))
+            last_result_id, last_result_status = f'{open_subtest["name"]} > {description}', status
             continue
 
         if open_subtest is not None:
             # This line is at or above the subtest's own indent -- it is
             # the subtest's ROLLUP line, not a new top-level test.
-            _drain_open_subtest(top_level, open_subtest, rollup_status=status)
+            appended = _drain_open_subtest(top_level, open_subtest, rollup_status=status)
             open_subtest = None
+            if appended:
+                last_result_id, last_result_status = appended[-1]
             continue
 
         top_level.append((description, status))
+        last_result_id, last_result_status = description, status
 
     if in_yaml_block:
         return None  # truncated -- a YAML diagnostic block was never closed
@@ -236,13 +279,23 @@ def parse_tap(text: "str | None") -> "ParsedTestCounts | None":
     failed = sum(1 for _, s in top_level if s == "fail")
     skipped = sum(1 for _, s in top_level if s == "skip")
     failed_ids = [tid for tid, s in top_level if s == "fail"]
+    # Diagnostics keyed by an id that never made it into top_level at all
+    # (e.g. a subtest CHILD id recorded as last_result_id, but the subtest
+    # was later found to have MORE children before rolling up, so that
+    # exact "name > child" id is not the rollup's own final id set for an
+    # empty-subtest case) are dropped rather than kept dangling -- a
+    # diagnostic must only ever be exposed under an id that is also a real,
+    # reported failed_test_ids entry.
+    diagnostics = {tid: diag for tid, diag in diagnostics.items() if tid in failed_ids}
     return ParsedTestCounts(
         passed=passed, failed=failed, skipped=skipped, errors=0,
-        failed_test_ids=failed_ids, mode="full",
+        failed_test_ids=failed_ids, mode="full", failure_diagnostics=diagnostics,
     )
 
 
-def _drain_open_subtest(top_level: "list[tuple[str, str]]", open_subtest: dict, rollup_status: str) -> None:
+def _drain_open_subtest(
+    top_level: "list[tuple[str, str]]", open_subtest: dict, rollup_status: str,
+) -> "list[tuple[str, str]]":
     """Fold a closed subtest's recorded children into `top_level`,
     preferring the CHILDREN's own identities/statuses over the subtest's
     own rollup line -- this is the "do not double-count a parent summary
@@ -251,11 +304,20 @@ def _drain_open_subtest(top_level: "list[tuple[str, str]]", open_subtest: dict, 
     hierarchical identity ("group > child"). If the subtest had no
     recorded children at all (e.g. an empty subtest, or one whose only
     content was diagnostics), the rollup line itself is the best
-    available identity and is used as a single leaf result instead."""
+    available identity and is used as a single leaf result instead.
+
+    Returns the list of (id, status) entries appended, in order -- so a
+    caller tracking "the most recently recorded result" (for diagnostic
+    association, see parse_tap's `last_result_id`/`last_result_status`)
+    can update itself to the LAST one without duplicating this function's
+    own child-vs-rollup logic."""
     name = open_subtest["name"]
     children = open_subtest["children"]
+    appended: "list[tuple[str, str]]" = []
     if children:
         for child_id, status in children:
-            top_level.append((f"{name} > {child_id}", status))
+            appended.append((f"{name} > {child_id}", status))
     else:
-        top_level.append((name, rollup_status))
+        appended.append((name, rollup_status))
+    top_level.extend(appended)
+    return appended

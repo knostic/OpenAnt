@@ -145,6 +145,186 @@ class TestCiSnippets:
         bundle = gather_test_plan_evidence(tmp_path)
         assert bundle.ci_snippets == ()
 
+    def test_relevant_step_after_original_truncation_boundary_is_preserved(self, tmp_path: Path):
+        """Direct regression anchor for the real replay finding: a real
+        urllib3-shaped CI workflow whose actual test-execution step sits
+        well past the original naive `text[:_MAX_CI_BYTES]` boundary --
+        that step must now be preserved, not silently cut off."""
+        from utilities.autopatcher.test_evidence_acquisition import _MAX_CI_BYTES
+
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        boilerplate = "\n".join(f"  # unrelated CI boilerplate line {i}" for i in range(400))
+        content = (
+            "name: CI\n"
+            "on: [push, pull_request]\n"
+            "jobs:\n"
+            "  build:\n"
+            f"{boilerplate}\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@v3\n"
+            "      - name: Run the test suite\n"
+            "        run: nox -s test\n"
+        )
+        assert len(content) > _MAX_CI_BYTES  # the original bug's precondition
+        assert content.index("nox -s test") > _MAX_CI_BYTES  # past the old head-only boundary
+        (wf / "ci.yml").write_text(content, encoding="utf-8")
+
+        bundle = gather_test_plan_evidence(tmp_path)
+        snippet = dict(bundle.ci_snippets)[".github/workflows/ci.yml"]
+        assert "nox -s test" in snippet
+        assert len(snippet) <= _MAX_CI_BYTES + 100  # still bounded
+
+    def test_beginning_only_boilerplate_does_not_consume_the_entire_budget(self, tmp_path: Path):
+        """The unrelated preamble must not be what fills the budget --
+        the relevant step must survive even when the preamble ALONE would
+        already exceed the per-item cap on its own."""
+        from utilities.autopatcher.test_evidence_acquisition import _MAX_CI_BYTES
+
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        # Many short, ordinary boilerplate LINES (realistic YAML shape) --
+        # their combined size alone already exceeds the per-item cap.
+        boilerplate = "\n".join(f"  # unrelated boilerplate line {i}" for i in range(2000))
+        assert len(boilerplate) > _MAX_CI_BYTES * 3
+        content = boilerplate + "\njobs:\n  test:\n    steps:\n      - run: pytest -v\n"
+        (wf / "ci.yml").write_text(content, encoding="utf-8")
+
+        bundle = gather_test_plan_evidence(tmp_path)
+        snippet = dict(bundle.ci_snippets)[".github/workflows/ci.yml"]
+        assert "pytest -v" in snippet
+
+    def test_multiple_relevant_sections_remain_bounded(self, tmp_path: Path):
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        filler = "\n".join(f"  # filler {i}" for i in range(200))
+        content = (
+            "jobs:\n"
+            "  test-py38:\n"
+            "    steps:\n      - run: pytest -k py38\n"
+            f"{filler}\n"
+            "  test-py311:\n"
+            "    steps:\n      - run: pytest -k py311\n"
+            f"{filler}\n"
+        )
+        from utilities.autopatcher.test_evidence_acquisition import _MAX_CI_BYTES
+        (wf / "ci.yml").write_text(content, encoding="utf-8")
+
+        bundle = gather_test_plan_evidence(tmp_path)
+        snippet = dict(bundle.ci_snippets)[".github/workflows/ci.yml"]
+        assert "pytest -k py38" in snippet
+        assert "pytest -k py311" in snippet
+        assert len(snippet) <= _MAX_CI_BYTES + 100
+
+    def test_provenance_file_name_intact(self, tmp_path: Path):
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        boilerplate = "\n".join(f"# line {i}" for i in range(500))
+        (wf / "ci.yml").write_text(f"{boilerplate}\njobs:\n  test:\n    steps:\n      - run: pytest\n", encoding="utf-8")
+
+        bundle = gather_test_plan_evidence(tmp_path)
+        assert ".github/workflows/ci.yml" in bundle.citable_identifiers
+        names = [path for path, _ in bundle.ci_snippets]
+        assert names == [".github/workflows/ci.yml"]
+
+    def test_non_python_shaped_workflow_relevant_section_preserved(self, tmp_path: Path):
+        """Generic across ecosystems -- not Python/pytest-specific. A
+        Node-shaped CI workflow with a large, unrelated preamble (lint,
+        build matrix, docs) before the actual `npm test` step."""
+        from utilities.autopatcher.test_evidence_acquisition import _MAX_CI_BYTES
+
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        boilerplate = "\n".join(f"  # node ci boilerplate line {i}" for i in range(400))
+        content = (
+            "name: Node CI\n"
+            "jobs:\n"
+            "  lint-and-build:\n"
+            f"{boilerplate}\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: actions/setup-node@v3\n"
+            "      - name: Run tests\n"
+            "        run: npm test\n"
+        )
+        assert content.index("npm test") > _MAX_CI_BYTES
+        (wf / "ci.yml").write_text(content, encoding="utf-8")
+
+        bundle = gather_test_plan_evidence(tmp_path)
+        snippet = dict(bundle.ci_snippets)[".github/workflows/ci.yml"]
+        assert "npm test" in snippet
+
+
+class TestRelevanceFilteredExcerptOnConfigFiles:
+    """The SAME relevance-aware bounding used for CI files also applies
+    to config-file truncation (_read_bounded) -- e.g. a large noxfile.py
+    whose actual `test` session sits after several unrelated sessions
+    (lint, docs, mypy)."""
+
+    def test_noxfile_test_session_preserved_past_original_truncation_boundary(self, tmp_path: Path):
+        from utilities.autopatcher.test_evidence_acquisition import _MAX_FILE_BYTES
+
+        unrelated_sessions = "\n\n".join(
+            f"@nox.session\ndef lint_variant_{i}(session):\n    session.run('flake8')"
+            for i in range(150)
+        )
+        content = (
+            "import nox\n\n"
+            f"{unrelated_sessions}\n\n"
+            "@nox.session\n"
+            "def test(session):\n"
+            "    session.run('pytest', '-v', 'test/')\n"
+        )
+        assert len(content) > _MAX_FILE_BYTES
+        assert content.index("def test(session)") > _MAX_FILE_BYTES
+        (tmp_path / "noxfile.py").write_text(content, encoding="utf-8")
+
+        bundle = gather_test_plan_evidence(tmp_path)
+        content_seen = dict(bundle.present_config_files)["noxfile.py"]
+        assert "def test(session)" in content_seen
+        assert "pytest" in content_seen
+
+
+class TestRelevanceFilteredExcerptUnit:
+    """Direct unit coverage for _relevance_filtered_excerpt -- the shared
+    mechanism behind both CI-file and config-file bounded truncation."""
+
+    def test_text_within_limit_returned_unchanged(self):
+        from utilities.autopatcher.test_evidence_acquisition import _relevance_filtered_excerpt
+        text = "short text, no truncation needed"
+        assert _relevance_filtered_excerpt(text, 1000) == text
+
+    def test_no_relevant_line_anywhere_falls_back_to_head_only(self):
+        """True "nothing test-relevant is identifiable" case -- existing
+        bounded head-only fallback behavior is acceptable here."""
+        from utilities.autopatcher.test_evidence_acquisition import _relevance_filtered_excerpt
+        text = "\n".join(f"unrelated boilerplate line {i}" for i in range(500))
+        assert len(text) > 200
+        out = _relevance_filtered_excerpt(text, 200)
+        assert out.startswith("unrelated boilerplate line 0")
+        assert "truncated" in out
+        assert len(out) <= 250
+
+    def test_relevant_line_far_past_the_limit_is_preserved(self):
+        from utilities.autopatcher.test_evidence_acquisition import _relevance_filtered_excerpt
+        boilerplate = "\n".join(f"unrelated line {i}" for i in range(500))
+        text = boilerplate + "\nrun: pytest -v\n" + boilerplate
+        assert text.index("pytest") > 3000
+        out = _relevance_filtered_excerpt(text, 3000)
+        assert "pytest -v" in out
+        assert len(out) <= 3100
+
+    def test_bounded_surrounding_context_included(self):
+        from utilities.autopatcher.test_evidence_acquisition import _relevance_filtered_excerpt
+        boilerplate = "\n".join(f"unrelated line {i}" for i in range(500))
+        text = boilerplate + "\nname: Run tests\nrun: |\n  pytest -v\n" + boilerplate
+        out = _relevance_filtered_excerpt(text, 3000)
+        assert "name: Run tests" in out
+        assert "pytest -v" in out
+
 
 class TestDirectoryListing:
     def test_top_level_entries_present(self, tmp_path: Path):

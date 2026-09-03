@@ -927,7 +927,34 @@ class RemediationStrategyResult(NamedTuple):
     to build ONE primary Validation Action when it is present and the
     coarser keyword-based Behavior Summary is too generic to be useful on
     its own; see pipeline.py's behavior-driven action block. Never read by
-    Recommendation Policy, applicability, repair, or patch generation.
+    Recommendation Policy, applicability, or repair.
+
+    `insufficient_evidence` is the model's own explicit statement (per
+    prompts/remediation_strategy.md's ground rules: "If the verified
+    evidence is insufficient to select a concrete mechanism, say so in
+    insufficient_evidence rather than guessing") of why it could not
+    select a concrete target. Structural, like the three fields above --
+    kept for OBSERVABILITY/reporting only. It is deliberately NOT the
+    signal patch_generation gating reads (see `evaluated` below and
+    pipeline._run_guided_context_acquisition) -- a real Final Strategy
+    response with empty target_files/target_symbols is unsafe to build a
+    patch from whether or not the model ALSO explained itself here; an
+    empty list must never be misread as "nothing to worry about."
+
+    `evaluated` is the ONE explicit signal that structurally distinguishes
+    "Final Strategy actually ran and this IS its real decision" from "no
+    authoritative Final Strategy decision exists" -- True only for a
+    genuinely-parsed LLM response (the constructor call at the bottom of
+    generate_remediation_strategy); False for _EMPTY_STRATEGY_RESULT
+    (covers: no planner_evidence_ctx to reason over, an LLM-call
+    exception, or a response that failed to parse as JSON -- every one of
+    these means "no decision exists," not "the decision was empty").
+    Never inferred from `rendered` (presentation output) or from whether
+    any other field happens to be non-empty -- see pipeline.py's own gate,
+    which is REQUIRED to read this field directly rather than re-derive
+    it. Existing callers that never asked this question (report
+    rendering, `_render_strategy`, `_verify_strategy_targets`) are
+    entirely unaffected -- this field is additive.
     """
 
     rendered: str
@@ -937,11 +964,14 @@ class RemediationStrategyResult(NamedTuple):
     extended_mechanism: "str | None"
     required_edits: "list[str]"
     security_invariant: "str | None" = None
+    insufficient_evidence: "list[str]" = []
+    evaluated: bool = False
 
 
 _EMPTY_STRATEGY_RESULT = RemediationStrategyResult(
     rendered="", target_files=[], target_symbols=[], warnings=[],
     extended_mechanism=None, required_edits=[], security_invariant=None,
+    insufficient_evidence=[], evaluated=False,
 )
 
 
@@ -1095,6 +1125,12 @@ def generate_remediation_strategy(
         extended_mechanism=plan.get("extended_mechanism") if isinstance(plan.get("extended_mechanism"), str) else None,
         required_edits=_string_list(plan.get("required_edits")),
         security_invariant=plan.get("security_invariant") if isinstance(plan.get("security_invariant"), str) else None,
+        insufficient_evidence=_string_list(plan.get("insufficient_evidence")),
+        # A real, successfully-parsed response was obtained -- this IS an
+        # authoritative Final Strategy decision, whatever it says (even if
+        # every other field above ended up empty -- see RemediationStrategyResult's
+        # own docstring on why `evaluated` is never inferred from the other fields).
+        evaluated=True,
     )
 
 

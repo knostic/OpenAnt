@@ -12,39 +12,40 @@ No retries in this release: any parse/validation/confidence/provenance
 failure is treated as "no plan discovered," never a second attempt.
 
 Metadata vs. execution-critical fields: ``setup_commands``, ``test_command``,
-``result_strategy``, ``result_output_path``, ``runtime_family``, and
-``evidence`` are execution-critical -- a response that omits one, or whose
-value is the wrong shape, gives OpenAnt nothing safe to execute, so it is
-rejected outright (see ``_REQUIRED_KEYS`` and the strict per-field checks
-below). ``confidence``, ``reasoning_summary``, and ``runtime_version_hint``
-are advisory provenance/metadata only -- never consulted by
-test_plan_validation.py's execution-safety checks, never rendered as if
-they were verified fact. A response that simply omits one of these three
-must not, by itself, discard an otherwise valid, deterministically
-validated plan: each is normalized to a safe default (``confidence`` ->
-"unknown", ``reasoning_summary`` -> "", ``runtime_version_hint`` -> None)
-rather than causing rejection. A malformed *value* for
-``reasoning_summary``/``runtime_version_hint`` (present, but the wrong
-JSON type) is still rejected, unchanged from before -- only their
-*absence* is now tolerated. ``confidence`` is treated more leniently even
-than that: a malformed type or an unrecognized string both normalize to
-"unknown" too, rather than rejecting the plan, since confidence is never
-part of the execution-safety boundary either way (see "Confidence
-semantics" below).
+``result_strategy``, ``result_output_path``, ``runtime_family``,
+``evidence``, and ``confidence`` are all part of the required response
+CONTRACT -- a response that omits one, or whose value is the wrong shape
+(or, for confidence, any value other than "high"/"medium"/"low"), gives
+OpenAnt nothing safe to execute or accept, so it is rejected outright (see
+``_REQUIRED_KEYS`` and the strict per-field checks below). Only
+``reasoning_summary`` and ``runtime_version_hint`` are advisory
+provenance/metadata -- never consulted by test_plan_validation.py's
+execution-safety checks, never rendered as if they were verified fact. A
+response that simply omits one of these two must not, by itself, discard
+an otherwise valid, deterministically validated plan: each is normalized
+to a safe default (``reasoning_summary`` -> "", ``runtime_version_hint`` ->
+None) rather than causing rejection -- a malformed *value* (present, but
+the wrong JSON type) is still rejected, unchanged. Confidence is
+deliberately NOT given this same absence-tolerant treatment, even though
+it is equally advisory in what it's USED for (see "Confidence semantics"
+below) -- see "Confidence contract enforcement" for why.
 
-Confidence still goes missing more often than it should: real runs
-(including a minimist stage replay) have shown the model omitting
-``confidence`` from an otherwise well-formed response, even though the
-schema block above states it. Mentioning a field once in a long prompt is
-evidently not enough repetition to reliably survive to the end of the
-response, so ``_SYSTEM_PROMPT`` ends with a short, mandatory "every schema
-key, and confidence is one of high/medium/low" checklist placed
-immediately before the repository evidence is shown -- the last thing the
-model reads before generating. This is a prompt-only reliability nudge:
-the ``"unknown"`` fallback above is unchanged and remains the real
-safeguard, and no retry is added merely because confidence was omitted
-(see "No retries" above) -- a second omission after the checklist is
-still just "unknown," not a failure.
+Confidence contract enforcement: a real urllib3 replay showed the model
+omitting ``confidence`` from an otherwise well-formed response, and an
+earlier version of this module silently normalized that to an internal
+"unknown" placeholder and still accepted the plan -- persisting a
+confidence value the LLM never actually returned, out of the three values
+the schema declares as the only legal ones. That is now rejected outright,
+the same "no plan discovered" path every other execution-critical failure
+already takes (see ``_parse_response``) -- no retry is added merely
+because confidence was omitted (see "No retries" above); a second omission
+is just as much a rejection as the first. ``_SYSTEM_PROMPT`` still ends
+with a short, mandatory "every schema key, and confidence is one of
+high/medium/low" checklist placed immediately before the repository
+evidence is shown -- the last thing the model reads before generating --
+as a prompt-only reliability nudge to reduce how often this rejection
+fires at all, but the rejection itself, not a silent substitute value, is
+what actually enforces the contract now.
 
 Confidence semantics: the actual execution trust boundary is entirely
 deterministic -- structured argv, test_plan_validation.py's checks,
@@ -59,9 +60,14 @@ workspace for both baseline and patched is not free, and there is no
 reason to spend that cost on a plan the model has already told us it
 doesn't trust. This is a cost/reliability heuristic, not a safety gate --
 deterministic validation still runs first and is what actually decides
-executability for every other confidence value, including the new
-"unknown" (missing/malformed self-report), which is intentionally treated
-as neutral rather than as "low."
+executability for "high" and "medium" alike. (test_execution_models.
+VALID_CONFIDENCE_LEVELS separately still includes "unknown" -- that is a
+*structural* validity set for ANY TestExecutionPlan object, including one
+reconstructed from a prior run's persisted artifact during replay, where
+an old, pre-this-fix "unknown" value may legitimately already exist on
+disk; it has no bearing on what a FRESH LLM response is allowed to
+contain, which is this module's own, narrower
+``_VALID_LLM_CONFIDENCE_LEVELS``.)
 
 Provenance: every path the model cites in ``evidence`` must be an EXACT
 member of the same EvidenceBundle's ``citable_identifiers`` that was used
@@ -151,6 +157,46 @@ requirements.txt" with no such file shown) -- it only stops discarding
 evidence the model WAS shown. A lockfile still governs INSTALL MODE only
 ("npm ci" vs "npm install"), never whether to install at all -- its
 absence must not be read as "skip setup."
+
+Parameterized-command grounding (evidenced template != evidenced concrete
+value): a real urllib3 replay showed the model taking a CI-evidenced,
+matrix-parameterized invocation (a shell expansion resolving to
+"test-$PYTHON_VERSION", the version coming from a CI matrix dimension
+OpenAnt's own environment has no visibility into) and instantiating it
+into a specific, unevidenced concrete command ("test-3.12") -- which then
+ran against a runtime that specific value didn't actually have available,
+silently producing no real test execution at all (see
+existing_test_regression.py's execution-validity handling for the other
+half of this fix). This is a prompt-only fix, deliberately not a CI-
+expression interpreter or templating framework (see the "PARAMETERIZED
+VALUES" rule below): repository evidence establishing that a
+parameterized command exists is not evidence for any ONE value of that
+parameter, and the model must not guess one -- exactly the same
+"no plan is better than a guessed plan" principle already governing every
+other part of this prompt, just for a category (matrix/environment-
+variable/template placeholders) that hadn't been called out explicitly
+before. Deterministic validation cannot reliably catch this after the
+fact once the model has already produced a syntactically clean, concrete
+value with no residual template syntax left in it -- this is why the fix
+is at the discovery/prompt boundary, not a new validation rule.
+
+Evidence-backed repository-owned commands: a real GitPython
+CVE-2026-44243 regression-suite run showed a valid, well-evidenced plan
+whose setup_commands included "./init-tests-after-clone.sh" -- a real
+script GitPython's own CI directly invokes, exactly the repository-owned
+entry point this prompt's own "PRESERVE REPOSITORY-OWNED ENTRY POINTS"
+rule already tells the model to preserve -- rejected outright by
+test_plan_validation's static ALLOWED_COMMAND_BINARIES, which has no
+notion of a repository-owned file at all. This is fixed at discovery,
+not by adding the exact path to a static allowlist (the next
+differently-named repository script would hit the identical wall) and
+not by a filename/path heuristic (a repository controls its own
+filenames -- that is not a meaningful security boundary): see
+test_plan_command_provenance.resolve_repository_owned_commands, called
+by discover_test_plan below, which trusts a "./"-prefixed command token
+for exactly one call only when it is BOTH a real, contained repository
+file AND grounded in the repository test/setup evidence actually shown
+to the model -- never a static entry, never a name-based guess.
 """
 
 from __future__ import annotations
@@ -161,22 +207,55 @@ from pathlib import Path
 
 from .test_evidence_acquisition import gather_test_plan_evidence
 from .test_execution_models import (
-    VALID_CONFIDENCE_LEVELS,
     VALID_RESULT_STRATEGIES,
     TestExecutionPlan,
 )
+from .test_plan_command_provenance import resolve_repository_owned_commands
 from .test_plan_validation import validate_plan
 
 # Execution-critical: the response must explicitly include every one of
 # these keys (a value may still be null where the schema allows it, e.g.
 # result_output_path or runtime_family) -- without them there is nothing
-# safe to execute, so a response missing any one is rejected outright.
-# Deliberately EXCLUDES confidence/reasoning_summary/runtime_version_hint
-# -- see the module docstring's "Metadata vs. execution-critical fields".
+# safe to execute (or, for confidence, nothing safe to ACCEPT -- see
+# "confidence is part of the response CONTRACT" below), so a response
+# missing any one is rejected outright. Deliberately EXCLUDES
+# reasoning_summary/runtime_version_hint -- see the module docstring's
+# "Metadata vs. execution-critical fields".
 _REQUIRED_KEYS = (
     "setup_commands", "test_command", "result_strategy", "result_output_path",
-    "runtime_family", "evidence",
+    "runtime_family", "evidence", "confidence",
 )
+
+# LLM call tags -- mirrors patch_generator.py/pipeline.py's own
+# "patch_generation" / "patch_generation_contract_retry" pair exactly (see
+# stage_registry.STAGE_OWNED_LLM_TAGS[TEST_ANALYSIS_AND_PLAN], which must
+# own both). The retry tag is used for AT MOST one additional call per
+# discover_test_plan() invocation -- see that function's own bounded
+# contract-repair retry.
+_DISCOVERY_STAGE = "test_plan_discovery"
+_CONTRACT_REPAIR_RETRY_STAGE = "test_plan_discovery_contract_retry"
+
+_CONTRACT_REPAIR_RETRY_HEADER = "\n\n## Contract violation in your previous response\n\n"
+_CONTRACT_REPAIR_RETRY_HINT = """\
+Your previous response violated the required output contract: {violation}
+
+Respond again with a complete, corrected JSON object satisfying the exact \
+same schema as before -- every required key present, "confidence" one of \
+"high"/"medium"/"low", "result_strategy" one of "junit"/"tap"/"exit_code". \
+Return the WHOLE object again, fully valid this time -- do not return only \
+the corrected piece. No prose, no markdown fences."""
+
+# The ONLY values the declared LLM-facing schema permits for confidence
+# (see _SYSTEM_PROMPT's schema block). Deliberately NOT
+# test_execution_models.VALID_CONFIDENCE_LEVELS, which additionally
+# contains "unknown" -- that frozenset validates ANY TestExecutionPlan
+# structurally, including one reconstructed from a PRIOR run's persisted
+# artifact during replay (where an old, pre-this-fix "unknown" value may
+# still legitimately exist on disk and must not make replay itself
+# crash). This narrower set is the response CONTRACT boundary for a
+# FRESH LLM response: it is never lenient about "unknown" or anything
+# else outside the three declared values -- see _parse_response.
+_VALID_LLM_CONFIDENCE_LEVELS = frozenset({"high", "medium", "low"})
 
 # Deterministic, conservative output bounds -- not semantic truncation, just
 # a hard cap so an LLM-authored provenance field can never grow without
@@ -209,7 +288,8 @@ markdown code fences, matching this schema:
 
 {
   "setup_commands": [[<argv tokens>], ...],
-  "test_command": [<argv tokens>],
+  "test_command": [<argv tokens>] | [] (empty ONLY together with confidence "low" --
+                  see "INSUFFICIENT EVIDENCE" below),
   "result_strategy": "junit" | "tap" | "exit_code",
   "result_output_path": "<absolute path under /tmp/, or null>",
   "runtime_family": "python" | "node" | "go" | "rust" | "jvm" | null,
@@ -268,6 +348,52 @@ Rules:
        directly is correct and is NOT the reconstruction problem above.
        The distinction is not "wrapper vs. direct command" -- it is
        "evidenced command vs. an unevidenced one you built yourself."
+    6. PARAMETERIZED VALUES: an evidenced command may itself contain a
+       placeholder your OWN environment does not resolve -- a shell
+       expansion (``${VAR}``, ``${VAR:-default}``), a CI matrix
+       expression (e.g. ``${{ matrix.python-version }}``), a template
+       substitution, a version placeholder, or any other build-matrix
+       dimension. Repository evidence establishing that a PARAMETERIZED
+       command exists is NOT, by itself, evidence for any ONE concrete
+       value of that parameter -- you have no visibility into which
+       matrix entry, environment variable, or default OpenAnt's own
+       execution environment would actually supply, and CI matrix
+       possibilities are not a grounded runtime fact about that
+       environment. Do NOT instantiate a placeholder into a specific
+       concrete value (e.g. turning ``test-$PYTHON_VERSION`` into
+       ``test-3.12``) unless repository evidence AND OpenAnt's execution
+       environment TOGETHER establish that exact value -- which, for a
+       CI-matrix-driven placeholder, they essentially never will. This is
+       exactly as unsafe as inventing a command from nothing: a
+       plausible-looking concrete value is still a guess. Instead, prefer
+       a DIFFERENT repository-owned entry point that avoids the
+       placeholder entirely, if the evidence establishes one (e.g. a
+       plain, non-parameterized session/target with the same purpose).
+       A wrapper/session tool that itself declares and owns expansion of
+       a parameterized session is exactly this kind of plain,
+       non-parameterized entry point -- e.g. nox's own
+       ``@nox.session(python=[...])`` decorator naming a base session
+       (``test``) that nox itself selects/expands among its declared
+       variants at invocation time. When repository evidence shows a
+       session/environment declared this way, invoking the wrapper with
+       that bare, repository-declared name (e.g. ``nox -s test``) uses a
+       repository-owned entry point exactly as declared -- it is NOT the
+       same act as instantiating a CI-computed, matrix-substituted value
+       (e.g. ``test-3.12``), which remains forbidden above. The
+       distinction is not "wrapper vs. direct" -- it is whether the exact
+       name used is itself present in the repository's own declaration,
+       or whether it was constructed by substituting a value the
+       repository never wrote down. This applies to any wrapper/session
+       tool with the same shape (e.g. tox environments), not only nox.
+       If none of this establishes a safe entry point, treat this exactly
+       like INSUFFICIENT EVIDENCE below: do not guess a value, and if no
+       command can be honestly grounded at all, use an empty test_command
+       with confidence "low" -- see that rule for the exact mechanism. A
+       literal, UNRESOLVED placeholder left in test_command instead (e.g.
+       the raw text ``${VAR}`` or ``${{ matrix.foo }}``) is likewise never
+       acceptable -- it is neither a real, executable argv token, nor the
+       explicit "no plan" signal; use the empty array, not a leftover
+       fragment of the unresolved expression.
 - Reconcile evidence rather than assuming a fixed priority. CI workflow
   commands, documented developer/test instructions, package-manager
   scripts, Makefile/build-system targets, tox/nox configuration,
@@ -352,11 +478,25 @@ Rules:
   establishes npm as the package manager; the repository-owned entry
   point is `npm test`. The inner tap invocation is intentionally not
   reconstructed."
-- When evidence is insufficient -- to determine a reliable command, to
-  choose a package manager, to resolve conflicting sources, or for any
-  other material part of the plan -- do not guess. Set confidence to
-  "low" (see below) rather than filling the gap with an inferred
-  "equivalent." Uncertainty must never be converted into invention.
+- INSUFFICIENT EVIDENCE: when evidence is insufficient -- to determine a
+  reliable command, to choose a package manager, to resolve conflicting
+  sources, to ground a parameterized value (see PARAMETERIZED VALUES
+  above), or for any other material part of the plan -- do not guess.
+  Set confidence to "low" rather than filling the gap with an inferred
+  "equivalent." Uncertainty must never be converted into invention. If
+  the result is that NO command can be honestly grounded at all -- not
+  even a non-parameterized fallback -- set test_command to an empty
+  array `[]` (and setup_commands to `[]` too; there is nothing to
+  install for a command that doesn't exist) TOGETHER WITH confidence
+  "low". This is the correct, sanctioned way to report "no executable
+  plan" -- explain briefly in reasoning_summary why no command could be
+  grounded. Do NOT leave an unresolved placeholder or partial expression
+  in test_command instead (e.g. the literal text of a shell/CI variable
+  you couldn't resolve) -- that is neither a real command nor the
+  explicit "no plan" signal; use the empty array. An empty test_command
+  is ONLY valid together with confidence "low" -- a "medium"/"high"
+  confidence response must always have a real, non-empty, executable
+  command.
 - The result_strategy rules below are about REPORTING, layered ON TOP of
   the repository-grounded command above -- never a license to rewrite it.
   Repository-owned execution semantics + safe reporting instrumentation is
@@ -458,6 +598,16 @@ Rules:
   "package.json defines scripts.test; package-lock.json establishes npm;
   the repository-owned entry point `npm test` is used as-is rather than
   reconstructing the tap invocation inside it."
+- Before settling on result_strategy = "exit_code", re-check one thing
+  specifically: does the evidence you were shown include a directly-
+  evidenced invocation (CI, documentation, or a repository test script
+  showing the raw command) of a SPECIFIC, well-known test runner you are
+  confident has its own built-in structured-output flag -- even if a
+  wrapper/session tool (e.g. nox/tox) is ALSO present in the evidence for
+  a different purpose? If so, prefer proposing "junit"/"tap" on that
+  directly-evidenced invocation over "exit_code", exactly as the
+  result_strategy rules above describe. Only fall back to "exit_code"
+  once you have actually considered this -- not by default.
 
 Before returning, verify that your JSON object contains every schema key:
     setup_commands
@@ -480,6 +630,85 @@ def _strip_fences(text: str) -> str:
     return _FENCE_RE.sub("", text.strip())
 
 
+def _find_balanced_json_objects(text: str) -> "list[str]":
+    """Find every top-level, brace-balanced ``{...}`` substring in
+    `text`, respecting JSON string-literal syntax (a ``{``/``}`` inside a
+    quoted string value, e.g. inside reasoning_summary prose, never
+    confuses the depth count). Purely syntactic bracket-matching -- no
+    JSON parsing, no semantic interpretation, no repair -- so a returned
+    substring is only a CANDIDATE; the caller still runs it through
+    ``json.loads`` and only trusts it if that succeeds on its own."""
+    objects: "list[str]" = []
+    depth = 0
+    start = None
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objects.append(text[start:i + 1])
+                start = None
+    return objects
+
+
+def _load_response_json(raw: str) -> "tuple[object, str | None]":
+    """Parse `raw` as JSON, tolerating harmless surrounding prose --
+    formatting tolerance only, never semantic repair.
+
+    Strategy, strictly in this order:
+      1. Prefer the whole (fence-stripped) response parsing as JSON on
+         its own -- unchanged from before this function existed. This is
+         the only path taken for a well-formed response.
+      2. Only if that fails: look for every top-level, brace-balanced
+         ``{...}`` substring (see _find_balanced_json_objects) and keep
+         exactly the ones that ALSO parse as valid JSON on their own.
+         If precisely ONE does, that is the extracted object -- e.g. one
+         prose sentence before and/or after an otherwise well-formed
+         JSON object, despite the prompt explicitly saying not to add
+         one, is recovered this way. If ZERO or MORE THAN ONE substring
+         parses successfully, this still rejects, exactly as strict
+         parsing already would -- never guesses among competing
+         candidates, never repairs a malformed one.
+
+    Returns (parsed_value, None) on success -- `parsed_value` may be any
+    JSON type; the caller (``_parse_response``) still checks it is a
+    dict, unchanged. Returns (None, reason) on failure."""
+    stripped = _strip_fences(raw)
+    try:
+        return json.loads(stripped), None
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    candidates = []
+    for substring in _find_balanced_json_objects(stripped):
+        try:
+            candidates.append(json.loads(substring))
+        except (json.JSONDecodeError, TypeError):
+            continue  # not valid JSON on its own -- e.g. a stray "{" in prose
+
+    if len(candidates) == 1:
+        return candidates[0], None
+    if len(candidates) > 1:
+        return None, "LLM response contained more than one candidate JSON object; expected exactly one"
+    return None, "LLM response was not valid JSON"
+
+
 def _as_tuple_of_str(value) -> "tuple[str, ...] | None":
     if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
         return None
@@ -498,95 +727,183 @@ def _as_tuple_of_command_tuples(value) -> "tuple[tuple[str, ...], ...] | None":
     return tuple(out)
 
 
-def _parse_response(raw: str) -> "tuple[dict | None, str | None]":
-    """Strict, deterministic parse. Any missing execution-critical key,
-    wrong type, or unparseable JSON returns (None, reason) -- never a
-    partially-trusted plan. ``confidence``/``reasoning_summary``/
-    ``runtime_version_hint`` are advisory metadata: their outright
-    ABSENCE normalizes to a safe default instead of rejecting the whole
-    response (see the module docstring's "Metadata vs. execution-critical
-    fields"); a malformed *value* (present, wrong JSON type) is still
-    rejected for reasoning_summary/runtime_version_hint exactly as
-    before, while confidence normalizes even a malformed or unrecognized
-    value to "unknown" rather than rejecting (see "Confidence
-    semantics").
+def _parse_response(raw: str) -> "tuple[dict | None, str | None, bool]":
+    """Strict, deterministic parse. Any missing required key, wrong type,
+    or unparseable JSON returns (None, reason, repairable) -- never a
+    partially-trusted plan.
+
+    ``repairable`` (the third element) is True for EXACTLY three narrow,
+    mechanical output-CONTRACT violations in an otherwise syntactically
+    valid JSON object -- missing required schema key(s), an invalid
+    ``result_strategy`` value, or a missing/invalid ``confidence`` value
+    -- see discover_test_plan's own single bounded contract-repair retry.
+    False for every other rejection below (unparseable JSON, wrong field
+    types, evidence-bound violations, malformed advisory fields): those
+    are not narrow omissions a "you forgot one thing" reminder can fix,
+    and are never retried. Cross-field semantic checks (e.g. empty
+    test_command paired with a non-"low" confidence) live in
+    discover_test_plan, not here, and are DELIBERATELY NOT marked
+    repairable in this slice -- our production evidence justifies
+    repairing schema completeness/enum-contract failures, not retrying
+    semantic contradictions. Meaningless (always False) on the success
+    path, where `candidate` is not None.
+
+    JSON extraction (formatting tolerance only, never semantic repair):
+    the prompt says "Respond with EXACTLY one JSON object, no prose
+    before or after it" -- a real urllib3 replay showed the model
+    otherwise producing an execution-critical-valid plan but prefacing it
+    with one explanatory prose sentence anyway, which made the whole
+    response fail strict ``json.loads`` and rejected an otherwise-good
+    plan. ``_load_response_json`` still prefers the whole response
+    parsing as JSON on its own (unchanged, and the only path taken for a
+    well-formed response); only when that fails does it look for exactly
+    one brace-balanced substring that parses as valid JSON by itself.
+    Zero such substrings, or more than one (never guessed among), both
+    still reject -- see that function's own docstring. Everything below
+    this point -- required-key/type/enum checks, confidence, evidence
+    provenance -- is completely UNCHANGED by this: it operates on
+    whatever dict was obtained, exactly as before, whether that came from
+    the whole response or an extracted substring.
+
+    ``reasoning_summary``/``runtime_version_hint`` are
+    advisory metadata ONLY: their outright ABSENCE normalizes to a safe
+    default instead of rejecting the whole response (see the module
+    docstring's "Metadata vs. execution-critical fields"); a malformed
+    *value* (present, wrong JSON type) is still rejected for either,
+    unchanged.
+
+    ``confidence`` is NOT treated this leniently, despite also being
+    advisory (never part of the execution-safety boundary -- see
+    "Confidence semantics" below): it is part of the declared response
+    CONTRACT (the schema block states exactly three valid values, and the
+    prompt repeats "confidence MUST be present"), so a response that
+    omits it, or supplies anything other than "high"/"medium"/"low", is
+    REJECTED here -- never silently normalized to an out-of-schema
+    placeholder like "unknown" and then treated as an accepted plan. A
+    prior version of this function normalized a missing/malformed
+    confidence to "unknown" and still accepted the plan; a real urllib3
+    replay showed the model omitting confidence from an otherwise
+    well-formed response, and that response being SILENTLY ACCEPTED with
+    a fabricated value the LLM never actually returned. A LATER real
+    urllib3 replay showed this exact rejection firing on an otherwise
+    fully correct, well-evidenced plan -- this is now `repairable=True`:
+    discover_test_plan gets exactly one bounded chance to ask the SAME
+    model to resend a complete, corrected object; OpenAnt itself still
+    never synthesizes the missing value (see "No retries" above, now
+    narrowed to "no MORE than one retry, and only for this narrow
+    contract-completeness shape").
 
     The returned reason string is a bounded, internal diagnostic for
     traced/debug runs only -- see discover_test_plan's rejection_reason
     parameter. It is never surfaced verbatim in the user-facing trust
     report."""
-    try:
-        data = json.loads(_strip_fences(raw))
-    except (json.JSONDecodeError, TypeError):
-        return None, "LLM response was not valid JSON"
+    def _fail(reason: str, *, repairable: bool = False) -> "tuple[None, str, bool]":
+        return None, reason, repairable
+
+    data, json_reason = _load_response_json(raw)
+    if json_reason is not None:
+        return _fail(json_reason)
     if not isinstance(data, dict):
-        return None, "LLM response JSON was not an object"
+        return _fail("LLM response JSON was not an object")
     missing = [key for key in _REQUIRED_KEYS if key not in data]
     if missing:
-        return None, f"LLM response missing required field(s): {', '.join(missing)}"
+        return _fail(f"LLM response missing required field(s): {', '.join(missing)}", repairable=True)
 
     setup_commands = _as_tuple_of_command_tuples(data["setup_commands"])
     if setup_commands is None:
-        return None, "setup_commands was not a list of argv-token lists"
+        return _fail("setup_commands was not a list of argv-token lists")
+    # `[]` is intentionally ACCEPTED here (_as_tuple_of_str allows an
+    # empty list through) -- it is the correct SHAPE for both "a real,
+    # zero-argument command" (never actually valid, see
+    # test_plan_validation._valid_command_shape's own non-empty check)
+    # and, more importantly, the model's explicit "no executable plan"
+    # signal (see _SYSTEM_PROMPT's "INSUFFICIENT EVIDENCE" rule).
+    # discover_test_plan (not here) is what enforces that an empty
+    # command is valid ONLY alongside confidence "low", and rejects it
+    # BEFORE ever constructing a TestExecutionPlan -- do not move that
+    # enforcement here, it needs `candidate["confidence"]`, which isn't
+    # parsed yet at this point in the function.
     test_command = _as_tuple_of_str(data["test_command"])
     if test_command is None:
-        return None, "test_command was not a list of string tokens"
+        return _fail("test_command was not a list of string tokens")
     evidence = _as_tuple_of_str(data["evidence"])
     if evidence is None:
-        return None, "evidence was not a list of strings"
+        return _fail("evidence was not a list of strings")
     if len(evidence) > _MAX_EVIDENCE_ENTRIES or any(len(e) > _MAX_EVIDENCE_ENTRY_CHARS for e in evidence):
-        return None, "evidence list exceeded the bounded entry count/length"
+        return _fail("evidence list exceeded the bounded entry count/length")
 
+    # Enum-contract violation -- one of the three narrow, repairable
+    # shapes (see this function's own docstring).
     result_strategy = data["result_strategy"]
     if result_strategy not in VALID_RESULT_STRATEGIES:
-        return None, f"unrecognized result_strategy: {result_strategy!r}"
+        return _fail(f"unrecognized result_strategy: {result_strategy!r}", repairable=True)
 
     result_output_path = data["result_output_path"]
     if result_output_path is not None and not isinstance(result_output_path, str):
-        return None, "result_output_path was neither a string nor null"
+        return _fail("result_output_path was neither a string nor null")
     runtime_family = data["runtime_family"]
     if runtime_family is not None and not isinstance(runtime_family, str):
-        return None, "runtime_family was neither a string nor null"
+        return _fail("runtime_family was neither a string nor null")
 
-    # --- advisory metadata: absence normalizes, malformed VALUES for
-    # reasoning_summary/runtime_version_hint still reject (unchanged from
-    # before); confidence is normalized even when malformed -- see module
-    # docstring.
+    # Part of the response CONTRACT, not advisory metadata (see this
+    # function's own docstring) -- missing or invalid confidence rejects
+    # the whole response, exactly like an unrecognized result_strategy
+    # above. isinstance-guard BEFORE the membership check: an unhashable
+    # value (e.g. a list/dict) must still be rejected cleanly, never
+    # raise -- `x in <frozenset>` itself requires hashing x. One of the
+    # three narrow, repairable contract shapes (see this function's own
+    # docstring) -- a MISSING confidence key is already caught above by
+    # the required-keys check; this branch additionally catches a
+    # PRESENT-but-invalid value (wrong type, or not one of the three).
+    confidence = data["confidence"]
+    if not isinstance(confidence, str) or confidence not in _VALID_LLM_CONFIDENCE_LEVELS:
+        return _fail(f"confidence must be exactly one of 'high'/'medium'/'low', got {confidence!r}", repairable=True)
+
+    # --- advisory metadata: absence normalizes, malformed VALUES still
+    # reject (unchanged from before).
     runtime_version_hint = data.get("runtime_version_hint")
     if runtime_version_hint is not None and not isinstance(runtime_version_hint, str):
-        return None, "runtime_version_hint was neither a string nor null"
+        return _fail("runtime_version_hint was neither a string nor null")
     reasoning_summary = data.get("reasoning_summary", "")
     if not isinstance(reasoning_summary, str):
-        return None, "reasoning_summary was not a string"
+        return _fail("reasoning_summary was not a string")
     reasoning_summary = reasoning_summary[:_MAX_REASONING_SUMMARY_CHARS]
-    confidence = data.get("confidence")
-    # isinstance-guard BEFORE the membership check: an unhashable
-    # malformed value (e.g. a list/dict, not just an int or an
-    # unrecognized string) must normalize to "unknown" too, never raise --
-    # `x in <frozenset>` itself requires hashing x, so checking membership
-    # first would crash on exactly the malformed input this is supposed to
-    # tolerate.
-    if not isinstance(confidence, str) or confidence not in VALID_CONFIDENCE_LEVELS:
-        confidence = "unknown"
 
     return {
         "setup_commands": setup_commands, "test_command": test_command,
         "result_strategy": result_strategy, "result_output_path": result_output_path,
         "runtime_family": runtime_family, "runtime_version_hint": runtime_version_hint,
         "evidence": evidence, "reasoning_summary": reasoning_summary, "confidence": confidence,
-    }, None
+    }, None, False
 
 
 def discover_test_plan(
     repo_root: "Path | str", llm, *, rejection_reason: "list[str] | None" = None,
 ) -> "TestExecutionPlan | None":
-    """Discover a TestExecutionPlan for repo_root using exactly one bounded
-    LLM call. Returns None (never a fabricated plan) when: there is no
-    evidence to reason from, the LLM call itself raises, the response
-    can't be parsed, the model deliberately self-reports low confidence,
-    evidence citations don't check out, or the resulting plan fails
-    deterministic validation. Callers must treat None identically to
-    NOT_VERIFIED.
+    """Discover a TestExecutionPlan for repo_root using AT MOST TWO bounded
+    LLM calls -- the second (see _CONTRACT_REPAIR_RETRY_STAGE) fires ONLY
+    when the first response's failure is one of the three narrow,
+    mechanical contract-completeness shapes _parse_response marks
+    `repairable=True` (missing required key(s), an invalid
+    `result_strategy`, or a missing/invalid `confidence`) -- never for
+    unparseable JSON, wrong field types, evidence-bound violations,
+    evidence-provenance hallucination, deterministic validation
+    (test_plan_validation) failure, or a cross-field semantic
+    inconsistency (e.g. empty test_command with a non-"low" confidence).
+    A second failure, of any kind, is never retried again -- exactly one
+    retry, ever, per call. OpenAnt never synthesizes the missing/invalid
+    value itself; the retry only ever asks the SAME model to resend a
+    complete, corrected object (see _CONTRACT_REPAIR_RETRY_HINT).
+
+    Returns None (never a fabricated plan) when: there is no evidence to
+    reason from, the LLM call itself raises, the response (after the one
+    contract-repair retry, if it fired) still can't be parsed, the model
+    EXPLICITLY reports insufficient evidence (an empty test_command +
+    confidence "low" -- see _SYSTEM_PROMPT's "INSUFFICIENT EVIDENCE"
+    rule), the model deliberately self-reports low confidence on an
+    otherwise-populated command, evidence citations don't check out, or
+    the resulting plan fails deterministic validation. Callers must treat
+    None identically to NOT_VERIFIED.
 
     ``rejection_reason``: optional, opt-in, additive-only. When a caller
     passes a list, exactly one bounded, internal diagnostic string is
@@ -614,18 +931,66 @@ def discover_test_plan(
     )
 
     try:
-        raw = llm.complete(_SYSTEM_PROMPT, user_message, stage="test_plan_discovery")
+        raw = llm.complete(_SYSTEM_PROMPT, user_message, stage=_DISCOVERY_STAGE)
     except Exception as exc:  # noqa: BLE001 -- an LLM-layer failure is a discovery failure, not a crash
         return _reject(f"LLM call failed: {type(exc).__name__}")
 
-    candidate, parse_reason = _parse_response(raw)
+    candidate, parse_reason, repairable = _parse_response(raw)
+
+    # Bounded contract-repair retry -- exactly one, and ONLY for the three
+    # narrow, mechanical contract-completeness shapes _parse_response
+    # marks repairable (see this function's own docstring). Never invoked
+    # a second time: the retry response's own `repairable` flag is
+    # discarded below, so a second failure -- of any kind, including the
+    # exact same one again -- falls straight through to the existing
+    # rejection path, unchanged.
+    if candidate is None and repairable:
+        retry_message = user_message + _CONTRACT_REPAIR_RETRY_HEADER + _CONTRACT_REPAIR_RETRY_HINT.format(
+            violation=parse_reason,
+        )
+        try:
+            retry_raw = llm.complete(_SYSTEM_PROMPT, retry_message, stage=_CONTRACT_REPAIR_RETRY_STAGE)
+        except Exception as exc:  # noqa: BLE001
+            return _reject(f"contract-repair retry LLM call failed: {type(exc).__name__}")
+        candidate, parse_reason, _ = _parse_response(retry_raw)
+
     if candidate is None:
         return _reject(parse_reason or "LLM response failed schema parsing")
+
+    if not candidate["test_command"]:
+        # An empty test_command is the model's explicit, structurally
+        # valid way to report "repository evidence is insufficient to
+        # produce an executable test plan" (see _SYSTEM_PROMPT's
+        # "INSUFFICIENT EVIDENCE" rule) -- checked, and rejected, BEFORE
+        # ever constructing a TestExecutionPlan: an empty command was
+        # never executable to begin with, so there is nothing to build or
+        # validate. This closes a real contract inconsistency a urllib3
+        # replay exposed: the prompt already told the model never to
+        # instantiate or leave an unresolved CI-matrix placeholder in
+        # test_command, but gave it no OTHER way to populate a
+        # nominally-required field when no command could be honestly
+        # grounded at all -- so it left the unresolved placeholder in
+        # place anyway (rejected today only because confidence also
+        # happened to be "low", or because test_plan_validation's
+        # shell-metacharacter check happened to catch the literal
+        # placeholder syntax -- both incidental, not an explicit
+        # contract). An empty command is valid ONLY alongside the
+        # model's own "low" confidence self-report -- a "medium"/"high"
+        # response must always have a real, executable command.
+        if candidate["confidence"] != "low":
+            return _reject(
+                "test_command was empty but confidence was not 'low' -- an "
+                "executable plan requires a real, non-empty command, or "
+                "confidence must be 'low' to signal insufficient evidence"
+            )
+        return _reject("model reported insufficient evidence: no executable command could be grounded")
+
     if candidate["confidence"] == "low":
-        # The model ITSELF deliberately reported low confidence -- kept
-        # distinct from "unknown" (missing/malformed self-report, treated
-        # as neutral, see module docstring) -- don't spend a Docker build
-        # on a plan the model has already told us it doesn't trust.
+        # The model ITSELF deliberately reported low confidence on an
+        # otherwise-populated command -- kept distinct from "unknown"
+        # (missing/malformed self-report, treated as neutral, see module
+        # docstring) -- don't spend a Docker build on a plan the model
+        # has already told us it doesn't trust.
         return _reject("model self-reported low confidence")
 
     # Provenance enforcement: every cited evidence path must be one we
@@ -637,12 +1002,30 @@ def discover_test_plan(
     if not set(candidate["evidence"]) <= evidence.citable_identifiers:
         return _reject("evidence citation not found among what was actually shown to the model")
 
+    # Evidence-backed repository-owned commands (real GitPython CVE-2026-44243
+    # regression-suite finding: a valid, well-evidenced plan's setup_commands
+    # included "./init-tests-after-clone.sh", a real CI-evidenced repository
+    # script -- rejected outright by validate_plan's static
+    # ALLOWED_COMMAND_BINARIES, which has no notion of a repository-owned
+    # entry point at all). Examines every "./"-prefixed argv[0] across
+    # setup_commands + test_command; each must be a real, contained
+    # repository file (see test_plan_command_provenance) AND grounded in the
+    # repository test/setup evidence actually shown -- never a static
+    # allowlist entry, never a filename/path heuristic. Any non-"./"-prefixed
+    # token is untouched here and continues to be governed solely by
+    # validate_plan's existing static allowlist, unchanged.
+    trusted_repo_commands, provenance_reason = resolve_repository_owned_commands(
+        candidate["setup_commands"] + (candidate["test_command"],), repo_root, evidence,
+    )
+    if provenance_reason is not None:
+        return _reject(provenance_reason)
+
     try:
         plan = TestExecutionPlan(source="llm", **candidate)
     except Exception as exc:  # noqa: BLE001
         return _reject(f"TestExecutionPlan construction failed: {type(exc).__name__}")
 
-    result = validate_plan(plan)
+    result = validate_plan(plan, extra_allowed_first_tokens=trusted_repo_commands)
     if not result.valid:
         return _reject(f"deterministic plan validation failed: {result.reason}")
     return result.plan

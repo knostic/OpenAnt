@@ -167,6 +167,35 @@ STAGE_DEPENDENCIES: "dict[str, tuple[str, ...]]" = {
         PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
         CHALLENGER,
     ),
+    # PATCH_REVIEW/CONFIDENCE_SCORING do NOT declare EXISTING_TEST_COMPARISON
+    # as a canonical dependency, even though the Existing Test Amendment
+    # feature (existing_test_amendment.py) means one MAY, at runtime,
+    # produce the authoritative candidate patch these stages read. Two
+    # reasons this is deliberately NOT a graph edge:
+    #   1. Production doesn't need it: pipeline.run() reassigns its own
+    #      local `patch` variable directly (plain sequential code, same
+    #      function) -- no dependency-graph machinery is involved in
+    #      making S7/S8/S9 see the amended patch.
+    #   2. EXISTING_TEST_COMPARISON is genuinely OPTIONAL (compare_existing_
+    #      tests defaults False; most runs never execute it at all) -- a
+    #      MANDATORY graph edge would make replaying patch_review/
+    #      confidence_scoring in isolation hard-fail for the overwhelming
+    #      majority of runs. Replay instead resolves S11's authoritative
+    #      candidate OPTIONALLY, via replay_engine._resolve_authoritative_
+    #      candidate (chain-based, same idiom _run_replay_report_generation
+    #      already used for S11 before this feature) -- never through
+    #      handler.dependencies, so it can never fail a replay and never
+    #      needs a graph edge here.
+    # (An earlier draft of this feature added this edge; it was removed --
+    # PATCH_REVIEW -> EXISTING_TEST_COMPARISON -> TEST_ANALYSIS_AND_PLAN ->
+    # IMPACT_AND_BEHAVIOR_ANALYSIS does NOT itself cycle back to PATCH_REVIEW,
+    # but it was still unnecessary and set a bad precedent for the sibling
+    # case that WOULD cycle -- see IMPACT_AND_BEHAVIOR_ANALYSIS below, which
+    # must never gain this edge: EXISTING_TEST_COMPARISON already
+    # transitively depends on IMPACT_AND_BEHAVIOR_ANALYSIS via TEST_ANALYSIS_
+    # AND_PLAN, so IMPACT_AND_BEHAVIOR_ANALYSIS -> EXISTING_TEST_COMPARISON
+    # would close a real cycle. This feature does not touch that pre-existing
+    # TEST_ANALYSIS_AND_PLAN/S9 canonical-vs-runtime ordering mismatch at all.)
     PATCH_REVIEW: (
         PATCH_REPAIR_AND_CALIBRATION,
     ),
@@ -181,9 +210,16 @@ STAGE_DEPENDENCIES: "dict[str, tuple[str, ...]]" = {
         PATCH_REPAIR_AND_CALIBRATION,
         IMPACT_AND_BEHAVIOR_ANALYSIS,
     ),
+    # REMEDIATION_STRATEGY added for the Existing Test Amendment feature
+    # (existing_test_amendment.py): its bounded amendment step reads S2's
+    # own already-computed `security_invariant` field as the evidence base
+    # for a conflict judgment. No cycle risk -- REMEDIATION_STRATEGY sits
+    # very early (deps only on REPOSITORY_ANALYSIS_AND_REMEDIATION_
+    # PLANNING) and has no path back to EXISTING_TEST_COMPARISON.
     EXISTING_TEST_COMPARISON: (
         PATCH_REPAIR_AND_CALIBRATION,
         TEST_ANALYSIS_AND_PLAN,
+        REMEDIATION_STRATEGY,
     ),
     TRUST_SIGNALS_AND_RECOMMENDATION: (
         PATCH_REPAIR_AND_CALIBRATION,
@@ -225,8 +261,34 @@ STAGE_OWNED_LLM_TAGS: "dict[str, tuple[str, ...]]" = {
     PATCH_REVIEW: ("patch_review",),
     CONFIDENCE_SCORING: ("confidence_scorer",),
     IMPACT_AND_BEHAVIOR_ANALYSIS: (),
-    TEST_ANALYSIS_AND_PLAN: ("test_plan_discovery",),
-    EXISTING_TEST_COMPARISON: (),
+    # test_plan_discovery_contract_retry: the bounded contract-repair
+    # retry (test_plan_discovery.discover_test_plan) -- mirrors
+    # PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION's own
+    # "patch_generation"/"patch_generation_contract_retry" pair exactly.
+    # Fires at most once per discover_test_plan() call, only for a narrow,
+    # mechanical output-contract violation (missing required key(s),
+    # invalid confidence, or invalid result_strategy) in an otherwise
+    # syntactically valid response -- never for semantic uncertainty.
+    TEST_ANALYSIS_AND_PLAN: ("test_plan_discovery", "test_plan_discovery_contract_retry"),
+    # test_failure_distillation: the narrow LLM Test Failure Evidence
+    # Distillation call, made ONLY when deterministic comparison already
+    # concluded NEW_FAILURES_DETECTED with no deterministic per-test
+    # identity available -- see existing_test_regression.py's
+    # _attempt_failure_distillation. Adding this tag is what flips
+    # _LLM_PROVIDER[EXISTING_TEST_COMPARISON] True below (derived, not
+    # hardcoded) -- both production and replay now resolve/require an LLM
+    # provider for this stage, exactly as every other LLM-owning stage
+    # already does.
+    #
+    # existing_test_amendment: the narrow LLM Existing Test Amendment call
+    # (existing_test_amendment.py), made ONLY when S11's comparison
+    # concluded NEW_FAILURES_DETECTED with deterministic per-test identity
+    # AND a stated security invariant/remediation intent is available. Its
+    # own STRUCTURALLY BOUNDED, single-attempt orchestration (S11 -> amend
+    # -> S11 rerun) lives entirely in pipeline.py, called from the same
+    # place S11 itself is called -- no new canonical stage; see this
+    # stage's own dependency comment above PATCH_REVIEW/CONFIDENCE_SCORING.
+    EXISTING_TEST_COMPARISON: ("test_failure_distillation", "existing_test_amendment"),
     TRUST_SIGNALS_AND_RECOMMENDATION: (),
     REPORT_GENERATION: (),
 }
