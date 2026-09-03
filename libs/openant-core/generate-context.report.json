@@ -1,0 +1,25 @@
+{
+  "step": "generate-context",
+  "status": "success",
+  "timestamp": "2026-09-03T13:58:14.192883Z",
+  "duration_seconds": 14.26,
+  "cost_usd": 0.010293,
+  "token_usage": {
+    "input_tokens": 1141,
+    "output_tokens": 458,
+    "total_tokens": 1599
+  },
+  "summary": {
+    "application_type": "web_app",
+    "confidence": 0.62,
+    "source": "llm"
+  },
+  "inputs": {
+    "repo_path": "/private/var/folders/hq/r08v642s63dcx3sd6h87grhr0000gn/T/opencode/openant-prs/fix346-tree/libs/openant-core/tests/fixtures/sample_python_repo",
+    "force": false
+  },
+  "outputs": {
+    "app_context_path": "/private/var/folders/hq/r08v642s63dcx3sd6h87grhr0000gn/T/opencode/openant-prs/fix346-tree/libs/openant-core/application_context.json"
+  },
+  "errors": []
+}
