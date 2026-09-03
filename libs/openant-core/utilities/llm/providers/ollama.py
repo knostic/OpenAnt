@@ -54,6 +54,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import sys
+
 import openai
 
 from ..adapter import (
@@ -242,6 +244,22 @@ class OllamaAdapter:
         return _response_to_unified(response, adapter="OllamaAdapter")
 
     def validate(self, model: str) -> None:
+        # reinvest (sol): a SHIPPED $0-local model on a NON-LOCAL base_url
+        # is the one shape where the honest $0 becomes a possible lie — the
+        # registry prices the MODEL (free by definition for local inference),
+        # but a remote gateway (LAN, Ollama Cloud) may bill. Warn once per
+        # combination: the cost report for this run may be false.
+        base = getattr(self, "base_url", _DEFAULT_BASE_URL) or _DEFAULT_BASE_URL
+        if ("localhost" not in base and "127.0.0.1" not in base
+                and base != _DEFAULT_BASE_URL):
+            print(
+                "[OllamaAdapter] note: a shipped $0-local model is running "
+                f"against a non-local endpoint ({base}) — the $0 cost "
+                "accounting is only truthful for local inference; a remote "
+                "gateway may bill. Treat this run's cost_incomplete-free "
+                "$0 with caution.",
+                file=sys.stderr,
+            )
         try:
             response = self._client.chat.completions.create(**{
                 "model": model,

@@ -4,7 +4,11 @@ Run OpenAnt entirely on local models via [Ollama](https://ollama.com). No API
 key, no per-token cost — with the default `base_url`, source code never
 leaves the machine. (The endpoint is overridable for LAN/remote
 Ollama-compatible gateways — see "Remote / LAN Ollama" below: what leaves
-the machine, and to where, is then exactly your configuration.)
+the machine, and to where, is then exactly your configuration. This
+includes managed remote services like Ollama Cloud — a shipped \$0-local
+model pointed at a billed endpoint is the one shape where the \$0 cost
+report is false; the adapter prints a warning at validation when it sees
+it.)
 
 ## Setup
 
