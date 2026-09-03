@@ -6,15 +6,18 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "#332: the vendored report scripts — versions live in the file names, the go:embed list, and the template literals; nothing else would look at them.",
-      "fileMatch": ["^apps/openant-cli/internal/report/templates/.*\\.gohtml$", "^apps/openant-cli/internal/report/report_vendor_test\\.go$", "^apps/openant-cli/internal/report/vendor/SOURCES\\.txt$"],
-      "matchStrings": [
-        "(?<depName>tailwindcss)-(?<currentValue>[0-9.]+)\\.js",
-        "chart-(?<currentValue>[0-9.]+)\\.umd\\.min\\.js",
-        "chartjs-plugin-datalabels-(?<currentValue>[0-9.]+)\\.min\\.js"
+      "description": "#332/#476: the vendored report scripts \u2014 versions live in the file names, the go:embed list, and the template literals; nothing else would look at them. Each package gets its OWN matchString (the regex manager substitutes named groups only \u2014 a conditional packageNameTemplate is invalid config and halted renovate).",
+      "fileMatch": [
+        "^apps/openant-cli/internal/report/templates/.*\\.gohtml$",
+        "^apps/openant-cli/internal/report/report_vendor_test\\.go$",
+        "^apps/openant-cli/internal/report/vendor/SOURCES\\.txt$"
       ],
-      "datasourceTemplate": "npm",
-      "packageNameTemplate": "{{#if matches.1}}tailwindcss{{else if matches.2}}chart.js{{else}}chartjs-plugin-datalabels{{/if}}"
+      "matchStrings": [
+        "(?<packageName>tailwindcss)-(?<currentValue>[0-9.]+)\\.js",
+        "(?<packageName>chart\\.js)-(?<currentValue>[0-9.]+)\\.umd\\.min\\.js",
+        "(?<packageName>chartjs-plugin-datalabels)-(?<currentValue>[0-9.]+)\\.min\\.js"
+      ],
+      "datasourceTemplate": "npm"
     }
   ]
 }
