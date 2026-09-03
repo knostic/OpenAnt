@@ -6,15 +6,19 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "#332: the vendored report scripts — versions live in the file names, the go:embed list, and the template literals; nothing else would look at them.",
-      "fileMatch": ["^apps/openant-cli/internal/report/templates/.*\\.gohtml$", "^apps/openant-cli/internal/report/report_vendor_test\\.go$", "^apps/openant-cli/internal/report/vendor/SOURCES\\.txt$"],
+      "description": "#332/#476: the vendored report scripts \u2014 versions live in the file names, the go:embed list, and the template literals; nothing else would look at them. The regex manager substitutes named groups only \u2014 a CONDITIONAL packageNameTemplate is invalid config and halted renovate; a STATIC packageNameTemplate is valid. tailwindcss and chartjs-plugin-datalabels read their packageName from the named capture group; chart.js keeps its chart- literal prefix (the vendored file is chart-X.umd.min.js \u2014 a chart\\.js literal never matches) and pins its packageName statically.",
+      "fileMatch": [
+        "^apps/openant-cli/internal/report/templates/.*\\.gohtml$",
+        "^apps/openant-cli/internal/report/report_vendor_test\\.go$",
+        "^apps/openant-cli/internal/report/vendor/SOURCES\\.txt$"
+      ],
       "matchStrings": [
-        "(?<depName>tailwindcss)-(?<currentValue>[0-9.]+)\\.js",
+        "(?<packageName>tailwindcss)-(?<currentValue>[0-9.]+)\\.js",
         "chart-(?<currentValue>[0-9.]+)\\.umd\\.min\\.js",
-        "chartjs-plugin-datalabels-(?<currentValue>[0-9.]+)\\.min\\.js"
+        "(?<packageName>chartjs-plugin-datalabels)-(?<currentValue>[0-9.]+)\\.min\\.js"
       ],
       "datasourceTemplate": "npm",
-      "packageNameTemplate": "{{#if matches.1}}tailwindcss{{else if matches.2}}chart.js{{else}}chartjs-plugin-datalabels{{/if}}"
+      "packageNameTemplate": "chart.js"
     }
   ]
 }
