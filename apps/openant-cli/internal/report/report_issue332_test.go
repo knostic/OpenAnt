@@ -55,7 +55,7 @@ func TestRenderedReportHasNoCDNScripts(t *testing.T) {
 // The vendored, pinned libraries are embedded non-empty at build time.
 func TestVendoredReportScriptsEmbedded(t *testing.T) {
 	for _, name := range []string{
-		"tailwindcss-3.4.16.js",
+		"tailwindcss-3.4.19.js",
 		"chart-4.5.1.umd.min.js",
 		"chartjs-plugin-datalabels-2.2.0.min.js",
 	} {

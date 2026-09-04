@@ -13,7 +13,7 @@ import (
 // detectable ("trust whoever ran curl" was the pre-round state).
 func TestVendoredReportScriptHashes(t *testing.T) {
 	for name, want := range map[string]string{
-		"tailwindcss-3.4.16.js":                  "3f81aa7f6ecdb1acc14c202e513dfee00b6c7703cd81ce1be25bf5215a92e8cb",
+		"tailwindcss-3.4.19.js":                  "3f81aa7f6ecdb1acc14c202e513dfee00b6c7703cd81ce1be25bf5215a92e8cb",
 		"chart-4.5.1.umd.min.js":                 "48444a82d4edcb5bec0f1965faacdde18d9c17db3063d042abada2f705c9f54a",
 		"chartjs-plugin-datalabels-2.2.0.min.js": "20c08f3d9c6d2ef76df6d6a6f1127c0013339fe32add24222276c398c6308c38",
 	} {
@@ -39,7 +39,7 @@ func TestVendoredReportScriptHashes(t *testing.T) {
 // it settled across version bumps (probed clean at vendoring time).
 func TestVendoredScriptsCarryNoScriptBreakouts(t *testing.T) {
 	for _, name := range []string{
-		"tailwindcss-3.4.16.js",
+		"tailwindcss-3.4.19.js",
 		"chart-4.5.1.umd.min.js",
 		"chartjs-plugin-datalabels-2.2.0.min.js",
 	} {
