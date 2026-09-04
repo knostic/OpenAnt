@@ -99,7 +99,8 @@ _GEMINI_FINISH_REASONS: dict[str, StopReason] = {
 # ``LLMRefusalError`` so a security scan doesn't read a safety-blocked
 # candidate as a clean, finding-free pass.
 #
-# We verified against the pinned google-genai SDK (v2.4.0) that
+# We verified (and tests/test_llm_sdk_contract_floor.py re-derives against the
+# INSTALLED SDK) that
 # ``types.FinishReason`` exposes SAFETY / RECITATION / BLOCKLIST /
 # PROHIBITED_CONTENT / SPII (among others). We build the comparison set
 # from the enum when importable so the names stay in sync with the SDK,
@@ -142,6 +143,20 @@ def reset_warnings() -> None:
     """Clear this adapter's one-time-warning memory (for tests / new scans)."""
     with _warned_finish_reasons_lock:
         _warned_finish_reasons.clear()
+
+
+def _gemini_output_tokens(usage: Any) -> int:
+    """Gemini's output-token billing rule, as the single source of truth.
+
+    Gemini bills output as candidates + thoughts (thinking models like
+    gemini-2.5-* emit ``thoughts_token_count``); count both so the cost
+    isn't undercounted. ``tests/test_llm_sdk_contract_floor.py`` drives
+    this against the INSTALLED SDK's ``usage_metadata`` type — a field
+    rename in a future google-genai turns that floor RED.
+    """
+    return (getattr(usage, "candidates_token_count", 0) or 0) + (
+        getattr(usage, "thoughts_token_count", 0) or 0
+    )
 
 
 def _extract_usage_details(usage: Any) -> Optional[dict]:
@@ -197,8 +212,11 @@ class GoogleAdapter:
             max_retries: Forwarded to the SDK as
                 ``HttpOptions(retry_options=HttpRetryOptions(attempts=...))``.
                 The google-genai SDK DOES expose retry configuration this
-                way (verified against the pinned v2.4.0:
-                ``HttpRetryOptions.attempts``); on top of the SDK's own
+                way (``HttpRetryOptions.attempts`` is a declared field of
+                the installed SDK — tests/test_llm_sdk_contract_floor.py
+                re-derives the field's existence on every run; the attempt-
+                COUNTING semantics below are documented, not machine-checked);
+                on top of the SDK's own
                 retry, our rate limiter coordinates 429 backoff across
                 workers — same division of labour as the other adapters.
             _client: Injected SDK instance for testing.
@@ -222,7 +240,9 @@ class GoogleAdapter:
         if max_retries is not None:
             # F3 (round-5): the SDK's ``attempts`` field is the "Maximum
             # number of attempts, INCLUDING the original request" (verified
-            # against pinned google-genai v2.4.0: "If 0 or 1, it means no
+            # against the installed google-genai (the FIELD is re-derived by
+            # tests/test_llm_sdk_contract_floor.py; this counting SEMANTICS is
+            # documented, not machine-checked): "If 0 or 1, it means no
             # retries"). OpenAI/Anthropic ``max_retries`` instead counts
             # retries BEYOND the first request. So forwarding
             # ``attempts=max_retries`` was off-by-one — ``max_retries=5``
@@ -454,13 +474,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
     usage = getattr(response, "usage_metadata", None)
     if usage is not None:
         input_tokens = getattr(usage, "prompt_token_count", 0) or 0
-        # Gemini bills output as candidates + thoughts (thinking models
-        # like gemini-2.5-* emit thoughts_token_count); count both so the
-        # cost isn't undercounted.
-        output_tokens = (
-            (getattr(usage, "candidates_token_count", 0) or 0)
-            + (getattr(usage, "thoughts_token_count", 0) or 0)
-        )
+        output_tokens = _gemini_output_tokens(usage)
     usage_details = _extract_usage_details(usage)
 
     # R4-2: a safety/blocked candidate finish reason is the more

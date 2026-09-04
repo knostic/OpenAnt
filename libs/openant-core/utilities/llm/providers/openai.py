@@ -676,7 +676,8 @@ def _extract_usage_details_responses(usage: Any) -> Optional[dict]:
     Same contract as :func:`_extract_usage_details_chat` but for the
     Responses API field names (``output_tokens_details.reasoning_tokens``,
     ``input_tokens_details.cached_tokens`` — field names verified against
-    the pinned openai SDK 2.37.0 ``ResponseUsage`` types). Verbatim,
+    the INSTALLED SDK's ``ResponseUsage`` types — tests/test_llm_sdk_contract_floor.py
+    re-derives the names against the installed version on every run). Verbatim,
     present-only, never in the cost math.
     """
     if usage is None:
