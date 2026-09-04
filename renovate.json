@@ -22,7 +22,7 @@
     },
     {
       "customType": "regex",
-      "description": "#332/#476 vendored report scripts \u2014 tailwindcss. Same rules as the chart.js manager above (static packageNameTemplate + value-only matchStrings; never add a packageName capture group to this manager \u2014 #485's lesson; the file name needs the static template because tailwindcss-3.4.16.js matches the npm package tailwindcss). Notifier-only: the vendored blob/sha do not move on a branch; see the chart.js manager entry for the full rules.",
+      "description": "#332/#476 vendored report scripts \u2014 tailwindcss. Same rules as the chart.js manager above (static packageNameTemplate + value-only matchStrings; never add a packageName capture group to this manager \u2014 #485's lesson; the file name needs the static template because tailwindcss-<version>.js matches the npm package tailwindcss). Notifier-only: the vendored blob/sha do not move on a branch; see the chart.js manager entry for the full rules.",
       "fileMatch": [
         "^apps/openant-cli/internal/report/templates/.*\\.gohtml$",
         "^apps/openant-cli/internal/report/report_vendor_test\\.go$",
