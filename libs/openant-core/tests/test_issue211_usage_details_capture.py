@@ -144,7 +144,7 @@ def test_openai_chat_absent_details_absent():
 
 
 def test_openai_responses_extracts_reasoning_and_cached_tokens():
-    """Field names verified against pinned openai SDK 2.37.0 ResponseUsage."""
+    """Field names verified against the installed SDK — tests/test_llm_sdk_contract_floor.py re-derives them against the installed version on every run."""
     from utilities.llm.providers.openai import _extract_usage_details_responses
     usage = SimpleNamespace(
         input_tokens=100, output_tokens=50,

@@ -1,7 +1,13 @@
 # Provenance + integrity record for the vendored report scripts (#332).
-# The sha256s below are ENFORCED by report_issue332_test.go
-# (TestVendoredReportScriptHashes) — an upgrade is a two-line diff here +
-# the embed list + the template literals, and tampering in git is detectable.
+# The sha256s below are ENFORCED by report_vendor_test.go
+# (TestVendoredReportScriptHashes). An upgrade is the full #332 recipe: the
+# vendored blob + the sha256 here + the go:embed list and vendorScripts names
+# in report.go + the template literals + the test pins — all in one commit.
+# Tampering in git is detectable. Renovate never touches this file:
+# config:recommended's :ignoreModulesAndTests preset adds **/vendor/** to
+# ignorePaths (verified: a no-extends config extracts it, the preset one
+# does not) and the standard ignores are deliberately not overridden —
+# provenance here is hand-maintained.
 #
 # tailwindcss-3.4.16.js
 #   source: https://cdn.tailwindcss.com/3.4.16
@@ -14,9 +20,13 @@
 #         script blocks — recorded as the follow-up direction.
 #   sha256: 3f81aa7f6ecdb1acc14c202e513dfee00b6c7703cd81ce1be25bf5215a92e8cb
 #
-# chart-4.4.7.umd.min.js
-#   source: https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js
-#   sha256: 206b6e8bb00fc7bba2c7ee80ca41db3e9e05ba7be0aa35abeba9cfd5357f5d0e
+# chart-4.5.1.umd.min.js
+#   source: https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js
+#   npm anchor: registry.npmjs.org/chart.js/-/chart.js-4.5.1.tgz
+#     dist.integrity: sha512-GIjfiT9dbmHRiYi6Nl2yFCq7kkwdkp1W/lp2J99rX0yo9tgJGn3lKQATztIjb5tVtevcBtIdICNWqlq5+E8/Pw==
+#     (the fetched tarball hashes to it; its inner dist/chart.umd.min.js is the
+#      bytes below — jsdelivr serves the same file, both verified 2026-09-05)
+#   sha256: 48444a82d4edcb5bec0f1965faacdde18d9c17db3063d042abada2f705c9f54a
 #
 # chartjs-plugin-datalabels-2.2.0.min.js
 #   source: https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js
