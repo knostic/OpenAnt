@@ -4,6 +4,7 @@ uses without any billed API call.
 """
 
 import json
+from pathlib import Path
 import os
 import types
 
@@ -121,7 +122,7 @@ def test_base_url_credentials_never_persisted_to_sidecar(tmp_path):
                  base_url="https://user:pass@host/v1?api_key=SECRET#frag"),
         ["S", "U"])
     cp.sync_identity(fp)
-    raw = open(os.path.join(cp.dir, FINGERPRINT_FILE)).read()
+    raw = Path(os.path.join(cp.dir, FINGERPRINT_FILE)).read_text(encoding="utf-8")
     for banned in ("user:pass", "SECRET", "api_key=", "#frag"):
         assert banned not in raw, f"{banned} leaked into the persisted sidecar"
     persisted = json.loads(raw)
@@ -142,7 +143,7 @@ def test_archive_stale_results_preserves_prior_report(tmp_path):
     assert not os.path.exists(results)
     archived = os.path.join(str(tmp_path), "results__OLD.json")
     assert os.path.isfile(archived)
-    assert json.load(open(archived))["results"] == [1, 2, 3]
+    assert json.loads(Path(archived).read_text(encoding="utf-8"))["results"] == [1, 2, 3]
 
 
 def test_archive_stale_results_noop_when_fingerprint_matches(tmp_path):
@@ -207,5 +208,5 @@ def test_archive_stale_results_never_clobbers_existing_archive(tmp_path):
         json.dump({"results": ["second"]}, fh)
     _archive_stale_results(d, "NEW")
     # Both preserved — neither clobbered.
-    assert json.load(open(os.path.join(d, "results__legacy.json")))["results"] == ["first"]
-    assert json.load(open(os.path.join(d, "results__legacy-1.json")))["results"] == ["second"]
+    assert json.loads(Path(os.path.join(d, "results__legacy.json")).read_text(encoding="utf-8"))["results"] == ["first"]
+    assert json.loads(Path(os.path.join(d, "results__legacy-1.json")).read_text(encoding="utf-8"))["results"] == ["second"]

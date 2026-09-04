@@ -8,6 +8,7 @@ param/runtime funcptr never over-connects.
 import json
 import os
 import tempfile
+from pathlib import Path
 
 from core.parser_adapter import parse_repository
 
@@ -22,7 +23,7 @@ def _cg(files: dict):
     out = tempfile.mkdtemp()
     parse_repository(repo, out, language="zig", processing_level="all",
                      skip_tests=True, name="r")
-    return json.load(open(os.path.join(out, "call_graph.json")))
+    return json.loads((Path(out) / "call_graph.json").read_text(encoding="utf-8"))
 
 
 def _edges(cg, caller_suffix):

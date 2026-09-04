@@ -10,6 +10,7 @@ zero call-graph edge change), truncating only pathological bodies with a logged 
 RED pre-fix: utilities.scan_budget.bound_macro_scan_text does not exist.
 """
 import re
+from pathlib import Path
 import time
 
 
@@ -64,8 +65,8 @@ def test_rust_and_zig_regex_unchanged():
     possessive both fails to fix the DoS and regresses rust's scoped-turbofish match."""
     import os
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    rust = open(os.path.join(here, "parsers/rust/call_graph_builder.py")).read()
-    zig = open(os.path.join(here, "parsers/zig/call_graph_builder.py")).read()
+    rust = Path(os.path.join(here, "parsers/rust/call_graph_builder.py")).read_text(encoding="utf-8")
+    zig = Path(os.path.join(here, "parsers/zig/call_graph_builder.py")).read_text(encoding="utf-8")
     assert r"(?:[A-Za-z_][A-Za-z0-9_]*::)+[A-Za-z_][A-Za-z0-9_]*" in rust
     assert r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*" in rust
     assert r"[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*" in zig

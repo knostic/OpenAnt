@@ -4,6 +4,7 @@ Each test fails on the pre-fix code and passes after. Kept together for traceabi
 the fixes live in html_report.py, context/threat_model.py, core/analysis_core.py.
 """
 import os
+from pathlib import Path
 import tempfile
 
 import pytest
@@ -19,7 +20,7 @@ def test_go1_verdict_badge_is_escaped():
                         "finding": "<img src=x onerror=alert(1)>"}]}
     out = os.path.join(tempfile.mkdtemp(), "r.html")
     H.generate_html_report(exp, {"units": []}, "", out)
-    html = open(out).read()
+    html = Path(out).read_text(encoding="utf-8")
     assert "<img src=x onerror=alert(1)>" not in html      # raw injection blocked
     assert "&lt;img src=x onerror=alert(1)&gt;" in html    # escaped form present
 
@@ -30,7 +31,7 @@ def test_go2_null_reasoning_no_crash():
     H.prepare_findings_summary(exp, {"units": []})          # was None[:300] TypeError
     out = os.path.join(tempfile.mkdtemp(), "r.html")
     H.generate_html_report(exp, {"units": []}, "", out)     # end-to-end
-    html = open(out).read()
+    html = Path(out).read_text(encoding="utf-8")
     # not just no-crash: the finding must actually render (else a refactor that skips
     # the row for a non-fix reason would keep the test green)
     assert "a.py:f" in html and "vulnerable" in html
@@ -41,7 +42,7 @@ def test_go3_error_verdict_surfaced():
     exp = {"results": [{"route_key": "a.py:f", "finding": "error"}]}
     out = os.path.join(tempfile.mkdtemp(), "r.html")
     H.generate_html_report(exp, {"units": []}, "", out)
-    html = open(out).read()
+    html = Path(out).read_text(encoding="utf-8")
     assert "Errored (unanalyzed)" in html          # stat card
     assert '"error"' in html                        # AND the charts (not just the card)
 
@@ -55,7 +56,7 @@ def test_go3_chart_does_not_reintroduce_injection():
     ]}
     out = os.path.join(tempfile.mkdtemp(), "r.html")
     H.generate_html_report(exp, {"units": []}, "", out)
-    html = open(out).read()
+    html = Path(out).read_text(encoding="utf-8")
     assert '"error"' in html                        # sentinel charted
     assert "<svg onload=alert(1)>" not in html      # arbitrary verdict NOT injected
 

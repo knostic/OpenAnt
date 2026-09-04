@@ -9,6 +9,7 @@ FIRST colon (relative paths contain no colon).
 import json
 import os
 import tempfile
+from pathlib import Path
 
 from core.parser_adapter import parse_repository
 
@@ -23,7 +24,7 @@ def _call_graph(files: dict):
     out = tempfile.mkdtemp()
     parse_repository(repo, out, language="javascript", processing_level="all",
                      skip_tests=True, name="r")
-    return json.load(open(os.path.join(out, "call_graph.json")))
+    return json.loads((Path(out) / "call_graph.json").read_text(encoding="utf-8"))
 
 
 def test_route_seed_with_colon_id_resolves_callee():

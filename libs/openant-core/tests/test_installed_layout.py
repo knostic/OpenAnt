@@ -117,7 +117,8 @@ def test_a_built_wheel_carries_the_config(tmp_path: Path):
 
     wheels = list(tmp_path.glob("*.whl"))
     assert wheels, "no wheel produced"
-    names = zipfile.ZipFile(wheels[0]).namelist()
+    with zipfile.ZipFile(wheels[0]) as zf:
+        names = zf.namelist()
     assert any("languages.json" in n for n in names), (
         f"wheel ships no language config; installed users get zero languages. "
         f"Entries: {[n for n in names if 'config' in n]}"
@@ -149,7 +150,8 @@ def test_wheel_omits_test_artifacts_and_carries_runtime_modules(tmp_path: Path):
 
     wheels = list(tmp_path.glob("*.whl"))
     assert wheels, "no wheel produced"
-    names = zipfile.ZipFile(wheels[0]).namelist()
+    with zipfile.ZipFile(wheels[0]) as zf:
+        names = zf.namelist()
 
     banned = [n for n in names
               if "/test_output/" in n or "/test_data/" in n
