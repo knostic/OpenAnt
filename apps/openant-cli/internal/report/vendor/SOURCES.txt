@@ -9,16 +9,23 @@
 # does not) and the standard ignores are deliberately not overridden —
 # provenance here is hand-maintained.
 #
-# tailwindcss-3.4.16.js
-#   source: https://cdn.tailwindcss.com/3.4.16
+# tailwindcss-3.4.17.js
+#   source: https://cdn.tailwindcss.com/3.4.17
 #   note: the Play CDN build — a runtime JIT CSS compiler, documented by
 #         upstream as development-only. DESIGN TRADE-OFF (accepted, #332):
 #         vendoring the compiler keeps the report self-contained (it is the
 #         artifact cdn.tailwindcss.com serves; the only published form) at
-#         the cost of ~451KB and a compiler-in-browser. A prebuilt CSS via
+#         the cost of ~407KB and a compiler-in-browser. A prebuilt CSS via
 #         the tailwind CLI would be 10-30KB and drop one of the two inline
 #         script blocks — recorded as the follow-up direction.
-#   sha256: 3f81aa7f6ecdb1acc14c202e513dfee00b6c7703cd81ce1be25bf5215a92e8cb
+#   ARTIFACT-SPACE CEILING (verified 2026-09-05): cdn.tailwindcss.com serves
+#         the Play CDN build up to 3.4.17 ONLY — 3.4.18+ and the v4 line
+#         return an "Unknown Tailwind version" stub. npm:tailwindcss has
+#         releases past 3.4.17, so renovate's npm-datasource notifier will
+#         propose versions with NO published Play-CDN artifact — those
+#         branches are read-before-acting: verify the CDN actually serves
+#         the version before attempting this recipe.
+#   sha256: 176e894661aa9cdc9a5cba6c720044cbbf7b8bd80d1c9a142a7c24b1b6c50d15
 #
 # chart-4.5.1.umd.min.js
 #   source: https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js

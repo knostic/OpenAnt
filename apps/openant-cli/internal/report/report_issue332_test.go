@@ -43,7 +43,7 @@ func TestRenderedReportHasNoCDNScripts(t *testing.T) {
 		// The vendored scripts must be PRESENT, not merely the CDN absent —
 		// markers come from the pinned files themselves (version banners),
 		// which the templates' own inline config blocks cannot provide.
-		for _, marker := range []string{"3.4.16", "Chart.js v4.5.1", "chartjs-plugin-datalabels"} {
+		for _, marker := range []string{"3.4.17", "Chart.js v4.5.1", "chartjs-plugin-datalabels"} {
 			if !strings.Contains(out, marker) {
 				t.Fatalf("%s: missing vendored-script marker %q (an empty inline would strip styling/charts silently)",
 					name, marker)
@@ -55,7 +55,7 @@ func TestRenderedReportHasNoCDNScripts(t *testing.T) {
 // The vendored, pinned libraries are embedded non-empty at build time.
 func TestVendoredReportScriptsEmbedded(t *testing.T) {
 	for _, name := range []string{
-		"tailwindcss-3.4.16.js",
+		"tailwindcss-3.4.17.js",
 		"chart-4.5.1.umd.min.js",
 		"chartjs-plugin-datalabels-2.2.0.min.js",
 	} {
