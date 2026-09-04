@@ -13,8 +13,8 @@ import (
 // detectable ("trust whoever ran curl" was the pre-round state).
 func TestVendoredReportScriptHashes(t *testing.T) {
 	for name, want := range map[string]string{
-		"tailwindcss-3.4.16.js":                  "3f81aa7f6ecdb1acc14c202e513dfee00b6c7703cd81ce1be25bf5215a92e8cb",
-		"chart-4.4.7.umd.min.js":                 "206b6e8bb00fc7bba2c7ee80ca41db3e9e05ba7be0aa35abeba9cfd5357f5d0e",
+		"tailwindcss-3.4.17.js":                  "176e894661aa9cdc9a5cba6c720044cbbf7b8bd80d1c9a142a7c24b1b6c50d15",
+		"chart-4.5.1.umd.min.js":                 "48444a82d4edcb5bec0f1965faacdde18d9c17db3063d042abada2f705c9f54a",
 		"chartjs-plugin-datalabels-2.2.0.min.js": "20c08f3d9c6d2ef76df6d6a6f1127c0013339fe32add24222276c398c6308c38",
 	} {
 		data, err := vendorFS.ReadFile("vendor/" + name)
@@ -39,20 +39,30 @@ func TestVendoredReportScriptHashes(t *testing.T) {
 // it settled across version bumps (probed clean at vendoring time).
 func TestVendoredScriptsCarryNoScriptBreakouts(t *testing.T) {
 	for _, name := range []string{
-		"tailwindcss-3.4.16.js",
-		"chart-4.4.7.umd.min.js",
+		"tailwindcss-3.4.17.js",
+		"chart-4.5.1.umd.min.js",
 		"chartjs-plugin-datalabels-2.2.0.min.js",
 	} {
 		data, err := vendorFS.ReadFile("vendor/" + name)
 		if err != nil {
 			t.Fatalf("vendored script %s missing: %v", name, err)
 		}
+		// The guard exists because vendorJS emits template.JS verbatim — it
+		// bypasses html/template contextual autoescaping, so the blobs
+		// themselves must never contain HTML tokenizer hazards. All four
+		// tokens below probed clean on the current blobs at vendoring time.
 		s := strings.ToLower(string(data))
 		if strings.Contains(s, "</script") {
 			t.Fatalf("%s contains </script — template.JS emits verbatim; the inline block would terminate early", name)
 		}
 		if strings.Contains(s, "<!--") {
 			t.Fatalf("%s contains an HTML comment open — the same breakout class", name)
+		}
+		if strings.Contains(s, "-->") {
+			t.Fatalf("%s contains an HTML comment close — script-data-escaped state hazard, same breakout class", name)
+		}
+		if strings.Contains(s, "<script") {
+			t.Fatalf("%s contains a nested <script open — script-data-double-escaped state hazard, same breakout class", name)
 		}
 	}
 }

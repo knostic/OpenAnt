@@ -24,7 +24,7 @@ var reskinFS embed.FS
 // func returning template.JS): self-contained in every mode — served,
 // standalone, air-gapped — with no route coupling.
 //
-//go:embed vendor/tailwindcss-3.4.16.js vendor/chart-4.4.7.umd.min.js vendor/chartjs-plugin-datalabels-2.2.0.min.js
+//go:embed vendor/tailwindcss-3.4.17.js vendor/chart-4.5.1.umd.min.js vendor/chartjs-plugin-datalabels-2.2.0.min.js
 var vendorFS embed.FS
 
 // vendorScripts holds the embedded script contents. A wrong name in a
@@ -33,8 +33,8 @@ var vendorFS embed.FS
 var vendorScripts = func() map[string]template.JS {
 	m := make(map[string]template.JS, 3)
 	for _, n := range []string{
-		"tailwindcss-3.4.16.js",
-		"chart-4.4.7.umd.min.js",
+		"tailwindcss-3.4.17.js",
+		"chart-4.5.1.umd.min.js",
 		"chartjs-plugin-datalabels-2.2.0.min.js",
 	} {
 		b, err := vendorFS.ReadFile("vendor/" + n)

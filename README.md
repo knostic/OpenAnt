@@ -90,8 +90,9 @@ Wizard defaults reflect the project's per-phase recommendations (stronger reason
 | `google` | [aistudio.google.com](https://aistudio.google.com/apikey) | NOT included in Gemini Advanced — separate billing. |
 | `bedrock` | — (AWS credential chain) | Claude on AWS Bedrock. No `api_key`: credentials come from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars or a `~/.aws` profile, region from `AWS_REGION`. Model IDs are inference profiles (`us.anthropic.claude-sonnet-4-6`, `global.anthropic.claude-haiku-4-5-20251001-v1:0`, ...) — enable them under "Model access" in the Bedrock console and list them with `aws bedrock list-inference-profiles`. Offered by `openant setup llm` (leave the API key blank — AWS credential chain, probe skipped) — full guide: [`utilities/llm/providers/BEDROCK.md`](libs/openant-core/utilities/llm/providers/BEDROCK.md). |
 | `openrouter` | [openrouter.ai](https://openrouter.ai/settings/keys) | Gateway to many providers with one key and one prepaid balance (also reads `OPENROUTER_API_KEY`). Model IDs are `vendor/model` slugs (`anthropic/claude-sonnet-4.6`, `openai/gpt-4o-mini`, ...) — browse them at [openrouter.ai/models](https://openrouter.ai/models). Offered by `openant setup llm` (leave the base URL blank for the OpenRouter default) — full guide: [`utilities/llm/providers/OPENROUTER.md`](libs/openant-core/utilities/llm/providers/OPENROUTER.md). |
+| `ollama` | — (local server) | Local models via [Ollama](https://ollama.com). No `api_key`: leave it blank (a placeholder is sent automatically); base URL defaults to `http://localhost:11434/v1`. Models must be pulled first (`ollama pull <model>`); model IDs are exactly what `ollama list` shows. Local inference is free — $0 cost reporting. Offered by `openant setup llm` — full guide: [`utilities/llm/providers/OLLAMA.md`](libs/openant-core/utilities/llm/providers/OLLAMA.md). |
 
-All four support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop.
+All of them support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop. For Ollama, pick a tools-capable model for those phases — very small local models may not handle tool calls reliably.
 
 #### Quick path for Anthropic-only setups
 
@@ -286,9 +287,9 @@ openant project switch <org/repo> # switch active project
 
 Things on the list, in no particular order:
 
-- **More provider adapters.** Ollama (local models), vLLM, Cohere, Mistral, Groq, Azure OpenAI — each is a small Python adapter recipe (plus a few Go wizard/probe touch-points if you want it offered by `openant setup llm`) per the contributor guide. Lower the barrier to local / on-prem inference.
+- **More provider adapters.** vLLM, Cohere, Mistral, Groq, Azure OpenAI — each is a small Python adapter recipe (plus a few Go wizard/probe touch-points if you want it offered by `openant setup llm`) per the contributor guide. Lower the barrier to local / on-prem inference. (Local inference via Ollama shipped in this release — [`OLLAMA.md`](libs/openant-core/utilities/llm/providers/OLLAMA.md).)
 - **Subscription-based auth.** ChatGPT / Codex, Claude Pro / Max, and Gemini Advanced subscriptions don't currently grant API quota — users have to maintain a separate API-tier key per provider. OAuth-based adapters that ride the consumer subscription would close that gap.
-- **Cross-provider tool-call quirks.** All three shipped adapters support tool calling, but the long tail (parallel tool calls, strict-mode schema enforcement, retry semantics on partial JSON) behaves differently per provider. Real-world scans surface these — PRs welcome.
+- **Cross-provider tool-call quirks.** All the shipped adapters support tool calling, but the long tail (parallel tool calls, strict-mode schema enforcement, retry semantics on partial JSON) behaves differently per provider. Real-world scans surface these — PRs welcome.
 - **More languages.** The supported-languages list above is current coverage. Java and C# come up frequently.
 - **Hosted scan service.** Knostic offers free scans for OSS projects today via the form linked above; a self-serve API for trusted partners is a future possibility.
 

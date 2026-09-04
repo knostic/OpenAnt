@@ -6,19 +6,49 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "#332/#476: the vendored report scripts \u2014 versions live in the file names, the go:embed list, and the template literals; nothing else would look at them. The regex manager substitutes named groups only \u2014 a CONDITIONAL packageNameTemplate is invalid config and halted renovate; a STATIC packageNameTemplate is valid. tailwindcss and chartjs-plugin-datalabels read their packageName from the named capture group; chart.js keeps its chart- literal prefix (the vendored file is chart-X.umd.min.js \u2014 a chart\\.js literal never matches) and pins its packageName statically.",
+      "description": "#332/#476 vendored report scripts \u2014 chart.js. Versions live in the vendored file names, the go:embed list and vendorScripts names, the template literals, and the test pins in report_vendor_test.go and report_issue332_test.go (filename lists + the 'Chart.js v<version>' banner marker). RULES BOUGHT WITH INCIDENTS: (1) A CONDITIONAL packageNameTemplate is invalid config for the regex manager and halted renovate (#476) \u2014 do not reintroduce one. (2) A STATIC packageNameTemplate overrides the packageName capture group of every matchString in its manager \u2014 observed behavior, renovate CLI 37.440.7 (--dry-run=extract at 1a6fa1be); #485's single shared manager used one static template for three matchStrings, so tailwindcss-3.4.16.js and chartjs-plugin-datalabels-2.2.0.min.js extracted as chart.js@3.4.16 / chart.js@2.2.0 and spawned the invalid #487/#488 branches. THE INVARIANT: never mix a static packageNameTemplate with a matchString carrying a packageName capture group \u2014 the group is silently overridden. Every manager here uses value-only matchStrings + its own static template; DO NOT add a matchString with a packageName group to any of these managers. chart.js needs the static template because the vendored file name (chart-X.umd.min.js) carries no literal matching the npm package name chart.js; the second matchString tracks the banner marker pinned by report_issue332_test.go. vendor/SOURCES.txt (the provenance record) is deliberately NOT tracked: config:recommended's :ignoreModulesAndTests preset adds **/vendor/** to ignorePaths (verified: a no-extends config extracts it, the preset one does not), we deliberately do not override the standard ignores \u2014 provenance there is hand-maintained per the #332 recipe. These managers are NOTIFIERS, not fixers: a vendored bump always needs the manual #332 recipe (the vendored blob + the sha256 pin + the go:embed/vendorScripts names + the template literals + both test files' pins \u2014 all in one commit); the branch rewrites the name literals (including the go:embed list in report.go, which makes the branch BUILD-red, not just test-red) while the vendored blob and its sha256 pin do not move, so every branch from this surface is unmergeable as-authored by design.",
       "fileMatch": [
         "^apps/openant-cli/internal/report/templates/.*\\.gohtml$",
         "^apps/openant-cli/internal/report/report_vendor_test\\.go$",
-        "^apps/openant-cli/internal/report/vendor/SOURCES\\.txt$"
+        "^apps/openant-cli/internal/report/report_issue332_test\\.go$",
+        "^apps/openant-cli/internal/report/report\\.go$"
       ],
       "matchStrings": [
-        "(?<packageName>tailwindcss)-(?<currentValue>[0-9.]+)\\.js",
         "chart-(?<currentValue>[0-9.]+)\\.umd\\.min\\.js",
-        "(?<packageName>chartjs-plugin-datalabels)-(?<currentValue>[0-9.]+)\\.min\\.js"
+        "Chart\\.js v(?<currentValue>[0-9.]+)"
       ],
       "datasourceTemplate": "npm",
       "packageNameTemplate": "chart.js"
+    },
+    {
+      "customType": "regex",
+      "description": "#332/#476 vendored report scripts \u2014 tailwindcss. Same rules as the chart.js manager above (static packageNameTemplate + value-only matchStrings; never add a packageName capture group to this manager \u2014 #485's lesson; the file name needs the static template because tailwindcss-3.4.16.js matches the npm package tailwindcss). Notifier-only: the vendored blob/sha do not move on a branch; see the chart.js manager entry for the full rules.",
+      "fileMatch": [
+        "^apps/openant-cli/internal/report/templates/.*\\.gohtml$",
+        "^apps/openant-cli/internal/report/report_vendor_test\\.go$",
+        "^apps/openant-cli/internal/report/report_issue332_test\\.go$",
+        "^apps/openant-cli/internal/report/report\\.go$"
+      ],
+      "matchStrings": [
+        "tailwindcss-(?<currentValue>[0-9.]+)\\.js"
+      ],
+      "datasourceTemplate": "npm",
+      "packageNameTemplate": "tailwindcss"
+    },
+    {
+      "customType": "regex",
+      "description": "#332/#476 vendored report scripts \u2014 chartjs-plugin-datalabels. Same rules as the chart.js manager above (static packageNameTemplate + value-only matchStrings; never add a packageName capture group to this manager \u2014 #485's lesson; the file name matches the npm package chartjs-plugin-datalabels). Notifier-only: the vendored blob/sha do not move on a branch; see the chart.js manager entry for the full rules.",
+      "fileMatch": [
+        "^apps/openant-cli/internal/report/templates/.*\\.gohtml$",
+        "^apps/openant-cli/internal/report/report_vendor_test\\.go$",
+        "^apps/openant-cli/internal/report/report_issue332_test\\.go$",
+        "^apps/openant-cli/internal/report/report\\.go$"
+      ],
+      "matchStrings": [
+        "chartjs-plugin-datalabels-(?<currentValue>[0-9.]+)\\.min\\.js"
+      ],
+      "datasourceTemplate": "npm",
+      "packageNameTemplate": "chartjs-plugin-datalabels"
     }
   ]
 }
