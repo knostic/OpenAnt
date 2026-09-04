@@ -14,7 +14,7 @@ import (
 func TestVendoredReportScriptHashes(t *testing.T) {
 	for name, want := range map[string]string{
 		"tailwindcss-3.4.16.js":                  "3f81aa7f6ecdb1acc14c202e513dfee00b6c7703cd81ce1be25bf5215a92e8cb",
-		"chart-4.4.7.umd.min.js":                 "206b6e8bb00fc7bba2c7ee80ca41db3e9e05ba7be0aa35abeba9cfd5357f5d0e",
+		"chart-4.5.1.umd.min.js":                 "206b6e8bb00fc7bba2c7ee80ca41db3e9e05ba7be0aa35abeba9cfd5357f5d0e",
 		"chartjs-plugin-datalabels-2.2.0.min.js": "20c08f3d9c6d2ef76df6d6a6f1127c0013339fe32add24222276c398c6308c38",
 	} {
 		data, err := vendorFS.ReadFile("vendor/" + name)
@@ -40,7 +40,7 @@ func TestVendoredReportScriptHashes(t *testing.T) {
 func TestVendoredScriptsCarryNoScriptBreakouts(t *testing.T) {
 	for _, name := range []string{
 		"tailwindcss-3.4.16.js",
-		"chart-4.4.7.umd.min.js",
+		"chart-4.5.1.umd.min.js",
 		"chartjs-plugin-datalabels-2.2.0.min.js",
 	} {
 		data, err := vendorFS.ReadFile("vendor/" + name)
