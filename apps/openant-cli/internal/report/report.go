@@ -27,9 +27,11 @@ var reskinFS embed.FS
 //go:embed vendor/tailwindcss-3.4.17.js vendor/chart-4.5.1.umd.min.js vendor/chartjs-plugin-datalabels-2.2.0.min.js
 var vendorFS embed.FS
 
-// vendorScripts holds the embedded script contents. A wrong name in a
-// template is a compile-time failure (go:embed), so the map is built once
-// and the read cannot fail.
+// vendorScripts holds the embedded script contents. go:embed validates the
+// directive's patterns at COMPILE time (a missing vendored file fails the
+// build); a wrong name in a TEMPLATE is a render-time failure — vendorJS
+// fails loud when the literal names nothing embedded (see below), so the
+// map is built once and a stale literal cannot pass silently.
 var vendorScripts = func() map[string]template.JS {
 	m := make(map[string]template.JS, 3)
 	for _, n := range []string{
