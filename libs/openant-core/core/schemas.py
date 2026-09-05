@@ -320,18 +320,22 @@ def verify_step_summary(result: "VerifyResult") -> dict:
 
     Shared by every construction site — core/scanner.py (the pipeline),
     openant/cli.py's chained analyze --verify, and standalone openant
-    verify — so the sites cannot drift. All seven fields reconcile:
-    agreed + disagreed + needs_review + error_count accounts for every
-    findings_input finding except the disagreed-but-still-vulnerable
-    case, which increments only confirmed_vulnerabilities (see
-    core/verifier.py _count_verification_outcomes) — the four reconciliation
-    counters are therefore a bound (<=), not exact equality.
+    verify — so the sites cannot drift. The reconciliation counters bound:
+    agreed + disagreed + disagreed_inconclusive + needs_review +
+    error_count accounts for every findings_input finding except the
+    disagreed-but-still-vulnerable case, which increments only
+    confirmed_vulnerabilities (see core/verifier.py
+    _count_verification_outcomes) — the counters are therefore a bound
+    (<=), not exact equality. #509: ``disagreed_inconclusive`` is the
+    disagreement arm whose corrected finding is ``inconclusive`` — the
+    verifier could NOT confirm it, so it must never fold into ``safe``.
     """
     return {
         "findings_input": result.findings_input,
         "findings_verified": result.findings_verified,
         "agreed": result.agreed,
         "disagreed": result.disagreed,
+        "disagreed_inconclusive": result.disagreed_inconclusive,
         "confirmed_vulnerabilities": result.confirmed_vulnerabilities,
         "needs_review": result.needs_review,
         "error_count": result.error_count,
@@ -353,6 +357,12 @@ class VerifyResult:
     findings_verified: int = 0
     agreed: int = 0
     disagreed: int = 0
+    # #509: disagreements whose corrected finding is ``inconclusive`` —
+    # the verifier explicitly could NOT confirm the finding. Counted
+    # separately so the scanner threads them into ``inconclusive`` and
+    # they never fold into ``safe`` (the ->inconclusive arm of the
+    # #374/#381 family).
+    disagreed_inconclusive: int = 0
     confirmed_vulnerabilities: int = 0
     # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
     # (degenerate path or adapter error). Counted separately so the scanner
