@@ -1106,7 +1106,13 @@ def scan_repository(
                     total=analyze_result.metrics.total,
                     vulnerable=verify_result.confirmed_vulnerabilities,
                     bypassable=0,
-                    inconclusive=analyze_result.metrics.inconclusive,
+                    # #509: a Stage-2 disagreement corrected to
+                    # ``inconclusive`` is an explicitly-unconfirmable finding —
+                    # it threads into inconclusive, NEVER into safe (the
+                    # plain-disagreement fold above covers only genuine
+                    # downgrades to safe).
+                    inconclusive=analyze_result.metrics.inconclusive
+                    + verify_result.disagreed_inconclusive,
                     protected=analyze_result.metrics.protected,
                     safe=analyze_result.metrics.safe + verify_result.disagreed,
                     errors=analyze_result.metrics.errors + verify_result.error_count,
