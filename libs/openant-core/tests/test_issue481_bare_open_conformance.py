@@ -322,7 +322,7 @@ def test_sim115_scope_keys_do_not_disarm():
     # exist today; each would be a visible repo change on review.
 
 
-_ENV_OR_BUILD_DIRS = {"__pycache__", "build", "dist", "node_modules"}
+_ENV_OR_BUILD_DIRS = {"__pycache__", "build", "dist", "node_modules", "venv", "env"}
 
 
 def _is_collected_logic(path: Path) -> bool:
@@ -342,8 +342,10 @@ def _is_swept(path: Path, root: Path, exempt: list[str]) -> bool:
     test-*generator* utility, and would sweep any future test-shaped file
     without a scope edit. NOT swept: env/build trees (dot-dirs — .venv et
     al. — __pycache__, build, dist, node_modules: machine-dependent
-    content a repo gate must not depend on; the sibling scanner
-    test_file_io._iter_python_sources uses the same exclusions) and prod
+    content a repo gate must not depend on; note the sibling scanner
+    test_file_io._iter_python_sources excludes a slightly different set
+    (it keeps venv/ and drops node_modules) — the two sweeps are
+    independent; drift between them is friction, not a hole) and prod
     files that are not test-shaped.
     """
     try:
