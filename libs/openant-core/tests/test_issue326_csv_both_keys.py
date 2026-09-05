@@ -16,6 +16,7 @@ The fix (the issue's suggested reading, with the key-name mapping the issue insi
   first) — this file's half of #321's producer (the single-shot half is #321's own PR).
 """
 import csv
+import io
 import json
 import sys
 import tempfile
@@ -169,7 +170,7 @@ def test_nonstring_agent_context_degrades_not_crashes():
             {"id": "app.py:x", "agent_context": "garbage", "code": "x=1"}]}))
         out = Path(d) / "r.csv"
         _ex(str(exp), str(ds), str(out))
-        row = list(_csv.DictReader(open(out)))[0]
+        row = list(_csv.DictReader(io.StringIO(Path(out).read_text(encoding="utf-8"))))[0]
         assert row["unit_description"] == ""
 
 

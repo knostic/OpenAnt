@@ -55,12 +55,25 @@ target-version = "py311"
 # parser import blocks + the core/utilities refactor residue, re-export-
 # adjudicated with 0 cross-file traps) was cleaned in the same commit the
 # scope expanded (the #481 prod half — the #483 test half preceded it).
-select = ["F821", "F811", "F823", "F401", "F841"]
+# SIM115 (open-without-with) flags unmanaged open-family calls EXCEPT in
+# return statements, behind ExitStack/enterContext, immediately .close()d,
+# or inside __enter__ — the return shape and Name/BinOp ``.open`` receivers
+# are its blind spot; the tests-tree conformance scan in
+# tests/test_issue481_bare_open_conformance.py closes those.
+select = ["F821", "F811", "F823", "F401", "F841", "SIM115"]
 
 [tool.ruff.lint.per-file-ignores]
-# fable (prod-cleanup panel, the #483 carryover): the efficacy fixtures are
-# BENCHMARK DATA — the oracle scores them; style rules never touch them.
-"tests/efficacy/fixtures/**" = ["F401", "F841"]
+# NOTE: the SIM115 entries below are also consumed (via fnmatch) by the
+# AST conformance sweep in tests/test_issue481_bare_open_conformance.py —
+# keep slash-containing path forms; a basename-only pattern matches for
+# ruff (basename) but not the sweep (full relative path).
+# The efficacy fixtures are BENCHMARK DATA — the oracle scores them; style
+# rules never touch them (a deliberate bare open lives at
+# tests/efficacy/fixtures/webapp/src/app_a.py:15 and must stay).
+"tests/efficacy/fixtures/**" = ["F401", "F841", "SIM115"]
+# The sample repos are parser INPUT DATA — arbitrary target-repo code the
+# language parsers consume, not this project's own test logic.
+"tests/fixtures/**" = ["SIM115"]
 
 [tool.hatch.build.targets.wheel]
 packages = [

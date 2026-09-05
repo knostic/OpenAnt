@@ -16,6 +16,7 @@ Sites (independently re-derived as LIVE this session):
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 # The breakout payload: a bare closing fence, injected instructions, then a
 # reopen. If any site fences with < 4 backticks (or not at all), the injected
@@ -212,7 +213,7 @@ def test_collapse_inline_has_a_single_home():
             if not fn.endswith(".py"):
                 continue
             p = os.path.join(dp, fn)
-            txt = open(p, encoding="utf-8", errors="ignore").read()
+            txt = Path(p).read_text(encoding="utf-8", errors="ignore")
             rel = os.path.relpath(p, core_root).replace(os.sep, "/")
             if "def _oneline" in txt:
                 offenders_oneline.append(rel)

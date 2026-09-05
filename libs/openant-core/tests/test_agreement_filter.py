@@ -214,7 +214,7 @@ def test_verifier_confirmed_findings_includes_disagree_vulnerable():
 
     try:
         _write_verified_results(path, experiment, merged, verified_only)
-        data = json.loads(open(path).read())
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
         confirmed = data["confirmed_findings"]
         assert len(confirmed) == 1, f"expected 1 confirmed (login), got {len(confirmed)}"
         assert confirmed[0]["route_key"] == "app.py:login"

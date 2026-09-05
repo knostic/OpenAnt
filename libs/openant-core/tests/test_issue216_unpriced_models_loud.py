@@ -208,7 +208,7 @@ def test_analyzer_resume_restores_marker(tmp_path, monkeypatch):
     tracker.reset()
     # drive the same accumulation the resume loop performs
     _existing = {"unit_a": json.loads(
-        open(os.path.join(td, "unit_a.json")).read())}
+        Path(os.path.join(td, "unit_a.json")).read_text(encoding="utf-8"))}
     unpriced = set()
     for _uid, _cp in _existing.items():
         unpriced.update(_cp.get("usage", {}).get("unpriced_models") or [])

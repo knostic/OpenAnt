@@ -8,6 +8,7 @@ that function and its calls. Other emit paths use a first-wins skip guard.
 import json
 import os
 import tempfile
+from pathlib import Path
 
 from core.parser_adapter import parse_repository
 
@@ -22,7 +23,7 @@ def _functions(files: dict):
     out = tempfile.mkdtemp()
     parse_repository(repo, out, language="javascript", processing_level="all",
                      skip_tests=True, name="r")
-    return json.load(open(os.path.join(out, "call_graph.json")))["functions"]
+    return json.loads((Path(out) / "call_graph.json").read_text(encoding="utf-8"))["functions"]
 
 
 def test_arrow_const_does_not_drop_block_function_sink():
