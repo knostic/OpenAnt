@@ -13,6 +13,7 @@
      callee silently dropped from the graph = an unreachable false-negative).
 """
 import glob
+from pathlib import Path
 import os
 import random
 import time
@@ -61,7 +62,7 @@ def test_differential_on_real_source_windows():
     files = glob.glob(os.path.join(here, "**", "*.py"), recursive=True)
     assert files, "no corpus files found"
     for fp in files:
-        txt = open(fp, encoding="utf-8", errors="ignore").read()
+        txt = Path(fp).read_text(encoding="utf-8", errors="ignore")
         for chunk in [txt] + [txt[k:k + 500] for k in range(0, len(txt), 500)]:
             assert _blank_rust_literals(chunk) == _old(chunk), f"{os.path.basename(fp)}"
 

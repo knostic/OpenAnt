@@ -9,6 +9,7 @@ file must never resolve to it -- no phantom, whether the object is exported or n
 import json
 import os
 import tempfile
+from pathlib import Path
 
 from core.parser_adapter import parse_repository
 
@@ -23,7 +24,7 @@ def _cg(files: dict):
     out = tempfile.mkdtemp()
     parse_repository(repo, out, language="javascript", processing_level="all",
                      skip_tests=True, name="r")
-    return json.load(open(os.path.join(out, "call_graph.json")))
+    return json.loads((Path(out) / "call_graph.json").read_text(encoding="utf-8"))
 
 
 def _edges(cg, caller_suffix):

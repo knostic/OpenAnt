@@ -151,8 +151,9 @@ def test_status_uses_the_same_breakdown_vocabulary():
             ("V3", "Container did not produce valid JSON output"),
             ("V4", "mystery"),
         ]:
-            (open(os.path.join(d, f"{name}.json"), "w")).write(_json.dumps(
-                {"id": name, "status": "ERROR", "details": details}))
+            (Path(os.path.join(d, f"{name}.json"))).write_text(_json.dumps(
+                {"id": name, "status": "ERROR", "details": details}),
+                encoding="utf-8")
         st = StepCheckpoint.status(d)
         bd = st["error_breakdown"]
         assert bd.get("generation") == 1, bd

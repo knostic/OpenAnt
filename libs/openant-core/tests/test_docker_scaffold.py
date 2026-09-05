@@ -84,7 +84,7 @@ def test_write_test_files_stages_source(tmp_path):
 
     staged = os.path.join(work_dir, "app.py")
     assert os.path.exists(staged), "source file must be staged into work_dir"
-    assert open(staged).read() == "def vuln(): pass"
+    assert Path(staged).read_text(encoding="utf-8") == "def vuln(): pass"
 
 
 def test_write_test_files_works_without_source(tmp_path):
