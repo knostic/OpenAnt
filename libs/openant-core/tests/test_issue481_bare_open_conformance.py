@@ -38,14 +38,16 @@ Policy points, so a future reader knows the intent:
    how the six shared ``_graph()`` helpers escaped it), plus non-Call
    ``.open`` receivers, plus anything outside its stdlib opener list —
    notably the project's own ``open_utf8`` wrapper, invisible to SIM115 in
-   every shape. This scan closes those gaps for the open family, and it
-   is the ONLY arm covering the constructor-style openers
-   (``zipfile.ZipFile``, ``tarfile.TarFile``, ``bz2.BZ2File``,
-   ``gzip.GzipFile``, ``io.FileIO``, ``lzma.LZMAFile``,
-   ``os.fdopen`` — which returns a handle, unlike the exempt
-   ``os.open``): ruff's list reaches only the tempfile family and
-   ``fileinput``, and only where its with/return/ExitStack/
-   immediate-close exemptions do not apply. Known limits
+   every shape. This scan closes those gaps for the open family. For the
+   constructor-style openers, ruff's list reaches the tempfile family,
+   ``lzma.LZMAFile`` and ``fileinput.FileInput`` (wherever its with/return/
+   ExitStack/immediate-close exemptions do not apply); this scan is the
+   only arm for ``zipfile.ZipFile``, ``tarfile.TarFile``, ``bz2.BZ2File``,
+   ``gzip.GzipFile``, ``io.FileIO`` and ``os.fdopen`` (which returns a
+   handle, unlike the exempt ``os.open``), and the only arm for the
+   tempfile/LZMAFile/FileInput family in RETURN shapes. ``os.popen`` and
+   subprocess pipe handles are the named remaining blind spot of both
+   arms (zero sites today). Known limits
    of any name-based detector apply to it too: an ``import os as o`` alias would false-positive, an opener
    imported under a different name would be a silent miss, and ANY
    non-``os`` ``.open`` flags — including non-handle openers
@@ -84,10 +86,11 @@ PYPROJECT = CORE_ROOT / "pyproject.toml"
 # project's own utf-8 wrapper (utilities/file_io.py — the with-target).
 _OPENER_NAMES = {"open", "open_utf8"}
 
-# Constructor-style openers invisible to ruff's SIM115 in every shape
-# (its list reaches only the tempfile family). os.fdopen joins them as a
-# special case: it RETURNS a handle, unlike os.open which returns an fd
-# and stays exempt.
+# Constructor-style openers this scan gates. ruff's SIM115 also sees some
+# of these in non-exempt shapes (the tempfile family, LZMAFile,
+# FileInput) — the scan is the sole arm for the REST and for return
+# shapes. os.fdopen is a special case: it RETURNS a handle, unlike
+# os.open which returns an fd and stays exempt.
 _OPENER_CTORS = {"ZipFile", "TarFile", "BZ2File", "GzipFile", "FileIO",
                  "LZMAFile", "FileInput", "NamedTemporaryFile",
                  "TemporaryFile", "SpooledTemporaryFile"}
@@ -195,6 +198,13 @@ def _bare_open_sites(source: str, filename: str = "<source>") -> list[int]:
                  id="zipfile-constructor-unmanaged"),
     pytest.param("import os\ndef f(p):\n    fd = os.open(p, os.O_RDONLY)\n    fh = os.fdopen(fd)\n    return fh\n", 1,
                  id="os-fdopen-unmanaged"),
+    pytest.param("from zipfile import ZipFile\ndef f(p):\n    z = ZipFile(p)\n    return z.namelist()\n", 1,
+                 id="ctor-from-import-unmanaged"),
+    pytest.param("import tempfile\ndef f(p):\n    t = tempfile.NamedTemporaryFile()\n    return t.name\n", 1,
+                 id="tempfile-ctor-unmanaged"),
+    # Must NOT trip: managed or exempt.
+    pytest.param("def f(x):\n    return x.ZipFile(p)\n", 0,
+                 id="ctor-attribute-on-non-module-receiver-not-flagged"),
     # Must NOT trip: managed or exempt.
     pytest.param("def f(p):\n    with open(p) as fh:\n        return fh.read()\n", 0,
                  id="with-open-managed"),
@@ -306,42 +316,97 @@ def test_sim115_scope_keys_do_not_disarm():
         "broadened?) — one arm of the bare-open guard is gone (see this "
         "file's docstring for the two-arm design)")
     # Named residuals this pin cannot reach: any noqa form in prod
-    # (``# noqa: SIM115``, bare ``# noqa``, file-level ``# ruff: noqa``),
-    # CI workflow flags (--config/--ignore/--exit-zero), sibling/nested
-    # ruff.toml/.ruff.toml files, and .gitignore-driven exclusion
-    # (respect-gitignore). None exist today; each would be a visible
-    # repo change on review.
+    # (line, bare, or file-level noqa directives), CI workflow flags
+    # (--config/--ignore/--exit-zero), sibling/nested ruff.toml/.ruff.toml
+    # files, and .gitignore-driven exclusion (respect-gitignore). None
+    # exist today; each would be a visible repo change on review.
+
+
+_ENV_OR_BUILD_DIRS = {"__pycache__", "build", "dist", "node_modules"}
+
+
+def _is_collected_logic(path: Path) -> bool:
+    return (path.name.startswith("test_")
+            or path.name.endswith("_test.py")
+            or path.name == "conftest.py")
+
+
+def _is_swept(path: Path, root: Path, exempt: list[str]) -> bool:
+    """The scope rule, extracted so its properties are unit-testable.
+
+    Swept: the tests tree (minus exempt fixture DATA), plus TEST-SHAPED
+    files anywhere else in the source tree — an over-approximation that
+    deliberately admits the parser CLI harnesses (parsers/*/test_pipeline.py,
+    which pytest.ini and the root conftest exclude from COLLECTION, and
+    which use open_utf8 — invisible to ruff's SIM115) and the
+    test-*generator* utility, and would sweep any future test-shaped file
+    without a scope edit. NOT swept: env/build trees (dot-dirs — .venv et
+    al. — __pycache__, build, dist, node_modules: machine-dependent
+    content a repo gate must not depend on; the sibling scanner
+    test_file_io._iter_python_sources uses the same exclusions) and prod
+    files that are not test-shaped.
+    """
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    if any(part.startswith(".") or part in _ENV_OR_BUILD_DIRS
+           for part in rel_parts):
+        return False
+    rel = path.relative_to(root).as_posix()
+    in_tests = rel.startswith("tests/")
+    if not in_tests and not _is_collected_logic(path):
+        return False
+    if in_tests and not _is_collected_logic(path) and any(
+            fnmatch.fnmatch(rel, glob) for glob in exempt):
+        return False
+    return True
+
+
+def test_scope_rule_is_pinned():
+    """The sweep's scope properties, pinned on a planted tree (so a
+    future 'simplify the walker' edit cannot silently narrow it)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        exempt = ["tests/efficacy/fixtures/**", "tests/fixtures/**"]
+        cases = [
+            ("tests/a/test_x.py", True, "tests-tree logic"),
+            ("tests/fixtures/sample/test_p.py", True, "logic under an exempt glob stays swept"),
+            ("tests/fixtures/sample/data.py", False, "data under an exempt glob stays exempt"),
+            ("tests/efficacy/fixtures/webapp/conftest.py", True, "conftest is always logic"),
+            ("parsers/c/test_pipeline.py", True, "the CLI harnesses are swept (open_utf8 is ruff-blind)"),
+            ("utilities/dynamic_tester/test_generator.py", True, "the test-shape over-approximation admits it"),
+            ("core/scanner.py", False, "prod out of scope by design"),
+            (".venv/lib/site-packages/test_x.py", False, "env trees never swept"),
+            ("build/pkg/test_x.py", False, "build trees never swept"),
+        ]
+        for rel, expected, why in cases:
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("")
+            assert _is_swept(f, root, exempt) == expected, f"{rel}: {why}"
 
 
 def test_no_bare_opens_in_collected_test_logic():
-    """The sweep: tests tree + collected logic outside it parses clean.
+    """The sweep: the tests tree + test-shaped files elsewhere, clean.
 
-    Scope: every *.py under tests/ (exempt globs apply, EXCEPT that
-    pytest-collected logic — test_*.py / *_test.py / conftest.py — is
-    NEVER exempt: a planted test file under a fixture glob is logic, not
-    data), PLUS every collected-logic file OUTSIDE tests/ (the root
-    conftest.py, the parsers/*/test_pipeline.py harnesses) — where
-    neither the sweep nor ruff previously reached. Prod files are NOT
-    swept: the two by-design prod sites (utilities/file_io.py's open_utf8
-    wrapper; core/parser_adapter.py's lock handle, closed in an outer
-    try/finally) are intentional and out of scope.
+    Scope rule (extracted into _is_swept, unit-pinned above): the tests
+    tree minus exempt fixture DATA, plus test-SHAPED files anywhere in
+    the source tree — the root conftest.py and the parsers/*/test_pipeline.py
+    CLI harnesses (which the repo's own pytest.ini/conftest EXCLUDE from
+    collection and whose open_utf8 idiom ruff's SIM115 cannot see), and
+    by over-approximation the test-generator utility too. NOT swept:
+    env/build trees and non-test-shaped prod files (the two by-design
+    prod open sites are utilities/file_io.py's open_utf8 wrapper and
+    core/parser_adapter.py's try/finally-closed lock handle).
     """
     exempt = _sim115_exempt_globs()
     offenders: list[str] = []
-
-    def _is_collected_logic(path: Path) -> bool:
-        return (path.name.startswith("test_")
-                or path.name.endswith("_test.py")
-                or path.name == "conftest.py")
-
     for path in sorted(CORE_ROOT.rglob("*.py")):
-        rel = path.relative_to(CORE_ROOT).as_posix()
-        in_tests = rel.startswith("tests/")
-        if not in_tests and not _is_collected_logic(path):
-            continue  # prod: out of the sweep's scope by design
-        if in_tests and not _is_collected_logic(path) and any(
-                fnmatch.fnmatch(rel, glob) for glob in exempt):
+        if not _is_swept(path, CORE_ROOT, exempt):
             continue
+        rel = path.relative_to(CORE_ROOT).as_posix()
         try:
             source = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
