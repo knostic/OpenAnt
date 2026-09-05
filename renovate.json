@@ -50,5 +50,14 @@
       "datasourceTemplate": "npm",
       "packageNameTemplate": "chartjs-plugin-datalabels"
     }
+  ],
+  "packageRules": [
+    {
+      "description": "#497's artifact-space ceiling, ENCODED: cdn.tailwindcss.com (the Play-CDN's only publisher) serves the 3.x build up to 3.4.17 ONLY \u2014 3.4.18+ and v4 have no published artifact (verified 2026-09-05; the npm datasource's version space outruns the artifact space). Cap the notifier at what is actually vendorable; keep the notifier alive for any genuine 3.4.x<=3.4.17 fix (there is none as of the cap date) instead of proposing unactionable branches. NOTE: closing the v4 renovate branch (#495) already put renovate into ignore-tailwindcss-4.x state (its own comment: 'You will not get PRs for any future 4.x releases') \u2014 this rule encodes the ceiling in-repo rather than leaving it in renovate's PR memory.",
+      "matchPackageNames": [
+        "tailwindcss"
+      ],
+      "allowedVersions": "<=3.4.17"
+    }
   ]
 }
