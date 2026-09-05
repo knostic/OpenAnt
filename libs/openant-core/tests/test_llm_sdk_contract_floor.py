@@ -450,3 +450,50 @@ def test_anthropic_wrong_shapes_extract_none():
 
     assert anthropic_provider._extract_usage_details(SimpleNamespace(cache_read_input_tokenz=1)) is None
     assert anthropic_provider._extract_usage_details(None) is None
+
+
+def test_anthropic_stop_reason_literal_declares_refusal_and_mapped_reasons():
+    """The adapter's typed refusal path (#212 family) keys on
+    stop_reason == 'refusal', and _ANTHROPIC_STOP_REASONS maps the four
+    normal terminations. A Literal rename/removal would silently degrade
+    refusals to the unknown-stop path (a refusal read as a clean pass —
+    the exact hazard anthropic.py's own comments warn about)."""
+    import typing
+
+    from anthropic.types import StopReason
+
+    args = set(typing.get_args(StopReason))
+    assert "refusal" in args, (
+        "the adapter raises LLMRefusalError on stop_reason=='refusal'; the "
+        "installed SDK's StopReason literal no longer declares it"
+    )
+    from utilities.llm.providers import anthropic as anthropic_provider
+
+    for reason in anthropic_provider._ANTHROPIC_STOP_REASONS:
+        assert reason in args, f"mapped stop reason {reason!r} missing from the installed StopReason literal"
+
+
+def test_anthropic_content_block_type_literals():
+    """The response walk keys assistant blocks by .type ('text' /
+    'tool_use') — unknown kinds are dropped with a warning. A literal
+    rename would silently drop ALL blocks (empty completions)."""
+    from anthropic.types import TextBlock, ToolUseBlock
+
+    assert set(typing.get_args(TextBlock.model_fields["type"].annotation)) == {"text"}
+    assert set(typing.get_args(ToolUseBlock.model_fields["type"].annotation)) == {"tool_use"}
+
+
+def test_anthropic_bedrock_constructs_with_real_signature():
+    """providers/bedrock.py:167 constructs AnthropicBedrock(**kwargs) — the
+    extra (anthropic[bedrock]) is requirements-pinned but nothing else in
+    the suite constructs it. A dropped/renamed extra crashes bedrock users
+    at adapter construction while `import anthropic` stays green."""
+    import anthropic
+
+    # no network: dummy credentials only exercise the constructor surface
+    client = anthropic.AnthropicBedrock(
+        aws_region="us-east-1",
+        aws_access_key="AKIATEST",
+        aws_secret_key="test-secret-not-real",  # synthetic, not a secret
+    )
+    assert client is not None
