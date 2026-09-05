@@ -38,17 +38,15 @@ Policy points, so a future reader knows the intent:
    how the six shared ``_graph()`` helpers escaped it), plus non-Call
    ``.open`` receivers, plus anything outside its stdlib opener list —
    notably the project's own ``open_utf8`` wrapper, invisible to SIM115 in
-   every shape. This scan closes those gaps for the open family. Among
-   constructor-style openers, ruff's list reaches the tempfile family,
-   ``lzma.LZMAFile`` and ``fileinput.FileInput`` (subject to the same
-   with/return/ExitStack/immediate-close exemptions above); the
-   CONSTRUCTORS ``zipfile.ZipFile(...)``, ``tarfile.TarFile(...)``,
-   ``bz2.BZ2File(...)``, ``io.FileIO``, ``gzip.GzipFile`` and ``os.fdopen``
-   are invisible to BOTH arms — though the ``.open()`` MEMBER on a
-   ``ZipFile(...)``/``LZMAFile(...)``/``TarFile(...)`` receiver IS visible
-   to both (zero unmanaged constructor sites today; if one appears, add
-   the constructor names here). Known limits of any name-based detector
-   apply to it too: an ``import os as o`` alias would false-positive, an opener
+   every shape. This scan closes those gaps for the open family, and it
+   is the ONLY arm covering the constructor-style openers
+   (``zipfile.ZipFile``, ``tarfile.TarFile``, ``bz2.BZ2File``,
+   ``gzip.GzipFile``, ``io.FileIO``, ``lzma.LZMAFile``,
+   ``os.fdopen`` — which returns a handle, unlike the exempt
+   ``os.open``): ruff's list reaches only the tempfile family and
+   ``fileinput``, and only where its with/return/ExitStack/
+   immediate-close exemptions do not apply. Known limits
+   of any name-based detector apply to it too: an ``import os as o`` alias would false-positive, an opener
    imported under a different name would be a silent miss, and ANY
    non-``os`` ``.open`` flags — including non-handle openers
    (``webbrowser.open``) and an ``IfExp`` with-header (both arms of a
@@ -85,6 +83,16 @@ PYPROJECT = CORE_ROOT / "pyproject.toml"
 # Name-form openers that return a file handle: the builtin, and the
 # project's own utf-8 wrapper (utilities/file_io.py — the with-target).
 _OPENER_NAMES = {"open", "open_utf8"}
+
+# Constructor-style openers invisible to ruff's SIM115 in every shape
+# (its list reaches only the tempfile family). os.fdopen joins them as a
+# special case: it RETURNS a handle, unlike os.open which returns an fd
+# and stays exempt.
+_OPENER_CTORS = {"ZipFile", "TarFile", "BZ2File", "GzipFile", "FileIO",
+                 "LZMAFile", "FileInput", "NamedTemporaryFile",
+                 "TemporaryFile", "SpooledTemporaryFile"}
+_OPENER_CTOR_MODULES = {"zipfile", "tarfile", "bz2", "gzip", "io", "lzma",
+                        "fileinput", "tempfile"}
 
 
 def _bare_open_sites(source: str, filename: str = "<source>") -> list[int]:
@@ -127,6 +135,24 @@ def _bare_open_sites(source: str, filename: str = "<source>") -> list[int]:
             and not (isinstance(func.value, ast.Name) and func.value.id == "os")
         ):
             sites.append(node.lineno)
+        elif (
+            isinstance(func, ast.Attribute)
+            and func.attr == "fdopen"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "os"
+        ):
+            sites.append(node.lineno)  # os.fdopen returns a handle; os.open does not
+        elif (
+            isinstance(func, ast.Name) and func.id in _OPENER_CTORS
+        ):
+            sites.append(node.lineno)
+        elif (
+            isinstance(func, ast.Attribute)
+            and func.attr in _OPENER_CTORS
+            and isinstance(func.value, ast.Name)
+            and func.value.id in _OPENER_CTOR_MODULES
+        ):
+            sites.append(node.lineno)
     return sites
 
 
@@ -162,9 +188,18 @@ def _bare_open_sites(source: str, filename: str = "<source>") -> list[int]:
         "import pytest\ndef f(p):\n"
         "    with pytest.raises(FileNotFoundError):\n        open(p)\n",
         1, id="raise-path-open"),
+    # Constructor-style openers: ruff's SIM115 is blind to these in every
+    # shape; this scan is their only gate (os.fdopen returns a handle,
+    # unlike the exempt os.open).
+    pytest.param("import zipfile\ndef f(p):\n    z = zipfile.ZipFile(p)\n    return z.namelist()\n", 1,
+                 id="zipfile-constructor-unmanaged"),
+    pytest.param("import os\ndef f(p):\n    fd = os.open(p, os.O_RDONLY)\n    fh = os.fdopen(fd)\n    return fh\n", 1,
+                 id="os-fdopen-unmanaged"),
     # Must NOT trip: managed or exempt.
     pytest.param("def f(p):\n    with open(p) as fh:\n        return fh.read()\n", 0,
                  id="with-open-managed"),
+    pytest.param("import zipfile\ndef f(p):\n    with zipfile.ZipFile(p) as z:\n        return z.namelist()\n", 0,
+                 id="zipfile-constructor-with-managed"),
     pytest.param(
         "def f(a, b):\n    with (open(a) as fa, open(b) as fb):\n"
         "        return fa.read() + fb.read()\n",
@@ -213,16 +248,43 @@ def _sim115_exempt_globs() -> list[str]:
     return [glob for glob, rules in merged.items() if "SIM115" in rules]
 
 
-def test_sim115_config_is_pinned():
-    """The ruff backstop must not silently appear, disappear, or widen.
+def test_sim115_per_file_ignores_map_is_pinned():
+    """The exemption map is pinned exactly — the assertion that matters.
+
+    An exemption entry blinds BOTH gates for its path (the sweep derives
+    its exemptions from these same keys), so any change here must be a
+    conscious decision. This assertion stands on its own function so it
+    survives independent review of the scope-key allowlist below.
+    """
+    lint = _load_ruff_config().get("lint", {})
+    expected_ignores = {
+        "tests/efficacy/fixtures/**": {"F401", "F841", "SIM115"},
+        "tests/fixtures/**": {"SIM115"},
+    }
+    actual_ignores = {glob: sorted(rules)
+                      for glob, rules in lint.get("per-file-ignores", {}).items()}
+    assert actual_ignores == {g: sorted(r) for g, r in expected_ignores.items()}, (
+        f"the ruff per-file-ignores map changed — expected exactly "
+        f"{ {g: sorted(r) for g, r in expected_ignores.items()} }, found {actual_ignores}. "
+        "An entry or a prefix selector (SIM/ALL) blinds BOTH gates for "
+        "that path (sweep + ruff); if deliberate, update this pin "
+        "consciously")
+
+
+def test_sim115_scope_keys_do_not_disarm():
+    """The ruff arm's scope keys are allowlisted.
 
     SIM115 is one of the two arms (it misses return-statement opens and
-    Name/BinOp ``.open`` receivers; this scan closes those). The pin is
-    tamper-evident in BOTH directions: dropping SIM115 disarms one arm,
-    and ADDING a SIM115 exemption silently blinds both arms for that
-    path (the sweep derives its exemptions from the same pyproject
-    keys). The exemption set is pinned exactly — a new entry must be a
-    conscious decision recorded here.
+    Name/BinOp ``.open`` receivers; this scan closes those). A blocklist
+    would trail ruff's growing options surface (ignore/exclude/include/
+    force-exclude/fix-only/extend-inheritance/deprecated top-level forms
+    each disarm SIM115 somewhere), so the whole config shape is pinned:
+    ANY new top-level or lint key — whatever ruff names it next — trips
+    this pin and becomes a conscious decision. NOTE: unlike the map pin
+    above, this allowlist is intentionally opinionated (it will trip on
+    unrelated keys like a future line-length too); if it proves friction,
+    narrow it to a disarm-keys denylist rather than deleting the pin —
+    the per-file-ignores pin lives in its own function and survives.
     """
     ruff = _load_ruff_config()
     lint = ruff.get("lint", {})
@@ -243,18 +305,6 @@ def test_sim115_config_is_pinned():
         "SIM115 is no longer exactly in ruff select (dropped, or renamed/"
         "broadened?) — one arm of the bare-open guard is gone (see this "
         "file's docstring for the two-arm design)")
-    expected_ignores = {
-        "tests/efficacy/fixtures/**": {"F401", "F841", "SIM115"},
-        "tests/fixtures/**": {"SIM115"},
-    }
-    actual_ignores = {glob: sorted(rules)
-                      for glob, rules in lint["per-file-ignores"].items()}
-    assert actual_ignores == {g: sorted(r) for g, r in expected_ignores.items()}, (
-        f"the ruff per-file-ignores map changed — expected exactly "
-        f"{ {g: sorted(r) for g, r in expected_ignores.items()} }, found {actual_ignores}. "
-        "An entry or a prefix selector (SIM/ALL) blinds BOTH gates for "
-        "that path (sweep + ruff); if deliberate, update this pin "
-        "consciously")
     # Named residuals this pin cannot reach: any noqa form in prod
     # (``# noqa: SIM115``, bare ``# noqa``, file-level ``# ruff: noqa``),
     # CI workflow flags (--config/--ignore/--exit-zero), sibling/nested
@@ -263,22 +313,34 @@ def test_sim115_config_is_pinned():
     # repo change on review.
 
 
-def test_no_bare_opens_in_the_test_tree():
-    """The sweep: every test file parses clean of unmanaged opens.
+def test_no_bare_opens_in_collected_test_logic():
+    """The sweep: tests tree + collected logic outside it parses clean.
 
-    Pytest-collected logic (test_*.py / *_test.py / conftest.py) is NEVER
-    exempt — a planted test file under a fixture glob is test logic,
-    not data.
+    Scope: every *.py under tests/ (exempt globs apply, EXCEPT that
+    pytest-collected logic — test_*.py / *_test.py / conftest.py — is
+    NEVER exempt: a planted test file under a fixture glob is logic, not
+    data), PLUS every collected-logic file OUTSIDE tests/ (the root
+    conftest.py, the parsers/*/test_pipeline.py harnesses) — where
+    neither the sweep nor ruff previously reached. Prod files are NOT
+    swept: the two by-design prod sites (utilities/file_io.py's open_utf8
+    wrapper; core/parser_adapter.py's lock handle, closed in an outer
+    try/finally) are intentional and out of scope.
     """
     exempt = _sim115_exempt_globs()
     offenders: list[str] = []
-    for path in sorted(TESTS_DIR.rglob("*.py")):
+
+    def _is_collected_logic(path: Path) -> bool:
+        return (path.name.startswith("test_")
+                or path.name.endswith("_test.py")
+                or path.name == "conftest.py")
+
+    for path in sorted(CORE_ROOT.rglob("*.py")):
         rel = path.relative_to(CORE_ROOT).as_posix()
-        is_collected_logic = (
-            path.name.startswith("test_")
-            or path.name.endswith("_test.py")
-            or path.name == "conftest.py")
-        if not is_collected_logic and any(fnmatch.fnmatch(rel, glob) for glob in exempt):
+        in_tests = rel.startswith("tests/")
+        if not in_tests and not _is_collected_logic(path):
+            continue  # prod: out of the sweep's scope by design
+        if in_tests and not _is_collected_logic(path) and any(
+                fnmatch.fnmatch(rel, glob) for glob in exempt):
             continue
         try:
             source = path.read_text(encoding="utf-8")
@@ -294,8 +356,8 @@ def test_no_bare_opens_in_the_test_tree():
             continue
         offenders.extend(f"{rel}:{lineno}" for lineno in sites)
     assert not offenders, (
-        "Unmanaged open() calls in the tests tree (the #481 class is "
-        f"back): {offenders}\n"
+        "Unmanaged open() calls in collected test logic (the #481 class "
+        f"is back): {offenders}\n"
         "Fix idiom: ``with open(p) as fh:`` for handles, "
         "``Path(p).read_text(encoding='utf-8')`` for one-line reads, "
         "``Path(p).write_text(..., encoding='utf-8')`` for one-line "
