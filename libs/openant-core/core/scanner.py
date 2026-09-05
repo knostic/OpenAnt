@@ -904,7 +904,6 @@ def scan_repository(
                 # Record the crash so the degraded reachability pass is
                 # visible in the artifacts, matching the dataset-read guard.
                 _record_skip(result, "llm-reachability", "failed")
-                dataset = None
 
         collected_step_reports.append(
             _load_step_report(output_dir, "llm-reachability")
@@ -1395,7 +1394,7 @@ _TEST_FILES_SKIPPED_KEY = "test_files_skipped"
 # JavaScript's scanner still writes camelCase testFilesSkipped (the same
 # naming drift the 2026-08 CHANGELOG fixed for symlinks_skipped) — read it
 # as an alias until the parser is renamed.
-_TEST_FILES_SKIPPED_ALIASES = ("test_files_skipped", "testFilesSkipped")
+_TEST_FILES_SKIPPED_ALIASES = (_TEST_FILES_SKIPPED_KEY, "testFilesSkipped")
 _COVERAGE_EXAMPLE_KEYS = ("symlink_examples", "unreadable_examples")
 # Parsers disagree on the filename: the in-process Python parser writes
 # scan_result.json (singular); the subprocess parsers write scan_results.json.
@@ -1499,7 +1498,7 @@ def _collect_coverage(result: ScanResult) -> dict:
         **counts,
         **examples,
         # #307: the dominant exclusion, per-language attributed
-        **({"test_files_skipped": test_files} if test_files else {}),
+        **({_TEST_FILES_SKIPPED_KEY: test_files} if test_files else {}),
         "languages_without_coverage_data": sorted(set(without_data)),
         # #307 (review finding): the languages whose test-file exclusion is
         # UNCOUNTERED — the reader must see that "no entry" means unknown,
