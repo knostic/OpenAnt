@@ -361,3 +361,92 @@ def test_openai_wrong_shapes_extract_none(wrong):
 )
 def test_google_wrong_shapes_extract_none(wrong):
     assert google_provider._extract_usage_details(wrong) is None
+
+
+# --------------------------------------------------------------------------- #
+# anthropic — the seam's third leg (same shape as openai/google above)        #
+# --------------------------------------------------------------------------- #
+
+
+def test_anthropic_pin_tied_to_requirements():
+    import re
+    from pathlib import Path
+
+    import anthropic
+
+    root = Path(__file__).resolve().parents[1]
+    pin = None
+    for line in (root / "requirements.txt").read_text().splitlines():
+        m = re.match(r"^anthropic\[bedrock\]==([0-9.]+)", line.strip())
+        if m:
+            pin = m.group(1)
+    assert pin is not None, "requirements.txt must carry the anthropic[bedrock] pin"
+    assert anthropic.__version__ == pin, (
+        f"installed anthropic {anthropic.__version__} != requirements pin {pin}"
+    )
+
+
+def test_anthropic_usage_fields_are_declared():
+    from anthropic.types import Usage
+
+    # the adapter's consumed surface: anthropic.py _extract_usage_details reads
+    # cache_read_input_tokens / cache_creation_input_tokens; the response walk
+    # reads input_tokens / output_tokens
+    assert {
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "input_tokens",
+        "output_tokens",
+    } <= set(Usage.model_fields)
+
+
+def test_anthropic_usage_details_from_real_sdk_type():
+    from anthropic.types import Usage
+
+    from utilities.llm.providers import anthropic as anthropic_provider
+
+    usage = Usage(input_tokens=10, output_tokens=20)
+    details = anthropic_provider._extract_usage_details(usage)
+    # absent cache fields extract None-details (absent != 0, same contract)
+    assert details is None
+
+    cached = Usage(
+        input_tokens=10,
+        output_tokens=20,
+        cache_read_input_tokens=3,
+        cache_creation_input_tokens=1,
+    )
+    assert anthropic_provider._extract_usage_details(cached) == {
+        "cache_read_input_tokens": 3,
+        "cache_creation_input_tokens": 1,
+    }
+
+
+def test_anthropic_exception_classes_construct_with_real_signatures():
+    import anthropic
+
+    cases = [
+        (anthropic.AuthenticationError, 401),
+        (anthropic.PermissionDeniedError, 403),
+        (anthropic.RateLimitError, 429),
+        (anthropic.NotFoundError, 404),
+        (anthropic.APIStatusError, 500),
+    ]
+    for exc_cls, status in cases:
+        exc = exc_cls(
+            message="m",
+            response=_fake_httpx_response(status),
+            body=None,
+        )
+        assert exc.response.status_code == status, exc_cls.__name__
+
+    anthropic.APIConnectionError(
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    )
+
+
+def test_anthropic_wrong_shapes_extract_none():
+    from utilities.llm.providers import anthropic as anthropic_provider
+
+    assert anthropic_provider._extract_usage_details(SimpleNamespace(cache_read_input_tokenz=1)) is None
+    assert anthropic_provider._extract_usage_details(None) is None
