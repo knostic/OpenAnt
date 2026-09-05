@@ -24,8 +24,11 @@
 #         releases past 3.4.17, so renovate's npm-datasource notifier will
 #         propose versions with NO published Play-CDN artifact — those
 #         branches are read-before-acting: verify the CDN actually serves
-#         the version before attempting this recipe. The verification will
-#         fail for EVERY version past 3.4.17 — this vendored blob is frozen
+#         the version before attempting this recipe. TRAP: the CDN answers
+#         unknown versions with HTTP 200 + a console.error stub (~730 bytes,
+#         'Unknown Tailwind version: ...') — a status-code check reads as
+#         success; MATCH ON CONTENT (a ~400KB script) or the stub wins. The
+#         verification will fail for EVERY version past 3.4.17 — this vendored blob is frozen
 #         on this channel (including for future security fixes; the npm
 #         dist carries no play-cdn script — verified by tarball listing, so
 #         there is no second source to dual-verify against either). A

@@ -133,6 +133,7 @@ def run_verification(
             findings_verified=0,
             agreed=0,
             disagreed=0,
+            disagreed_inconclusive=0,
             confirmed_vulnerabilities=0,
             # #302: the denominator survives the zero-findings early return —
             # a clean scan's scope statement is "adjudicated 0 of N", never
@@ -263,7 +264,8 @@ def run_verification(
     needs_review = _counts["needs_review"]
     error_count = _counts["error_count"]
 
-    print(f"\n[Verify] Results: {agreed} agreed, {disagreed} disagreed, "
+    print(f"\n[Verify] Results: {agreed} agreed, {disagreed} disagreed "
+          f"({_counts['disagreed_inconclusive']} to inconclusive), "
           f"{needs_review} need manual review, "
           f"{confirmed_vulnerabilities} confirmed vulnerabilities", file=sys.stderr)
     if error_count:
@@ -307,6 +309,7 @@ def run_verification(
         findings_verified=len(verified_results),
         agreed=agreed,
         disagreed=disagreed,
+        disagreed_inconclusive=_counts["disagreed_inconclusive"],
         confirmed_vulnerabilities=confirmed_vulnerabilities,
         needs_review=needs_review,
         error_count=error_count,
@@ -390,6 +393,9 @@ def _count_verification_outcomes(verified_results: list) -> dict:
     counts = {
         "agreed": 0,
         "disagreed": 0,
+        # #509: disagreements whose corrected finding is ``inconclusive`` —
+        # threaded to metrics.inconclusive, never folded into safe.
+        "disagreed_inconclusive": 0,
         "needs_review": 0,
         "confirmed_vulnerabilities": 0,
         "error_count": 0,
@@ -429,6 +435,14 @@ def _count_verification_outcomes(verified_results: list) -> dict:
             # safe — counting it as ``disagreed`` would under-report the vuln.
             if finding in ("vulnerable", "bypassable"):
                 counts["confirmed_vulnerabilities"] += 1
+            elif finding == "inconclusive":
+                # #509: the verifier disagreed AND could not confirm — the
+                # corrected finding is ``inconclusive``. NOT a safe verdict
+                # and NOT a generic disagreement: the scanner folds plain
+                # ``disagreed`` into ``safe`` (safe += disagreed), which
+                # would reclassify an explicitly-unconfirmable finding as
+                # safe in the aggregate metrics. Its own bucket.
+                counts["disagreed_inconclusive"] += 1
             else:
                 counts["disagreed"] += 1
         # #302: direction. `verdict` is the UN-overwritten Stage-1 original;
