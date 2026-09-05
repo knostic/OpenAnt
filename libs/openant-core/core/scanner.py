@@ -1498,7 +1498,7 @@ def _collect_coverage(result: ScanResult) -> dict:
         **counts,
         **examples,
         # #307: the dominant exclusion, per-language attributed
-        **({"test_files_skipped": test_files} if test_files else {}),
+        **({_TEST_FILES_SKIPPED_KEY: test_files} if test_files else {}),
         "languages_without_coverage_data": sorted(set(without_data)),
         # #307 (review finding): the languages whose test-file exclusion is
         # UNCOUNTERED — the reader must see that "no entry" means unknown,
