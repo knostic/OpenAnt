@@ -24,7 +24,13 @@
 #         releases past 3.4.17, so renovate's npm-datasource notifier will
 #         propose versions with NO published Play-CDN artifact — those
 #         branches are read-before-acting: verify the CDN actually serves
-#         the version before attempting this recipe.
+#         the version before attempting this recipe. The verification will
+#         fail for EVERY version past 3.4.17 — this vendored blob is frozen
+#         on this channel (including for future security fixes; the npm
+#         dist carries no play-cdn script — verified by tarball listing, so
+#         there is no second source to dual-verify against either). A
+#         security bump means executing the prebuilt-CSS/CLI follow-up
+#         direction recorded above, not a re-vendor.
 #   sha256: 176e894661aa9cdc9a5cba6c720044cbbf7b8bd80d1c9a142a7c24b1b6c50d15
 #
 # chart-4.5.1.umd.min.js
