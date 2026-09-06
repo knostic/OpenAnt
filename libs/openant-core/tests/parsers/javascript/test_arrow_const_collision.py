@@ -14,16 +14,16 @@ from core.parser_adapter import parse_repository
 
 
 def _functions(files: dict):
-    repo = os.path.realpath(tempfile.mkdtemp())
-    for rel, content in files.items():
-        p = os.path.join(repo, rel)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w") as fh:
-            fh.write(content)
-    out = tempfile.mkdtemp()
-    parse_repository(repo, out, language="javascript", processing_level="all",
-                     skip_tests=True, name="r")
-    return json.loads((Path(out) / "call_graph.json").read_text(encoding="utf-8"))["functions"]
+    with tempfile.TemporaryDirectory() as _repo, tempfile.TemporaryDirectory() as out:
+        repo = os.path.realpath(_repo)
+        for rel, content in files.items():
+            p = os.path.join(repo, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        parse_repository(repo, out, language="javascript", processing_level="all",
+                         skip_tests=True, name="r")
+        return json.loads((Path(out) / "call_graph.json").read_text(encoding="utf-8"))["functions"]
 
 
 def test_arrow_const_does_not_drop_block_function_sink():

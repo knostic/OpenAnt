@@ -38,16 +38,16 @@ from core.parser_adapter import parse_repository  # noqa: E402
 
 
 def _cg(files: dict):
-    repo = Path(tempfile.mkdtemp())
-    for rel, content in files.items():
-        p = repo / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
-    out = tempfile.mkdtemp()
-    parse_repository(str(repo), out, language="python",
-                   processing_level="all", skip_tests=True, name="r")
-    with open(Path(out) / "call_graph.json") as fh:
-        return json.load(fh)["call_graph"]
+    with tempfile.TemporaryDirectory() as _repo, tempfile.TemporaryDirectory() as out:
+        repo = Path(_repo)
+        for rel, content in files.items():
+            p = repo / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        parse_repository(str(repo), out, language="python",
+                       processing_level="all", skip_tests=True, name="r")
+        with open(Path(out) / "call_graph.json") as fh:
+            return json.load(fh)["call_graph"]
 
 
 def test_init_definition_resolves():

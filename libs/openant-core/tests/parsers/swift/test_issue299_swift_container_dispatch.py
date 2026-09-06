@@ -40,17 +40,17 @@ from core.parser_adapter import parse_repository  # noqa: E402
 
 
 def _cg(files: dict):
-    repo = os.path.realpath(tempfile.mkdtemp())
-    for rel, content in files.items():
-        p = os.path.join(repo, rel)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w") as fh:
-            fh.write(content)
-    out = tempfile.mkdtemp()
-    parse_repository(repo, out, language="swift", processing_level="all",
-                     skip_tests=True, name="r")
-    with open(os.path.join(out, "call_graph.json")) as fh:
-        return json.load(fh)
+    with tempfile.TemporaryDirectory() as _repo, tempfile.TemporaryDirectory() as out:
+        repo = os.path.realpath(_repo)
+        for rel, content in files.items():
+            p = os.path.join(repo, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        parse_repository(repo, out, language="swift", processing_level="all",
+                         skip_tests=True, name="r")
+        with open(os.path.join(out, "call_graph.json")) as fh:
+            return json.load(fh)
 
 
 def _edges(cg, caller_suffix):
