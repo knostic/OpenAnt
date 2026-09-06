@@ -46,7 +46,7 @@ def _cg(files: dict):
             p.write_text(content, encoding="utf-8")
         parse_repository(str(repo), out, language="python",
                        processing_level="all", skip_tests=True, name="r")
-        with open(Path(out) / "call_graph.json") as fh:
+        with open(Path(out) / "call_graph.json", encoding="utf-8") as fh:
             return json.load(fh)["call_graph"]
 
 

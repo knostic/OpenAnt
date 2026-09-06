@@ -44,7 +44,7 @@ def _cg(files: dict):
                 fh.write(content)
         parse_repository(repo, out, language="rust", processing_level="all",
                          skip_tests=True, name="r")
-        with open(os.path.join(out, "call_graph.json")) as fh:
+        with open(os.path.join(out, "call_graph.json"), encoding="utf-8") as fh:
             return json.load(fh)
 
 
