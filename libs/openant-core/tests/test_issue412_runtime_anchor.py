@@ -55,6 +55,28 @@ def test_runtime_anchor_guidance_present():
     """The policy itself is pinned: target-declared runtime first, stable
     fallback only when nothing is declared."""
     src = (_DYNDIR / "test_generator.py").read_text(encoding="utf-8")
-    assert "BASE IMAGE RUNTIME POLICY" in src
-    assert "DECLARED runtime" in src
-    assert "fall back to the current stable" in src
+    assert "BASE IMAGE RUNTIME POLICY" in src, (
+        "the runtime-policy block was removed from the prompt — #412's "
+        "anchor is gone; restore it or update this pin consciously")
+    assert "DECLARED runtime" in src, (
+        "the target-declared-runtime-first clause is gone from the prompt")
+    assert "fall back to the current stable" in src, (
+        "the stable-fallback clause is gone from the prompt")
+
+
+def test_reference_doc_template_table_matches_the_templates():
+    """The reference doc's template table is a THIRD spelling of the
+    template facts — it drifted before (node:20 vs the template's 24) and
+    is bound here now (the #412 audit's find)."""
+    doc = (_DYNDIR / "DYNAMIC_TESTER_REFERENCE.md").read_text(encoding="utf-8")
+    for name in ("python", "node", "go"):
+        tmpl_first = (_DYNDIR / "docker_templates" / f"{name}.Dockerfile"
+                      ).read_text(encoding="utf-8").splitlines()[0]
+        import re as _re
+        m = _re.search(r"FROM\s+(\S+)", tmpl_first)
+        assert m, f"{name}.Dockerfile's FROM line is malformed: {tmpl_first!r}"
+        image = m.group(1)
+        assert f"`{image}`" in doc, (
+            f"DYNAMIC_TESTER_REFERENCE.md's template table does not name "
+            f"{image} (the {name}.Dockerfile base) — the table drifted "
+            "from the templates it describes (the #412 class)")
