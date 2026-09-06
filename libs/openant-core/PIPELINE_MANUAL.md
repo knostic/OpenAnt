@@ -49,7 +49,7 @@ OpenAnt is a vulnerability analysis tool using Claude. The name "two-stage" refe
 ### Required Software
 
 ```bash
-# Python 3.10+
+# Python 3.11+
 python3 --version
 
 # Node.js (for JavaScript parser)
