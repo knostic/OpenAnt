@@ -1194,9 +1194,45 @@ class FindingVerifier:
                     for result in results:
                         if result.get("route_key") == route_key:
                             # Check if this result has conclusive exploit path analysis
-                            if self._has_conclusive_exploit_path(result):
+                            # (#296's direction-aware fix: an INCOMPLETE
+                            # verification never counts as conclusive, even
+                            # with a populated exploit_path — the finish-path
+                            # shapes (agree-missing, self-contradictory)
+                            # preserve the path and model text while marking
+                            # the run incomplete, and that unfinished evidence
+                            # must not veto a correction. The marker check
+                            # below stays: it covers the same signal for
+                            # rows that predate the structured flag.)
+                            verification = result.get("verification", {})
+                            if verification.get("incomplete"):
+                                self._log("debug",
+                                          f"Skipping conclusive-path check for {route_key}: "
+                                          "verification is incomplete",
+                                          unit_id=route_key)
+                            elif self._has_conclusive_exploit_path(result):
                                 self._log("debug", f"Skipping {route_key}: has conclusive exploit path analysis",
                                           unit_id=route_key)
+                                continue
+
+                            # #296 + astra-round guard: a correction of an
+                            # INCOMPLETE verification into any DISCLOSURE_DROPPED
+                            # verdict is blocked (mirroring the conclusive-
+                            # exploitable block below). The mirror alone cannot
+                            # catch the broken-path shapes: its return requires
+                            # a reached sink, attacker control, and no break —
+                            # so an incomplete result with a broken path would
+                            # pass straight through into a disclosure drop.
+                            if (verification.get("incomplete")
+                                    and str(new_verdict or "").strip().lower() in DISCLOSURE_DROPPED):
+                                self._log("warning",
+                                          f"Blocked disclosure-dropping correction of incomplete {route_key} -> {new_verdict}",
+                                          unit_id=route_key)
+                                result["consistency_downgrade_blocked"] = {
+                                    "proposed": new_verdict,
+                                    "reason": finding_update.get("reason"),
+                                    "pattern": consistency_result.pattern_identified,
+                                    "incomplete": True,
+                                }
                                 continue
 
                             # F-KB-1b: a conclusively-exploitable finding must not be
