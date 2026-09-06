@@ -299,11 +299,28 @@ def generate_test(
         return None
     # Every staging field the executor writes or joins must be a str — a non-str
     # (JSON allows any type) would raise in _write_test_files and abort the whole
-    # dynamic-test run. Degrade a malformed generation to the None (NOT_REPRODUCED) path.
-    _STR_FIELDS = ("dockerfile", "test_script", "test_filename",
-                   "requirements", "requirements_filename", "docker_compose")
-    if any(k in parsed and not isinstance(parsed[k], str) for k in _STR_FIELDS):
+    # dynamic-test run. Degrade a malformed generation to the None (ERROR) path —
+    # result_collector records generation-None as status ERROR, un-retried.
+    _REQUIRED_STR_FIELDS = ("dockerfile", "test_script", "test_filename")
+    if any(k in parsed and not isinstance(parsed[k], str)
+           for k in _REQUIRED_STR_FIELDS):
         return None
+    # The OPTIONAL fields are prompt-declared as "string | null" (the system
+    # prompt: docker_compose "null if single container"; Go tests are told NOT
+    # to write go.mod, so null requirements are the expected emission) — a
+    # model that enumerates the full schema emits null, and that complete,
+    # valid generation must NOT be discarded (#522: 18/21 real sonnet
+    # generations were dropped this way). Coerce null to the canonical absent
+    # form "" (what result_collector's .get(k, "") and DynamicTestResult
+    # default to); keep rejecting non-str non-null values — a dict/number is
+    # still a malformed generation.
+    _OPTIONAL_STR_FIELDS = ("requirements", "requirements_filename",
+                            "docker_compose")
+    for k in _OPTIONAL_STR_FIELDS:
+        if k in parsed and parsed[k] is None:
+            parsed[k] = ""
+        if k in parsed and not isinstance(parsed[k], str):
+            return None
 
     return parsed
 
@@ -378,11 +395,28 @@ def regenerate_test(
         return None
     # Every staging field the executor writes or joins must be a str — a non-str
     # (JSON allows any type) would raise in _write_test_files and abort the whole
-    # dynamic-test run. Degrade a malformed generation to the None (NOT_REPRODUCED) path.
-    _STR_FIELDS = ("dockerfile", "test_script", "test_filename",
-                   "requirements", "requirements_filename", "docker_compose")
-    if any(k in parsed and not isinstance(parsed[k], str) for k in _STR_FIELDS):
+    # dynamic-test run. Degrade a malformed generation to the None (ERROR) path —
+    # result_collector records generation-None as status ERROR, un-retried.
+    _REQUIRED_STR_FIELDS = ("dockerfile", "test_script", "test_filename")
+    if any(k in parsed and not isinstance(parsed[k], str)
+           for k in _REQUIRED_STR_FIELDS):
         return None
+    # The OPTIONAL fields are prompt-declared as "string | null" (the system
+    # prompt: docker_compose "null if single container"; Go tests are told NOT
+    # to write go.mod, so null requirements are the expected emission) — a
+    # model that enumerates the full schema emits null, and that complete,
+    # valid generation must NOT be discarded (#522: 18/21 real sonnet
+    # generations were dropped this way). Coerce null to the canonical absent
+    # form "" (what result_collector's .get(k, "") and DynamicTestResult
+    # default to); keep rejecting non-str non-null values — a dict/number is
+    # still a malformed generation.
+    _OPTIONAL_STR_FIELDS = ("requirements", "requirements_filename",
+                            "docker_compose")
+    for k in _OPTIONAL_STR_FIELDS:
+        if k in parsed and parsed[k] is None:
+            parsed[k] = ""
+        if k in parsed and not isinstance(parsed[k], str):
+            return None
 
     return parsed
 
