@@ -30,7 +30,7 @@ State machine additions in `autopilot/state.py`:
 | `reporter.py` | Markdown report | `generate_report()` |
 | `docker_templates/python.Dockerfile` | Base Python image | `python:3.11-slim` |
 | `docker_templates/node.Dockerfile` | Base Node image | `node:20-slim` |
-| `docker_templates/go.Dockerfile` | Base Go image | `golang:1.22-alpine` |
+| `docker_templates/go.Dockerfile` | Base Go image | `golang:1.27-alpine` |
 | `docker_templates/attacker_server.py` | Capture server | Port 9999, endpoints: `/health`, `/capture`, `/logs`, `/logs/clear` |
 
 ## Modified Existing Files
