@@ -309,8 +309,10 @@ def generate_test(
     # prompt: docker_compose "null if single container"; Go tests are told NOT
     # to write go.mod, so null requirements are the expected emission) — a
     # model that enumerates the full schema emits null, and that complete,
-    # valid generation must NOT be discarded (#522: 18/21 real sonnet
-    # generations were dropped this way). Coerce null to the canonical absent
+    # valid generation must NOT be discarded (#522: of 21 scored generations
+    # in the discovery run, 14 carried a null optional and were dropped this
+    # way; 4 more were truncated replies failing at the parser, not here).
+    # Coerce null to the canonical absent
     # form "" (what result_collector's .get(k, "") and DynamicTestResult
     # default to); keep rejecting non-str non-null values — a dict/number is
     # still a malformed generation.
@@ -405,8 +407,10 @@ def regenerate_test(
     # prompt: docker_compose "null if single container"; Go tests are told NOT
     # to write go.mod, so null requirements are the expected emission) — a
     # model that enumerates the full schema emits null, and that complete,
-    # valid generation must NOT be discarded (#522: 18/21 real sonnet
-    # generations were dropped this way). Coerce null to the canonical absent
+    # valid generation must NOT be discarded (#522: of 21 scored generations
+    # in the discovery run, 14 carried a null optional and were dropped this
+    # way; 4 more were truncated replies failing at the parser, not here).
+    # Coerce null to the canonical absent
     # form "" (what result_collector's .get(k, "") and DynamicTestResult
     # default to); keep rejecting non-str non-null values — a dict/number is
     # still a malformed generation.

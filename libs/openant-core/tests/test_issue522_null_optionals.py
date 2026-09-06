@@ -5,8 +5,9 @@ tests NOT to write go.mod — so a model that enumerates the full schema
 emits ``"docker_compose": null`` (and, for Go findings, null requirements)
 for a complete, valid generation. The old validator rejected any non-str value for those
 fields, discarding the generation to the ERROR path (result_collector
-records generation-None as status ERROR, un-retried): 18/21 real
-sonnet-family generations in the discovery run were dropped this way.
+records generation-None as status ERROR, un-retried in-run): of 21 scored
+generations in the discovery run, 14 carried a null optional and were
+dropped this way (4 more were truncated replies failing at the parser).
 
 The contract now: the required trio stays strictly str; null optionals
 coerce to the canonical absent form "" (what the executor and
