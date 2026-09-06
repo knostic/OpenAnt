@@ -1,21 +1,19 @@
-"""Regression tests for issue #296 — the conclusive-exploit-path guards
-test a free-text explanation string; the structured signal
-(``verification["incomplete"]``) sits unused on the same object.
-
-Scope of this change (the issue's lower-risk items, explicitly NOT the
-direction-aware behavior change the maintainer raised as an open question):
+"""Regression tests for issue #296 — the conclusive-path guards and the
+incomplete-verification signal, at the call site (the direction-aware fix,
+landed in this PR after the issue's own 2026-08-21 re-scoping):
 
 1. The matched marker is a NAMED constant (``INCOMPLETE_VERIFICATION_MARKER``)
-   with the match set UNCHANGED — widening it is the false-negative direction
-   for BOTH guards and must wait for the direction-awareness analysis.
-2. The ASYMMETRY is pinned (the issue's suggested test 3): an INCOMPLETE
-   verification carrying an INTACT exploit path must still leave
-   ``_has_conclusive_exploitable_path`` True — the downgrade into
-   DISCLOSURE_DROPPED stays BLOCKED. Whatever future fix makes the guards
-   signal-aware, it must not let an unfinished verification become the
-   reason a finding is downgraded out of disclosure.
-3. The guards' current behavior on the marker and on the constructed
-   defect input is characterized so any change forces a conscious decision.
+   — it stays as the legacy arm covering rows that predate the structured
+   flag.
+2. The raw helpers below are SHAPE-ONLY characterizations (both still
+   free-text/marker-driven by design — the incomplete-awareness lives at the
+   consistency CALL SITE, not in the helpers, so the #195/#243 mirror
+   contract is untouched).
+3. The call-site behavior: an INCOMPLETE verification never vetoes a
+   correction (arm 1) and never drops out of disclosure (arm 2 — a
+   correction into any DISCLOSURE_DROPPED verdict is blocked with an audit
+   record carrying ``incomplete: True``); the incomplete flag survives an
+   allowed correction (pinned).
 """
 
 from __future__ import annotations
@@ -83,19 +81,17 @@ def test_asymmetry_incomplete_intact_path_blocks_downgrade():
     assert _exploit_path(v) is False
 
 
-def test_characterization_incomplete_broken_path_is_the_open_defect():
-    """CHARACTERIZATION (the open defect, pinned so any change is a
-    conscious decision): incomplete:True + BROKEN path + model-authored
-    explanation reads as conclusive today, suppressing a consistency
-    correction. #296's traced constraint: the obvious tightening re-opens
-    the disclosure FN via the consistency update at :918 — the fix must be
-    direction-aware (skip only for non-downgrade updates). Changing this
-    assertion without that analysis is exactly what #296 warns against."""
+def test_characterization_incomplete_broken_path_helper_still_marker_driven():
+    """CHARACTERIZATION (the helper's shape contract, unchanged by the fix):
+    incomplete:True + BROKEN path + model-authored explanation still reads
+    as conclusive to the RAW helper — the incomplete-awareness lives at the
+    consistency call site (which skips the helper for incomplete rows), not
+    in the helper itself, so the #195/#243 mirror contract is untouched."""
     v = {"incomplete": True, "explanation": _MODEL_TEXT,
          "exploit_path": dict(_BROKEN)}
     assert _exploit_path(v) is True, (
-        "KNOWN DEFECT (see #296): an incomplete verification's broken path "
-        "currently suppresses corrections — fix requires direction-awareness")
+        "the raw helper must stay marker-driven (the #195/#243 contract); "
+        "incomplete-awareness belongs to the call site")
 
 
 def _verifier():
