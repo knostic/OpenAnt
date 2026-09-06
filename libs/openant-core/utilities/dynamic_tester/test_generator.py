@@ -62,14 +62,25 @@ DEPENDENCY INSTALLATION:
 - For Node.js: put ALL dependencies in package.json.
 - For Go: do NOT write go.mod or go.sum yourself. Instead, the Dockerfile MUST initialize
   the module inside the container using `RUN go mod init <name> && go mod tidy`. This works
-  whether the test uses stdlib only or third-party packages. Use golang:1.25-alpine as the
-  base image to support modern k8s and cloud-native packages. Example Dockerfile for Go:
-      FROM golang:1.25-alpine
+  whether the test uses stdlib only or third-party packages. Use golang:1.27-alpine as the
+  base image (the fallback when the target's declared Go version is unknown — matches
+  docker_templates/go.Dockerfile) to support modern k8s and cloud-native packages.
+  Example Dockerfile for Go:
+      FROM golang:1.27-alpine
       WORKDIR /test
       COPY test_exploit.go .
       RUN go mod init openant-test && go mod tidy
       RUN go build -o test_exploit test_exploit.go
       CMD ["./test_exploit"]
+- BASE IMAGE RUNTIME POLICY (all languages): prefer a base image matching the
+  scanned target's DECLARED runtime — the `go` directive in go.mod, a
+  .python-version / pyproject requires-python, a package.json engines field,
+  a .tool-versions, or a language-version cue stated in the finding itself.
+  A wrong runtime can hide version-dependent exploit behavior or break the
+  repro outright (the exploit may not compile/run on a different major).
+  Only when no declaration is visible, fall back to the current stable
+  release of the language. The Go example above is that fallback, not an
+  override of a declared version.
 - The Dockerfile MUST install dependencies from the requirements/package file, NOT inline in RUN commands.
 - If a package has many transitive dependencies, only install the specific sub-package you need
   (e.g., `langchain-core` instead of `langchain`).
