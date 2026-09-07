@@ -77,13 +77,13 @@ def test_application_context_sources_fenced(monkeypatch, tmp_path):
 
     def _capture(binding, prompt, **kw):
         raise _Captured(prompt)
-    monkeypatch.setattr(ac, "simple_text", _capture)
+    monkeypatch.setattr(ac, "simple_completion", _capture)
 
     import types
     binding = types.SimpleNamespace(provider_name="test", model="test")
     try:
         ac.generate_application_context(tmp_path, binding=binding, force_regenerate=True)
-        assert False, "simple_text was not reached"
+        assert False, "simple_completion was not reached"
     except _Captured as c:
         _assert_injection_is_contained(c.prompt)
 

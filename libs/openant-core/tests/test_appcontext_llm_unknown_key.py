@@ -26,6 +26,18 @@ from context.application_context import (  # noqa: E402
 )
 
 
+def _completion_for(text: str):
+    """A simple_completion stub result for the #512 migration: appctx now
+    reads .content/.stop_reason instead of simple_text's joined str."""
+    from utilities.llm.adapter import CompletionResult, TextBlock
+    return CompletionResult(
+        content=[TextBlock(text)],
+        input_tokens=0,
+        output_tokens=0,
+        stop_reason="end_turn",
+    )
+
+
 _LLM_JSON_WITH_HALLUCINATED_KEY = """```json
 {
   "application_type": "cli_tool",
@@ -46,7 +58,7 @@ def test_hallucinated_llm_key_does_not_crash(tmp_path, monkeypatch):
     (tmp_path / "README.md").write_text("# Demo\nA small CLI tool.\n")
 
     monkeypatch.setattr(
-        appctx, "simple_text", lambda *a, **k: _LLM_JSON_WITH_HALLUCINATED_KEY
+        appctx, "simple_completion", lambda *a, **k: _completion_for(_LLM_JSON_WITH_HALLUCINATED_KEY)
     )
     fake_binding = SimpleNamespace(provider_name="fake", model="fake-model")
 
@@ -100,7 +112,7 @@ _LLM_JSON_ONLY_UNKNOWN_KEYS = """```json
 )
 def test_missing_required_field_does_not_crash(tmp_path, monkeypatch, llm_json):
     (tmp_path / "README.md").write_text("# Demo\nA small CLI tool.\n")
-    monkeypatch.setattr(appctx, "simple_text", lambda *a, **k: llm_json)
+    monkeypatch.setattr(appctx, "simple_completion", lambda *a, **k: _completion_for(llm_json))
     fake_binding = SimpleNamespace(provider_name="fake", model="fake-model")
 
     # Pre-fix: raises TypeError (missing required positional argument 'purpose').

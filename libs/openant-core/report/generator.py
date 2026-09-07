@@ -15,6 +15,7 @@ from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
 from .schema import validate_pipeline_output, ValidationError
 from utilities.file_io import normalize_results, open_utf8, read_json
 from utilities.llm import (
+    DEFAULT_MAX_TOKENS,
     PhaseBinding,
     PhaseRegistry,
     build_phase_registry,
@@ -404,7 +405,7 @@ def generate_summary_report(
 
     result = binding.adapter.complete(
         model=binding.model,
-        max_tokens=4096,
+        max_tokens=DEFAULT_MAX_TOKENS,
         system=system_prompt,
         messages=[Message(role="user", content=[TextBlock(user_prompt)])],
     )
@@ -426,6 +427,18 @@ def generate_summary_report(
         raise RuntimeError(
             "summary report generation returned empty output; refusing to write "
             "a summary-free SUMMARY_REPORT.md"
+            + (" (stop_reason=max_tokens: the whole budget went to hidden "
+               "reasoning, not the answer)" if result.stop_reason == "max_tokens" else "")
+        )
+    # #512: a TRUNCATED (but non-empty) summary must say so in the
+    # deliverable itself — the banner joins the deterministic provenance/
+    # reachability headers (stderr alone is lost in CI and quiet runs).
+    if result.stop_reason == "max_tokens":
+        text = (
+            "> [!WARNING]\n"
+            "> This summary was TRUNCATED at the model's output budget "
+            "(stop_reason=max_tokens) — the reply was cut mid-generation "
+            "and the sections below may be incomplete.\n\n" + text
         )
     # Prepend the provenance banner + the reachability advisory
     # deterministically (see the helper docstrings).
@@ -583,7 +596,7 @@ def generate_disclosure(
 
     result = binding.adapter.complete(
         model=binding.model,
-        max_tokens=4096,
+        max_tokens=DEFAULT_MAX_TOKENS,
         system=system_prompt,
         messages=[Message(role="user", content=[TextBlock(user_prompt)])],
     )
@@ -592,6 +605,15 @@ def generate_disclosure(
         b.text for b in result.content if isinstance(b, TextBlock)
     )
     final_output = _splice_code_section(llm_output, code_section)
+    # #512: a TRUNCATED disclosure must say so in the deliverable itself
+    # (stderr alone is lost in CI and quiet runs).
+    if result.stop_reason == "max_tokens":
+        final_output = (
+            "> [!WARNING]\n"
+            "> This disclosure was TRUNCATED at the model's output budget "
+            "(stop_reason=max_tokens) — the reply was cut mid-generation "
+            "and the sections below may be incomplete.\n\n" + final_output
+        )
     # #210: stamp the verification status + location deterministically from the
     # server-truth stage2_verdict, the same way the vulnerable code is spliced
     # in above. The prompt otherwise asks the LLM to render "Verified via ..."
