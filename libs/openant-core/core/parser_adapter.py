@@ -519,6 +519,10 @@ def apply_reachability_filter(
             "reduction_percentage": 0,
             "warning": warning,
         }
+        # #520: the seed-class counts on BOTH branches — the keep-all record
+        # must not read as "no signal" when synthetic-only seeding was the cause.
+        _rec["structural_entry_points"], _rec["incidental_entry_points"] = (
+            _epd.classify_seeds(detector.entry_point_details))
         # #328 (wave r1, opus+fable): the effective level on the pass-through
         # path is "all" — nothing was pruned — and this is the case where
         # recording it matters MOST: without it the record looks identical to
@@ -559,9 +563,13 @@ def apply_reachability_filter(
         if original_count > 0
         else 0
     )
+    _structural_eps, _incidental_eps = _epd.classify_seeds(
+        detector.entry_point_details)
     dataset.setdefault("metadata", {})["reachability_filter"] = {
         "original_units": original_count,
         "entry_points": len(entry_points),
+        "structural_entry_points": _structural_eps,
+        "incidental_entry_points": _incidental_eps,
         "reachable_units": len(filtered_units),
         "filtered_out": original_count - len(filtered_units),
         "reduction_percentage": reduction_pct,
