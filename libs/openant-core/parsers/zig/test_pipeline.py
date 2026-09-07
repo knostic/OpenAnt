@@ -270,7 +270,7 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
     _blackout = blackout_warning(detector.entry_point_details, len(functions),
                                  len(filtered_functions), library_mode=library_mode)
     if _blackout:
-        print(f"  [Warning] {_blackout}", file=sys.stderr)
+        print(f"  [Advisory] {_blackout}", file=sys.stderr)
 
     return result
 
