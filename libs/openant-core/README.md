@@ -10,7 +10,7 @@ OpenAnt uses Claude to analyze code for security vulnerabilities through a two-s
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.11+
 - Node.js 16+ (for JavaScript/TypeScript parsing)
 - Go 1.21+ (for Go parsing)
 - Docker (for dynamic testing)
