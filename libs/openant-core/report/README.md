@@ -186,6 +186,6 @@ Uses Claude Opus 4.5 (`claude-opus-4-5-20250514`).
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - `anthropic` package
 - `ANTHROPIC_API_KEY` in `.env` file (project root) or environment variable
