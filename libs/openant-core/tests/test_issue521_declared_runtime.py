@@ -154,3 +154,39 @@ def test_prompt_revalidation_omits_non_grammar(tmp_path):
 # --- G3: the #519 drift guard stays green (the existing suite covers it) -----
 # (tests/test_issue412_runtime_anchor.py — imported here only as a cross-ref
 # guard so a rename of that file trips this one at collection)
+
+
+# --- the fable gate folds (the wiring + the two security holes) ----
+
+def test_fold_scan_entry_passes_repo_path():
+    """The #521 blocker: the default `openant scan --dynamic-test` path
+    (core/scanner.py) previously omitted repo_path — the channel was still
+    dead input on the PRIMARY entry. Source-scan pin."""
+    from pathlib import Path as _P
+    src = _P("core/scanner.py").read_text(encoding="utf-8")
+    assert "repo_path=repo_path," in src, (
+        "the scan entry must pass repo_path to run_tests — without it the "
+        "declared-runtime channel is dead input on the primary path")
+
+
+def test_fold_symlink_manifest_refused_not_followed(tmp_path):
+    """The bounded read previously FOLLOWED symlinks (go.mod -> /dev/zero
+    reads unbounded — st_size 0, infinite stream). read_repo_file refuses."""
+    import os
+    from utilities.dynamic_tester.declared_runtime import derive_declared_runtimes
+    devzero = "/dev/zero" if os.path.exists("/dev/zero") else None
+    if devzero is None:
+        import pytest
+        pytest.skip("no /dev/zero on this platform")
+    os.symlink(devzero, tmp_path / "go.mod")
+    d = derive_declared_runtimes(str(tmp_path))
+    assert d == {}, "a symlinked manifest must derive NOTHING (refused, not followed)"
+
+
+def test_fold_deep_nesting_json_degrades_not_raises(tmp_path):
+    """A 64KB '[[[[' package.json blows the stdlib parser's stack
+    (RecursionError) — the derivation degrades, never aborts the step."""
+    (tmp_path / "package.json").write_text("[[[[" * 16384, encoding="utf-8")
+    from utilities.dynamic_tester.declared_runtime import derive_declared_runtimes
+    d = derive_declared_runtimes(str(tmp_path))
+    assert d == {}, "deeply-nested hostile json must derive NOTHING (degrade, not raise)"

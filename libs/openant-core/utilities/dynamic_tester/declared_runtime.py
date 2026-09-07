@@ -40,11 +40,18 @@ def _clean_version(raw: object) -> Optional[str]:
 
 
 def _read_bounded(path: Path) -> Optional[str]:
+    # The fable gate: a manifest under a scanned repo is attacker-controlled
+    # — a SYMLINK to /dev/zero reads unbounded (st_size 0, infinite stream)
+    # and a FIFO/device wedges the step. Use the repo's own read_repo_file
+    # (lstat-before-open, symlink/device refusal, bounded read — the same
+    # guard every other repo-file loader uses), degraded to absent on refusal.
+    from utilities.file_io import read_repo_file
     try:
-        if path.stat().st_size > _MAX_MANIFEST_BYTES:
-            return None
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        return read_repo_file(path, max_bytes=_MAX_MANIFEST_BYTES)
+    except Exception:
+        # read_repo_file raises UnsafeRepoFile (symlink/device/oversize — the
+        # #258 guard classes); the declared channel degrades to ABSENT, never
+        # raises (a raise here would abort the dynamic-test step).
         return None
 
 
@@ -80,7 +87,9 @@ def _from_package_json(text: str) -> Optional[str]:
     # engines.node lower bound: '>=20' (the node runtime declaration)
     try:
         engines = json.loads(text).get("engines", {})
-    except (json.JSONDecodeError, AttributeError):
+    except (json.JSONDecodeError, AttributeError, RecursionError, ValueError):
+        # RecursionError: deeply-nested hostile json (64KB of "[[[[") blows
+        # the stdlib's parser stack — degrade to absent, never abort the step.
         return None
     node = engines.get("node") if isinstance(engines, dict) else None
     if not isinstance(node, str):
