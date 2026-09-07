@@ -185,6 +185,13 @@ def run_dynamic_tests(
         "language": pipeline.get("repository", {}).get("language") or "unknown",
         "application_type": pipeline.get("application_type", "unknown"),
     }
+    # #521: the declared-runtime channel — mechanically derived from the repo
+    # root's manifests (go.mod / .python-version / requires-python / engines /
+    # .tool-versions), allowlist-validated, degrade-to-absent on anything else.
+    # NEVER raises (that would abort the whole dynamic-test step before any
+    # finding is tested); absent repo_path (the None default) derives {}.
+    from utilities.dynamic_tester.declared_runtime import derive_declared_runtimes
+    repo_info["declared_runtimes"] = derive_declared_runtimes(repo_path)
 
     if not findings:
         print("No findings to test.", file=sys.stderr)
