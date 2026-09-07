@@ -263,13 +263,14 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
 
     _blackout = blackout_warning(detector.entry_point_details, len(functions),
                                  len(filtered_functions), library_mode=library_mode)
-    # #520: the seed-class counts ride the result (this pipeline's surface is
-    # the returned dict — the callers print/merge it; no dataset metadata here).
+    # #520: the seed-class counts ride the result dict (this pipeline's
+    # surface is the return value — stderr-only delivery, like zig's; the
+    # counts have no downstream reader today and are informational).
     _struct, _inc = classify_seeds(detector.entry_point_details)
     result["_seed_class_counts"] = {
         "structural_entry_points": _struct, "incidental_entry_points": _inc}
     if _blackout:
-        print(f"  [Warning] {_blackout}", file=sys.stderr)
+        print(f"  [Advisory] {_blackout}", file=sys.stderr)
 
     return result
 

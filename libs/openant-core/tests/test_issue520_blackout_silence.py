@@ -124,7 +124,7 @@ def test_filtered_branch_records_seed_class_counts(tmp_path):
     rf = result["metadata"]["reachability_filter"]
     assert rf["structural_entry_points"] == 0
     assert rf["incidental_entry_points"] == 1
-    assert "warning" in rf, "the incidental-only record carries no advisory"
+    assert "blackout_advisory" in rf, "the incidental-only record carries no advisory (the fable+astra fold moved it to its own key)"
     # the no-set-change proof: the retained set is the seed + its callees only
     # (f_main has no caller edge INTO it; f_dead reachable only via f_main,
     # which is not reachable from the seed) — the BFS set, unchanged by the fix
@@ -149,3 +149,69 @@ def test_keep_all_branch_records_seed_class_counts(tmp_path):
     assert rf.get("incidental_entry_points") == 0
     assert "warning" in rf
     assert {u["id"] for u in result["units"]} == {"a.py:plain"}  # keep-all kept all
+
+
+# --- the fable+astra fold: slot discipline + the mute->wording conversion ----
+
+def test_fold_advisory_has_its_own_key_not_the_warning_slot():
+    """The seed-quality advisory rides `blackout_advisory` (the orphan_advisory
+    pattern) — it must NEVER occupy the reserved `warning` slot at any
+    reduction (the fable F1 blocker: the sub-band advisory displaced the
+    forward-asymmetry invariant)."""
+    import sys as _sys
+    from pathlib import Path as _P
+    _sys.path.insert(0, str(_P(__file__).resolve().parent.parent))
+    from core.parser_adapter import apply_reachability_filter
+    from pathlib import Path as _Path
+    src = _Path(apply_reachability_filter.__code__.co_filename).read_text(encoding="utf-8")
+    assert '"blackout_advisory"] = _blackout' in src, (
+        "the advisory must write its OWN key (blackout_advisory), not warning")
+
+
+def test_fold_advisory_reaches_the_envelope_channel():
+    """The delivery proof (astra M1): the reporter forwards blackout_advisory
+    onto reachability_warnings — the channel the CLI envelope reads."""
+    from pathlib import Path as _Path
+    src = _Path("core/reporter.py").read_text(encoding="utf-8")
+    assert 'get("blackout_advisory")' in src, (
+        "reporter.py must forward the blackout_advisory key onto "
+        "reachability_warnings (the envelope channel)")
+    from pathlib import Path as _Path
+    cli = _Path("openant/cli.py").read_text(encoding="utf-8")
+    assert "reachability_warnings" in cli, "the CLI envelope reads the channel"
+
+
+def test_fold_empty_details_with_extras_names_them_not_mutes():
+    """The F2 blocker: empty detector details + caller extras previously fired
+    at >=90% (pristine) and the branch muted it. The fold NAMES the extras
+    as unclassified — never mutes — at any reduction."""
+    from utilities.agentic_enhancer.entry_point_detector import blackout_warning
+    # the old silent cell: empty details, extras, >=90% reduction
+    msg = blackout_warning({}, 100, 5, extra_seed_count=2)
+    assert msg is not None and "2 caller-supplied" in msg, (
+        "empty details + extras must NAME the extras, not mute")
+    # sub-band too
+    msg2 = blackout_warning({}, 100, 95, extra_seed_count=1)
+    assert msg2 is not None and "1 caller-supplied" in msg2
+    # no details, no extras: unchanged silence below the threshold
+    assert blackout_warning({}, 100, 95, extra_seed_count=0) is None
+    # mixed: incidental + extras — names both, never "only incidental"
+    d = {"f:1": {"reasons": ["input_pattern:argv"], "synthetic_harness": False,
+                 "non_runtime_main": False}}
+    msg3 = blackout_warning(d, 100, 5, extra_seed_count=3)
+    assert "3 caller-supplied" in msg3 and "1 incidental" in msg3
+
+
+def test_fold_asymmetry_not_displaced_by_incidental_advisory():
+    """The F1 regression pin: incidental-only seeds + sub-band reduction +
+    a forward-asymmetry condition -> the ASYMMETRY warning keeps the reserved
+    slot; the advisory rides its own key. (The empty-details asymmetry fixture
+    cannot stand in for this — the fold's whole point.)"""
+    from core.parser_adapter import apply_reachability_filter
+    from pathlib import Path as _Path
+    src = _Path(apply_reachability_filter.__code__.co_filename).read_text(encoding="utf-8")
+    # the precedence line: the asymmetry check must not require an EMPTY
+    # warning slot in the presence of the advisory (which no longer touches it)
+    assert '"blackout_advisory"] = _blackout' in src
+    # and the asymmetry guard still keys on "warning"
+    assert 'if _asym_warning and "warning" not in _rf:' in src

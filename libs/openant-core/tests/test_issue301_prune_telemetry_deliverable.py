@@ -266,7 +266,14 @@ def test_parser_adapter_no_advisory_no_stderr_noise(tmp_path, capsys):
                                     extra_entry_points={"f.py:root"})
     rf = res["metadata"]["reachability_filter"]
     assert "orphan_advisory" not in rf
-    assert "[Advisory]" not in capsys.readouterr().err
+    # #520 fold: an extras-only run (no detector details) now NAMES the
+    # caller-supplied roots via the blackout advisory (the orphan advisory —
+    # this test's subject — stays silent below rate). The [Advisory] stderr
+    # line may carry the #520 seed-quality text; the ORPHAN advisory key and
+    # its stderr noise stay absent.
+    err = capsys.readouterr().err
+    assert "orphan_advisory" not in rf
+    assert "ORPHAN" not in err
 
 
 def test_reporter_forwards_the_advisory(tmp_path):

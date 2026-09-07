@@ -576,10 +576,18 @@ def _is_non_runtime_main(file_path: str) -> bool:
 
 
 def blackout_warning(entry_point_details, original_count, reachable_count,
-                     library_mode=False, reduction_threshold=0.90):
+                     library_mode=False, reduction_threshold=0.90,
+                     extra_seed_count=0):
     """Advisory string when a reachability result looks like a silent library
     blackout, else None. This is ADVISORY ONLY — it never changes which units
     are kept.
+
+    ``extra_seed_count`` (the fable+astra fold, #520): the number of
+    ACCEPTED-EFFECTIVE caller-supplied seeds (deduplicated, resolved to graph
+    nodes — never the raw list length). Empty detector details with extras
+    present is no longer a mute (the old >=0.90 fire there was silently
+    dropped — the #520 class re-created): the extras are NAMED as
+    unclassified instead. Extras are never claimed structural or incidental.
 
     Two triggers (both off when ``library_mode`` is set, since then the public
     API was deliberately seeded and a high reduction is the intended result):
@@ -603,13 +611,53 @@ def blackout_warning(entry_point_details, original_count, reachable_count,
                 f"re-run with --library-mode to seed the exported public API surface.")
     reduction = 1.0 - (reachable_count / original_count)
     structural, incidental = classify_seeds(entry_point_details)
-    # #520: the ratio gate is dropped — the advisory fires whenever NO seed is
-    # structural (incidental-only OR excluded-only, e.g. the fuzz-only library
-    # the #75 contract was written for), at any reduction. The ONE silent case
-    # is EMPTY details: the caller supplied extra_entry_points deliberately —
-    # those seeds are chosen, not incidental, and the warning slot belongs to
-    # the asymmetry invariant there.
-    if structural == 0 and entry_point_details:
+    # #520 (the fable+astra fold): the ratio gate is dropped — the advisory
+    # fires whenever NO seed is structural, at any reduction, with the wording
+    # scaled to what actually happened. EMPTY details is no longer a mute
+    # (the old gate fired there at >=90% — silencing it re-created the #520
+    # class on the LLM path): the caller-supplied seeds are NAMED as
+    # unclassified instead. The caller passes the accepted-effective seed
+    # count (deduplicated, resolved to graph nodes) via extra_seed_count.
+    if structural == 0:
+        if not entry_point_details and extra_seed_count:
+            # Caller-supplied roots only: describe them, never mute — the
+            # provenance says "chosen by the caller", not "structural".
+            if reduction >= reduction_threshold:
+                return (f"Reachability kept {reachable_count} of {original_count} units "
+                        f"({reduction * 100:.0f}% pruned) with NO structural entry point "
+                        f"detected (route/main/CLI/handler) — the {extra_seed_count} "
+                        f"caller-supplied root(s) that seeded this run are unclassified. "
+                        "If this is a library, the public API surface may not have been "
+                        "seeded — re-run with --library-mode to seed it explicitly.")
+            return (f"Reachability found NO structural entry point "
+                    f"(route/main/CLI/handler) — the {extra_seed_count} "
+                    f"caller-supplied root(s) that seeded this run are unclassified "
+                    f"({reachable_count} of {original_count} units kept, "
+                    f"{reduction * 100:.0f}% pruned). If this is a library, "
+                    "re-run with --library-mode to seed the public API explicitly.")
+        if not entry_point_details and not extra_seed_count:
+            # No detector details AND no caller seeds: the old code was silent
+            # here below the threshold too — unchanged (nothing seeded the run
+            # that the keep-all net did not already catch).
+            return None
+        if extra_seed_count:
+            # Mixed: detector found incidental seeds AND caller supplied some.
+            # Name both; never claim "only incidental" while extras exist.
+            if reduction >= reduction_threshold:
+                return (f"Reachability kept {reachable_count} of {original_count} units "
+                        f"({reduction * 100:.0f}% pruned) but found NO structural entry point "
+                        f"(route/main/CLI/handler) — {incidental} incidental code-pattern "
+                        f"seed(s) and {extra_seed_count} caller-supplied unclassified "
+                        f"root(s). This is the library-blackout pattern: the public API "
+                        f"was not seeded, so the core may have been dropped. Re-run with "
+                        f"--library-mode to seed the exported public API.")
+            return (f"Reachability found NO structural entry point "
+                    f"(route/main/CLI/handler) — {incidental} incidental code-pattern "
+                    f"seed(s) and {extra_seed_count} caller-supplied unclassified "
+                    f"root(s) ({reachable_count} of {original_count} units kept, "
+                    f"{reduction * 100:.0f}% pruned). The public API surface was "
+                    f"not seeded; if this is a library, re-run with "
+                    f"--library-mode to seed it explicitly.")
         if reduction >= reduction_threshold:
             return (f"Reachability kept {reachable_count} of {original_count} units "
                     f"({reduction * 100:.0f}% pruned) but found NO structural entry point "

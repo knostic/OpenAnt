@@ -515,7 +515,7 @@ class GoPipelineTest:
                                          len(filtered_units),
                                          library_mode=getattr(self, "library_mode", False))
             if _blackout:
-                dataset["metadata"]["reachability_filter"]["warning"] = _blackout
+                dataset["metadata"]["reachability_filter"]["blackout_advisory"] = _blackout
                 print(f"  [Warning] {_blackout}", file=sys.stderr)
 
             # Write filtered dataset

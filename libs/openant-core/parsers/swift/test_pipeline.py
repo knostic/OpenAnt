@@ -276,7 +276,7 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
             if _asym_warning:
                 rf["warning"] = _asym_warning
             if _blackout:            # blackout warning takes precedence (core parity)
-                rf["warning"] = _blackout
+                rf["blackout_advisory"] = _blackout
             if _orphan_advisory:
                 rf["orphan_advisory"] = _orphan_advisory
                 print(f"  [Advisory] {_orphan_advisory}", file=sys.stderr)
