@@ -19,6 +19,9 @@ _DOC_FILES = [
     _CORE / "README.md",
     _CORE / "report" / "README.md",
     _CORE / "PIPELINE_MANUAL.md",
+    # the repo-root README also states the floor (README.md:143) — the
+    # census found it correct today, but it must not drift silently either
+    _REPO_ROOT / "README.md",
 ]
 _RUNTIME_GO = _REPO_ROOT / "apps" / "openant-cli" / "internal" / "python" / "runtime.go"
 
