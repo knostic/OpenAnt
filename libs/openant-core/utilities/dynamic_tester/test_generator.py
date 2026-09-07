@@ -10,13 +10,21 @@ import json
 import os
 
 from core.language_registry import docker_template_for, language_for_path
+from utilities.dynamic_tester.declared_runtime import _clean_version
 import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utilities.llm_client import TokenTracker
-from utilities.llm import PhaseBinding, simple_text
+
+
+def _clean_declared(raw: object) -> str:
+    """Re-validate at the interpolation site (defense in depth: the value was
+    allowlist-validated at derivation; this re-checks so a future refactoring
+    of either side cannot open the executed-prompt surface)."""
+    return _clean_version(raw) or ""
+from utilities.llm import DEFAULT_MAX_TOKENS, PhaseBinding, simple_text
 
 # Map language strings to Dockerfile template names
 def resolve_docker_template(file_path: str, scan_language: str | None = None) -> str | None:
@@ -73,14 +81,18 @@ DEPENDENCY INSTALLATION:
       RUN go build -o test_exploit test_exploit.go
       CMD ["./test_exploit"]
 - BASE IMAGE RUNTIME POLICY (all languages): prefer a base image matching the
-  scanned target's DECLARED runtime — the `go` directive in go.mod, a
-  .python-version / pyproject requires-python, a package.json engines field,
-  a .tool-versions, or a language-version cue stated in the finding itself.
+  scanned target's DECLARED runtime — the `Declared runtime:` lines in the
+  finding prompt below (mechanically derived from the target's go.mod /
+  .python-version / pyproject requires-python / package.json engines /
+  .tool-versions), or a language-version cue stated in the finding itself.
   A wrong runtime can hide version-dependent exploit behavior or break the
   repro outright (the exploit may not compile/run on a different major).
   Only when no declaration is visible, fall back to the current stable
   release of the language. The Go example above is that fallback, not an
-  override of a declared version.
+  override of a declared version. If a build fails because a dependency
+  requires a newer toolchain than the declared runtime, the RETRY may use
+  the current stable release instead — and MUST state the deviation in the
+  test's output/details.
 - The Dockerfile MUST install dependencies from the requirements/package file, NOT inline in RUN commands.
 - If a package has many transitive dependencies, only install the specific sub-package you need
   (e.g., `langchain-core` instead of `langchain`).
@@ -182,6 +194,20 @@ def _build_finding_prompt(finding: dict, repo_info: dict) -> str:
             f"  Source file (pre-staged in Docker build context): {source_basename}",
             f"  Your Dockerfile MUST use `COPY {source_basename} .` — the file is already there.",
         ])
+
+    # #521: the declared-runtime lines — mechanically derived from the target's
+    # root manifests by declared_runtime.derive_declared_runtimes and
+    # ALLOWLIST-VALIDATED there (a strict version grammar; anything else was
+    # omitted BEFORE reaching this point). Repo-author-controlled text never
+    # interpolates raw into this EXECUTED-output prompt: these lines carry
+    # zero free-text capacity — tighter than the collapsed inline fields above.
+    declared = repo_info.get("declared_runtimes")
+    if isinstance(declared, dict) and declared:
+        parts.extend(["", "  Declared runtimes (from the target's manifests):"])
+        for lang in sorted(declared):
+            v = _clean_declared(declared.get(lang))
+            if v:
+                parts.append(f"    {lang}: {v}")
 
     # These four fields are UNTRUSTED: `vulnerable_code` is raw Stage-1/2 LLM
     # output or a raw scanned-source excerpt; description/impact/steps are prior
@@ -286,7 +312,7 @@ def generate_test(
 
     prompt = _build_finding_prompt(finding, repo_info)
     raw = simple_text(
-        binding, prompt, max_tokens=8192, system=SYSTEM_PROMPT, tracker=tracker,
+        binding, prompt, max_tokens=DEFAULT_MAX_TOKENS, system=SYSTEM_PROMPT, tracker=tracker,
     )
 
     parsed = _parse_generation_response(raw)
@@ -385,7 +411,7 @@ def regenerate_test(
     )
 
     raw = simple_text(
-        binding, retry_prompt, max_tokens=8192, system=SYSTEM_PROMPT, tracker=tracker,
+        binding, retry_prompt, max_tokens=DEFAULT_MAX_TOKENS, system=SYSTEM_PROMPT, tracker=tracker,
     )
 
     parsed = _parse_generation_response(raw)

@@ -1239,6 +1239,11 @@ def scan_repository(
                         pipeline_output_path=pipeline_output_path,
                         output_dir=output_dir,
                         registry=registry,
+                        # #521: the declared-runtime channel — the scanned
+                        # repo's root, so the derivation reads the TARGET's
+                        # manifests (the dead-input fix; the scan entry
+                        # previously omitted it).
+                        repo_path=repo_path,
                     )
 
                     ctx.summary = {
