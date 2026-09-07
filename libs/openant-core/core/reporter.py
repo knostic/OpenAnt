@@ -668,6 +668,13 @@ def build_pipeline_output(
         _rf_warning = _reach.get("warning")
         if isinstance(_rf_warning, str) and _rf_warning:
             reachability_warnings.append(_rf_warning)
+        # #520 (the fable+astra fold): the seed-quality advisory forwards on
+        # the same human + envelope channel as the reserved warning — its own
+        # key at the producer, delivered here so it can never be silently
+        # dropped for lack of a forwarding path.
+        _rf_blackout = _reach.get("blackout_advisory")
+        if isinstance(_rf_blackout, str) and _rf_blackout:
+            reachability_warnings.append(_rf_blackout)
         # #328: the Python-path level fallback (codeql/exploitable accepted,
         # reachability-only run) reaches the artifact instead of dying on
         # stderr. Present-only forward — records without the key (non-Python

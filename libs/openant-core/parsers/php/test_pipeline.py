@@ -340,7 +340,7 @@ class PHPPipelineTest:
                                          len(filtered_units),
                                          library_mode=getattr(self, "library_mode", False))
             if _blackout:
-                dataset["metadata"]["reachability_filter"]["warning"] = _blackout
+                dataset["metadata"]["reachability_filter"]["blackout_advisory"] = _blackout
                 print(f"  [Warning] {_blackout}", file=sys.stderr)
 
             write_json(self.dataset_file, dataset)

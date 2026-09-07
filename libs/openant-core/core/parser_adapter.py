@@ -519,6 +519,10 @@ def apply_reachability_filter(
             "reduction_percentage": 0,
             "warning": warning,
         }
+        # #520: the seed-class counts on BOTH branches — the keep-all record
+        # must not read as "no signal" when synthetic-only seeding was the cause.
+        _rec["structural_entry_points"], _rec["incidental_entry_points"] = (
+            _epd.classify_seeds(detector.entry_point_details))
         # #328 (wave r1, opus+fable): the effective level on the pass-through
         # path is "all" — nothing was pruned — and this is the case where
         # recording it matters MOST: without it the record looks identical to
@@ -559,9 +563,13 @@ def apply_reachability_filter(
         if original_count > 0
         else 0
     )
+    _structural_eps, _incidental_eps = _epd.classify_seeds(
+        detector.entry_point_details)
     dataset.setdefault("metadata", {})["reachability_filter"] = {
         "original_units": original_count,
         "entry_points": len(entry_points),
+        "structural_entry_points": _structural_eps,
+        "incidental_entry_points": _incidental_eps,
         "reachable_units": len(filtered_units),
         "filtered_out": original_count - len(filtered_units),
         "reduction_percentage": reduction_pct,
@@ -574,11 +582,24 @@ def apply_reachability_filter(
         file=sys.stderr,
     )
 
-    _blackout = blackout_warning(detector.entry_point_details, original_count,
-                                 len(filtered_units), library_mode=library_mode)
+    # #520 (the fable+astra fold): the seed-quality advisory rides its OWN
+    # key — following the orphan_advisory pattern — so it can never displace
+    # the forward-asymmetry invariant from the reserved ``warning`` slot (the
+    # correctness voice outranks the seed-quality voice at ANY reduction).
+    # extra_seed_count = the ACCEPTED-EFFECTIVE caller-supplied seeds
+    # (deduplicated, resolved to graph nodes) — named in the wording, never
+    # classified.
+    _extra_seeds_effective = sum(
+        1 for s in (extra_entry_points or [])
+        if s in reachable_ids or s in {u.get("id") for u in units}
+    )
+    _blackout = blackout_warning(
+        detector.entry_point_details, original_count,
+        len(filtered_units), library_mode=library_mode,
+        extra_seed_count=_extra_seeds_effective)
     if _blackout:
-        dataset["metadata"]["reachability_filter"]["warning"] = _blackout
-        print(f"  [Warning] {_blackout}", file=sys.stderr)
+        dataset["metadata"]["reachability_filter"]["blackout_advisory"] = _blackout
+        print(f"  [Advisory] {_blackout}", file=sys.stderr)
 
     # Per-unit prune telemetry (ADDITIVE, all-language; advisory — must never crash
     # the filter). Merges classification keys + the pruned_units.json sidecar; a
@@ -589,6 +610,10 @@ def apply_reachability_filter(
     _extra, _asym_warning, _orphan_advisory = compute_prune_telemetry(
         reachable_ids, sorted(_pruned_ids), call_graph, reverse_call_graph, output_dir)
     _rf.update(_extra)
+    # #520 (the fable+astra fold): with the advisory on its own key, the
+    # reserved ``warning`` slot belongs to the correctness signals — the
+    # forward-asymmetry invariant lands whenever it fires, no longer crowded
+    # out by the seed-quality advisory.
     if _asym_warning and "warning" not in _rf:
         _rf["warning"] = _asym_warning
         print(f"  [Warning] {_asym_warning}", file=sys.stderr)
