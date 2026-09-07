@@ -169,3 +169,19 @@ def test_appcontext_has_no_numeric_output_cap():
            / "context" / "application_context.py").read_text(encoding="utf-8")
     bad = re.findall(r"max_tokens\s*=\s*(\d+)", src)
     assert not bad, f"numeric max_tokens pins found in context/application_context.py: {bad}"
+
+def test_empty_completion_guards_name_the_stop_reason():
+    """The gate round's fold: the adapter empty-content guards (the only
+    layer that sees an EMPTY reasoning-only truncation) name the stop
+    reason — anthropic.py/openai.py carry it in the raise message; google
+    names the truncation class in prose. Source-scan pin (no live call).
+    """
+    from pathlib import Path
+
+    from utilities.llm.providers import anthropic as ap, openai as op
+    ap_src = Path(ap.__file__).read_text(encoding="utf-8")
+    assert "stop_reason={raw_stop!r}" in ap_src, (
+        "anthropic's empty-completion guard no longer names the stop reason")
+    op_src = Path(op.__file__).read_text(encoding="utf-8")
+    assert "finish_reason={raw_finish!r}" in op_src, (
+        "openai's empty-completion guard no longer names the finish reason")

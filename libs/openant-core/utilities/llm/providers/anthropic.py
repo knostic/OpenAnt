@@ -387,8 +387,9 @@ def _response_to_unified(
     # here because ``content_blocks`` is non-empty.
     if not content_blocks:
         raise LLMResponseError(
-            f"{adapter} returned no usable content (empty completion); the "
-            "request may have been filtered or the response was malformed"
+            f"{adapter} returned no usable content (empty completion; "
+            f"stop_reason={raw_stop!r}); the request may have been "
+            "filtered or the response was malformed"
         )
 
     if raw_stop not in _ANTHROPIC_STOP_REASONS:
