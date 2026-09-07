@@ -24,7 +24,7 @@ def _clean_declared(raw: object) -> str:
     allowlist-validated at derivation; this re-checks so a future refactoring
     of either side cannot open the executed-prompt surface)."""
     return _clean_version(raw) or ""
-from utilities.llm import PhaseBinding, simple_text
+from utilities.llm import DEFAULT_MAX_TOKENS, PhaseBinding, simple_text
 
 # Map language strings to Dockerfile template names
 def resolve_docker_template(file_path: str, scan_language: str | None = None) -> str | None:
@@ -312,7 +312,7 @@ def generate_test(
 
     prompt = _build_finding_prompt(finding, repo_info)
     raw = simple_text(
-        binding, prompt, max_tokens=8192, system=SYSTEM_PROMPT, tracker=tracker,
+        binding, prompt, max_tokens=DEFAULT_MAX_TOKENS, system=SYSTEM_PROMPT, tracker=tracker,
     )
 
     parsed = _parse_generation_response(raw)
@@ -411,7 +411,7 @@ def regenerate_test(
     )
 
     raw = simple_text(
-        binding, retry_prompt, max_tokens=8192, system=SYSTEM_PROMPT, tracker=tracker,
+        binding, retry_prompt, max_tokens=DEFAULT_MAX_TOKENS, system=SYSTEM_PROMPT, tracker=tracker,
     )
 
     parsed = _parse_generation_response(raw)
