@@ -139,8 +139,11 @@ def test_agree_missing_safe_row_survives_confirmed_findings():
     vv = FindingVerifier.__new__(FindingVerifier)
     fr = {"correct_finding": "safe", "explanation": "model text"}
     v = vv._parse_finish_result(fr, "vulnerable", 2, 100)
-    # _verify_one's incomplete write-back (finding_verifier:~:890)
-    row = {"route_key": "x.go:serveMsg.json", "finding": "vulnerable",
+    # _verify_one's incomplete write-back (finding_verifier:~:890) MIRRORED,
+    # not hardcoded — the assertion reads the produced verdict, so this test
+    # is RED on pristine master (the gate round's fix: the original form
+    # hardcoded finding="vulnerable" and passed vacuously on both sides).
+    row = {"route_key": "x.go:serveMsg.json", "finding": v.correct_finding,
            "verdict": "vulnerable",
            "verification": v.to_dict()}
     assert row["finding"] == "vulnerable"
