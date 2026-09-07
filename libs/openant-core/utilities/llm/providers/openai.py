@@ -905,8 +905,9 @@ def _response_to_unified(
     # more specific signal and already raised above.
     if not content_blocks:
         raise LLMResponseError(
-            f"{adapter} returned an empty completion (no text or tool calls); the "
-            "request may have been filtered or the response was malformed"
+            f"{adapter} returned an empty completion (no text or tool calls; "
+            f"finish_reason={raw_finish!r}); the request may have been "
+            "filtered or the response was malformed"
         )
 
     if raw_finish not in _OPENAI_FINISH_REASONS:

@@ -33,7 +33,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from utilities.file_io import open_utf8, read_json, read_repo_file, write_json
-from utilities.llm import PhaseBinding, simple_text
+from utilities.llm import PhaseBinding, simple_completion
 
 load_dotenv()
 
@@ -788,10 +788,21 @@ def generate_application_context(
         f"Generating context with {binding.provider_name}/{binding.model}...",
         file=sys.stderr,
     )
-    response_text = simple_text(
+    # #512: the typed-result sibling (simple_completion) so the parse-
+    # failure error can NAME the truncation when that is the cause; and
+    # the private 2000 cap is dropped (DEFAULT_MAX_TOKENS — the cap was
+    # never protecting cost where it mattered: the OpenAI Responses path
+    # floors output to 16000 anyway, and Stage-1's per-unit calls already
+    # run at this default. A 2000 cap on a reasoning model spends the
+    # whole budget on hidden reasoning and returns a fence fragment —
+    # exactly the failure the parse error below then mislabels).
+    _result = simple_completion(
         binding,
         CONTEXT_GENERATION_PROMPT.format(sources=sources_text),
-        max_tokens=2000,
+    )
+    response_text = "\n".join(
+        block.text for block in _result.content
+        if hasattr(block, "text")
     )
 
     # Extract JSON from response
@@ -811,7 +822,17 @@ def generate_application_context(
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse LLM response as JSON: {e}\nResponse: {response_text}")
+        # #512: name the truncation when that is the cause — a bare
+        # "could not parse" on a max_tokens reply hid the real failure
+        # (the budget went to hidden reasoning, not the answer).
+        trunc_note = ""
+        if _result.stop_reason == "max_tokens":
+            trunc_note = ("; the reply was TRUNCATED at max_tokens — the "
+                          "budget was spent on hidden reasoning, not the answer")
+        raise ValueError(
+            f"Failed to parse LLM response as JSON: {e}\n"
+            f"(stop_reason={_result.stop_reason}{trunc_note})\n"
+            f"Response: {response_text}")
 
     data['source'] = 'llm'
 

@@ -14,10 +14,12 @@ inspect content blocks and continue the conversation.
 
 from __future__ import annotations
 
+import sys
+import threading
 from typing import Optional
 
 from ..llm_client import TokenTracker, get_global_tracker
-from .adapter import Message, TextBlock
+from .adapter import CompletionResult, Message, TextBlock
 from .registry import PhaseBinding
 
 # Thinking-era output budget (the simple_text default; PR #242 raised it from
@@ -47,7 +49,17 @@ def lookup_pricing(binding: PhaseBinding) -> Optional[dict]:
     return getattr(binding.adapter, "pricing", {}).get(binding.model)
 
 
-def simple_text(
+_TRUNCATION_WARNED: set = set()
+_TRUNCATION_WARNED_LOCK = threading.Lock()
+
+
+def reset_truncation_warnings() -> None:
+    """Clear the one-time truncation warning set (for tests)."""
+    with _TRUNCATION_WARNED_LOCK:
+        _TRUNCATION_WARNED.clear()
+
+
+def simple_completion(
     binding: PhaseBinding,
     prompt: str,
     *,
@@ -55,26 +67,14 @@ def simple_text(
     # See DEFAULT_MAX_TOKENS above for why this is 20000, not 8192.
     max_tokens: int = DEFAULT_MAX_TOKENS,
     tracker: Optional[TokenTracker] = None,
-) -> str:
-    """Send one user-prompt completion, return the concatenated text reply.
+) -> CompletionResult:
+    """Send one user-prompt completion, return the raw result.
 
-    Args:
-        binding: Phase binding from :meth:`PhaseRegistry.get`. The
-            adapter + model embedded in it are what the call actually
-            uses — no caller-side model selection.
-        prompt: Plain text user message.
-        system: Optional system prompt.
-        max_tokens: Upper bound on response length.
-        tracker: Token tracker to record this call against. Defaults
-            to the global tracker so callers that don't care about
-            multi-tracker setups don't have to thread one through.
-
-    Returns:
-        Concatenated text from every :class:`TextBlock` in the
-        response. Non-text blocks (e.g. a stray ``tool_use`` if the
-        model misbehaves) are dropped — this is the "I just want
-        text" helper, so callers that need richer handling should
-        use ``binding.adapter.complete()`` directly.
+    The typed-result sibling of :func:`simple_text`: same call, same
+    tracking — for callers that need the structured fields
+    (``stop_reason``), e.g. the app-context phase, which must name the
+    truncation in its parse-failure error instead of a bare "could not
+    parse LLM response".
     """
     used_tracker = tracker if tracker is not None else get_global_tracker()
 
@@ -98,7 +98,62 @@ def simple_text(
         # (never in the cost math — see TokenTracker.record_call).
         usage_details=result.usage_details,
     )
+    return result
 
+
+def simple_text(
+    binding: PhaseBinding,
+    prompt: str,
+    *,
+    system: Optional[str] = None,
+    # See DEFAULT_MAX_TOKENS above for why this is 20000, not 8192.
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    tracker: Optional[TokenTracker] = None,
+) -> str:
+    """Send one user-prompt completion, return the concatenated text reply.
+
+    Args:
+        binding: Phase binding from :meth:`PhaseRegistry.get`. The
+            adapter + model embedded in it are what the call actually
+            uses — no caller-side model selection.
+        prompt: Plain text user message.
+        system: Optional system prompt.
+        max_tokens: Upper bound on response length.
+        tracker: Token tracker to record this call against. Defaults
+            to the global tracker so callers that don't care about
+            multi-tracker setups don't have to thread one through.
+
+    Returns: Concatenated text from every :class:`TextBlock` in the
+        response. Non-text blocks (e.g. a stray ``tool_use`` if the
+        model misbehaves) are dropped — this is the "I just want
+        text" helper, so callers that need richer handling should
+        use ``binding.adapter.complete()`` directly.
+    """
+    result = simple_completion(
+        binding, prompt, system=system, max_tokens=max_tokens, tracker=tracker
+    )
+    # #512: a truncated reply is otherwise a SILENT quality degradation —
+    # reasoning models can spend the whole budget on hidden reasoning and
+    # return a fence fragment or an empty completion (#242), which then
+    # surfaces as a bare JSON-parse failure downstream. Warn once per
+    # (phase, model, cap) so a run's logs name the cause without per-call
+    # spam. simple_text runs inside thread-pool workers, so the warned-set
+    # is lock-guarded. NOTE: several providers map UNKNOWN stop reasons to
+    # "max_tokens", so the wording includes the unrecognized case. The join
+    # below still returns whatever text exists.
+    if result.stop_reason == "max_tokens":
+        key = (getattr(binding, "phase", None), binding.model, max_tokens)
+        with _TRUNCATION_WARNED_LOCK:
+            if key not in _TRUNCATION_WARNED:
+                _TRUNCATION_WARNED.add(key)
+                print(
+                    f"warning: {getattr(binding, 'provider_name', '?')}/{binding.model} "
+                    f"(phase {getattr(binding, 'phase', '?')}) hit max_tokens="
+                    f"{max_tokens} (output_tokens={result.output_tokens}); reply "
+                    "truncated — reasoning models can spend the whole budget "
+                    "on hidden reasoning",
+                    file=sys.stderr,
+                )
     return "\n".join(
         block.text for block in result.content if isinstance(block, TextBlock)
     )
