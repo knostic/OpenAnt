@@ -483,11 +483,20 @@ def _resolve_containing_function(
     candidate: RepositoryCandidate,
 ) -> "tuple[dict | None, str | None]":
     """Resolve which function in ``functions_in_file`` contains -- or is
-    nearest to -- the candidate's strongest evidence's ``hit_line``.
+    nearest to -- the strongest of the candidate's LINE-BEARING evidence's
+    ``hit_line``.
 
     Never fabricates a match: an explicit note accompanies any fallback,
     and ``None`` with a note is returned rather than guessing when nothing
-    can be resolved.
+    can be resolved. ``explicit_path`` evidence is file-level, not
+    line-level: its ``hit_line`` is a synthetic placeholder, never a real
+    match position, so it is excluded before "strongest" is even chosen --
+    a lower-tier pass on the same candidate that found a genuine line
+    (e.g. ``symbol_search``, ``symbol_definition``, ``cwe_fallback``)
+    still resolves normally. A hit line of exactly ``0`` from one of those
+    passes is a real (0-indexed) match position, not the same placeholder --
+    exclusion is keyed on evidence provenance (``pass_name``), never on the
+    line value itself.
     """
     if not functions_in_file:
         return None, "file has no parsed functions (module-level code, or unsupported/unparsed file)"
@@ -495,11 +504,23 @@ def _resolve_containing_function(
     evidence_with_tier = [e for e in candidate.evidence if e.tier is not None]
     if not evidence_with_tier:
         return None, "no evidence carries a tier"
-    strongest = max(evidence_with_tier, key=lambda e: e.tier)
 
+    # Only evidence that both (a) isn't the file-level "explicit_path" pass
+    # and (b) actually carries a hit_line is usable for line-based
+    # resolution -- see the docstring above.
+    line_bearing_evidence = [
+        e for e in evidence_with_tier
+        if e.pass_name != "explicit_path" and e.hit_line is not None
+    ]
+    if not line_bearing_evidence:
+        return None, (
+            "strongest evidence is an explicit file-path match, which has no "
+            "real source line (hit_line=0 is a file-level placeholder, not a "
+            "match position) -- no containing or nearest function can be "
+            "resolved from it"
+        )
+    strongest = max(line_bearing_evidence, key=lambda e: e.tier)
     hit_line = strongest.hit_line
-    if hit_line is None:
-        return None, "strongest evidence carries no hit_line"
 
     containing = [
         f

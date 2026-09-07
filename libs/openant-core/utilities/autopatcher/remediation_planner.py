@@ -503,15 +503,28 @@ def _resolve_symbol(raw: str, repo_root: Path, context) -> "tuple[str, str, int]
     return match.file, match.label, match.line
 
 
-def _resolve_planner_symbols(plan: RemediationPlanResult, repo_root: Path, context) -> "dict[str, _SymbolMatch]":
+def _resolve_planner_symbols(
+    plan: RemediationPlanResult, repo_root: Path, context,
+    verified_files: "list[str] | None" = None,
+) -> "dict[str, _SymbolMatch]":
     """Resolve every Planner-proposed symbol exactly once, keyed by its
     resolved file (first-occurrence wins per file, matching the Planner's
     own target_symbols order). Shared by build_planner_candidates (which
     only reads .label/.line) and build_planner_source_excerpts (which also
-    needs .kind/.end_line/.func_id) so this resolution never runs twice."""
+    needs .kind/.end_line/.func_id) so this resolution never runs twice.
+
+    `verified_files`, when given by the caller, is that caller's OWN
+    already-verified Planner target_files -- passed straight through to
+    _resolve_symbol_details as its own `verified_files` so a symbol the
+    structured lookup can't resolve (e.g. a nested function the upstream
+    analyzer never indexed) still gets the same deterministic, file-scoped
+    identifier fallback _verify_strategy_targets and
+    _build_final_target_slice_inner already use, scoped to exactly those
+    already-verified files -- never a wider search. Omitted (the default)
+    preserves every existing caller's exact prior behavior."""
     resolved: "dict[str, _SymbolMatch]" = {}
     for raw_symbol in plan.target_symbols:
-        match = _resolve_symbol_details(raw_symbol, repo_root, context)
+        match = _resolve_symbol_details(raw_symbol, repo_root, context, verified_files=verified_files)
         if match is None:
             continue
         if match.file not in resolved:
@@ -540,7 +553,11 @@ def build_planner_candidates(
     own output -- passed in by build_planner_evidence so symbol resolution
     runs exactly once per Planner proposal, shared with the source-excerpt
     bridge, rather than being recomputed here. Computed internally when
-    omitted, so existing 3-argument callers are unaffected.
+    omitted (using this same already-verified `verified_files`, so a
+    3-argument caller gets the identical deterministic-fallback-eligible
+    resolution build_planner_evidence's own call already gets), so
+    existing 3-argument callers are unaffected in shape, only in that a
+    symbol only the deterministic fallback can find now also resolves here.
     """
     if not plan.target_files:
         return []
@@ -559,7 +576,7 @@ def build_planner_candidates(
     from .candidate_selection import DEFAULT_MAX_CANDIDATES
 
     if symbol_locations is None:
-        symbol_locations = _resolve_planner_symbols(plan, repo_root, context)
+        symbol_locations = _resolve_planner_symbols(plan, repo_root, context, verified_files=verified_files)
 
     candidates = []
     for path in verified_files[:DEFAULT_MAX_CANDIDATES]:
@@ -831,10 +848,27 @@ def build_planner_evidence(
         return ""
     try:
         root = Path(repo_root)
+        # Same file-verification pass build_planner_candidates itself does
+        # (and will redo, harmlessly, immediately below) -- computed here
+        # first so _resolve_planner_symbols can pass it through to
+        # _resolve_symbol_details as `verified_files`, giving a symbol the
+        # structured lookup can't resolve (e.g. a nested function the
+        # upstream analyzer never indexed) the same deterministic,
+        # file-scoped identifier fallback _verify_strategy_targets and
+        # _build_final_target_slice_inner already use -- never a wider
+        # search than these already-verified target_files.
+        verified_target_files: "list[str]" = []
+        seen_target_files: set = set()
+        for raw in plan.target_files:
+            vf = _verify_file(raw, root)
+            if vf and vf not in seen_target_files:
+                seen_target_files.add(vf)
+                verified_target_files.append(vf)
+
         # Resolved exactly once here, then reused for both candidate
         # construction (hit_line selection) and source-excerpt selection
         # below -- never re-derived by a second lookup pass.
-        symbol_locations = _resolve_planner_symbols(plan, root, context)
+        symbol_locations = _resolve_planner_symbols(plan, root, context, verified_files=verified_target_files)
         candidates = build_planner_candidates(plan, root, context, symbol_locations=symbol_locations)
         if not candidates:
             return ""

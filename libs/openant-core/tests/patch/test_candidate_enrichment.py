@@ -118,6 +118,115 @@ class TestResolveContainingFunction:
         assert resolved["id"] == "app/auth.py:a"
         assert note is None
 
+    def test_explicit_path_only_never_resolves_to_a_function(self):
+        """explicit_path is file-level evidence (a bare path named in the
+        advisory) -- its hit_line is a synthetic placeholder, not a real
+        match position. With no other evidence, no function may be picked,
+        containing or nearest -- regardless of how many candidate
+        functions the file has."""
+        candidate = _candidate("app/auth.py", "explicit_path", 4, hit_line=0)
+        functions_in_file = [
+            {"id": "app/auth.py:a", "name": "a", "startLine": 1, "endLine": 5},
+            {"id": "app/auth.py:b", "name": "b", "startLine": 10, "endLine": 15},
+        ]
+        resolved, note = _resolve_containing_function(functions_in_file, candidate)
+        assert resolved is None
+        assert note is not None
+        assert "explicit file-path match" in note
+        assert "no real source line" in note
+        # Fails closed -- never silently names one of the candidates as picked.
+        assert "app/auth.py:a" not in note
+        assert "app/auth.py:b" not in note
+
+    def test_explicit_path_exclusion_is_keyed_on_provenance_not_value(self):
+        """The exclusion above is about WHERE the hit_line came from, not
+        what its value is: an explicit_path evidence entry with a non-zero
+        hit_line must still be excluded, and a hit_line of exactly 0 from a
+        real pass (symbol_search below) must still resolve normally --
+        0 is a valid 0-indexed match position for a pass that actually
+        performed one."""
+        functions_in_file = [
+            {"id": "app/auth.py:authenticate", "name": "authenticate", "startLine": 1, "endLine": 5},
+        ]
+
+        explicit_only = _candidate("app/auth.py", "explicit_path", 4, hit_line=12)
+        resolved, note = _resolve_containing_function(functions_in_file, explicit_only)
+        assert resolved is None and "explicit file-path match" in note
+
+        real_hit_at_zero = _candidate("app/auth.py", "symbol_search", 2, hit_line=0)
+        resolved, note = _resolve_containing_function(functions_in_file, real_hit_at_zero)
+        # startLine is 1-indexed and hit_line here is the genuine 0-indexed
+        # match line, so containment doesn't apply -- it still resolves via
+        # the ordinary nearest-function fallback, proving 0 was used as a
+        # real value rather than excluded outright like explicit_path above.
+        assert resolved["id"] == "app/auth.py:authenticate"
+        assert note is not None and "nearest" in note
+
+    def test_explicit_path_ignored_in_favor_of_lower_tier_real_hit_line(self):
+        """A candidate can carry BOTH explicit_path (tier 4, no real line)
+        and a lower-tier pass with a genuine hit_line (e.g. the advisory
+        also names the exact symbol, not just the file) -- the real,
+        lower-tier line must still resolve normally rather than being
+        shadowed by the higher-tier but line-less explicit_path evidence.
+        This is the exact shape of the existing real-repo integration test
+        (TestRealIntegration.test_select_then_enrich_against_a_real_small_repo)."""
+        candidate = RepositoryCandidate(
+            path="app/auth.py",
+            evidence=[
+                _evidence("explicit_path", 4, hit_line=0),
+                _evidence("symbol_definition", 3, hit_line=8),
+            ],
+            best_tier=4,
+        )
+        functions_in_file = [
+            {"id": "app/auth.py:authenticate", "name": "authenticate", "startLine": 8, "endLine": 20},
+            {"id": "app/auth.py:check_password", "name": "check_password", "startLine": 22, "endLine": 25},
+        ]
+        resolved, note = _resolve_containing_function(functions_in_file, candidate)
+        assert resolved is not None
+        assert resolved["id"] == "app/auth.py:authenticate"
+        assert note is None
+
+
+class TestExplicitPathDoesNotProduceSpuriousAnchors:
+    """Downstream-anchor regression for the explicit_path/hit_line=0 fix
+    above. derive_pre_patch_anchors (post_patch_investigation.py) turns any
+    non-None CandidateEnrichment.resolved_function into a resolved_function
+    Anchor plus a reachability Anchor, unconditionally -- it never reads
+    resolution_note. Before this fix, an explicit_path-only candidate's
+    nearest-function guess became a real Anchor despite the evidence never
+    having pointed at any particular function; this proves the fix removes
+    that at the source by feeding _resolve_containing_function's own real
+    output (not a hand-built enrichment) into anchor derivation."""
+
+    def test_explicit_path_only_candidate_yields_no_resolved_function_or_reachability_anchor(self):
+        from utilities.autopatcher.evidence_fusion import RepositoryUnderstanding
+        from utilities.autopatcher.post_patch_investigation import derive_pre_patch_anchors
+        from utilities.autopatcher.repository_grounding_models import CandidateEnrichment
+
+        candidate = _candidate("index.js", "explicit_path", 4, hit_line=0)
+        functions_in_file = [
+            {"id": "index.js:hasKey", "name": "hasKey", "startLine": 230, "endLine": 238},
+            {"id": "index.js:isNumber", "name": "isNumber", "startLine": 240, "endLine": 244},
+        ]
+        resolved, note = _resolve_containing_function(functions_in_file, candidate)
+        assert resolved is None  # pre-condition: the fix above already covers this directly
+
+        candidate.enrichment = CandidateEnrichment(
+            functions_in_file=functions_in_file, resolved_function=resolved, resolution_note=note,
+            callees=[], callers_by_call_graph=[], callers_by_text_search=[],
+            is_reachable_from_entry_point=None, entry_point_path=None,
+            related_tests=[], test_support_rating=None, sink_matches=None,
+            scope_constants=[], enrichment_errors=[],
+        )
+
+        understanding = RepositoryUnderstanding(candidate_evidence=[candidate])
+        anchors = derive_pre_patch_anchors(understanding)
+
+        assert [a.kind for a in anchors] == []
+        assert not any(a.kind == "resolved_function" for a in anchors)
+        assert not any(a.kind == "reachability" for a in anchors)
+
 
 class TestEnrichCandidatesWithContext:
     def test_callees_and_callers_populated_from_call_graph(self, tmp_path):
@@ -534,15 +643,26 @@ class TestRealIntegration:
         from utilities.autopatcher.repo_locator import ground_repository
 
         (tmp_path / "app").mkdir()
+        # Uses "authenticate_user" (snake_case, not "authenticate") so the
+        # vulnerability text's mention of it is picked up as genuine
+        # symbol_definition/symbol_search evidence by repo_locator.py's
+        # _extract_symbols (its snake_case rule requires an underscore --
+        # "authenticate" alone matches none of _extract_symbols' rules and
+        # would leave this candidate's only evidence as explicit_path, whose
+        # hit_line=0 is a file-level placeholder, not a real line -- see
+        # test_explicit_path_synthetic_hit_line_zero_never_resolves above).
+        # This keeps the test's own real end-to-end resolution intact
+        # through real, line-bearing evidence rather than accidentally
+        # relying on explicit_path's placeholder line.
         (tmp_path / "app" / "auth.py").write_text(
-            "def authenticate(u, p):\n"
+            "def authenticate_user(u, p):\n"
             "    return check_password(u, p)\n"
             "\n"
             "def check_password(u, p):\n"
             "    return True\n",
             encoding="utf-8",
         )
-        vuln_text = "Vulnerability in app/auth.py — authenticate() is exploitable"
+        vuln_text = "Vulnerability in app/auth.py — authenticate_user() is exploitable"
 
         grounding = ground_repository(vuln_text, tmp_path)
         selection = select_candidates(grounding, max_candidates=3)
@@ -557,10 +677,10 @@ class TestRealIntegration:
         enriched = result[0].enrichment
         assert enriched is not None
         assert enriched.enrichment_errors == []
-        # The real parser must resolve authenticate() as the containing
+        # The real parser must resolve authenticate_user() as the containing
         # function, and the real call graph must show it calling
         # check_password() -- proving the whole chain end to end, not just
         # that it didn't crash.
         assert enriched.resolved_function is not None
-        assert enriched.resolved_function["name"] == "authenticate"
+        assert enriched.resolved_function["name"] == "authenticate_user"
         assert any("check_password" in callee for callee in enriched.callees)

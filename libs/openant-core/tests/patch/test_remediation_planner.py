@@ -1355,6 +1355,112 @@ class TestBuildPlannerEvidence:
 
 
 # ---------------------------------------------------------------------------
+# Planner bridge propagates verified_files into symbol resolution
+#
+# Regression: the deterministic identifier fallback (see
+# TestDeterministicIdentifierFallback / TestMinimistNestedFunctionRegression)
+# was wired into Final Strategy verification and the Final Target Slice
+# (both via an explicit `verified_files=` argument to
+# _resolve_symbol_details), but never into the earlier Planner-Proposed
+# Candidate Evidence bridge -- _resolve_planner_symbols called
+# _resolve_symbol_details with no verified_files at all, so a symbol only
+# the fallback can find (present in real source, absent from the
+# structured index) resolved to nothing here even though the exact same
+# fallback succeeds one stage later for the same file/symbol pair.
+# ---------------------------------------------------------------------------
+
+class TestPlannerBridgePropagatesVerifiedFiles:
+    def _context(self, tmp_path):
+        (tmp_path / "index.js").write_text(_NESTED_JS_FIXTURE, encoding="utf-8")
+        return _make_context(
+            functions={"index.js:hasKey": {"name": "hasKey", "startLine": 21, "endLine": 27}},
+            repo_path=tmp_path,
+        )
+
+    def test_fallback_only_symbol_produces_planner_symbol_verified_evidence(self, tmp_path):
+        # Exercises build_planner_candidates' own 3-argument form
+        # (symbol_locations=None), which now computes verified_files
+        # itself and passes it into _resolve_planner_symbols -- the
+        # second of the two production call sites this fix touches.
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+
+        plan = RemediationPlanResult(rendered="", target_files=["index.js"], target_symbols=["setKey"])
+        candidates = build_planner_candidates(plan, tmp_path, context)
+
+        assert len(candidates) == 1
+        ev = candidates[0].evidence[0]
+        assert ev.pass_name == "planner_proposed"
+        # The real, fallback-recovered declaration line -- never the
+        # synthetic 0 placeholder that meant "no symbol resolved".
+        assert ev.resolution_strategy == "planner_symbol_verified"
+        assert ev.hit_line != 0
+        assert ev.matched_tokens == ["setKey"]
+
+    def test_fallback_only_symbol_resolves_through_full_planner_bridge(self, tmp_path):
+        # The production entry point (build_planner_evidence): computes
+        # verified_files itself and passes it into _resolve_planner_symbols
+        # before build_planner_candidates ever runs -- the first of the two
+        # call sites this fix touches, and the one the real pipeline uses.
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+
+        plan = RemediationPlanResult(rendered="", target_files=["index.js"], target_symbols=["setKey"])
+        result = build_planner_evidence(plan, str(tmp_path), "vuln", context)
+
+        # The old, dishonest "hit_line=0 means no symbol resolved" note is
+        # gone -- whatever nearest-function note remains now names a real,
+        # fallback-recovered line.
+        assert "hit_line 0" not in result
+        # Pass 1 of build_planner_source_excerpts now has a verified symbol
+        # location to use -- the exact setKey source excerpt, not a
+        # full-file fallback (see the sibling source-excerpt test below for
+        # the full-file-fallback-avoided assertion).
+        assert "index.js:setKey" in result
+        assert "function setKey" in result
+
+    def test_fallback_only_symbol_source_excerpt_used_instead_of_full_file(self, tmp_path):
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import (
+            build_planner_candidates, build_planner_source_excerpts, _resolve_planner_symbols,
+        )
+
+        plan = RemediationPlanResult(rendered="", target_files=["index.js"], target_symbols=["setKey"])
+        verified_files = ["index.js"]
+        symbol_locations = _resolve_planner_symbols(plan, tmp_path, context, verified_files=verified_files)
+        candidates = build_planner_candidates(plan, tmp_path, context, symbol_locations=symbol_locations)
+
+        assert "index.js" in symbol_locations
+        assert symbol_locations["index.js"].label == "setKey"
+
+        excerpts = build_planner_source_excerpts(candidates, symbol_locations, tmp_path, context)
+
+        assert "#### Verified source: `index.js:setKey`" in excerpts
+        # Full-file fallback is Pass 2, reached only when NO symbol
+        # resolved for that path -- must not fire now that one has.
+        assert "full file" not in excerpts
+
+    def test_genuinely_unresolved_symbol_stays_file_only_not_invented(self, tmp_path):
+        # A symbol that truly doesn't exist anywhere in the verified
+        # file -- with a real (non-None) context now reachable via the
+        # fallback's own token-search tier, this must still fail closed
+        # rather than guess, exactly as it did before this fix.
+        context = self._context(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_planner_candidates
+
+        plan = RemediationPlanResult(
+            rendered="", target_files=["index.js"], target_symbols=["neverDefinedAnywhere"],
+        )
+        candidates = build_planner_candidates(plan, tmp_path, context)
+
+        assert len(candidates) == 1
+        ev = candidates[0].evidence[0]
+        assert ev.resolution_strategy == "planner_file_only"
+        assert ev.hit_line == 0
+        assert ev.matched_tokens is None
+
+
+# ---------------------------------------------------------------------------
 # No additional LLM call anywhere in the bridge
 # ---------------------------------------------------------------------------
 
