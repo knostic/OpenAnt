@@ -572,12 +572,25 @@ def main(argv: "list[str] | None" = None) -> int:
         else:
             os.environ["AUTOPATCHER_DEBUG"] = _prev_debug
 
+    # OpenAnt's existing canonical shared usage/cost tracker -- the same
+    # TokenTracker utilities.autopatcher.llm_client.call_llm() already
+    # records every real call into (see that module's own record_call()
+    # comment), and the same core.tracking.get_usage() every other OpenAnt
+    # command (analyze/verify/enhance/scan) already reads. Read here, not
+    # reset: this script runs run_patch()/run_patch_cve() exactly once in a
+    # fresh process, so the tracker already starts empty -- no independent
+    # accounting, no new mechanism, just surfacing the existing total.
+    from core import tracking
+
+    usage = tracking.get_usage()
+
     print(json.dumps({
         "vulnerability_path": result.vulnerability_path,
         "trust_report_path": result.trust_report_path,
         "trace_dir": str(trace_dir),
         "trace_manifest": str(manifest_path),
         "llm_calls": len(tracer.calls),
+        "usage": usage.to_dict(),
     }, indent=2))
     return 0
 

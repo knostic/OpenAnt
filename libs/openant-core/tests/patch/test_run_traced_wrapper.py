@@ -244,6 +244,43 @@ class TestTraceHooksHermetic:
         assert manifest["status"] == "success"
         assert manifest["input_type"] == "cve"
 
+    def test_final_summary_includes_canonical_usage(self, run_traced, tmp_path, monkeypatch, capsys):
+        """run_traced.py's final JSON summary must surface OpenAnt's
+        canonical core.tracking.get_usage() -- the same shared TokenTracker
+        every other OpenAnt command already reads -- not a fabricated or
+        Auto-Patcher-specific number. This only tests that the already-
+        correct total is serialized here; recording (call_llm() ->
+        get_global_tracker().record_call()) is covered by
+        test_llm_client.py's own usage/cost propagation tests, not
+        re-tested here."""
+        from utilities.llm_client import get_global_tracker
+
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        get_global_tracker().reset()
+        get_global_tracker().record_call(
+            model="claude-opus-4-8", input_tokens=1000, output_tokens=500,
+            pricing={"input": 15.0, "output": 75.0},
+        )
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        output_dir = tmp_path / "out"
+
+        argv = ["--cve", "CVE-2021-12345", "--repo-root", str(repo_root), "--output", str(output_dir)]
+        with _mock_fetch_cve_at_source():
+            exit_code = run_traced.main(argv)
+
+        assert exit_code == 0
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["usage"] == {
+            "total_calls": 1,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "total_tokens": 1500,
+            "total_cost_usd": pytest.approx(
+                (1000 / 1_000_000) * 15.0 + (500 / 1_000_000) * 75.0
+            ),
+        }
+
 
 class TestDebugArtifactManifest:
     """Covers requirement 1: context_selection_*.json artifacts must be
