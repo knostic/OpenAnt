@@ -330,6 +330,10 @@ class VerificationResult:
     # lets the reporter render "unverified" (not "rejected") and lets the
     # metrics bucket it as needs-review (not "safe").
     incomplete: bool = False
+    # #521: the model-supplied verdict withheld by the incomplete-finish
+    # severity rule, verbatim (None when nothing was withheld). Serialized
+    # so the triager can see what the unfinished verification proposed.
+    withheld_correct_finding: Optional[str] = None
     # #211 pass-through capture: per-turn provider usage detail dicts
     # (verbatim; None entries for turns that reported none). Serialized
     # into the unit's verification record so results_verified.json is
@@ -353,6 +357,8 @@ class VerificationResult:
         # Always serialize the incomplete flag so downstream consumers
         # (core/reporter.py, core/verifier.py) can branch on it explicitly.
         result["incomplete"] = self.incomplete
+        if self.withheld_correct_finding is not None:
+            result["withheld_correct_finding"] = self.withheld_correct_finding
         return result
 
 
@@ -1485,8 +1491,10 @@ class FindingVerifier:
         # incomplete=False.
         agree_missing = "agree" not in finish_result
         agree = finish_result.get("agree", False)
-        correct_finding = finish_result.get("correct_finding", original_finding)
+        supplied_correct_finding = finish_result.get("correct_finding", original_finding)
+        correct_finding = supplied_correct_finding
         incomplete = agree_missing
+        withheld_correct_finding = None
 
         # FAM-REPORT-2: a self-contradictory finish — `agree=True` (claims to
         # agree with Stage-1) while `correct_finding` diverges from the Stage-1
@@ -1503,9 +1511,37 @@ class FindingVerifier:
         # Mirrors this file's R4-7 fail-safe philosophy (abnormal signal ->
         # surface, don't silently resolve).
         if agree and str(correct_finding or "").strip().lower() != str(original_finding or "").strip().lower():
-            correct_finding = _more_severe(original_finding, correct_finding)
+            # FAM-REPORT-2: contradiction detected. The verdict resolution
+            # lives in the shared incomplete rule below (one site), so the
+            # withheld audit record fires here too (agree=True + downgrade).
             agree = False
             incomplete = True
+
+        # #521 finding 2: an INCOMPLETE finish never authors a downgrade.
+        # One rule, stated once, shared with FAM-REPORT-2 above: whether the
+        # finish was self-contradictory or simply did not assert `agree`, an
+        # unfinished verification's model-supplied verdict may not move a
+        # row DOWN FINDING_VERDICT_ORDER — a downgrade here wrote result
+        # ["finding"] and the row silently left disclosure (verifier's
+        # confirmed_findings admits only vulnerable|bypassable) while the
+        # metrics still counted it needs_review. Upgrades are honoured; the
+        # withheld supplied verdict is recorded for the triager (the
+        # consistency pass's #518 block may separately record its own
+        # withheld proposal on the same row — both should be visible).
+        if incomplete:
+            normalized = str(supplied_correct_finding or "").strip().lower()
+            if not normalized:
+                # a null/blank supplied verdict: the Stage-1 verdict stands
+                correct_finding = original_finding
+            else:
+                # normalize the returned verdict (the #448 storage convention)
+                correct_finding = _more_severe(original_finding, normalized)
+                if str(correct_finding or "").strip().lower() != normalized:
+                    # a downgrade was withheld — record the supplied verdict
+                    # for the triager (the consistency pass's #518 block may
+                    # separately record its own withheld proposal on the same
+                    # row; both should be visible)
+                    withheld_correct_finding = supplied_correct_finding
 
         return VerificationResult(
             agree=agree,
@@ -1517,6 +1553,7 @@ class FindingVerifier:
             exploit_path=exploit_path,
             security_weakness=finish_result.get("security_weakness"),
             incomplete=incomplete,
+            withheld_correct_finding=withheld_correct_finding,
         )
 
     def _try_parse_text_response(
