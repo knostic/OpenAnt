@@ -604,6 +604,14 @@ def scan_repository(
             # and that one MUST still abort (bad credentials must not be
             # silently skipped into a "successful" degraded scan).
             pre_llmreach_units_count = result.units_count
+            # #516: whether the re-filtered dataset reached disk. write_json
+            # is ATOMIC (temp + fsync + os.replace) — after it returns, the
+            # disk IS the post-filter dataset and downstream consumes the
+            # DISK (enhance/analyze read active_dataset_path, never this
+            # local). A post-write bookkeeping failure must therefore leave
+            # units_count describing the post-filter state, not restore the
+            # pre-stage count over a persisted dataset.
+            dataset_persisted = False
             try:
                 if dataset is not None:
                     app_ctx_payload = None
@@ -852,6 +860,7 @@ def scan_repository(
                     # Persist final dataset so downstream stages see promoted
                     # entry points, per-unit signals, and the applied filter.
                     write_json(active_dataset_path, dataset, indent=2)
+                    dataset_persisted = True
 
                     ctx.summary = {
                         "units_reviewed": pre_filter_count,
@@ -894,13 +903,22 @@ def scan_repository(
                 # failure in that window left the count describing a dataset
                 # that never reached disk. Restore the pre-stage count so the
                 # result matches what downstream actually consumes.
-                result.units_count = pre_llmreach_units_count
+                # #516: that restore is correct ONLY when the persist never
+                # happened. write_json is atomic, so a persisted dataset IS
+                # the post-filter one downstream consumes — restoring the
+                # pre count there would describe a dataset that no longer
+                # exists on disk. Gate on the persist; record which state
+                # won so the step report never reads "no effects" while
+                # downstream consumes the re-filtered dataset.
+                if not dataset_persisted:
+                    result.units_count = pre_llmreach_units_count
                 print(
                     f"  WARNING: LLM reachability stage failed: {exc}",
                     file=sys.stderr,
                 )
                 ctx.status = "skipped"
-                ctx.summary = {"skipped": True, "reason": str(exc)}
+                ctx.summary = {"skipped": True, "reason": str(exc),
+                               "dataset_persisted": dataset_persisted}
                 # Record the crash so the degraded reachability pass is
                 # visible in the artifacts, matching the dataset-read guard.
                 _record_skip(result, "llm-reachability", "failed")
