@@ -470,7 +470,9 @@ def _disclosure_verdict_header(vulnerability_data: dict) -> str:
     Lets a reader distinguish an attacker-simulation-confirmed finding from a
     not-yet-confirmed one without trusting the LLM to render the "Verified via
     ..." line (dropped in most documents), and stamps the real file/function
-    location the "{affected_versions}" prompt field never carries.
+    location the "{affected_versions}" prompt field never carries. Placement
+    is deterministic; the explanation line's CONTENT is Stage-2 model text
+    (repo-influenced) — deterministically placed, not server-authored.
     """
     verdict = str(vulnerability_data.get("stage2_verdict") or "").lower()
     stage1 = str(vulnerability_data.get("stage1_verdict") or "").lower()
@@ -517,6 +519,20 @@ def _disclosure_verdict_header(vulnerability_data: dict) -> str:
     if isinstance(loc, dict) and (loc.get("file") or loc.get("function")):
         where = ":".join(str(x) for x in (loc.get("file"), loc.get("function")) if x)
         lines.append(f"> **Location:** {where}")
+    # #534: the Stage-2 QUALIFICATION line, stated verbatim — the one piece
+    # of Stage 2's reasoning a reader must not lose to the model's prose. The
+    # banner is deterministic and server-stamped, so the qualification cannot
+    # be dropped the way the in-body "Verification:" line was (the receipt:
+    # a disclosure asserted the exact path Stage 2's explanation said was
+    # gated).
+    qual = str(vulnerability_data.get("verification_explanation") or "").strip()
+    if qual:
+        # #534: blockquote-safe — a multi-paragraph explanation must stay
+        # inside the banner block (a bare \n\n would dump the rest as
+        # top-level prose above the model's H1).
+        lines.append("> **Stage-2 explanation:** "
+                     + qual.replace("\n", "\n> "))
+
     return "\n".join(lines) + "\n\n"
 
 

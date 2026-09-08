@@ -497,8 +497,17 @@ def build_pipeline_output(
                 else:
                     flow_str = _coerce_to_str(data_flow)
                 parts.append("Data flow: " + flow_str)
-            if finding.get("verification_explanation"):
-                parts.append("Verification: " + _coerce_to_str(finding["verification_explanation"]))
+            # #534: read Stage 2's explanation from where the verify stage
+            # actually writes it (finding["verification"]["explanation"]),
+            # with the legacy top-level key as fallback — the old read was a
+            # hook to a key NO PRODUCER wrote (the disclosure body could
+            # assert what Stage 2 refuted).
+            _v = finding.get("verification")
+            if not isinstance(_v, dict):
+                _v = {}
+            _v_expl = _v.get("explanation") or finding.get("verification_explanation")
+            if _v_expl:
+                parts.append("Verification: " + _coerce_to_str(_v_expl))
             steps_to_reproduce = "\n\n".join(parts) if parts else None
 
         # Determine stage2 verdict.
@@ -564,6 +573,19 @@ def build_pipeline_output(
             "cwe_name": vuln.get("cwe_name") or finding.get("cwe_name") or full_result.get("cwe_name", "Unknown"),
             "stage1_verdict": finding.get("verdict", finding.get("finding", "vulnerable")),
             "stage2_verdict": stage2_verdict,
+            # #534: Stage 2's text reaches the disclosure prompt as OWN
+            # record keys. Fresh-wins precedence (the verify dict is the
+            # authoritative Stage-2 record — the same precedence as the
+            # steps-rebuild path); coerced (dict-shaped explanations are a
+            # real model-output class); the note is the TOP-LEVEL
+            # verification_note the verifier actually writes; present-only.
+            **({"verification_explanation":
+                    _coerce_to_str(verification.get("explanation")
+                                  or finding.get("verification_explanation"))}
+               if (isinstance(verification, dict) and verification.get("explanation"))
+               or finding.get("verification_explanation") else {}),
+            **({"verification_note": finding["verification_note"]}
+               if finding.get("verification_note") else {}),
             # #215 (partial repair): the two FINDING-SEMANTIC transit
             # fields — confidence (float 0.0-1.0 per the verdict schema,
             # json_corrector.py:32; NOT analysis_core.py:181's error-shape
