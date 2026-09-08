@@ -379,6 +379,211 @@ def _reachability_header(pipeline_data: dict) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+
+
+# ---------------------------------------------------------------------------
+# #535: server-rendered numeric/eligibility surfaces for SUMMARY_REPORT.md
+# ---------------------------------------------------------------------------
+
+_SUMMARY_SERVER_SECTIONS = (
+    "Pipeline Statistics", "Per-Step Durations", "Per-Step Costs",
+    "Results", "Confirmed Vulnerabilities", "Not Confirmed",
+)
+
+
+
+
+def _fmt_duration(seconds: float) -> str:
+    """A duration string that can't mis-render 10.22s as '10m 13s'."""
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    if seconds >= 60:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds:.1f}s"
+
+
+def _strip_server_sections(text: str) -> str:
+    """Remove any model-emitted duplicate of a server-owned section.
+
+    The prompt is advisory; the model may still transcribe a '## Pipeline
+    Statistics' block from the JSON dump. Every heading in
+    _SUMMARY_SERVER_SECTIONS is server-owned — strip from its heading to the
+    next heading (or end) so the deliverable carries exactly one copy (the
+    same pattern as _splice_code_section's duplicate-block strip). The
+    heading is ANCHORED (a '## Results Overview' narrative section survives)
+    and matched case-insensitively with an optional numbering prefix.
+    """
+    import re as _re
+    for heading in _SUMMARY_SERVER_SECTIONS:
+        text = _re.sub(
+            r"^##\s+(?:\d+[.)]\s*)?" + _re.escape(heading)
+            + r"\s*:(?:\n(?!## ).*)*\n?",
+            "", text, flags=_re.M | _re.I)
+        text = _re.sub(
+            r"^##\s+(?:\d+[.)]\s*)?" + _re.escape(heading)
+            + r"\s*$(?:\n(?!## ).*)*\n?",
+            "", text, flags=_re.M | _re.I)
+    return text
+
+
+
+
+def _verified_tier(f: dict) -> str:
+    """The 4-tier Verified cell, the same dynamic-then-stage2 priority the
+    disclosure header encodes (#319; the summary and disclosure tables must
+    agree for the same finding)."""
+    dt = f.get("dynamic_testing")
+    dta = f.get("dynamic_testing_attempted")
+    if isinstance(dt, dict) and dt.get("status") == "CONFIRMED":
+        return "dynamic"
+    if isinstance(dta, dict) and dta.get("status"):
+        return f"dynamic test failed ({dta.get('status')})"
+    v = str(f.get("stage2_verdict", "")).lower()
+    if v in _STAGE2_CONFIRMED:
+        return "verified"
+    return "static"
+
+
+def _summary_statistics_block(pipeline_data: dict) -> str:
+    """The server-rendered numeric facts (the #535 core).
+
+    Every line present-only — an old artifact without the new keys renders
+    with omitted lines, never fabricated zeros. Numbers come from
+    pipeline_stats only (the reporter folded the step reports in; the
+    generator never saw them).
+    """
+    stats = pipeline_data.get("pipeline_stats") or {}
+    lines: list[str] = []
+    parsed = stats.get("parsed_units")
+    if isinstance(parsed, int) and not isinstance(parsed, bool):
+        lines.append(f"- Parsed: {parsed} units")
+    if stats.get("reachability_filter_applied"):
+        orig = stats.get("original_units")
+        reach = stats.get("reachable_units")
+        if isinstance(orig, int) and isinstance(reach, int) and orig > 0:
+            pct = stats.get("reachability_reduction_percentage")
+            pct_str = f"{pct}" if isinstance(pct, (int, float)) else (
+                f"{round(100 * (orig - reach) / orig, 1)}")
+            lines.append(f"- In scope after reachability filter: {reach} of "
+                         f"{orig} units ({pct_str}% pruned)")
+    analyzed = stats.get("units_analyzed")
+    total = stats.get("total_units")
+    if isinstance(analyzed, int) and not isinstance(analyzed, bool):
+        extra = ""
+        s1err = stats.get("stage1_errors")
+        if isinstance(s1err, int) and s1err:
+            extra = f" ({s1err} errored)"
+        base = f"- Analyzed in Stage 1: {analyzed} units"
+        if isinstance(total, int) and total != analyzed:
+            base += f" of {total}"
+        lines.append(base + extra)
+    vi = stats.get("findings_input")
+    va = stats.get("units_analyzed_total")
+    if isinstance(vi, int) and isinstance(va, int):
+        adj = f"- Adjudicated in Stage 2: {vi} of {va} analyzed units"
+        down, up = stats.get("downgraded"), stats.get("upgraded")
+        if isinstance(down, int) or isinstance(up, int):
+            adj += f" ({down or 0} downgraded, {up or 0} upgraded)"
+        lines.append(adj)
+    if stats.get("same_model_verification"):
+        lines.append(
+            "- Stage 2 ran on the same model as Stage 1 and is not an "
+            "independent instrument")
+    if not lines:
+        return ""
+    return "## Pipeline Statistics\n\n" + "\n".join(lines) + "\n\n"
+
+
+def _summary_tables_block(pipeline_data: dict) -> str:
+    """The server-rendered Results / durations / costs / Confirmed tables."""
+    stats = pipeline_data.get("pipeline_stats") or {}
+    parts: list[str] = []
+
+    results = pipeline_data.get("results") or {}
+    if results:
+        rows = []
+        for label, key in (("Vulnerable", "vulnerable"), ("Safe", "safe"),
+                           ("Protected", "protected"),
+                           ("Inconclusive", "inconclusive"),
+                           ("Needs review", "needs_review"),
+                           ("Errored", "errors"),
+                           ("Deduplicated away", "deduplicated")):
+            v = results.get(key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                rows.append(f"| {label} | {v} |")
+        if rows:
+            parts.append("## Results\n\n| Outcome | Units |\n|---|---|\n"
+                         + "\n".join(rows) + "\n")
+
+    durations = stats.get("durations") or {}
+    if durations:
+        rows = [f"| {step} | {_fmt_duration(float(sec))} |"
+                for step, sec in durations.items()
+                if isinstance(sec, (int, float))]
+        total = sum(float(v) for v in durations.values()
+                    if isinstance(v, (int, float)))
+        rows.append(f"| **Total** | **{_fmt_duration(total)}** |")
+        parts.append("## Per-Step Durations\n\n| Step | Duration |\n"
+                     "|---|---|\n" + "\n".join(rows) + "\n")
+
+    costs = stats.get("costs") or {}
+    if costs:
+        rows = [f"| {step} | ${float((c or {}).get('actual') or 0):.2f} |"
+                for step, c in costs.items()]
+        total = sum(float((c or {}).get("actual") or 0) for c in costs.values())
+        rows.append(f"| **Total** | **${total:.2f}** |")
+        parts.append("## Per-Step Costs\n\n| Step | Actual |\n|---|---|\n"
+                     + "\n".join(rows) + "\n")
+
+    findings = pipeline_data.get("findings") or []
+    if findings:
+        confirmed = [f for f in findings
+                     if str(f.get("stage2_verdict", "")).lower()
+                     in _STAGE2_CONFIRMED]
+        not_confirmed = [f for f in findings if f not in confirmed]
+        if confirmed:
+            rows = []
+            for i, f in enumerate(confirmed, 1):
+                sev = f.get("severity")
+                rows.append(f"| {i} | {f.get('name', '?')} | "
+                            f"{(f.get('location') or {}).get('file', '?')}:"
+                            f"{(f.get('location') or {}).get('function', '?')} | "
+                            f"CWE-{f.get('cwe_id', '')} | {sev if sev else ''} | "
+                            f"{_verified_tier(f)} |")
+            parts.append(
+                "## Confirmed Vulnerabilities\n\n"
+                "| # | Vulnerability | Location | CWE | Severity | Verified |\n"
+                "|---|---|---|---|---|---|\n" + "\n".join(rows) + "\n")
+        else:
+            parts.append("## Confirmed Vulnerabilities\n\n"
+                         "No vulnerabilities were confirmed by Stage 2.\n")
+        if not_confirmed:
+            rows = []
+            for i, f in enumerate(not_confirmed, 1):
+                rows.append(f"| {i} | {f.get('name', '?')} | "
+                            f"{str(f.get('stage2_verdict', '')).lower()} |")
+            parts.append(
+                "## Not Confirmed\n\n"
+                "The following findings were not confirmed by Stage 2 "
+                "(unverified, incomplete, reclassified, or not re-examined):\n\n"
+                "| # | Finding | Stage 2 |\n|---|---|---|\n"
+                + "\n".join(rows) + "\n")
+    elif not parts:
+        parts.append("No findings to report.\n")
+
+    return ("\n\n".join(parts) + "\n\n") if parts else ""
+
+
+def _strip_summary_placeholders(text: str) -> str:
+    """The empty-case placeholder tables must never render literally."""
+    import re as _re
+    text = _re.sub(r"^\| \{step\} \| \{reason\} \|\n?", "", text, flags=_re.M)
+    text = _re.sub(
+        r"^\| \{name\} \| \{verdict\} \| \{verdict\} \| "
+        r"\{one_sentence_reason\} \|\n?", "", text, flags=_re.M)
+    return text
+
+
 def generate_summary_report(
     pipeline_data: dict,
     binding: PhaseBinding,
@@ -440,9 +645,43 @@ def generate_summary_report(
             "(stop_reason=max_tokens) — the reply was cut mid-generation "
             "and the sections below may be incomplete.\n\n" + text
         )
-    # Prepend the provenance banner + the reachability advisory
-    # deterministically (see the helper docstrings).
-    text = _context_provenance_header(pipeline_data) + _reachability_header(pipeline_data) + text
+    # #535: the numeric/eligibility surfaces are SERVER-rendered. The model
+    # keeps the narrative; the server owns the numbers (the receipt: the
+    # model transcribed 10.22s as "10m 13s" and put unverified rows in the
+    # Confirmed table). Strip any model-emitted duplicate of a server-owned
+    # section, strip literal placeholder tables, then splice the server
+    # blocks after the deterministic headers.
+    text = _strip_server_sections(text)
+    text = _strip_summary_placeholders(text)
+    server_blocks = (_summary_statistics_block(pipeline_data)
+                     + _summary_tables_block(pipeline_data))
+    # Splice the server blocks AFTER the model's H1/metadata block (the
+    # banners may precede the title; whole H2 sections may not — the #535
+    # review round: prepending put four tables above the document title).
+    # The gate fold (fable+astra, the m.start()>0 inversion): the
+    # H1-at-offset-0 canonical reply took the prepend branch — the tables
+    # rendered ABOVE the title. The boundary is normalized instead: find
+    # the first heading; skip its line and any following non-heading
+    # metadata lines; insert before the NEXT heading (or the end when the
+    # metadata block runs to the end). EVERY shape — H1 at 0, banners
+    # before the H1, metadata after, metadata-only-to-the-end — inserts
+    # AFTER the metadata block, never above the title.
+    import re as _re
+    m = _re.search(r"^#{1,2} ", text, flags=_re.M)
+    if m:
+        line_end = text.index("\n", m.start()) if "\n" in text[m.start():] else len(text)
+        m2 = _re.search(r"^#{1,2} ", text[line_end:], flags=_re.M)
+        insert_at = line_end + (m2.start() if m2 else len(text) - line_end)
+        text = text[:insert_at] + server_blocks + text[insert_at:]
+    else:
+        # No heading at all: the fallback document gets a canonical title
+        # (the banners + tables, then the model prose) — the banners
+        # prepend EXACTLY ONCE here (the old path prepended them twice:
+        # once in this branch and once in the unconditional prepend below).
+        text = (server_blocks + text)
+    # The banners prepend exactly once, unconditionally, at the very top.
+    text = (_context_provenance_header(pipeline_data)
+            + _reachability_header(pipeline_data) + text)
     return text, _extract_usage(
         result.input_tokens,
         result.output_tokens,

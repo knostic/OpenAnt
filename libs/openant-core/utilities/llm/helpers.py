@@ -19,7 +19,7 @@ import threading
 from typing import Optional
 
 from ..llm_client import TokenTracker, get_global_tracker
-from .adapter import CompletionResult, Message, TextBlock
+from .adapter import CompletionResult, LLMResponseError, Message, TextBlock
 from .registry import PhaseBinding
 
 # Thinking-era output budget (the simple_text default; PR #242 raised it from
@@ -79,12 +79,27 @@ def simple_completion(
     used_tracker = tracker if tracker is not None else get_global_tracker()
 
     messages = [Message(role="user", content=[TextBlock(prompt)])]
-    result = binding.adapter.complete(
-        model=binding.model,
-        system=system,
-        messages=messages,
-        max_tokens=max_tokens,
-    )
+    try:
+        result = binding.adapter.complete(
+            model=binding.model,
+            system=system,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+    except LLMResponseError as exc:
+        # #537: a rejected completion's returned usage is recorded BEFORE
+        # the re-raise — the call's tokens must not vanish from accounting
+        # (what the provider actually charged is unknowable from the
+        # artifact and stays unclaimed; the token counts are what the
+        # response carried).
+        if exc.input_tokens or exc.output_tokens:
+            used_tracker.record_call(
+                model=binding.model,
+                input_tokens=exc.input_tokens,
+                output_tokens=exc.output_tokens,
+                pricing=lookup_pricing(binding),
+            )
+        raise
     # Pricing lives on the adapter (issue #65 §9). Pass it through
     # so the tracker isn't forced to consult a shared global per
     # provider — the result is per-model accuracy without

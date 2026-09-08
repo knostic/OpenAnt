@@ -282,6 +282,7 @@ def parse_response(
     on_error: Optional[Callable[[str], None]] = None,
     batch_label: Optional[str] = None,
     on_batch_drop: Optional[Callable[[], None]] = None,
+    stop_reason: Optional[str] = None,
 ) -> List[ReachabilitySignal]:
     """Parse a single LLM response into validated ``ReachabilitySignal``s.
 
@@ -304,9 +305,16 @@ def parse_response(
     data = _extract_json(response_text)
     if not isinstance(data, dict):
         shape = _classify_malformed(response_text)
+        # #538: the stop reason upgrades the brace heuristic to evidence —
+        # "truncated at max_tokens" (the model hit the cap) vs "unbalanced
+        # JSON (not truncated)" (end_turn + broken braces = a shape error).
+        truncated = (stop_reason == "max_tokens" and
+                     shape == "truncated or unbalanced JSON")
+        if truncated:
+            shape = "truncated at max_tokens"
         log(f"malformed response: {shape} — skipping batch{label};{snippet}")
         if on_batch_drop is not None:
-            on_batch_drop()
+            on_batch_drop(truncated=truncated)
         return []
 
     raw_signals = data.get("signals")
@@ -314,7 +322,7 @@ def parse_response(
         log(f"malformed response: 'signals' missing or not a list "
             f"(got {type(raw_signals).__name__}) — skipping batch{label};{snippet}")
         if on_batch_drop is not None:
-            on_batch_drop()
+            on_batch_drop(truncated=False)
         return []
 
     out: List[ReachabilitySignal] = []
@@ -432,7 +440,8 @@ def analyze_reachability(
 
     # Lazy import so this module stays usable when callers explicitly
     # provide a binding and never want the registry fallback above.
-    from utilities.llm import LLMAuthError, simple_text
+    from utilities.llm import (LLMAuthError, TextBlock, simple_completion,
+                            DEFAULT_MAX_TOKENS)
 
     # #532 (review-wave fix): the usage machinery must be live in PRODUCTION —
     # resolve the global tracker when the caller doesn't pass one (the family
@@ -450,6 +459,7 @@ def analyze_reachability(
     # in which some units were never reviewed.
     dropped_batches = 0
     units_not_reviewed = 0
+    batches_truncated = 0
 
     # ------------------------------------------------------------------
     # #532: resume/adopt machinery — the checkpoint family's own pattern
@@ -596,7 +606,12 @@ def analyze_reachability(
             except Exception:  # noqa: BLE001
                 pass
         try:
-            text = simple_text(binding, prompt, max_tokens=4096, tracker=tracker)
+            result = simple_completion(binding, prompt,
+                                       max_tokens=DEFAULT_MAX_TOKENS,
+                                       tracker=tracker)
+            text = "\n".join(
+                b.text for b in result.content
+                if isinstance(b, TextBlock))
         except LLMAuthError:
             # Auth failures are fatal and recur on every batch — surface
             # them instead of burying them as a per-batch "failed" line,
@@ -620,24 +635,55 @@ def analyze_reachability(
         last = batch[-1].get("id", "?") if batch else "?"
         dropped_this_batch = False
 
-        def _count_drop_and_flag(batch=batch):
-            nonlocal dropped_batches, units_not_reviewed, dropped_this_batch
+        def _count_drop_and_flag(batch=batch, truncated=False):
+            nonlocal dropped_batches, units_not_reviewed, \
+                dropped_this_batch, batches_truncated
             dropped_batches += 1
             units_not_reviewed += len(batch)
             dropped_this_batch = True
+            if truncated:
+                batches_truncated += 1
 
         parsed = parse_response(
             text, valid_unit_ids=batch_ids, on_error=on_error,
             batch_label=f"batch {i + 1}/{len(batches)}, units {first}..{last}",
             on_batch_drop=_count_drop_and_flag,
+            stop_reason=result.stop_reason,
         )
+        # #538 gate fold (fable+astra — the salvage-success gap): a
+        # max_tokens reply drops the batch WHOLE — the parsed prefix
+        # signals are NOT applied (the applied==adopted invariant: the
+        # signals gated the re-filter this run but were absent from the
+        # checkpoint, so a resume silently re-filtered on un-replayed
+        # state), and batches_truncated counts the truncation
+        # INDEPENDENTLY of the parse outcome (the salvage parse may
+        # succeed without the on_batch_drop callback ever firing — the
+        # counter was blind to exactly the case the gate acts on).
+        # Deduplicated: when the salvage parse DID drop (the callback
+        # fired), its counters already stand — the fold only adds the
+        # counts the callback never made.
+        _truncated = (result.stop_reason == "max_tokens")
+        if _truncated:
+            if not dropped_this_batch:
+                batches_truncated += 1
+                dropped_batches += 1
+                units_not_reviewed += len(batch)
+                print(f"[LLMReach] batch {i + 1}/{len(batches)} truncated at "
+                      f"max_tokens — dropping whole (salvage prefix discarded); "
+                      f"{len(batch)} units re-run on the next pass",
+                      file=sys.stderr)
+            continue
         signals.extend(parsed)
 
         # Persist per-unit records ONLY for a batch that completed without a
         # drop — dropped batches leave no records (absence = the retry
         # marker on the next resume). Save failures cost persistence, not
         # the pass (the stage's own advisory doctrine).
-        if checkpoint is not None and not dropped_this_batch:
+        # #538 (4)-primitive: a max_tokens reply NEVER reaches this block —
+        # the fold's `continue` above drops the whole batch BEFORE the
+        # persist (the applied==adopted invariant; the salvage prefix
+        # discarded). dropped_this_batch stays the parse-drop marker.
+        if (checkpoint is not None and not dropped_this_batch):
             batch_usage = {}
             if tracker is not None:
                 try:
@@ -709,6 +755,8 @@ def analyze_reachability(
     if stats is not None:
         stats["batches_dropped"] = dropped_batches
         stats["units_not_reviewed"] = units_not_reviewed
+        # #538: the truncation subclass — the recurrence's diagnosis lever.
+        stats["batches_truncated"] = batches_truncated
 
     return signals
 

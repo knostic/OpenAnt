@@ -369,11 +369,19 @@ def test_summary_prompt_receives_severity():
 
 
 def test_summary_template_row_has_severity_cell():
-    from pathlib import Path as P
-    tpl = (P(__file__).resolve().parents[1] / "report" / "prompts" / "summary.txt").read_text()
-    assert "{severity}" in tpl
-    assert "lowercase" not in tpl
-    assert tpl.count("| # | Vulnerability | Location | CWE | Severity | Verified |") == 1
+    """#535 migration: the Confirmed table moved server-side — the severity
+    cell and the one-table guarantees now pin the RENDERER (the prompt no
+    longer carries the exemplar)."""
+    from report.generator import _summary_tables_block
+    findings = [{
+        "name": "XSS", "short_name": "XSS",
+        "location": {"file": "a.py", "function": "handler"},
+        "cwe_id": 79, "severity": "high", "stage2_verdict": "confirmed",
+    }]
+    block = _summary_tables_block({"findings": findings})
+    assert block.count(
+        "| # | Vulnerability | Location | CWE | Severity | Verified |") == 1
+    assert "| 1 | XSS | a.py:handler | CWE-79 | high | verified |" in block
 
 
 def test_max_iterations_downgrade_strips_severity():
@@ -411,17 +419,22 @@ def test_twin_severity_parity():
 
 
 def test_summary_table_is_contiguous():
-    """Wave r2 (t#5): a blank line between the separator and the example
-    row terminates the markdown table (the exemplar the summary LLM copies
-    was header-only + an orphan row). Every findings-table line contiguous."""
-    from pathlib import Path as P
-    lines = (P(__file__).resolve().parents[1] / "report" / "prompts"
-             / "summary.txt").read_text().split("\n")
+    """#535 migration: the contiguity guarantee now pins the server-rendered
+    table (header, separator, and rows on consecutive lines — the model can
+    no longer orphan the exemplar row)."""
+    from report.generator import _summary_tables_block
+    findings = [{
+        "name": "R", "short_name": "R",
+        "location": {"file": "b.py", "function": "f"},
+        "cwe_id": 89, "severity": "medium", "stage2_verdict": "agreed",
+    }]
+    block = _summary_tables_block({"findings": findings})
+    lines = block.split("\n")
     i = next(k for k, l in enumerate(lines)
              if l.startswith("| # | Vulnerability"))
     assert lines[i + 1].startswith("|---"), "separator row must follow directly"
-    assert lines[i + 2].startswith("| 1 |") and "{severity}" in lines[i + 2], (
-        "the example row must be contiguous and carry the severity cell")
+    assert lines[i + 2].startswith("| 1 |") and "medium" in lines[i + 2], (
+        "the data row must be contiguous and carry the severity cell")
 
 
 def test_the_one_severity_enum_everywhere():

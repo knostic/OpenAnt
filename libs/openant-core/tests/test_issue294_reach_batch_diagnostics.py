@@ -107,7 +107,7 @@ def test_signals_missing_branch_names_type_and_counts_drop():
         '{"signals": "nope"}',
         on_error=got.append,
         batch_label="batch 1/1",
-        on_batch_drop=lambda: drops.append(1),
+        on_batch_drop=lambda truncated=False: drops.append(1),
     )
     assert "'signals' missing or not a list (got str)" in got[0]
     assert drops == [1]
@@ -119,7 +119,7 @@ def test_valid_response_does_not_fire_drop_callback():
         '{"signals": [{"unit_id": "a.py:f", "kind": "entry_point", '
         '"confidence": "high", "reason": "r"}]}',
         valid_unit_ids={"a.py:f"},
-        on_batch_drop=lambda: drops.append(1),
+        on_batch_drop=lambda truncated=False: drops.append(1),
     )
     assert len(out) == 1
     assert drops == []
@@ -136,12 +136,28 @@ def _dataset(n_units: int) -> dict:
 
 
 class _ScriptedBinding:
-    """simple_text is monkeypatched at module level; binding is opaque."""
+    """#538 migration: the call path is simple_completion now — the binding
+    carries a FakeAdapter (the test_issue532 pattern) that replays the
+    scripted responses through the real path (stop_reason included)."""
 
-    def __init__(self):  # pragma: no cover - opaque to analyze_reachability
-        self.model = "m"
-        self.adapter = None
-        self.provider_name = "anthropic"
+    def __init__(self, responses):
+        from utilities.llm import PhaseBinding
+        from tests.test_issue532_llr_resume import FakeAdapter
+        self._b = PhaseBinding(
+            phase="llm_reach", adapter=FakeAdapter(list(responses)),
+            model="m", provider_name="anthropic")
+
+    @property
+    def adapter(self):
+        return self._b.adapter
+
+    @property
+    def model(self):
+        return self._b.model
+
+    @property
+    def provider_name(self):
+        return self._b.provider_name
 
 
 def test_analyze_reachability_counts_dropped_units(tmp_path, monkeypatch):
@@ -156,13 +172,10 @@ def test_analyze_reachability_counts_dropped_units(tmp_path, monkeypatch):
     ])
     errs: list[str] = []
 
-    import utilities.llm as llm_mod
-    monkeypatch.setattr(llm_mod, "simple_text",
-                        lambda binding, prompt, **kw: next(responses))
 
     stats: dict = {}
     signals = analyze_reachability(
-        dataset, binding=_ScriptedBinding(), batch_size=2,
+        dataset, binding=_ScriptedBinding(responses), batch_size=2,
         on_error=errs.append, stats=stats)
 
     # batch 1's signal survived the drop of batch 2
@@ -173,15 +186,14 @@ def test_analyze_reachability_counts_dropped_units(tmp_path, monkeypatch):
     assert any("batch 2/2" in e and "prose/refusal" in e for e in errs), errs
 
 
-def test_analyze_reachability_stats_absent_means_uncounted(tmp_path, monkeypatch):
+def test_analyze_reachability_stats_absent_means_uncounted():
     """No stats dict → no counting (backwards-compatible call shape)."""
 
     dataset = _dataset(2)
-    import utilities.llm as llm_mod
-    monkeypatch.setattr(llm_mod, "simple_text",
-                        lambda binding, prompt, **kw: "not json at all")
-    signals = analyze_reachability(dataset, binding=_ScriptedBinding(),
-                                   batch_size=2)
+    signals = analyze_reachability(
+        dataset,
+        binding=_ScriptedBinding(["not json at all"]),
+        batch_size=2)
     assert signals == []
 
 
