@@ -1,9 +1,9 @@
 """
 Shared checkpoint utilities for resumable pipeline steps.
 
-Each LLM-heavy step (enhance, analyze, verify) can save per-unit checkpoint
-files so interrupted runs resume where they left off. The checkpoint dir
-lives next to the output file:
+Each LLM-heavy step (enhance, analyze, verify, llm_reach) can save per-unit
+checkpoint files so interrupted runs resume where they left off. The
+checkpoint dir lives next to the output file:
 
     {scan_dir}/enhance_checkpoints/
     {scan_dir}/analyze_checkpoints/
