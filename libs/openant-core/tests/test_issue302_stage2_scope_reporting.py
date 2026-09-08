@@ -212,14 +212,27 @@ def test_same_model_note():
 # the summary template instruction
 # ---------------------------------------------------------------------------
 def test_summary_template_states_stage2_scope():
-    src = (PROJECT_ROOT / "report" / "prompts" / "summary.txt").read_text()
-    assert "units_analyzed_total" in src, (
-        "the template must instruct the Stage-2 denominator line "
-        "(adjudicated N of M; the rest not re-examined)")
-    assert "downgraded" in src and "upgraded" in src, (
-        "the template must state the direction of Stage-2 changes")
-    assert "same_model_verification" in src, (
-        "the template must instruct the same-model independence caveat")
+    """#535 migration: the Stage-2 scope line moved server-side — the
+    denominator/direction pins now target the renderer; the same-model
+    independence caveat stays in the prompt (narrative)."""
+    from report.generator import _summary_statistics_block
+    stats = {"pipeline_stats": {
+        "findings_input": 4, "units_analyzed_total": 120,
+        "downgraded": 1, "upgraded": 0}}
+    block = _summary_statistics_block(stats)
+    assert "Adjudicated in Stage 2: 4 of 120 analyzed units" in block
+    assert "1 downgraded, 0 upgraded" in block
+
+def test_same_model_caveat_rendered_server_side():
+    """#535: the independence caveat is deterministic — the prompt can no
+    longer drop it (the strip-net would have deleted the model's copy)."""
+    from report.generator import _summary_statistics_block
+    block = _summary_statistics_block({"pipeline_stats": {
+        "units_analyzed": 5, "same_model_verification": True}})
+    assert "not an independent instrument" in block
+    clean = _summary_statistics_block({"pipeline_stats": {
+        "units_analyzed": 5, "same_model_verification": False}})
+    assert "independent instrument" not in clean
 
 
 def test_zero_findings_early_return_keeps_denominator():

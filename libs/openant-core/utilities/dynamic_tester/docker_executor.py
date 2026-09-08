@@ -538,6 +538,19 @@ def _run_compose(
         result.build_error = stderr if not timed_out else "Compose build timed out"
         result.stderr = stderr
         result.timed_out = timed_out
+        # #536: a failed build still tears down. The finally below covers
+        # the success path only — an early return here used to leak the
+        # images the partial build had already created (per-run UUID names
+        # like openant-<run>-<id>-<service> accumulate forever: the receipt
+        # was a post-run image matching the compose naming shape exactly).
+        # --rmi local removes the images this project built; a build that
+        # failed before ANY service built is a no-op for it.
+        _run_command(
+            compose_base + ["down", "--volumes", "--remove-orphans",
+                            "--rmi", "local"],
+            timeout=30,
+            cwd=work_dir,
+        )
         return result
 
     # Start services

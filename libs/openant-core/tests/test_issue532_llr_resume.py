@@ -538,3 +538,116 @@ class TestDeepRefuteFixes:
         s = StepCheckpoint.read_summary(cp)
         assert s["phase"] == "in_progress"
         assert s["incomplete"] >= 1
+
+
+class TestIssue538Tracker:
+    """#538: the stop-reason evidence, the cap lift, the truncation gate."""
+
+    def test_truncated_batch_evidence_and_stats(self):
+        """A max_tokens reply: the drop line names the cause; the
+        truncation counter fires; NO records persist for the batch."""
+
+        class TruncAdapter(FakeAdapter):
+            def complete(self, *, model, system, messages, max_tokens,
+                         tools=None):
+                from utilities.llm import CompletionResult, TextBlock
+                self.calls.append({"max_tokens": max_tokens})
+                return CompletionResult(
+                    content=[TextBlock('{"signals": [{"unit_id"')],
+                    input_tokens=5, output_tokens=5,
+                    stop_reason="max_tokens")
+
+        errors: List[str] = []
+        stats: dict = {}
+        analyze_reachability(
+            {"units": [_make_unit("a:f1")]},
+            binding=_binding(TruncAdapter()),
+            on_error=errors.append, stats=stats)
+        assert stats["batches_truncated"] == 1
+        assert stats["batches_dropped"] == 1
+        assert any("max_tokens" in e for e in errors)
+
+    def test_end_turn_unbalanced_not_truncated(self):
+        from utilities.llm import CompletionResult, TextBlock
+
+        class Unbalanced(FakeAdapter):
+            def complete(self, **kw):
+                return CompletionResult(
+                    content=[TextBlock('{"signals": [{"unit_id"')],
+                    input_tokens=5, output_tokens=5,
+                    stop_reason="end_turn")
+
+        stats: dict = {}
+        errors: List[str] = []
+        analyze_reachability(
+            {"units": [_make_unit("a:f1")]}, binding=_binding(Unbalanced()),
+            on_error=errors.append, stats=stats)
+        assert stats["batches_truncated"] == 0
+        assert stats["batches_dropped"] == 1
+        assert any("unbalanced" in e for e in errors)
+
+    def test_cap_is_default_not_4096(self):
+        """The private 4096 retired — the phase shares the floor cap."""
+        from utilities.llm.helpers import DEFAULT_MAX_TOKENS
+        adapter = FakeAdapter([_canned(_sig("a:f1"))])
+        analyze_reachability(
+            {"units": [_make_unit("a:f1")]}, binding=_binding(adapter))
+        assert adapter.calls[0]["max_tokens"] == DEFAULT_MAX_TOKENS
+
+    def test_truncated_reply_never_persists(self, tmp_path):
+        """(4)-primitive: even when the salvage parse SUCCEEDS on a
+        max_tokens reply, no records are written (the tail units must not
+        freeze as reviewed-no-signal)."""
+        from utilities.llm import CompletionResult, TextBlock
+
+        class TruncButValid(FakeAdapter):
+            def complete(self, **kw):
+                return CompletionResult(
+                    content=[TextBlock(_canned(_sig("a:f1")))],
+                    input_tokens=5, output_tokens=5,
+                    stop_reason="max_tokens")
+
+        cp = str(tmp_path / "llr_reach_checkpoints")
+        analyze_reachability(
+            {"units": [_make_unit("a:f1")]},
+            binding=_binding(TruncButValid()),
+            checkpoint_path=cp, tracker=FakeTracker())
+        import os
+        recs = [f for f in os.listdir(cp)
+                if f.endswith(".json") and not f.startswith("_")]
+        assert recs == [], f"a truncated reply must not persist: {recs}"
+
+
+class TestIssue538GateFold:
+    """The fable+astra fold: the salvage-success invariant — a truncated
+    reply's PARSED-PREFIX signals are never applied (applied==adopted), and
+    the truncation counts even when the salvage parse succeeds (the callback
+    never fires)."""
+
+    def test_fold_salvage_success_signals_not_applied(self):
+        """A max_tokens reply whose salvage parse WOULD succeed: the parsed
+        prefix signals must NOT reach the applied set (the applied==adopted
+        invariant — they were never persisted)."""
+        from utilities.llm import CompletionResult, TextBlock
+
+        class SalvageAdapter(FakeAdapter):
+            def complete(self, **kw):
+                # a WELL-FORMED reply (the salvage parse succeeds) but
+                # truncated per the stop reason — the fold's exact case
+                return CompletionResult(
+                    content=[TextBlock('{"signals": [{"unit_id": "a:f1", '
+                                       '"signal_kind": "input_pattern", '
+                                       '"confidence": 0.9}]}')],
+                    input_tokens=5, output_tokens=5,
+                    stop_reason="max_tokens")
+
+        stats: dict = {}
+        sigs = analyze_reachability(
+            {"units": [_make_unit("a:f1")]},
+            binding=_binding(SalvageAdapter()), stats=stats)
+        assert sigs == [], (
+            "a truncated reply's salvage-parsed signals must NOT apply "
+            "(applied==adopted)")
+        assert stats.get("batches_truncated") == 1, (
+            "the truncation counts even when the salvage parse succeeds")
+        assert stats.get("batches_dropped") == 1
