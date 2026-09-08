@@ -56,6 +56,9 @@ var (
 	scanLLMReachability             bool
 	scanLLMReachabilityMaxCodeBytes int
 	scanLibraryMode                 bool
+	scanRepoName                    string
+	scanRepoURL                     string
+	scanCommitSHA                   string
 )
 
 func init() {
@@ -65,6 +68,25 @@ func init() {
 // registerScanFlags wires the full scan-pipeline flag set onto cmd. Used by
 // scanCmd and by the thin diffCmd wrapper so that both surfaces accept the
 // same knobs.
+
+// resolveRepoMetadata merges the explicit CLI flags with the project
+// context (#539): the flag wins; the project context is the fallback; a
+// bare-path scan (nil context) uses the flags alone.
+func resolveRepoMetadata(name, url, sha string, ctx *projectContext) (string, string, string) {
+	if ctx != nil && ctx.Project != nil {
+		if name == "" && ctx.Project.Name != "" {
+			name = ctx.Project.Name
+		}
+		if url == "" && ctx.Project.RepoURL != "" {
+			url = ctx.Project.RepoURL
+		}
+		if sha == "" && ctx.Project.CommitSHA != "" {
+			sha = ctx.Project.CommitSHA
+		}
+	}
+	return name, url, sha
+}
+
 func registerScanFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVarP(&scanOutput, "output", "o", "", "Output directory (default: project scan dir or temp dir)")
 	cmd.Flags().StringVarP(&scanLanguage, "language", "l", "", languages.FlagHelp())
@@ -85,6 +107,13 @@ func registerScanFlags(cmd *cobra.Command) {
 	cmd.Flags().IntVar(&scanPR, "pr", 0, "Incremental mode against a GitHub PR number (requires gh; mutex with --diff-base)")
 	cmd.Flags().BoolVar(&scanStaged, "staged", false, "Incremental mode against the staged index vs HEAD (pre-commit hook usage; mutex with --diff-base/--pr)")
 	cmd.Flags().StringVar(&scanDiffScope, "diff-scope", "changed_functions", "Diff scope: changed_files, changed_functions, callers")
+	// #539: the repository metadata the Python CLI already accepts — a
+	// bare-path scan (the documented primary usage) resolves to a nil
+	// project context, so the metadata block below never fired and every
+	// report carried [NOT PROVIDED] with no CLI way to supply it.
+	cmd.Flags().StringVar(&scanRepoName, "repo-name", "", "Repository name (org/repo) — stamped into reports")
+	cmd.Flags().StringVar(&scanRepoURL, "repo-url", "", "Repository URL — stamped into reports")
+	cmd.Flags().StringVar(&scanCommitSHA, "commit-sha", "", "Commit SHA — stamped into reports")
 	cmd.Flags().BoolVar(&scanLLMReachability, "llm-reachability", false, "Enable the LLM reachability review stage (Opus). Surfaces entry points and external-input sites the structural pass would miss by reviewing the full codebase before the reachability filter is applied. Off by default — enabling this incurs cost proportional to total repo size, not the filtered unit count (~one Opus call per 25 units across the whole codebase).")
 	cmd.Flags().IntVar(&scanLLMReachabilityMaxCodeBytes, "llm-reachability-max-code-bytes", 1500, "Max code bytes per unit sent to the LLM reachability stage (default: 1500). Higher values (e.g. 4096, 8192) catch entry-point indicators past byte 1500 in long handlers / generated code, at proportional Opus cost increase. Only meaningful with --llm-reachability.")
 	cmd.Flags().BoolVar(&scanLibraryMode, "library-mode", false, "Seed the exported public API as reachability entry points, for a library whose public API is being dropped by the structural filter. Blunt: keeps most units — prefer letting fuzz/bin/route entry points seed reachability first.")
@@ -223,18 +252,20 @@ func runScan(cmd *cobra.Command, args []string) {
 		pyArgs = append(pyArgs, "--llm-reachability-max-code-bytes", fmt.Sprintf("%d", scanLLMReachabilityMaxCodeBytes))
 	}
 
-	// Pass repository metadata from project context so reports don't show
-	// [NOT PROVIDED] placeholders.
-	if ctx != nil && ctx.Project != nil {
-		if ctx.Project.Name != "" {
-			pyArgs = append(pyArgs, "--repo-name", ctx.Project.Name)
-		}
-		if ctx.Project.RepoURL != "" {
-			pyArgs = append(pyArgs, "--repo-url", ctx.Project.RepoURL)
-		}
-		if ctx.Project.CommitSHA != "" {
-			pyArgs = append(pyArgs, "--commit-sha", ctx.Project.CommitSHA)
-		}
+	// Pass repository metadata so reports don't show [NOT PROVIDED]
+	// placeholders. #539: an explicit flag wins; the project context is the
+	// fallback (a bare-path scan has no project context — the flags are the
+	// only way in).
+	repoName, repoURL, commitSHA := resolveRepoMetadata(
+		scanRepoName, scanRepoURL, scanCommitSHA, ctx)
+	if repoName != "" {
+		pyArgs = append(pyArgs, "--repo-name", repoName)
+	}
+	if repoURL != "" {
+		pyArgs = append(pyArgs, "--repo-url", repoURL)
+	}
+	if commitSHA != "" {
+		pyArgs = append(pyArgs, "--commit-sha", commitSHA)
 	}
 
 	result, err := python.Invoke(rt.Path, pyArgs, "", quiet, requireAPIKey())
