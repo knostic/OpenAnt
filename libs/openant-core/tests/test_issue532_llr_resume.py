@@ -616,3 +616,38 @@ class TestIssue538Tracker:
         recs = [f for f in os.listdir(cp)
                 if f.endswith(".json") and not f.startswith("_")]
         assert recs == [], f"a truncated reply must not persist: {recs}"
+
+
+class TestIssue538GateFold:
+    """The fable+astra fold: the salvage-success invariant — a truncated
+    reply's PARSED-PREFIX signals are never applied (applied==adopted), and
+    the truncation counts even when the salvage parse succeeds (the callback
+    never fires)."""
+
+    def test_fold_salvage_success_signals_not_applied(self):
+        """A max_tokens reply whose salvage parse WOULD succeed: the parsed
+        prefix signals must NOT reach the applied set (the applied==adopted
+        invariant — they were never persisted)."""
+        from utilities.llm import CompletionResult, TextBlock
+
+        class SalvageAdapter(FakeAdapter):
+            def complete(self, **kw):
+                # a WELL-FORMED reply (the salvage parse succeeds) but
+                # truncated per the stop reason — the fold's exact case
+                return CompletionResult(
+                    content=[TextBlock('{"signals": [{"unit_id": "a:f1", '
+                                       '"signal_kind": "input_pattern", '
+                                       '"confidence": 0.9}]}')],
+                    input_tokens=5, output_tokens=5,
+                    stop_reason="max_tokens")
+
+        stats: dict = {}
+        sigs = analyze_reachability(
+            {"units": [_make_unit("a:f1")]},
+            binding=_binding(SalvageAdapter()), stats=stats)
+        assert sigs == [], (
+            "a truncated reply's salvage-parsed signals must NOT apply "
+            "(applied==adopted)")
+        assert stats.get("batches_truncated") == 1, (
+            "the truncation counts even when the salvage parse succeeds")
+        assert stats.get("batches_dropped") == 1

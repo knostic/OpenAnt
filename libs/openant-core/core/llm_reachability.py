@@ -650,18 +650,40 @@ def analyze_reachability(
             on_batch_drop=_count_drop_and_flag,
             stop_reason=result.stop_reason,
         )
+        # #538 gate fold (fable+astra — the salvage-success gap): a
+        # max_tokens reply drops the batch WHOLE — the parsed prefix
+        # signals are NOT applied (the applied==adopted invariant: the
+        # signals gated the re-filter this run but were absent from the
+        # checkpoint, so a resume silently re-filtered on un-replayed
+        # state), and batches_truncated counts the truncation
+        # INDEPENDENTLY of the parse outcome (the salvage parse may
+        # succeed without the on_batch_drop callback ever firing — the
+        # counter was blind to exactly the case the gate acts on).
+        # Deduplicated: when the salvage parse DID drop (the callback
+        # fired), its counters already stand — the fold only adds the
+        # counts the callback never made.
+        _truncated = (result.stop_reason == "max_tokens")
+        if _truncated:
+            if not dropped_this_batch:
+                batches_truncated += 1
+                dropped_batches += 1
+                units_not_reviewed += len(batch)
+                print(f"[LLMReach] batch {i + 1}/{len(batches)} truncated at "
+                      f"max_tokens — dropping whole (salvage prefix discarded); "
+                      f"{len(batch)} units re-run on the next pass",
+                      file=sys.stderr)
+            continue
         signals.extend(parsed)
 
         # Persist per-unit records ONLY for a batch that completed without a
         # drop — dropped batches leave no records (absence = the retry
         # marker on the next resume). Save failures cost persistence, not
         # the pass (the stage's own advisory doctrine).
-        # #538 (4)-primitive: a max_tokens reply is NEVER persisted even
-        # when the salvage parse succeeds — a truncated batch's prefix
-        # signals must not freeze the tail units as "reviewed, no signal".
-        truncated_reply = (result.stop_reason == "max_tokens")
-        if (checkpoint is not None and not dropped_this_batch
-                and not truncated_reply):
+        # #538 (4)-primitive: a max_tokens reply NEVER reaches this block —
+        # the fold's `continue` above drops the whole batch BEFORE the
+        # persist (the applied==adopted invariant; the salvage prefix
+        # discarded). dropped_this_batch stays the parse-drop marker.
+        if (checkpoint is not None and not dropped_this_batch):
             batch_usage = {}
             if tracker is not None:
                 try:
