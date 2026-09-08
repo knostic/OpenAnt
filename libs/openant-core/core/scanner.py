@@ -898,7 +898,15 @@ def scan_repository(
                         # #538: the truncation subclass — the diagnosis
                         # lever for the deferred-recovery tracker.
                         "batches_truncated": reach_stats.get("batches_truncated", 0),
+                        # #541: the provider-exception class — the coverage
+                        # truth the parse-path-only counters missed.
+                        "batches_failed": reach_stats.get("batches_failed", 0),
                         "units_not_reviewed": reach_stats.get("units_not_reviewed", 0),
+                        # #541 (the refute round): the #285/#376 partial-
+                        # status contract — dropped + failed batches make
+                        # the STEP read partial, never success/0/0.
+                        "error_count": (reach_stats.get("batches_dropped", 0)
+                                        + reach_stats.get("batches_failed", 0)),
                     }
                     ctx.outputs = {"signals_path": signals_path}
 
