@@ -895,6 +895,9 @@ def scan_repository(
                         # counts what was SENT for review, not what was
                         # actually reviewed.
                         "batches_dropped": reach_stats.get("batches_dropped", 0),
+                        # #538: the truncation subclass — the diagnosis
+                        # lever for the deferred-recovery tracker.
+                        "batches_truncated": reach_stats.get("batches_truncated", 0),
                         "units_not_reviewed": reach_stats.get("units_not_reviewed", 0),
                     }
                     ctx.outputs = {"signals_path": signals_path}
