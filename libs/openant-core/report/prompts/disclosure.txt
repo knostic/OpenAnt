@@ -55,6 +55,10 @@ Verified via {"dynamic testing" if dynamic_testing else "dynamic test FAILED (st
 
 INSTRUCTIONS:
 - Keep summary under 50 words
+- If the vulnerability data includes a "verification_explanation" field, the
+  Summary and Steps to Reproduce must not assert reachability of any path that
+  explanation describes as gated or conditional — state the precondition it
+  names instead.
 - Do NOT include a "## Vulnerable Code" section — it is added automatically after your output is generated. Do NOT emit code fences with the vulnerable source code. If you need to reference the vulnerable code, refer to the function name and describe the issue in prose.
 - Other code snippets (Suggested Fix): show only the minimal change needed, not entire files
 - Steps to Reproduce: if dynamic_testing data exists, use those steps; if only dynamic_testing_attempted exists (the test ran but did not confirm), still write "[REQUIRES DYNAMIC TESTING]" — the attempted evidence is diagnostic, not a reproduction; otherwise write "[REQUIRES DYNAMIC TESTING]" for each step

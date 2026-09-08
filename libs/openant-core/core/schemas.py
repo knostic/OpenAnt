@@ -421,6 +421,38 @@ class DynamicTestStepResult:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def step_summary(self) -> dict:
+        return dynamic_test_step_summary(self)
+
+
+def dynamic_test_step_summary(result: "DynamicTestStepResult") -> dict:
+    """The dynamic-test step-report summary (#533; the #300 verify pattern).
+
+    Shared by every construction site — core/scanner.py (the pipeline) and
+    openant/cli.py's standalone ``openant dynamic-test`` — so the sites
+    cannot drift. ``error_count`` is the #285/#376 partial-status contract's
+    well-typed int (``step_report.py`` derives ``partial`` from it and from
+    the ctx error list, never from ``summary["errors"]``); the ``errors``
+    key is retained as the persisted display contract (an int count here —
+    do NOT widen the status contract to read it: the same word is a list of
+    strings one level up on StepReport itself).
+
+    Reconciliation bound (the verify precedent): ``confirmed + not_reproduced
+    + blocked + inconclusive + errors <= findings_tested`` — the gap is the
+    language-SKIPPED rows (and any restored row whose persisted status falls
+    outside the five counted words); restored checkpoints ARE counted into
+    their buckets, and SKIPPED rows are deliberately not counted as errors.
+    """
+    return {
+        "findings_tested": result.findings_tested,
+        "confirmed": result.confirmed,
+        "not_reproduced": result.not_reproduced,
+        "blocked": result.blocked,
+        "inconclusive": result.inconclusive,
+        "errors": result.errors,
+        "error_count": result.errors,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Step Report — written as {step}.report.json by every pipeline step
