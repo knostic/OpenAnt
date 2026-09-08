@@ -616,12 +616,47 @@ def build_pipeline_output(
                         _vs["same_model_verification"])
             break
 
+    # #535: re-source the Stage-1 population facts from the step reports
+    # (the same pattern as _verify_scope). units_analyzed's old formula
+    # (total_units - metrics.errors) is exact on the analyze-only path but
+    # contaminated whenever verify ran: results_verified's recount buckets a
+    # Stage-2 verify ERROR on an already-analyzed unit into `errors`, so a
+    # 120-analyzed run with one verify error reported 119 analyzed. The
+    # analyze step report's own `analyzed` is the authoritative Stage-1
+    # count. parsed_units: the parse stage's total (the pre-filter
+    # population — original_units is NOT a reliable parse count; it falls
+    # back to total_units when no reachability record exists).
+    _stage1_stats: dict = {}
+    for sr in (step_reports or []):
+        _ss = sr.get("summary")
+        if not isinstance(_ss, dict):
+            continue
+        if sr.get("step") == "parse":
+            if isinstance(_ss.get("total_units"), int) and not isinstance(
+                    _ss.get("total_units"), bool):
+                _stage1_stats["parsed_units"] = _ss["total_units"]
+        elif sr.get("step") == "analyze":
+            # #535: analyzed is flat; the error count lives under
+            # error_count (the #285 key) with verdicts.errors nested —
+            # the flat `errors` key has no producer here.
+            if isinstance(_ss.get("analyzed"), int) and not isinstance(
+                    _ss.get("analyzed"), bool):
+                _stage1_stats["units_analyzed"] = _ss["analyzed"]
+            _err = _ss.get("error_count")
+            if not isinstance(_err, int) or isinstance(_err, bool):
+                _v = _ss.get("verdicts")
+                _err = _v.get("errors") if isinstance(_v, dict) else None
+            if isinstance(_err, int) and not isinstance(_err, bool):
+                _stage1_stats["stage1_errors"] = _err
+
     if step_reports:
         for sr in step_reports:
             step = sr.get("step", "unknown")
-            if sr.get("cost_usd"):
+            # #535: `is not None` — a $0 or <0.5s step is a REAL step
+            # (parse), not an absence; truthiness dropped it from the tables.
+            if sr.get("cost_usd") is not None:
                 costs[step] = {"actual": sr["cost_usd"]}
-            if sr.get("duration_seconds"):
+            if sr.get("duration_seconds") is not None:
                 durations[step] = sr["duration_seconds"]
 
     # Populate skipped_steps from the authoritative ScanResult skip data. The
@@ -767,7 +802,17 @@ def build_pipeline_output(
             **_reach_telemetry,
 
             **_verify_scope,
-            "units_analyzed": total_units - metrics.get("errors", 0),
+            # #535: units_analyzed re-sourced from the analyze step report
+            # (see _stage1_stats above). Fallback: with no analyze report and
+            # no verify report, the analyze-only formula is exact; with
+            # verify having run, the subtraction is contaminated — omit
+            # (present-only) rather than emit a wrong integer. The rest of
+            # _stage1_stats (parsed_units, stage1_errors) ALWAYS spreads.
+            **_stage1_stats,
+            **({"units_analyzed":
+                    total_units - metrics.get("errors", 0)}
+               if "units_analyzed" not in _stage1_stats
+               and not _verify_scope else {}),
             "processing_level": processing_level,
             "costs": costs,
             "durations": durations,
