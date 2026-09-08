@@ -25,6 +25,7 @@ from pathlib import Path
 
 from core.schemas import (
     ScanResult, AnalysisMetrics, StepReport, verify_step_summary,
+    dynamic_test_step_summary,
 )
 from core.step_report import step_context
 from core import tracking
@@ -1262,14 +1263,7 @@ def scan_repository(
                         repo_path=repo_path,
                     )
 
-                    ctx.summary = {
-                        "findings_tested": dt_result.findings_tested,
-                        "confirmed": dt_result.confirmed,
-                        "not_reproduced": dt_result.not_reproduced,
-                        "blocked": dt_result.blocked,
-                        "inconclusive": dt_result.inconclusive,
-                        "errors": dt_result.errors,
-                    }
+                    ctx.summary = dynamic_test_step_summary(dt_result)
                     ctx.outputs = {
                         "results_json_path": dt_result.results_json_path,
                         "results_md_path": dt_result.results_md_path,
