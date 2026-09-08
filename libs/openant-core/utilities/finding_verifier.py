@@ -728,6 +728,7 @@ class FindingVerifier:
         results_to_verify = []
         _restored_ok = 0
         _restored_incomplete = 0
+        _errored_retried = 0
         for r in results:
             key = r.get("unit_id") or r.get("route_key", "unknown")
             cp_data = checkpointed.get(key)
@@ -750,13 +751,15 @@ class FindingVerifier:
             else:
                 # Either no checkpoint, or an errored one — re-verify
                 results_to_verify.append(r)
+                if cp_data:
+                    _errored_retried += 1
 
         if _restored_ok or _restored_incomplete:
             print(f"[Verify] Restored {_restored_ok + _restored_incomplete} findings "
                   f"from checkpoints", file=sys.stderr, flush=True)
             if restored_callback:
                 restored_callback(_restored_ok + _restored_incomplete)
-        errored_retries = len(checkpointed) - _restored_ok - _restored_incomplete
+        errored_retries = _errored_retried
         if errored_retries:
             print(f"[Verify] Retrying {errored_retries} previously errored findings",
                   file=sys.stderr, flush=True)
@@ -832,9 +835,16 @@ class FindingVerifier:
                                          usage=_usage_dict(), incomplete=_summary_incomplete)
 
         remaining = len(results_to_verify)
+        # #542 (the #435 family, PR #472's verify sibling): "already done"
+        # derives from the RESTORED-COMPLETE counts, not the raw checkpoint
+        # store — the store includes the errored rows being re-queued, so
+        # the old line narrated "3 to verify (3 already done)" over a
+        # population of 4 (1 complete + 2 being retried). Done + remaining
+        # must reconcile to the findings population.
+        _done = _restored_ok + _restored_incomplete
         mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
         print(f"[Verify] Mode: {mode}, {remaining} findings to verify "
-              f"({len(checkpointed)} already done)", file=sys.stderr, flush=True)
+              f"({_done} already done)", file=sys.stderr, flush=True)
 
         if workers <= 1:
             self._verify_batch_sequential(
