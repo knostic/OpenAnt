@@ -839,9 +839,15 @@ def _response_to_unified(
         # the taxonomy instead of letting an IndexError escape unmapped
         # (mirrors the Gemini empty-``candidates`` guard); for a security
         # tool an empty end_turn would read as a clean, passing result.
+        _usage = getattr(response, "usage", None)
         raise LLMResponseError(
             f"{adapter} returned no choices (empty completion); the request "
-            "may have been filtered or the response was malformed"
+            "may have been filtered or the response was malformed",
+            # #537: same as the empty-content guard below — the rejected
+            # reply's usage travels (the sibling site of this class).
+            input_tokens=getattr(_usage, "prompt_tokens", 0) if _usage else 0,
+            output_tokens=(getattr(_usage, "completion_tokens", 0)
+                           if _usage else 0),
         )
     choice = choices[0]
     message = choice.message
@@ -904,10 +910,17 @@ def _response_to_unified(
     # here because ``content_blocks`` is non-empty. Refusal/content_filter is the
     # more specific signal and already raised above.
     if not content_blocks:
+        _usage = getattr(response, "usage", None)
         raise LLMResponseError(
             f"{adapter} returned an empty completion (no text or tool calls; "
             f"finish_reason={raw_finish!r}); the request may have been "
-            "filtered or the response was malformed"
+            "filtered or the response was malformed",
+            # #537: the rejected reply's usage travels ON the error —
+            # the raise used to fire before the usage read, discarding
+            # tokens the provider may already have billed.
+            input_tokens=getattr(_usage, "prompt_tokens", 0) if _usage else 0,
+            output_tokens=(getattr(_usage, "completion_tokens", 0)
+                           if _usage else 0),
         )
 
     if raw_finish not in _OPENAI_FINISH_REASONS:

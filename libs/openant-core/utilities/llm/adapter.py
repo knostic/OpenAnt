@@ -271,7 +271,19 @@ class LLMResponseError(LLMError):
     requires (e.g. missing usage block, malformed tool_use). Distinct
     from connection errors and rate limits so the pipeline can decide
     whether to retry.
+
+    #537: carries the REJECTED reply's usage when the provider supplied it
+    (a rejected call the provider billed must not vanish from accounting).
+    Zeroes when the failure predates a usage block (a transport error or
+    a refusal raised before the response parsed) — those are never billed
+    as completions by construction.
     """
+
+    def __init__(self, message: str, *,
+                 input_tokens: int = 0, output_tokens: int = 0):
+        super().__init__(message)
+        self.input_tokens = int(input_tokens or 0)
+        self.output_tokens = int(output_tokens or 0)
 
 
 class LLMRefusalError(LLMResponseError):
