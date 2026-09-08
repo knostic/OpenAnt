@@ -779,7 +779,7 @@ def cmd_build_output(args):
 def cmd_dynamic_test(args):
     """Run Docker-isolated dynamic exploit testing."""
     from core.dynamic_tester import run_tests
-    from core.schemas import success, error
+    from core.schemas import success, error, dynamic_test_step_summary
     from core.step_report import step_context
     from core import tracking
 
@@ -800,14 +800,7 @@ def cmd_dynamic_test(args):
                 llm_config_name=args.llm_config,
             )
 
-            ctx.summary = {
-                "findings_tested": result.findings_tested,
-                "confirmed": result.confirmed,
-                "not_reproduced": result.not_reproduced,
-                "blocked": result.blocked,
-                "inconclusive": result.inconclusive,
-                "errors": result.errors,
-            }
+            ctx.summary = dynamic_test_step_summary(result)
             ctx.outputs = {
                 "results_json_path": result.results_json_path,
                 "results_md_path": result.results_md_path,

@@ -376,6 +376,8 @@ def analyze_reachability(
     max_units: Optional[int] = None,
     on_error: Optional[Callable[[str], None]] = None,
     stats: Optional[Dict[str, int]] = None,
+    checkpoint_path: Optional[str] = None,
+    tracker: Optional[Any] = None,
 ) -> List[ReachabilitySignal]:
     """Run the LLM reachability review stage over a parsed dataset.
 
@@ -428,14 +430,19 @@ def analyze_reachability(
         probe_registry_or_raise(registry)
         binding = registry.get("llm_reach")
 
-    valid_ids = {u.get("id") for u in units if u.get("id")}
-
     # Lazy import so this module stays usable when callers explicitly
     # provide a binding and never want the registry fallback above.
     from utilities.llm import LLMAuthError, simple_text
 
+    # #532 (review-wave fix): the usage machinery must be live in PRODUCTION —
+    # resolve the global tracker when the caller doesn't pass one (the family
+    # pattern; without this, records persist zero usage and the restored-cost
+    # contract is dead outside tests).
+    if tracker is None:
+        from utilities.llm_client import get_global_tracker
+        tracker = get_global_tracker()
+
     signals: List[ReachabilitySignal] = []
-    batches = _chunk(units, batch_size)
     # #294: count parse-level batch drops and the units they carried —
     # a dropped batch is a coverage gap in the most consequential direction
     # (this stage decides which units are analyzed at all), and previously
@@ -443,12 +450,153 @@ def analyze_reachability(
     # in which some units were never reviewed.
     dropped_batches = 0
     units_not_reviewed = 0
+
+    # ------------------------------------------------------------------
+    # #532: resume/adopt machinery — the checkpoint family's own pattern
+    # (analyzer.py's StepCheckpoint + backend-identity gate).
+    #   * per-unit records {"signals", "projection_sha", "usage"} — a
+    #     "reviewed, no signal" outcome IS a record (the majority case);
+    #   * the KEY is backend-identity only (model/provider/adapter/base_url/
+    #     static template rendered with app_context=None) — app-context
+    #     CONTENT is deliberately excluded (it regenerates non-determinis-
+    #     tically every scan; content-keying = a guaranteed re-pay — the
+    #     backend_identity ~17k-token lesson at LLR prices);
+    #   * projection_sha = unit_type + trimmed code: a body edit under the
+    #     same id re-runs (closes the family's path-only residual for the
+    #     phase where it is most FN-severe);
+    #   * dropped/exception batches leave NO records — absence IS the retry
+    #     marker (no frozen coverage gaps, no error records the #311
+    #     summary-vs-status drift class would miscount);
+    #   * adopted SIGNALS (not promotion outcomes) — apply_signals still
+    #     runs over them under the CURRENT promotion policy.
+    # ------------------------------------------------------------------
+    checkpoint = None
+    adopted: Dict[str, dict] = {}
+    units_to_run = units
+    if checkpoint_path is not None:
+        import hashlib
+        import os as _os
+
+        from core.backend_identity import (
+            fingerprint_for_binding,
+            render_template_texts,
+        )
+        from core.checkpoint import StepCheckpoint
+
+        def _projection_sha(unit: dict) -> str:
+            # Hash EXACTLY the bytes the prompt sends: the same
+            # _unit_for_prompt projection build_prompt uses (golden
+            # invariant by construction). is_entry_point / reachable are
+            # excluded because they are CONSTANT at this stage's input in
+            # the scanner path — parse runs at level "all" under
+            # --llm-reachability (parser_adapter.py:688-690 skips the
+            # filter), so the flags arrive False/None every run; the
+            # re-parsed dataset overwrites any mutation before the next
+            # pass reads it (scanner.py:391-399). A parser that stamped
+            # the flags itself would carry them across a flip — named
+            # residual. Null/non-str fields coerce to "" — a malformed
+            # unit must cost this hash one line, never the whole stage
+            # (deep-refute 2026-09-08: TypeError here skipped LLR).
+            p = _unit_for_prompt(unit, max_code_bytes=max_code_bytes)
+            body = str(p.get("unit_type") or "") + "\n" + str(p.get("code") or "")
+            return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+
+        try:
+            checkpoint = StepCheckpoint("llm_reach", _os.path.dirname(checkpoint_path))
+            checkpoint.dir = checkpoint_path
+            # I2 adopt gate: BEFORE loading prior checkpoints, verify the backend
+            # identity that produced them matches (a changed model/provider/
+            # adapter/template archives the stale dir and forces a re-run).
+            llr_fp = fingerprint_for_binding(
+                binding,
+                render_template_texts([
+                    lambda: PROMPT_TEMPLATE.format(
+                        app_context_block=_build_app_context_block(None),
+                        units_block="",
+                    )
+                ]),
+            )
+            checkpoint.sync_identity(llr_fp)
+            prior_records = checkpoint.load()
+        except OSError as exc:
+            # The save doctrine applies to the whole persistence block: an
+            # unwritable/absent checkpoint dir costs persistence, never the
+            # pass — run this stage without checkpointing rather than skip it.
+            if on_error:
+                on_error(f"llm_reach checkpoint init failed, running unpersisted: {exc}")
+            else:
+                print(f"[LLMReach] checkpoint init failed, running unpersisted: {exc}",
+                      file=sys.stderr)
+            checkpoint = None
+            prior_records = {}
+        if checkpoint is not None:
+            current_sha = {u.get("id"): _projection_sha(u) for u in units}
+            for uid, rec in prior_records.items():
+                if (uid not in current_sha or not isinstance(rec, dict)
+                        or rec.get("projection_sha") != current_sha[uid]):
+                    continue
+                try:
+                    rec_sigs = [ReachabilitySignal(**s)
+                                for s in (rec.get("signals") or [])]
+                except TypeError:
+                    # Malformed prior record — never adopt it; the unit re-runs.
+                    continue
+                adopted[uid] = rec
+                signals.extend(rec_sigs)
+            units_to_run = [u for u in units if u.get("id") not in adopted]
+            if stats is not None:
+                stats["units_adopted"] = len(adopted)
+            # Family lifecycle (deep-refute 2026-09-08): an in_progress
+            # summary at PASS START, exactly as analyzer.py:719-722 does —
+            # a run killed mid-loop after a prior completed pass must NOT
+            # leave a stale phase="done" summary behind (the Go resume
+            # sweep reads it and would suppress the fresh/resume prompt
+            # entirely, checkpoint.go:115-116).
+            try:
+                checkpoint.write_summary(
+                    total_units=len(units),
+                    completed=len(adopted),
+                    errors=0,
+                    error_breakdown={},
+                    phase="in_progress",
+                    usage=None,
+                    incomplete=max(0, len(units) - len(adopted)),
+                )
+            except OSError:
+                pass
+            # Restored cost lands as PRIOR usage — never zero, never this run's
+            # new spend (the #26/#26b kill-vs-complete asymmetry lessons).
+            if adopted and tracker is not None:
+                tot_in = sum(int((r.get("usage") or {}).get("input_tokens", 0) or 0)
+                             for r in adopted.values())
+                tot_out = sum(int((r.get("usage") or {}).get("output_tokens", 0) or 0)
+                              for r in adopted.values())
+                tot_cost = sum(float((r.get("usage") or {}).get("cost_usd", 0) or 0)
+                               for r in adopted.values())
+                unpriced: set = set()
+                for r in adopted.values():
+                    unpriced.update(
+                        (r.get("usage") or {}).get("unpriced_models") or [])
+                try:
+                    tracker.add_prior_usage(
+                        tot_in, tot_out, tot_cost,
+                        unpriced_models=sorted(unpriced) or None)
+                except Exception:  # noqa: BLE001 — accounting must never kill the pass
+                    pass
+
+    batches = _chunk(units_to_run, batch_size)
+    persisted = 0
     for i, batch in enumerate(batches):
         prompt = build_prompt(
             batch, app_context=app_context, max_code_bytes=max_code_bytes
         )
+        if tracker is not None:
+            try:
+                tracker.start_unit_tracking()
+            except Exception:  # noqa: BLE001
+                pass
         try:
-            text = simple_text(binding, prompt, max_tokens=4096)
+            text = simple_text(binding, prompt, max_tokens=4096, tracker=tracker)
         except LLMAuthError:
             # Auth failures are fatal and recur on every batch — surface
             # them instead of burying them as a per-batch "failed" line,
@@ -462,19 +610,101 @@ def analyze_reachability(
                 print(f"[LLMReach] {msg}", file=sys.stderr)
             continue
 
-        def _count_drop(batch=batch):
-            nonlocal dropped_batches, units_not_reviewed
-            dropped_batches += 1
-            units_not_reviewed += len(batch)
-
+        # #532 (disclosed behavior change): valid ids are PER-BATCH, so a
+        # signal for a unit outside the producing batch is ungrounded by
+        # construction — under persistence, adopted state must equal
+        # applied state (an out-of-batch signal would apply this run but
+        # never persist).
+        batch_ids = {u.get("id") for u in batch if u.get("id")}
         first = batch[0].get("id", "?") if batch else "?"
         last = batch[-1].get("id", "?") if batch else "?"
+        dropped_this_batch = False
+
+        def _count_drop_and_flag(batch=batch):
+            nonlocal dropped_batches, units_not_reviewed, dropped_this_batch
+            dropped_batches += 1
+            units_not_reviewed += len(batch)
+            dropped_this_batch = True
+
         parsed = parse_response(
-            text, valid_unit_ids=valid_ids, on_error=on_error,
+            text, valid_unit_ids=batch_ids, on_error=on_error,
             batch_label=f"batch {i + 1}/{len(batches)}, units {first}..{last}",
-            on_batch_drop=_count_drop,
+            on_batch_drop=_count_drop_and_flag,
         )
         signals.extend(parsed)
+
+        # Persist per-unit records ONLY for a batch that completed without a
+        # drop — dropped batches leave no records (absence = the retry
+        # marker on the next resume). Save failures cost persistence, not
+        # the pass (the stage's own advisory doctrine).
+        if checkpoint is not None and not dropped_this_batch:
+            batch_usage = {}
+            if tracker is not None:
+                try:
+                    batch_usage = tracker.get_unit_usage() or {}
+                except Exception:  # noqa: BLE001
+                    batch_usage = {}
+            n_units = max(len(batch), 1)
+
+            def _share(units_in_batch: int) -> dict:
+                share = {
+                    "input_tokens": int(batch_usage.get("input_tokens", 0) or 0) // units_in_batch,
+                    "output_tokens": int(batch_usage.get("output_tokens", 0) or 0) // units_in_batch,
+                    "cost_usd": round(float(batch_usage.get("cost_usd", 0.0) or 0.0) / units_in_batch, 6),
+                }
+                # #216: the incomplete-cost marker travels with the record so
+                # a resume restores it (the family's analyzer contract).
+                if batch_usage.get("unpriced_models"):
+                    share["cost_incomplete"] = True
+                    share["unpriced_models"] = sorted(
+                        set(batch_usage["unpriced_models"]))
+                return share
+
+            sig_by_unit: Dict[str, List[dict]] = {}
+            for s in parsed:
+                sig_by_unit.setdefault(s.unit_id, []).append({
+                    "unit_id": s.unit_id, "kind": s.kind,
+                    "confidence": s.confidence, "reason": s.reason,
+                })
+            for u in batch:
+                uid = u.get("id")
+                if not uid:
+                    continue
+                try:
+                    checkpoint.save(uid, {
+                        "signals": sig_by_unit.get(uid, []),
+                        "projection_sha": current_sha[uid],
+                        "usage": _share(n_units),
+                    })
+                    persisted += 1
+                except OSError as exc:
+                    if on_error:
+                        on_error(f"llm_reach checkpoint save failed for {uid}: {exc}")
+                    else:
+                        print(f"[LLMReach] checkpoint save failed for {uid}: {exc}",
+                              file=sys.stderr)
+
+    if checkpoint is not None:
+        try:
+            completed = len(adopted) + persisted
+            # #293 three-state invariant: completed + incomplete + errors ==
+            # total_units. Un-reviewed units (dropped/exception batches —
+            # absence IS their retry marker) are the `incomplete` bucket,
+            # NOT summary errors (#311 drift class); the phase stays
+            # "in_progress" until every unit has a record.
+            incomplete = max(0, len(units) - completed)
+            checkpoint.write_summary(
+                total_units=len(units),
+                completed=completed,
+                errors=0,
+                error_breakdown={},
+                phase="done" if completed == len(units) else "in_progress",
+                usage=None,
+                incomplete=incomplete,
+            )
+        except OSError as exc:
+            if on_error:
+                on_error(f"llm_reach checkpoint summary write failed: {exc}")
 
     if stats is not None:
         stats["batches_dropped"] = dropped_batches
