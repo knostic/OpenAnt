@@ -658,22 +658,28 @@ def generate_summary_report(
     # Splice the server blocks AFTER the model's H1/metadata block (the
     # banners may precede the title; whole H2 sections may not — the #535
     # review round: prepending put four tables above the document title).
+    # The gate fold (fable+astra, the m.start()>0 inversion): the
+    # H1-at-offset-0 canonical reply took the prepend branch — the tables
+    # rendered ABOVE the title. The boundary is normalized instead: find
+    # the first heading; skip its line and any following non-heading
+    # metadata lines; insert before the NEXT heading (or the end when the
+    # metadata block runs to the end). EVERY shape — H1 at 0, banners
+    # before the H1, metadata after, metadata-only-to-the-end — inserts
+    # AFTER the metadata block, never above the title.
     import re as _re
     m = _re.search(r"^#{1,2} ", text, flags=_re.M)
-    if m and m.start() > 0:
-        insert_at = m.start()
-        # skip past the heading line and any metadata lines that follow
-        line_end = text.index("\n", insert_at) if "\n" in text[insert_at:] else len(text)
-        # insert before the NEXT heading or after the first paragraph
+    if m:
+        line_end = text.index("\n", m.start()) if "\n" in text[m.start():] else len(text)
         m2 = _re.search(r"^#{1,2} ", text[line_end:], flags=_re.M)
-        insert_at = line_end + (m2.start() if m2 else 0)
+        insert_at = line_end + (m2.start() if m2 else len(text) - line_end)
         text = text[:insert_at] + server_blocks + text[insert_at:]
-    elif m:
-        text = server_blocks + text
     else:
-        text = (_context_provenance_header(pipeline_data)
-                + _reachability_header(pipeline_data)
-                + server_blocks + text)
+        # No heading at all: the fallback document gets a canonical title
+        # (the banners + tables, then the model prose) — the banners
+        # prepend EXACTLY ONCE here (the old path prepended them twice:
+        # once in this branch and once in the unconditional prepend below).
+        text = (server_blocks + text)
+    # The banners prepend exactly once, unconditionally, at the very top.
     text = (_context_provenance_header(pipeline_data)
             + _reachability_header(pipeline_data) + text)
     return text, _extract_usage(

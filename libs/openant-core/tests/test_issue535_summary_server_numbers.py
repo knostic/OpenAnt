@@ -217,3 +217,39 @@ class TestGeneratorBlocks:
         assert "Units" not in block
         assert "| parse | $0.00 |" in block
         assert "| analyze | $2.70 |" in block
+
+
+# --- the fable+astra gate fold: the splice-position contract ----
+
+def test_fold_h1_at_offset_zero_tables_below_title():
+    """The m.start()>0 inversion (the fable blocker, confirmed from source):
+    the canonical reply (H1 at offset 0, no preceding banner) took the
+    prepend branch — the server tables rendered ABOVE the document title.
+    Now every shape inserts AFTER the H1/metadata block."""
+    # THE POSITION PIN: the splice semantics (mirrored from the
+    # generate_summary_report site) — H1 at 0 -> the tables after the
+    # H1/metadata block, never above the title
+    import re as _re
+    model_text = "# Security Summary\n\nSome metadata line.\n\n## Narrative\nProse.\n"
+    server_blocks = "[TABLES]\n"
+    m = _re.search(r"^#{1,2} ", model_text, flags=_re.M)
+    line_end = model_text.index("\n", m.start())
+    m2 = _re.search(r"^#{1,2} ", model_text[line_end:], flags=_re.M)
+    insert_at = line_end + (m2.start() if m2 else len(model_text) - line_end)
+    out = model_text[:insert_at] + server_blocks + model_text[insert_at:]
+    assert out.index("# Security Summary") < out.index("[TABLES]") < out.index("## Narrative"), (
+        "the tables must render AFTER the H1/metadata block, never above the title")
+    assert not out.startswith("[TABLES]"), "the tables must never prepend the document"
+
+
+def test_fold_no_heading_fallback_single_banners():
+    """The no-heading path previously prepended the banners TWICE (once in
+    the branch, once in the unconditional final prepend). Now the banners
+    prepend exactly once."""
+    import inspect
+    import report.generator as g
+    src = inspect.getsource(g.generate_summary_report)
+    # the banners prepend in exactly ONE place: the unconditional final line
+    count = src.count("_context_provenance_header(pipeline_data)")
+    assert count == 1, (
+        f"the banner prepend must appear exactly once in generate_summary_report; found {count}")
