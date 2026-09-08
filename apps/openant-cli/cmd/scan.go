@@ -69,10 +69,18 @@ func init() {
 // scanCmd and by the thin diffCmd wrapper so that both surfaces accept the
 // same knobs.
 
-// resolveRepoMetadata merges the explicit CLI flags with the project
-// context (#539): the flag wins; the project context is the fallback; a
-// bare-path scan (nil context) uses the flags alone.
-func resolveRepoMetadata(name, url, sha string, ctx *projectContext) (string, string, string) {
+// resolveRepoMetadata merges the explicit CLI flags, the project context,
+// and the git-detected working-tree HEAD (#539 + #557): the flag wins; the
+// project context is the middle tier; a bare-path scan of a git checkout
+// falls to detection (a nil context is the #539 primary usage; a non-git
+// path detects empty and keeps whatever the earlier tiers supplied).
+// The returned warn is non-empty when the winning SHA disagrees with the
+// detected HEAD (an explicit flag in a CI synthetic-merge checkout is
+// legitimate; a stale project SHA is the footgun — the caller prints it).
+// The "nogit" sentinel (init records it for non-repo paths) is treated as
+// empty so it never flows into permalinks or SARIF revisionIds.
+func resolveRepoMetadata(name, url, sha string, ctx *projectContext, detectedSHA string) (string, string, string, string) {
+	flaggedSHA := sha != ""
 	if ctx != nil && ctx.Project != nil {
 		if name == "" && ctx.Project.Name != "" {
 			name = ctx.Project.Name
@@ -80,11 +88,27 @@ func resolveRepoMetadata(name, url, sha string, ctx *projectContext) (string, st
 		if url == "" && ctx.Project.RepoURL != "" {
 			url = ctx.Project.RepoURL
 		}
-		if sha == "" && ctx.Project.CommitSHA != "" {
+		if sha == "" && ctx.Project.CommitSHA != "" &&
+			ctx.Project.CommitSHA != "nogit" {
 			sha = ctx.Project.CommitSHA
 		}
 	}
-	return name, url, sha
+	if sha == "" && detectedSHA != "" {
+		sha = detectedSHA
+	}
+	warn := ""
+	if detectedSHA != "" && sha != detectedSHA {
+		warn = fmt.Sprintf(
+			"report will stamp commit %s but the working tree is at %s; "+
+				"the scan runs on the working tree, not the stamped commit",
+			sha, detectedSHA)
+		if !flaggedSHA {
+			// The project tier supplied a SHA init recorded — a moved tree,
+			// not a deliberate CI override. The remedy: re-run init.
+			warn += " (re-run `openant init` to refresh the project SHA)"
+		}
+	}
+	return name, url, sha, warn
 }
 
 func registerScanFlags(cmd *cobra.Command) {
@@ -256,8 +280,16 @@ func runScan(cmd *cobra.Command, args []string) {
 	// placeholders. #539: an explicit flag wins; the project context is the
 	// fallback (a bare-path scan has no project context — the flags are the
 	// only way in).
-	repoName, repoURL, commitSHA := resolveRepoMetadata(
-		scanRepoName, scanRepoURL, scanCommitSHA, ctx)
+	// #557: detection runs AFTER resolveScanMode (the --pr path checks
+	// out the PR head in mode.go's FetchPR — scan.go:178) — hoisting this
+	// above would stamp the pre-checkout SHA (the review round's ordering
+	// hazard).
+	detectedSHA := git.HeadSHA(repoPath)
+	repoName, repoURL, commitSHA, metadataWarn := resolveRepoMetadata(
+		scanRepoName, scanRepoURL, scanCommitSHA, ctx, detectedSHA)
+	if metadataWarn != "" {
+		output.PrintWarning(metadataWarn)
+	}
 	if repoName != "" {
 		pyArgs = append(pyArgs, "--repo-name", repoName)
 	}

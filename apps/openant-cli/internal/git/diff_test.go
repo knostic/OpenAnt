@@ -405,9 +405,9 @@ func TestHunkHeaderRegex(t *testing.T) {
 		wantCount int // 0 = no match expected
 	}{
 		{"@@ -1,3 +1,5 @@", 1, 5},
-		{"@@ -10 +20 @@", 20, 1},          // implicit count=1
+		{"@@ -10 +20 @@", 20, 1}, // implicit count=1
 		{"@@ -5,0 +12,3 @@", 12, 3},
-		{"@@ -5,2 +0,0 @@", 0, 0},          // pure deletion — count=0
+		{"@@ -5,2 +0,0 @@", 0, 0}, // pure deletion — count=0
 		{"not a hunk header", 0, 0},
 	}
 	for _, c := range cases {

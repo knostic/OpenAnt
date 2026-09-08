@@ -36,6 +36,24 @@ func gitRevParse(repoPath, ref string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// HeadSHA returns the working-tree HEAD commit of the repo at repoPath, or
+// "" when the path is not inside a git work tree (a bare-path scan of a
+// non-repo directory is legal; the caller treats "" as "not detected").
+// It deliberately reads HEAD rather than any requested ref — #557's
+// metadata tier mirrors the incremental manifest's head_sha semantics
+// (the tree that will actually be scanned), never a checkout intent.
+func HeadSHA(repoPath string) string {
+	// An unborn repo (a fresh `git init`) errors here (rev-parse HEAD:
+	// ambiguous argument) — the empty return covers it; no zero-id is
+	// ever emitted, so no zero-guard is needed (the review round's catch:
+	// the earlier zero-id comment was a false claim about git).
+	out, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // CurrentBranch returns the name of the branch HEAD points at, or "" if
 // HEAD is detached. Callers treat the empty result as "no branch info" —
 // it is informational metadata, not load-bearing.
