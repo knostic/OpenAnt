@@ -145,3 +145,60 @@ class TestDeterministicHeader:
         header = _disclosure_verdict_header(data)
         banner_lines = [l for l in header.split("\n") if l.strip()]
         assert all(l.startswith(">") for l in banner_lines), header
+
+
+# --- the fable+astra gate folds (the consistency provenance + the containment) ----
+
+def _base_vd(explanation="Model analysis of the finding."):
+    """The vulnerability_data dict the banner consumes, with a
+    verification_explanation present (the #534 shape)."""
+    return {
+        "status": "confirmed",
+        "finding": "vulnerable",
+        "verdict": "vulnerable",
+        "file": "app.py",
+        "function": "handler",
+        "cwe_id": 79,
+        "verification_explanation": explanation,
+    }
+
+def test_fold_consistency_update_carried_and_banner_attributes():
+    """The MEDIUM-2 fold: after a consistency pass rewrites the verdict, the
+    banner must attribute the pre-update explanation (the explanation argued
+    for the ORIGINAL verdict; the status line shows the updated one)."""
+    vd = dict(_base_vd(), verification_explanation="The path is gated by the "
+              "autodetect filter; exploitation requires the gate to be open.",
+              consistency_update={"from": "vulnerable", "to": "bypassable",
+                                  "reason": "peer units disagree"})
+    header = _disclosure_verdict_header(vd)
+    assert "Stage-2 explanation (pre-dating the consistency update" in header, (
+        "the banner must attribute the pre-update explanation when an update occurred")
+    assert "**Consistency update:** vulnerable → bypassable — peer units disagree" in header
+
+
+def test_fold_no_update_no_attribution():
+    """The negative: without a consistency update, the plain label stays."""
+    vd = dict(_base_vd(), verification_explanation="The path is fully reachable.")
+    header = _disclosure_verdict_header(vd)
+    assert "> **Stage-2 explanation:** " in header
+    assert "pre-dating" not in header
+    assert "Consistency update:" not in header
+
+
+def test_fold_crlf_and_cr_stay_inside_the_banner():
+    """The LOW-4 fold: \\r\\n and bare \\r are CommonMark line endings — an
+    unnormalized \\r would escape the > prefix and dump prose above the H1."""
+    vd = dict(_base_vd(), verification_explanation="line one\r\nline two\rline three")
+    header = _disclosure_verdict_header(vd)
+    assert "line one\n> line two\n> line three" in header, (
+        "CRLF and CR must be normalized to \\n and stay inside the blockquote")
+
+
+def test_fold_gt_leading_line_and_link_contained():
+    """The containment probes (fable's ask): a >-leading line nests (cosmetic
+    containment); a markdown link renders inside the quote (structural
+    containment — the same trust model as every model-text line)."""
+    vd = dict(_base_vd(), verification_explanation="> nested quote\n[link](http://x)")
+    header = _disclosure_verdict_header(vd)
+    assert "> **Stage-2 explanation:** > nested quote" in header
+    assert "> [link](http://x)" in header

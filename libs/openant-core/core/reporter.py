@@ -586,6 +586,13 @@ def build_pipeline_output(
                or finding.get("verification_explanation") else {}),
             **({"verification_note": finding["verification_note"]}
                if finding.get("verification_note") else {}),
+            # #534 gate fold (fable+astra): the consistency pass rewrites
+            # the verdict WITHOUT touching verification["explanation"] — the
+            # banner can stamp an updated status beside the explanation that
+            # argued for the original one. Carry the update present-only so
+            # the banner can attribute the pre-update explanation correctly.
+            **({"consistency_update": finding["consistency_update"]}
+               if isinstance(finding.get("consistency_update"), dict) else {}),
             # #215 (partial repair): the two FINDING-SEMANTIC transit
             # fields — confidence (float 0.0-1.0 per the verdict schema,
             # json_corrector.py:32; NOT analysis_core.py:181's error-shape

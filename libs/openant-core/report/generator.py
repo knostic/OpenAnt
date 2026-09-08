@@ -529,9 +529,33 @@ def _disclosure_verdict_header(vulnerability_data: dict) -> str:
     if qual:
         # #534: blockquote-safe — a multi-paragraph explanation must stay
         # inside the banner block (a bare \n\n would dump the rest as
-        # top-level prose above the model's H1).
-        lines.append("> **Stage-2 explanation:** "
-                     + qual.replace("\n", "\n> "))
+        # top-level prose above the model's H1). The gate fold adds newline
+        # normalization first: CommonMark treats \r\n and bare \r as line
+        # endings, so an unnormalized \r would escape the > prefix (fable's
+        # finding — a Windows/legacy-model output shape would break out).
+        _norm = qual.replace("\r\n", "\n").replace("\r", "\n")
+        _had_update = isinstance(vulnerability_data.get("consistency_update"), dict)
+        _label = ("Stage-2 explanation (pre-dating the consistency update — "
+                  "the verdict shown above was changed after this reasoning):"
+                  if _had_update else "Stage-2 explanation:")
+        # The banner length is DELIBERATELY UNBOUNDED (the fable+astra gate
+        # decision, recorded here): the explanation's gate clause ("the path
+        # is gated by...") is the entire point of #534 — a cap risks cutting
+        # it when it appears late in a multi-paragraph analysis. Both
+        # sibling consumers cap at 300 for their own surfaces (the CLI
+        # summary; the HTML justification line); this surface — the
+        # reporter-facing disclosure body — preserves the full reasoning by
+        # design. The docstring records the decision; the multi-paragraph
+        # test pins the containment.
+        lines.append(f"> **{_label}** " + _norm.replace("\n", "\n> "))
+        # The gate fold: attribute the verdict transition when it happened.
+        cu = vulnerability_data.get("consistency_update")
+        if _had_update:
+            _from = str(cu.get("from") or "?").strip()
+            _to = str(cu.get("to") or "?").strip()
+            _reason = str(cu.get("reason") or "").strip()
+            _reason_part = f" — {_reason}" if _reason else ""
+            lines.append(f"> **Consistency update:** {_from} → {_to}{_reason_part}")
 
     return "\n".join(lines) + "\n\n"
 
