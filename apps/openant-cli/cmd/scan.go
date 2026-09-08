@@ -151,7 +151,13 @@ func runScan(cmd *cobra.Command, args []string) {
 
 	// Check for interrupted runs in the scan directory
 	if ctx != nil && scanOutput != "" {
-		steps := []string{"enhance", "analyze", "verify"}
+		// #532: llm_reach joins the probe list — its checkpoints are the most
+		// expensive per-pass ($10+ on a 5K-unit corpus), so a silent auto-adopt
+		// on an explicit fresh start would defeat the user's choice. Records
+		// classify as completed (no error arms match) and a missing/unknown
+		// _summary takes PromptResume's legacy arm — same lifecycle as the
+		// other phases.
+		steps := []string{"enhance", "analyze", "verify", "llm_reach"}
 		for _, step := range steps {
 			if cpInfo := checkpoint.DetectViaPython(rt.Path, scanOutput, step); cpInfo != nil {
 				if !checkpoint.PromptResume(cpInfo, step, quiet) {

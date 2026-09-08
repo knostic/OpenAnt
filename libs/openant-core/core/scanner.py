@@ -28,6 +28,7 @@ from core.schemas import (
 )
 from core.step_report import step_context
 from core import tracking
+from utilities.llm_client import get_global_tracker
 from utilities.child_interp import resolved_core_path
 from utilities.file_io import read_json, write_json
 from utilities.llm.adapter import LLMAuthError
@@ -648,6 +649,13 @@ def scan_repository(
                         binding=llm_reach_binding,
                         max_code_bytes=llm_reachability_max_code_bytes,
                         stats=reach_stats,
+                        # #532: resume parity with the checkpointed stages —
+                        # per-unit records under the family's backend-identity
+                        # gate; a relaunch adopts matching units instead of
+                        # re-paying the whole pass.
+                        checkpoint_path=os.path.join(
+                            output_dir, "llm_reach_checkpoints"),
+                        tracker=get_global_tracker(),
                     )
                     summary = apply_signals(dataset, signals)
 
@@ -863,6 +871,10 @@ def scan_repository(
                     dataset_persisted = True
 
                     ctx.summary = {
+                        # Coverage semantics (#386 + #532): every unit whose
+                        # review state is ACCOUNTED this pass — adopted-
+                        # restored (see units_adopted) plus newly sent. For
+                        # "sent this run" only, subtract units_adopted.
                         "units_reviewed": pre_filter_count,
                         "signals_added": summary["signals_applied"],
                         "entry_points_promoted": summary["entry_points_promoted"],
@@ -872,6 +884,10 @@ def scan_repository(
                         # sets differ in promotions with byte-identical
                         # step reports otherwise.
                         "promote_set": summary.get("promote_set", []),
+                        # #532: adopted units are restored, not re-reviewed —
+                        # the resume provenance (they were reviewed; their
+                        # signals replay under THIS run's promote set).
+                        "units_adopted": reach_stats.get("units_adopted", 0),
                         "post_filter_units": post_filter_count,
                         "refilter_supported": refilter_supported,
                         # #294: the honest coverage numbers — units_reviewed
