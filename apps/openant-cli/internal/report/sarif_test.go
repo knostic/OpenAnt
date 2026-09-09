@@ -218,6 +218,58 @@ func TestBuildSARIF_NoVCSWhenRepoURLEmpty(t *testing.T) {
 	}
 }
 
+// #568: a credential-bearing but PARSEABLE remote is normalized — the
+// credential never reaches the artifact, and the provenance keeps the clean
+// browse form.
+func TestBuildSARIF_CredentialFormNormalized(t *testing.T) {
+	d := sarifFixtureData()
+	d.RepoURL = "https://user:TOKEN@github.com/org/repo"
+	got := BuildSARIF(d, SARIFOptions{})
+	run, _ := got["runs"].([]any)[0].(map[string]any)
+	prov, ok := run["versionControlProvenance"].([]any)
+	if !ok || len(prov) != 1 {
+		t.Fatalf("expected versionControlProvenance with one entry for the parseable credential form")
+	}
+	entry, _ := prov[0].(map[string]any)
+	if entry["repositoryUri"] != "https://github.com/org/repo" {
+		t.Errorf("repositoryUri: got %v, want the normalized browse form", entry["repositoryUri"])
+	}
+	blob, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(blob), "TOKEN") {
+		t.Error("the credential reached the SARIF artifact")
+	}
+}
+
+// #568: an UNPARSEABLE remote (password-scp, bad %-escape in the userinfo,
+// git://) never reaches the SARIF artifact — versionControlProvenance is
+// omitted entirely (the honest absence; revisionId co-travels because SARIF's
+// versionControlDetails requires repositoryUri).
+func TestBuildSARIF_ProvenanceOmittedWhenUnparseable(t *testing.T) {
+	for _, tc := range []struct{ repoURL, marker string }{
+		{"user:pass@host:path", "user:pass@"},
+		{"https://user:pa%ss@github.com/org/repo", "user:pa%ss@"},
+		{"git://github.com/org/repo.git", "git://github.com"},
+	} {
+		d := sarifFixtureData()
+		d.RepoURL = tc.repoURL
+		got := BuildSARIF(d, SARIFOptions{})
+		run, _ := got["runs"].([]any)[0].(map[string]any)
+		if _, has := run["versionControlProvenance"]; has {
+			t.Errorf("RepoURL %q: versionControlProvenance must be omitted when unparseable", tc.repoURL)
+		}
+		blob, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(blob), tc.marker) {
+			t.Errorf("RepoURL %q: the raw remote reached the SARIF artifact", tc.repoURL)
+		}
+	}
+}
+
 func TestBuildSARIF_MessageFallbackWhenAttackVectorEmpty(t *testing.T) {
 	d := ReportData{
 		Findings: []Finding{

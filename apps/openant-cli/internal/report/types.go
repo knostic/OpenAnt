@@ -175,6 +175,14 @@ func (d ReportData) FileURL(filePath string) string {
 	return base + "/blob/" + d.CommitSHA + "/" + filePath
 }
 
+// BrowseURL returns the normalized browse form of the repo URL — the #568
+// render-boundary contract: a raw remote (scp-form, credential-bearing)
+// never reaches a rendered link. Returns "" when the URL cannot be
+// normalized safely (the honest absence).
+func (d ReportData) BrowseURL() string {
+	return remoteurl.Normalize(d.RepoURL)
+}
+
 // HasStepReports returns true if there are step reports to display.
 func (d ReportData) HasStepReports() bool {
 	return len(d.StepReports) > 0

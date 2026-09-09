@@ -1216,8 +1216,14 @@ func (s *Server) runJob(job *Job) {
 	if job.libraryMode {
 		args = append(args, "--library-mode")
 	}
+	// #566's entry-surface residual: the metadata flag carries the browse
+	// form — job.Repo stays raw for the clone, but a credential-bearing or
+	// unparseable remote never reaches the scan's metadata artifacts (the
+	// honest absence skips the flag entirely).
 	if isURL {
-		args = append(args, "--repo-url", job.Repo)
+		if _u := remoteurl.Normalize(job.Repo); _u != "" {
+			args = append(args, "--repo-url", _u)
+		}
 	}
 	args = append(args, "--", localPath)
 
@@ -1694,11 +1700,13 @@ func patchPipelineOutput(outDir, repo string, onLog func(string)) {
 	if repoField, ok := obj["repository"]; ok {
 		if repoMap, ok := repoField.(map[string]any); ok {
 			// #568: the render-boundary defense — never write a raw remote.
-			normalized := remoteurl.Normalize(repo)
-			if normalized == "" {
-				normalized = repo // the honest raw form when unparseable
+			// An unparseable form is removed (the honest absence); a
+			// parseable one carries the normalized browse form.
+			if normalized := remoteurl.Normalize(repo); normalized != "" {
+				repoMap["url"] = normalized
+			} else {
+				delete(repoMap, "url")
 			}
-			repoMap["url"] = normalized
 		}
 	}
 	patched, err := json.MarshalIndent(obj, "", "  ")

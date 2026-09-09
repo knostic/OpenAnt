@@ -15,8 +15,10 @@ import (
 
 // Normalize normalizes a git remote URL to a plain browse URL. Returns ""
 // when the input cannot be normalized safely: git:// (deprecated), local
-// paths, Windows drive paths, and anything unparseable — the honest absence
-// is better than a broken or leaking link. Userinfo NEVER persists.
+// paths, Windows drive paths, bracketed IPv6 in the ssh/scp forms,
+// non-URL-safe bytes in the host or the scp fold, and anything unparseable
+// — the honest absence is better than a broken or leaking link. Userinfo
+// NEVER persists.
 //
 //   - scp-form "git@host:org/repo.git" -> "https://host/org/repo"
 //   - ssh://git@host[:port]/org/repo    -> "https://host/org/repo" (the ssh
@@ -59,6 +61,13 @@ func Normalize(raw string) string {
 		if host == "" || strings.ContainsAny(host, "[]") {
 			return "" // bracketed IPv6 scp — unparseable by this rule
 		}
+		// The fold concatenates host and path into a URL — never emit
+		// unvalidated text: a host or path with bytes outside the URL-safe
+		// set (quotes, angle brackets, control bytes) is not a remote. The
+		// honest absence beats a malformed or smuggled URL.
+		if !scpURLSafe(host, false) || !scpURLSafe(rest, true) {
+			return ""
+		}
 		return "https://" + strings.ToLower(host) + "/" +
 			strings.TrimSuffix(strings.Trim(rest, "/"), ".git")
 	}
@@ -68,6 +77,15 @@ func Normalize(raw string) string {
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https":
+		if u.Host == "" {
+			return "" // empty authority — the path would masquerade as the host
+		}
+		// url.Parse deliberately accepts quote/angle bytes in the host —
+		// never emit them (they break the URI and any artifact that embeds
+		// it). The honest absence.
+		if strings.ContainsAny(u.Host, "\"<>") {
+			return ""
+		}
 		u.User = nil
 		u.RawQuery = ""
 		u.Fragment = ""
@@ -77,6 +95,17 @@ func Normalize(raw string) string {
 	case "ssh":
 		host := u.Hostname()
 		if host == "" {
+			return ""
+		}
+		// A bracketed IPv6 host loses its brackets here (Hostname strips
+		// them) — re-emitting it bracketless is a broken URL, so reject:
+		// the honest absence.
+		if strings.Contains(host, ":") {
+			return ""
+		}
+		// Same hostile-byte gate as the http arm — url.Parse accepts
+		// quote/angle bytes in the host; never emit them.
+		if strings.ContainsAny(host, "\"<>") {
 			return ""
 		}
 		u.User = nil
@@ -108,4 +137,20 @@ func scpHostRegion(repo string) string {
 		return ""
 	}
 	return s
+}
+
+// scpURLSafe reports whether every byte of s is URL-safe for the scp fold —
+// host: letters, digits, ".", "-", "_"; path additionally allows "/" and "~".
+func scpURLSafe(s string, path bool) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.' || c == '-' || c == '_':
+		case path && (c == '/' || c == '~'):
+		default:
+			return false
+		}
+	}
+	return true
 }
