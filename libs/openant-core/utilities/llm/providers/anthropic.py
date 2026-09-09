@@ -394,9 +394,16 @@ def _response_to_unified(
                   if raw_stop == "max_tokens"
                   else "the request may have been filtered or the response "
                        "was malformed")
+        # #564: the rejected reply's usage travels ON the error (the #537
+        # carriage the openai sites already have — the successful return
+        # below reads the same response object; the guard used to raise
+        # before the read, recording 0/0 for a call the provider may have
+        # billed).
         raise LLMResponseError(
             f"{adapter} returned no usable content (empty completion; "
-            f"stop_reason={raw_stop!r}); {_cause}"
+            f"stop_reason={raw_stop!r}); {_cause}",
+            input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
+            output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
         )
 
     if raw_stop not in _ANTHROPIC_STOP_REASONS:
