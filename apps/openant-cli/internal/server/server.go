@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/knostic/open-ant-cli/internal/remoteurl"
 	"html/template"
 	"io"
 	"math/big"
@@ -318,7 +319,10 @@ func (s *Server) recoverJobs() {
 
 		// Fall back: infer repo from git config and mtime from dir.
 		if job.Repo == "" {
-			job.Repo = inferRepoURL(jobDir)
+			// #568: normalize the .git/config raw remote (scp/credential
+			// forms) at the source — everything downstream (the job record,
+			// patchPipelineOutput, the report) then carries the browse form.
+			job.Repo = remoteurl.Normalize(inferRepoURL(jobDir))
 		}
 		if job.StartedAt.IsZero() {
 			if info, err := os.Stat(jobDir); err == nil {
@@ -1689,7 +1693,12 @@ func patchPipelineOutput(outDir, repo string, onLog func(string)) {
 	}
 	if repoField, ok := obj["repository"]; ok {
 		if repoMap, ok := repoField.(map[string]any); ok {
-			repoMap["url"] = repo
+			// #568: the render-boundary defense — never write a raw remote.
+			normalized := remoteurl.Normalize(repo)
+			if normalized == "" {
+				normalized = repo // the honest raw form when unparseable
+			}
+			repoMap["url"] = normalized
 		}
 	}
 	patched, err := json.MarshalIndent(obj, "", "  ")
