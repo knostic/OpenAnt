@@ -460,6 +460,7 @@ def analyze_reachability(
     dropped_batches = 0
     units_not_reviewed = 0
     batches_truncated = 0
+    batches_failed = 0
 
     # ------------------------------------------------------------------
     # #532: resume/adopt machinery — the checkpoint family's own pattern
@@ -618,11 +619,20 @@ def analyze_reachability(
             # so the caller can stop and tell the user the key is bad.
             raise
         except Exception as exc:  # noqa: BLE001 — advisory stage; never crash pipeline
+            # #541: a provider-exception batch is counted in the coverage
+            # truth — the #386 counters covered the parse path only, so a
+            # step report could read success/0/0 for a pass that reviewed
+            # nothing (4 empty-completion batches on the receipt run were
+            # invisible to every surviving counter). A distinct counter
+            # (different failure class, different remediation) + the same
+            # units_not_reviewed so the coverage gap is the visible sum.
             msg = f"batch {i + 1}/{len(batches)} failed: {exc}"
             if on_error:
                 on_error(msg)
             else:
                 print(f"[LLMReach] {msg}", file=sys.stderr)
+            batches_failed += 1
+            units_not_reviewed += len(batch)
             continue
 
         # #532 (disclosed behavior change): valid ids are PER-BATCH, so a
@@ -757,6 +767,9 @@ def analyze_reachability(
         stats["units_not_reviewed"] = units_not_reviewed
         # #538: the truncation subclass — the recurrence's diagnosis lever.
         stats["batches_truncated"] = batches_truncated
+        # #541: the provider-exception class — distinct from the parse
+        # drops, same coverage-truth denominator.
+        stats["batches_failed"] = batches_failed
 
     return signals
 
