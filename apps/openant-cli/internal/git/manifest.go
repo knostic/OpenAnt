@@ -29,12 +29,12 @@ func IsValidScope(s string) bool {
 // in Hunks is a slice of [start_line, end_line] pairs on the new side
 // (inclusive). Pure-deletion hunks are dropped at build time.
 type Manifest struct {
-	BaseRef      string          `json:"base_ref"`
-	BaseSHA      string          `json:"base_sha"`
-	HeadSHA      string          `json:"head_sha"`
-	Scope        string          `json:"scope"`
-	PRNumber     int             `json:"pr_number,omitempty"`
-	ChangedFiles []string        `json:"changed_files"`
+	BaseRef      string              `json:"base_ref"`
+	BaseSHA      string              `json:"base_sha"`
+	HeadSHA      string              `json:"head_sha"`
+	Scope        string              `json:"scope"`
+	PRNumber     int                 `json:"pr_number,omitempty"`
+	ChangedFiles []string            `json:"changed_files"`
 	Hunks        map[string][][2]int `json:"hunks,omitempty"`
 }
 

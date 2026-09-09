@@ -651,3 +651,82 @@ class TestIssue538GateFold:
         assert stats.get("batches_truncated") == 1, (
             "the truncation counts even when the salvage parse succeeds")
         assert stats.get("batches_dropped") == 1
+
+
+class TestIssue541ExceptionCounters:
+    """#541: a provider-exception batch is counted — the coverage truth."""
+
+    def test_exception_batch_counts_failed_and_unreviewed(self):
+        """THE #541 regression: a batch whose LLM call raises (empty
+        completion, transport error) counts in batches_failed AND
+        units_not_reviewed — a step report can no longer read 0/0 for a
+        pass that reviewed nothing."""
+
+        class Boom(FakeAdapter):
+            def complete(self, **kw):
+                raise RuntimeError("provider exploded")
+
+        stats: dict = {}
+        errors: List[str] = []
+        analyze_reachability(
+            {"units": [_make_unit("a:f1"), _make_unit("b:f2")]},
+            binding=_binding(Boom()),
+            on_error=errors.append, stats=stats)
+        assert stats["batches_failed"] == 1
+        assert stats["units_not_reviewed"] == 2
+        assert stats["batches_dropped"] == 0  # the parse-path counter untouched
+
+    def test_parse_drop_not_counted_as_failed(self):
+        """The classes stay distinct: a malformed-parse drop does not
+        increment batches_failed."""
+        stats: dict = {}
+        analyze_reachability(
+            {"units": [_make_unit("a:f1")]},
+            binding=_binding(FakeAdapter(["not json {"])),
+            stats=stats)
+        assert stats["batches_dropped"] == 1
+        assert stats["batches_failed"] == 0
+
+    def test_mixed_pass_reports_both_classes(self):
+        """A pass with one exception batch and one malformed batch: both
+        counters fire; units_not_reviewed is the visible sum."""
+        class OneBoomThenBad(FakeAdapter):
+            def __init__(self):
+                super().__init__(["not json {"])
+                self.n = 0
+
+            def complete(self, **kw):
+                self.n += 1
+                if self.n == 1:
+                    raise RuntimeError("boom")
+                return super().complete(**kw)
+
+        stats: dict = {}
+        analyze_reachability(
+            {"units": [_make_unit("a:f1"), _make_unit("b:f2")]},
+            binding=_binding(OneBoomThenBad()), batch_size=1,
+            stats=stats)
+        assert stats["batches_failed"] == 1
+        assert stats["batches_dropped"] == 1
+        assert stats["units_not_reviewed"] == 2
+
+    def test_step_status_partial_when_batches_fail(self, tmp_path):
+        """#541 (the refute round): the step-report derivation — with
+        batches_dropped or batches_failed > 0 the LLR step's summary carries
+        error_count so step_context reads partial (the #285/#376 contract;
+        all-batches-failed must never read success)."""
+        from core.step_report import step_context
+        # The scanner's summary shape with the counters:
+        with step_context("llm-reachability", str(tmp_path)) as ctx:
+            ctx.summary = {
+                "units_reviewed": 2,
+                "batches_dropped": 0,
+                "batches_failed": 1,
+                "units_not_reviewed": 2,
+                "error_count": 0 + 1,
+            }
+        import json as _json
+        import os as _os
+        with open(_os.path.join(str(tmp_path), "llm-reachability.report.json")) as fh:
+            rep = _json.load(fh)
+        assert rep["status"] == "partial"
