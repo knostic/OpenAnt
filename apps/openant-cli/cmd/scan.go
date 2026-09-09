@@ -80,6 +80,17 @@ func init() {
 // The "nogit" sentinel (init records it for non-repo paths) is treated as
 // empty so it never flows into permalinks or SARIF revisionIds.
 func resolveRepoMetadata(name, url, sha string, ctx *projectContext, detectedSHA string) (string, string, string, string) {
+	return resolveRepoMetadataFull(name, url, sha, ctx, detectedSHA, "")
+}
+
+// resolveRepoMetadataFull is resolveRepoMetadata with the #562 URL tier: a
+// bare-path scan of a git checkout derives its --repo-url from the origin
+// remote, NORMALIZED (scp→https, credentials stripped — a raw remote never
+// persists). The detected URL is the LAST resort (an explicit flag or a
+// project URL wins; the project tier also normalizes defensively — an init
+// recorded scp-form or credential-bearing remote would otherwise reach the
+// report permalinks and the SARIF repositoryUri verbatim).
+func resolveRepoMetadataFull(name, url, sha string, ctx *projectContext, detectedSHA, detectedURL string) (string, string, string, string) {
 	flaggedSHA := sha != ""
 	if ctx != nil && ctx.Project != nil {
 		if name == "" && ctx.Project.Name != "" {
@@ -92,6 +103,19 @@ func resolveRepoMetadata(name, url, sha string, ctx *projectContext, detectedSHA
 			ctx.Project.CommitSHA != "nogit" {
 			sha = ctx.Project.CommitSHA
 		}
+	}
+	// #562: normalize whatever the earlier tiers supplied (the hazard
+	// predates detection — init records the raw remote today). An EXPLICIT
+	// FLAG that fails normalization (git://, a local path) keeps the honest
+	// absence — never a silent fall-through to detection behind the user's
+	// back (the #557 flag-wins invariant); detection only fills a never-set
+	// flag or an empty project tier.
+	flagURLSet := url != ""
+	if url != "" {
+		url = git.NormalizeRemote(url)
+	}
+	if url == "" && !flagURLSet && detectedURL != "" {
+		url = detectedURL
 	}
 	if sha == "" && detectedSHA != "" {
 		sha = detectedSHA
@@ -285,10 +309,23 @@ func runScan(cmd *cobra.Command, args []string) {
 	// above would stamp the pre-checkout SHA (the review round's ordering
 	// hazard).
 	detectedSHA := git.HeadSHA(repoPath)
-	repoName, repoURL, commitSHA, metadataWarn := resolveRepoMetadata(
-		scanRepoName, scanRepoURL, scanCommitSHA, ctx, detectedSHA)
+	// #562: the origin remote, normalized (scp→https, credentials never
+	// persist). The detection is informational — a non-git path or a
+	// remote-less repo yields "" and the tier is skipped.
+	detectedURL := git.NormalizeRemote(git.RemoteURL(repoPath))
+	repoName, repoURL, commitSHA, metadataWarn := resolveRepoMetadataFull(
+		scanRepoName, scanRepoURL, scanCommitSHA, ctx, detectedSHA,
+		detectedURL)
 	if metadataWarn != "" {
 		output.PrintWarning(metadataWarn)
+	}
+	if scanRepoURL != "" && detectedURL != "" &&
+		git.NormalizeRemote(scanRepoURL) != detectedURL {
+		// #562 (the review round): print the NORMALIZED forms only — the
+		// raw flag may carry credentials that must never reach a log.
+		output.PrintWarning(fmt.Sprintf(
+			"report will stamp repo URL %s but the origin remote is %s",
+			git.NormalizeRemote(scanRepoURL), detectedURL))
 	}
 	if repoName != "" {
 		pyArgs = append(pyArgs, "--repo-name", repoName)
