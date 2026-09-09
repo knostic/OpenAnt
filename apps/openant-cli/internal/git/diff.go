@@ -76,6 +76,16 @@ func NormalizeRemote(raw string) string {
 		if rest == "" || strings.HasPrefix(rest, "/") {
 			return ""
 		}
+		// The gate fold (the astra round's live-confirmed leak): the
+		// password-bearing scp shape "user:pass@host:path" splits at the
+		// first colon, leaving the path "pass@host:path" — the credential
+		// text and the raw host:path survive into the normalized URL. A
+		// legitimate scp path (org/repo.git) NEVER contains '@': reject
+		// any scp form whose path region carries '@' (the credential-
+		// bearing shape) — the honest absence, never a leaking link.
+		if strings.ContainsAny(rest, "@") {
+			return ""
+		}
 		host := scpHostRegion(raw)
 		if host == "" || host != strings.ToLower(host) && strings.ContainsAny(host, "[]") {
 			return "" // bracketed IPv6 scp — unparseable by this rule

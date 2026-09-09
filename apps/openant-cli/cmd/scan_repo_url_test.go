@@ -71,3 +71,19 @@ func TestResolveRepoMetadataURLTier(t *testing.T) {
 		t.Errorf("flag url = %q, want the flag", u)
 	}
 }
+
+// The gate fold (the astra round): the password-bearing scp shape must
+// normalize to the honest absence — the pre-fold normalizer emitted
+// "https://user/pass@host:path", leaking the credential text.
+func TestFoldScpPasswordShapeRejected(t *testing.T) {
+	if got := git.NormalizeRemote("user:pass@host:path"); got != "" {
+		t.Errorf("NormalizeRemote(password-bearing scp) = %q, want \"\" (the honest absence)", got)
+	}
+	// the legitimate shapes unaffected
+	if got := git.NormalizeRemote("git@host:org/repo.git"); got != "https://host/org/repo" {
+		t.Errorf("legitimate scp broken: %q", got)
+	}
+	if got := git.NormalizeRemote("git@evil@127.0.0.1:org/repo.git"); got != "https://127.0.0.1/org/repo" {
+		t.Errorf("last-@ rule broken: %q", got)
+	}
+}
