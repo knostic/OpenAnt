@@ -386,10 +386,17 @@ def _response_to_unified(
     # response (ToolUseBlock present, no text) is VALID and is not caught
     # here because ``content_blocks`` is non-empty.
     if not content_blocks:
+        # #561: the same cause-clause branch as the openai chat path — a
+        # max_tokens stop is the budget, not a filter; anything else keeps
+        # the honest non-assertion (#212).
+        _cause = ("the output budget was consumed before any visible "
+                  "content (reasoning models spend it on hidden reasoning)"
+                  if raw_stop == "max_tokens"
+                  else "the request may have been filtered or the response "
+                       "was malformed")
         raise LLMResponseError(
             f"{adapter} returned no usable content (empty completion; "
-            f"stop_reason={raw_stop!r}); the request may have been "
-            "filtered or the response was malformed"
+            f"stop_reason={raw_stop!r}); {_cause}"
         )
 
     if raw_stop not in _ANTHROPIC_STOP_REASONS:

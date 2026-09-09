@@ -911,10 +911,20 @@ def _response_to_unified(
     # more specific signal and already raised above.
     if not content_blocks:
         _usage = getattr(response, "usage", None)
+        # #561: the cause clause branches on the finish reason it already
+        # carries — a length stop is the output budget consumed before any
+        # visible content (the #512 reasoning-model shape), not a filter;
+        # anything else keeps the honest non-assertion (#212: never say
+        # WHO filtered — the same module's Responses path says the budget
+        # wording for its truncation arm).
+        _cause = ("the output budget was consumed before any visible "
+                  "content (reasoning models spend it on hidden reasoning)"
+                  if raw_finish == "length"
+                  else "the request may have been filtered or the response "
+                       "was malformed")
         raise LLMResponseError(
             f"{adapter} returned an empty completion (no text or tool calls; "
-            f"finish_reason={raw_finish!r}); the request may have been "
-            "filtered or the response was malformed",
+            f"finish_reason={raw_finish!r}); {_cause}",
             # #537: the rejected reply's usage travels ON the error —
             # the raise used to fire before the usage read, discarding
             # tokens the provider may already have billed.
