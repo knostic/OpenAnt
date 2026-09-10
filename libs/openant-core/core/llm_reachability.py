@@ -461,6 +461,10 @@ def analyze_reachability(
     units_not_reviewed = 0
     batches_truncated = 0
     batches_failed = 0
+    # #558: the split-and-retry provenance counters (direction 4 — the
+    # recovery never silently overwrites the coverage counts).
+    batches_split_recovered = 0
+    batches_split_lost = 0
 
     # ------------------------------------------------------------------
     # #532: resume/adopt machinery — the checkpoint family's own pattern
@@ -597,15 +601,22 @@ def analyze_reachability(
 
     batches = _chunk(units_to_run, batch_size)
     persisted = 0
-    for i, batch in enumerate(batches):
+
+    # #558: one call+parse attempt for a (sub-)batch. Returns
+    # (signals, outcome) where outcome ∈ {"ok", "failed", "dropped",
+    # "truncated"}; the counters are mutated here so the split-and-retry
+    # below can revise them (a recovered original subtracts what its
+    # drop counted; the halves count their own outcomes).
+    def _attempt(sub_batch, label) -> tuple:
+        """Returns (signals, outcome, deltas) — deltas are THIS attempt's
+        applied counter changes ({dropped, units, truncated}), so the
+        split-and-retry subtracts exactly what was applied (never an
+        inferred shape — the refutation's negative-counter catch)."""
+        nonlocal dropped_batches, units_not_reviewed, batches_truncated, \
+            batches_failed
         prompt = build_prompt(
-            batch, app_context=app_context, max_code_bytes=max_code_bytes
+            sub_batch, app_context=app_context, max_code_bytes=max_code_bytes
         )
-        if tracker is not None:
-            try:
-                tracker.start_unit_tracking()
-            except Exception:  # noqa: BLE001
-                pass
         try:
             result = simple_completion(binding, prompt,
                                        max_tokens=DEFAULT_MAX_TOKENS,
@@ -620,87 +631,132 @@ def analyze_reachability(
             raise
         except Exception as exc:  # noqa: BLE001 — advisory stage; never crash pipeline
             # #541: a provider-exception batch is counted in the coverage
-            # truth — the #386 counters covered the parse path only, so a
-            # step report could read success/0/0 for a pass that reviewed
-            # nothing (4 empty-completion batches on the receipt run were
-            # invisible to every surviving counter). A distinct counter
-            # (different failure class, different remediation) + the same
-            # units_not_reviewed so the coverage gap is the visible sum.
-            msg = f"batch {i + 1}/{len(batches)} failed: {exc}"
+            # truth. A distinct counter (different failure class, different
+            # remediation) + the same units_not_reviewed.
+            msg = f"{label} failed: {exc}"
             if on_error:
                 on_error(msg)
             else:
                 print(f"[LLMReach] {msg}", file=sys.stderr)
             batches_failed += 1
-            units_not_reviewed += len(batch)
-            continue
+            units_not_reviewed += len(sub_batch)
+            return [], "failed", {"dropped": 0, "units": 0, "truncated": 0}
 
-        # #532 (disclosed behavior change): valid ids are PER-BATCH, so a
-        # signal for a unit outside the producing batch is ungrounded by
-        # construction — under persistence, adopted state must equal
-        # applied state (an out-of-batch signal would apply this run but
-        # never persist).
-        batch_ids = {u.get("id") for u in batch if u.get("id")}
-        first = batch[0].get("id", "?") if batch else "?"
-        last = batch[-1].get("id", "?") if batch else "?"
-        dropped_this_batch = False
+        batch_ids = {u.get("id") for u in sub_batch if u.get("id")}
+        first = sub_batch[0].get("id", "?") if sub_batch else "?"
+        last = sub_batch[-1].get("id", "?") if sub_batch else "?"
+        dropped = []
+        _delta = {"dropped": 0, "units": 0, "truncated": 0}
 
-        def _count_drop_and_flag(batch=batch, truncated=False):
-            nonlocal dropped_batches, units_not_reviewed, \
-                dropped_this_batch, batches_truncated
+        def _count_drop(sb=sub_batch, truncated=False):
+            nonlocal dropped_batches, units_not_reviewed, batches_truncated
             dropped_batches += 1
-            units_not_reviewed += len(batch)
-            dropped_this_batch = True
+            units_not_reviewed += len(sb)
+            _delta["dropped"] += 1
+            _delta["units"] += len(sb)
             if truncated:
                 batches_truncated += 1
+                _delta["truncated"] += 1
+            dropped.append(True)
 
         parsed = parse_response(
             text, valid_unit_ids=batch_ids, on_error=on_error,
-            batch_label=f"batch {i + 1}/{len(batches)}, units {first}..{last}",
-            on_batch_drop=_count_drop_and_flag,
+            batch_label=f"{label}, units {first}..{last}",
+            on_batch_drop=_count_drop,
             stop_reason=result.stop_reason,
         )
-        # #538 gate fold (fable+astra — the salvage-success gap): a
-        # max_tokens reply drops the batch WHOLE — the parsed prefix
-        # signals are NOT applied (the applied==adopted invariant: the
-        # signals gated the re-filter this run but were absent from the
-        # checkpoint, so a resume silently re-filtered on un-replayed
-        # state), and batches_truncated counts the truncation
-        # INDEPENDENTLY of the parse outcome (the salvage parse may
-        # succeed without the on_batch_drop callback ever firing — the
-        # counter was blind to exactly the case the gate acts on).
-        # Deduplicated: when the salvage parse DID drop (the callback
-        # fired), its counters already stand — the fold only adds the
-        # counts the callback never made.
-        _truncated = (result.stop_reason == "max_tokens")
-        if _truncated:
-            if not dropped_this_batch:
+        # #538 gate fold: a max_tokens reply drops the batch WHOLE (the
+        # applied==adopted invariant; the salvage prefix discarded) —
+        # independently of the parse outcome (the callback may not fire).
+        if result.stop_reason == "max_tokens":
+            if not dropped:
                 batches_truncated += 1
                 dropped_batches += 1
-                units_not_reviewed += len(batch)
-                print(f"[LLMReach] batch {i + 1}/{len(batches)} truncated at "
-                      f"max_tokens — dropping whole (salvage prefix discarded); "
-                      f"{len(batch)} units re-run on the next pass",
-                      file=sys.stderr)
+                units_not_reviewed += len(sub_batch)
+                _delta["truncated"] += 1
+                _delta["dropped"] += 1
+                _delta["units"] += len(sub_batch)
+            return [], "truncated", _delta
+        if dropped:
+            return [], "dropped", _delta
+        return parsed, "ok", _delta
+
+    for i, batch in enumerate(batches):
+        # #558 (the refutation's usage fix): the tracking window spans the
+        # ORIGINAL batch AND its split halves — started once here, never
+        # inside _attempt, so the per-unit records carry the whole
+        # recovery's true cost (a lost half's spend shared over the
+        # recovered units — the conservative choice, else it vanishes).
+        if tracker is not None:
+            try:
+                tracker.start_unit_tracking()
+            except Exception:  # noqa: BLE001
+                pass
+        parsed, outcome, deltas = _attempt(
+            batch, f"batch {i + 1}/{len(batches)}")
+        record_units: list = batch if outcome == "ok" else []
+
+        # #558: SPLIT-AND-RETRY (never the JSON corrector — it cannot
+        # recover signals the model never emitted, and on the truncation
+        # class it would freeze partial batches as reviewed). A dropped
+        # or truncated batch of >= 2 units is re-issued once as two
+        # halves: the halves are smaller outputs (less likely to exhaust
+        # a cap or break mid-structure) AND a fresh roll (the model's
+        # own broken-JSON finishes — the measured residual class at the
+        # lifted cap — recover on re-generation; the #292 rationale).
+        # Bounded: ONE split level, no recursion — a half that still
+        # drops stays dropped (its units re-run on the next resume via
+        # absence-as-retry). The ORIGINAL drop's counters are revised
+        # (subtracted) so the halves count their own outcomes: the
+        # coverage truth is never double-counted, and the recovery has
+        # its own provenance counters (#558's direction 4).
+        if outcome in ("dropped", "truncated") and len(batch) >= 2:
+            # Subtract EXACTLY this attempt's applied deltas (the
+            # refutation's negative-counter catch: a max_tokens reply
+            # with a no-brace shape incremented dropped but NOT truncated
+            # — inferring the shape drove batches_truncated to -1).
+            dropped_batches -= deltas["dropped"]
+            units_not_reviewed -= deltas["units"]
+            batches_truncated -= deltas["truncated"]
+            halves = []
+            mid = (len(batch) + 1) // 2
+            for j, half in enumerate((batch[:mid], batch[mid:])):
+                if not half:
+                    continue
+                p2, o2, _d2 = _attempt(
+                    half, f"batch {i + 1}/{len(batches)} half {j + 1}/2")
+                if o2 == "ok":
+                    halves.extend(p2)
+                    record_units.extend(half)
+            if halves or record_units:
+                batches_split_recovered += 1
+            else:
+                batches_split_lost += 1
+            print(f"[LLMReach] batch {i + 1}/{len(batches)} split-retry: "
+                  f"{sum(1 for u in record_units)} units recovered via "
+                  f"halves", file=sys.stderr)
+            parsed = halves
+            outcome = "recovered" if record_units else outcome
+
+        # NOTE: a "failed" (provider-exception) batch is deliberately NOT
+        # split — the exception class (empty completions, transport) is
+        # not output-size-shaped; the #541 counters + the resume own it.
+        if outcome == "failed" or (outcome in ("dropped", "truncated")
+                                   and not record_units):
             continue
         signals.extend(parsed)
 
-        # Persist per-unit records ONLY for a batch that completed without a
-        # drop — dropped batches leave no records (absence = the retry
-        # marker on the next resume). Save failures cost persistence, not
-        # the pass (the stage's own advisory doctrine).
-        # #538 (4)-primitive: a max_tokens reply NEVER reaches this block —
-        # the fold's `continue` above drops the whole batch BEFORE the
-        # persist (the applied==adopted invariant; the salvage prefix
-        # discarded). dropped_this_batch stays the parse-drop marker.
-        if (checkpoint is not None and not dropped_this_batch):
+        # Persist per-unit records for the OK units — dropped halves leave
+        # no records (absence = the retry marker on the next resume). Save
+        # failures cost persistence, not the pass (the advisory doctrine).
+        if checkpoint is not None and record_units:
             batch_usage = {}
             if tracker is not None:
                 try:
                     batch_usage = tracker.get_unit_usage() or {}
                 except Exception:  # noqa: BLE001
                     batch_usage = {}
-            n_units = max(len(batch), 1)
+            n_units = max(len(record_units), 1)
 
             def _share(units_in_batch: int) -> dict:
                 share = {
@@ -708,8 +764,6 @@ def analyze_reachability(
                     "output_tokens": int(batch_usage.get("output_tokens", 0) or 0) // units_in_batch,
                     "cost_usd": round(float(batch_usage.get("cost_usd", 0.0) or 0.0) / units_in_batch, 6),
                 }
-                # #216: the incomplete-cost marker travels with the record so
-                # a resume restores it (the family's analyzer contract).
                 if batch_usage.get("unpriced_models"):
                     share["cost_incomplete"] = True
                     share["unpriced_models"] = sorted(
@@ -717,12 +771,12 @@ def analyze_reachability(
                 return share
 
             sig_by_unit: Dict[str, List[dict]] = {}
-            for s in parsed:
-                sig_by_unit.setdefault(s.unit_id, []).append({
-                    "unit_id": s.unit_id, "kind": s.kind,
-                    "confidence": s.confidence, "reason": s.reason,
+            for sig in parsed:
+                sig_by_unit.setdefault(sig.unit_id, []).append({
+                    "unit_id": sig.unit_id, "kind": sig.kind,
+                    "confidence": sig.confidence, "reason": sig.reason,
                 })
-            for u in batch:
+            for u in record_units:
                 uid = u.get("id")
                 if not uid:
                     continue
@@ -770,6 +824,9 @@ def analyze_reachability(
         # #541: the provider-exception class — distinct from the parse
         # drops, same coverage-truth denominator.
         stats["batches_failed"] = batches_failed
+        # #558: the split-and-retry provenance.
+        stats["batches_split_recovered"] = batches_split_recovered
+        stats["batches_split_lost"] = batches_split_lost
 
     return signals
 

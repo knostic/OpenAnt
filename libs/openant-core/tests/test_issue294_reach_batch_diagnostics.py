@@ -167,7 +167,10 @@ def test_analyze_reachability_counts_dropped_units(tmp_path, monkeypatch):
         # batch 1: valid
         ('{"signals": [{"unit_id": "f0.py:fn", "kind": "entry_point", '
          '"confidence": "high", "reason": "ok"}]}'),
-        # batch 2: malformed (prose refusal)
+        # batch 2: malformed (prose refusal) — and its #558 split halves
+        # also malformed (the batch must STAY dropped for this pin)
+        "I can't help with analyzing this code for security purposes.",
+        "I can't help with analyzing this code for security purposes.",
         "I can't help with analyzing this code for security purposes.",
     ])
     errs: list[str] = []
@@ -180,10 +183,14 @@ def test_analyze_reachability_counts_dropped_units(tmp_path, monkeypatch):
 
     # batch 1's signal survived the drop of batch 2
     assert [s.unit_id for s in signals] == ["f0.py:fn"]
-    assert stats["batches_dropped"] == 1
+    # #558: the original drop is REVISED (subtracted) and the two halves
+    # count their own outcomes — both dropped: 2 half-drops, 2 units.
+    assert stats["batches_dropped"] == 2
     assert stats["units_not_reviewed"] == 2, "exact: batch membership known"
+    assert stats["batches_split_lost"] == 1
     # the drop message is attributable
     assert any("batch 2/2" in e and "prose/refusal" in e for e in errs), errs
+    assert any("half" in e and "prose/refusal" in e for e in errs), errs
 
 
 def test_analyze_reachability_stats_absent_means_uncounted():
