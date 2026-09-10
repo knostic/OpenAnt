@@ -195,6 +195,12 @@ def run_verification(
         verify_binding, _verify_texts,
         extra_key={
             "analyze_fingerprint": experiment.get("analyze_fingerprint"),
+            # #546: the context's deterministic-derivation identity — a
+            # standalone verify can be given a different --app-context than
+            # analyze used; the fold keeps the family's keys consistent.
+            **({"ctx_sources_sha256":
+                    getattr(app_context, "source_sha256", None)}
+               if getattr(app_context, "source_sha256", None) else {}),
             # #287: the verify phase's generation budget is part of its
             # checkpoint identity — a budget change invalidates verify
             # checkpoints specifically (no scheme bump; the extra_key

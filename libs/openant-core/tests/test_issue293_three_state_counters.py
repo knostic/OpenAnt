@@ -295,7 +295,7 @@ def test_analyzer_run_analysis_three_bucket_summary(tmp_path, monkeypatch):
 
     monkeypatch.setattr(analyzer_mod, "_run_detection", fake_run_detection)
     monkeypatch.setattr(analyzer_mod, "_analyze_fingerprint",
-                        lambda binding: {"key_digest": "sha256:test"})
+                        lambda binding, ctx_sha=None: {"key_digest": "sha256:test"})
 
     from utilities.llm import PhaseBinding
 
@@ -358,7 +358,7 @@ def test_analyzer_restore_counts_inconclusive_completed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(analyzer_mod, "_run_detection", fake_run_detection)
     monkeypatch.setattr(analyzer_mod, "_analyze_fingerprint",
-                        lambda binding: {"key_digest": "sha256:test"})
+                        lambda binding, ctx_sha=None: {"key_digest": "sha256:test"})
 
     from utilities.llm import PhaseBinding
 

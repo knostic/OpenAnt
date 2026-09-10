@@ -518,6 +518,8 @@ def analyze_reachability(
             # I2 adopt gate: BEFORE loading prior checkpoints, verify the backend
             # identity that produced them matches (a changed model/provider/
             # adapter/template archives the stale dir and forces a re-run).
+            _ctx_sha = ((app_context or {}).get("source_sha256")
+                        if isinstance(app_context, dict) else None)
             llr_fp = fingerprint_for_binding(
                 binding,
                 render_template_texts([
@@ -526,6 +528,12 @@ def analyze_reachability(
                         units_block="",
                     )
                 ]),
+                # #546: the context's deterministic-derivation identity —
+                # the per-prompt app-context block stays excluded (the
+                # narration non-determinism trap); the SOURCES hash
+                # invalidates the stale records when the derivation changes.
+                extra_key=({"ctx_sources_sha256": _ctx_sha}
+                          if _ctx_sha else None),
             )
             checkpoint.sync_identity(llr_fp)
             prior_records = checkpoint.load()
