@@ -309,7 +309,8 @@ def analyze_unit(
     use_multifile: bool = False,
     json_corrector: JSONCorrector = None,
     context_reviewer: ContextReviewer = None,
-    app_context: "ApplicationContext" = None
+    app_context: "ApplicationContext" = None,
+    max_tokens: int | None = None
 ) -> dict:
     """
     Analyze a single code unit.
@@ -395,7 +396,12 @@ def analyze_unit(
     # Call the configured analyze-phase model with the threat-model system prompt.
     start_time = datetime.now()
     system_prompt = get_stage1_system_prompt(app_context=app_context)
-    response = simple_text(binding, prompt, system=system_prompt)
+    # #569 (choice c): the budget-retry path passes a raised cap — the
+    # deterministic length-empty class gets one retry that attacks the
+    # cause (the budget) instead of a same-cap coin flip.
+    response = simple_text(binding, prompt, system=system_prompt,
+                           max_tokens=max_tokens) if max_tokens else \
+        simple_text(binding, prompt, system=system_prompt)
     elapsed = (datetime.now() - start_time).total_seconds()
 
     # Parse response
