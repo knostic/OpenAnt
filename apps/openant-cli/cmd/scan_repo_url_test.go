@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/knostic/open-ant-cli/internal/config"
 	"github.com/knostic/open-ant-cli/internal/git"
+	"github.com/knostic/open-ant-cli/internal/report"
 )
 
 // TestNormalizeRemote pins the #562 matrix: every remote shape either
@@ -85,5 +87,28 @@ func TestFoldScpPasswordShapeRejected(t *testing.T) {
 	}
 	if got := git.NormalizeRemote("git@evil@127.0.0.1:org/repo.git"); got != "https://127.0.0.1/org/repo" {
 		t.Errorf("last-@ rule broken: %q", got)
+	}
+}
+
+// TestFileURLNormalizesDefensively pins the #568 render boundary: an
+// scp-form or credential-bearing RepoURL from an old artifact never reaches
+// the permalink (and never renders the credential).
+func TestFileURLNormalizesDefensively(t *testing.T) {
+	d := report.ReportData{CommitSHA: "abc123"}
+	// An scp-form URL from an old pipeline_output: the permalink is the
+	// normalized https form, never the raw scp.
+	d.RepoURL = "git@github.com:org/repo.git"
+	if got := d.FileURL("f.py"); got != "https://github.com/org/repo/blob/abc123/f.py" {
+		t.Errorf("FileURL(scp) = %q, want the normalized permalink", got)
+	}
+	// A credential-bearing URL: the TOKEN never reaches the output.
+	d.RepoURL = "https://user:TOKEN@github.com/org/repo"
+	if got := d.FileURL("f.py"); strings.Contains(got, "TOKEN") || strings.Contains(got, "user:") {
+		t.Errorf("FileURL(cred) = %q — the credential leaked", got)
+	}
+	// An unparseable URL: the honest absence (no broken link).
+	d.RepoURL = "git://github.com/org/repo.git"
+	if got := d.FileURL("f.py"); got != "" {
+		t.Errorf("FileURL(git://) = %q, want empty", got)
 	}
 }

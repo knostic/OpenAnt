@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/knostic/open-ant-cli/internal/remoteurl"
 	"html/template"
 	"io"
 	"math/big"
@@ -318,7 +319,10 @@ func (s *Server) recoverJobs() {
 
 		// Fall back: infer repo from git config and mtime from dir.
 		if job.Repo == "" {
-			job.Repo = inferRepoURL(jobDir)
+			// #568: normalize the .git/config raw remote (scp/credential
+			// forms) at the source — everything downstream (the job record,
+			// patchPipelineOutput, the report) then carries the browse form.
+			job.Repo = remoteurl.Normalize(inferRepoURL(jobDir))
 		}
 		if job.StartedAt.IsZero() {
 			if info, err := os.Stat(jobDir); err == nil {
@@ -1212,8 +1216,14 @@ func (s *Server) runJob(job *Job) {
 	if job.libraryMode {
 		args = append(args, "--library-mode")
 	}
+	// #566's entry-surface residual: the metadata flag carries the browse
+	// form — job.Repo stays raw for the clone, but a credential-bearing or
+	// unparseable remote never reaches the scan's metadata artifacts (the
+	// honest absence skips the flag entirely).
 	if isURL {
-		args = append(args, "--repo-url", job.Repo)
+		if _u := remoteurl.Normalize(job.Repo); _u != "" {
+			args = append(args, "--repo-url", _u)
+		}
 	}
 	args = append(args, "--", localPath)
 
@@ -1689,7 +1699,14 @@ func patchPipelineOutput(outDir, repo string, onLog func(string)) {
 	}
 	if repoField, ok := obj["repository"]; ok {
 		if repoMap, ok := repoField.(map[string]any); ok {
-			repoMap["url"] = repo
+			// #568: the render-boundary defense — never write a raw remote.
+			// An unparseable form is removed (the honest absence); a
+			// parseable one carries the normalized browse form.
+			if normalized := remoteurl.Normalize(repo); normalized != "" {
+				repoMap["url"] = normalized
+			} else {
+				delete(repoMap, "url")
+			}
 		}
 	}
 	patched, err := json.MarshalIndent(obj, "", "  ")

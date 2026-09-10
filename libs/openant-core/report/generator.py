@@ -268,6 +268,32 @@ def _compact_for_summary(pipeline_data: dict) -> dict:
     from findings to avoid exceeding the context window.
     """
     compact = {k: v for k, v in pipeline_data.items() if k != "findings"}
+    # #568: the render boundary never carries a raw remote — an old
+    # pipeline_output.json (or a raw --repo-url) can hold a
+    # credential-bearing or scp-form repository.url. Swap in a url-less
+    # COPY unless it is a clean http(s) browse URL (the honest absence);
+    # name/language stay, and the caller's dict is never mutated (the
+    # shallow copy above aliases the nested objects).
+    _repo = compact.get("repository")
+    if not isinstance(_repo, dict):
+        # a non-dict repository is hand-edited garbage — the honest absence
+        compact["repository"] = {}
+    elif "url" in _repo:
+        _url = _repo.get("url")
+        if not isinstance(_url, str):
+            _url = ""  # a non-string url is garbage — treated as absent
+        _scheme, _sep, _rest = _url.partition("://")
+        _authority = _rest.partition("/")[0]
+        if (
+            not _sep
+            or _scheme not in ("http", "https")
+            or "@" in _authority
+            or "?" in _url
+            or "#" in _url
+        ):
+            compact["repository"] = {
+                k: v for k, v in _repo.items() if k != "url"
+            }
     compact["findings"] = []
     for f in pipeline_data.get("findings", []):
         compact["findings"].append({

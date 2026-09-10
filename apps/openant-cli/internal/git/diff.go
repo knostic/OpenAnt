@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"net/url"
+	"github.com/knostic/open-ant-cli/internal/remoteurl"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -37,113 +37,11 @@ func gitRevParse(repoPath, ref string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// NormalizeRemote normalizes a git remote URL to a plain browse URL,
-// the shape the report permalink and SARIF repositoryUri consumers require
-// (#562). Returns "" when the input cannot be normalized safely:
-//
-//   - scp-form "git@host:org/repo.git"  -> "https://host/org/repo"
-//   - ssh://git@host[:port]/org/repo    -> "https://host/org/repo" (the ssh
-//     PORT is dropped — it is sshd's, not the browse UI's)
-//   - https://user:TOKEN@host/org/repo  -> "https://host/org/repo" (userinfo
-//     NEVER persists — a credential-bearing remote must not reach a report,
-//     a log, OR a warn line)
-//   - http(s)://host/org/repo           -> itself (scheme preserved — an
-//     http-only internal host keeps a live permalink; host lowercased, .git
-//     suffix trimmed, query/fragment dropped)
-//   - git:// (deprecated), local paths, and anything unparseable -> ""
-//     (the current honest absence is better than a broken or leaking link)
-//
-// The scp host region parses after the LAST '@' before the path separator
-// (the scpHost rule: "git@evil@127.0.0.1:path" must resolve to 127.0.0.1).
+// NormalizeRemote re-exports remoteurl.Normalize (the canonical home as of
+// #568 — the render packages need the normalization without this package's
+// exec dependencies).
 func NormalizeRemote(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	// scp-form: no scheme, "[user@]host:path" with a colon before any slash
-	// or drive-letter shape. Hand-parsed (net/url cannot parse scp form).
-	if !strings.Contains(raw, "://") {
-		// Reject Windows drive paths and bracketed IPv6 (the colon rule
-		// cannot distinguish them; the honest absence).
-		if strings.Contains(raw, "\\") {
-			return ""
-		}
-		i := strings.IndexByte(raw, ':')
-		if i <= 0 || i+1 >= len(raw) {
-			return ""
-		}
-		rest := raw[i+1:]
-		if rest == "" || strings.HasPrefix(rest, "/") {
-			return ""
-		}
-		// The gate fold (the astra round's live-confirmed leak): the
-		// password-bearing scp shape "user:pass@host:path" splits at the
-		// first colon, leaving the path "pass@host:path" — the credential
-		// text and the raw host:path survive into the normalized URL. A
-		// legitimate scp path (org/repo.git) NEVER contains '@': reject
-		// any scp form whose path region carries '@' (the credential-
-		// bearing shape) — the honest absence, never a leaking link.
-		if strings.ContainsAny(rest, "@") {
-			return ""
-		}
-		host := scpHostRegion(raw)
-		if host == "" || host != strings.ToLower(host) && strings.ContainsAny(host, "[]") {
-			return "" // bracketed IPv6 scp — unparseable by this rule
-		}
-		return "https://" + strings.ToLower(host) + "/" +
-			strings.TrimSuffix(strings.Trim(rest, "/"), ".git")
-	}
-	// Scheme form: net/url handles the case-insensitive scheme, the
-	// bracketed IPv6, the port, the query/fragment, and User in one pass.
-	u, err := url.Parse(raw)
-	if err != nil {
-		return ""
-	}
-	switch strings.ToLower(u.Scheme) {
-	case "http", "https":
-		// Preserve the scheme (and a legitimate http(s) port); drop
-		// userinfo, query, fragment.
-		u.User = nil
-		u.RawQuery = ""
-		u.Fragment = ""
-		u.RawFragment = ""
-		u.Path = strings.TrimSuffix(strings.Trim(u.Path, "/"), ".git")
-		return u.String()
-	case "ssh":
-		host := u.Hostname()
-		if host == "" {
-			return ""
-		}
-		// Drop the ssh port (sshd's, not the browse UI's); keep IPv6
-		// brackets handled by net/url.
-		u.User = nil
-		u.Host = host
-		u.Scheme = "https"
-		u.RawQuery = ""
-		u.Fragment = ""
-		u.RawFragment = ""
-		u.Path = strings.TrimSuffix(strings.Trim(u.Path, "/"), ".git")
-		return u.String()
-	default:
-		return "" // git://, ftp://, file:// — not browseable
-	}
-}
-
-// scpHostRegion extracts the host from an scp-style address using the
-// scpHost parsing rule (the last '@' before the ':' path separator).
-func scpHostRegion(repo string) string {
-	limit := len(repo)
-	if c := strings.IndexByte(repo, ':'); c >= 0 && c < limit {
-		limit = c
-	}
-	s := repo[:limit]
-	if a := strings.LastIndexByte(s, '@'); a >= 0 {
-		s = s[a+1:]
-	}
-	if s == "" {
-		return ""
-	}
-	return s
+	return remoteurl.Normalize(raw)
 }
 
 // RemoteURL returns the origin remote's URL for the repo at repoPath, or ""

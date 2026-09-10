@@ -3,6 +3,7 @@ package report
 
 import (
 	"fmt"
+	"github.com/knostic/open-ant-cli/internal/remoteurl"
 	"html/template"
 	"strings"
 
@@ -163,9 +164,23 @@ func (d ReportData) FileURL(filePath string) string {
 	if d.RepoURL == "" || d.CommitSHA == "" {
 		return ""
 	}
-	base := strings.TrimRight(d.RepoURL, "/")
+	// #568: normalize defensively — an artifact (or a caller) may carry a
+	// raw remote form (scp/credential-bearing); the render boundary never
+	// persists or leaks it.
+	base := remoteurl.Normalize(d.RepoURL)
 	base = strings.TrimSuffix(base, ".git")
+	if base == "" {
+		return ""
+	}
 	return base + "/blob/" + d.CommitSHA + "/" + filePath
+}
+
+// BrowseURL returns the normalized browse form of the repo URL — the #568
+// render-boundary contract: a raw remote (scp-form, credential-bearing)
+// never reaches a rendered link. Returns "" when the URL cannot be
+// normalized safely (the honest absence).
+func (d ReportData) BrowseURL() string {
+	return remoteurl.Normalize(d.RepoURL)
 }
 
 // HasStepReports returns true if there are step reports to display.

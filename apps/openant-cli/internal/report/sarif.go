@@ -3,6 +3,7 @@ package report
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/knostic/open-ant-cli/internal/remoteurl"
 	"io"
 	"os"
 	"path/filepath"
@@ -65,12 +66,19 @@ func BuildSARIF(data ReportData, opts SARIFOptions) map[string]any {
 		},
 		"results": results,
 	}
-	if data.RepoURL != "" {
-		// versionControlProvenance is consumed by GitHub Code Scanning to
-		// associate the upload with a specific commit. Skip when we don't
-		// have it rather than emitting an empty/misleading object.
+	// versionControlProvenance is consumed by GitHub Code Scanning to
+	// associate the upload with a specific commit. Skip when we don't
+	// have it rather than emitting an empty/misleading object.
+	// #568: normalize defensively — a non-URI (scp-form) or
+	// credential-bearing URL can break the Code Scanning upload or
+	// leak credentials into the artifact. When the remote cannot be
+	// normalized safely, omit the block entirely (the honest absence —
+	// a raw fallback would write the credential text); revisionId
+	// co-travels because SARIF's versionControlDetails requires
+	// repositoryUri.
+	if _uri := remoteurl.Normalize(data.RepoURL); _uri != "" {
 		prov := map[string]any{
-			"repositoryUri": data.RepoURL,
+			"repositoryUri": _uri,
 		}
 		if data.CommitSHA != "" {
 			prov["revisionId"] = data.CommitSHA
