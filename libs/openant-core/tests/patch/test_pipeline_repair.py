@@ -65,6 +65,17 @@ _CHALLENGER_RISK_ONLY = {
     "summary": "Unverified risk only.",
 }
 
+# A challenger result with a concrete, patch-caused behavioral defect only
+# (run-4 Architecture B) -- no exploitability language at all, mirroring
+# the real run-4 transcript's own "Still vulnerable: No" shape.
+_BEHAVIORAL_TEXT = "The patch rejects previously accepted configuration values."
+_CHALLENGER_WITH_BEHAVIORAL_DEFECT = {
+    "still_vulnerable": False,
+    "edge_cases": [],
+    "potential_issues": [_BEHAVIORAL_TEXT],
+    "summary": "The patch works but changes accepted behavior.",
+}
+
 _APPLICABILITY_CLEAN = {
     "applicable": True, "skipped": False, "stderr": "",
     "exit_code": 0, "skipped_reason": None, "error": None,
@@ -192,10 +203,14 @@ class TestRenderRepairNotice:
         assert _render_repair_notice(r) == ""
 
     def test_success_notice_contains_auto_repaired(self):
+        # _render_repair_notice now reads the repair-ELIGIBLE fields (see
+        # its own docstring), not the confirmed_defect-only ones -- for a
+        # scenario with no behavioral_defect at all, eligible == confirmed,
+        # so both are set to the same value here.
         from utilities.autopatcher.pipeline import _render_repair_notice
         r = self._make_result(
             repair_attempted=True, repair_succeeded=True,
-            original_challenger_defect_count=2,
+            original_challenger_defect_count=2, original_challenger_repair_eligible_count=2,
         )
         notice = _render_repair_notice(r)
         assert "auto-repaired" in notice.lower()
@@ -205,7 +220,8 @@ class TestRenderRepairNotice:
         from utilities.autopatcher.pipeline import _render_repair_notice
         r = self._make_result(
             repair_attempted=True, repair_succeeded=False, repair_rechallenged=True,
-            original_challenger_defect_count=1, repair_defect_count=1,
+            original_challenger_defect_count=1, original_challenger_repair_eligible_count=1,
+            repair_defect_count=1, repair_eligible_defect_count=1,
         )
         notice = _render_repair_notice(r)
         assert "repair attempted" in notice.lower()
@@ -215,7 +231,8 @@ class TestRenderRepairNotice:
         from utilities.autopatcher.pipeline import _render_repair_notice
         r = self._make_result(
             repair_attempted=True, repair_succeeded=False, repair_rechallenged=True,
-            original_challenger_defect_count=2, repair_defect_count=1,
+            original_challenger_defect_count=2, original_challenger_repair_eligible_count=2,
+            repair_defect_count=1, repair_eligible_defect_count=1,
         )
         notice = _render_repair_notice(r)
         assert "original recommendation stands" in notice.lower()
@@ -223,12 +240,13 @@ class TestRenderRepairNotice:
     def test_never_rechallenged_notice_does_not_claim_a_defect_count(self):
         """When the repair patch never reached re-challenge (applicability
         failure or an internal error), the notice must say so explicitly and
-        must not present the untouched repair_defect_count default as if it
-        were an observed finding."""
+        must not present the untouched repair_eligible_defect_count default
+        as if it were an observed finding."""
         from utilities.autopatcher.pipeline import _render_repair_notice
         r = self._make_result(
             repair_attempted=True, repair_succeeded=False, repair_rechallenged=False,
-            original_challenger_defect_count=2, repair_defect_count=0,
+            original_challenger_defect_count=2, original_challenger_repair_eligible_count=2,
+            repair_defect_count=0, repair_eligible_defect_count=0,
         )
         notice = _render_repair_notice(r)
         assert "repair attempted" in notice.lower()
@@ -246,10 +264,27 @@ class TestRenderRepairNotice:
         from utilities.autopatcher.pipeline import _render_repair_notice
         r = self._make_result(
             repair_attempted=True, repair_succeeded=False, repair_rechallenged=False,
-            original_challenger_defect_count=3, repair_defect_count=0,
+            original_challenger_defect_count=3, original_challenger_repair_eligible_count=3,
+            repair_defect_count=0, repair_eligible_defect_count=0,
         )
         notice = _render_repair_notice(r)
         assert "3" in notice
+
+    def test_notice_uses_eligible_count_not_confirmed_only_count(self):
+        """The exact scenario this correction targets: a repair triggered
+        purely by a behavioral_defect finding (0 confirmed_defect, 1
+        behavioral_defect) must show "1", not "0" -- reading
+        original_challenger_defect_count here would be self-contradictory
+        ("Original patch had 0 confirmed issue(s)... A repair was
+        generated")."""
+        from utilities.autopatcher.pipeline import _render_repair_notice
+        r = self._make_result(
+            repair_attempted=True, repair_succeeded=True,
+            original_challenger_defect_count=0, original_challenger_repair_eligible_count=1,
+        )
+        notice = _render_repair_notice(r)
+        assert "1 confirmed issue" in notice
+        assert "0 confirmed issue" not in notice
 
 
 # ---------------------------------------------------------------------------
@@ -643,14 +678,18 @@ class TestRepairReport:
         assert "0 confirmed defect(s)" not in report.lower()
 
     def test_report_states_defect_count_before_repair(self, tmp_path):
-        # original had 1 confirmed defect; notice should say 1
+        # original had 1 confirmed defect; notice should say 1. Wording is
+        # "confirmed issue(s)", not "confirmed defect(s)" (run-4
+        # Architecture B: the same notice now also covers behavioral_defect
+        # findings, so it no longer names "defect" specifically -- see
+        # _render_repair_notice's own docstring).
         report = self._run_and_get_report(
             tmp_path,
             patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
             patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
             patches_chall=[_CHALLENGER_WITH_DEFECT, _CHALLENGER_CLEAN],
         )
-        assert "1 confirmed defect" in report
+        assert "1 confirmed issue" in report
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +825,104 @@ class TestShouldAutoRepair:
         assert decisions == {False}
 
 
+class TestBehavioralDefectShouldAutoRepair:
+    """behavioral_defect (run-4 Architecture B) must be held to the EXACT
+    SAME three-condition gate as confirmed_defect -- same tests as
+    TestShouldAutoRepair, with the finding text/category swapped."""
+
+    def _classified(self, challenger=None):
+        from utilities.autopatcher.pipeline import _classify_challenger
+        return _classify_challenger(challenger or _CHALLENGER_WITH_BEHAVIORAL_DEFECT)
+
+    def test_raw_classification_is_behavioral_defect_not_confirmed_defect(self):
+        classified = self._classified()
+        assert classified["behavioral_defect_count"] == 1
+        assert classified["confirmed_defect_count"] == 0
+
+    def test_no_repair_when_calibrated_hypothesis(self):
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        assert should_auto_repair(classified, [_hypothesis(_BEHAVIORAL_TEXT)], True) is False
+
+    def test_no_repair_when_calibrated_hardening(self):
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        assert should_auto_repair(classified, [_hardening(_BEHAVIORAL_TEXT)], True) is False
+
+    def test_no_repair_when_calibration_is_none(self):
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        assert should_auto_repair(classified, None, True) is False
+
+    def test_no_repair_when_calibration_omits_this_specific_finding(self):
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        other = _observed("a completely unrelated finding")
+        assert should_auto_repair(classified, [other], True) is False
+
+    def test_repair_authorized_when_observed_and_applicable(self):
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        assert should_auto_repair(classified, [_observed(_BEHAVIORAL_TEXT)], True) is True
+
+    def test_no_repair_when_observed_but_not_applicable(self):
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified()
+        assert should_auto_repair(classified, [_observed(_BEHAVIORAL_TEXT)], False) is False
+
+    def test_plausible_risk_never_authorizes_repair_even_if_calibrated_observed(self):
+        """A finding that is NOT classified confirmed_defect or
+        behavioral_defect must never authorize repair, no matter how it
+        calibrates -- plausible_risk/validation_gap/generic stay outside
+        this mechanism entirely, unchanged."""
+        from utilities.autopatcher.pipeline import should_auto_repair
+        classified = self._classified(_CHALLENGER_RISK_ONLY)
+        risk_text = _CHALLENGER_RISK_ONLY["edge_cases"][0]
+        assert classified["confirmed_defect_count"] == 0
+        assert classified["behavioral_defect_count"] == 0
+        assert should_auto_repair(classified, [_observed(risk_text)], True) is False
+
+    def test_validation_gap_never_authorizes_repair_even_if_calibrated_observed(self):
+        from utilities.autopatcher.pipeline import should_auto_repair, _classify_challenger
+        challenger = {
+            "still_vulnerable": False, "edge_cases": [],
+            "potential_issues": ["Cannot verify this without running the test suite"],
+            "summary": "...",
+        }
+        classified = _classify_challenger(challenger)
+        text = challenger["potential_issues"][0]
+        assert classified["validation_gap_count"] == 1
+        assert should_auto_repair(classified, [_observed(text)], True) is False
+
+    def test_confirmed_defect_and_behavioral_defect_both_present_either_observed_authorizes(self):
+        """A run raising BOTH a confirmed_defect and a behavioral_defect --
+        either one alone, calibrated observed, is sufficient to authorize
+        repair (the gate is an OR across the eligible set, unchanged from
+        confirmed_defect-only's own pre-existing semantics)."""
+        from utilities.autopatcher.pipeline import should_auto_repair, _classify_challenger
+        challenger = {
+            "still_vulnerable": False,
+            "edge_cases": [_BYPASS_TEXT],
+            "potential_issues": [_BEHAVIORAL_TEXT],
+            "summary": "...",
+        }
+        classified = _classify_challenger(challenger)
+        assert classified["confirmed_defect_count"] == 1
+        assert classified["behavioral_defect_count"] == 1
+        # Only the behavioral_defect finding calibrates observed.
+        assert should_auto_repair(
+            classified, [_hypothesis(_BYPASS_TEXT), _observed(_BEHAVIORAL_TEXT)], True,
+        ) is True
+        # Only the confirmed_defect finding calibrates observed.
+        assert should_auto_repair(
+            classified, [_observed(_BYPASS_TEXT), _hypothesis(_BEHAVIORAL_TEXT)], True,
+        ) is True
+        # Neither calibrates observed.
+        assert should_auto_repair(
+            classified, [_hypothesis(_BYPASS_TEXT), _hypothesis(_BEHAVIORAL_TEXT)], True,
+        ) is False
+
+
 class TestAcceptRepair:
     """Unit tests for accept_repair — the v2 acceptance gate. Symmetric with
     should_auto_repair but applied to v2's own finding state, and fails
@@ -831,6 +968,49 @@ class TestAcceptRepair:
         classified = self._classified(_BYPASS_CHALLENGER)
         other = _observed("a completely unrelated finding")
         assert accept_repair(classified, [other], True) is False
+
+    def test_accept_when_behavioral_defect_calibrates_away_from_observed(self):
+        from utilities.autopatcher.pipeline import accept_repair
+        classified = self._classified(_CHALLENGER_WITH_BEHAVIORAL_DEFECT)
+        assert accept_repair(classified, [_hypothesis(_BEHAVIORAL_TEXT)], True) is True
+
+    def test_reject_when_behavioral_defect_calibrates_observed(self):
+        from utilities.autopatcher.pipeline import accept_repair
+        classified = self._classified(_CHALLENGER_WITH_BEHAVIORAL_DEFECT)
+        assert accept_repair(classified, [_observed(_BEHAVIORAL_TEXT)], True) is False
+
+    def test_reject_when_v2_fixes_original_confirmed_defect_but_introduces_behavioral_defect(self):
+        """The exact symmetry requirement: v2's Challenger clears the
+        original confirmed_defect but raises a DIFFERENT, concrete
+        behavioral_defect that calibrates observed -- must still reject v2
+        and preserve v1, never accept merely because ONE category cleared."""
+        from utilities.autopatcher.pipeline import accept_repair, _classify_challenger
+        v2_challenger = {
+            "still_vulnerable": False,
+            "edge_cases": [],
+            "potential_issues": [_BEHAVIORAL_TEXT],
+            "summary": "bypass fixed, but now drops previously accepted values",
+        }
+        classified = _classify_challenger(v2_challenger)
+        assert classified["confirmed_defect_count"] == 0
+        assert classified["behavioral_defect_count"] == 1
+        assert accept_repair(classified, [_observed(_BEHAVIORAL_TEXT)], True) is False
+
+    def test_reject_when_v2_fixes_behavioral_defect_but_introduces_confirmed_defect(self):
+        """Symmetric in the other direction: v2 clears the original
+        behavioral_defect but its Challenger raises a NEW confirmed_defect
+        that calibrates observed -- must still reject v2."""
+        from utilities.autopatcher.pipeline import accept_repair, _classify_challenger
+        v2_challenger = {
+            "still_vulnerable": False,
+            "edge_cases": [_BYPASS_TEXT],
+            "potential_issues": [],
+            "summary": "behavioral concern fixed, but introduced a new bypass",
+        }
+        classified = _classify_challenger(v2_challenger)
+        assert classified["confirmed_defect_count"] == 1
+        assert classified["behavioral_defect_count"] == 0
+        assert accept_repair(classified, [_observed(_BYPASS_TEXT)], True) is False
 
 
 class TestRepairGateEndToEnd:
@@ -986,6 +1166,225 @@ class TestRepairGateEndToEnd:
         known = _build_known_findings(classified, result.finding_calibration)
         assert known["potential_remaining_risks"] == []
         assert any("bypass" in h for h in known["validation_hypotheses"])
+
+
+class TestBehavioralDefectRepairEndToEnd:
+    """Full pipeline.run() coverage for the run-4 Architecture B addition:
+    a candidate patch with no security-exploitability finding at all, but a
+    concrete, Observed behavioral_defect, must trigger the SAME single-shot
+    repair mechanism confirmed_defect already uses -- no new stage, no
+    second repair attempt, no new LLM call beyond the ones this loop
+    already made before this feature existed."""
+
+    @staticmethod
+    def _calibrate_group(group):
+        def _side_effect(vulnerability_text, patch, findings, llm, code_context=""):
+            return [{"original": f, "group": group, "reworded": f} for f in findings]
+        return _side_effect
+
+    def test_no_repair_when_behavioral_finding_calibrates_hypothesis(self, tmp_path):
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_BEHAVIORAL_DEFECT],
+            calibration_side_effect=self._calibrate_group("hypothesis"),
+        )
+        assert result.repair_attempted is False
+        assert mock_gen.call_count == 0
+        assert mock_chall.call_count == 1
+
+    def test_behavioral_defect_repair_fires_exactly_once(self, tmp_path):
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_BEHAVIORAL_DEFECT, _CHALLENGER_CLEAN],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_attempted is True
+        assert mock_gen.call_count == 1  # single-shot: exactly one repair attempt
+        assert mock_chall.call_count == 2  # v1 + v2 re-challenge, never a third
+
+    def test_repaired_patch_accepted_once_behavioral_concern_clears(self, tmp_path):
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_BEHAVIORAL_DEFECT, _CHALLENGER_CLEAN],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_succeeded is True
+        assert "repaired" in result.patch
+
+    def test_v2_retains_behavioral_defect_rejects_v2_preserves_v1_no_third_attempt(self, tmp_path):
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_BEHAVIORAL_DEFECT, _CHALLENGER_WITH_BEHAVIORAL_DEFECT],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_succeeded is False
+        assert "repaired" not in result.patch
+        assert mock_gen.call_count == 1  # no second/third repair attempt despite rejection
+
+    def test_exact_run_4_finding_triggers_repair_end_to_end(self, tmp_path):
+        """The exact real run-4 regression: candidate patch -> Challenger
+        produces the real run-4 behavioral finding -> classification =
+        behavioral_defect -> calibration = Observed -> should_auto_repair =
+        true -> exactly one repair attempt. This proves the orchestration
+        chain, not that the real LLM produces a better patch (that is a
+        question for the fifth targeted minimist run, not this test)."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+        run_4_challenger = {
+            "still_vulnerable": False,
+            "edge_cases": [
+                "Dotted keys like `--foo.constructor.x` still blocked mid-path "
+                "(intended, but may break legit `constructor` data keys)"
+            ],
+            "potential_issues": [
+                "Silent drop of legitimate keys named `constructor`/`prototype` may "
+                "cause surprising behavior for consumers (no deprecation/error surfaced)"
+            ],
+            "summary": "The patch correctly extends the existing guard...",
+        }
+        classified = _classify_challenger(run_4_challenger)
+        assert classified["behavioral_defect_count"] == 2
+        assert classified["confirmed_defect_count"] == 0
+
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[run_4_challenger, _CHALLENGER_CLEAN],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_attempted is True
+        assert mock_gen.call_count == 1
+        assert mock_chall.call_count == 2
+
+
+class TestCountFieldSemanticsNotOverloaded:
+    """Post-review correction: confirmed_defect_count/original_challenger_
+    defect_count/repair_defect_count must remain confirmed_defect-ONLY,
+    never silently widened to include behavioral_defect -- repair
+    eligibility uses a SEPARATE, additively-named concept
+    (original_challenger_repair_eligible_count/repair_eligible_defect_count)
+    instead. See PipelineResult's own field comments."""
+
+    @staticmethod
+    def _calibrate_group(group):
+        def _side_effect(vulnerability_text, patch, findings, llm, code_context=""):
+            return [{"original": f, "group": group, "reworded": f} for f in findings]
+        return _side_effect
+
+    def test_behavioral_only_finding_reports_correct_split_counts(self, tmp_path):
+        """Requirement 1: 0 confirmed_defect, 1 behavioral_defect must
+        report EXACTLY that split -- never confirmed_defect_count == 1 --
+        while repair still triggers when calibrated Observed."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+        classified = _classify_challenger(_CHALLENGER_WITH_BEHAVIORAL_DEFECT)
+        assert classified["confirmed_defect_count"] == 0
+        assert classified["behavioral_defect_count"] == 1
+
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_BEHAVIORAL_DEFECT, _CHALLENGER_CLEAN],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_attempted is True
+
+    def test_behavioral_only_repair_does_not_inflate_persisted_confirmed_defect_count(self, tmp_path):
+        """Requirement 2: a behavioral-only repair must leave
+        original_challenger_defect_count at 0 -- it must NEVER become 1
+        merely because a behavioral_defect authorized the repair. The
+        repair-eligible count (which the notice reads) is the field that
+        legitimately becomes 1."""
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_BEHAVIORAL_DEFECT, _CHALLENGER_CLEAN],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_attempted is True
+        assert result.original_challenger_defect_count == 0
+        assert result.original_challenger_repair_eligible_count == 1
+
+    def test_mixed_confirmed_and_behavioral_counts_stay_separate(self, tmp_path):
+        """Requirement 3: 1 confirmed_defect + 2 behavioral_defect must
+        retain each count separately (never merged into one field), while
+        all three remain repair-eligible subject to calibration."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+        mixed_challenger = {
+            "still_vulnerable": False,
+            "edge_cases": [
+                _BYPASS_TEXT,
+                "The patch rejects previously accepted configuration values.",
+            ],
+            "potential_issues": [
+                "The change silently drops valid user-supplied options.",
+            ],
+            "summary": "mixed confirmed + behavioral findings",
+        }
+        classified = _classify_challenger(mixed_challenger)
+        assert classified["confirmed_defect_count"] == 1
+        assert classified["behavioral_defect_count"] == 2
+
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[mixed_challenger, _CHALLENGER_CLEAN],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_attempted is True
+        assert result.original_challenger_defect_count == 1
+        assert result.original_challenger_repair_eligible_count == 3
+
+    def test_v2_behavioral_only_finding_does_not_inflate_repair_defect_count(self, tmp_path):
+        """Requirement 4: if v2's own re-challenge raises only a
+        behavioral_defect (0 confirmed_defect), repair_defect_count (the
+        historically confirmed_defect-only public field) must stay 0 --
+        the eligible field is what legitimately shows 1."""
+        v2_challenger_with_behavioral = {
+            "still_vulnerable": False,
+            "edge_cases": [],
+            "potential_issues": [_BEHAVIORAL_TEXT],
+            "summary": "confirmed defect fixed, but introduced a behavioral concern",
+        }
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_DEFECT, v2_challenger_with_behavioral],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        # v2's behavioral_defect, calibrated observed, must reject v2 and
+        # preserve v1 -- accept_repair treats it as repair-eligible.
+        assert result.repair_succeeded is False
+        assert result.repair_defect_count == 0
+        assert result.repair_eligible_defect_count == 1
+        assert mock_gen.call_count == 1  # single-shot: no second repair attempt
+
+    def test_repair_remains_single_shot_for_behavioral_defect(self, tmp_path):
+        """Requirement 6, restated directly for this correction: even with
+        the count-semantics fix, the repair loop is still exactly one
+        generate_patch/challenge_patch call pair -- no loop was
+        introduced by separating confirmed vs. eligible counts."""
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_BEHAVIORAL_DEFECT, _CHALLENGER_WITH_BEHAVIORAL_DEFECT],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        assert result.repair_succeeded is False
+        assert mock_gen.call_count == 1
+        assert mock_chall.call_count == 2
 
 
 class TestNoUnnecessaryCalibrationCall:

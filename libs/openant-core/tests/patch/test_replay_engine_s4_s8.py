@@ -259,3 +259,110 @@ class TestSharedImplementation:
         assert re_mod._run_patch_generation_and_investigation is pipeline_mod._run_patch_generation_and_investigation
         assert re_mod._run_patch_repair_and_calibration is pipeline_mod._run_patch_repair_and_calibration
         assert re_mod._adjust_confidence_score_for_challenger is pipeline_mod._adjust_confidence_score_for_challenger
+
+
+# ---------------------------------------------------------------------------
+# Post-review correction (run-4 Architecture B count/artifact semantics):
+# _run_replay_report_generation's own reconstruction of
+# original_challenger_repair_eligible_count/repair_eligible_defect_count
+# from a Stage-6 artifact -- hand-built synthetic artifacts, same style as
+# test_replay_planner_claim_verifier.py's own S1-artifact tests, since this
+# is a narrow backward-compatibility property (old artifact shape without
+# "behavioral_defect_count" at all) that the real-run_traced integration
+# tests above cannot exercise (mock-mode LLM never produces a behavioral_
+# defect-shaped Challenger response).
+# ---------------------------------------------------------------------------
+
+class TestReplayReportGenerationRepairEligibleCounts:
+    def _resolution(self, path):
+        from utilities.autopatcher.lineage import RESOLVED, Resolution
+        return Resolution(state=RESOLVED, artifact_path=str(path))
+
+    def _write(self, path, data):
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def _build_artifacts(self, tmp_path, *, s6_challenger_extra=None, s6_rechallenge_extra=None,
+                          repair_rechallenged=True):
+        """Minimal-but-complete S1/S2/S4/S6/S7/S8/S9 artifacts -- only the
+        fields _run_replay_report_generation actually reads (traced
+        directly from its own source), so this fails loudly (KeyError) if
+        that function's required-field contract ever changes without this
+        test being updated."""
+        s1 = self._write(tmp_path / "s1.json", {"grounding": None, "repository_understanding": None})
+        s2 = self._write(tmp_path / "s2.json", {"strategy_result": None})
+        s4 = self._write(tmp_path / "s4.json", {})
+        original_challenger = {"confirmed_defect_count": 1, **(s6_challenger_extra or {})}
+        s6_data = {
+            "vulnerability_text": "some vuln",
+            "patch": "some patch",
+            "challenger": original_challenger,
+            "authoritative_candidate": {
+                "source": "original", "patch": "some patch",
+                "applicability_result": None, "hygiene_findings": None,
+            },
+            "original_candidate_evaluated": {"patch": "some patch", "challenger": original_challenger},
+            "repair_regeneration": None,
+            "repair_rechallenge": (
+                {"challenger": original_challenger, "confirmed_defect_count": 0, **(s6_rechallenge_extra or {})}
+                if repair_rechallenged else None
+            ),
+            "repair_attempted": repair_rechallenged,
+            "finding_calibration": None,
+        }
+        s6 = self._write(tmp_path / "s6.json", s6_data)
+        s7 = self._write(tmp_path / "s7.json", {"review": "some review"})
+        s8 = self._write(tmp_path / "s8.json", {"score_text": "Confidence score: 0.8"})
+        s9 = self._write(tmp_path / "s9.json", {})
+        from utilities.autopatcher.stage_registry import (
+            CONFIDENCE_SCORING, IMPACT_AND_BEHAVIOR_ANALYSIS, PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION,
+            PATCH_REPAIR_AND_CALIBRATION, PATCH_REVIEW, REMEDIATION_STRATEGY,
+            REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING,
+        )
+        return {
+            REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING: self._resolution(s1),
+            REMEDIATION_STRATEGY: self._resolution(s2),
+            PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION: self._resolution(s4),
+            PATCH_REPAIR_AND_CALIBRATION: self._resolution(s6),
+            PATCH_REVIEW: self._resolution(s7),
+            CONFIDENCE_SCORING: self._resolution(s8),
+            IMPACT_AND_BEHAVIOR_ANALYSIS: self._resolution(s9),
+        }
+
+    def _replay(self, tmp_path, **kwargs):
+        from utilities.autopatcher.replay_engine import _run_replay_report_generation
+        artifacts_dir = tmp_path / "artifacts"
+        artifacts_dir.mkdir()
+        deps = self._build_artifacts(artifacts_dir, **kwargs)
+        result = _run_replay_report_generation(
+            repo_root=None, llm=None, output_dir=tmp_path, resolved_dependencies=deps, chain=None,
+        )
+        artifact = json.loads(result.artifact_path.read_text(encoding="utf-8"))
+        return artifact["pipeline_result"]
+
+    def test_old_artifact_shape_without_behavioral_key_replays_unchanged(self, tmp_path):
+        """The exact backward-compatibility requirement: an S6 artifact
+        from before behavioral_defect existed (no "behavioral_defect_count"
+        key anywhere) must reproduce the pre-existing confirmed_defect-only
+        totals exactly -- eligible == confirmed, byte-for-byte."""
+        pr = self._replay(tmp_path)
+        assert pr["original_challenger_defect_count"] == 1
+        assert pr["original_challenger_repair_eligible_count"] == 1
+        assert pr["repair_defect_count"] == 0
+        assert pr["repair_eligible_defect_count"] == 0
+
+    def test_new_artifact_shape_with_behavioral_key_sums_correctly(self, tmp_path):
+        pr = self._replay(
+            tmp_path,
+            s6_challenger_extra={"behavioral_defect_count": 2},
+            s6_rechallenge_extra={"confirmed_defect_count": 0, "behavioral_defect_count": 1},
+        )
+        assert pr["original_challenger_defect_count"] == 1
+        assert pr["original_challenger_repair_eligible_count"] == 3  # 1 confirmed + 2 behavioral
+        assert pr["repair_defect_count"] == 0
+        assert pr["repair_eligible_defect_count"] == 1  # 0 confirmed + 1 behavioral
+
+    def test_no_rechallenge_defaults_eligible_count_to_zero(self, tmp_path):
+        pr = self._replay(tmp_path, repair_rechallenged=False)
+        assert pr["repair_defect_count"] == 0
+        assert pr["repair_eligible_defect_count"] == 0

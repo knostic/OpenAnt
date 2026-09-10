@@ -125,6 +125,22 @@ class PipelineResult:
     repair_defect_count: int = 0
     repair_rechallenged: bool = False
     original_challenger_defect_count: int = 0
+    # Additive (post-review correction to run-4 Architecture B):
+    # `repair_defect_count`/`original_challenger_defect_count` above are
+    # confirmed_defect-ONLY, exactly as their names have always meant --
+    # never widened to also count behavioral_defect findings, even though
+    # both categories can now trigger repair (see should_auto_repair).
+    # These two fields carry the SEPARATE "how many repair-eligible
+    # findings existed" concept (confirmed_defect + behavioral_defect) that
+    # _render_repair_notice actually needs to avoid a self-contradictory
+    # notice ("Original patch had 0 confirmed defect(s)... A repair was
+    # generated") when a behavioral_defect alone authorized the repair.
+    # Never read by Trust Signals/Recommendation Policy -- those derive
+    # their own calibrated defect count from _build_known_findings'
+    # confirmed_defect-only `potential_remaining_risks` bucket, unaffected
+    # by these fields' existence.
+    original_challenger_repair_eligible_count: int = 0
+    repair_eligible_defect_count: int = 0
     # Deterministic static signals (Phase I)
     constraint_signals: list[dict] | None = None
     remediation_signals: list[dict] | None = None
@@ -749,6 +765,79 @@ _GENERIC_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Behavioral-defect patterns (Architecture B, run 4) -- a candidate patch
+# that itself removes, rejects, changes, or breaks behavior the repository
+# previously allowed, distinct from the vulnerable behavior being
+# intentionally removed. Generic across repositories/languages/vulnerability
+# classes: no key name, framework, or CVE is ever named here.
+#
+# Deliberately a COMBINATION of two independent signals, never a single
+# broad keyword -- "behavior"/"change"/"compatibility"/"risk" alone are far
+# too common in ordinary Challenger prose to mean anything on their own (see
+# _classify_finding's own test corpus, none of which uses these words to
+# describe an actual behavioral defect). A finding only qualifies when BOTH
+# an action verb that removes/changes something (_BEHAVIORAL_DEFECT_VERB_RE)
+# AND a description of something the repository previously allowed
+# (_BEHAVIORAL_DEFECT_OBJECT_RE) appear in the SAME clause -- never merely
+# anywhere in a longer, multi-clause finding, so an unrelated verb earlier
+# in a sentence cannot combine with a reassuring aside elsewhere in the same
+# sentence (e.g. "...and existing behavior for valid inputs remains
+# unaffected") to produce a false match.
+_BEHAVIORAL_DEFECT_VERB_RE = re.compile(
+    r"\b(break\w*|drop\w*|reject\w*|remov\w*|prevent\w*|alter\w*|chang\w*)\b",
+    re.IGNORECASE,
+)
+_BEHAVIORAL_DEFECT_OBJECT_RE = re.compile(
+    # Either shape names "something the repository previously allowed":
+    # a QUALIFIER (existing/previously-valid/legitimate/valid/unrelated)
+    # immediately preceding the noun ("legitimate keys", "existing
+    # behavior"), OR the noun immediately followed by an explicit
+    # out-of-scope marker ("behavior outside the intended security
+    # scope") -- the same "outside this advisory's scope" phrasing this
+    # module's OWN _SCOPE_MARKER_RE already recognizes for a different
+    # category, reused here as a second, equally concrete way to say
+    # "this is not the vulnerable behavior."
+    r"\b(existing|previously[\s-]+(?:valid|supported|accepted)|legit(?:imate)?|valid|unrelated)\b"
+    r"(?:\s+\S+){0,4}?\s*\b(behaviou?rs?|inputs?|configurations?|options?|keys?|values?|usages?"
+    r"|functionalit(?:y|ies))\b"
+    r"|\b(behaviou?rs?|inputs?|configurations?|options?|keys?|values?|usages?|functionalit(?:y|ies))\b"
+    r"(?:\s+\S+){0,4}?\s*\bout(?:side)?\s+(?:the\s+)?(?:intended\s+|security\s+)*scope\b",
+    re.IGNORECASE,
+)
+# Clause boundaries -- punctuation and contrast conjunctions a human would
+# read as separating one claim from another. Deterministic string
+# splitting only, never NLP/sentiment analysis -- mirrors this module's own
+# existing `_extract_security_gain` sentence-splitting idiom, one level
+# finer-grained (clauses, not sentences), since Challenger findings are
+# short, often single-sentence bullet points where a clause boundary is the
+# only structural signal available to separate independent claims.
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[,;()]|\b(?:but|and|while|though|although|however|whereas)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_behavioral_defect_signal(text: str) -> bool:
+    """True when some CLAUSE of `text` names both (a) an action that
+    removes/rejects/changes/breaks something and (b) something the
+    repository previously allowed (an existing/previously-valid/
+    previously-supported/previously-accepted/legitimate/valid/unrelated
+    behavior, input, configuration, option, key, value, usage, or piece of
+    functionality). Both signals must co-occur in the SAME clause -- see
+    _BEHAVIORAL_DEFECT_VERB_RE/_BEHAVIORAL_DEFECT_OBJECT_RE's own comment
+    for why a same-string-anywhere check is not used here, unlike this
+    module's other single-pattern classifiers (the run-4 real-world
+    positive spans "drop" and "keys" ~70 characters apart in the same
+    clause with no intervening punctuation, so a fixed character-distance
+    window was tried and rejected -- see the historical trace fixture this
+    module's tests regress against)."""
+    if not text:
+        return False
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        if _BEHAVIORAL_DEFECT_VERB_RE.search(clause) and _BEHAVIORAL_DEFECT_OBJECT_RE.search(clause):
+            return True
+    return False
+
 _BENEFIT_VERB_RE = re.compile(
     r"\b(fix(es)?|prevent(s)?|add(s)?|block(s)?|strip(s)?|remov(es)?|"
     r"resolve(s)?|ensure(s)?|protect(s)?|mitigat(es)?|eliminat(es)?|"
@@ -758,9 +847,10 @@ _BENEFIT_VERB_RE = re.compile(
 
 
 def _classify_finding(text: str) -> str:
-    """Classify a single challenger finding into one of four categories.
+    """Classify a single challenger finding into one of five categories.
 
-    Returns: 'confirmed_defect' | 'plausible_risk' | 'validation_gap' | 'generic'
+    Returns: 'confirmed_defect' | 'behavioral_defect' | 'plausible_risk'
+             | 'validation_gap' | 'generic'
 
     Priority order:
     1. Explicit exploitability patterns (still vulnerable, bypass, attack vector remains…)
@@ -769,9 +859,18 @@ def _classify_finding(text: str) -> str:
        → plausible_risk (scope limitation, not a primary fix failure).
     3. "does not fix/address/prevent/close" WITHOUT any scope marker
        → confirmed_defect (the primary fix is being claimed as non-functional).
-    4. Validation gap patterns → validation_gap.
-    5. Generic observation patterns → generic.
-    6. Default → plausible_risk (conservative).
+    4. Concrete behavioral-defect language (the candidate patch itself
+       removes/rejects/changes/breaks previously-allowed behavior) →
+       behavioral_defect. Deliberately placed AFTER steps 1-3: explicit
+       current-exploitability language, and an unqualified "does not
+       fix/address/prevent/close", both describe the PRIMARY vulnerability
+       itself and must never be downgraded to a secondary behavioral
+       concern merely because the same finding also happens to use
+       behavioral-sounding wording (run-4 evidence never showed this
+       collision, but the ordering makes it impossible regardless).
+    5. Validation gap patterns → validation_gap.
+    6. Generic observation patterns → generic.
+    7. Default → plausible_risk (conservative).
     """
     if not text:
         return "generic"
@@ -783,10 +882,13 @@ def _classify_finding(text: str) -> str:
         if _VERSION_MARKER_RE.search(text) or _SCOPE_MARKER_RE.search(text):
             return "plausible_risk"   # finding describes a scope / version limitation
         return "confirmed_defect"     # no scope qualifier → primary fix failure
-    # Step 3: validation gap.
+    # Step 3: concrete behavioral-defect language (run-4 Architecture B).
+    if _has_behavioral_defect_signal(text):
+        return "behavioral_defect"
+    # Step 4: validation gap.
     if _VALIDATION_GAP_RE.search(text):
         return "validation_gap"
-    # Step 4: generic observation.
+    # Step 5: generic observation.
     if _GENERIC_RE.search(text):
         return "generic"
     return "plausible_risk"
@@ -810,6 +912,16 @@ def _classify_challenger(challenger: dict) -> dict:
     result["confirmed_defect_count"] = sum(1 for f in all_classified if f["category"] == "confirmed_defect")
     result["plausible_risk_count"] = sum(1 for f in all_classified if f["category"] == "plausible_risk")
     result["validation_gap_count"] = sum(1 for f in all_classified if f["category"] == "validation_gap")
+    # Additive (run-4 Architecture B): a fifth, distinctly-tracked category
+    # for concrete, patch-caused behavior changes -- never folded into
+    # confirmed_defect_count (which _compute_trust_signals/
+    # _build_recommendation_v1 read; both remain untouched by this addition)
+    # and never removed from plausible_risk_count's own semantics -- a
+    # finding that now classifies behavioral_defect simply no longer also
+    # counts as plausible_risk, exactly as adding validation_gap once
+    # narrowed plausible_risk_count's population without changing what
+    # plausible_risk itself means for findings that still land there.
+    result["behavioral_defect_count"] = sum(1 for f in all_classified if f["category"] == "behavioral_defect")
     return result
 
 
@@ -1093,9 +1205,9 @@ def _build_known_findings(classified_challenger: dict, finding_calibration: list
     """Group already-classified challenger findings into report-facing
     epistemic categories for the Known Findings section.
 
-    This reuses the four categories _classify_challenger already computes
-    (confirmed_defect / plausible_risk / validation_gap / generic) — no new
-    classification.
+    This reuses the five categories _classify_challenger already computes
+    (confirmed_defect / behavioral_defect / plausible_risk / validation_gap
+    / generic) — no new classification.
 
       confirmed_defect  -> calibration-aware: stays in potential_remaining_
                            risks only if calibration is missing (fail-closed
@@ -1110,11 +1222,34 @@ def _build_known_findings(classified_challenger: dict, finding_calibration: list
                            (repair gate, Trust Signals, Recommendation) —
                            see should_auto_repair/accept_repair below and
                            _build_report's use of this function's output.
+                           `potential_remaining_risks`' LENGTH is read
+                           elsewhere as the authoritative, calibration-aware
+                           defect count Trust Signals/Recommendation Policy
+                           key off of -- confirmed_defect is the ONLY
+                           category that ever lands here; deliberately NOT
+                           widened to behavioral_defect (see below).
       validation_gap    -> validation_gaps             ("things we did not verify")
       plausible_risk,
-      generic           -> split three ways by the finding_calibration stage
+      generic,
+      behavioral_defect -> split three ways by the finding_calibration stage
                            (evidence-quality pass): observed_implementation_notes,
                            validation_hypotheses, future_hardening_ideas.
+                           behavioral_defect (run-4 Architecture B) is
+                           grouped with plausible_risk/generic here, NOT
+                           with confirmed_defect above -- it must be
+                           REPAIR-eligible (see should_auto_repair/
+                           accept_repair, which DO treat it identically to
+                           confirmed_defect) without also being counted
+                           toward `potential_remaining_risks`' length,
+                           which Trust Signals/Recommendation Policy read
+                           and which this feature is explicitly scoped to
+                           leave untouched. An uncalibrated behavioral_defect
+                           defaults to the SAME "hypothesis" bucket
+                           plausible_risk defaults to (not generic's
+                           "hardening" default) -- a concrete, unhedged
+                           behavior-change finding is closer in severity to
+                           an unverified risk than to an unrelated
+                           suggestion.
 
     finding_calibration is the (optional) output of
     finding_calibration.calibrate_findings — a list of {"original", "group",
@@ -1124,11 +1259,11 @@ def _build_known_findings(classified_challenger: dict, finding_calibration: list
     calibration entry (calibration wasn't run, or failed, or omitted this
     specific finding), it falls back to a conservative default rather than
     being dropped: confirmed_defect stays a confirmed defect (fail-closed —
-    uncertainty must never look like clearance), plausible_risk ->
-    Validation Hypotheses (already a hedge), generic -> Future Hardening
-    Ideas (already a suggestion) — the same mapping this project used before
-    calibration existed, so a calibration failure degrades to prior behavior
-    rather than losing information.
+    uncertainty must never look like clearance), plausible_risk and
+    behavioral_defect -> Validation Hypotheses (already a hedge), generic ->
+    Future Hardening Ideas (already a suggestion) — the same mapping this
+    project used before calibration existed, so a calibration failure
+    degrades to prior behavior rather than losing information.
 
     Returns a plain dict of five lists so the renderer (and tests) can
     address each category directly. Rendering/suppression decisions (e.g.
@@ -1185,14 +1320,20 @@ def _build_known_findings(classified_challenger: dict, finding_calibration: list
                 validation_hypotheses.append(text)
             continue
 
-        if f["category"] not in ("plausible_risk", "generic"):
+        if f["category"] not in ("plausible_risk", "generic", "behavioral_defect"):
             continue
         entry = calibration_by_original.get(f["text"])
         if entry and entry.get("reworded"):
             group = entry.get("group")
             text = entry["reworded"]
         else:
-            group = "hypothesis" if f["category"] == "plausible_risk" else "hardening"
+            # behavioral_defect (run-4 Architecture B) defaults to the SAME
+            # "hypothesis" bucket plausible_risk defaults to -- see this
+            # function's own docstring for why it is grouped here with
+            # plausible_risk/generic rather than with confirmed_defect
+            # above, and why an uncalibrated one leans toward "needs
+            # verification" rather than generic's "unrelated suggestion".
+            group = "hypothesis" if f["category"] in ("plausible_risk", "behavioral_defect") else "hardening"
             text = f["text"]
 
         if group == "observed":
@@ -1239,15 +1380,32 @@ def _build_known_findings(classified_challenger: dict, finding_calibration: list
 # ---------------------------------------------------------------------------
 
 
-def _confirmed_defect_calibration_entries(
-    classified_challenger: dict, finding_calibration: list[dict] | None
+_REPAIR_ELIGIBLE_CATEGORIES = ("confirmed_defect", "behavioral_defect")
+"""The only two _classify_finding categories should_auto_repair/
+accept_repair ever consider. `behavioral_defect` (run-4 Architecture B) is
+held to the EXACT SAME epistemic bar as `confirmed_defect` -- both require
+an explicit Finding Calibration "observed" entry before authorizing/
+accepting a mutation; a behavioral_defect finding calibrated Hypothesis or
+Hardening never authorizes repair, identically to a confirmed_defect
+finding calibrated that way. `plausible_risk`, `validation_gap`, and
+`generic` remain entirely outside this mechanism, unchanged -- adding
+`behavioral_defect` narrows which findings can land in those three
+categories (see _classify_finding's own priority ordering) but does not
+change what happens to a finding that still lands in one of them."""
+
+
+def _repair_eligible_calibration_entries(
+    classified_challenger: dict, finding_calibration: list[dict] | None,
 ) -> list[tuple[str, dict | None]]:
-    """(finding_text, calibration_entry_or_None) for every raw
-    confirmed_defect finding in classified_challenger.
+    """(finding_text, calibration_entry_or_None) for every raw finding in
+    classified_challenger whose category is in _REPAIR_ELIGIBLE_CATEGORIES.
 
     The single lookup should_auto_repair and accept_repair both key off of,
-    so "which calibration entry belongs to which confirmed_defect finding"
-    is decided in exactly one place.
+    so "which calibration entry belongs to which repair-eligible finding"
+    is decided in exactly one place. Renamed from
+    `_confirmed_defect_calibration_entries` when `behavioral_defect` was
+    added as a second repair-eligible category -- identical shape and
+    semantics, just no longer confirmed_defect-only.
     """
     calibration_by_original = {
         entry.get("original"): entry for entry in (finding_calibration or [])
@@ -1259,7 +1417,7 @@ def _confirmed_defect_calibration_entries(
     return [
         (f["text"], calibration_by_original.get(f["text"]))
         for f in all_findings
-        if f["category"] == "confirmed_defect"
+        if f["category"] in _REPAIR_ELIGIBLE_CATEGORIES
     ]
 
 
@@ -1272,22 +1430,28 @@ def should_auto_repair(
 
     Automatic repair is allowed only when ALL of:
       1. the current patch applies
-      2. at least one finding is raw-classified confirmed_defect
+      2. at least one finding is raw-classified confirmed_defect OR
+         behavioral_defect (see _REPAIR_ELIGIBLE_CATEGORIES)
       3. that SAME finding has an explicit Finding Calibration entry whose
          group is "observed"
 
     Anything else must NOT authorize a mutation: a finding calibrated
-    Hypothesis or Hardening, a validation_gap (never considered here at
-    all), a confirmed_defect finding calibration produced no entry for
-    (missing calibration for that finding), or calibration failing
-    outright (finding_calibration is None/empty) -- none of these satisfy
-    condition 3, so none authorize repair. Uncertainty may increase report
-    caution (see _build_known_findings) but must never increase permission
-    to mutate code.
+    Hypothesis or Hardening, a plausible_risk/validation_gap/generic
+    finding (never considered here at all), a repair-eligible finding
+    calibration produced no entry for (missing calibration for that
+    finding), or calibration failing outright (finding_calibration is
+    None/empty) -- none of these satisfy condition 3, so none authorize
+    repair. Uncertainty may increase report caution (see
+    _build_known_findings) but must never increase permission to mutate
+    code. behavioral_defect (run-4 Architecture B) shares this exact gate
+    with confirmed_defect rather than having its own, separate threshold --
+    a concrete, patch-caused behavior change is held to the identical
+    "observed, not merely hypothesized" bar before it can trigger a
+    mutation.
     """
     if not applicable or not finding_calibration:
         return False
-    for _text, entry in _confirmed_defect_calibration_entries(classified_challenger, finding_calibration):
+    for _text, entry in _repair_eligible_calibration_entries(classified_challenger, finding_calibration):
         if entry is not None and entry.get("group") == "observed":
             return True
     return False
@@ -1302,21 +1466,31 @@ def accept_repair(
     the repaired patch's own (freshly re-challenged, freshly calibrated)
     finding state instead of the pre-repair state.
 
-    v2 replaces v1 only when v2 applies AND, for every raw confirmed_defect
-    finding v2's own Challenger raised, calibration explicitly places it
-    outside "observed" (Hypothesis or Hardening). If v2 has no raw
-    confirmed_defect finding at all, there is nothing to gate on and v2 is
-    accepted on applicability alone (unchanged from the pre-calibration
-    zero-tolerance check this replaces). Anything else -- v2 does not
-    apply, a confirmed_defect finding has no calibration entry at all
-    (cannot verify it was cleared), or a confirmed_defect finding
-    explicitly calibrates "observed" -- rejects v2 and leaves v1 in place:
-    fail closed, preserving the safer prior state, at most once, never a
-    second repair attempt.
+    v2 replaces v1 only when v2 applies AND, for every raw repair-eligible
+    (confirmed_defect OR behavioral_defect) finding v2's own Challenger
+    raised, calibration explicitly places it outside "observed" (Hypothesis
+    or Hardening). If v2 has no raw repair-eligible finding at all, there
+    is nothing to gate on and v2 is accepted on applicability alone
+    (unchanged from the pre-calibration zero-tolerance check this
+    replaces). Anything else -- v2 does not apply, a repair-eligible
+    finding has no calibration entry at all (cannot verify it was
+    cleared), or a repair-eligible finding explicitly calibrates "observed"
+    -- rejects v2 and leaves v1 in place: fail closed, preserving the
+    safer prior state, at most once, never a second repair attempt.
+
+    Critically symmetric across categories: v2 is NOT accepted merely
+    because the ORIGINAL confirmed_defect (or behavioral_defect) finding
+    that triggered should_auto_repair disappeared, if v2's own Challenger
+    raises a DIFFERENT concrete confirmed_defect or behavioral_defect
+    finding that still calibrates "observed" -- `entries` here is v2's own,
+    freshly-computed finding set, never the v1 finding that triggered the
+    repair, so a patch that fixes one repair-eligible finding while
+    introducing (or leaving behind) another one of either category is
+    still rejected.
     """
     if not applicable:
         return False
-    entries = _confirmed_defect_calibration_entries(classified_challenger_v2, finding_calibration_v2)
+    entries = _repair_eligible_calibration_entries(classified_challenger_v2, finding_calibration_v2)
     if not entries:
         return True
     for _text, entry in entries:
@@ -2541,38 +2715,52 @@ def _render_deterministic_signals(
 def _render_repair_notice(result: PipelineResult) -> str:
     """Return a short Markdown blockquote about the repair attempt, or empty string.
 
-    Renders only what was actually observed. `repair_defect_count` is only a
-    real, re-challenge-derived number when `repair_rechallenged` is True — it
-    is otherwise an untouched default and must never be printed as if it were
-    a finding.
+    Renders only what was actually observed. `repair_eligible_defect_count`
+    is only a real, re-challenge-derived number when `repair_rechallenged`
+    is True — it is otherwise an untouched default and must never be
+    printed as if it were a finding.
 
     Acceptance (repair_succeeded) is now decided by accept_repair against
-    calibration-aware findings, not by repair_defect_count == 0 alone — a
-    repair can be accepted with a nonzero raw repair_defect_count if every
-    such finding calibrated away from Observed. The success branch below
-    says "0 calibration-confirmed defect(s)", which is true by construction
-    whenever repair_succeeded is True, rather than a raw count that could
-    otherwise contradict the calibrated outcome.
+    calibration-aware findings, not by repair_eligible_defect_count == 0
+    alone — a repair can be accepted with a nonzero raw eligible count if
+    every such finding calibrated away from Observed. The success branch
+    below says "0 calibration-confirmed issue(s)", which is true by
+    construction whenever repair_succeeded is True, rather than a raw count
+    that could otherwise contradict the calibrated outcome.
+
+    Post-review correction (run-4 Architecture B): this notice reads
+    `original_challenger_repair_eligible_count`/`repair_eligible_defect_
+    count` -- the SEPARATE, additive fields that count confirmed_defect AND
+    behavioral_defect combined -- NEVER `original_challenger_defect_count`/
+    `repair_defect_count`, which remain confirmed_defect-ONLY (their
+    historical, public meaning; also read by execution-artifact/replay
+    consumers under keys literally named "confirmed_defect_count"). Using
+    the eligible fields here is what keeps a repair triggered ONLY by a
+    behavioral_defect finding (0 confirmed_defect, N behavioral_defect)
+    from reading as self-contradictory ("Original patch had 0 confirmed
+    issue(s)... A repair was generated") -- the wording says "issue(s)",
+    not "defect(s)", specifically because it may be reporting either
+    category or both.
     """
     if not result.repair_attempted:
         return ""
     if result.repair_succeeded:
         return (
             f"\n> **Auto-repaired:** Original patch had "
-            f"{result.original_challenger_defect_count} confirmed defect(s). "
+            f"{result.original_challenger_repair_eligible_count} confirmed issue(s). "
             f"A repair was generated and accepted — re-challenge found 0 "
-            f"calibration-confirmed defect(s).\n"
+            f"calibration-confirmed issue(s).\n"
         )
     if result.repair_rechallenged:
         return (
             f"\n> **Repair attempted:** Challenger found "
-            f"{result.original_challenger_defect_count} confirmed defect(s). "
-            f"Repair patch still had {result.repair_defect_count} confirmed defect(s); "
+            f"{result.original_challenger_repair_eligible_count} confirmed issue(s). "
+            f"Repair patch still had {result.repair_eligible_defect_count} confirmed issue(s); "
             f"original recommendation stands.\n"
         )
     return (
         f"\n> **Repair attempted:** Challenger found "
-        f"{result.original_challenger_defect_count} confirmed defect(s). "
+        f"{result.original_challenger_repair_eligible_count} confirmed issue(s). "
         f"The repair patch did not reach re-challenge (it failed to apply, or the "
         f"repair loop encountered an unexpected error) — no repair defect count is "
         f"available; original recommendation stands.\n"
@@ -3665,10 +3853,19 @@ def _extract_patch_target(patch: str) -> str | None:
 
 
 def _build_repair_hint(confirmed_texts: list[str]) -> str:
-    """Build a repair instruction for the patch generator from confirmed defect texts."""
+    """Build a repair instruction for the patch generator from confirmed
+    defect texts -- reused unchanged for behavioral_defect findings (run-4
+    Architecture B): the instructions below (minimal diff, use verified
+    source as ground truth, wire every code path) are equally correct
+    advice whether the finding is a security gap or an unnecessary
+    behavior change, so no separate behavioral-repair hint was created.
+    The one word that WOULD misdescribe a behavioral_defect finding
+    ("security") was dropped from the intro sentence; the exact finding
+    text itself (passed through verbatim, never summarized or reworded
+    here) still tells the patch generator precisely what to address."""
     items = "\n".join(f"- {t}" for t in confirmed_texts)
     return (
-        "The previous patch has the following confirmed security gap(s) identified "
+        "The previous patch has the following confirmed gap(s) identified "
         "by adversarial review:\n\n"
         f"{items}\n\n"
         "Regenerate the patch to address these specific gaps.\n"
@@ -3679,6 +3876,410 @@ def _build_repair_hint(confirmed_texts: list[str]) -> str:
         "Use the repository code context shown above as the ground truth for the code.\n"
         "Keep the same minimal-diff approach: change only what is necessary."
     )
+
+
+def _dispatch_narrower_mode(plan_result) -> str:
+    """Deterministically resolve which Planner Claim Verifier mode (if any)
+    applies to `plan_result`, from its OWN structural
+    `narrower_alternative_decision` -- never inferred from
+    `narrower_alternative_considered`'s prose. Returns `"REJECTED"`,
+    `"SELECTED"`, or `"NONE_IDENTIFIED"` -- reusing the Planner's own enum
+    values directly, so the mapping from decision to verifier mode is the
+    identity function for the two decisions that need a verifier call at
+    all; the caller treats `"NONE_IDENTIFIED"` as "make no verifier call."
+
+    Missing/invalid `narrower_alternative_decision` (a fresh response that
+    omitted it, or supplied something outside the three valid values) is
+    NEVER inferred from `narrower_alternative_considered`'s wording -- only
+    a fixed, conservative SUBSTITUTION applies: if there is a non-empty
+    narrative to check at all, default to `"REJECTED"` (Mode A) -- the more
+    scrutinized mode, never a silent authorization to skip verification --
+    because Mode A's own gate requires an explicit `true` commitment to
+    ever clear, so this default is safe regardless of what the Planner
+    actually meant. If there is no narrative at all either, there is
+    nothing to check under either mode, matching this architecture's
+    existing "nothing to verify" behavior exactly.
+
+    Used both for the initial (v1) dispatch and, inside
+    `_run_planner_claim_verification`, to re-dispatch v2's mode from the
+    REVISED Planner result -- v2's decision may differ from v1's (e.g. a
+    Planner that rejected in v1 may select in v2), so this is always
+    re-evaluated, never carried over from v1."""
+    decision = plan_result.narrower_alternative_decision
+    if decision in ("SELECTED", "REJECTED", "NONE_IDENTIFIED"):
+        return decision
+    narrative = (plan_result.narrower_alternative_considered or "").strip()
+    return "REJECTED" if narrative else "NONE_IDENTIFIED"
+
+
+def _build_planner_verification_hint(verifier_result, mode: str) -> str:
+    """Build the ONE bounded revision instruction for the Planner, from the
+    Planner Claim Verifier's own CONTRADICTED result -- worded according to
+    which mode produced it, since the two modes' contradictions describe
+    entirely different problems (Mode A: a claimed rejection counterexample
+    didn't hold up; Mode B: the authoritative fields didn't match the
+    claimed selection) and reusing one mode-blind hint for both would
+    misdescribe whichever one didn't actually happen. Mirrors
+    `_build_repair_hint`'s shape exactly (a structured finding from an
+    independent check, turned into a narrowly-scoped correction
+    instruction) -- generic across vulnerability classes, repositories, and
+    languages: it names no CVE, no repository, no specific mechanism."""
+    finding = verifier_result.contradiction or verifier_result.reason
+    if mode == "REJECTED":
+        return (
+            "An independent verifier found a concrete contradiction in your prior "
+            "remediation decision: the reason you gave for rejecting the narrower "
+            "alternative does not hold up against the verified source once that "
+            "narrower alternative is hypothetically applied.\n\n"
+            f"Verifier finding: {finding}\n\n"
+            "Revise your remediation decision in light of this finding. Specifically "
+            "reconsider `narrower_alternative_decision`, `remediation_mechanism`, "
+            "`narrower_alternative_considered`, and `required_edits`. Do not blindly "
+            "keep the broader mechanism, and do not blindly switch to the narrower "
+            "one either -- re-evaluate which mechanism actually closes the security "
+            "invariant using the verified source semantics, not your prior reasoning. "
+            "If you now select the narrower alternative, `remediation_mechanism`/"
+            "`required_edits` must describe THAT alternative directly, not the "
+            "broader mechanism you are moving away from. Preserve your prior "
+            "evidence-backed target files and symbols unless this specific "
+            "contradiction requires changing them."
+        )
+    # mode == "SELECTED"
+    return (
+        "An independent verifier found a concrete contradiction in your prior "
+        "remediation decision: you recorded that you selected the narrower "
+        "alternative, but the authoritative `remediation_mechanism`/`required_edits` "
+        "you gave do not actually describe that same selected alternative -- they "
+        "describe a different (typically broader) scope.\n\n"
+        f"Verifier finding: {finding}\n\n"
+        "Revise your remediation decision so it is internally consistent. "
+        "Specifically reconsider `narrower_alternative_decision`, "
+        "`remediation_mechanism`, `narrower_alternative_considered`, and "
+        "`required_edits` together. If the narrower alternative is genuinely what "
+        "you are proposing, `remediation_mechanism`/`required_edits` must describe "
+        "it directly and completely, with nothing left over from a broader "
+        "mechanism. If, on reflection, the narrower alternative is not actually "
+        "sufficient, say so explicitly by setting `narrower_alternative_decision` "
+        "to \"REJECTED\" with a concrete, source-grounded counterexample -- do not "
+        "leave the decision and the authoritative fields describing two different "
+        "things. Preserve your prior evidence-backed target files and symbols "
+        "unless this specific contradiction requires changing them."
+    )
+
+
+def _run_planner_claim_verification(
+    *, vulnerability_text, llm, repo_root, investigation_context,
+    evidence_so_far, plan_result, planner_evidence_ctx, mode,
+):
+    """Planner Claim Verifier orchestration -- sits between S1's own
+    Planner call and S2 (Remediation Strategy), still inside S1's canonical
+    stage family (see stage_registry.STAGE_OWNED_LLM_TAGS). Structurally
+    bounded, exactly like `existing_test_amendment.py`'s R1 -> amend -> R2
+    orchestrator: at most two verifier calls and at most one Planner
+    revision call, EVER, per invocation -- there is only one call site for
+    each in this function's body, so a second revision is not merely
+    unlikely, it is impossible to reach without editing this function.
+
+    Trigger: this function assumes the caller already resolved `mode` via
+    `_dispatch_narrower_mode(plan_result)` and confirmed it is not
+    `"NONE_IDENTIFIED"` -- the ONLY trigger for this implementation (see
+    module-level callers). When it is `"NONE_IDENTIFIED"`, the caller never
+    calls this function at all: zero verifier calls, zero revision calls.
+
+    Mode-aware, not mode-blind: `mode` ("REJECTED" or "SELECTED") selects
+    which of the two Planner Claim Verifier questions v1 answers (see
+    remediation_verifier.py's module docstring). v2 (if a revision
+    happens) is NOT assumed to share v1's mode -- the revised Planner
+    result's OWN decision is re-dispatched via `_dispatch_narrower_mode`,
+    since a revision can legitimately flip REJECTED<->SELECTED.
+
+    Revision trigger -- deliberately narrow: ONLY `verifier_v1.status ==
+    "CONTRADICTED"` consumes the one bounded revision, in EITHER mode.
+    `_parse_response` (remediation_verifier.py) never returns
+    `status="CONTRADICTED"` for an infrastructure failure -- an ordinary
+    LLM-call error, timeout, or malformed/unparseable response always
+    degrades to `UNRESOLVED`/`failure_kind="infrastructure"` instead -- so
+    this check already, structurally, excludes ordinary infrastructure
+    noise from ever consuming the revision budget without needing a
+    separate `failure_kind` check here. A genuine semantic UNRESOLVED
+    (verifier actually reasoned about the claim and could not determine
+    support/contradiction) also does not trigger a revision -- ordinary
+    uncertainty must never destroy patch-generation coverage, exactly as
+    before this mode-aware change.
+
+    Fail-closed guarantee: once verifier v1 returns CONTRADICTED, this
+    function NEVER returns normally with `authoritative` still "v1" --
+    every path out of that point either reaches "v2" (only on a genuine v2
+    SUPPORTED) or "none" (forced_skip=True), including an unexpected
+    internal exception during the revision/rebuild/re-verify sequence
+    (caught by this function's own top-level try/except, never left for
+    the caller to default-open on), and including the specific case where
+    the revised Planner result's OWN decision re-dispatches to
+    "NONE_IDENTIFIED" -- see the dedicated check below. That case fails
+    closed WITHOUT a second verifier call: a Planner cannot escape an
+    already-established contradiction merely by changing its decision to
+    "no alternative was ever identified" on revision. Before v1 is known
+    CONTRADICTED, ordinary best-effort degradation applies exactly as
+    elsewhere in this module family -- nothing is converted to a hard skip
+    prematurely.
+
+    Returns a dict (not `locals()`, unlike this module's other `_run_*`
+    executors -- this one has few enough produced values that an explicit
+    dict is clearer than the exhaustive-return-signature problem those
+    other executors solve):
+      verifier_v1               -- VerifierResult from the first check.
+      verifier_v2                -- VerifierResult | None from the
+                                     post-revision re-check (None unless
+                                     v1 was CONTRADICTED and a second
+                                     verifier call was actually made -- see
+                                     the v2 NONE_IDENTIFIED case above,
+                                     which fails closed WITHOUT one).
+      mode_v1 / mode_v2          -- "REJECTED" | "SELECTED" (mode_v2 is
+                                     None unless a second verifier call was
+                                     actually made) -- purely observability,
+                                     mirroring which structured field each
+                                     VerifierResult actually gates on.
+      revision_attempted         -- bool, True iff a revision call was made.
+      revised_plan_result        -- RemediationPlanResult | None, the
+                                     revised Planner output (only set when
+                                     a revision was attempted AND produced
+                                     a result).
+      revised_plan_ctx           -- str, revised Target Discovery Plan
+                                     rendering (only when revised_plan_result
+                                     is set).
+      revised_planner_evidence_ctx -- str, revised Planner evidence bridge
+                                     (only when revised_plan_result is set
+                                     AND its re-dispatched mode was not
+                                     "NONE_IDENTIFIED" -- that case fails
+                                     closed before evidence is rebuilt).
+      authoritative              -- "v1" | "v2" | "none": which Planner
+                                     result (if any) may proceed to
+                                     Strategy. "none" means a contradiction
+                                     was never cleared (v1 CONTRADICTED ->
+                                     revision -> v2 not SUPPORTED, or v2's
+                                     re-dispatched mode was
+                                     "NONE_IDENTIFIED") -- see forced_skip
+                                     below.
+      forced_skip                -- bool, True only for the "none" case.
+      skip_reason                -- str | None, the specific reason to
+                                     surface through `_skip_patch_generation`
+                                     (see _run_patch_generation_and_investigation's
+                                     `_skip_patch_generation_reason`) when
+                                     forced_skip is True.
+      broadening_unresolved      -- bool, observability-only: True when v1
+                                     was UNRESOLVED (a rejection claim
+                                     existed) AND `mode == "REJECTED"` --
+                                     this signal is specifically about
+                                     whether BROADENING's necessity (Mode
+                                     A's own question) could not be
+                                     established; it is never set for a
+                                     Mode B ("SELECTED") UNRESOLVED, which
+                                     is a different, decision-coherence
+                                     ambiguity this field was never meant
+                                     to describe. Never gates Strategy or
+                                     Patch Generation on its own; see
+                                     PipelineResult/execution_recorder for
+                                     where this is surfaced.
+    """
+    from .remediation_planner import build_planner_evidence, generate_remediation_plan
+    from .remediation_verifier import verify_planner_claim
+
+    verifier_v1 = verify_planner_claim(
+        vulnerability_text,
+        plan_result.security_invariant,
+        plan_result.remediation_mechanism,
+        plan_result.narrower_alternative_considered,
+        plan_result.required_edits,
+        planner_evidence_ctx,
+        llm,
+        mode=mode,
+    )
+    print(
+        f"[pipeline] Planner Claim Verifier (v1, mode={mode}): status={verifier_v1.status} "
+        f"failure_kind={verifier_v1.failure_kind}",
+        file=sys.stderr,
+    )
+
+    result = {
+        "verifier_v1": verifier_v1, "verifier_v2": None,
+        "mode_v1": mode, "mode_v2": None,
+        "revision_attempted": False, "revised_plan_result": None,
+        "revised_plan_ctx": "", "revised_planner_evidence_ctx": "",
+        "authoritative": "v1", "forced_skip": False, "skip_reason": None,
+        # Review fix: `failure_kind is None` excludes an infrastructure
+        # failure (network/timeout/malformed response) from this signal --
+        # an infrastructure failure establishes nothing about whether a
+        # broadening decision's necessity is unresolved (it may not even
+        # be a rejection claim at all; see remediation_verifier.
+        # VerifierResult's own docstring on failure_kind). Only a genuine
+        # semantic UNRESOLVED (the verifier actually reasoned about the
+        # claim and could not determine support/contradiction) IN MODE A
+        # sets this -- a Mode B UNRESOLVED is a decision-coherence
+        # ambiguity, not a broadening-necessity ambiguity, and must not be
+        # mislabeled under this name. Observability-only either way --
+        # never read by Strategy/Patch Generation/Recommendation Policy.
+        "broadening_unresolved": (
+            verifier_v1.status == "UNRESOLVED"
+            and verifier_v1.failure_kind is None
+            and mode == "REJECTED"
+        ),
+    }
+
+    if verifier_v1.status != "CONTRADICTED":
+        # SUPPORTED or UNRESOLVED (semantic or infrastructure), in EITHER
+        # mode, both proceed to Strategy with v1 unchanged -- ordinary
+        # uncertainty must never destroy patch-generation coverage (see
+        # remediation_verifier.md). No contradiction has been established
+        # yet, so nothing here needs to fail closed -- this is still
+        # ordinary best-effort degradation. `_parse_response` never emits
+        # CONTRADICTED for an infrastructure failure, so this branch also
+        # already excludes ordinary infrastructure noise from the revision
+        # trigger without a separate check.
+        return result
+
+    # From here on, verifier_v1 has established a concrete CONTRADICTED
+    # finding (in EITHER mode). Review fix: everything below (the revision
+    # call, rebuilding evidence, the second verification, and constructing
+    # the result) is wrapped in one fail-closed boundary. Before that fix,
+    # an unexpected exception anywhere in this block propagated to the
+    # caller's own generic `except Exception` in
+    # _run_repository_analysis_and_remediation_planning, which left
+    # `_verifier_forced_skip` at its default False and the ORIGINAL
+    # (contradicted) Planner evidence untouched -- silently reopening the
+    # door for an already-known-bad plan to reach Strategy. That is a
+    # fail-OPEN default on the single most safety-critical branch,
+    # inconsistent with this codebase's own established discipline
+    # elsewhere (see accept_repair's docstring: "fail closed, preserving
+    # the safer prior state"). Structurally still bounded: this is a
+    # try/except around the SAME linear, loop-free code that was already
+    # here -- it adds no retry, no second revision, no second attempt of
+    # anything; it only changes what happens if that existing code raises
+    # something unexpected.
+    try:
+        result["revision_attempted"] = True
+        _hint = _build_planner_verification_hint(verifier_v1, mode)
+        try:
+            revised_plan_result = generate_remediation_plan(
+                vulnerability_text, llm, code_context=evidence_so_far,
+                retry_hint=_hint, stage=_PLAN_REVISION_STAGE,
+            )
+        except ModelUnavailableError:
+            raise
+        except Exception as exc:
+            print(f"[pipeline] Planner revision unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+            revised_plan_result = None
+
+        if revised_plan_result is None or not revised_plan_result.rendered:
+            # The revision call itself failed or produced nothing usable --
+            # the contradiction was never even attempted to be cleared.
+            # Fail closed exactly like an uncleared contradiction: never
+            # silently keep v1 as if the verifier's finding never happened.
+            result["forced_skip"] = True
+            result["authoritative"] = "none"
+            result["skip_reason"] = (
+                "Planner Claim Verifier: causal contradiction found, but the bounded "
+                "Planner revision attempt did not produce a usable result"
+            )
+            return result
+
+        result["revised_plan_result"] = revised_plan_result
+        result["revised_plan_ctx"] = revised_plan_result.rendered
+
+        # Re-dispatch mode from the REVISED result's own decision -- never
+        # assumed to be the same as v1's mode; a revision can legitimately
+        # flip REJECTED<->SELECTED. IMPORTANT correction (locked policy):
+        # if the revised decision re-dispatches to "NONE_IDENTIFIED", this
+        # must NOT be treated as "nothing to verify" the way it is for a
+        # fresh, never-contradicted v1 -- an already-established
+        # contradiction cannot be cleared by the Planner simply declaring,
+        # on its one bounded revision, that no alternative was ever
+        # identified. Fail closed immediately, WITHOUT a second verifier
+        # call (no new LLM call is spent discovering what is already
+        # certain: there is nothing left for a second call to check, and
+        # the contradiction from v1 was never positively cleared).
+        _v2_mode = _dispatch_narrower_mode(revised_plan_result)
+        if _v2_mode == "NONE_IDENTIFIED":
+            result["authoritative"] = "none"
+            result["forced_skip"] = True
+            result["skip_reason"] = (
+                "Planner Claim Verifier: causal contradiction not cleared after one "
+                "bounded revision (revised decision was NONE_IDENTIFIED, which cannot "
+                "clear an already-established contradiction)"
+            )
+            return result
+        result["mode_v2"] = _v2_mode
+
+        try:
+            revised_evidence_ctx = build_planner_evidence(
+                revised_plan_result, repo_root, vulnerability_text, investigation_context,
+            )
+        except Exception as exc:
+            print(f"[pipeline] Revised Planner evidence unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+            revised_evidence_ctx = ""
+        result["revised_planner_evidence_ctx"] = revised_evidence_ctx
+
+        verifier_v2 = verify_planner_claim(
+            vulnerability_text,
+            revised_plan_result.security_invariant,
+            revised_plan_result.remediation_mechanism,
+            revised_plan_result.narrower_alternative_considered,
+            revised_plan_result.required_edits,
+            revised_evidence_ctx,
+            llm,
+            mode=_v2_mode,
+            stage=_PLAN_REVERIFICATION_STAGE,
+        )
+        print(
+            f"[pipeline] Planner Claim Verifier (v2, post-revision, mode={_v2_mode}): "
+            f"status={verifier_v2.status} failure_kind={verifier_v2.failure_kind}",
+            file=sys.stderr,
+        )
+        result["verifier_v2"] = verifier_v2
+
+        if verifier_v2.status == "SUPPORTED":
+            result["authoritative"] = "v2"
+            return result
+
+        # v2 CONTRADICTED or v2 UNRESOLVED: a concrete contradiction was
+        # already established once, and the one bounded revision did not
+        # clear it -- per locked policy this is treated exactly like a
+        # second contradiction, never promoted to Strategy either as v1 or
+        # v2 (see module docstring and pipeline.py's own orchestration
+        # comment at the call site). No second revision is attempted in
+        # either mode.
+        result["authoritative"] = "none"
+        result["forced_skip"] = True
+        result["skip_reason"] = (
+            "Planner Claim Verifier: causal contradiction not cleared after one "
+            f"bounded revision (second verification, mode={_v2_mode}: {verifier_v2.status})"
+        )
+        return result
+    except ModelUnavailableError:
+        # Same explicit execution/configuration-decision exception every
+        # other LLM call in this module family re-raises unconditionally --
+        # never treated as best-effort, never converted into a forced skip.
+        raise
+    except Exception as exc:
+        # Anything else reaching here is unexpected -- not a documented
+        # failure mode of generate_remediation_plan/build_planner_evidence/
+        # verify_planner_claim (each already degrades ordinary failures
+        # internally; see their own docstrings), but exactly the case the
+        # architectural invariant requires failing closed for: a concrete
+        # contradiction is already established, and it must not be cleared
+        # by accident. No second attempt of anything -- this returns
+        # immediately, it does not retry the revision or the verification.
+        print(
+            f"[pipeline] Planner Claim Verifier: internal failure while attempting to "
+            f"clear an already-established contradiction: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        result["authoritative"] = "none"
+        result["forced_skip"] = True
+        result["skip_reason"] = (
+            "Planner Claim Verifier: internal failure while attempting to clear an "
+            f"already-established contradiction ({type(exc).__name__}: {exc})"
+        )
+        return result
 
 
 def _build_retry_hint(stderr: str, failed_file: str) -> str:
@@ -3732,6 +4333,17 @@ _CONTRACT_RETRY_STAGE = "patch_generation_contract_retry"
 # change only -- it does not alter prompt content, retry behavior, or the
 # request itself; see generate_patch()'s `stage` parameter.
 _REPAIR_REGENERATION_STAGE = "patch_repair_regeneration"
+
+# Planner Claim Verifier orchestration tags -- owned by the SAME canonical
+# stage as the Planner's own first call (repository_analysis_and_
+# remediation_planning; see stage_registry.STAGE_OWNED_LLM_TAGS), never a
+# new canonical stage. Distinct names for the revision call and the
+# post-revision re-verification call so a traced run shows all four
+# possible calls (initial plan, v1 verify, revision, v2 verify)
+# individually, mirroring exactly how patch_generation_contract_retry is
+# distinguished from plain patch_generation above.
+_PLAN_REVISION_STAGE = "remediation_plan_revision"
+_PLAN_REVERIFICATION_STAGE = "remediation_plan_reverification"
 
 
 def _generate_patch_with_contract_check(
@@ -3904,6 +4516,7 @@ def _run_patch_generation_and_investigation(
     *, vulnerability_text, llm, repo_root, code_context, budget_controller,
     _skip_patch_generation, _edit_readiness, _slice_result, _investigation_context,
     _pre_patch_anchors, _plan_result, _strategy_result,
+    _skip_patch_generation_reason=None,
 ):
     """Reusable Stage-4 (patch_generation_and_post_patch_investigation)
     executor -- the COMPLETE current production contract (contract
@@ -3920,13 +4533,26 @@ def _run_patch_generation_and_investigation(
     caller (run() or a replay run_fn) picks whichever fields it needs by
     name -- avoids hand-enumerating an exhaustive, easy-to-drift return
     signature for ~20 produced values.
+
+    `_skip_patch_generation_reason` (additive, default None so every
+    pre-existing caller/test gets the exact prior "no verified final-target
+    source" text unchanged): an optional, more specific skip reason -- set
+    by the Planner Claim Verifier orchestration when `_skip_patch_generation`
+    is True because a causal contradiction was never cleared, rather than
+    because of an ordinary Edit-Readiness/Strategy-Gate outcome. Threaded
+    straight into `_patch_validation_skip_reason` below, the SAME field
+    that already surfaces through `applicability_result["skipped_reason"]`
+    into the Recommendation Policy's "Not Verified"/"Manual Review
+    Required" path (see `_applicability_unavailable_reason` and I1) -- no
+    new report field, no new recommendation category.
     """
     _patch_validation_skip_reason: str | None = None
     _patch_generation_status: str | None = None  # set only when generation actually ran
     if _skip_patch_generation:
-        print("[pipeline] Step 1/4 – Patch Generation skipped (no verified final-target source).", file=sys.stderr)
+        _skip_reason_text = _skip_patch_generation_reason or "no verified final-target source"
+        print(f"[pipeline] Step 1/4 – Patch Generation skipped ({_skip_reason_text}).", file=sys.stderr)
         patch = ""
-        _patch_validation_skip_reason = "no verified final-target source"
+        _patch_validation_skip_reason = _skip_reason_text
     else:
         print("[pipeline] Step 1/4 – Generating patch …", file=sys.stderr)
         patch, _patch_generation_status, _patch_generation_llm_calls = _generate_patch_with_contract_check(
@@ -4505,13 +5131,43 @@ def _run_patch_repair_and_calibration(
     _run_patch_generation_and_investigation's docstring for why.
     """
     _repair_classified = _classify_challenger(challenger)
+    # Post-review correction: `_orig_defect_count` is a historically
+    # confirmed_defect-ONLY count, read directly into the PUBLIC
+    # `PipelineResult.original_challenger_defect_count` field and into
+    # execution-artifact/replay keys literally named "confirmed_defect_
+    # count" -- it must never silently mean "confirmed_defect +
+    # behavioral_defect", even though both categories are now repair-
+    # eligible. A prior revision of this feature widened this exact
+    # variable to include behavioral_defect_count, which would have made
+    # every one of those historically-confirmed-defect-specific
+    # names/fields semantically misleading (e.g. a run with 0 confirmed
+    # defects and 1 Observed behavioral defect would have reported
+    # "original_challenger_defect_count == 1", falsely implying a
+    # confirmed SECURITY defect existed). Reverted.
+    #
+    # `_orig_repair_eligible_count` is the SEPARATE, NEW control-flow-only
+    # concept this feature actually needs: "is there anything eligible to
+    # calibrate/repair at all" (confirmed_defect + behavioral_defect,
+    # mirroring _REPAIR_ELIGIBLE_CATEGORIES exactly). It gates the block
+    # below and distinguishes the two "repair never attempted" outcome
+    # labels (see run()/replay_engine.py's own repair_outcome computation)
+    # -- it is NEVER itself treated as a confirmed-defect count, never
+    # stored under a "confirmed_defect_count"-named field/key, and the
+    # repair gate functions (should_auto_repair/accept_repair) never read
+    # it either -- they inspect findings by category + calibration
+    # directly (see their own docstrings); this count exists purely for
+    # "should we even bother running calibration/the repair loop at all"
+    # and for observability, never as an authorization input itself.
     _orig_defect_count = _repair_classified["confirmed_defect_count"]
+    _orig_repair_eligible_count = _orig_defect_count + _repair_classified["behavioral_defect_count"]
 
     repair_attempted = False
     repair_succeeded = False
     repair_patch_content: str | None = None
     repair_challenger_result: dict | None = None
     repair_defect_count = 0
+    repair_eligible_defect_count = 0
+    _r_behavioral_defect_count = 0
     repair_rechallenged = False
     finding_calibration: list[dict] | None = None
     # Batch B3: pre-initialized (not previously read outside the repair
@@ -4526,23 +5182,24 @@ def _run_patch_repair_and_calibration(
     _r_app: "dict | None" = None
     _r_applicable: "bool | None" = None
 
-    if _orig_defect_count > 0:
-        # Finding Calibration v1: widened to include confirmed_defect
-        # findings (not just plausible_risk/generic) so the repair gate
-        # below reads calibration-aware state, not the raw regex
-        # classification alone. Best-effort: a failure leaves
+    if _orig_repair_eligible_count > 0:
+        # Finding Calibration v1: widened to include confirmed_defect AND
+        # behavioral_defect findings (not just plausible_risk/generic) so
+        # the repair gate below reads calibration-aware state, not the raw
+        # regex classification alone. Best-effort: a failure leaves
         # _calibration_v1 as None, which _build_known_findings treats as
-        # "no calibration entry" -- fail-closed, every confirmed_defect
-        # finding stays classified as a defect, and should_auto_repair
-        # therefore still may authorize repair on the raw evidence (see
-        # its own docstring) rather than silently clearing.
+        # "no calibration entry" -- fail-closed, every confirmed_defect or
+        # behavioral_defect finding stays classified as a defect, and
+        # should_auto_repair therefore still may authorize repair on the
+        # raw evidence (see its own docstring) rather than silently
+        # clearing.
         _calibration_inputs_v1 = [
             f["text"]
             for f in (
                 _repair_classified["classified_edge_cases"]
                 + _repair_classified["classified_potential_issues"]
             )
-            if f["category"] in ("confirmed_defect", "plausible_risk", "generic")
+            if f["category"] in (*_REPAIR_ELIGIBLE_CATEGORIES, "plausible_risk", "generic")
         ]
         _post_patch_evidence_current_v1 = (
             _post_patch_observations is not None and patch == _investigated_patch
@@ -4564,18 +5221,24 @@ def _run_patch_repair_and_calibration(
         if should_auto_repair(_repair_classified, _calibration_v1, applicability_result.get("applicable") is True):
             try:
                 repair_attempted = True
+                # Both repair-eligible categories reach the repair hint --
+                # a behavioral_defect finding that authorized this repair
+                # must actually be told to the patch generator, exactly
+                # like a confirmed_defect finding always was (see
+                # _build_repair_hint's own docstring: reused unchanged,
+                # its wording no longer says "security" specifically).
                 _confirmed_texts = [
                     f["text"]
                     for f in (
                         _repair_classified["classified_edge_cases"]
                         + _repair_classified["classified_potential_issues"]
                     )
-                    if f["category"] == "confirmed_defect"
+                    if f["category"] in _REPAIR_ELIGIBLE_CATEGORIES
                 ]
                 print(
-                    f"[pipeline] Repair loop – "
-                    f"{len(_known_findings_v1['potential_remaining_risks'])} calibration-confirmed "
-                    "defect(s) found; attempting one repair …"
+                    f"[pipeline] Repair loop – should_auto_repair authorized on "
+                    f"{len(_confirmed_texts)} raw repair-eligible finding(s) "
+                    "(confirmed_defect and/or behavioral_defect); attempting one repair …"
                 , file=sys.stderr)
                 _r_hint = _build_repair_hint(_confirmed_texts)
                 _r_raw = generate_patch(
@@ -4601,7 +5264,12 @@ def _run_patch_repair_and_calibration(
                 if _r_applicable:
                     _r_challenger = challenge_patch(vulnerability_text, _r_raw, llm, code_context=code_context)
                     _r_classified = _classify_challenger(_r_challenger)
+                    # Same correction as _orig_defect_count above: restored
+                    # to confirmed_defect-ONLY (the historical, public
+                    # meaning), with a separate eligible count alongside it.
                     repair_defect_count = _r_classified["confirmed_defect_count"]
+                    _r_behavioral_defect_count = _r_classified["behavioral_defect_count"]
+                    repair_eligible_defect_count = repair_defect_count + _r_behavioral_defect_count
                     repair_rechallenged = True
                     repair_challenger_result = _r_challenger
 
@@ -4614,7 +5282,7 @@ def _run_patch_repair_and_calibration(
                             _r_classified["classified_edge_cases"]
                             + _r_classified["classified_potential_issues"]
                         )
-                        if f["category"] in ("confirmed_defect", "plausible_risk", "generic")
+                        if f["category"] in (*_REPAIR_ELIGIBLE_CATEGORIES, "plausible_risk", "generic")
                     ]
                     _calibration_v2: list[dict] | None = None
                     try:
@@ -4637,14 +5305,15 @@ def _run_patch_repair_and_calibration(
                         if _repair_loop_meta is not None:
                             _final_repair_meta = _repair_loop_meta
                         print(
-                            "[pipeline] Repair succeeded – 0 calibration-confirmed defects "
-                            "after re-challenge.", file=sys.stderr
+                            "[pipeline] Repair succeeded – 0 calibration-confirmed "
+                            "issue(s) after re-challenge.", file=sys.stderr
                         )
                     else:
                         print(
                             f"[pipeline] Repair rejected – "
                             f"{len(_known_findings_v2['potential_remaining_risks'])} calibration-confirmed "
-                            "defect(s) remain; keeping original."
+                            f"confirmed_defect(s) and/or a calibrated-observed behavioral_defect "
+                            "remain; keeping original."
                         , file=sys.stderr)
                 else:
                     print("[pipeline] Repair patch does not apply; keeping original.", file=sys.stderr)
@@ -4678,20 +5347,27 @@ def _run_patch_repair_and_calibration(
     # Finding calibration (evidence-quality pass) — classifies and rewords
     # the plausible_risk/generic findings from the FINAL challenger result
     # (post-repair, if a repair was accepted) so calibration reasons about
-    # the patch that will actually be reported. confirmed_defect and
-    # validation_gap findings are not sent here — those already have
-    # unambiguous framing from earlier report-presentation work. Best-effort:
-    # any failure leaves finding_calibration as None, and report rendering
-    # falls back to the uncalibrated classifier text rather than losing
-    # findings or crashing the run.
+    # the patch that will actually be reported. validation_gap findings are
+    # not sent here — those already have unambiguous framing from earlier
+    # report-presentation work. Best-effort: any failure leaves
+    # finding_calibration as None, and report rendering falls back to the
+    # uncalibrated classifier text rather than losing findings or crashing
+    # the run.
     #
-    # Only runs when the repair block above did NOT already compute the
-    # authoritative calibration (i.e. _orig_defect_count was 0 -- no raw
-    # confirmed_defect finding existed, so `challenger`/`patch` are still
-    # exactly what they were before the repair block, and this is
-    # identical to the pre-existing, unwidened plausible_risk/generic-only
-    # call). This is what keeps the common all-clear case free of any
-    # extra LLM call.
+    # Normally runs only when the repair block above did NOT already
+    # compute the authoritative calibration (i.e. _orig_defect_count was 0
+    # -- no raw confirmed_defect OR behavioral_defect finding existed, so
+    # `challenger`/`patch` are still exactly what they were before the
+    # repair block, and this is identical to the pre-existing, unwidened
+    # plausible_risk/generic-only call). This is what keeps the common
+    # all-clear case free of any extra LLM call. `behavioral_defect` is
+    # ALSO included in this fallback's own filter (not just
+    # plausible_risk/generic) purely for resilience: if _orig_defect_count
+    # WAS > 0 but the earlier calibration_v1 call itself failed outright
+    # (finding_calibration left None by that failure, not by this block
+    # never running), this still gives a behavioral_defect finding one
+    # more best-effort chance at a calibration entry, same spirit as every
+    # other best-effort degradation in this module family.
     _finding_calibration_source = "none"
     if finding_calibration is not None:
         _finding_calibration_source = "v2" if repair_succeeded else "v1"
@@ -4703,7 +5379,7 @@ def _run_patch_repair_and_calibration(
                 _final_classified["classified_edge_cases"]
                 + _final_classified["classified_potential_issues"]
             )
-            if f["category"] in ("plausible_risk", "generic")
+            if f["category"] in ("behavioral_defect", "plausible_risk", "generic")
         ]
         if _calibration_inputs:
             try:
@@ -4878,6 +5554,20 @@ def _run_repository_analysis_and_remediation_planning(
     _plan_result = None  # set below only when the Planner actually runs; read again
     # much further down (as a source of "files already connected via Planner
     # evidence") by the Final-Target Remediation Slice builder.
+    # Planner Claim Verifier defaults -- ALWAYS defined (not only inside the
+    # `if not _plan_text` branch below) so `locals()`/`_s1_result` always
+    # carries these keys, including the hand-authored-plan and Planner-call-
+    # failure paths where the Planner never even runs. "No verifier ran" is
+    # these values' own steady state, exactly like `_plan_result = None`
+    # above -- not a special case callers need to guard for separately.
+    _verifier_v1 = None
+    _verifier_v2 = None
+    _verifier_mode_v1 = None
+    _verifier_mode_v2 = None
+    _planner_revision_attempted = False
+    _verifier_forced_skip = False
+    _verifier_skip_reason = None
+    _verifier_broadening_unresolved = False
     if not _plan_text:
         try:
             from .remediation_planner import build_planner_evidence, generate_remediation_plan
@@ -4908,6 +5598,65 @@ def _run_repository_analysis_and_remediation_planning(
                     )
             except Exception as exc:
                 print(f"[pipeline] Planner candidate evidence unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+            # Planner Claim Verifier: sits between this Planner call and S2
+            # (Remediation Strategy), still owned by this same canonical
+            # stage (see stage_registry.STAGE_OWNED_LLM_TAGS). The trigger
+            # is now mode-aware and structural, never inferred from prose:
+            # `_dispatch_narrower_mode` reads the Planner's OWN
+            # `narrower_alternative_decision` enum (falling back to a fixed,
+            # conservative "REJECTED" default only when that field is
+            # missing/invalid AND there is a non-empty narrative to check --
+            # see that function's own docstring for why this default is
+            # safe). "NONE_IDENTIFIED" is the only value that makes ZERO
+            # additional LLM calls, leaving every local above at its default
+            # ("no verifier ran") value -- so a run that genuinely has no
+            # narrower alternative to compare (or, as before this change,
+            # says nothing about one at all) is completely unchanged.
+            _narrower_mode = _dispatch_narrower_mode(_plan_result)
+            if _narrower_mode != "NONE_IDENTIFIED":
+                try:
+                    _verification = _run_planner_claim_verification(
+                        vulnerability_text=vulnerability_text, llm=llm, repo_root=repo_root,
+                        investigation_context=_investigation_context, evidence_so_far=_evidence_so_far,
+                        plan_result=_plan_result, planner_evidence_ctx=_planner_evidence_ctx,
+                        mode=_narrower_mode,
+                    )
+                    _verifier_v1 = _verification["verifier_v1"]
+                    _verifier_v2 = _verification["verifier_v2"]
+                    _verifier_mode_v1 = _verification["mode_v1"]
+                    _verifier_mode_v2 = _verification["mode_v2"]
+                    _planner_revision_attempted = _verification["revision_attempted"]
+                    _verifier_forced_skip = _verification["forced_skip"]
+                    _verifier_skip_reason = _verification["skip_reason"]
+                    _verifier_broadening_unresolved = _verification["broadening_unresolved"]
+                    if _verification["authoritative"] == "v2":
+                        # v2 SUPPORTED -- the revised Planner result becomes
+                        # authoritative for Strategy, exactly as locked
+                        # policy case B requires. Never a silent partial
+                        # swap: rendered/target_files/target_symbols and
+                        # the evidence bridge are replaced together.
+                        _plan_result = _verification["revised_plan_result"]
+                        _plan_ctx = _verification["revised_plan_ctx"]
+                        _planner_evidence_ctx = _verification["revised_planner_evidence_ctx"]
+                    elif _verification["authoritative"] == "none":
+                        # A contradiction was found and the one bounded
+                        # revision did not clear it (cases C/D). Neither v1
+                        # nor v2 may reach Strategy: clearing
+                        # _planner_evidence_ctx reuses generate_remediation_
+                        # strategy's OWN existing "nothing materially new to
+                        # reason over" skip (see its docstring) -- Strategy
+                        # is never called, never faked as evaluated. The
+                        # explicit _verifier_forced_skip/_verifier_skip_reason
+                        # below is what independently guarantees Patch
+                        # Generation is also skipped, rather than relying on
+                        # the Edit Readiness/Strategy gates to reach the same
+                        # conclusion on their own by coincidence.
+                        _planner_evidence_ctx = ""
+                except ModelUnavailableError:
+                    raise
+                except Exception as exc:
+                    print(f"[pipeline] Planner Claim Verifier unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
         except ModelUnavailableError:
             # An explicit execution/configuration decision (non-interactive
             # rejection, or a declined/cancelled interactive reselection),
@@ -4922,6 +5671,7 @@ def _run_repository_analysis_and_remediation_planning(
 def _run_guided_context_acquisition(
     *, vulnerability_text, llm, repo_root, budget_controller,
     _strategy_result, _plan_result, _investigation_context,
+    _verifier_forced_skip=False, _verifier_skip_reason=None,
 ):
     """Reusable Stage-3 (guided_context_acquisition) executor -- the
     COMPLETE current production contract (Final-Target Remediation Slice,
@@ -4933,10 +5683,28 @@ def _run_guided_context_acquisition(
     only, bounded), same best-effort try/except degradation. Returns every
     local variable this body binds (`locals()`), so callers (run() and
     replay_engine.py) unpack only the specific keys they need.
+
+    `_verifier_forced_skip`/`_verifier_skip_reason` (both additive, default
+    False/None so every pre-existing caller is unaffected): set by the
+    Planner Claim Verifier orchestration (see
+    _run_repository_analysis_and_remediation_planning) when a concrete
+    causal contradiction survived its one bounded Planner revision -- an
+    EXPLICIT third trigger onto this function's own `_skip_patch_generation`
+    flag, seeded here rather than left to fall through to whatever the
+    Edit Readiness Gate/Strategy Gate below happen to conclude on their
+    own (by this point `_strategy_result` is already None/unevaluated --
+    Strategy was never called for the same reason -- so relying on those
+    gates alone would work by coincidence, not by design). Never a new
+    terminal state: this reuses the exact same flag and skip-reason
+    propagation (`_patch_validation_skip_reason`, see
+    _run_patch_generation_and_investigation) the Strategy Gate below
+    already established for "a real decision exists but is not safe to
+    build a patch from."
     """
     _slice_ctx = ""
     _coverage_warning_ctx = ""
-    _skip_patch_generation = False
+    _skip_patch_generation = bool(_verifier_forced_skip)
+    _skip_patch_generation_reason = _verifier_skip_reason if _verifier_forced_skip else None
     _edit_readiness = None  # EditReadinessResult | None -- see PipelineResult.edit_readiness
     _edit_acquisition = None  # AcquisitionResult | None -- see PipelineResult.edit_acquisition
     _guided_acquisition = None  # GuidedAcquisitionResult | None -- see PipelineResult.guided_acquisition
@@ -5421,6 +6189,14 @@ def run(
     _plan_ctx = _s1_result["_plan_ctx"]
     _planner_evidence_ctx = _s1_result["_planner_evidence_ctx"]
     _plan_result = _s1_result["_plan_result"]
+    _verifier_v1 = _s1_result["_verifier_v1"]
+    _verifier_v2 = _s1_result["_verifier_v2"]
+    _verifier_mode_v1 = _s1_result["_verifier_mode_v1"]
+    _verifier_mode_v2 = _s1_result["_verifier_mode_v2"]
+    _planner_revision_attempted = _s1_result["_planner_revision_attempted"]
+    _verifier_forced_skip = _s1_result["_verifier_forced_skip"]
+    _verifier_skip_reason = _s1_result["_verifier_skip_reason"]
+    _verifier_broadening_unresolved = _s1_result["_verifier_broadening_unresolved"]
 
     # Batch B2: finish S1's execution -- outcome reflects which of the three
     # sub-paths above actually settled; the artifact carries the REAL
@@ -5472,6 +6248,22 @@ def run(
                 # above is a DIFFERENT, derived object). Zero behavior
                 # change: purely additive artifact content.
                 "grounding": to_jsonable(_grounding),
+                # Planner Claim Verifier observability -- additive, never
+                # read by _build_recommendation_v1/_compute_trust_signals
+                # (see remediation_verifier.VerifierResult's own docstring):
+                # lets a trace/replay answer "did the verifier run, what did
+                # it find, was a revision attempted, did it clear" without
+                # re-deriving any of this from _plan_ctx prose.
+                "planner_claim_verification": {
+                    "verifier_v1": to_jsonable(_verifier_v1),
+                    "verifier_v2": to_jsonable(_verifier_v2),
+                    "mode_v1": _verifier_mode_v1,
+                    "mode_v2": _verifier_mode_v2,
+                    "revision_attempted": _planner_revision_attempted,
+                    "forced_skip": _verifier_forced_skip,
+                    "skip_reason": _verifier_skip_reason,
+                    "broadening_necessity_unresolved": _verifier_broadening_unresolved,
+                },
             },
         )
 
@@ -5577,10 +6369,13 @@ def run(
         _strategy_result=_strategy_result,
         _plan_result=_plan_result,
         _investigation_context=_investigation_context,
+        _verifier_forced_skip=_verifier_forced_skip,
+        _verifier_skip_reason=_verifier_skip_reason,
     )
     _slice_ctx = _s3_result["_slice_ctx"]
     _coverage_warning_ctx = _s3_result["_coverage_warning_ctx"]
     _skip_patch_generation = _s3_result["_skip_patch_generation"]
+    _skip_patch_generation_reason = _s3_result["_skip_patch_generation_reason"]
     _edit_readiness = _s3_result["_edit_readiness"]
     _edit_acquisition = _s3_result["_edit_acquisition"]
     _guided_acquisition = _s3_result["_guided_acquisition"]
@@ -5662,6 +6457,7 @@ def run(
         budget_controller=budget_controller, _skip_patch_generation=_skip_patch_generation,
         _edit_readiness=_edit_readiness, _slice_result=_slice_result, _investigation_context=_investigation_context,
         _pre_patch_anchors=_pre_patch_anchors, _plan_result=_plan_result, _strategy_result=_strategy_result,
+        _skip_patch_generation_reason=_skip_patch_generation_reason,
     )
     patch = _s4["patch"]
     _patch_generation_status = _s4["_patch_generation_status"]
@@ -5837,11 +6633,14 @@ def run(
     finding_calibration = _s6["finding_calibration"]
     _repair_classified = _s6["_repair_classified"]
     _orig_defect_count = _s6["_orig_defect_count"]
+    _orig_repair_eligible_count = _s6["_orig_repair_eligible_count"]
     repair_attempted = _s6["repair_attempted"]
     repair_succeeded = _s6["repair_succeeded"]
     repair_patch_content = _s6["repair_patch_content"]
     repair_challenger_result = _s6["repair_challenger_result"]
     repair_defect_count = _s6["repair_defect_count"]
+    repair_eligible_defect_count = _s6["repair_eligible_defect_count"]
+    _r_behavioral_defect_count = _s6["_r_behavioral_defect_count"]
     repair_rechallenged = _s6["repair_rechallenged"]
     _r_hygiene = _s6["_r_hygiene"]
     _r_app = _s6["_r_app"]
@@ -5868,7 +6667,13 @@ def run(
         else:
             _s6_outcome = "settled"
         if not repair_attempted:
-            _repair_outcome = "not_triggered_no_defects" if _orig_defect_count == 0 else "not_triggered_gate_declined"
+            # Uses the ELIGIBLE count (confirmed_defect + behavioral_defect),
+            # not the confirmed-only _orig_defect_count -- a run whose ONLY
+            # finding is an un-Observed behavioral_defect must report
+            # "gate_declined" (something eligible existed but wasn't
+            # authorized), never "no_defects" (nothing eligible existed at
+            # all). See _orig_repair_eligible_count's own comment.
+            _repair_outcome = "not_triggered_no_defects" if _orig_repair_eligible_count == 0 else "not_triggered_gate_declined"
         elif _r_applicable is None:
             _repair_outcome = "attempted_failed"  # never even completed applicability check
         elif _r_applicable is False:
@@ -5911,7 +6716,17 @@ def run(
                 "repair_rechallenge": (
                     {
                         "challenger": to_jsonable(repair_challenger_result),
+                        # confirmed_defect-ONLY, matching this key's own
+                        # name exactly -- see repair_defect_count's own
+                        # comment. behavioral_defect_count is a SEPARATE,
+                        # additive key (never merged into this one) so an
+                        # old artifact/reader that only knows about
+                        # "confirmed_defect_count" still gets the correct,
+                        # unwidened value; a reader that wants the
+                        # repair-eligible total combines both explicitly
+                        # (see replay_engine.py's own reconstruction).
                         "confirmed_defect_count": repair_defect_count,
+                        "behavioral_defect_count": _r_behavioral_defect_count,
                     } if repair_rechallenged else None
                 ),
                 "repair_outcome": _repair_outcome,
@@ -6324,6 +7139,8 @@ def run(
         repair_defect_count=repair_defect_count,
         repair_rechallenged=repair_rechallenged,
         original_challenger_defect_count=_orig_defect_count,
+        original_challenger_repair_eligible_count=_orig_repair_eligible_count,
+        repair_eligible_defect_count=repair_eligible_defect_count,
         constraint_signals=_c_signals,
         remediation_signals=_r_signals,
         detected_language=_detected_language,

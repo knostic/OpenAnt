@@ -491,6 +491,25 @@ def _run_replay_repository_analysis_and_remediation_planning(
         "plan_ctx": s1_locals["_plan_ctx"],
         "repo_code": s1_locals["_repo_code"],
         "grounding": to_jsonable(s1_locals["_grounding"]),
+        # Planner Claim Verifier state -- SAME shape/keys as pipeline.run()'s
+        # own execution_recorder artifact for this stage (see pipeline.py's
+        # "planner_claim_verification" sub-dict) -- one semantic owner for
+        # "what did the verifier decide", even though this JSON file and
+        # execution_recorder's artifact are physically separate. `forced_skip`/
+        # `skip_reason` here are what _run_replay_guided_context_acquisition
+        # (S3) reads to reproduce the authoritative skip decision -- S3 must
+        # consume this, never re-derive it from strategy_result being empty
+        # (see that function's own comment on why that inference is unsafe).
+        "planner_claim_verification": {
+            "verifier_v1": to_jsonable(s1_locals["_verifier_v1"]),
+            "verifier_v2": to_jsonable(s1_locals["_verifier_v2"]),
+            "mode_v1": s1_locals["_verifier_mode_v1"],
+            "mode_v2": s1_locals["_verifier_mode_v2"],
+            "revision_attempted": s1_locals["_planner_revision_attempted"],
+            "forced_skip": s1_locals["_verifier_forced_skip"],
+            "skip_reason": s1_locals["_verifier_skip_reason"],
+            "broadening_necessity_unresolved": s1_locals["_verifier_broadening_unresolved"],
+        },
     }
     artifact_path = output_dir / "repository_analysis_and_remediation_planning.json"
     artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
@@ -585,10 +604,24 @@ def _run_replay_guided_context_acquisition(
     plan_result = from_jsonable(RemediationPlanResult, s1.get("plan_result"))
     strategy_result = from_jsonable(RemediationStrategyResult, s2.get("strategy_result"))
 
+    # Planner Claim Verifier: S1 already made the authoritative forced-skip
+    # decision (pipeline._run_planner_claim_verification) -- this replay
+    # must consume that decision exactly as recorded, never re-derive it
+    # from `strategy_result` being empty/unevaluated. An empty Strategy
+    # result and a verifier-forced block are NOT distinguishable from
+    # `strategy_result` alone (both leave it with no targets/evaluated=False)
+    # -- production itself does not rely on that inference either (see
+    # pipeline.py's own comment on _verifier_forced_skip at the top of
+    # _run_guided_context_acquisition), so replay must not either.
+    _planner_claim_verification = s1.get("planner_claim_verification") or {}
+    verifier_forced_skip = bool(_planner_claim_verification.get("forced_skip"))
+    verifier_skip_reason = _planner_claim_verification.get("skip_reason")
+
     with LLMCallCapture() as capture:
         s3_locals = _run_guided_context_acquisition(
             vulnerability_text=vulnerability_text, llm=llm, repo_root=repo_root, budget_controller=None,
             _strategy_result=strategy_result, _plan_result=plan_result, _investigation_context=None,
+            _verifier_forced_skip=verifier_forced_skip, _verifier_skip_reason=verifier_skip_reason,
         )
 
     llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
@@ -597,6 +630,7 @@ def _run_replay_guided_context_acquisition(
     slice_result = s3_locals["_slice_result"]
     edit_readiness = s3_locals["_edit_readiness"]
     skip_patch_generation = s3_locals["_skip_patch_generation"]
+    skip_patch_generation_reason = s3_locals["_skip_patch_generation_reason"]
     has_targets = strategy_result is not None and (strategy_result.target_files or strategy_result.target_symbols)
     outcome = "ready" if slice_result is not None else ("skipped_no_strategy_targets" if not has_targets else "unavailable")
 
@@ -604,6 +638,7 @@ def _run_replay_guided_context_acquisition(
         "slice_result": to_jsonable(slice_result),
         "edit_readiness": to_jsonable(edit_readiness),
         "skip_patch_generation": skip_patch_generation,
+        "skip_patch_generation_reason": skip_patch_generation_reason,
     }
     artifact_path = output_dir / "guided_context_acquisition.json"
     artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
@@ -667,6 +702,7 @@ def _run_replay_patch_generation_and_investigation(
     edit_readiness = from_jsonable(EditReadinessResult, s3.get("edit_readiness"))
     slice_result = from_jsonable(FinalTargetSliceResult, s3.get("slice_result"))
     skip_patch_generation = bool(s3.get("skip_patch_generation"))
+    skip_patch_generation_reason = s3.get("skip_patch_generation_reason")
 
     # Reconstructed the same way pipeline.run() assembles it -- concatenating
     # each upstream stage's own rendered text, in the same order, skipping
@@ -688,6 +724,7 @@ def _run_replay_patch_generation_and_investigation(
             budget_controller=None, _skip_patch_generation=skip_patch_generation,
             _edit_readiness=edit_readiness, _slice_result=slice_result, _investigation_context=None,
             _pre_patch_anchors=pre_patch_anchors, _plan_result=plan_result, _strategy_result=strategy_result,
+            _skip_patch_generation_reason=skip_patch_generation_reason,
         )
 
     llm_call_records = _write_llm_calls_for_stage(capture.calls, output_dir)
@@ -811,7 +848,16 @@ def _run_replay_patch_repair_and_calibration(
     outcome = "no_candidate_patch" if not (final_patch and final_patch.strip()) and not repair_attempted else "settled"
 
     if not repair_attempted:
-        repair_outcome = "not_triggered_no_defects" if s6_locals["_orig_defect_count"] == 0 else "not_triggered_gate_declined"
+        # Uses the ELIGIBLE count (confirmed_defect + behavioral_defect),
+        # mirroring pipeline.run()'s own corrected outcome-label logic --
+        # see pipeline.py's _orig_repair_eligible_count comment. Never the
+        # confirmed_defect-only _orig_defect_count, which would mislabel a
+        # run whose only finding is an un-Observed behavioral_defect as
+        # "no_defects" rather than "gate_declined".
+        repair_outcome = (
+            "not_triggered_no_defects" if s6_locals["_orig_repair_eligible_count"] == 0
+            else "not_triggered_gate_declined"
+        )
     elif s6_locals["_r_applicable"] is None:
         repair_outcome = "attempted_failed"
     elif s6_locals["_r_applicable"] is False:
@@ -845,7 +891,13 @@ def _run_replay_patch_repair_and_calibration(
         "repair_rechallenge": (
             {
                 "challenger": to_jsonable(s6_locals["repair_challenger_result"]),
+                # confirmed_defect-ONLY, matching production's own artifact
+                # shape exactly -- see pipeline.py's own comment on this
+                # same key. behavioral_defect_count is a separate, additive
+                # key so an old reader that only knows "confirmed_defect_
+                # count" still gets the correct, unwidened value.
                 "confirmed_defect_count": s6_locals["repair_defect_count"],
+                "behavioral_defect_count": s6_locals["_r_behavioral_defect_count"],
             } if s6_locals["repair_rechallenged"] else None
         ),
         "repair_outcome": repair_outcome,
@@ -1188,6 +1240,18 @@ def _run_replay_report_generation(
     repair_regeneration = s6.get("repair_regeneration")
     repair_rechallenge = s6.get("repair_rechallenge")
     original_challenger_defect_count = s6["original_candidate_evaluated"]["challenger"]["confirmed_defect_count"]
+    # Additive (post-review correction, run-4 Architecture B): the
+    # repair-eligible total (confirmed_defect + behavioral_defect), kept
+    # SEPARATE from original_challenger_defect_count above -- which stays
+    # confirmed_defect-only, its historical meaning. `.get(..., 0)` on
+    # "behavioral_defect_count" is the backward-compatibility path: an S6
+    # artifact from before this field existed (or from before
+    # behavioral_defect existed at all) simply has no such key, and
+    # defaults to 0 -- reproducing the pre-existing confirmed_defect-only
+    # total exactly, byte-for-byte, for every old artifact.
+    original_challenger_repair_eligible_count = original_challenger_defect_count + (
+        s6["original_candidate_evaluated"]["challenger"].get("behavioral_defect_count", 0)
+    )
 
     post_patch_observations = (
         [from_jsonable(AnchorObservation, o) for o in s4["post_patch_observations"]]
@@ -1236,8 +1300,16 @@ def _run_replay_report_generation(
         repair_patch=repair_regeneration.get("patch") if repair_regeneration else None,
         repair_challenger=repair_rechallenge.get("challenger") if repair_rechallenge else None,
         repair_defect_count=repair_rechallenge.get("confirmed_defect_count", 0) if repair_rechallenge else 0,
+        # Additive, backward-compatible (see original_challenger_repair_
+        # eligible_count's own comment above): an old repair_rechallenge
+        # dict without "behavioral_defect_count" defaults that term to 0,
+        # reproducing the pre-existing confirmed_defect-only total exactly.
+        repair_eligible_defect_count=(
+            repair_rechallenge.get("confirmed_defect_count", 0) + repair_rechallenge.get("behavioral_defect_count", 0)
+        ) if repair_rechallenge else 0,
         repair_rechallenged=repair_rechallenge is not None,
         original_challenger_defect_count=original_challenger_defect_count,
+        original_challenger_repair_eligible_count=original_challenger_repair_eligible_count,
         constraint_signals=constraint_signals,
         remediation_signals=remediation_signals,
         detected_language=s9.get("detected_language") or "python",

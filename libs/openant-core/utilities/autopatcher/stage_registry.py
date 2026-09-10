@@ -245,7 +245,24 @@ STAGE_DEPENDENCIES: "dict[str, tuple[str, ...]]" = {
 # ---------------------------------------------------------------------------
 
 STAGE_OWNED_LLM_TAGS: "dict[str, tuple[str, ...]]" = {
-    REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING: ("remediation_planning",),
+    # remediation_plan_verification/remediation_plan_revision/
+    # remediation_plan_reverification: the Planner Claim Verifier
+    # orchestration (pipeline.py::_run_planner_claim_verification) --
+    # bounded (at most one revision, at most two verification calls) and
+    # owned by THIS canonical stage, not a new one: it sits between this
+    # stage's own Planner call and S2 (Remediation Strategy), reads only
+    # evidence this stage already produced, and never touches Strategy or
+    # Patch Generation directly (see _skip_patch_generation propagation in
+    # pipeline.py for how an uncleared contradiction reaches S3/S4
+    # instead). Triggered only when the Planner's own
+    # narrower_alternative_considered is non-empty -- most runs never emit
+    # any of these three tags at all.
+    REPOSITORY_ANALYSIS_AND_REMEDIATION_PLANNING: (
+        "remediation_planning",
+        "remediation_plan_verification",
+        "remediation_plan_revision",
+        "remediation_plan_reverification",
+    ),
     REMEDIATION_STRATEGY: ("remediation_strategy",),
     GUIDED_CONTEXT_ACQUISITION: ("guided_context_request",),
     PATCH_GENERATION_AND_POST_PATCH_INVESTIGATION: (

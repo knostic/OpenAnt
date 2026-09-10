@@ -142,6 +142,321 @@ class TestParsing:
         assert "Required edits:" not in result.rendered
 
 
+class TestNarrowerAlternativeConsideredField:
+    """`narrower_alternative_considered` -- additive, optional scalar field.
+    Like `security_invariant`/`remediation_mechanism` before it, it is
+    rendering-only: RemediationPlanResult carries no new attribute for it
+    (see RemediationPlanResult's own docstring), so it flows through the
+    same generic _SECTIONS render loop every other scalar field already
+    uses -- no new parsing/coercion code was needed."""
+
+    def test_well_formed_response_with_field_renders_it(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_WELL_FORMED,
+            "narrower_alternative_considered": "NARROWER_MECHANISM_MARKER",
+        })
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert "Narrower alternative considered:" in result.rendered
+        assert "NARROWER_MECHANISM_MARKER" in result.rendered
+
+    def test_field_rendered_between_security_invariant_and_mechanism(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_WELL_FORMED,
+            "narrower_alternative_considered": "NARROWER_MECHANISM_MARKER",
+        })
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        # Mirrors the reasoning order the prompt now requires: the condition
+        # to restore, then the comparison that produced the choice, then the
+        # choice itself.
+        assert (
+            result.rendered.index("Security invariant:")
+            < result.rendered.index("Narrower alternative considered:")
+            < result.rendered.index("Likely remediation mechanism:")
+        )
+
+    def test_null_field_renders_no_heading(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_considered": None})
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert "Narrower alternative considered:" not in result.rendered
+        assert "Security invariant:" in result.rendered  # other sections unaffected
+
+    def test_missing_field_is_backward_compatible(self):
+        # _WELL_FORMED has no narrower_alternative_considered key at all --
+        # a response shaped exactly like one from before this field existed.
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert "Narrower alternative considered:" not in result.rendered
+        assert "Security invariant:" in result.rendered
+
+
+class TestNarrowerAlternativeDecisionField:
+    """`narrower_alternative_decision` -- the explicit, machine-readable
+    enum the Planner Claim Verifier orchestration (pipeline.py) dispatches
+    on. Fail-closed normalization, never inference: only the exact three
+    schema values are trusted; anything else (missing, wrong type, or an
+    unrecognized string) collapses to `None`, which the orchestration's own
+    `_dispatch_narrower_mode` then substitutes a fixed, conservative
+    default for -- never by re-parsing this field's or
+    `narrower_alternative_considered`'s prose."""
+
+    def test_selected_is_retained(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": "SELECTED"})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision == "SELECTED"
+
+    def test_rejected_is_retained(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": "REJECTED"})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision == "REJECTED"
+
+    def test_none_identified_is_retained(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": "NONE_IDENTIFIED"})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision == "NONE_IDENTIFIED"
+
+    def test_missing_field_normalizes_to_none(self):
+        # _WELL_FORMED has no narrower_alternative_decision key at all --
+        # the exact shape a pre-this-change (or otherwise non-compliant)
+        # response takes. Never inferred from narrower_alternative_considered.
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision is None
+
+    def test_invalid_string_value_normalizes_to_none(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": "MAYBE"})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision is None
+
+    def test_wrong_type_normalizes_to_none(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": 1})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision is None
+
+    def test_case_and_whitespace_tolerant(self):
+        # Ordinary response normalization (case/whitespace), never semantic
+        # inference: "selected"/" SELECTED " are the same schema value
+        # spelled differently, not a different claim to interpret.
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "narrower_alternative_decision": " selected "})
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision == "SELECTED"
+
+    def test_wording_that_implies_selected_is_never_treated_as_the_enum(self):
+        # The critical non-inference guarantee: prose that clearly SOUNDS
+        # like a selection claim must NOT be treated as if the enum field
+        # itself said "SELECTED" when that field is absent.
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_WELL_FORMED,
+            "narrower_alternative_considered": "I select it as the mechanism.",
+        })
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.narrower_alternative_decision is None
+
+    def test_rendered_between_security_invariant_and_narrower_alternative_considered(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_WELL_FORMED,
+            "narrower_alternative_decision": "REJECTED",
+            "narrower_alternative_considered": "NARROWER_MECHANISM_MARKER",
+        })
+        result = generate_remediation_plan("some vuln", llm)
+        assert (
+            result.rendered.index("Security invariant:")
+            < result.rendered.index("Narrower alternative decision:")
+            < result.rendered.index("Narrower alternative considered:")
+        )
+
+
+class TestStructuralFieldRetention:
+    """`security_invariant`/`remediation_mechanism`/
+    `narrower_alternative_decision`/`narrower_alternative_considered`/
+    `required_edits`/`approaches_to_avoid`/`explicit_unknowns` are the SAME
+    already-parsed JSON values `_render_plan` already renders -- these
+    tests confirm they are ALSO retained structurally on
+    RemediationPlanResult (consumed by the Planner Claim Verifier
+    orchestration in pipeline.py), not just rendered to Markdown."""
+
+    def test_all_seven_fields_retained(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            **_WELL_FORMED,
+            "narrower_alternative_decision": "REJECTED",
+            "narrower_alternative_considered": "considered X, rejected because Y",
+        })
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert result.security_invariant == _WELL_FORMED["security_invariant"]
+        assert result.remediation_mechanism == _WELL_FORMED["remediation_mechanism"]
+        assert result.narrower_alternative_decision == "REJECTED"
+        assert result.narrower_alternative_considered == "considered X, rejected because Y"
+        assert result.required_edits == _WELL_FORMED["required_edits"]
+        assert result.approaches_to_avoid == _WELL_FORMED["approaches_to_avoid"]
+        assert result.explicit_unknowns == []
+
+    def test_null_scalar_fields_retained_as_none(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({
+            "remediation_mechanism": None, "target_files": [], "target_symbols": [],
+            "security_invariant": None, "narrower_alternative_decision": None,
+            "narrower_alternative_considered": None,
+            "required_edits": [], "approaches_to_avoid": [], "explicit_unknowns": [],
+        })
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert result.security_invariant is None
+        assert result.remediation_mechanism is None
+        assert result.narrower_alternative_decision is None
+        assert result.narrower_alternative_considered is None
+        assert result.required_edits == []
+
+    def test_non_string_scalar_is_dropped_to_none(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps({**_WELL_FORMED, "security_invariant": 12345})
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert result.security_invariant is None
+
+    def test_empty_plan_result_has_safe_defaults(self):
+        from utilities.autopatcher.remediation_planner import _EMPTY_PLAN_RESULT
+
+        assert _EMPTY_PLAN_RESULT.security_invariant is None
+        assert _EMPTY_PLAN_RESULT.remediation_mechanism is None
+        assert _EMPTY_PLAN_RESULT.narrower_alternative_decision is None
+        assert _EMPTY_PLAN_RESULT.narrower_alternative_considered is None
+        assert _EMPTY_PLAN_RESULT.required_edits == []
+        assert _EMPTY_PLAN_RESULT.approaches_to_avoid == []
+        assert _EMPTY_PLAN_RESULT.explicit_unknowns == []
+
+    def test_malformed_json_still_returns_empty_plan_result(self):
+        # Backward-compatibility guard: a response shaped exactly like one
+        # from before these fields existed (or a malformed one) must still
+        # produce a RemediationPlanResult with every new field at its safe
+        # default -- never a crash, never a partially-populated object.
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan, _EMPTY_PLAN_RESULT
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = "not json at all"
+
+        result = generate_remediation_plan("some vuln", llm)
+
+        assert result == _EMPTY_PLAN_RESULT
+
+
+class TestRetryHint:
+    """`retry_hint` -- the Planner Claim Verifier orchestration's ONE
+    bounded revision call uses this exact idiom, mirroring
+    `generate_patch()`/`generate_patch_raw()`'s own `retry_hint` parameter."""
+
+    def test_default_empty_hint_preserves_exact_prior_user_message(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm, code_context="ctx")
+
+        _system, user_message = llm.complete.call_args[0]
+        assert "## Retry instruction" not in user_message
+
+    def test_hint_appended_as_retry_instruction_section(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm, retry_hint="RETRY_HINT_MARKER")
+
+        _system, user_message = llm.complete.call_args[0]
+        assert "## Retry instruction" in user_message
+        assert "RETRY_HINT_MARKER" in user_message
+
+    def test_still_makes_exactly_one_llm_call(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm, retry_hint="hint")
+
+        llm.complete.assert_called_once()
+
+    def test_custom_stage_label(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm, retry_hint="hint", stage="remediation_plan_revision")
+
+        _args, kwargs = llm.complete.call_args
+        assert kwargs.get("stage") == "remediation_plan_revision"
+
+    def test_default_stage_label_unchanged(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = json.dumps(_WELL_FORMED)
+
+        generate_remediation_plan("some vuln", llm)
+
+        _args, kwargs = llm.complete.call_args
+        assert kwargs.get("stage") == "remediation_planning"
+
+
 class TestStageLabel:
     def test_stage_label_is_remediation_planning(self):
         from utilities.autopatcher.remediation_planner import generate_remediation_plan
@@ -1790,6 +2105,264 @@ class TestFinalStrategyPromptRepositoryAgnostic:
         text = _STRATEGY_PROMPT_PATH_TEXT().lower()
         for term in ("urllib3", "cookie", "header", "redirect", "python"):
             assert term not in text, f"prompt hardcodes domain-specific term: {term!r}"
+
+
+def _PLANNER_PROMPT_PATH_TEXT() -> str:
+    from utilities.autopatcher.remediation_planner import _PROMPT_PATH
+    return _PROMPT_PATH.read_text(encoding="utf-8")
+
+
+def _PLANNER_PROMPT_NORMALIZED() -> str:
+    """Whitespace-collapsed, lowercased prompt text -- so a multi-word phrase
+    check survives the source .md file's own line wrapping (a phrase that
+    happens to span a line break is still one string of words separated by
+    single spaces, never split by a literal newline)."""
+    return " ".join(_PLANNER_PROMPT_PATH_TEXT().lower().split())
+
+
+class TestPlannerPromptReasoningDiscipline:
+    """Semantic phrase checks for the reasoning-order rewrite -- deliberately
+    a handful of stable substrings, not a whole-prompt snapshot, so the
+    wording can still be refined without every check breaking."""
+
+    def test_requires_identifying_runtime_condition_before_a_mechanism(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "runtime condition" in text
+        assert "before you commit to a mechanism" in text
+
+    def test_distinguishes_exploit_tokens_from_the_dangerous_condition(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "not automatically unsafe in every" in text
+        assert "one exploit example" in text
+
+    def test_requires_minimum_necessary_change_and_behavior_check(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "existing legitimate behavior" in text
+        assert "smallest change that makes that condition impossible" in text
+
+    def test_requires_narrower_mechanism_check_before_broad_rule(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "more conditional mechanism" in text
+        assert "broad rejection, filtering, sanitization, or allow/deny-list" in text
+
+    def test_still_requires_security_completeness_not_under_fixing(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "security completeness is still mandatory" in text
+        assert "must never leave the exploit reachable" in text
+
+    def test_still_requires_exactly_one_mechanism(self):
+        # The narrower-alternative check must not turn into a menu of options
+        # -- the pre-existing single-mechanism rule must survive verbatim.
+        text = _PLANNER_PROMPT_PATH_TEXT()
+        assert "Propose exactly one remediation mechanism, not a menu of options." in text
+
+
+class TestPlannerPromptRepositoryAgnostic:
+    def test_no_hardcoded_domain_terms_in_universal_prompt(self):
+        text = _PLANNER_PROMPT_PATH_TEXT().lower()
+        for term in (
+            "minimist", "cve-2021-44906", "constructor", "prototype", "__proto__",
+            "javascript", "urllib3", "cookie", "header", "redirect", "python",
+        ):
+            assert term not in text, f"prompt hardcodes domain-specific term: {term!r}"
+
+
+class TestPlannerSchemaFieldSet:
+    """Guards against accidental schema drift when the prompt is next edited:
+    the schema block must declare exactly the nine expected field names.
+    Parsed with a plain regex, not `json.loads` -- the schema block uses
+    type placeholders (`string | null`, `[string, ...]`) that are not valid
+    JSON values, only valid JSON *keys*."""
+
+    _EXPECTED_FIELDS = {
+        "remediation_mechanism", "target_files", "target_symbols",
+        "security_invariant", "narrower_alternative_decision",
+        "narrower_alternative_considered",
+        "required_edits", "approaches_to_avoid", "explicit_unknowns",
+    }
+
+    def test_schema_has_exactly_the_expected_nine_fields(self):
+        text = _PLANNER_PROMPT_PATH_TEXT()
+        schema_start = text.index("## Output schema")
+        next_heading = text.index("\n## ", schema_start + 1)
+        schema_block = text[schema_start:next_heading]
+
+        found = set(re.findall(r'"([a-zA-Z_]+)":', schema_block))
+        assert found == self._EXPECTED_FIELDS
+
+
+class TestPlannerPromptNarrowerAlternativeDecisionEnum:
+    """The explicit, structural `narrower_alternative_decision` enum the
+    Planner Claim Verifier orchestration (pipeline.py) dispatches its mode
+    from -- never inferred from `narrower_alternative_considered`'s own
+    prose. Introduced specifically because a real minimist trace showed a
+    Planner response whose `narrower_alternative_considered` said it
+    "selected" a narrower mechanism while `remediation_mechanism`/
+    `required_edits` still described the broader one -- an internal
+    inconsistency no free-text comparison can safely detect."""
+
+    def test_schema_declares_the_three_valid_values(self):
+        text = _PLANNER_PROMPT_PATH_TEXT()
+        schema_start = text.index("## Output schema")
+        next_heading = text.index("\n## ", schema_start + 1)
+        schema_block = text[schema_start:next_heading]
+        assert '"SELECTED"' in schema_block
+        assert '"REJECTED"' in schema_block
+        assert '"NONE_IDENTIFIED"' in schema_block
+
+    def test_field_always_required_when_alternative_considered_is_non_empty(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "this field is always required when you have anything to say" in text
+
+    def test_selected_means_remediation_mechanism_is_the_authoritative_description(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "they become its authoritative description" in text
+        assert "not a separate or broader mechanism" in text
+
+    def test_rejected_means_broader_mechanism_is_authoritative(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "remediation_mechanism`/`required_edits` then describe the".lower() in text
+        assert "broader mechanism you are proposing instead" in text
+
+    def test_none_identified_means_only_mechanism_found(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "no genuine narrower alternative could be identified" in text
+
+    def test_never_leave_decision_to_be_inferred_from_prose(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "never leave the decision to be inferred from this field's prose alone" in text
+
+
+class TestPlannerPromptDecisionRule:
+    """The decision rule is the point of this experiment: recognizing
+    overbreadth (already covered by TestPlannerPromptReasoningDiscipline)
+    is not the same as being required to act on it. These checks target the
+    added must-choose-the-narrower-mechanism language specifically."""
+
+    def test_states_narrower_mechanism_must_be_selected_when_equally_secure(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "narrower_alternative_considered" in text
+        assert "fully restores the security invariant" in text
+        assert "preserving more legitimate behavior" in text
+        assert "is your `remediation_mechanism`" in text
+
+    def test_requires_concrete_evidence_before_choosing_broader_mechanism(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "concrete evidence that the narrower one" in text
+        assert "not, by itself, evidence" in text
+
+    def test_remediation_mechanism_is_the_selected_alternative_when_selected(self):
+        # Superseded by the explicit narrower_alternative_decision enum:
+        # rather than merely forbidding a contradiction between two
+        # separately-worded fields, the prompt now requires
+        # `remediation_mechanism` to directly BE the selected alternative's
+        # description -- a stronger, structurally-enforceable contract than
+        # "must not contradict".
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "this field is the narrower alternative's mechanism" in text
+
+
+class TestPlannerPromptCounterfactualExecutionValidation:
+    """Recognizing overbreadth (TestPlannerPromptReasoningDiscipline) and
+    being required to act on it (TestPlannerPromptDecisionRule) still left a
+    gap: the Planner could reject a narrower alternative on an unverified
+    assertion. These checks target the added requirement that a rejection
+    be backed by a concrete, source-grounded execution trace."""
+
+    def test_requires_a_concrete_remaining_exploit_path_before_rejecting(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "trace the remaining exploit path through the verified source" in text
+        assert "you may reject a narrower alternative as insufficient only if you can walk a concrete" in text
+
+    def test_requires_existing_guards_applied_in_actual_execution_order(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "existing guard, reset, normalization, validation" in text
+        assert "in the actual order the" in text
+
+    def test_forbids_rejection_on_tokens_or_intuition_alone(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "invalid rejection" in text
+        assert "vulnerability-class intuition" in text
+        assert "without showing how" in text
+
+    def test_requires_explicit_unknowns_when_path_cannot_be_demonstrated(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "you may not claim the narrower alternative is insufficient" in text
+        assert "record the gap in `explicit_unknowns`".lower() in text
+        # the field-semantics section reinforces the same rule from the
+        # other direction: don't invent a path to avoid recording the gap.
+        assert "do not invent a" in text
+
+    def test_required_edits_must_not_broaden_beyond_the_validated_trace(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "do not broaden the edits beyond what the" in text
+        assert "execution trace in `narrower_alternative_considered`".lower() in text
+
+    def test_decision_consistency_rule_still_present(self):
+        # Guards against this experiment accidentally regressing the
+        # previous one's central rule while restructuring the same steps --
+        # now expressed via the explicit narrower_alternative_decision enum
+        # rather than a bare "must not contradict" instruction (see
+        # test_remediation_mechanism_is_the_selected_alternative_when_selected).
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "this field is the narrower alternative's mechanism" in text
+        assert "is your `remediation_mechanism`" in text
+
+    def test_no_chain_of_thought_verbosity_required(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "checkable trace, not a narrated deliberation" in text
+
+
+class TestPlannerPromptGenuineNarrowerAlternative:
+    """The counterfactual-trace rule (TestPlannerPromptCounterfactualExecutionValidation)
+    closed the "plausible-looking but wrong trace" gap, but a real trace
+    against a fake alternative (the vulnerable baseline / no-op) is just as
+    meaningless. These checks target the requirement that
+    `narrower_alternative_considered` be a genuine, code-changing mechanism,
+    not the baseline restated."""
+
+    def test_baseline_or_no_op_cannot_satisfy_the_field(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert '"do nothing"' in text
+        assert "leaving the vulnerable code unchanged" in text
+        assert "you have not satisfied this step" in text
+
+    def test_existing_protections_alone_do_not_count(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "relying only on protections already present before any fix" in text
+        assert '"the current behavior already has some guards" is not a valid' in text
+
+    def test_valid_alternative_requires_a_real_code_or_logic_change(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "genuine narrower alternative" in text
+        assert "requires an actual code or logic change relative to the vulnerable baseline" in text
+
+    def test_requires_actively_searching_for_a_conditional_remediation_first(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "actively search for at least one" in text
+        assert "genuine, code-changing conditional" in text
+
+    def test_conditional_remediation_tied_to_runtime_state_not_surface_tokens(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "tied to the actual unsafe runtime state or transition from step 1" in text
+        assert "not the surface form of the exploit" in text
+
+    def test_broad_mechanism_only_wins_after_counterexample_trace_rule_applies(self):
+        # The genuine-alternative requirement (step 3) must feed into, not
+        # bypass, the existing trace-before-rejecting rule (step 4).
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "before rejecting a narrower alternative, trace the remaining exploit" in text
+        assert "step 4 produced" in text
+
+    def test_required_edits_cannot_cite_baseline_vulnerability_as_justification(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "not justified merely because the vulnerable baseline" in text
+        assert "not against doing nothing" in text
+
+    def test_no_fabricating_an_alternative_when_none_is_found(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert "no genuine narrower alternative can be identified from the verified source" in text
+        assert "say so plainly" in text
 
 
 class TestFinalStrategyEvidenceBinding:

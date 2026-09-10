@@ -82,6 +82,144 @@ class TestClassifyFinding:
 
 
 # ---------------------------------------------------------------------------
+# behavioral_defect (run-4 Architecture B)
+#
+# A generic, repository/language-agnostic category for a candidate patch
+# that itself removes, rejects, changes, or breaks behavior the repository
+# previously allowed -- distinct from the vulnerable behavior intentionally
+# being removed. Requires a COMBINATION of an action verb and a
+# previously-allowed-behavior description in the SAME clause, never a
+# single broad keyword like "behavior"/"change"/"compatibility"/"risk".
+# ---------------------------------------------------------------------------
+
+_RUN_4_BEHAVIORAL_FINDING = (
+    "Silent drop of legitimate keys named `constructor`/`prototype` may "
+    "cause surprising behavior for consumers (no deprecation/error surfaced)."
+)
+_RUN_1_BEHAVIORAL_FINDING = (
+    "Legitimate CLI keys literally named `constructor` or `prototype` are "
+    "now silently dropped (behavior change)"
+)
+
+
+class TestBehavioralDefectClassification:
+    def test_exact_run_4_finding_is_behavioral_defect(self):
+        # The real fixture this whole feature exists to catch -- see
+        # /tmp/minimist-verifier-trace-4/trace/005_challenger.response.txt
+        # (potential_issues[1]). Object and verb are ~70 characters apart
+        # with no intervening punctuation, which is why a fixed
+        # character-distance window was rejected in favor of clause-level
+        # co-occurrence (see _has_behavioral_defect_signal's docstring).
+        assert _classify_finding(_RUN_4_BEHAVIORAL_FINDING) == "behavioral_defect"
+
+    def test_real_run_1_finding_is_also_behavioral_defect(self):
+        # A second, independently-worded real transcript finding
+        # describing the identical underlying defect class.
+        assert _classify_finding(_RUN_1_BEHAVIORAL_FINDING) == "behavioral_defect"
+
+    def test_breaks_existing_behavior(self):
+        assert _classify_finding(
+            "The patch breaks existing behavior for a previously supported input format."
+        ) == "behavioral_defect"
+
+    def test_drops_previously_supported_behavior(self):
+        assert _classify_finding(
+            "This drops previously supported behavior for a class of callers."
+        ) == "behavioral_defect"
+
+    def test_rejects_previously_accepted_input(self):
+        assert _classify_finding(
+            "The patch rejects previously accepted configuration values."
+        ) == "behavioral_defect"
+
+    def test_prevents_previously_valid_usage(self):
+        assert _classify_finding(
+            "The fix prevents an existing supported input from being processed."
+        ) == "behavioral_defect"
+
+    def test_changes_legitimate_behavior(self):
+        assert _classify_finding(
+            "This changes legitimate behavior that callers may depend on."
+        ) == "behavioral_defect"
+
+    def test_silently_drops_valid_options(self):
+        assert _classify_finding(
+            "The change silently drops valid user-supplied options."
+        ) == "behavioral_defect"
+
+    def test_removes_behavior_outside_intended_scope(self):
+        assert _classify_finding(
+            "The patch removes behavior outside the intended security scope."
+        ) == "behavioral_defect"
+
+    def test_alters_unrelated_existing_behavior(self):
+        assert _classify_finding(
+            "The patch changes unrelated existing behavior outside the security condition."
+        ) == "behavioral_defect"
+
+    # --- Speculative compatibility language must NOT classify behavioral_defect ---
+
+    def test_may_affect_compatibility_is_not_behavioral_defect(self):
+        assert _classify_finding("This may affect compatibility.") != "behavioral_defect"
+
+    def test_behavior_should_be_tested_is_not_behavioral_defect(self):
+        assert _classify_finding("Behavior should be tested.") != "behavioral_defect"
+
+    def test_consider_whether_consumers_depend_is_not_behavioral_defect(self):
+        assert _classify_finding(
+            "Consider whether downstream consumers depend on this."
+        ) != "behavioral_defect"
+
+    def test_there_may_be_behavioral_differences_is_not_behavioral_defect(self):
+        assert _classify_finding("There may be behavioral differences.") != "behavioral_defect"
+
+    def test_bare_behavior_keyword_alone_is_not_behavioral_defect(self):
+        assert _classify_finding(
+            "The behavior of this function is complex and could be refactored."
+        ) != "behavioral_defect"
+
+    def test_bare_change_keyword_alone_is_not_behavioral_defect(self):
+        assert _classify_finding(
+            "This change improves the overall clarity of the validation logic."
+        ) != "behavioral_defect"
+
+    def test_reassuring_clause_about_valid_input_does_not_false_positive(self):
+        # Regression for the specific gaming vector clause-splitting exists
+        # to close: an unrelated verb in one clause must not combine with a
+        # reassuring aside in a DIFFERENT clause of the same finding.
+        assert _classify_finding(
+            "This change works correctly, and existing behavior for valid "
+            "session keys remains unaffected."
+        ) != "behavioral_defect"
+
+    # --- Priority: explicit exploitability / does-not-fix still win ---
+
+    def test_explicit_exploitability_with_behavioral_wording_stays_confirmed_defect(self):
+        assert _classify_finding(
+            "The attack vector remains exploitable, and this also breaks "
+            "existing behavior for legitimate keys."
+        ) == "confirmed_defect"
+
+    def test_does_not_fix_without_scope_marker_stays_confirmed_defect_over_behavioral(self):
+        assert _classify_finding(
+            "This does not fix the underlying issue and also removes legitimate options."
+        ) == "confirmed_defect"
+
+    def test_does_not_fix_with_scope_marker_stays_plausible_risk_over_behavioral(self):
+        assert _classify_finding(
+            "does not fix the issue for older versions, and also removes legitimate options"
+        ) == "plausible_risk"
+
+    # --- Existing categories still reachable ---
+
+    def test_validation_gap_wording_without_behavioral_signal_still_validation_gap(self):
+        assert _classify_finding("Cannot verify this without running the test suite") == "validation_gap"
+
+    def test_generic_wording_without_behavioral_signal_still_generic(self):
+        assert _classify_finding("Consider adding logging for audit purposes") == "generic"
+
+
+# ---------------------------------------------------------------------------
 # Scope-marker exclusion for "does not fix/address/prevent/close"
 # ---------------------------------------------------------------------------
 
@@ -1369,11 +1507,13 @@ class TestBuildKnownFindings:
     a given finding, so a calibration failure degrades gracefully instead of
     losing information."""
 
-    def _classified_with(self, defects=(), risks=(), gaps=(), generic=()):
+    def _classified_with(self, defects=(), behavioral=(), risks=(), gaps=(), generic=()):
         classified_edge = []
         classified_issues = []
         for d in defects:
             classified_edge.append({"text": d, "category": "confirmed_defect"})
+        for b in behavioral:
+            classified_edge.append({"text": b, "category": "behavioral_defect"})
         for r in risks:
             classified_edge.append({"text": r, "category": "plausible_risk"})
         for g in gaps:
@@ -1384,6 +1524,7 @@ class TestBuildKnownFindings:
             "classified_edge_cases": classified_edge,
             "classified_potential_issues": classified_issues,
             "confirmed_defect_count": len(defects),
+            "behavioral_defect_count": len(behavioral),
             "plausible_risk_count": len(risks),
             "validation_gap_count": len(gaps),
         }
@@ -1392,6 +1533,72 @@ class TestBuildKnownFindings:
         cc = self._classified_with(defects=["confirmed issue"])
         findings = _build_known_findings(cc)
         assert findings["potential_remaining_risks"] == ["confirmed issue"]
+
+    def test_behavioral_defect_without_calibration_is_not_silently_dropped(self):
+        # Run-4 Architecture B: a behavioral_defect finding must NOT
+        # silently vanish from every report section -- but it must ALSO
+        # NOT be counted in potential_remaining_risks, since that list's
+        # LENGTH is read elsewhere as the authoritative defect count Trust
+        # Signals/Recommendation Policy key off of, and this feature is
+        # explicitly scoped to leave that logic untouched (see this
+        # function's own docstring). It defaults to the same "hypothesis"
+        # bucket plausible_risk defaults to when uncalibrated.
+        cc = self._classified_with(behavioral=["silent drop of legitimate keys"])
+        findings = _build_known_findings(cc)
+        assert findings["potential_remaining_risks"] == []
+        assert findings["validation_hypotheses"] == ["silent drop of legitimate keys"]
+
+    def test_behavioral_defect_calibrated_observed_moves_to_observed_notes(self):
+        cc = self._classified_with(behavioral=["silent drop of legitimate keys"])
+        calibration = [{
+            "original": "silent drop of legitimate keys", "group": "observed",
+            "reworded": "Legitimate keys named X are silently dropped by the new guard.",
+        }]
+        findings = _build_known_findings(cc, finding_calibration=calibration)
+        assert findings["observed_implementation_notes"] == [
+            "Legitimate keys named X are silently dropped by the new guard."
+        ]
+        # Critically: NEVER potential_remaining_risks, regardless of
+        # calibration group -- that bucket stays confirmed_defect-only so
+        # Trust Signals/Recommendation Policy's input is unaffected by this
+        # feature's presence.
+        assert findings["potential_remaining_risks"] == []
+
+    def test_behavioral_defect_calibrated_hypothesis_stays_in_validation_hypotheses(self):
+        cc = self._classified_with(behavioral=["silent drop of legitimate keys"])
+        calibration = [{
+            "original": "silent drop of legitimate keys", "group": "hypothesis",
+            "reworded": "Keys named X may be dropped, though this would need confirmation.",
+        }]
+        findings = _build_known_findings(cc, finding_calibration=calibration)
+        assert findings["validation_hypotheses"] == [
+            "Keys named X may be dropped, though this would need confirmation."
+        ]
+        assert findings["potential_remaining_risks"] == []
+
+    def test_behavioral_defect_calibrated_hardening_moves_to_future_hardening(self):
+        cc = self._classified_with(behavioral=["silent drop of legitimate keys"])
+        calibration = [{
+            "original": "silent drop of legitimate keys", "group": "hardening",
+            "reworded": "Unrelated to this advisory; a separate hardening improvement.",
+        }]
+        findings = _build_known_findings(cc, finding_calibration=calibration)
+        assert findings["future_hardening_ideas"] == [
+            "Unrelated to this advisory; a separate hardening improvement."
+        ]
+        assert findings["potential_remaining_risks"] == []
+
+    def test_potential_remaining_risks_is_confirmed_defect_only_never_behavioral(self):
+        """The authoritative defect-count bucket Trust Signals/Recommendation
+        Policy read must contain ONLY confirmed_defect findings -- a mixed
+        classified_challenger must not let a behavioral_defect finding leak
+        into it under any calibration state."""
+        cc = self._classified_with(
+            defects=["confirmed security defect"],
+            behavioral=["silent drop of legitimate keys"],
+        )
+        findings = _build_known_findings(cc)  # no calibration at all
+        assert findings["potential_remaining_risks"] == ["confirmed security defect"]
 
     def test_validation_gaps_map_to_validation_gaps(self):
         cc = self._classified_with(gaps=["gap1"])

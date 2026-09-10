@@ -61,6 +61,8 @@ _FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL)
 
 _SECTIONS = [
     ("security_invariant", "Security invariant", False),
+    ("narrower_alternative_decision", "Narrower alternative decision", False),
+    ("narrower_alternative_considered", "Narrower alternative considered", False),
     ("remediation_mechanism", "Likely remediation mechanism", False),
     ("target_files", "Likely remediation files", True),
     ("target_symbols", "Relevant symbols", True),
@@ -68,6 +70,23 @@ _SECTIONS = [
     ("approaches_to_avoid", "Approaches to avoid", True),
     ("explicit_unknowns", "Explicit unknowns", True),
 ]
+"""`narrower_alternative_decision`/`narrower_alternative_considered` sit
+between `security_invariant` and `remediation_mechanism` deliberately: they
+are the recorded decision and comparison that produced the final mechanism,
+not an independent finding -- rendering them between "the condition that
+must be restored" and "the mechanism chosen to restore it" mirrors the
+reasoning order the Planner prompt now requires. Additive only: an
+absent/null value renders nothing (see `_render_plan`'s existing
+scalar-field handling below), so a response from before either field
+existed, or one that omits them, is unaffected."""
+
+_VALID_NARROWER_DECISIONS = frozenset({"SELECTED", "REJECTED", "NONE_IDENTIFIED"})
+"""The only values `narrower_alternative_decision` is trusted to carry --
+see `RemediationPlanResult.narrower_alternative_decision`'s own docstring
+for why an unrecognized or missing value is normalized to `None` here
+rather than passed through: this module never guesses a decision from
+`narrower_alternative_considered`'s prose, and callers (pipeline.py's
+Planner Claim Verifier dispatch) must never see a value outside this set."""
 
 
 class RemediationPlanResult(NamedTuple):
@@ -75,11 +94,46 @@ class RemediationPlanResult(NamedTuple):
     hierarchy: the rendered Markdown (unchanged from before), plus the
     parsed-but-UNVERIFIED target_files/target_symbols lists the pipeline
     needs to build the deterministic evidence bridge. Never claims these
-    paths/symbols are real -- that's `build_planner_candidates`'s job."""
+    paths/symbols are real -- that's `build_planner_candidates`'s job.
+
+    `security_invariant`/`remediation_mechanism`/`narrower_alternative_
+    considered`/`required_edits`/`approaches_to_avoid`/`explicit_unknowns`
+    are the SAME already-parsed JSON values `_render_plan` already renders
+    into `rendered` -- ALSO kept here structurally, mirroring exactly the
+    pattern `RemediationStrategyResult` already uses for its own analogous
+    free-text fields (see that class's docstring). No prompt or JSON schema
+    change: every one of these fields already existed in the parsed
+    response; this only stops discarding them after rendering. Additive --
+    every existing caller that only ever read `.rendered`/`.target_files`/
+    `.target_symbols` is unaffected.
+
+    `narrower_alternative_decision`: the Planner's explicit, structured
+    decision about `narrower_alternative_considered` -- `"SELECTED"`,
+    `"REJECTED"`, or `"NONE_IDENTIFIED"` (see
+    prompts/remediation_planner.md's own field description), or `None` when
+    the response omitted it or supplied a value outside that set. This is
+    the ONLY thing the Planner Claim Verifier orchestration (pipeline.py)
+    reads to decide WHICH question to ask the verifier -- it is never
+    inferred from `narrower_alternative_considered`'s prose. `None` is
+    handled entirely by the orchestration's own fail-closed default, not by
+    this module guessing a value.
+
+    Read by the Planner Claim Verifier orchestration (pipeline.py) to
+    decide whether verification is even triggered at all, and in which
+    mode, and (when triggered) to give the verifier the exact claim to
+    check -- never by Strategy or Patch Generation, which continue to read
+    only the rendered Markdown."""
 
     rendered: str
     target_files: "list[str]"
     target_symbols: "list[str]"
+    security_invariant: "str | None" = None
+    remediation_mechanism: "str | None" = None
+    narrower_alternative_decision: "str | None" = None
+    narrower_alternative_considered: "str | None" = None
+    required_edits: "list[str]" = []
+    approaches_to_avoid: "list[str]" = []
+    explicit_unknowns: "list[str]" = []
 
 
 _EMPTY_PLAN_RESULT = RemediationPlanResult(rendered="", target_files=[], target_symbols=[])
@@ -133,7 +187,10 @@ def _string_list(value) -> "list[str]":
     return [item for item in value if isinstance(item, str)]
 
 
-def generate_remediation_plan(vulnerability_text: str, llm, code_context: str = "") -> RemediationPlanResult:
+def generate_remediation_plan(
+    vulnerability_text: str, llm, code_context: str = "", retry_hint: str = "",
+    stage: str = "remediation_planning",
+) -> RemediationPlanResult:
     """
     Ask the model to commit to a remediation strategy before Patch
     Generation runs. Never generates code or a diff. Best-effort: any
@@ -147,14 +204,34 @@ def generate_remediation_plan(vulnerability_text: str, llm, code_context: str = 
     non-interactive or the user declined to pick a working alternative --
     an explicit execution/configuration decision, not ordinary evidence
     acquisition failure. It must abort the run, not degrade to "no plan".
+
+    `retry_hint`, when given, is appended as a "## Retry instruction"
+    section -- the exact same idiom `generate_patch()`/`generate_patch_raw()`
+    already use for their own bounded retry callers. Empty by default (the
+    default preserves this function's exact prior behavior byte-for-byte):
+    this is what the Planner Claim Verifier orchestration (pipeline.py)
+    uses for its own ONE bounded revision call when the verifier finds a
+    concrete contradiction -- never a general retry/agent loop, and this
+    function itself still makes exactly one LLM call regardless of whether
+    a hint is given.
+
+    `stage`, like `generate_patch_raw`'s own parameter of the same name, is
+    purely an observability tag for the LLM call tracer -- it never
+    affects the request or the returned text. Defaults to
+    "remediation_planning" (identical to this function's prior hardcoded
+    value, so every pre-existing caller is unaffected); a revision call
+    should pass a distinct value (e.g. "remediation_plan_revision") so the
+    two calls remain distinguishable in a trace.
     """
     system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
     user_message = "## Vulnerability report\n\n" + vulnerability_text
     if code_context:
         user_message += "\n\n## Repository evidence\n\n" + code_context
+    if retry_hint:
+        user_message += "\n\n## Retry instruction\n\n" + retry_hint
 
     try:
-        raw = llm.complete(system_prompt, user_message, stage="remediation_planning")
+        raw = llm.complete(system_prompt, user_message, stage=stage)
     except ModelUnavailableError:
         raise
     except Exception:
@@ -169,10 +246,34 @@ def generate_remediation_plan(vulnerability_text: str, llm, code_context: str = 
     except Exception:
         rendered = ""
 
+    def _opt_str(value) -> "str | None":
+        return value if isinstance(value, str) and value.strip() else None
+
+    def _opt_decision(value) -> "str | None":
+        # Fail-closed normalization, not inference: a missing field, a
+        # non-string value, or any string outside _VALID_NARROWER_DECISIONS
+        # all collapse to the SAME `None` -- this never guesses a decision
+        # from wording (e.g. treating "I select it" as SELECTED); it only
+        # recognizes the exact enum value the schema asked for. Case/
+        # whitespace-tolerant only ("selected", " SELECTED ") since that is
+        # ordinary response normalization, not semantic interpretation.
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized in _VALID_NARROWER_DECISIONS:
+                return normalized
+        return None
+
     return RemediationPlanResult(
         rendered=rendered,
         target_files=_string_list(plan.get("target_files")),
         target_symbols=_string_list(plan.get("target_symbols")),
+        security_invariant=_opt_str(plan.get("security_invariant")),
+        remediation_mechanism=_opt_str(plan.get("remediation_mechanism")),
+        narrower_alternative_decision=_opt_decision(plan.get("narrower_alternative_decision")),
+        narrower_alternative_considered=_opt_str(plan.get("narrower_alternative_considered")),
+        required_edits=_string_list(plan.get("required_edits")),
+        approaches_to_avoid=_string_list(plan.get("approaches_to_avoid")),
+        explicit_unknowns=_string_list(plan.get("explicit_unknowns")),
     )
 
 
