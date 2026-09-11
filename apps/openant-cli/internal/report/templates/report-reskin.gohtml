@@ -4,39 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{.Title}}</title>
-    {{/* #332: vendored + pinned + inlined — the report is self-contained (served, standalone, air-gapped); the CDN tags carried no SRI and no version. */}}
-    <script>{{ vendorJS "tailwindcss-3.4.17.js" }}</script>
+    {{/* #540: the prebuilt CSS (the choice-1 migration; the runtime compiler was frozen at the dead Play-CDN channel). Same self-containment: template.CSS embed, no CDN. Cascade: this block comes BEFORE the hand-written <style> below — the hand-written rules win at equal specificity, the same order the runtime-injected stylesheet had (appended at head-end AFTER these blocks) reversed only for utility-vs-handcrafted collisions, none observed (one manual render checked). */}}
+    <style>{{ vendorCSS "report.css" }}</style>
     <script>{{ vendorJS "chart-4.5.1.umd.min.js" }}</script>
     <script>{{ vendorJS "chartjs-plugin-datalabels-2.2.0.min.js" }}</script>
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        knostic: {
-                            purple: '#6861FF',
-                            'purple-hover': '#7D77FF',
-                            'purple-light': '#F0EDFF',
-                            'purple-glow': 'rgba(104, 97, 255, 0.08)',
-                            navy: '#1F1E45',
-                            'navy-deep': '#1F0451',
-                            body: '#727272',
-                            muted: '#87909E',
-                            border: '#B3BEFB',
-                            'border-light': '#E8ECF4',
-                            'card-bg': '#F5F7FB',
-                        },
-                    },
-                    fontFamily: {
-                        sans: ['system-ui', 'sans-serif'],
-                    },
-                    borderRadius: {
-                        'card': '20px',
-                    },
-                }
-            }
-        }
-    </script>
     <style>
         /* Details marker styling */
         details > summary { cursor: pointer; list-style: none; }
@@ -82,7 +53,7 @@
         }
     </style>
 </head>
-<body class="bg-white text-knostic-body font-sans leading-relaxed">
+<body class="bg-white text-knostic-body font-knostic leading-relaxed">
 
     <!-- Section Nav Bar -->
     <nav class="sticky top-0 z-50 bg-white/95 backdrop-blur border-b border-knostic-border">
@@ -181,7 +152,7 @@
                         </thead>
                         <tbody>
                             {{range $i, $cat := .Categories}}
-                            <tr class="border-b border-knostic-border-light {{if even $i}}bg-knostic-card-bg{{end}}">
+                            <tr class="border-b border-knostic-border-light {{if even $i}} bg-knostic-card-bg {{end}}">
                                 <td class="py-3 px-4">
                                     <span class="inline-block px-3 py-1 rounded-full text-xs font-semibold text-white" style="background-color: {{$cat.Color}}">{{$cat.Verdict}}</span>
                                 </td>
@@ -230,7 +201,7 @@
                             </thead>
                             <tbody>
                                 {{range $i, $step := .StepReports}}
-                                <tr class="border-b border-knostic-border-light {{if even $i}}bg-knostic-card-bg{{end}}">
+                                <tr class="border-b border-knostic-border-light {{if even $i}} bg-knostic-card-bg {{end}}">
                                     <td class="py-3 px-4 font-mono text-knostic-navy">{{$step.Step}}</td>
                                     <td class="py-3 px-4">{{$step.Duration}}</td>
                                     <td class="py-3 px-4">{{$step.Cost}}</td>

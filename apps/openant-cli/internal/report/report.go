@@ -24,7 +24,7 @@ var reskinFS embed.FS
 // func returning template.JS): self-contained in every mode — served,
 // standalone, air-gapped — with no route coupling.
 //
-//go:embed vendor/tailwindcss-3.4.17.js vendor/chart-4.5.1.umd.min.js vendor/chartjs-plugin-datalabels-2.2.0.min.js
+//go:embed vendor/report.css vendor/chart-4.5.1.umd.min.js vendor/chartjs-plugin-datalabels-2.2.0.min.js
 var vendorFS embed.FS
 
 // vendorScripts holds the embedded script contents. go:embed validates the
@@ -33,9 +33,8 @@ var vendorFS embed.FS
 // fails loud when the literal names nothing embedded (see below), so the
 // map is built once and a stale literal cannot pass silently.
 var vendorScripts = func() map[string]template.JS {
-	m := make(map[string]template.JS, 3)
+	m := make(map[string]template.JS, 2)
 	for _, n := range []string{
-		"tailwindcss-3.4.17.js",
 		"chart-4.5.1.umd.min.js",
 		"chartjs-plugin-datalabels-2.2.0.min.js",
 	} {
@@ -76,6 +75,15 @@ func init() {
 				return "", fmt.Errorf("report: no vendored script %q (vendor/ is missing the file, or the template's literal is stale)", name)
 			}
 			return js, nil
+		},
+		// #540: the prebuilt CSS embed — same fail-loud contract as vendorJS
+		// (an unknown name fails the render, not a silently unstyled report).
+		"vendorCSS": func(name string) (template.CSS, error) {
+			b, err := vendorFS.ReadFile("vendor/" + name)
+			if err != nil {
+				return "", fmt.Errorf("report: no vendored CSS %q (vendor/ is missing the file, or the template's literal is stale)", name)
+			}
+			return template.CSS(b), nil
 		},
 	}
 

@@ -13,7 +13,9 @@ import (
 // detectable ("trust whoever ran curl" was the pre-round state).
 func TestVendoredReportScriptHashes(t *testing.T) {
 	for name, want := range map[string]string{
-		"tailwindcss-3.4.17.js":                  "176e894661aa9cdc9a5cba6c720044cbbf7b8bd80d1c9a142a7c24b1b6c50d15",
+		// #540: the prebuilt CSS (the choice-1 migration) — the sha pins the
+		// exact build output; a regen updates it deliberately.
+		"report.css":                             "b0d7b28d9bc5f16f9de5432e73a681a24b5ba2d805e4399bcab1f89148ca8dfd",
 		"chart-4.5.1.umd.min.js":                 "48444a82d4edcb5bec0f1965faacdde18d9c17db3063d042abada2f705c9f54a",
 		"chartjs-plugin-datalabels-2.2.0.min.js": "20c08f3d9c6d2ef76df6d6a6f1127c0013339fe32add24222276c398c6308c38",
 	} {
@@ -26,7 +28,13 @@ func TestVendoredReportScriptHashes(t *testing.T) {
 		if got != want {
 			t.Fatalf("%s sha256 mismatch: got %s want %s — the blob changed (upgrade? tampering? update vendor/SOURCES.txt deliberately)", name, got, want)
 		}
-		if len(data) < 10_000 {
+		minSize := 10_000
+		if name == "report.css" {
+			// #540: the CSS is ~16KB (the build ruling: a loose floor, not
+			// the anticipated size as a compatibility requirement).
+			minSize = 8_000
+		}
+		if int(len(data)) < minSize {
 			t.Fatalf("vendored script %s suspiciously small (%d bytes) — a stub would silently strip the report", name, len(data))
 		}
 	}
@@ -39,7 +47,7 @@ func TestVendoredReportScriptHashes(t *testing.T) {
 // it settled across version bumps (probed clean at vendoring time).
 func TestVendoredScriptsCarryNoScriptBreakouts(t *testing.T) {
 	for _, name := range []string{
-		"tailwindcss-3.4.17.js",
+		"report.css",
 		"chart-4.5.1.umd.min.js",
 		"chartjs-plugin-datalabels-2.2.0.min.js",
 	} {
@@ -52,7 +60,13 @@ func TestVendoredScriptsCarryNoScriptBreakouts(t *testing.T) {
 		// themselves must never contain HTML tokenizer hazards. All four
 		// tokens below probed clean on the current blobs at vendoring time.
 		s := strings.ToLower(string(data))
-		if strings.Contains(s, "</script") {
+		if name == "report.css" {
+			// #540: the CSS embed's breakout is </style (template.CSS), the
+			// same guard retargeted for the artifact class.
+			if strings.Contains(s, "</style") {
+				t.Fatalf("%s contains </style — template.CSS emits verbatim; the inline block would terminate early", name)
+			}
+		} else if strings.Contains(s, "</script") {
 			t.Fatalf("%s contains </script — template.JS emits verbatim; the inline block would terminate early", name)
 		}
 		if strings.Contains(s, "<!--") {

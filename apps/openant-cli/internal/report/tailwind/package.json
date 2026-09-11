@@ -1,0 +1,8 @@
+{
+  "name": "openant-report-css-build",
+  "private": true,
+  "comment": "#540: the pinned build recipe for the committed report.css. NOT under vendor/ (renovate ignores **/vendor/**). Regenerate: npm ci && npx tailwindcss -c tailwind.config.js -i input.css -o ../vendor/report.css --minify; then update the sha in SOURCES.txt. The committed package-lock pins the CLI exactly.",
+  "dependencies": {
+    "tailwindcss": "3.4.17"
+  }
+}

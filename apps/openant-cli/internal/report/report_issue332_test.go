@@ -43,7 +43,8 @@ func TestRenderedReportHasNoCDNScripts(t *testing.T) {
 		// The vendored scripts must be PRESENT, not merely the CDN absent —
 		// markers come from the pinned files themselves (version banners),
 		// which the templates' own inline config blocks cannot provide.
-		for _, marker := range []string{"3.4.17", "Chart.js v4.5.1", "chartjs-plugin-datalabels"} {
+		// #540: the tailwind marker is the CSS build banner ("tailwindcss v3.4.17").
+		for _, marker := range []string{"tailwindcss v3.4.17", "Chart.js v4.5.1", "chartjs-plugin-datalabels"} {
 			if !strings.Contains(out, marker) {
 				t.Fatalf("%s: missing vendored-script marker %q (an empty inline would strip styling/charts silently)",
 					name, marker)
@@ -55,7 +56,7 @@ func TestRenderedReportHasNoCDNScripts(t *testing.T) {
 // The vendored, pinned libraries are embedded non-empty at build time.
 func TestVendoredReportScriptsEmbedded(t *testing.T) {
 	for _, name := range []string{
-		"tailwindcss-3.4.17.js",
+		"report.css",
 		"chart-4.5.1.umd.min.js",
 		"chartjs-plugin-datalabels-2.2.0.min.js",
 	} {
@@ -63,7 +64,11 @@ func TestVendoredReportScriptsEmbedded(t *testing.T) {
 		if err != nil {
 			t.Fatalf("vendored script %s missing from the embed: %v", name, err)
 		}
-		if len(data) < 10_000 {
+		minSize := 10_000
+		if name == "report.css" {
+			minSize = 8_000 // the CSS is ~16KB; the the build review loose-floor ruling
+		}
+		if int(len(data)) < minSize {
 			t.Fatalf("vendored script %s suspiciously small (%d bytes) — a stub would silently strip the report",
 				name, len(data))
 		}
