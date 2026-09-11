@@ -49,6 +49,38 @@
       ],
       "datasourceTemplate": "npm",
       "packageNameTemplate": "chartjs-plugin-datalabels"
+    },
+    {
+      "customType": "regex",
+      "description": "#577 vendored ui scripts \u2014 marked. Versions live in the vendored file names, the go:embed list in ui/embed.go, the handleAsset case list in internal/server/server.go, the /assets script tags in ui/summary.html + ui/disclosure.html, and the pin table in ui/vendor_test.go. Same rules as the chart.js manager entry (static packageNameTemplate + value-only matchStrings; never a matchString carrying a packageName capture group \u2014 #485's lesson; the file name matches the npm package name marked). Notifier-only, never a fixer: a vendored bump is the manual #332-recipe commit \u2014 the blob + vendor/SOURCES.txt + the ui/vendor_test.go pin table + all reference files \u2014 in one commit; the branch rewrites the name literals (including the go:embed list, which makes the branch BUILD-red, not just test-red) while the vendored bytes and their sha pins do not move, so every branch from this surface is unmergeable as-authored by design.",
+      "fileMatch": [
+        "^apps/openant-cli/ui/embed\\.go$",
+        "^apps/openant-cli/ui/summary\\.html$",
+        "^apps/openant-cli/ui/disclosure\\.html$",
+        "^apps/openant-cli/internal/server/server\\.go$",
+        "^apps/openant-cli/ui/vendor_test\\.go$"
+      ],
+      "matchStrings": [
+        "marked-(?<currentValue>[0-9.]+)\\.min\\.js"
+      ],
+      "datasourceTemplate": "npm",
+      "packageNameTemplate": "marked"
+    },
+    {
+      "customType": "regex",
+      "description": "#577 vendored ui scripts \u2014 dompurify (the sole XSS sanitizer for the ui pages' untrusted-markdown render path \u2014 currency matters more here than anywhere else on the vendored surface). Same rules as the chart.js manager entry: static packageNameTemplate + value-only matchStrings, never a packageName capture group (#485's lesson; the file name dompurify-<version>.min.js matches the npm package name dompurify). Notifier-only, never a fixer \u2014 see the chart.js manager entry for the full rules.",
+      "fileMatch": [
+        "^apps/openant-cli/ui/embed\\.go$",
+        "^apps/openant-cli/ui/summary\\.html$",
+        "^apps/openant-cli/ui/disclosure\\.html$",
+        "^apps/openant-cli/internal/server/server\\.go$",
+        "^apps/openant-cli/ui/vendor_test\\.go$"
+      ],
+      "matchStrings": [
+        "dompurify-(?<currentValue>[0-9.]+)\\.min\\.js"
+      ],
+      "datasourceTemplate": "npm",
+      "packageNameTemplate": "dompurify"
     }
   ],
   "packageRules": [
