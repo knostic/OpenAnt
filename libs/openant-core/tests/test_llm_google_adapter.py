@@ -101,6 +101,36 @@ def test_present_candidate_with_empty_parts_raises_not_clean_end_turn():
         _response_to_unified(resp)
 
 
+def test_empty_max_tokens_candidate_raises_budget_wording():
+    # #569: the budget marker is DETERMINISTIC-CLASS-ONLY — a MAX_TOKENS
+    # empty candidate carries "consumed the token budget" (the raised-cap
+    # retry class); the other empty shapes must NOT (producer-side pin —
+    # the #569 review round: the classifier must not over-match).
+    from types import SimpleNamespace
+    from utilities.llm import LLMResponseError
+    from utilities.llm.providers.google import _response_to_unified
+    cand = SimpleNamespace(finish_reason="MAX_TOKENS", content=SimpleNamespace(parts=[]))
+    resp = SimpleNamespace(candidates=[cand], usage_metadata=SimpleNamespace(
+        prompt_token_count=1, candidates_token_count=0, total_token_count=1))
+    with pytest.raises(LLMResponseError, match="consumed the token budget"):
+        _response_to_unified(resp)
+
+
+def test_empty_stop_candidate_has_no_budget_wording():
+    # #569 producer-side pin: a filtered/blank empty candidate keeps the
+    # #292 same-cap rationale — its raise must NOT carry the marker.
+    from types import SimpleNamespace
+    from utilities.llm import LLMResponseError
+    from utilities.llm.providers.google import _response_to_unified
+    cand = SimpleNamespace(finish_reason="STOP", content=SimpleNamespace(parts=[]))
+    resp = SimpleNamespace(candidates=[cand], usage_metadata=SimpleNamespace(
+        prompt_token_count=1, candidates_token_count=0, total_token_count=1))
+    with pytest.raises(LLMResponseError) as ei:
+        _response_to_unified(resp)
+    assert "consumed the token budget" not in str(ei.value)
+    assert "filtered" in str(ei.value)
+
+
 def test_tool_use_only_candidate_is_valid_not_empty():
     # Control: a function_call part with no text is a VALID response (content
     # non-empty) and must NOT be caught by the empty-content guard.

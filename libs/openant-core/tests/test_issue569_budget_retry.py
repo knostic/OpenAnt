@@ -72,55 +72,100 @@ class TestCapThreaded:
         assert budget_retry_cap(1, {0, 2}) is None  # the #292 same-cap path
         assert budget_retry_cap(2, {0, 2}) == BUDGET_RETRY_MAX_TOKENS
 
-    def test_retry_loop_drives_the_split(self, monkeypatch, capsys):
-        """End-to-end: the retry loop itself — a length-empty unit's retry
-        call carries the raised cap; a stop-empty unit's carries None."""
+    def test_retry_loop_drives_the_split(self, tmp_path, monkeypatch):
+        """End-to-end through the REAL run_analysis retry pass: a
+        length-empty unit's retry call carries the raised cap; a
+        stop-empty unit's carries None. Drives the production wiring
+        (analyzer's retry loop) — the #569 review round replaced this
+        test's prior shape, which re-implemented the loop's computation
+        and never invoked it."""
+        import json as _json
         from core import analyzer
+        from utilities.llm_client import reset_warning_state
+
+        reset_warning_state()
+        dataset_path = tmp_path / "dataset.json"
+        dataset_path.write_text(_json.dumps({"units": [
+            {"id": "a:f1", "code": "x=1"},
+            {"id": "b:f2", "code": "x=1"},
+        ]}))
+        output_dir = tmp_path / "out"
+
+        def fake_run_detection(units, binding, json_corrector, app_context,
+                               workers, checkpoint=None,
+                               summary_callback=None):
+            # Two failed units: one budget-class, one stop-class.
+            return ([{"unit_id": "a:f1", "error": MSG_LENGTH},
+                     {"unit_id": "b:f2", "error": MSG_STOP}],
+                    {u["id"]: "" for u in units})
 
         calls = []
 
         def fake_process(binding, unit, i, jc, ac, max_tokens=None):
             calls.append((unit["id"], max_tokens))
-            return {"result": {"unit_id": unit["id"], "finding": "safe"},
+            return {"result": {"unit_id": unit["id"], "finding": "safe",
+                               "verdict": "SAFE", "confidence": 90,
+                               "vulnerabilities": [], "reasoning": "r"},
                     "route_key": unit["id"], "code_for_route": "",
                     "finding": "safe", "usage": {}}
 
+        monkeypatch.setattr(analyzer, "_run_detection", fake_run_detection)
+        monkeypatch.setattr(analyzer, "_analyze_fingerprint",
+                            lambda binding, ctx_sha=None: {
+                                "key_digest": "sha256:test"})
         monkeypatch.setattr(analyzer, "_process_unit", fake_process)
-        # Two failed units: one budget-class, one stop-class.
-        units = [{"id": "a:f1"}, {"id": "b:f2"}]
-        results = [{"error": MSG_LENGTH, "unit_id": "a:f1"},
-                   {"error": MSG_STOP, "unit_id": "b:f2"}]
 
-        # Drive the retry block's logic through the real production path
-        # by invoking the same computation the loop performs.
-        retryable = [i for i, r in enumerate(results)
-                     if r and analyzer.is_retryable_error(r.get("error"))]
-        budget = {i for i in retryable
-                  if analyzer.is_budget_exhausted_error(
-                      results[i].get("error"))}
-        caps = {units[i]["id"]: analyzer.budget_retry_cap(i, budget)
-                for i in retryable}
-        assert caps == {"a:f1": analyzer.BUDGET_RETRY_MAX_TOKENS,
-                        "b:f2": None}
+        from utilities.llm import PhaseBinding
+
+        class _Adapter:
+            name = "anthropic"
+            supports_tools = True
+            pricing = {}
+
+        class _FakeRegistry:
+            def get(self, phase):
+                return PhaseBinding(phase=phase, adapter=_Adapter(),
+                                    model="m", provider_name="anthropic")
+
+        analyzer.run_analysis(
+            str(dataset_path), str(output_dir),
+            registry=_FakeRegistry(), workers=1)
+        reset_warning_state()
+
+        assert calls == [("a:f1", analyzer.BUDGET_RETRY_MAX_TOKENS),
+                         ("b:f2", None)], (
+            "the retry pass must thread the raised cap ONLY into the "
+            "budget-class unit's call")
 
 
 class TestParityMarkers:
     """The #569 refutation's parity extension: the discriminator reaches
-    EVERY adapter's budget wording (the reasoning-model providers the fix
-    targets — gemini-thinking, the o-series Responses path)."""
+    EVERY adapter's budget wording — which the #569 review round made
+    DETERMINISTIC-CLASS-ONLY (the truncated wordings carry the marker; the
+    filtered wordings must NOT — gemini/Responses producers branch on the
+    finish signal, mirroring the openai-chat #561 pattern)."""
 
-    def test_gemini_wording(self):
+    def test_gemini_budget_wording(self):
         assert is_budget_exhausted_error(
             "Gemini returned a candidate with no usable content (empty "
-            "completion); the response may have been truncated (a thinking "
-            "model consumed the token budget before emitting output) or "
-            "filtered/malformed")
+            "completion); the response was truncated — a thinking "
+            "model consumed the token budget before emitting output")
 
-    def test_openai_responses_wording(self):
+    def test_gemini_filtered_not_budget(self):
+        assert not is_budget_exhausted_error(
+            "Gemini returned a candidate with no usable content (empty "
+            "completion); the response may have been filtered or malformed")
+
+    def test_openai_responses_budget_wording(self):
         assert is_budget_exhausted_error(
-            "OpenAI Responses returned no usable content (status='incomplete'); "
-            "the request may have been truncated (reasoning consumed the "
-            "budget) or filtered")
+            "OpenAI Responses returned no usable content "
+            "(status='incomplete'); the request was truncated — "
+            "reasoning consumed the budget")
+
+    def test_openai_responses_filtered_not_budget(self):
+        assert not is_budget_exhausted_error(
+            "OpenAI Responses returned no usable content "
+            "(status='completed'); the request may have been filtered")
 
     def test_filtered_still_not_budget(self):
         assert not is_budget_exhausted_error(
