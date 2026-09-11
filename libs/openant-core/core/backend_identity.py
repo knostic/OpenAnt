@@ -25,10 +25,16 @@ Deliberate exclusions (minimal by mandate):
   * NO endpoint DETECTION / drift_log / strict-mode — over-built, excluded.
   * NO credential-derived value (api_key). A credential-routing gateway (same
     URL + model, different key → different upstream) is a NAMED RESIDUAL.
-  * app_context / threat-model is LLM-generated and regenerates
+  * app_context / threat-model NARRATION is LLM-generated and regenerates
     non-deterministically every scan; callers MUST render templates with
     ``app_context=None`` so it never enters ``templates_sha`` (including it
     caused a VERIFIED ~17k-token spurious re-pay on a same-config resume).
+    #546 (scheme 2) amends the clause: the DETERMINISTIC-DERIVATION identity
+    of the context (the artifact's ``source_sha256`` — the threat-model
+    file's bytes, the override's content, or the gathered CONTEXT sources'
+    digest) DOES belong in the key via ``extra_key["ctx_sources_sha256"]`` —
+    the narration stays excluded; the derivation invalidates stale records
+    when the repo shape that produced the context changes.
   * Generation parameters (``max_tokens``, ``temperature``, etc.) are
     deliberately NOT global KEY members (#242: "this config-only change does
     not invalidate prior checkpoints. Rationale is FN-safe: pre-fix empty
@@ -74,7 +80,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 # Bump when the KEY definition below changes so pre-existing sidecars invalidate
 # cleanly (they will simply mismatch and trigger an archive-and-repay).
-FINGERPRINT_SCHEME_VERSION = 1
+FINGERPRINT_SCHEME_VERSION = 2
 
 # Sidecar filename written into each checkpoint dir. Excluded from every
 # checkpoint counter (see core/checkpoint.py and the Go DetectFallback).

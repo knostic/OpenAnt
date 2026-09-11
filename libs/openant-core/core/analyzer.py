@@ -469,7 +469,7 @@ def _count_verdicts(results):
     return counts
 
 
-def _analyze_fingerprint(binding) -> dict:
+def _analyze_fingerprint(binding, ctx_sha=None) -> dict:
     """Build the analyze-phase backend-identity fingerprint.
 
     The static system + user-analysis templates are rendered with
@@ -485,7 +485,14 @@ def _analyze_fingerprint(binding) -> dict:
         lambda: get_system_prompt(app_context=None),
         lambda: get_analysis_prompt(code="", language="code", app_context=None),
     ])
-    return fingerprint_for_binding(binding, texts)
+    # #546: the context's deterministic-derivation identity joins the KEY
+    # (the narration stays excluded — this is the SOURCES hash, not the
+    # text). None (no context / a pre-#546 artifact) leaves the key
+    # member absent-equivalent; a changed derivation archives the stale
+    # records and re-pays.
+    return fingerprint_for_binding(
+        binding, texts,
+        extra_key=({"ctx_sources_sha256": ctx_sha} if ctx_sha else None))
 
 
 def _archive_stale_results(output_dir: str, current_fp: str) -> None:
@@ -625,12 +632,22 @@ def run_analysis(
     binding = registry.get("analyze")
     print(f"[Analyze] Provider: {binding.provider_name}, Model: {binding.model}", file=sys.stderr)
 
+    # #546: the application context loads BEFORE the I2 fingerprint — the
+    # adopt gate folds the context's deterministic-derivation identity
+    # (source_sha256), so the prior order (fingerprint-then-load) would key
+    # on None forever.
+    app_context = None
+    if app_context_path and HAS_APP_CONTEXT and os.path.exists(app_context_path):
+        app_context = load_context(Path(app_context_path))
+        print(f"[Analyze] App context: {app_context.application_type}", file=sys.stderr)
+
     # I2 adopt gate: BEFORE loading any prior checkpoints, verify the backend
     # identity that produced them matches the current one. A changed model /
     # provider / adapter / static template archives the stale dir aside and
     # forces a re-run rather than silently adopting another backend's verdicts.
     # Run AFTER the checkpoint.dir override above.
-    analyze_fp = _analyze_fingerprint(binding)
+    analyze_fp = _analyze_fingerprint(
+        binding, ctx_sha=getattr(app_context, "source_sha256", None))
     checkpoint.sync_identity(analyze_fp)
     # Preserve a prior scan's final report before this run overwrites it.
     _archive_stale_results(output_dir, analyze_fp["key_digest"])
@@ -638,12 +655,6 @@ def run_analysis(
     # JSON corrector inherits the analyze binding so correction calls
     # route through the same provider+model.
     json_corrector = JSONCorrector(binding)
-
-    # Load application context if provided
-    app_context = None
-    if app_context_path and HAS_APP_CONTEXT and os.path.exists(app_context_path):
-        app_context = load_context(Path(app_context_path))
-        print(f"[Analyze] App context: {app_context.application_type}", file=sys.stderr)
 
     # Load dataset
     print(f"[Analyze] Loading dataset: {dataset_path}", file=sys.stderr)

@@ -151,8 +151,13 @@ class ApplicationContext:
     # file is handed to the pipeline — the precondition for comparing them.
     # Provenance of a repo-supplied threat model, for scan-artifact visibility.
     # Both are additive/defaulted so save_context(asdict)/load_context(**data)
-    # round-trip unchanged. sha256 is over the raw file bytes; permissive_warnings
-    # is warn_permissive_threat_model's output, which was previously discarded.
+    # round-trip unchanged. #546 generalizes source_sha256 to the
+    # DETERMINISTIC-DERIVATION identity of whichever arm produced the
+    # context: the threat-model file's raw bytes (that arm), the override
+    # file's content (the manual arm), or the gathered CONTEXT sources'
+    # digest (the LLM arm) — the checkpoint family's resume keys fold it;
+    # permissive_warnings is warn_permissive_threat_model's output, which
+    # was previously discarded.
     source_sha256: str | None = None
     permissive_warnings: list = None
     threat_model_version: int | None = None
@@ -389,6 +394,27 @@ def gather_context_sources(repo_path: Path) -> dict[str, str]:
     return sources
 
 
+def context_sources_digest(sources: dict[str, str]) -> str:
+    """#546: the deterministic-derivation identity over the gathered
+    CONTEXT sources — the fingerprint the checkpoint family folds into its
+    resume keys (via the artifact's source_sha256).
+
+    Hashes ONLY the repo-derived CONTEXT_FILES entries and the two
+    degradation markers — NOT ``[directory_structure]`` (it lists the
+    in-repo output dir, so hashing it would self-invalidate on every
+    resume that writes a new artifact) and NOT ``[detected_patterns]``
+    (an rglob-order, cap-windowed list — not canonical). Those two stay a
+    named residual: a rename that flips the LLM's classification without
+    touching the hashed sources does not invalidate.
+    """
+    import hashlib
+    entries = {k: v for k, v in sources.items()
+               if not k.startswith("[directory_structure]")
+               and not k.startswith("[detected_patterns]")}
+    payload = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def get_directory_structure(repo_path: Path, max_depth: int = 2) -> str:
     """Get directory tree for pattern recognition.
 
@@ -580,6 +606,18 @@ def _application_context_from_override(data: Any, filename: str) -> ApplicationC
         )
     data["override_warnings"] = override_warnings
     data["override_filename"] = filename
+    # #546: the override arm's deterministic input IS the override file —
+    # sha over the raw content (the family folds it via the artifact).
+    # UNCONDITIONAL: the override data is repo-supplied; a supplied
+    # source_sha256 must never pin the resume identity (#546's review
+    # round — the identity is derived, never adopted).
+    import hashlib as _h
+    try:
+        _raw = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        data["source_sha256"] = _h.sha256(
+            _raw.encode("utf-8")).hexdigest()
+    except (TypeError, ValueError):
+        data["source_sha256"] = None
     known = {f.name for f in fields(ApplicationContext)}
     unknown = [k for k in data if k not in known]
     if unknown:
@@ -835,6 +873,13 @@ def generate_application_context(
             f"Response: {response_text}")
 
     data['source'] = 'llm'
+    # #546: stamp the deterministic-derivation identity — the checkpoint
+    # family's resume keys fold this (via the artifact), so a repo edit
+    # that changes the context derivation invalidates the stale records
+    # while the LLM's own re-narration does not re-pay. UNCONDITIONAL:
+    # model output is untrusted — a supplied source_sha256 (steered by
+    # the scanned repo's sources text) must never pin the identity.
+    data['source_sha256'] = context_sources_digest(sources)
 
     # Allowlist-filter to dataclass fields: the LLM can hallucinate unknown/extra
     # keys, and a raw ApplicationContext(**data) would raise an uncaught TypeError
