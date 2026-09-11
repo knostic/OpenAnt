@@ -901,6 +901,12 @@ def scan_repository(
                         # #541: the provider-exception class — the coverage
                         # truth the parse-path-only counters missed.
                         "batches_failed": reach_stats.get("batches_failed", 0),
+                        # #558: the split-and-retry provenance — the recovery
+                        # never silently overwrites the coverage counts.
+                        "batches_split_recovered": reach_stats.get(
+                            "batches_split_recovered", 0),
+                        "batches_split_lost": reach_stats.get(
+                            "batches_split_lost", 0),
                         "units_not_reviewed": reach_stats.get("units_not_reviewed", 0),
                         # #541 (the refute round): the #285/#376 partial-
                         # status contract — dropped + failed batches make

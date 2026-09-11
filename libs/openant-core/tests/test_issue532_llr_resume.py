@@ -189,13 +189,17 @@ class TestAdopt:
 
 class TestRetryMarkers:
     def test_dropped_batch_writes_no_records(self, tmp_path):
-        """A malformed batch must leave no records: absence IS the retry
-        marker (the #386 counter family + #532's 'must not freeze drops')."""
+        """A malformed batch (and its split-halves STILL failing) must
+        leave no records: absence IS the retry marker (#538 + #558's
+        split-retry — the original drop is revised, the halves count
+        their own outcomes)."""
         cp = str(tmp_path / "llm_reach_checkpoints")
         dataset = {"units": [_make_unit("a:f1"), _make_unit("b:f2")]}
-        # Malformed JSON for the whole (single) batch.
+        # The batch drops AND both halves drop (3 malformed responses:
+        # the original + the 2 split halves).
         analyze_reachability(
-            dataset, binding=_binding(FakeAdapter(["not json {"])),
+            dataset, binding=_binding(FakeAdapter(
+                ["not json {", "not json {", "not json {"])),
             checkpoint_path=cp, tracker=FakeTracker(),
         )
         adapter = FakeAdapter([_canned(_sig("a:f1"), _sig("b:f2"))])
@@ -203,7 +207,7 @@ class TestRetryMarkers:
             dataset, binding=_binding(adapter), checkpoint_path=cp,
             tracker=FakeTracker(),
         )
-        # Both units had no records -> both re-ran in one batch.
+        # No records from the dropped pass -> both re-ran in one batch.
         assert len(adapter.calls) == 1
 
     def test_exception_batch_writes_no_records(self, tmp_path):
@@ -381,9 +385,11 @@ class TestUsageAndSummary:
 
         cp = str(tmp_path / "llm_reach_checkpoints")
         dataset = {"units": [_make_unit("a:f1"), _make_unit("b:f2")]}
-        # Malformed response drops the whole (single) batch.
+        # Malformed response drops the whole (single) batch; the split
+        # halves ALSO drop (3 malformed responses total).
         analyze_reachability(
-            dataset, binding=_binding(FakeAdapter(["not json {"])),
+            dataset, binding=_binding(FakeAdapter(
+                ["not json {", "not json {", "not json {"])),
             checkpoint_path=cp, tracker=FakeTracker(),
         )
         s = StepCheckpoint.read_summary(cp)
@@ -730,3 +736,120 @@ class TestIssue541ExceptionCounters:
         with open(_os.path.join(str(tmp_path), "llm-reachability.report.json")) as fh:
             rep = _json.load(fh)
         assert rep["status"] == "partial"
+
+
+class TestIssue558SplitRetry:
+    """#558: the split-and-retry — a dropped batch re-issued once as two
+    halves; never the JSON corrector; the recovery carries provenance."""
+
+    def test_dropped_batch_recovers_via_halves(self):
+        """The measurement's class (an end_turn broken-JSON finish): the
+        batch drops, the halves re-roll OK — the units are reviewed, the
+        original drop REVISED away, the recovery counted."""
+        stats: dict = {}
+        # resp 1: the batch drops (malformed); resp 2-3: the halves OK.
+        adapter = FakeAdapter([
+            "not json {",
+            _canned(_sig("a:f1")),
+            _canned(_sig("b:f2")),
+        ])
+        signals = analyze_reachability(
+            {"units": [_make_unit("a:f1"), _make_unit("b:f2")]},
+            binding=_binding(adapter), batch_size=2,
+            tracker=FakeTracker(), stats=stats)
+        assert {s.unit_id for s in signals} == {"a:f1", "b:f2"}
+        assert stats["batches_split_recovered"] == 1
+        assert stats["batches_dropped"] == 0  # the original revised
+        assert stats["units_not_reviewed"] == 0  # the halves recovered
+
+    def test_recovered_units_persist(self, tmp_path):
+        """The recovered halves' units get checkpoint records (they were
+        reviewed this pass — absence-as-retry only for the STILL-dropped)."""
+        cp = str(tmp_path / "llm_reach_checkpoints")
+        adapter = FakeAdapter(["not json {", _canned(_sig("a:f1")),
+                               _canned(_sig("b:f2"))])
+        analyze_reachability(
+            {"units": [_make_unit("a:f1"), _make_unit("b:f2")]},
+            binding=_binding(adapter), batch_size=2,
+            checkpoint_path=cp, tracker=FakeTracker())
+        import os
+        recs = sorted(f for f in os.listdir(cp)
+                      if f.endswith(".json") and not f.startswith("_"))
+        assert recs == ["a_f1.json", "b_f2.json"]
+
+    def test_one_unit_batch_never_splits(self):
+        """A 1-unit dropped batch cannot split — it stays dropped (the
+        bounded design: no recursion, the resume owns it)."""
+        stats: dict = {}
+        analyze_reachability(
+            {"units": [_make_unit("a:f1")]},
+            binding=_binding(FakeAdapter(["not json {"])),
+            stats=stats)
+        assert stats["batches_dropped"] == 1
+        assert stats["units_not_reviewed"] == 1
+        assert stats["batches_split_recovered"] == 0
+        assert stats["batches_split_lost"] == 0
+
+    def test_half_recovered_half_lost(self):
+        """A mixed split: one half OK, one half still drops — the
+        recovered units reviewed + persisted-eligible; the lost half's
+        units counted unreviewed (the coverage truth exact)."""
+        stats: dict = {}
+        adapter = FakeAdapter([
+            "not json {",                 # the batch drops
+            _canned(_sig("a:f1")),        # half 1 OK
+            "not json {",                 # half 2 drops (1 unit: no split)
+        ])
+        signals = analyze_reachability(
+            {"units": [_make_unit("a:f1"), _make_unit("b:f2")]},
+            binding=_binding(adapter), batch_size=2,
+            tracker=FakeTracker(), stats=stats)
+        assert [s.unit_id for s in signals] == ["a:f1"]
+        assert stats["units_not_reviewed"] == 1  # b:f2 only
+        assert stats["batches_split_recovered"] == 1  # partial recovery
+        assert stats["batches_dropped"] == 1  # the lost half
+
+    def test_truncated_no_brace_never_negative(self):
+        """The refutation's negative-counter catch: a max_tokens reply
+        with a NO-BRACE shape (prose preamble hit the cap) incremented
+        dropped but NOT truncated — the old inferred subtraction drove
+        batches_truncated to -1. The deltas fix keeps it exact."""
+        from utilities.llm import CompletionResult, TextBlock
+
+        class TruncProse(FakeAdapter):
+            def complete(self, **kw):
+                return CompletionResult(
+                    content=[TextBlock("prose preamble that never opens "
+                                      "the JSON before the cap")],
+                    input_tokens=5, output_tokens=5,
+                    stop_reason="max_tokens")
+
+        stats: dict = {}
+        analyze_reachability(
+            {"units": [_make_unit("a:f1"), _make_unit("b:f2")]},
+            binding=_binding(TruncProse()), batch_size=2,
+            tracker=FakeTracker(), stats=stats)
+        # The deltas fix: the prose+max_tokens shape counts in the
+        # malformed class (the #538 dedup: the parse's own drop stands),
+        # NOT truncated — and NO counter ever goes negative (the old
+        # inferred subtraction drove batches_truncated to -1 here).
+        assert stats["batches_dropped"] == 2  # the 2 lost halves
+        assert stats["units_not_reviewed"] == 2
+        assert stats["batches_truncated"] == 0  # non-negative, exact
+        assert stats["batches_split_lost"] == 1
+
+    def test_usage_spans_the_recovery(self):
+        """The refutation's usage fix: the tracking window starts ONCE
+        per original batch — the records' usage carries the whole
+        recovery's cost (original + halves), not the last half's only."""
+        from utilities.llm_client import TokenTracker
+        tracker = TokenTracker()
+        adapter = FakeAdapter(["not json {", _canned(_sig("a:f1")),
+                               _canned(_sig("b:f2"))])
+        analyze_reachability(
+            {"units": [_make_unit("a:f1"), _make_unit("b:f2")]},
+            binding=_binding(adapter), batch_size=2,
+            tracker=tracker)
+        # All three calls' tokens are in the tracker totals (the records'
+        # shares derive from the window spanning them).
+        assert tracker.total_input_tokens >= 3  # 3 calls happened
