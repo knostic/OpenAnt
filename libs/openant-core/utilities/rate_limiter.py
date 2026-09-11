@@ -303,6 +303,16 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     status_hit = any(
         code in _RETRYABLE_STATUS_CODES
         for code in re.findall(r"\b5\d{2}\b", error_str))
+    # #569 (choice c): a length-stop empty completion is a DETERMINISTIC
+    # budget exhaustion (#561 named the cause) — a same-cap retry pays for a
+    # coin flip. The caller re-runs those units ONCE at a HIGHER cap
+    # (is_budget_exhausted_error) instead of the same-cap #292 re-roll; every
+    # other empty completion keeps the #292 rationale (a malformed/overloaded
+    # reply that re-generating usually recovers).
+    # NOTE (openant-kb CONC-C2, corrected post-#564): the empty-completion
+    # raise now CARRIES the rejected reply's usage, so a retry is billed AND
+    # recorded — the old "billed-but-unrecorded" trade note described the
+    # pre-#537/#564 shape.
     return status_hit or any(term in error_str for term in (
         "rate_limit", "connection", "timeout",
         "overloaded",
@@ -321,10 +331,9 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
         # (LLMRefusalError, "refused the request") and Gemini's deterministic
         # prompt-block ("no candidates (prompt blocked...)") — neither contains
         # either substring, so both stay non-retryable.
-        # NOTE (openant-kb CONC-C2): the empty-completion raise happens before the
-        # call is recorded, so each retry is a billed-but-unrecorded call — this
-        # trades a small billing under-report for verdict recovery. Bounded to the
-        # single detection retry pass.
+        # NOTE (openant-kb CONC-C2, superseded post-#537/#564 — see the
+        # corrected note at the head of this function: the raise now CARRIES
+        # the rejected reply's usage, so a retry is billed AND recorded).
         # DELIBERATELY NOT matched: OpenRouter's finish_reason='error'
         # (openrouter.py, "the completion is incomplete") is left to that adapter's
         # original handling (surface as ERROR). Unlike the direct-provider empty
@@ -335,4 +344,29 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
         # adapter, so a precise fix belongs in openrouter.py, not this term.
         "no usable content",
         "empty completion",
+    ))
+
+
+def is_budget_exhausted_error(error_info) -> bool:
+    """#569 (choice c): True when the error is the DETERMINISTIC budget-
+    exhaustion empty completion (#561's named cause — the message carries
+    'the output budget was consumed' and a length/max_tokens stop). The
+    caller retries these ONCE at a raised cap instead of the same-cap
+    #292 re-roll; returns False for every other error shape (including
+    other empty completions — the filtered/malformed class keeps the
+    #292 same-cap retry rationale).
+    """
+    error_str = error_info if isinstance(error_info, str) else str(
+        (error_info or {}).get("error")
+        or (error_info or {}).get("message")
+        or error_info)
+    # The budget-exhaustion wording across the adapters (#561 + the #569
+    # review round's parity extension): the openai chat + anthropic
+    # branches say "the output budget was consumed"; Gemini says "consumed
+    # the token budget"; the OpenAI Responses path says "reasoning consumed
+    # the budget". All three names of the same deterministic cause.
+    return any(marker in error_str for marker in (
+        "output budget was consumed",
+        "consumed the token budget",
+        "reasoning consumed the budget",
     ))

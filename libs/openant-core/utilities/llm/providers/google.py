@@ -500,11 +500,19 @@ def _response_to_unified(response: Any) -> CompletionResult:
     # VALID and not caught here because content_blocks is non-empty. Refusal is
     # the more specific signal and already raised above.
     if not content_blocks:
+        # #569: the budget wording is DETERMINISTIC-CLASS-ONLY — a
+        # MAX_TOKENS stop is the thinking-budget exhaustion (the raised-cap
+        # retry class); every other empty candidate (filtered/malformed)
+        # keeps the #292 same-cap rationale and must NOT carry the marker.
+        if raw_finish in ("MAX_TOKENS", "FinishReason.MAX_TOKENS"):
+            raise LLMResponseError(
+                "Gemini returned a candidate with no usable content (empty "
+                "completion); the response was truncated — a thinking "
+                "model consumed the token budget before emitting output"
+            )
         raise LLMResponseError(
             "Gemini returned a candidate with no usable content (empty "
-            "completion); the response may have been truncated (a thinking "
-            "model consumed the token budget before emitting output) or "
-            "filtered/malformed"
+            "completion); the response may have been filtered or malformed"
         )
 
     stop_reason: StopReason

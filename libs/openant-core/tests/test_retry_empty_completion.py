@@ -30,12 +30,14 @@ _EMPTY_ANTHROPIC = ("AnthropicAdapter returned no usable content (empty completi
                     "the request may have been filtered or the response was malformed")
 _EMPTY_GEMINI = ("Gemini returned a candidate with no usable content (empty completion); "
                  "the response may have been truncated (a thinking block)")
-# OpenAI Responses-API empty path (openai.py:730): says "no usable content" but
-# NOT "empty completion" — the term must match the shared "no usable content"
-# phrase so this sibling is covered too.
+# OpenAI Responses-API empty path: says "no usable content" but NOT
+# "empty completion" — the term must match the shared "no usable content"
+# phrase so this sibling is covered too. Both post-#569 producer arms (the
+# truncated budget class and the filtered class) stay retryable.
 _EMPTY_OPENAI_RESPONSES = ("OpenAI Responses returned no usable content (status='incomplete'); "
-                           "the request may have been truncated (reasoning consumed the budget) "
-                           "or filtered")
+                           "the request was truncated — reasoning consumed the budget")
+_EMPTY_OPENAI_RESPONSES_FILTERED = ("OpenAI Responses returned no usable content (status='completed'); "
+                                     "the request may have been filtered")
 # OpenAI Chat-Completions empty paths (openai.py:760, :816): say "empty
 # completion" but NOT "no usable content" — so the term set must include the
 # "empty completion" phrase too, or these (and OpenRouter, which reuses the

@@ -36,7 +36,25 @@ from utilities.llm import (
 )
 from utilities.file_io import read_json, write_json
 from utilities.json_corrector import JSONCorrector
-from utilities.rate_limiter import get_rate_limiter, is_retryable_error
+from utilities.llm import DEFAULT_MAX_TOKENS
+from utilities.rate_limiter import (
+    get_rate_limiter,
+    is_budget_exhausted_error,
+    is_retryable_error,
+)
+
+# #569 (choice c): the budget-retry cap — raised above the analyze
+# default but under the Anthropic non-streaming ceiling (the SDK rejects
+# >~21,333 with "Streaming is required" — see helpers.py:29-31; the
+# adapters call non-streaming). The deterministic length-empty class gets
+# ONE retry that attacks the cause (the budget) within that envelope.
+BUDGET_RETRY_MAX_TOKENS = min(DEFAULT_MAX_TOKENS * 2, 21000)
+
+def budget_retry_cap(index: int, budget_set: set) -> int | None:
+    """#569: the per-index retry cap — the raised cap for the budget class,
+    None (the unchanged default) for every other retryable."""
+    return BUDGET_RETRY_MAX_TOKENS if index in budget_set else None
+
 
 # These live in core/ because core is shipped and experiment.py is not: importing
 # them from the research harness made `import core.analyzer` fail in any installed
@@ -119,7 +137,8 @@ def _apply_limit(units, limit):
     return prioritized[:limit]
 
 
-def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_context):
+def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_context,
+                  max_tokens=None):
     """Process a single unit for Stage 1 detection.
 
     Returns a dict with all result data. Does not mutate shared state.
@@ -135,6 +154,7 @@ def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_contex
             use_multifile=True,
             json_corrector=json_corrector,
             app_context=app_context,
+            max_tokens=max_tokens,
         )
 
         # Ensure unit_id is always present
@@ -752,6 +772,16 @@ def run_analysis(
         i for i, r in enumerate(results)
         if r and is_retryable_error(r.get("error"))
     ]
+    # #569 (choice c): the deterministic budget-exhaustion empties (the
+    # length-stop class #561 named) retry ONCE at a RAISED cap — a same-cap
+    # re-roll of a budget exhaustion is a coin flip; the raised cap attacks
+    # the cause. Every other retryable (the filtered/malformed empties, the
+    # transient network class) keeps the #292 same-cap rationale.
+    budget_retry_indices = [
+        i for i in retryable_indices
+        if is_budget_exhausted_error(results[i].get("error"))
+    ]
+    _budget_set = set(budget_retry_indices)
     if retryable_indices:
         rate_limiter = get_rate_limiter()
         backoff = rate_limiter.time_until_ready()
@@ -760,13 +790,18 @@ def run_analysis(
                   f"(waiting {backoff:.0f}s for rate limit to clear)...", file=sys.stderr)
             rate_limiter.wait_if_needed()
         else:
-            print(f"[Analyze] Retrying {len(retryable_indices)} failed units (transient errors)...",
-                  file=sys.stderr)
+            _extra = (f" ({len(budget_retry_indices)} at a raised output "
+                      f"cap {BUDGET_RETRY_MAX_TOKENS} — budget exhaustion)"
+                      if budget_retry_indices else "")
+            print(f"[Analyze] Retrying {len(retryable_indices)} failed units "
+                  f"(transient errors){_extra}...", file=sys.stderr)
 
         # Retry sequentially to avoid re-triggering rate limit
         for i in retryable_indices:
             unit = units[i]
-            out = _process_unit(binding, unit, i, json_corrector, app_context)
+            _cap = budget_retry_cap(i, _budget_set)
+            out = _process_unit(binding, unit, i, json_corrector, app_context,
+                                max_tokens=_cap)
             results[i] = out["result"]
             code_by_route[out["route_key"]] = out["code_for_route"]
 

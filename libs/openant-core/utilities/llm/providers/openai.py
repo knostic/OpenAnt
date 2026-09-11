@@ -808,9 +808,18 @@ def _responses_to_unified(response: Any) -> CompletionResult:
         stop_reason = "tool_use"
 
     if not content_blocks:
+        # #569: the budget wording is DETERMINISTIC-CLASS-ONLY — a
+        # max_tokens stop (the incomplete/max_output_tokens shape) is the
+        # budget-exhaustion class; a filtered/failed response keeps the
+        # #292 same-cap rationale and must not carry the marker.
+        if stop_reason == "max_tokens":
+            raise LLMResponseError(
+                f"OpenAI Responses returned no usable content (status={status!r}); "
+                "the request was truncated — reasoning consumed the budget"
+            )
         raise LLMResponseError(
-            f"OpenAI Responses returned no usable content (status={status!r}); the "
-            "request may have been truncated (reasoning consumed the budget) or filtered"
+            f"OpenAI Responses returned no usable content (status={status!r}); "
+            "the request may have been filtered"
         )
 
     usage = getattr(response, "usage", None)
