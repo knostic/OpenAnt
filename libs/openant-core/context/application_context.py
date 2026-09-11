@@ -608,14 +608,16 @@ def _application_context_from_override(data: Any, filename: str) -> ApplicationC
     data["override_filename"] = filename
     # #546: the override arm's deterministic input IS the override file —
     # sha over the raw content (the family folds it via the artifact).
-    if not data.get("source_sha256"):
-        import hashlib as _h
-        try:
-            _raw = json.dumps(data, sort_keys=True, separators=(",", ":"))
-            data["source_sha256"] = _h.sha256(
-                _raw.encode("utf-8")).hexdigest()
-        except (TypeError, ValueError):
-            data["source_sha256"] = None
+    # UNCONDITIONAL: the override data is repo-supplied; a supplied
+    # source_sha256 must never pin the resume identity (#546's review
+    # round — the identity is derived, never adopted).
+    import hashlib as _h
+    try:
+        _raw = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        data["source_sha256"] = _h.sha256(
+            _raw.encode("utf-8")).hexdigest()
+    except (TypeError, ValueError):
+        data["source_sha256"] = None
     known = {f.name for f in fields(ApplicationContext)}
     unknown = [k for k in data if k not in known]
     if unknown:
@@ -874,9 +876,10 @@ def generate_application_context(
     # #546: stamp the deterministic-derivation identity — the checkpoint
     # family's resume keys fold this (via the artifact), so a repo edit
     # that changes the context derivation invalidates the stale records
-    # while the LLM's own re-narration does not re-pay.
-    if 'source_sha256' not in data or not data.get('source_sha256'):
-        data['source_sha256'] = context_sources_digest(sources)
+    # while the LLM's own re-narration does not re-pay. UNCONDITIONAL:
+    # model output is untrusted — a supplied source_sha256 (steered by
+    # the scanned repo's sources text) must never pin the identity.
+    data['source_sha256'] = context_sources_digest(sources)
 
     # Allowlist-filter to dataclass fields: the LLM can hallucinate unknown/extra
     # keys, and a raw ApplicationContext(**data) would raise an uncaught TypeError

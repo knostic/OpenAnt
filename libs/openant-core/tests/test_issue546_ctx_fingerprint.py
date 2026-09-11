@@ -154,6 +154,61 @@ class TestProducerStamps:
                                   ["one", "DIFFERENT"])
         assert ctx1.source_sha256 == ctx2.source_sha256
 
+    def test_llm_arm_supplied_sha_is_overwritten(self, tmp_path, monkeypatch):
+        """A model-emitted source_sha256 (steerable by the scanned repo's
+        sources text) must never pin the identity — the stamp is DERIVED
+        (#546's review round: the identity is computed, never adopted)."""
+        from context import application_context as ac
+        (tmp_path / "README.md").write_text("stub repo")
+        supplied = iter(["0" * 64, "1" * 64])
+        narrated = iter(["p", "p"])
+
+        class _R:
+            stop_reason = "end_turn"
+            input_tokens = 1
+            output_tokens = 1
+            usage_details = None
+
+            def __init__(self, text):
+                self.content = [type("B", (), {"text": text})()]
+
+        def fake_sc(binding, prompt, system=None, max_tokens=0, tracker=None):
+            return _R(json.dumps({"application_type": "cli_tool",
+                                  "purpose": next(narrated),
+                                  "source_sha256": next(supplied)}))
+
+        monkeypatch.setattr(ac, "simple_completion", fake_sc)
+        from utilities.llm import PhaseBinding
+
+        class _A:
+            name = "t"
+            supports_tools = True
+
+            def validate(self, model):
+                pass
+
+        b = PhaseBinding(phase="app_context", adapter=_A(), model="m",
+                         provider_name="p")
+        ctx1 = ac.generate_application_context(
+            repo_path=Path(tmp_path), binding=b)
+        ctx2 = ac.generate_application_context(
+            repo_path=Path(tmp_path), binding=b)
+        # SAME sources → the same DERIVED digest — regardless of the two
+        # DIFFERENT supplied constants.
+        assert ctx1.source_sha256 == ctx2.source_sha256
+        assert ctx1.source_sha256 not in ("0" * 64, "1" * 64)
+
+    def test_override_arm_supplied_sha_is_overwritten(self):
+        """A repo-supplied OPENANT.json source_sha256 must never pin the
+        identity — the stamp is computed over the override content."""
+        from context.application_context import _application_context_from_override
+        ctx = _application_context_from_override(
+            {"application_type": "cli_tool", "purpose": "p",
+             "source_sha256": "0" * 64},
+            "OPENANT.json")
+        assert ctx.source_sha256 is not None
+        assert ctx.source_sha256 != "0" * 64
+
 
 class TestGateWiring:
     def test_analyze_fingerprint_folds_the_sha(self):
