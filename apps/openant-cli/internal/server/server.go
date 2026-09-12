@@ -406,31 +406,72 @@ func inferRepoURL(jobDir string) string {
 // Handler returns the HTTP handler for the server.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", s.handleIndex)
+	// #578 follow-up 1a: route and CSP policy are declared on the SAME
+	// line. The three policy shapes are per-route wrappers; the middleware
+	// below carries a RESTRICTIVE DEFAULT for everything unwrapped — a
+	// future HTML route registered without a wrapper renders scriptless
+	// and unstyled (loud), never silently CSP-less.
+	mux.HandleFunc("GET /{$}", s.noncedPage(s.handleIndex))
 	mux.HandleFunc("POST /scan", s.handleStartScan)
 	mux.HandleFunc("GET /assets/{name}", s.handleAsset)
-	mux.HandleFunc("GET /scan/{id}", s.handleScanPage)
+	mux.HandleFunc("GET /scan/{id}", s.noncedPage(s.handleScanPage))
 	mux.HandleFunc("GET /scan/{id}/logs", s.handleScanLogs)
-	mux.HandleFunc("GET /report/{id}", s.handleReport)
-	mux.HandleFunc("GET /summary/{id}", s.handleSummary)
+	mux.HandleFunc("GET /report/{id}", s.reportCSP(s.handleReport))
+	mux.HandleFunc("GET /summary/{id}", s.noncedPage(s.handleSummary))
 	mux.HandleFunc("GET /disclosures/{id}", s.handleDisclosureList)
-	mux.HandleFunc("GET /disclosure/{id}/{filename}", s.handleDisclosure)
+	mux.HandleFunc("GET /disclosure/{id}/{filename}", s.noncedPage(s.handleDisclosure))
 	mux.HandleFunc("DELETE /scan/{id}", s.handleDeleteScan)
 	return securityHeaders(mux)
+}
+
+// noncedPage wraps an HTML template handler with the per-response nonce
+// policy (#578-A): a fresh 32-hex nonce in the CSP header AND the request
+// context (the handler passes it to the template via nonceFrom), with
+// no-store (a nonce is single-use).
+func (s *Server) noncedPage(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		nonce := newCSPNonce()
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'none'; script-src 'self' 'nonce-"+nonce+"'; "+
+				"style-src 'self' 'nonce-"+nonce+"'; style-src-attr 'unsafe-inline'; "+
+				"connect-src 'self'; form-action 'self'; base-uri 'none'; "+
+				"object-src 'none'; frame-ancestors 'none'")
+		w.Header().Set("Cache-Control", "no-store")
+		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), cspNonceKey{}, nonce)))
+	}
+}
+
+// reportCSP wraps the /report handler with the no-network policy (#578-A):
+// the report is a PRE-GENERATED static file whose inline scripts/styles
+// cannot carry a serve-time nonce — script/style 'unsafe-inline' (the page
+// is the trusted origin) but connect-src/form-action 'none', blocking
+// exfil/remote loads from a page rendering LLM-authored remediation HTML.
+func (s *Server) reportCSP(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "+
+				"img-src 'self' data:; connect-src 'none'; form-action 'none'; "+
+				"base-uri 'none'; frame-ancestors 'none'")
+		h.ServeHTTP(w, r)
+	}
 }
 
 // securityHeaders wraps h with defensive response headers on every route. The
 // pages render untrusted LLM/scanned-repo content, so we deny framing, stop
 // content-type sniffing, and suppress referrer leakage of the local URL.
 //
-// #578 follow-up A: route-scoped Content-Security-Policy. The four UI
-// template pages carry per-response nonces (script-src/style-src 'nonce-…');
-// /report/{id} is a PRE-GENERATED static file whose inline scripts/styles
-// cannot carry a serve-time nonce, so it gets a separate no-network policy
-// (script/style 'unsafe-inline' — the page is the trusted origin — but
-// connect-src 'none' blocks any exfil/remote load from a page rendering
-// LLM-authored remediation HTML). /assets and the API routes carry no CSP
-// (not documents).
+// #578 follow-up A + 1a: route-scoped Content-Security-Policy. The four UI
+// template pages carry per-response nonces (the noncedPage wrapper); /report/{id}
+// is a PRE-GENERATED static file whose inline scripts/styles cannot carry a
+// serve-time nonce, so it gets the no-network policy (the reportCSP wrapper —
+// script/style 'unsafe-inline', the page is the trusted origin, but
+// connect-src/form-action 'none' blocks exfil/remote loads from a page
+// rendering LLM-authored remediation HTML). EVERYTHING ELSE carries the
+// restrictive fail-closed default below — always set; a wrapper OVERWRITES
+// it via Header().Set (never Add — two CSP headers intersect in browsers,
+// deadening the page). A future HTML route registered without a wrapper
+// renders scriptless/unstyled: loud, never silently CSP-less. The default
+// is inert on non-documents (JS/JSON/SSE — CSP governs document loads).
 func securityHeaders(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// DNS-rebinding guard for EVERY route (GET included): a non-loopback Host
@@ -447,45 +488,22 @@ func securityHeaders(h http.Handler) http.Handler {
 		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
 		w.Header().Set("Permissions-Policy", "geolocation=(), camera=(), microphone=(), payment=()")
-		if isUIPage(r.URL.Path) {
-			nonce := newCSPNonce()
-			w.Header().Set("Content-Security-Policy",
-				"default-src 'none'; script-src 'self' 'nonce-"+nonce+"'; "+
-					"style-src 'self' 'nonce-"+nonce+"'; style-src-attr 'unsafe-inline'; "+
-					"connect-src 'self'; form-action 'self'; base-uri 'none'; "+
-					"object-src 'none'; frame-ancestors 'none'")
-			// A nonce is single-use: never let a shared cache replay one page's
-			// nonce against another response.
-			w.Header().Set("Cache-Control", "no-store")
-			r = r.WithContext(context.WithValue(r.Context(), cspNonceKey{}, nonce))
-		} else if strings.HasPrefix(r.URL.Path, "/report/") {
-			w.Header().Set("Content-Security-Policy",
-				"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "+
-					"img-src 'self' data:; connect-src 'none'; form-action 'none'; "+
-					"base-uri 'none'; frame-ancestors 'none'")
-		}
+		// #578 follow-up 1a: the FAIL-CLOSED DEFAULT — always set here;
+		// the per-route wrappers OVERWRITE it via Header().Set after this
+		// returns (never Add — two CSP headers intersect in browsers).
+		// An un-wrapped HTML route renders scriptless/unstyled (loud,
+		// noticed, fixed) instead of silently shipping CSP-less. Inert on
+		// non-documents (JS/JSON/SSE): CSP governs document loads.
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'none'; script-src 'none'; style-src 'none'; "+
+				"connect-src 'none'; form-action 'none'; base-uri 'none'; "+
+				"object-src 'none'; frame-ancestors 'none'")
 		h.ServeHTTP(w, r)
 	})
 }
 
-// isUIPage reports whether the path is one of the four html/template pages
-// that carry inline scripts/styles under nonce CSP.
-func isUIPage(path string) bool {
-	switch {
-	case path == "/":
-		return true
-	case strings.HasPrefix(path, "/scan/") && !strings.HasSuffix(path, "/logs"):
-		return true
-	case strings.HasPrefix(path, "/summary/"):
-		return true
-	case strings.HasPrefix(path, "/disclosure/"):
-		return true
-	}
-	return false
-}
-
 // cspNonceKey is the unexported context key carrying the per-response CSP
-// nonce (set by securityHeaders, read by the page handlers).
+// nonce (set by the noncedPage wrapper, read by the page handlers).
 type cspNonceKey struct{}
 
 // newCSPNonce returns a fresh 32-hex-char nonce (the CSRF token's shape):
@@ -499,8 +517,8 @@ func newCSPNonce() string {
 	return hex.EncodeToString(b)
 }
 
-// nonceFrom returns the securityHeaders-generated CSP nonce for this
-// request ("" when the route carries none).
+// nonceFrom returns the noncedPage wrapper's CSP nonce for this request
+// ("" when the route carries none).
 func nonceFrom(r *http.Request) string {
 	n, _ := r.Context().Value(cspNonceKey{}).(string)
 	return n
@@ -600,7 +618,7 @@ type indexData struct {
 	HasAPIKey    bool // whether a key is configured; the key VALUE is never sent to the page
 	APIKeySource string
 	CSRF         string
-	Nonce        string // the securityHeaders CSP nonce (see #578 follow-up A)
+	Nonce        string // the noncedPage CSP nonce (see #578 follow-up A)
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -946,7 +964,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 type summaryData struct {
 	ID           string
 	MarkdownJSON template.JS // full JSON-encoded string literal (incl. outer quotes)
-	Nonce        string      // the securityHeaders CSP nonce (see #578 follow-up A)
+	Nonce        string      // the noncedPage CSP nonce (see #578 follow-up A)
 }
 
 func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
@@ -1025,7 +1043,7 @@ type disclosureData struct {
 	ID           string
 	Name         string
 	MarkdownJSON template.JS
-	Nonce        string // the securityHeaders CSP nonce (see #578 follow-up A)
+	Nonce        string // the noncedPage CSP nonce (see #578 follow-up A)
 }
 
 func (s *Server) handleDisclosure(w http.ResponseWriter, r *http.Request) {
