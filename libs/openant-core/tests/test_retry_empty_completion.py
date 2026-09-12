@@ -28,8 +28,11 @@ from utilities.rate_limiter import is_retryable_error  # noqa: E402
 # retry filter via core.analyzer._process_unit's except-branch error=str(e)).
 _EMPTY_ANTHROPIC = ("AnthropicAdapter returned no usable content (empty completion); "
                     "the request may have been filtered or the response was malformed")
+# Post-#569 the google producer branches on the finish signal; the filtered
+# arm is the retryable shape tested here (the MAX_TOKENS arm carries the
+# budget marker and is pinned by test_issue569_budget_retry instead).
 _EMPTY_GEMINI = ("Gemini returned a candidate with no usable content (empty completion); "
-                 "the response may have been truncated (a thinking block)")
+                 "the response may have been filtered or malformed")
 # OpenAI Responses-API empty path: says "no usable content" but NOT
 # "empty completion" — the term must match the shared "no usable content"
 # phrase so this sibling is covered too. Both post-#569 producer arms (the
@@ -54,6 +57,7 @@ def test_empty_completion_is_retryable():
     assert is_retryable_error(_EMPTY_ANTHROPIC) is True
     assert is_retryable_error(_EMPTY_GEMINI) is True
     assert is_retryable_error(_EMPTY_OPENAI_RESPONSES) is True
+    assert is_retryable_error(_EMPTY_OPENAI_RESPONSES_FILTERED) is True
     assert is_retryable_error(_EMPTY_OPENAI_CHAT_NOCHOICES) is True
     assert is_retryable_error(_EMPTY_OPENAI_CHAT_NOBLOCKS) is True
 
@@ -98,6 +102,7 @@ def test_empty_completion_dict_is_retryable():
     assert is_retryable_error(_info(_EMPTY_ANTHROPIC)) is True
     assert is_retryable_error(_info(_EMPTY_GEMINI)) is True
     assert is_retryable_error(_info(_EMPTY_OPENAI_RESPONSES)) is True
+    assert is_retryable_error(_info(_EMPTY_OPENAI_RESPONSES_FILTERED)) is True
     assert is_retryable_error(_info(_EMPTY_OPENAI_CHAT_NOCHOICES)) is True
     assert is_retryable_error(_info(_EMPTY_OPENAI_CHAT_NOBLOCKS)) is True
 

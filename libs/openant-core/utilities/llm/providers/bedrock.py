@@ -83,6 +83,16 @@ _MODEL_ACCESS_HINT = (
 
 _NO_CREDENTIALS_MARKER = "could not resolve credentials"
 
+
+def _typed_credentials_error() -> type[BaseException]:
+    """The SDK's typed credential-error class, or a never-matching fallback
+    when the pinned anthropic predates it (>=1.5.0 carries CredentialsError;
+    the pyproject floor is >=0.40.0). Returns BaseException-substituted so
+    the except clause is syntactically valid on every floor version while
+    matching nothing on the old SDKs."""
+    cls = getattr(anthropic, "CredentialsError", None)
+    return cls if cls is not None else type("_NeverRaised", (BaseException,), {})
+
 # One-time warning when a config sets api_key on a bedrock provider.
 # Silent-ignoring config a user explicitly wrote would violate the
 # no-silent-drops rule the other adapters follow.
@@ -231,6 +241,15 @@ class BedrockAdapter:
             if _NO_CREDENTIALS_MARKER in str(exc):
                 raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
             raise
+        except _typed_credentials_error() as exc:
+            # 1.5.0 narrowed the identity-token/auth-profile raises to the
+            # typed CredentialsError family (an AnthropicError subclass the
+            # APIStatusError arm above never sees). Map it to the same typed
+            # auth path as the bare-RuntimeError marker. getattr-guarded:
+            # the pyproject floor (anthropic>=0.40.0) predates the class —
+            # a bare `except anthropic.CredentialsError` would AttributeError
+            # on older SDKs at exactly the moment a real error propagates.
+            raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
 
         return _response_to_unified(response, adapter="BedrockAdapter")
 
