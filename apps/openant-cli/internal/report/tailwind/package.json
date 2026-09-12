@@ -1,0 +1,11 @@
+{
+  "name": "openant-report-css-build",
+  "private": true,
+  "engines": {
+    "node": ">=24"
+  },
+  "comment": "#540: the pinned build recipe for the committed report.css. NOT under vendor/ (renovate ignores **/vendor/**). Regenerate: npm ci --ignore-scripts && ./node_modules/.bin/tailwindcss -c tailwind.config.js -i input.css -o ../vendor/report.css --minify; then update the sha in SOURCES.txt AND report_vendor_test.go. ALWAYS ./node_modules/.bin/tailwindcss — never npx (which can fetch a different version on resolution failure). The committed package-lock pins the CLI exactly; engines.node declares the runtime the CI job reproduces on (setup-node pins it; npm only warns without engine-strict).",
+  "dependencies": {
+    "tailwindcss": "3.4.17"
+  }
+}

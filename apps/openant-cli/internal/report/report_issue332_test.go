@@ -1,6 +1,9 @@
 package report
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -43,11 +46,36 @@ func TestRenderedReportHasNoCDNScripts(t *testing.T) {
 		// The vendored scripts must be PRESENT, not merely the CDN absent —
 		// markers come from the pinned files themselves (version banners),
 		// which the templates' own inline config blocks cannot provide.
-		for _, marker := range []string{"3.4.17", "Chart.js v4.5.1", "chartjs-plugin-datalabels"} {
+		// #540: the tailwind marker is the CSS build banner ("tailwindcss v3.4.17").
+		for _, marker := range []string{"tailwindcss v3.4.17", "Chart.js v4.5.1", "chartjs-plugin-datalabels"} {
 			if !strings.Contains(out, marker) {
-				t.Fatalf("%s: missing vendored-script marker %q (an empty inline would strip styling/charts silently)",
+				t.Fatalf("%s: missing vendored-asset marker %q (an empty inline would strip styling/charts silently)",
 					name, marker)
 			}
+		}
+	}
+}
+
+// The #540 artifact class adds a self-containment channel the prefix
+// blacklist above cannot see: report.css is a CSS BLOB, where a url(...),
+// @font-face, or @import referencing an external origin would pass every
+// CDN-prefix check (the retired JS compiler could not emit one; a CSS
+// utility like bg-[url(...)] or a future plugin could). The built CSS is
+// banned from ANY external reference, by shape.
+func TestReportCSSSelfContained(t *testing.T) {
+	cssBytes, err := os.ReadFile(filepath.Join("vendor", "report.css"))
+	if err != nil {
+		t.Fatalf("report.css is go:embed'd, a missing file is a build failure: %v", err)
+	}
+	css := string(cssBytes)
+	// Comments carry the build banner's license attribution
+	// (https://tailwindcss.com) — not a fetchable reference; the ban runs (case-folded)
+	// on the comment-stripped stylesheet (the same class as the vendored
+	// JS blobs' banner source URLs).
+	noComments := regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(css, "")
+	for _, bad := range []string{"url(", "@font-face", "@import", "http://", "https://"} {
+		if strings.Contains(strings.ToLower(noComments), bad) {
+			t.Fatalf("report.css contains %q — the air-gapped report would reference an external origin through the CSS channel (a url()/font/import utility or plugin)", bad)
 		}
 	}
 }
@@ -55,7 +83,7 @@ func TestRenderedReportHasNoCDNScripts(t *testing.T) {
 // The vendored, pinned libraries are embedded non-empty at build time.
 func TestVendoredReportScriptsEmbedded(t *testing.T) {
 	for _, name := range []string{
-		"tailwindcss-3.4.17.js",
+		"report.css",
 		"chart-4.5.1.umd.min.js",
 		"chartjs-plugin-datalabels-2.2.0.min.js",
 	} {
@@ -63,7 +91,11 @@ func TestVendoredReportScriptsEmbedded(t *testing.T) {
 		if err != nil {
 			t.Fatalf("vendored script %s missing from the embed: %v", name, err)
 		}
-		if len(data) < 10_000 {
+		minSize := 10_000
+		if name == "report.css" {
+			minSize = 8_000 // the CSS is ~21KB; the build review loose-floor ruling
+		}
+		if len(data) < minSize {
 			t.Fatalf("vendored script %s suspiciously small (%d bytes) — a stub would silently strip the report",
 				name, len(data))
 		}
