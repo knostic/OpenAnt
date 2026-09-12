@@ -422,6 +422,15 @@ func (s *Server) Handler() http.Handler {
 // securityHeaders wraps h with defensive response headers on every route. The
 // pages render untrusted LLM/scanned-repo content, so we deny framing, stop
 // content-type sniffing, and suppress referrer leakage of the local URL.
+//
+// #578 follow-up A: route-scoped Content-Security-Policy. The four UI
+// template pages carry per-response nonces (script-src/style-src 'nonce-…');
+// /report/{id} is a PRE-GENERATED static file whose inline scripts/styles
+// cannot carry a serve-time nonce, so it gets a separate no-network policy
+// (script/style 'unsafe-inline' — the page is the trusted origin — but
+// connect-src 'none' blocks any exfil/remote load from a page rendering
+// LLM-authored remediation HTML). /assets and the API routes carry no CSP
+// (not documents).
 func securityHeaders(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// DNS-rebinding guard for EVERY route (GET included): a non-loopback Host
@@ -438,8 +447,63 @@ func securityHeaders(h http.Handler) http.Handler {
 		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
 		w.Header().Set("Permissions-Policy", "geolocation=(), camera=(), microphone=(), payment=()")
+		if isUIPage(r.URL.Path) {
+			nonce := newCSPNonce()
+			w.Header().Set("Content-Security-Policy",
+				"default-src 'none'; script-src 'self' 'nonce-"+nonce+"'; "+
+					"style-src 'self' 'nonce-"+nonce+"'; style-src-attr 'unsafe-inline'; "+
+					"connect-src 'self'; form-action 'self'; base-uri 'none'; "+
+					"object-src 'none'; frame-ancestors 'none'")
+			// A nonce is single-use: never let a shared cache replay one page's
+			// nonce against another response.
+			w.Header().Set("Cache-Control", "no-store")
+			r = r.WithContext(context.WithValue(r.Context(), cspNonceKey{}, nonce))
+		} else if strings.HasPrefix(r.URL.Path, "/report/") {
+			w.Header().Set("Content-Security-Policy",
+				"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "+
+					"img-src 'self' data:; connect-src 'none'; form-action 'none'; "+
+					"base-uri 'none'; frame-ancestors 'none'")
+		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// isUIPage reports whether the path is one of the four html/template pages
+// that carry inline scripts/styles under nonce CSP.
+func isUIPage(path string) bool {
+	switch {
+	case path == "/":
+		return true
+	case strings.HasPrefix(path, "/scan/") && !strings.HasSuffix(path, "/logs"):
+		return true
+	case strings.HasPrefix(path, "/summary/"):
+		return true
+	case strings.HasPrefix(path, "/disclosure/"):
+		return true
+	}
+	return false
+}
+
+// cspNonceKey is the unexported context key carrying the per-response CSP
+// nonce (set by securityHeaders, read by the page handlers).
+type cspNonceKey struct{}
+
+// newCSPNonce returns a fresh 32-hex-char nonce (the CSRF token's shape):
+// hex avoids html/template's '+'-escaping of base64, which would desync any
+// raw-body/header comparison test.
+func newCSPNonce() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic("csp nonce: crypto/rand unavailable: " + err.Error())
+	}
+	return hex.EncodeToString(b)
+}
+
+// nonceFrom returns the securityHeaders-generated CSP nonce for this
+// request ("" when the route carries none).
+func nonceFrom(r *http.Request) string {
+	n, _ := r.Context().Value(cspNonceKey{}).(string)
+	return n
 }
 
 // supportedLanguages is the allowlist the scan form's language checkboxes draw
@@ -536,6 +600,7 @@ type indexData struct {
 	HasAPIKey    bool // whether a key is configured; the key VALUE is never sent to the page
 	APIKeySource string
 	CSRF         string
+	Nonce        string // the securityHeaders CSP nonce (see #578 follow-up A)
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -568,6 +633,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		HasAPIKey:    apiKey != "",
 		APIKeySource: apiKeySource,
 		CSRF:         s.csrfToken,
+		Nonce:        nonceFrom(r),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.tmplIndex.Execute(w, d); err != nil {
@@ -745,9 +811,10 @@ func (s *Server) handleStartScan(w http.ResponseWriter, r *http.Request) {
 }
 
 type scanPageData struct {
-	ID   string
-	Repo string
-	CSRF string
+	ID    string
+	Repo  string
+	CSRF  string
+	Nonce string // the securityHeaders CSP nonce (see #578 follow-up A)
 }
 
 func (s *Server) handleScanPage(w http.ResponseWriter, r *http.Request) {
@@ -762,7 +829,7 @@ func (s *Server) handleScanPage(w http.ResponseWriter, r *http.Request) {
 	job.mu.Unlock()
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.tmplScan.Execute(w, scanPageData{ID: id, Repo: repo, CSRF: s.csrfToken}); err != nil {
+	if err := s.tmplScan.Execute(w, scanPageData{ID: id, Repo: repo, CSRF: s.csrfToken, Nonce: nonceFrom(r)}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -879,6 +946,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 type summaryData struct {
 	ID           string
 	MarkdownJSON template.JS // full JSON-encoded string literal (incl. outer quotes)
+	Nonce        string      // the securityHeaders CSP nonce (see #578 follow-up A)
 }
 
 func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
@@ -912,6 +980,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	if err := s.tmplSum.Execute(w, summaryData{
 		ID:           id,
 		MarkdownJSON: template.JS(mdJSON),
+		Nonce:        nonceFrom(r),
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -956,6 +1025,7 @@ type disclosureData struct {
 	ID           string
 	Name         string
 	MarkdownJSON template.JS
+	Nonce        string // the securityHeaders CSP nonce (see #578 follow-up A)
 }
 
 func (s *Server) handleDisclosure(w http.ResponseWriter, r *http.Request) {
@@ -1007,6 +1077,7 @@ func (s *Server) handleDisclosure(w http.ResponseWriter, r *http.Request) {
 		ID:           id,
 		Name:         disclosureLabel(filename),
 		MarkdownJSON: template.JS(mdJSON),
+		Nonce:        nonceFrom(r),
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}

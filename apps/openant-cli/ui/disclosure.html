@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{{.Name}} — Knostic OpenAnt</title>
-<style>
+<style nonce="{{.Nonce}}">
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #1a1a1a; }
   header { background: #0d1117; padding: 16px 32px; display: flex; align-items: center; gap: 16px; }
@@ -53,7 +53,7 @@
 </div>
 <script src="/assets/marked-18.0.12.min.js"></script>
 <script src="/assets/dompurify-3.4.15.min.js"></script>
-<script>
+<script nonce="{{.Nonce}}">
 // Strict INERT allowlist for markdown rendered from an untrusted scanned repo.
 // The disclosure markdown embeds attacker-controlled source in a code fence the
 // repo can break out of; DOMPurify's DEFAULT config still permits style/form/

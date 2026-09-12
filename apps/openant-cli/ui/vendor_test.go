@@ -261,14 +261,20 @@ func TestUIPagesLoadNoExternalScripts(t *testing.T) {
 			t.Fatalf("%s: a quoted protocol-relative string literal %q — the scheme-less form inside any JS call, srcset, or @import evades the named guards (backticked and backslash-escaped spellings included)", page, m)
 		}
 		// The script-tag INVENTORY: every <script open in the page must be
-		// accounted for as either a vendored src tag or a bare inline open.
-		// This closes the regex's documented boundary — an attribute value
+		// accounted for as a vendored src tag, a NONCED inline open (the CSP
+		// shape — #578 follow-up A: a bare <script> open is out of policy),
+		// or (not yet present anywhere) an attribute-bearing open. This
+		// closes the regex's documented boundary — an attribute value
 		// containing '>' (e.g. data-x="a>b") can hide a tag from the src
 		// regex, but not from the count.
 		totalOpens := strings.Count(low, "<script")
+		noncedOpens := strings.Count(low, `<script nonce=`)
 		bareOpens := strings.Count(low, "<script>")
-		if totalOpens != len(srcTags)+bareOpens {
-			t.Fatalf("%s: %d <script opens but only %d src tags + %d bare inline opens accounted — an unaccounted tag form (e.g. an attribute value containing '>') is present", page, totalOpens, len(srcTags), bareOpens)
+		if bareOpens != 0 {
+			t.Fatalf("%s: %d bare <script> opens — the CSP policy requires every inline script to carry a nonce", page, bareOpens)
+		}
+		if totalOpens != len(srcTags)+noncedOpens {
+			t.Fatalf("%s: %d <script opens but only %d src tags + %d nonced inline opens accounted — an unaccounted tag form (e.g. an attribute value containing '>') is present", page, totalOpens, len(srcTags), noncedOpens)
 		}
 	}
 }
