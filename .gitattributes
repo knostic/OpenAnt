@@ -3,3 +3,8 @@
 # (TestVendoredReportScriptHashes) correctly caught the change. Never
 # convert, never diff-convert.
 apps/openant-cli/internal/report/vendor/*.js -text -diff
+
+# #577: the vendored ui scripts are BINARY artifacts too — same rule (Windows
+# autocrlf must never convert their bytes; the sha256 lock in
+# ui/vendor_test.go would correctly catch the change).
+apps/openant-cli/ui/vendor/*.js -text -diff

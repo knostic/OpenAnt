@@ -619,7 +619,7 @@ func sameOriginOK(r *http.Request) bool {
 func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	switch name {
-	case "marked.min.js", "purify.min.js":
+	case "marked-12.0.2.min.js", "dompurify-3.4.15.min.js":
 	default:
 		http.NotFound(w, r)
 		return
