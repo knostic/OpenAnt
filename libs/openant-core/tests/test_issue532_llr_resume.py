@@ -762,6 +762,105 @@ class TestIssue558SplitRetry:
         assert stats["batches_dropped"] == 0  # the original revised
         assert stats["units_not_reviewed"] == 0  # the halves recovered
 
+    def test_budget_exhausted_exception_split_recovers(self):
+        """#569 x #558 composition: a DETERMINISTIC budget-exhausted empty
+        surfaces as an ADAPTER EXCEPTION (the empty-content raise) before
+        LLR's parse-path truncation gate can see a stop_reason. Under the
+        old #541 classification it became batches_failed -> a same-cap
+        resume re-roll (the coin flip #569 exists to kill). Now it is the
+        TRUNCATED class: the split re-issues halves, the recovery carries
+        provenance, and the failed counter never moves."""
+        stats: dict = {}
+        from utilities.llm.adapter import LLMResponseError
+
+        class BudgetRaisingAdapter(FakeAdapter):
+            """Raises the deterministic budget-exhaustion raise ONCE (the
+            original batch), then serves the halves OK."""
+
+            def __init__(self, responses):
+                super().__init__(responses)
+                self._raised = False
+
+            def complete(self, *, model, system, messages, max_tokens,
+                         tools=None):
+                if not self._raised:
+                    self._raised = True
+                    raise LLMResponseError(
+                        "OpenAIAdapter returned an empty completion (no text "
+                        "or tool calls; finish_reason='length'); the output "
+                        "budget was consumed before any visible content")
+                return super().complete(model=model, system=system,
+                                        messages=messages,
+                                        max_tokens=max_tokens, tools=tools)
+
+        adapter = BudgetRaisingAdapter([
+            _canned(_sig("a:f1")),
+            _canned(_sig("b:f2")),
+        ])
+        signals = analyze_reachability(
+            {"units": [_make_unit("a:f1"), _make_unit("b:f2")]},
+            binding=_binding(adapter), batch_size=2,
+            tracker=FakeTracker(), stats=stats)
+        assert {s.unit_id for s in signals} == {"a:f1", "b:f2"}
+        assert stats["batches_split_recovered"] == 1
+        assert stats["batches_dropped"] == 0  # the original revised
+        assert stats["units_not_reviewed"] == 0  # the halves recovered
+        assert stats["batches_failed"] == 0  # NOT the failed class anymore
+        assert stats.get("batches_truncated") == 0  # revised with the drop
+
+    def test_budget_exhausted_halves_stay_dropped(self):
+        """A budget-exhausted original whose halves ALSO budget-exhaust:
+        one split level, no recursion — the units re-run on the next resume
+        (absence-as-retry), the split-lost provenance counted."""
+        stats: dict = {}
+        from utilities.llm.adapter import LLMResponseError
+
+        class AlwaysBudgetAdapter(FakeAdapter):
+            def complete(self, *, model, system, messages, max_tokens,
+                         tools=None):
+                raise LLMResponseError(
+                    "OpenAIAdapter returned an empty completion (no text or "
+                    "tool calls; finish_reason='length'); the output budget "
+                    "was consumed before any visible content")
+
+        adapter = AlwaysBudgetAdapter()
+        signals = analyze_reachability(
+            {"units": [_make_unit("a:f1"), _make_unit("b:f2")]},
+            binding=_binding(adapter), batch_size=2,
+            tracker=FakeTracker(), stats=stats)
+        assert signals == []
+        assert stats["batches_split_lost"] == 1
+        # The original revised away; each half's own drop counted —
+        # never negative, never double beyond the two half attempts.
+        assert stats["batches_dropped"] == 2
+        assert stats["units_not_reviewed"] == 2
+        assert stats["batches_failed"] == 0
+        assert stats.get("batches_truncated") == 2
+
+    def test_odd_size_batch_splits_three_plus_two(self):
+        """mid = (len+1)//2 on an ODD batch: 5 units split 3+2 (the
+        untested arithmetic the #575 review named — pinned here)."""
+        stats: dict = {}
+        adapter = FakeAdapter([
+            "not json {",                       # the batch drops
+            _canned(_sig("u1"), _sig("u2"), _sig("u3")),   # half 1 (3)
+            _canned(_sig("u4"), _sig("u5")),                # half 2 (2)
+        ])
+        units = [_make_unit(f"u{i}") for i in range(1, 6)]
+        signals = analyze_reachability(
+            {"units": units}, binding=_binding(adapter), batch_size=5,
+            tracker=FakeTracker(), stats=stats)
+        assert {s.unit_id for s in signals} == {"u1", "u2", "u3", "u4", "u5"}
+        assert stats["batches_split_recovered"] == 1
+        assert stats["units_not_reviewed"] == 0
+        # The halves' unit counts prove the 3+2 split (the calls' prompts
+        # carry the unit ids — assert the grouping shape).
+        assert len(adapter.calls) == 3  # original + two halves
+        half1_ids = adapter.calls[1]["prompt"]
+        half2_ids = adapter.calls[2]["prompt"]
+        assert "u1" in half1_ids and "u3" in half1_ids and "u5" not in half1_ids
+        assert "u4" in half2_ids and "u5" in half2_ids and "u1" not in half2_ids
+
     def test_recovered_units_persist(self, tmp_path):
         """The recovered halves' units get checkpoint records (they were
         reviewed this pass — absence-as-retry only for the STILL-dropped)."""
