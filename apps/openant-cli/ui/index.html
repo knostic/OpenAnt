@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="csrf" content="{{.CSRF}}">
 <title>Knostic OpenAnt — Security Scanner</title>
-<style>
+<style nonce="{{.Nonce}}">
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #1a1a1a; min-height: 100vh; }
   header { background: #0d1117; padding: 16px 32px; display: flex; align-items: center; gap: 12px; }
@@ -157,7 +157,7 @@
           <div>
             <div class="scan-repo-wrap">
               <span class="scan-repo" title="{{.Repo}}">{{.Repo}}</span>
-              <button class="copy-btn" title="Copy URL/path" data-repo="{{.Repo}}" onclick="copyRepo(this)"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg></button>
+              <button class="copy-btn" title="Copy URL/path" data-repo="{{.Repo}}"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg></button>
             </div>
             <div class="scan-meta">{{.StartedAt}}</div>
           </div>
@@ -174,7 +174,7 @@
             {{else}}
               <a class="link-btn" href="/scan/{{.ID}}">View →</a>
             {{end}}
-            <button class="delete-btn" title="Delete" onclick="deleteScan('{{.ID}}')">🗑</button>
+            <button class="delete-btn" title="Delete" data-id="{{.ID}}">🗑</button>
           </div>
         </div>
         {{end}}
@@ -185,7 +185,16 @@
   </div>
 </div>
 
-<script>
+<script nonce="{{.Nonce}}">
+// #578 follow-up A: CSP nonces forbid inline event handlers — the scan
+// list's buttons use delegated listeners with data-* attributes instead.
+document.getElementById('scans-list').addEventListener('click', function(e) {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  if (btn.classList.contains('copy-btn')) copyRepo(btn);
+  if (btn.classList.contains('delete-btn')) deleteScan(btn.dataset.id);
+});
+
 function copyRepo(btn) {
   const text = btn.dataset.repo;
   navigator.clipboard.writeText(text).then(function() {

@@ -21,11 +21,12 @@ import (
 // the :ignoreModulesAndTests preset and the standard ignores are
 // deliberately not overridden.
 //
-// DOMPurify is the SOLE XSS sanitizer for the untrusted-markdown render
-// path (both pages render attacker-influenced markdown through
-// marked.parse → DOMPurify.sanitize → innerHTML, and no CSP backstop
-// exists — recorded as the #577 limitation in vendor/SOURCES.txt). The
-// vendored bytes are therefore integrity-critical: an upgrade is the full
+// DOMPurify is the PRIMARY content boundary for the untrusted-markdown
+// render path (both pages render attacker-influenced markdown through
+// marked.parse → DOMPurify.sanitize → innerHTML); since #578-A the
+// server ships a route-scoped nonce CSP as the execution-class backstop
+// (see vendor/SOURCES.txt's SANITIZER MODEL note). The vendored bytes are
+// therefore integrity-critical: an upgrade is the full
 // recipe in ONE commit — the blob, this table's shas, vendor/SOURCES.txt,
 // the go:embed list, the handleAsset case list, and both pages' script
 // tags.
@@ -261,14 +262,20 @@ func TestUIPagesLoadNoExternalScripts(t *testing.T) {
 			t.Fatalf("%s: a quoted protocol-relative string literal %q — the scheme-less form inside any JS call, srcset, or @import evades the named guards (backticked and backslash-escaped spellings included)", page, m)
 		}
 		// The script-tag INVENTORY: every <script open in the page must be
-		// accounted for as either a vendored src tag or a bare inline open.
-		// This closes the regex's documented boundary — an attribute value
+		// accounted for as a vendored src tag, a NONCED inline open (the CSP
+		// shape — #578 follow-up A: a bare <script> open is out of policy),
+		// or (not yet present anywhere) an attribute-bearing open. This
+		// closes the regex's documented boundary — an attribute value
 		// containing '>' (e.g. data-x="a>b") can hide a tag from the src
 		// regex, but not from the count.
 		totalOpens := strings.Count(low, "<script")
+		noncedOpens := strings.Count(low, `<script nonce=`)
 		bareOpens := strings.Count(low, "<script>")
-		if totalOpens != len(srcTags)+bareOpens {
-			t.Fatalf("%s: %d <script opens but only %d src tags + %d bare inline opens accounted — an unaccounted tag form (e.g. an attribute value containing '>') is present", page, totalOpens, len(srcTags), bareOpens)
+		if bareOpens != 0 {
+			t.Fatalf("%s: %d bare <script> opens — the CSP policy requires every inline script to carry a nonce", page, bareOpens)
+		}
+		if totalOpens != len(srcTags)+noncedOpens {
+			t.Fatalf("%s: %d <script opens but only %d src tags + %d nonced inline opens accounted — an unaccounted tag form (e.g. an attribute value containing '>') is present", page, totalOpens, len(srcTags), noncedOpens)
 		}
 	}
 }
@@ -303,12 +310,14 @@ func TestUIHTMLScriptsVersionedAndOrdered(t *testing.T) {
 				t.Fatalf("%s: script tag references %q which is not in the embed: %v", page, got[i], err)
 			}
 		}
-		// The consumer anchor is the FIRST inline <script> open — the
-		// earliest executing consumer. A vendor tag inserted inside the
-		// consumer body, or an inline script placed before the vendor tags,
-		// both break this; the MD_SANITIZE index is the fallback anchor if
-		// the open-tag shape ever changes.
-		consumer := strings.Index(s, "<script>")
+		// The consumer anchor is the FIRST inline <script nonce=…> open —
+		// the earliest executing consumer (the #578-A CSP shape: inline
+		// opens carry nonces; bare opens are banned by the inventory
+		// test). A vendor tag inserted inside the consumer body, or an
+		// inline script placed before the vendor tags, both break this;
+		// the MD_SANITIZE index is the fallback anchor if the open-tag
+		// shape ever changes again.
+		consumer := strings.Index(s, `<script nonce=`)
 		if fb := strings.Index(s, "const MD_SANITIZE = {"); fb >= 0 && (consumer < 0 || fb < consumer) {
 			consumer = fb
 		}

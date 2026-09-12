@@ -18,14 +18,16 @@
 # DO transfer are the sha256 lock and the versioned-name invariants in
 # ui/vendor_test.go.
 #
-# LIMITATION (recorded, #577): DOMPurify is the sole XSS sanitizer for the
-# untrusted-markdown render path of summary.html + disclosure.html; no
-# Content-Security-Policy header is set anywhere in internal/server/ (the
-# securityHeaders wrapper sets X-Frame-Options, X-Content-Type-Options,
-# Referrer-Policy, COOP, CORP, Permissions-Policy and
-# X-Permitted-Cross-Domain-Policies — a CSP would additionally need nonces
-# or hashes for the templates' inline <script> and <style> blocks: a design
-# change, deliberately out of this fix's scope).
+# SANITIZER MODEL (amended by #578 follow-up A): DOMPurify remains the
+# PRIMARY content boundary for the untrusted-markdown render path of
+# summary.html + disclosure.html (marked.parse -> DOMPurify.sanitize ->
+# innerHTML); since #578-A the server additionally ships a route-scoped
+# nonce CSP on those pages (script-src 'self' 'nonce-…'), so a sanitizer
+# bypass yielding script execution is dead — the worst residual is
+# markup-level abuse (allowlisted-tag defacement / same-origin phishing),
+# which no header can fix because the page IS the trusted origin. The CSP
+# is the backstop for the execution class; the sanitizer policy stays the
+# load-bearing boundary.
 #
 # LIMITATION (the sha lock's blind spot, #578 review round): the lock
 # detects UNCOORDINATED drift only — a single commit that moves the blob
