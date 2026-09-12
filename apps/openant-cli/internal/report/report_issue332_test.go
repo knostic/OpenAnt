@@ -46,8 +46,8 @@ func TestRenderedReportHasNoCDNScripts(t *testing.T) {
 		// The vendored scripts must be PRESENT, not merely the CDN absent —
 		// markers come from the pinned files themselves (version banners),
 		// which the templates' own inline config blocks cannot provide.
-		// #540: the tailwind marker is the CSS build banner ("tailwindcss v3.4.17").
-		for _, marker := range []string{"tailwindcss v3.4.17", "Chart.js v4.5.1", "chartjs-plugin-datalabels"} {
+		// #540: the tailwind marker is the CSS build banner ("tailwindcss v3.4.19").
+		for _, marker := range []string{"tailwindcss v3.4.19", "Chart.js v4.5.1", "chartjs-plugin-datalabels"} {
 			if !strings.Contains(out, marker) {
 				t.Fatalf("%s: missing vendored-asset marker %q (an empty inline would strip styling/charts silently)",
 					name, marker)

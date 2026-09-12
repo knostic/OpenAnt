@@ -31,7 +31,7 @@
 #         The OLD blob (tailwindcss-3.4.17.js, the Play-CDN runtime
 #         compiler) was deleted by this migration — its 26 lines of
 #         channel history are in git.
-#   sha256: 49b8a7c399720d237594695e2dbccade46ee253fc681ab936f9831eed954254b
+#   sha256: 9c146ec362d03090688714f48f0241b4262ea6b19c819bbe020c75a6526d477e
 #
 # chart-4.5.1.umd.min.js
 #   source: https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js

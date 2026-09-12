@@ -75,7 +75,7 @@ func TestVendoredReportScriptHashes(t *testing.T) {
 	for name, want := range map[string]string{
 		// #540: the prebuilt CSS (the choice-1 migration) — the sha pins the
 		// exact build output; a regen updates it deliberately.
-		"report.css":                             "49b8a7c399720d237594695e2dbccade46ee253fc681ab936f9831eed954254b",
+		"report.css":                             "9c146ec362d03090688714f48f0241b4262ea6b19c819bbe020c75a6526d477e",
 		"chart-4.5.1.umd.min.js":                 "48444a82d4edcb5bec0f1965faacdde18d9c17db3063d042abada2f705c9f54a",
 		"chartjs-plugin-datalabels-2.2.0.min.js": "20c08f3d9c6d2ef76df6d6a6f1127c0013339fe32add24222276c398c6308c38",
 	} {
