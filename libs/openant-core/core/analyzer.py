@@ -48,12 +48,34 @@ from utilities.rate_limiter import (
 # >~21,333 with "Streaming is required" — see helpers.py:29-31; the
 # adapters call non-streaming). The deterministic length-empty class gets
 # ONE retry that attacks the cause (the budget) within that envelope.
+# #569 follow-up (2b): the envelope is PER-MODEL where the registry knows
+# the ceiling (config/models.json max_output_tokens) — the review round's
+# granularity fix: a per-ADAPTER number over-raises for small-output
+# models, and a 400 on the retry would be an un-retried error, strictly
+# worse than the coin flip. Unlisted models keep this default-derived cap.
 BUDGET_RETRY_MAX_TOKENS = min(DEFAULT_MAX_TOKENS * 2, 21000)
 
-def budget_retry_cap(index: int, budget_set: set) -> int | None:
+def budget_retry_cap(index: int, budget_set: set, binding=None) -> int | None:
     """#569: the per-index retry cap — the raised cap for the budget class,
-    None (the unchanged default) for every other retryable."""
-    return BUDGET_RETRY_MAX_TOKENS if index in budget_set else None
+    None (the unchanged default) for every other retryable. With a binding,
+    the cap honors the model's documented max-output ceiling
+    (model_registry.max_output_tokens): a listed model gets
+    min(2x default, ceiling); an unlisted model keeps the default-derived
+    BUDGET_RETRY_MAX_TOKENS. A ceiling that admits no raise (<= the
+    default) returns None — a same-cap retry beats a guaranteed 400."""
+    if index not in budget_set:
+        return None
+    if binding is None:
+        return BUDGET_RETRY_MAX_TOKENS
+    from core import model_registry
+    ceiling = model_registry.max_output_tokens(
+        binding.provider_name, binding.model)
+    if ceiling is None:
+        return BUDGET_RETRY_MAX_TOKENS
+    cap = min(DEFAULT_MAX_TOKENS * 2, ceiling)
+    if cap <= DEFAULT_MAX_TOKENS:
+        return None
+    return cap
 
 
 # These live in core/ because core is shipped and experiment.py is not: importing
@@ -801,16 +823,25 @@ def run_analysis(
                   f"(waiting {backoff:.0f}s for rate limit to clear)...", file=sys.stderr)
             rate_limiter.wait_if_needed()
         else:
-            _extra = (f" ({len(budget_retry_indices)} at a raised output "
-                      f"cap {BUDGET_RETRY_MAX_TOKENS} — budget exhaustion)"
-                      if budget_retry_indices else "")
+            _cap_desc = ""
+            if budget_retry_indices:
+                _caps = sorted({c for c in (budget_retry_cap(
+                    i, _budget_set, binding) for i in budget_retry_indices)
+                    if c is not None})
+                if _caps:
+                    _cap_desc = (f" ({len(budget_retry_indices)} at a raised "
+                                 f"output cap {_caps} — budget exhaustion)")
+                else:
+                    _cap_desc = (f" ({len(budget_retry_indices)} budget-"
+                                 f"exhausted; no ceiling admits a raise — "
+                                 f"same-cap retry)")
             print(f"[Analyze] Retrying {len(retryable_indices)} failed units "
-                  f"(transient errors){_extra}...", file=sys.stderr)
+                  f"(transient errors){_cap_desc}...", file=sys.stderr)
 
         # Retry sequentially to avoid re-triggering rate limit
         for i in retryable_indices:
             unit = units[i]
-            _cap = budget_retry_cap(i, _budget_set)
+            _cap = budget_retry_cap(i, _budget_set, binding)
             out = _process_unit(binding, unit, i, json_corrector, app_context,
                                 max_tokens=_cap)
             results[i] = out["result"]

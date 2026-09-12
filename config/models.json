@@ -1,5 +1,5 @@
 {
-  "_comment": "Provider-model registry: the single source of truth for model IDs and pricing, read by BOTH the Python engine (core/model_registry.py) and the Go CLI (internal/models). status is OpenAnt's shipped claim; source+retrieved are its provenance. price is null for any model that must not be auto-dispatched (retired/unknown) so it never resolves to a silent $0 in cost accounting. Prices are OpenAnt's shipped rates and are NOT verified against live provider pricing in the build environment \u2014 see each record's source. Recency of `retrieved` is an operational/CI concern, not asserted in the unit tests. INVARIANT (test_models_price_cross_check.py): records for the same model family across providers must agree on price unless the diverging record carries an explicit `price_diverges` reason string (#344).",
+  "_comment": "Provider-model registry: the single source of truth for model IDs and pricing, read by BOTH the Python engine (core/model_registry.py) and the Go CLI (internal/models). status is OpenAnt's shipped claim; source+retrieved are its provenance. price is null for any model that must not be auto-dispatched (retired/unknown) so it never resolves to a silent $0 in cost accounting. Prices are OpenAnt's shipped rates and are NOT verified against live provider pricing in the build environment — see each record's source. Recency of `retrieved` is an operational/CI concern, not asserted in the unit tests. INVARIANT (test_models_price_cross_check.py): records for the same model family across providers must agree on price unless the diverging record carries an explicit `price_diverges` reason string (#344).",
   "schema_version": 1,
   "models": [
     {
@@ -10,7 +10,7 @@
         "input": 5.0,
         "output": 25.0
       },
-      "source": "verified against live Anthropic pricing (Claude Opus 4.8 = $5/$25 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-09-01) and the live OpenRouter catalogue (anthropic/claude-opus-4.8 = $5.00/$25.00 per 1M, openrouter.ai/api/v1/models, 2026-09-01) \u2014 both live sources agree; the prior 15.00/75.00 was the retired Opus 4.1-era shipped-table rate, never re-verified (#344)",
+      "source": "verified against live Anthropic pricing (Claude Opus 4.8 = $5/$25 per MTok, platform.claude.com/docs/en/about-claude/pricing, 2026-09-01) and the live OpenRouter catalogue (anthropic/claude-opus-4.8 = $5.00/$25.00 per 1M, openrouter.ai/api/v1/models, 2026-09-01) — both live sources agree; the prior 15.00/75.00 was the retired Opus 4.1-era shipped-table rate, never re-verified (#344)",
       "retrieved": "2026-09-01"
     },
     {
@@ -69,7 +69,7 @@
       },
       "source": "regional Bedrock inference profile; liveness via list-inference-profiles (us-east-1, status ACTIVE) on 2026-07-31; price = the direct Anthropic rate x1.1 (the regional-endpoint premium Anthropic's pricing page documents for Claude 4.5+ models), re-derived 2026-09-01",
       "retrieved": "2026-07-31",
-      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models \u2014 this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
+      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models — this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
     },
     {
       "id": "global.anthropic.claude-opus-4-8",
@@ -92,7 +92,7 @@
       },
       "source": "regional Bedrock inference profile; liveness via list-inference-profiles (us-east-1, status ACTIVE) on 2026-07-31; price = the direct Anthropic rate x1.1 (the regional-endpoint premium Anthropic's pricing page documents for Claude 4.5+ models), re-derived 2026-09-01",
       "retrieved": "2026-07-31",
-      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models \u2014 this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
+      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models — this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
     },
     {
       "id": "global.anthropic.claude-sonnet-4-6",
@@ -115,7 +115,7 @@
       },
       "source": "regional Bedrock inference profile; liveness via list-inference-profiles (us-east-1, status ACTIVE) on 2026-07-31; price = the direct Anthropic rate x1.1 (the regional-endpoint premium Anthropic's pricing page documents for Claude 4.5+ models), re-derived 2026-09-01",
       "retrieved": "2026-07-31",
-      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models \u2014 this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
+      "price_diverges": "Bedrock REGIONAL endpoint premium: Anthropic's pricing page states regional/multi-region endpoints carry +10% over global for Claude 4.5+ models — this is the direct rate x1.1, derived 2026-09-01 from that live page; the global.anthropic sibling carries the standard rate."
     },
     {
       "id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -159,7 +159,8 @@
         "output": 8.0
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "max_output_tokens": 32768
     },
     {
       "id": "gpt-4.1-mini",
@@ -170,7 +171,8 @@
         "output": 1.6
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "max_output_tokens": 32768
     },
     {
       "id": "gpt-4.1-nano",
@@ -181,7 +183,8 @@
         "output": 0.4
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "max_output_tokens": 32768
     },
     {
       "id": "o1",
@@ -192,7 +195,8 @@
         "output": 60.0
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "max_output_tokens": 100000
     },
     {
       "id": "o3",
@@ -203,7 +207,8 @@
         "output": 8.0
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "max_output_tokens": 100000
     },
     {
       "id": "o3-mini",
@@ -214,7 +219,8 @@
         "output": 4.4
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "max_output_tokens": 100000
     },
     {
       "id": "o4-mini",
@@ -225,7 +231,8 @@
         "output": 4.4
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live OpenAI pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "max_output_tokens": 100000
     },
     {
       "id": "gemini-2.5-pro",
@@ -236,7 +243,8 @@
         "output": 10.0
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "max_output_tokens": 65536
     },
     {
       "id": "gemini-2.5-flash",
@@ -247,7 +255,8 @@
         "output": 2.5
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "max_output_tokens": 65536
     },
     {
       "id": "gemini-2.5-flash-lite",
@@ -258,7 +267,8 @@
         "output": 0.4
       },
       "source": "openant shipped pricing table (utilities/model_config.py); not re-verified against live Google pricing",
-      "retrieved": "2026-07-23"
+      "retrieved": "2026-07-23",
+      "max_output_tokens": 65536
     },
     {
       "id": "gemini-2.0-flash",
@@ -368,7 +378,8 @@
         "output": 8.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "max_output_tokens": 32768
     },
     {
       "id": "openai/gpt-4.1-mini",
@@ -379,7 +390,8 @@
         "output": 1.6
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "max_output_tokens": 32768
     },
     {
       "id": "openai/gpt-4.1-nano",
@@ -390,7 +402,8 @@
         "output": 0.4
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "max_output_tokens": 32768
     },
     {
       "id": "openai/o1",
@@ -401,7 +414,8 @@
         "output": 60.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "max_output_tokens": 100000
     },
     {
       "id": "openai/o3",
@@ -412,7 +426,8 @@
         "output": 8.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "max_output_tokens": 100000
     },
     {
       "id": "openai/o3-mini",
@@ -423,7 +438,8 @@
         "output": 4.4
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "max_output_tokens": 100000
     },
     {
       "id": "openai/o4-mini",
@@ -434,7 +450,8 @@
         "output": 4.4
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "max_output_tokens": 100000
     },
     {
       "id": "google/gemini-2.5-pro",
@@ -445,7 +462,8 @@
         "output": 10.0
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "max_output_tokens": 65536
     },
     {
       "id": "google/gemini-2.5-flash",
@@ -456,7 +474,8 @@
         "output": 2.5
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "max_output_tokens": 65536
     },
     {
       "id": "google/gemini-2.5-flash-lite",
@@ -467,7 +486,8 @@
         "output": 0.4
       },
       "source": "verified against the live OpenRouter catalogue (GET https://openrouter.ai/api/v1/models), per-token rates converted to per-1M; OpenRouter's rate, which may differ from the direct provider's",
-      "retrieved": "2026-08-01"
+      "retrieved": "2026-08-01",
+      "max_output_tokens": 65536
     },
     {
       "id": "anthropic/claude-opus-5",
@@ -510,7 +530,7 @@
         "input": 0.75,
         "output": 3.75
       },
-      "source": "verified against Google's own pricing page (ai.google.dev/gemini-api/docs/pricing: gemini-3.7-flash $0.75/$3.75 per 1M, 2026-09-01 \u2014 the page documents a scheduled step to $1.50/$7.50 on 2027-01-01; revisit then) and the live OpenRouter catalogue (google/gemini-3.7-flash $0.75/$3.75) \u2014 both live sources agree (#434's stale-family gap)",
+      "source": "verified against Google's own pricing page (ai.google.dev/gemini-api/docs/pricing: gemini-3.7-flash $0.75/$3.75 per 1M, 2026-09-01 — the page documents a scheduled step to $1.50/$7.50 on 2027-01-01; revisit then) and the live OpenRouter catalogue (google/gemini-3.7-flash $0.75/$3.75) — both live sources agree (#434's stale-family gap)",
       "retrieved": "2026-09-01"
     },
     {
@@ -532,7 +552,7 @@
         "input": 0.0,
         "output": 0.0
       },
-      "source": "verified on ollama.com/library/qwen3.8 (18GB, 256K ctx); local inference is free \u2014 $0 by definition, not an unverified vendor price",
+      "source": "verified on ollama.com/library/qwen3.8 (18GB, 256K ctx); local inference is free — $0 by definition, not an unverified vendor price",
       "retrieved": "2026-08-27"
     },
     {
@@ -543,7 +563,7 @@
         "input": 0.0,
         "output": 0.0
       },
-      "source": "modest-hardware alternative; verified on ollama.com/library/qwen3.5 (6.6GB); local inference is free \u2014 $0 by definition",
+      "source": "modest-hardware alternative; verified on ollama.com/library/qwen3.5 (6.6GB); local inference is free — $0 by definition",
       "retrieved": "2026-08-27"
     },
     {
@@ -554,7 +574,7 @@
         "input": 0.0,
         "output": 0.0
       },
-      "source": "verified live end-to-end: planted-vuln scan, both CWE-89 findings detected (2026-08-25); local inference is free \u2014 $0 by definition",
+      "source": "verified live end-to-end: planted-vuln scan, both CWE-89 findings detected (2026-08-25); local inference is free — $0 by definition",
       "retrieved": "2026-08-27"
     },
     {
