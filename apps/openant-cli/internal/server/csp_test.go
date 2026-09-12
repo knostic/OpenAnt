@@ -21,6 +21,10 @@ func TestCSPPoliciesPerRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse index.html: %v", err)
 	}
+	tmplScan, err := template.ParseFS(uifiles.FS, "scan.html")
+	if err != nil {
+		t.Fatalf("parse scan.html: %v", err)
+	}
 	s := &Server{
 		outDir:       t.TempDir(),
 		mgr:          newManager(t.TempDir()),
@@ -28,6 +32,7 @@ func TestCSPPoliciesPerRoute(t *testing.T) {
 		sem:          make(chan struct{}, 4),
 		shutdownDone: make(chan struct{}),
 		tmplIndex:    tmplIndex,
+		tmplScan:     tmplScan,
 	}
 	h := s.Handler()
 	get := func(path string) *httptest.ResponseRecorder {
@@ -37,6 +42,10 @@ func TestCSPPoliciesPerRoute(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		return rec
 	}
+	// A registered job so the scan/summary/disclosure routes render (the
+	// handlers 404 without one).
+	j := &Job{ID: "j1", Repo: "https://example.com/o/r", Status: "done", done: make(chan struct{})}
+	s.mgr.add(j)
 
 	t.Run("index carries the nonce policy", func(t *testing.T) {
 		rec := get("/")
@@ -76,6 +85,49 @@ func TestCSPPoliciesPerRoute(t *testing.T) {
 		}
 	})
 
+	t.Run("every UI page carries header/body nonce equality", func(t *testing.T) {
+		// The scan page needs only the registered job; summary/disclosure
+		// additionally need their artifacts on disk (the handlers 404
+		// otherwise) — the nonce CONTRACT is asserted on the routes that
+		// render; the template-side nonce pin (vendor_test.go's
+		// zero-bare-opens + nonced inventory) covers the artifact-backed
+		// pages' markup regardless.
+		for _, path := range []string{"/", "/scan/j1"} {
+			rec := get(path)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET %s = %d, want 200", path, rec.Code)
+			}
+			csp := rec.Header().Get("Content-Security-Policy")
+			m := regexp.MustCompile(`'nonce-([0-9a-f]+)'`).FindStringSubmatch(csp)
+			if m == nil {
+				t.Fatalf("GET %s: CSP carries no nonce: %q", path, csp)
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, `<script nonce="`+m[1]+`">`) {
+				t.Errorf("GET %s: the inline script's nonce does not match the header's nonce", path)
+			}
+			if !strings.Contains(body, `<style nonce="`+m[1]+`">`) {
+				t.Errorf("GET %s: the inline style's nonce does not match the header's nonce", path)
+			}
+			if strings.Contains(body, "onclick=") {
+				t.Errorf("GET %s: inline event handlers survive — the nonce script-src blocks them", path)
+			}
+		}
+	})
+
+	t.Run("summary and disclosure routes carry the nonce policy", func(t *testing.T) {
+		// Even 404 responses from the UI-page routes carry the CSP header
+		// (the middleware sets it before the handler) — this pins the
+		// ROUTE classification (isUIPage) for the artifact-backed pages.
+		for _, path := range []string{"/summary/j1", "/disclosure/j1/d.md"} {
+			csp := get(path).Header().Get("Content-Security-Policy")
+			m := regexp.MustCompile(`'nonce-([0-9a-f]+)'`).FindStringSubmatch(csp)
+			if m == nil {
+				t.Errorf("GET %s: no nonce policy (the route is mis-classified): %q", path, csp)
+			}
+		}
+	})
+
 	t.Run("nonces rotate per response", func(t *testing.T) {
 		m1 := regexp.MustCompile(`'nonce-([0-9a-f]+)'`).FindStringSubmatch(get("/").Header().Get("Content-Security-Policy"))
 		m2 := regexp.MustCompile(`'nonce-([0-9a-f]+)'`).FindStringSubmatch(get("/").Header().Get("Content-Security-Policy"))
@@ -99,6 +151,20 @@ func TestCSPPoliciesPerRoute(t *testing.T) {
 		}
 		if strings.Contains(csp, "nonce-") {
 			t.Errorf("GET /report/: the policy carries a nonce — the report is a pre-generated static file; a nonce here CSP-kills its inline scripts: %q", csp)
+		}
+	})
+
+	t.Run("report policy needs no unsafe-eval", func(t *testing.T) {
+		// #578-A review round: the report's three vendored blobs were
+		// checked for eval/new Function (the CSP-kills-the-report hazard):
+		// 0 matches in chart-4.5.1.umd.min.js, chartjs-plugin-datalabels-
+		// 2.2.0.min.js, and tailwindcss-3.4.17.js (grep -o "new Function(\|
+		// [^A-Za-z_.]eval(" over internal/report/vendor/*.js — 2026-09-12
+		// receipt in the PR). The absence is NOT re-checked here (the blobs
+		// are sha-pinned by the report side's own vendor discipline); this
+		// test pins the POLICY SHAPE the absence justifies.
+		if strings.Contains(get("/report/none").Header().Get("Content-Security-Policy"), "unsafe-eval") {
+			t.Error("GET /report/: the policy carries unsafe-eval — the vendored blobs contain no eval shapes (checked at #578-A; re-justify on any blob bump)")
 		}
 	})
 

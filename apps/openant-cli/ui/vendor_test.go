@@ -21,11 +21,12 @@ import (
 // the :ignoreModulesAndTests preset and the standard ignores are
 // deliberately not overridden.
 //
-// DOMPurify is the SOLE XSS sanitizer for the untrusted-markdown render
-// path (both pages render attacker-influenced markdown through
-// marked.parse → DOMPurify.sanitize → innerHTML, and no CSP backstop
-// exists — recorded as the #577 limitation in vendor/SOURCES.txt). The
-// vendored bytes are therefore integrity-critical: an upgrade is the full
+// DOMPurify is the PRIMARY content boundary for the untrusted-markdown
+// render path (both pages render attacker-influenced markdown through
+// marked.parse → DOMPurify.sanitize → innerHTML); since #578-A the
+// server ships a route-scoped nonce CSP as the execution-class backstop
+// (see vendor/SOURCES.txt's SANITIZER MODEL note). The vendored bytes are
+// therefore integrity-critical: an upgrade is the full
 // recipe in ONE commit — the blob, this table's shas, vendor/SOURCES.txt,
 // the go:embed list, the handleAsset case list, and both pages' script
 // tags.
@@ -309,12 +310,14 @@ func TestUIHTMLScriptsVersionedAndOrdered(t *testing.T) {
 				t.Fatalf("%s: script tag references %q which is not in the embed: %v", page, got[i], err)
 			}
 		}
-		// The consumer anchor is the FIRST inline <script> open — the
-		// earliest executing consumer. A vendor tag inserted inside the
-		// consumer body, or an inline script placed before the vendor tags,
-		// both break this; the MD_SANITIZE index is the fallback anchor if
-		// the open-tag shape ever changes.
-		consumer := strings.Index(s, "<script>")
+		// The consumer anchor is the FIRST inline <script nonce=…> open —
+		// the earliest executing consumer (the #578-A CSP shape: inline
+		// opens carry nonces; bare opens are banned by the inventory
+		// test). A vendor tag inserted inside the consumer body, or an
+		// inline script placed before the vendor tags, both break this;
+		// the MD_SANITIZE index is the fallback anchor if the open-tag
+		// shape ever changes again.
+		consumer := strings.Index(s, `<script nonce=`)
 		if fb := strings.Index(s, "const MD_SANITIZE = {"); fb >= 0 && (consumer < 0 || fb < consumer) {
 			consumer = fb
 		}
