@@ -53,6 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from utilities.llm import PhaseBinding
+from utilities.rate_limiter import is_budget_exhausted_error
 
 
 # Maximum number of units to send in a single LLM call. Larger batches save
@@ -638,6 +639,33 @@ def analyze_reachability(
             # so the caller can stop and tell the user the key is bad.
             raise
         except Exception as exc:  # noqa: BLE001 — advisory stage; never crash pipeline
+            # #569 x #558 composition (the review follow-up): a DETERMINISTIC
+            # budget-exhausted empty surfaces HERE as an exception — the
+            # adapter raises on empty content before LLR's parse-path
+            # truncation gate ever sees a stop_reason — and under the #541
+            # classification it became batches_failed -> a same-cap resume
+            # re-roll: the exact billed coin flip #569 exists to kill, in the
+            # phase that decides what gets analyzed at all. Classify it as
+            # the TRUNCATED class with FULL deltas so #558's split-and-retry
+            # covers it: the counters + deltas match the parse-path
+            # truncated arm exactly, the split's subtraction stays exact,
+            # and the halves' own outcomes flow through the same arms. The
+            # split halves are smaller outputs (less likely to exhaust) AND
+            # a fresh roll — the #558 rationale, same-cap by design (LLR
+            # passes no raised cap; the raised-cap path is analyze-phase
+            # only, per #569).
+            if is_budget_exhausted_error(str(exc)):
+                dropped_batches += 1
+                batches_truncated += 1
+                units_not_reviewed += len(sub_batch)
+                msg = f"{label} truncated (budget exhausted: the model spent "
+                f"the output cap before emitting content): {exc}"
+                if on_error:
+                    on_error(msg)
+                else:
+                    print(f"[LLMReach] {msg}", file=sys.stderr)
+                return [], "truncated", {
+                    "dropped": 1, "units": len(sub_batch), "truncated": 1}
             # #541: a provider-exception batch is counted in the coverage
             # truth. A distinct counter (different failure class, different
             # remediation) + the same units_not_reviewed.
