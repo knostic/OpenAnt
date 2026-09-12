@@ -242,13 +242,17 @@ class BedrockAdapter:
                 raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
             raise
         except _typed_credentials_error() as exc:
-            # 1.5.0 narrowed the identity-token/auth-profile raises to the
-            # typed CredentialsError family (an AnthropicError subclass the
-            # APIStatusError arm above never sees). Map it to the same typed
-            # auth path as the bare-RuntimeError marker. getattr-guarded:
-            # the pyproject floor (anthropic>=0.40.0) predates the class —
-            # a bare `except anthropic.CredentialsError` would AttributeError
-            # on older SDKs at exactly the moment a real error propagates.
+            # Upgrade-defense (the review round's reachability correction):
+            # on the pinned 1.5.0 the BEDROCK signer still raises the bare
+            # RuntimeError the marker arm above already maps; the typed
+            # CredentialsError family is raised by the BASE client's
+            # auth-profile machinery, which AnthropicBedrock never invokes
+            # today — but an SDK narrowing (the direction 1.5.0 took the
+            # base-client raises) lands here first. Map it to the same typed
+            # auth path. getattr-guarded: the pyproject floor
+            # (anthropic>=0.40.0) predates the class — a bare
+            # `except anthropic.CredentialsError` would AttributeError on
+            # older SDKs at exactly the moment a real error propagates.
             raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
 
         return _response_to_unified(response, adapter="BedrockAdapter")
@@ -284,6 +288,12 @@ class BedrockAdapter:
             if _NO_CREDENTIALS_MARKER in str(exc):
                 raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
             raise
+        except _typed_credentials_error() as exc:
+            # Upgrade-defense, mirrored from complete() (validate() is the
+            # FIRST call a scan makes — registry.validate at startup — and
+            # probe_registry_or_raise catches only LLMError, so a typed
+            # credential failure here would surface raw and unredacted.
+            raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
 
 
 # ----------------------------------------------------------------------

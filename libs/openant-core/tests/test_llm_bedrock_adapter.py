@@ -275,12 +275,23 @@ class TestErrorMapping:
         if cls is None:
             pytest.skip("the pinned anthropic predates CredentialsError (>=1.5.0)")
 
+        # The message deliberately does NOT carry _NO_CREDENTIALS_MARKER —
+        # a marker-carrying message would pass via the RuntimeError arm if
+        # the class ever subclassed RuntimeError, and this test must prove
+        # the TYPED arm did the mapping.
         def respond(**kw):
-            raise cls("could not resolve credentials from identity token file")
+            raise cls("identity token file is not readable")
 
         adapter, _ = _stub_adapter(respond)
         with pytest.raises(LLMAuthError) as exc_info:
             _complete(adapter)
+        assert "AWS_ACCESS_KEY_ID" in str(exc_info.value)
+
+        # The startup probe takes the same typed path (validate() is the
+        # first call a scan makes; the probe catches only LLMError).
+        adapter, _ = _stub_adapter(respond)
+        with pytest.raises(LLMAuthError) as exc_info:
+            adapter.validate(model="us.anthropic.claude-sonnet-4-6")
         assert "AWS_ACCESS_KEY_ID" in str(exc_info.value)
 
     def test_unrelated_runtime_error_propagates(self):
