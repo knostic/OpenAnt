@@ -138,6 +138,89 @@ class TestCapThreaded:
             "budget-class unit's call")
 
 
+class TestRegistryCeilingInvariants:
+    """The registry discipline the per-model cap depends on (the review
+    round's conformance asks): the anthropic/bedrock exclusion is enforced
+    by TEST, not prose — a future max_output_tokens >= ~21,334 on those
+    records would push the retry past the SDK non-streaming ceiling (the
+    exact class the 21000 default exists to prevent); and same-family
+    records agree on their ceilings (the #344 price precedent, extended)."""
+
+    def test_anthropic_and_bedrock_carry_no_ceiling(self):
+        from core import model_registry
+        for rec in model_registry.load_models():
+            if rec.get("provider") in ("anthropic", "bedrock"):
+                assert not rec.get("max_output_tokens"), (
+                    f"{rec['provider']}/{rec['id']} carries max_output_tokens "
+                    f"{rec['max_output_tokens']!r} — the retry cap would "
+                    f"exceed the SDK non-streaming ~21,333 ceiling; the "
+                    f"exclusion is load-bearing (see analyzer.py)")
+
+    def test_same_family_agrees_on_ceiling(self):
+        from core import model_registry
+        import re
+        fam = {}
+        for rec in model_registry.load_models():
+            cap = rec.get("max_output_tokens")
+            if not cap:
+                continue
+            # family = the base model id (strip vendor prefix + date stamps)
+            base = rec["id"].split("/")[-1]
+            base = re.sub(r"-\d{8}.*$", "", base)
+            fam.setdefault(base, set()).add(cap)
+        for base, caps in fam.items():
+            assert len(caps) == 1, (
+                f"family {base!r} disagrees on max_output_tokens: {caps} — "
+                f"an alias landing on a sibling record must be ceiling-safe "
+                f"(the #344 same-family price precedent)")
+
+
+class TestPerModelCeiling:
+    """#569 follow-up (2b): the retry cap honors the model's documented
+    max-output ceiling (config/models.json max_output_tokens) — a listed
+    model gets min(2x default, ceiling); an unlisted model keeps the
+    default-derived cap; a ceiling that admits no raise gets None (a
+    same-cap retry beats a guaranteed 400)."""
+
+    class _Binding:
+        def __init__(self, provider, model):
+            self.provider_name = provider
+            self.model = model
+
+    def test_listed_model_gets_ceiling_capped_raise(self):
+        from core.analyzer import budget_retry_cap
+        from utilities.llm.helpers import DEFAULT_MAX_TOKENS
+        # gpt-4.1 carries max_output_tokens 32768: min(40000, 32768).
+        assert budget_retry_cap(0, {0}, self._Binding("openai", "gpt-4.1")) == 32768
+        # gemini-2.5-pro carries 65536: the 2x-default term binds.
+        assert budget_retry_cap(0, {0}, self._Binding("google", "gemini-2.5-pro")) == DEFAULT_MAX_TOKENS * 2
+
+    def test_alias_spelling_resolves_to_the_record(self):
+        from core.analyzer import budget_retry_cap
+        # The openrouter mirror spells it bare; the alias pass resolves it.
+        assert budget_retry_cap(0, {0}, self._Binding("openrouter", "gpt-4.1")) == 32768
+
+    def test_unlisted_model_keeps_default_cap(self):
+        from core.analyzer import budget_retry_cap, BUDGET_RETRY_MAX_TOKENS
+        assert budget_retry_cap(0, {0}, self._Binding("openai", "gpt-4o")) == BUDGET_RETRY_MAX_TOKENS
+        assert budget_retry_cap(0, {0}, self._Binding("anthropic", "claude-opus-4-8")) == BUDGET_RETRY_MAX_TOKENS
+
+    def test_ceiling_admitting_no_raise_returns_none(self):
+        from core.analyzer import budget_retry_cap
+        # A hypothetical ceiling at/below the default: no raise is possible;
+        # None (same-cap) beats a guaranteed 400 on the retry.
+        from unittest.mock import patch
+        with patch("core.model_registry.max_output_tokens", return_value=16000):
+            assert budget_retry_cap(0, {0}, self._Binding("openai", "x")) is None
+
+    def test_registry_accessor_shapes(self):
+        from core import model_registry
+        assert model_registry.max_output_tokens("openai", "gpt-4.1") == 32768
+        assert model_registry.max_output_tokens("openrouter", "gpt-4.1") == 32768
+        assert model_registry.max_output_tokens("openai", "gpt-4o") is None
+        assert model_registry.max_output_tokens("openai", "not-a-model") is None
+
+
 class TestParityMarkers:
     """The #569 refutation's parity extension: the discriminator reaches
     EVERY adapter's budget wording — which the #569 review round made

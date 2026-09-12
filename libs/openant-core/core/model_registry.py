@@ -172,6 +172,33 @@ def pricing_map(provider: str) -> dict[str, dict[str, float]]:
     return out
 
 
+def max_output_tokens(provider: str, model: str) -> int | None:
+    """The model's documented max-output ceiling, or ``None`` when unknown.
+
+    Feeds the #569 budget-retry cap (the review-round granularity fix: a
+    PER-ADAPTER number over-raises for small-output models — a 400 on the
+    retry would be an un-retried error, strictly worse than the coin flip).
+    The retry honors a ceiling only when it EXCEEDS the default-derived cap;
+    a smaller ceiling changes nothing (such a model would already 400 at the
+    default). Alias-tolerant like pricing_map: bare, vendor-prefixed, dotted
+    and dashed spellings resolve to the same record. Missing config raises
+    via require_models (fail-loud, same contract as pricing).
+    """
+    recs = [rec for rec in require_models()
+            if rec.get("provider") == provider]
+    by_id = {rec["id"]: rec for rec in recs}
+    rec = by_id.get(model)
+    if rec is None:
+        for rec_ in recs:  # alias pass
+            if model in _alias_spellings(rec_["id"]):
+                rec = rec_
+                break
+    if rec is None:
+        return None
+    cap = rec.get("max_output_tokens")
+    return int(cap) if cap else None
+
+
 def _alias_spellings(model_id: str) -> list[str]:
     """The conventional alternate spellings of a model id (#434's enumerated
     set): a vendor slug prefix may be present or absent, an Anthropic
