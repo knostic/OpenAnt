@@ -45,7 +45,7 @@ func TestInvokeCtx_DeadlineFiresWithNamedError(t *testing.T) {
 	// #585 (the start-window class): the budget must also survive a loaded
 	// runner's fork+exec stall — if the deadline fires during cmd.Start the
 	// error shape is "start: context deadline exceeded", not the named
-	// deadline error. 1s clears the common sub-2s stall shape.
+	// deadline error. 1s clears the common sub-1s stall shape.
 	t.Setenv("OPENANT_INVOKE_TIMEOUT", "1s")
 	start := time.Now()
 	_, _, err := InvokeCtxCapture(context.Background(), s, []string{"scan", "x"}, "", "", nil)
@@ -79,7 +79,7 @@ func TestInvokeCtx_EnvOverrideHonored(t *testing.T) {
 	// The elapsed allowance is SCHEDULING TOLERANCE, not the override pin:
 	// the real pin is the ErrInvokeDeadline assertion below (an ignored
 	// override lets `sleep 5` complete naturally and returns a nil error).
-	// The kill + pipe teardown under load can exceed the nominal 300ms by
+	// The kill + pipe teardown under load can exceed the nominal 1s by
 	// seconds; 15s is still far below the 30m default the override replaces.
 	if time.Since(start) > 15*time.Second {
 		t.Fatalf("the override was not honored: %v", time.Since(start))

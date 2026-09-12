@@ -222,10 +222,13 @@ func invokeCtxInner(ctx context.Context, pythonPath string, args []string, workD
 		}
 		if ctx.Err() == context.DeadlineExceeded {
 			// The kill tripped the pipe-close path instead. The zombie-kill
-			// window (invoke.go:274-285's #319): the child already exited —
-			// SUCCESSFULLY — and only a descendant held a pipe; the
-			// watchdog's Cancel fired on the reaped zombie. A usable
-			// envelope wins; only when there is none is it a deadline kill.
+			// window (#319): the child already exited — SUCCESSFULLY — and
+			// only a descendant held a pipe. Mechanism (the #585 round's
+			// correction, traced against os/exec): Cancel is never called
+			// once the child is reaped; Wait blocks on the descendant-held
+			// pipe and the WaitDelay timer force-closes it at child-exit +
+			// invokeWaitDelay. A usable envelope in the captured stdout
+			// wins; only when there is none is it a deadline kill.
 			if cmd.ProcessState != nil && cmd.ProcessState.Success() {
 				// (deep-refute: Success() alone — the Len()>0 conjunct made
 				// the discard-stdout InvokeCtx mode report a successful
