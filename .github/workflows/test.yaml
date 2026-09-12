@@ -174,3 +174,34 @@ jobs:
       - name: Run Go CLI integration tests
         working-directory: libs/openant-core
         run: python -m pytest tests/test_go_cli.py -v --tb=short
+
+  report-css:
+    name: Report CSS reproducibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: apps/openant-cli/internal/report/tailwind/package-lock.json
+
+      - name: Regenerate report.css from the pinned recipe
+        working-directory: apps/openant-cli/internal/report/tailwind
+        # NB: -o regen.css, NOT ../vendor/report.css — writing to the
+        # committed path would make the cmp compare the file against ITSELF
+        # (vacuously green on divergence). The distinct output is load-bearing.
+        run: |
+          npm ci --ignore-scripts
+          ./node_modules/.bin/tailwindcss -c tailwind.config.js -i input.css -o regen.css --minify
+
+      - name: Compare with the committed bytes
+        run: cmp apps/openant-cli/internal/report/tailwind/regen.css apps/openant-cli/internal/report/vendor/report.css
+
+      - name: Clean the regen artifact
+        working-directory: apps/openant-cli/internal/report/tailwind
+        run: rm -f regen.css

@@ -4,39 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{.Title}}</title>
-    {{/* #332: vendored + pinned + inlined — the report is self-contained (served, standalone, air-gapped); the CDN tags carried no SRI and no version. */}}
-    <script>{{ vendorJS "tailwindcss-3.4.17.js" }}</script>
+    {{/* #540: the prebuilt CSS (the choice-1 migration; the runtime compiler was frozen at the dead Play-CDN channel). Same self-containment: template.CSS embed, no CDN. Cascade: this block comes BEFORE the hand-written <style> below — the hand-written rules win at equal specificity, the same order the runtime-injected stylesheet had (appended at head-end AFTER these blocks) reversed only for utility-vs-handcrafted collisions, none observed (one manual render checked). */}}
+    <style>{{ vendorCSS "report.css" }}</style>
     <script>{{ vendorJS "chart-4.5.1.umd.min.js" }}</script>
     <script>{{ vendorJS "chartjs-plugin-datalabels-2.2.0.min.js" }}</script>
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        knostic: {
-                            purple: '#6861FF',
-                            'purple-hover': '#7D77FF',
-                            'purple-light': '#F0EDFF',
-                            'purple-glow': 'rgba(104, 97, 255, 0.08)',
-                            navy: '#1F1E45',
-                            'navy-deep': '#1F0451',
-                            body: '#727272',
-                            muted: '#87909E',
-                            border: '#B3BEFB',
-                            'border-light': '#E8ECF4',
-                            'card-bg': '#F5F7FB',
-                        },
-                    },
-                    fontFamily: {
-                        sans: ['system-ui', 'sans-serif'],
-                    },
-                    borderRadius: {
-                        'card': '20px',
-                    },
-                }
-            }
-        }
-    </script>
     <style>
         /* Details marker styling */
         details > summary { cursor: pointer; list-style: none; }
@@ -82,7 +53,7 @@
         }
     </style>
 </head>
-<body class="bg-white text-knostic-body font-sans leading-relaxed">
+<body class="bg-white text-knostic-body font-knostic leading-relaxed">
 
     <!-- Section Nav Bar -->
     <nav class="sticky top-0 z-50 bg-white/95 backdrop-blur border-b border-knostic-border">
@@ -181,7 +152,7 @@
                         </thead>
                         <tbody>
                             {{range $i, $cat := .Categories}}
-                            <tr class="border-b border-knostic-border-light {{if even $i}}bg-knostic-card-bg{{end}}">
+                            <tr class="border-b border-knostic-border-light {{if even $i}} bg-knostic-card-bg {{end}}">
                                 <td class="py-3 px-4">
                                     <span class="inline-block px-3 py-1 rounded-full text-xs font-semibold text-white" style="background-color: {{$cat.Color}}">{{$cat.Verdict}}</span>
                                 </td>
@@ -198,13 +169,26 @@
         <section id="remediation" class="mb-10 border-l-4 border-knostic-purple pl-4 sm:pl-6">
             <h2 class="text-xl sm:text-2xl font-semibold text-knostic-navy mb-6">Remediation Guidance</h2>
             <div class="remediation-content bg-white border border-knostic-border rounded-card p-4 sm:p-6 card-hover max-w-none
+                        [&_h1]:text-2xl [&_h1]:font-semibold [&_h1]:text-knostic-navy [&_h1]:mb-3
+                        [&_h2]:text-xl [&_h2]:font-semibold [&_h2]:text-knostic-navy [&_h2]:mb-3
                         [&_h3]:text-base [&_h3]:sm:text-lg [&_h3]:font-semibold [&_h3]:text-knostic-navy [&_h3]:mb-2
                         [&_h4]:text-sm [&_h4]:sm:text-base [&_h4]:font-semibold [&_h4]:text-knostic-navy [&_h4]:mb-2
+                        [&_h5]:text-sm [&_h5]:font-semibold [&_h5]:text-knostic-navy [&_h5]:mb-2
+                        [&_h6]:text-sm [&_h6]:font-semibold [&_h6]:text-knostic-navy [&_h6]:mb-2
                         [&_p]:text-knostic-body [&_p]:mb-3
                         [&_ul]:list-disc [&_ul]:pl-6 [&_ul]:mb-3
+                        [&_ol]:list-decimal [&_ol]:pl-6 [&_ol]:mb-3
                         [&_li]:text-knostic-body [&_li]:mb-1
+                        [&_blockquote]:border-l-2 [&_blockquote]:border-knostic-border [&_blockquote]:pl-4 [&_blockquote]:italic [&_blockquote]:text-knostic-body [&_blockquote]:mb-3
+                        [&_code]:text-sm [&_code]:bg-knostic-card-bg [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-knostic-navy [&_code]:border [&_code]:border-knostic-border-light
+                        [&_pre]:overflow-x-auto [&_pre]:text-sm [&_pre]:bg-knostic-card-bg [&_pre]:border [&_pre]:border-knostic-border-light [&_pre]:rounded [&_pre]:p-4 [&_pre]:mb-3
+                        [&_kbd]:text-sm [&_samp]:text-sm
+                        [&_hr]:border-knostic-border [&_hr]:my-4
+                        [&_table]:w-full [&_table]:border-collapse [&_table]:mb-3
+                        [&_th]:border [&_th]:border-knostic-border-light [&_th]:px-2 [&_th]:py-1
+                        [&_td]:border [&_td]:border-knostic-border-light [&_td]:px-2 [&_td]:py-1
                         [&_strong]:text-knostic-navy
-                        [&_code]:text-sm [&_code]:bg-knostic-card-bg [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-knostic-navy [&_code]:border [&_code]:border-knostic-border-light">
+                        [&_a]:text-knostic-purple [&_a]:underline [&_a:hover]:text-knostic-purple-hover">
                 {{.SafeRemediation}}
             </div>
         </section>
@@ -230,7 +214,7 @@
                             </thead>
                             <tbody>
                                 {{range $i, $step := .StepReports}}
-                                <tr class="border-b border-knostic-border-light {{if even $i}}bg-knostic-card-bg{{end}}">
+                                <tr class="border-b border-knostic-border-light {{if even $i}} bg-knostic-card-bg {{end}}">
                                     <td class="py-3 px-4 font-mono text-knostic-navy">{{$step.Step}}</td>
                                     <td class="py-3 px-4">{{$step.Duration}}</td>
                                     <td class="py-3 px-4">{{$step.Cost}}</td>

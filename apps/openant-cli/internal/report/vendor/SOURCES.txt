@@ -1,40 +1,37 @@
-# Provenance + integrity record for the vendored report scripts (#332).
+# Provenance + integrity record for the vendored report assets (#332/#540 —
+# the report scripts AND the build-time report.css).
 # The sha256s below are ENFORCED by report_vendor_test.go
-# (TestVendoredReportScriptHashes). An upgrade is the full #332 recipe: the
+# (TestVendoredReportScriptHashes). An upgrade is the full recipe: the
 # vendored blob + the sha256 here + the go:embed list and vendorScripts names
-# in report.go + the template literals + the test pins — all in one commit.
+# in report.go + the template literals + the version banner marker in
+# report_issue332_test.go (a regen changes the banner) + the version-pin
+# freshness binding in test_class_coverage_test.go — all in one commit.
 # Tampering in git is detectable. Renovate never touches this file:
 # config:recommended's :ignoreModulesAndTests preset adds **/vendor/** to
 # ignorePaths (verified: a no-extends config extracts it, the preset one
 # does not) and the standard ignores are deliberately not overridden —
 # provenance here is hand-maintained.
 #
-# tailwindcss-3.4.17.js
-#   source: https://cdn.tailwindcss.com/3.4.17
-#   note: the Play CDN build — a runtime JIT CSS compiler, documented by
-#         upstream as development-only. DESIGN TRADE-OFF (accepted, #332):
-#         vendoring the compiler keeps the report self-contained (it is the
-#         artifact cdn.tailwindcss.com serves; the only published form) at
-#         the cost of ~407KB and a compiler-in-browser. A prebuilt CSS via
-#         the tailwind CLI would be 10-30KB and drop one of the two inline
-#         script blocks — recorded as the follow-up direction.
-#   ARTIFACT-SPACE CEILING (verified 2026-09-05): cdn.tailwindcss.com serves
-#         the Play CDN build up to 3.4.17 ONLY — 3.4.18+ and the v4 line
-#         return an "Unknown Tailwind version" stub. npm:tailwindcss has
-#         releases past 3.4.17, so renovate's npm-datasource notifier will
-#         propose versions with NO published Play-CDN artifact — those
-#         branches are read-before-acting: verify the CDN actually serves
-#         the version before attempting this recipe. TRAP: the CDN answers
-#         unknown versions with HTTP 200 + a console.error stub (~730 bytes,
-#         'Unknown Tailwind version: ...') — a status-code check reads as
-#         success; MATCH ON CONTENT (a ~400KB script) or the stub wins. The
-#         verification will fail for EVERY version past 3.4.17 — this vendored blob is frozen
-#         on this channel (including for future security fixes; the npm
-#         dist carries no play-cdn script — verified by tarball listing, so
-#         there is no second source to dual-verify against either). A
-#         security bump means executing the prebuilt-CSS/CLI follow-up
-#         direction recorded above, not a re-vendor.
-#   sha256: 176e894661aa9cdc9a5cba6c720044cbbf7b8bd80d1c9a142a7c24b1b6c50d15
+# report.css
+#   source: BUILT — tailwind/ (the #540 prebuilt-CSS migration; the
+#         runtime compiler was retired). Regen recipe (documented in
+#         tailwind/package.json): cd tailwind && npm ci --ignore-scripts
+#         && ./node_modules/.bin/tailwindcss -c tailwind.config.js
+#         -i input.css -o ../vendor/report.css --minify
+#         Then update the sha256 below AND in report_vendor_test.go.
+#         (ALWAYS ./node_modules/.bin/tailwindcss — NEVER npx, which can
+#         fetch a different version on resolution failure.) The clean-
+#         runner reproducibility of this recipe is enforced in CI (the
+#         Report CSS reproducibility job: regen + cmp vs the committed
+#         bytes). The palette lives in tailwind/palette.json (the single
+#         source of truth, read by the Go coverage test); the version pin
+#         in tailwind/package.json (the npm channel is LIVE for the CLI —
+#         a v3 security bump is a valid regen; v4 is a config-format
+#         migration, capped <4 in renovate.json).
+#         The OLD blob (tailwindcss-3.4.17.js, the Play-CDN runtime
+#         compiler) was deleted by this migration — its 26 lines of
+#         channel history are in git.
+#   sha256: 49b8a7c399720d237594695e2dbccade46ee253fc681ab936f9831eed954254b
 #
 # chart-4.5.1.umd.min.js
 #   source: https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js
