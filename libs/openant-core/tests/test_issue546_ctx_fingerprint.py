@@ -210,6 +210,129 @@ class TestProducerStamps:
         assert ctx.source_sha256 != "0" * 64
 
 
+class TestFoldSiteReads:
+    """#546 follow-up (3a): pin the READS at the actual gate sites, not just
+    the _analyze_fingerprint helper — the verifier and LLR folds had no
+    wiring tests (a key-name drift there silently keys None and #546
+    returns with nothing failing)."""
+
+    def test_llr_fold_reads_the_dict_context(self, tmp_path):
+        """End-to-end through the REAL analyze_reachability gate: two runs
+        with the same units/binding but DIFFERENT source_sha256 in the
+        artifact dict produce DIFFERENT persisted identities (the fold is
+        live at the LLR read site); the same sha reproduces (stability)."""
+        import json as _json
+        from pathlib import Path
+        from core.llm_reachability import analyze_reachability
+        from core.backend_identity import FINGERPRINT_FILE
+        from tests.test_issue532_llr_resume import (
+            FakeAdapter, FakeTracker, _binding, _make_unit, _canned, _sig)
+
+        def sidecar_digest(cp):
+            fp = _json.loads(Path(cp, FINGERPRINT_FILE).read_text())
+            return fp.get("key_digest")
+        cp = str(tmp_path / "cp")
+        dataset = {"units": [_make_unit("a:f1")]}
+        canned = _canned(_sig("a:f1"))
+
+        analyze_reachability(
+            dataset, app_context={"source_sha256": "a" * 64, "application_type": "cli_tool"},
+            binding=_binding(FakeAdapter([canned])),
+            checkpoint_path=cp, tracker=FakeTracker())
+        d1 = sidecar_digest(cp)
+        assert d1, "the sidecar identity was not persisted"
+
+        # Same sha -> same digest (stability: the narration never keys).
+        analyze_reachability(
+            dataset, app_context={"source_sha256": "a" * 64, "application_type": "cli_tool"},
+            binding=_binding(FakeAdapter([canned])),
+            checkpoint_path=cp, tracker=FakeTracker())
+        assert sidecar_digest(cp) == d1
+
+        # Different sha -> different digest (invalidation: the fold is live).
+        analyze_reachability(
+            dataset, app_context={"source_sha256": "b" * 64, "application_type": "cli_tool"},
+            binding=_binding(FakeAdapter([canned])),
+            checkpoint_path=cp, tracker=FakeTracker())
+        assert sidecar_digest(cp) != d1
+
+    def test_llr_fold_accepts_the_dataclass_shape(self, tmp_path):
+        """#546 follow-up (3b): a direct caller passing an ApplicationContext
+        (not the artifact dict) must fold the same identity — the dict-only
+        read used to silently fold nothing for that shape."""
+        from context.application_context import ApplicationContext
+        from tests.test_issue532_llr_resume import (
+            FakeAdapter, FakeTracker, _binding, _make_unit, _canned, _sig)
+        from core.llm_reachability import analyze_reachability
+        import json as _json
+        from pathlib import Path
+        from core.backend_identity import FINGERPRINT_FILE
+        cp1 = str(tmp_path / "cp1"); cp2 = str(tmp_path / "cp2")
+        dataset = {"units": [_make_unit("a:f1")]}
+        canned = _canned(_sig("a:f1"))
+        ctx_dict = {"source_sha256": "c" * 64, "application_type": "cli_tool"}
+        ctx_obj = ApplicationContext(application_type="cli_tool",
+                                     purpose="p",
+                                     source_sha256="c" * 64)
+        for cp, ctx in ((cp1, ctx_dict), (cp2, ctx_obj)):
+            analyze_reachability(
+                dataset, app_context=ctx,
+                binding=_binding(FakeAdapter([canned])),
+                checkpoint_path=cp, tracker=FakeTracker())
+        d_dict = _json.loads(Path(cp1, FINGERPRINT_FILE).read_text())["key_digest"]
+        d_obj = _json.loads(Path(cp2, FINGERPRINT_FILE).read_text())["key_digest"]
+        assert d_dict == d_obj, "the dataclass shape folded a different identity than the dict shape"
+
+    def test_override_with_yaml_date_stays_derived(self):
+        """#546 follow-up (3c): a YAML override with a non-JSON-serializable
+        scalar (an unquoted date -> datetime.date) must NOT land
+        source_sha256=None (the silent fold-skip = stale adoption after an
+        override edit); default=str keeps the identity DERIVED, and the
+        derivation is stable across calls."""
+        import datetime
+        from context.application_context import _application_context_from_override
+        ctx1 = _application_context_from_override(
+            {"application_type": "cli_tool", "purpose": "p",
+             "deadline": datetime.date(2026, 1, 1)},
+            "OPENANT.yaml")
+        ctx2 = _application_context_from_override(
+            {"application_type": "cli_tool", "purpose": "p",
+             "deadline": datetime.date(2026, 1, 1)},
+            "OPENANT.yaml")
+        assert ctx1.source_sha256 is not None, (
+            "a YAML date landed source_sha256=None — the invalidation fold "
+            "is silently skipped for this run")
+        assert ctx1.source_sha256 == ctx2.source_sha256, (
+            "the date-bearing override's identity is not stable across "
+            "calls — every run would re-pay")
+        # The invalidation direction: a CHANGED date value must re-key
+        # (the derivation is a function of the content, not just present).
+        ctx3 = _application_context_from_override(
+            {"application_type": "cli_tool", "purpose": "p",
+             "deadline": datetime.date(2026, 6, 1)},
+            "OPENANT.yaml")
+        assert ctx3.source_sha256 != ctx1.source_sha256
+
+    def test_verifier_fold_reads_the_loaded_context(self):
+        """The verifier's read site (verifier.py's fingerprint_for_binding
+        extra_key) folds the loaded app_context's source_sha256. Pinned at
+        the source level (the house idiom: the assets allowlist test) —
+        run_verification's harness is too heavy to drive end-to-end, and a
+        re-implementation of the expression would be the hollow-test shape.
+        The pin: the call site reads source_sha256 off the loaded
+        app_context via getattr, inside the extra_key, alongside the
+        analyze_fingerprint."""
+        from pathlib import Path
+        src = (Path(__file__).resolve().parent.parent / "core" /
+               "verifier.py").read_text(encoding="utf-8")
+        i = src.index("fingerprint_for_binding(")
+        block = src[i:i + 2500]
+        assert '"ctx_sources_sha256"' in block, "the verifier fold key is gone"
+        assert "getattr(app_context, \"source_sha256\", None)" in block, (
+            "the verifier fold no longer reads the loaded context's "
+            "source_sha256 — a wiring drift keys None silently")
+
+
 class TestGateWiring:
     def test_analyze_fingerprint_folds_the_sha(self):
         from core.analyzer import _analyze_fingerprint

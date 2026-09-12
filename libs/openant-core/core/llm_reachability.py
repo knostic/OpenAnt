@@ -49,10 +49,11 @@ import os
 import re
 import sys
 from dataclasses import dataclass, asdict
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Union, Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from utilities.llm import PhaseBinding
+    from context.application_context import ApplicationContext  # noqa: F401
 from utilities.rate_limiter import is_budget_exhausted_error
 
 
@@ -378,7 +379,7 @@ def _chunk(items: List[Any], size: int) -> List[List[Any]]:
 
 def analyze_reachability(
     dataset: Dict[str, Any],
-    app_context: Optional[Dict[str, Any]] = None,
+    app_context: Optional[Union[Dict[str, Any], "ApplicationContext"]] = None,
     binding: Optional["PhaseBinding"] = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_code_bytes: int = DEFAULT_MAX_CODE_BYTES,
@@ -523,8 +524,16 @@ def analyze_reachability(
             # I2 adopt gate: BEFORE loading prior checkpoints, verify the backend
             # identity that produced them matches (a changed model/provider/
             # adapter/template archives the stale dir and forces a re-run).
-            _ctx_sha = ((app_context or {}).get("source_sha256")
-                        if isinstance(app_context, dict) else None)
+            # #546 follow-up (3b): accept BOTH shapes — the scanner passes
+            # the artifact dict; a direct caller may pass an ApplicationContext
+            # (the type asymmetry the #546 review named: a dataclass-carrying
+            # caller silently folded nothing).
+            _ctx_sha = None
+            if app_context is not None:
+                if isinstance(app_context, dict):
+                    _ctx_sha = app_context.get("source_sha256")
+                else:
+                    _ctx_sha = getattr(app_context, "source_sha256", None)
             llr_fp = fingerprint_for_binding(
                 binding,
                 render_template_texts([

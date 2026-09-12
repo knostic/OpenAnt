@@ -607,16 +607,36 @@ def _application_context_from_override(data: Any, filename: str) -> ApplicationC
     data["override_warnings"] = override_warnings
     data["override_filename"] = filename
     # #546: the override arm's deterministic input IS the override file —
-    # sha over the raw content (the family folds it via the artifact).
+    # sha over the RE-SERIALIZED PARSE of its data (a stable function of
+    # the file's content; not the raw bytes — key ORDER and whitespace
+    # changes do not re-key, semantic changes do).
     # UNCONDITIONAL: the override data is repo-supplied; a supplied
     # source_sha256 must never pin the resume identity (#546's review
     # round — the identity is derived, never adopted).
     import hashlib as _h
     try:
-        _raw = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        # #546 follow-up (3c): default=str — a YAML override with a
+        # non-JSON-serializable scalar (an unquoted date becomes a
+        # datetime.date) used to land source_sha256=None here, silently
+        # skipping the invalidation fold for that run (stale adoption after
+        # an override edit). str() keeps the identity DERIVED; the
+        # documented residual: str() on a type whose repr embeds an address
+        # or other unstable text would make the key never-stable (always
+        # re-pay) — accepted for YAML's date/bytes shapes, which str()
+        # renders deterministically. A SECOND residual: json.dumps raises
+        # BEFORE default is consulted for non-str/mixed-type MAPPING KEYS
+        # (e.g. a YAML `1: x` alongside `a: y` trips sort_keys) — that
+        # lands None (the fail-open direction; warned below, never silent).
+        _raw = json.dumps(data, sort_keys=True, separators=(",", ":"),
+                          default=str)
         data["source_sha256"] = _h.sha256(
             _raw.encode("utf-8")).hexdigest()
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        # Never silent: the None path skips the invalidation fold for this
+        # run (stale adoption) — surface it so an operator sees why.
+        print(f"Warning: override identity could not be derived ({exc}); "
+              f"checkpoint invalidation is skipped for this run — fix the "
+              f"override file's non-serializable keys", file=sys.stderr)
         data["source_sha256"] = None
     known = {f.name for f in fields(ApplicationContext)}
     unknown = [k for k in data if k not in known]
