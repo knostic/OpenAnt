@@ -363,9 +363,8 @@ func TestVendorSourcesTxtMatchesPinTable(t *testing.T) {
 // The sanitizer policy is the XSS boundary. Pin the MD_SANITIZE block
 // cross-template (byte-equal), pin its inert FORBID floor, and pin its
 // USE — a preserved-but-bypassed config block would silently decouple the
-// pages from the sanitizer contract. disclosure.html carries a second
-// sink (the repository-URL rewrite re-sanitizes its innerHTML rewrite);
-// both sinks are pinned.
+// pages from the sanitizer contract. Each page carries exactly ONE
+// innerHTML sink (the primary render), pinned by count below.
 func TestMDSanitizeConfigPinnedAndUsed(t *testing.T) {
 	extract := func(page string) string {
 		s := readPage(t, page)
@@ -465,7 +464,7 @@ func TestMDSanitizeConfigPinnedAndUsed(t *testing.T) {
 	// spellings is evaded; a count is not.
 	for _, page := range []string{"summary.html", "disclosure.html"} {
 		ps := readPage(t, page)
-		wantCount := map[string]int{"summary.html": 2, "disclosure.html": 3}[page]
+		wantCount := map[string]int{"summary.html": 2, "disclosure.html": 2}[page]
 		if got := strings.Count(ps, "MD_SANITIZE"); got != wantCount {
 			t.Fatalf("%s: MD_SANITIZE appears %d times, want exactly %d — a post-block mutation (aliasing, bracket spelling, defineProperty, Object.assign) bypasses every pin on the block itself", page, got, wantCount)
 		}
@@ -474,9 +473,9 @@ func TestMDSanitizeConfigPinnedAndUsed(t *testing.T) {
 		// explanatory comment) is fungible — rewording the comment to free a
 		// mention for a setConfig call would otherwise hold the count. The
 		// legitimate code mentions are exactly the sanitize call sites
-		// (summary: 1; disclosure: 2).
+		// (summary: 1; disclosure: 1).
 		codeOnly := regexp.MustCompile(`//[^\n]*`).ReplaceAllString(ps, "")
-		wantDP := map[string]int{"summary.html": 1, "disclosure.html": 2}[page]
+		wantDP := map[string]int{"summary.html": 1, "disclosure.html": 1}[page]
 		if got := strings.Count(codeOnly, "DOMPurify"); got != wantDP {
 			t.Fatalf("%s: DOMPurify appears %d times in code, want exactly %d — a reassignment (DOMPurify.sanitize=s=>s kills the sink while the pinned invocation string survives), an alias, or a config-API call in any spelling (setConfig deadens the per-call argument — the vendored blob: Ae?(ae=Ee,ce=we):rn(e); clearConfig resets the shared state; addHook re-allows) adds a code mention", page, got, wantDP)
 		}
@@ -544,18 +543,16 @@ func TestMDSanitizeConfigPinnedAndUsed(t *testing.T) {
 		if !strings.Contains(s, "DOMPurify.sanitize(marked.parse(markdown), MD_SANITIZE)") {
 			t.Fatalf("%s: the primary sanitize invocation is gone — the policy block exists but the render path bypassed it", page)
 		}
-	}
-	d := readPage(t, "disclosure.html")
-	if !strings.Contains(string(d), "DOMPurify.sanitize(el.innerHTML.replace(") {
-		t.Fatal("disclosure.html: the URL-rewrite re-sanitize invocation is gone — rewriting innerHTML without re-sanitizing reintroduces markup")
-	}
-	// The policy ARGUMENT of the REWRITE call is pinned by its exact closing
-	// shape: a bare Contains("), MD_SANITIZE);") is satisfied by the primary
-	// sink's own text (line 73) and would mask the exact regression this
-	// exists to catch — the second sink silently falling back to DOMPurify's
-	// DEFAULT policy.
-	const rewriteTail = "'$1<a href=\"$2\" target=\"_blank\" rel=\"noopener\">$2</a>'\n  ), MD_SANITIZE);"
-	if !strings.Contains(string(d), rewriteTail) {
-		t.Fatal("disclosure.html: the URL-rewrite re-sanitize dropped its MD_SANITIZE policy argument — the second sink would run the DEFAULT policy instead of the inert allowlist")
+		// The single-sink pin: exactly ONE innerHTML write per page (the
+		// primary sanitized render). The #578 cleanup round removed
+		// disclosure.html's repository-URL rewrite — a regex-on-innerHTML
+		// second sink that never matched its own target (the
+		// **Repository:** line is the SUMMARY prompt's, prompts/summary.txt;
+		// marked renders it as <strong> + a native GFM autolink before the
+		// regex ever ran) and misfired only inside code spans. Any second
+		// innerHTML write must re-open this pin deliberately.
+		if got := strings.Count(s, "innerHTML"); got != 1 {
+			t.Fatalf("%s: %d innerHTML writes, want exactly 1 (the primary sanitized render) — a second innerHTML sink must be re-justified and re-pinned deliberately", page, got)
+		}
 	}
 }
