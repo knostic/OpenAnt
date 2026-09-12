@@ -40,7 +40,7 @@ var uiVendorScripts = []struct {
 	sha256 string
 	banner string
 }{
-	{"marked-12.0.2.min.js", "15fabce5b65898b32b03f5ed25e9f891a729ad4c0d6d877110a7744aa847a894", "marked v"},
+	{"marked-18.0.12.min.js", "fa0cfbf0181339312eaa3709b577ad698fc21a9baa42d580a3fd1f267b19b4a8", "marked v"},
 	{"dompurify-3.4.15.min.js", "f263b05369e050fa175d4ecb9c9358eb4253602d510297adfb31df48b2f1c4d5", "DOMPurify "},
 }
 
