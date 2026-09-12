@@ -24,11 +24,11 @@ func TestRepoHostBlocked(t *testing.T) {
 		"http://0.0.0.0/x.git",
 		// Legacy numeric IPv4 encodings of 127.0.0.1 (net.ParseIP rejects these,
 		// inet_aton/libcurl accept them).
-		"http://2130706433/x.git",   // decimal
-		"http://0x7f000001/x.git",   // hex (single field)
-		"http://017700000001/x.git", // octal (single field)
-		"http://127.1/x.git",        // short form
-		"git@2130706433:x.git",      // decimal over ssh host
+		"http://2130706433/x.git",     // decimal
+		"http://0x7f000001/x.git",     // hex (single field)
+		"http://017700000001/x.git",   // octal (single field)
+		"http://127.1/x.git",          // short form
+		"git@2130706433:x.git",        // decimal over ssh host
 		// Decimal encoding of 169.254.169.254 (cloud metadata).
 		"http://2852039166/latest/meta-data/",
 		// Integer >= 2^32: C inet_aton wraps mod 2^32, so 4294967296 -> 0.0.0.0,
@@ -52,9 +52,9 @@ func TestRepoHostBlocked(t *testing.T) {
 		// of what it resolves to, so no encoding can bypass. These are non-sensitive
 		// as values but still refused because a real repo would use the canonical
 		// form or a DNS name.
-		"http://0xdeadbeef/x.git",      // hex of a public IP (222.173.190.239)
-		"http://010.010.010.010/x.git", // octal 8.8.8.8 / decimal 10.10.10.10
-		"http://3232235521/x.git",      // decimal of 192.168.0.1 (canonical form allowed)
+		"http://0xdeadbeef/x.git",       // hex of a public IP (222.173.190.239)
+		"http://010.010.010.010/x.git",  // octal 8.8.8.8 / decimal 10.10.10.10
+		"http://3232235521/x.git",       // decimal of 192.168.0.1 (canonical form allowed)
 		// FQDN-root spellings.
 		"http://localhost./x.git",
 		"https://127.0.0.1./x.git",
@@ -87,7 +87,7 @@ func TestRepoHostBlocked(t *testing.T) {
 		`http://example.com\@127.0.0.1/x.git`,
 		// Non-ASCII (IDNA) host: a libidn2 git maps unicode label separators /
 		// fullwidth digits to ASCII, dialing 127.0.0.1. Non-ASCII fails closed.
-		"http://127。0。0。1/x.git", // U+3002 ideographic dots
+		"http://127。0。0。1/x.git",       // U+3002 ideographic dots
 		"http://１２７．0．0．1/x.git", // fullwidth 127.0.0.1
 	}
 	for _, r := range blocked {

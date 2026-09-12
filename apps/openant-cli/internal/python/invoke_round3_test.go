@@ -69,7 +69,14 @@ func TestInvoke_KillArtifactExitCodeIsConservative(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("signal-death artifact is Unix; Windows takes the same mapping via exitErrIsKillArtifact")
 	}
-	t.Setenv("OPENANT_INVOKE_TIMEOUT", "2s")
+	// #585: the deadline is the fast-phase margin — the envelope printf
+	// must land before the deadline fires. The 2s this replaced carried
+	// the same load-spawn race as the invoke_ctx trio. This child STAYS
+	// ALIVE (exec sleep 60) — no WaitDelay ceiling — so the budget
+	// follows the envelope family's incident-bought rule (see
+	// invoke_envelope_test.go:30-37): 30s, the stalled-child-beatable
+	// shape.
+	t.Setenv("OPENANT_INVOKE_TIMEOUT", "30s")
 	s := writeScript(t, `printf '{"status":"success","errors":[]}'
 exec sleep 60
 `)
@@ -89,7 +96,7 @@ exec sleep 60
 	if res.ExitCode != 2 {
 		t.Fatalf("exit code = %d, want the conservative 2 — the kill artifact must never surface as clean/vulns-found", res.ExitCode)
 	}
-	if !strings.Contains(string(b), "result envelope was recovered") {
+	if !strings.Contains(string(b), envelopeRecoveredMarker) {
 		t.Fatalf("the recovery notice must be visible on stderr when not quiet; got: %q", string(b))
 	}
 }

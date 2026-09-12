@@ -36,6 +36,13 @@ import (
 // that checkpoint) the resume path.
 // resolveInvokeTimeout lets an operator raise the budget via
 // OPENANT_INVOKE_TIMEOUT without recompiling.
+// invokeWaitDelay bounds how long Wait tolerates open pipes after the
+// child exits (or the context fires) — the descendant-held-pipe window.
+// The zombie-window tests assert their deadlines stay strictly BELOW this
+// (at or above it they flip to the ErrWaitDelay branch and their pins go
+// vacuous); a change here is a deliberate contract change.
+const invokeWaitDelay = 5 * time.Second
+
 var defaultInvokeTimeout = 30 * time.Minute
 
 // resolveInvokeTimeout returns the invoke deadline, honoring the
@@ -109,7 +116,7 @@ func Invoke(pythonPath string, args []string, workDir string, quiet bool, apiKey
 	// (the old normal-path drain bound) is deleted — its only production
 	// call site was removed by the managed-writers refactor; the tests
 	// ride this WaitDelay bound now.
-	cmd.WaitDelay = 5 * time.Second
+	cmd.WaitDelay = invokeWaitDelay
 
 	if workDir != "" {
 		cmd.Dir = workDir

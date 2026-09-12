@@ -89,9 +89,9 @@ func deadlineOutcome(stdoutBuf *bytes.Buffer, invokeTimeout time.Duration, onLog
 	// deep-refute (fable, strictness finding): the whole-buffer single-JSON
 	// requirement is stricter than the server's own noise premise —
 	// envelopeErrors exists because the stream can carry non-JSON log noise
-	// around the envelope. Scan lines bottom-up for the last well-formed
-	// envelope, the same tolerance; only when NO usable envelope exists is
-	// it a deadline kill.
+	// around the envelope. Scan for a well-formed envelope line (the FIRST
+	// match wins — the #585 review corrected an earlier "bottom-up" claim
+	// here); only when NO usable envelope exists is it a deadline kill.
 	recovered := ""
 	for _, line := range strings.Split(stdoutBuf.String(), "\n") {
 		line = strings.TrimSpace(line)
@@ -174,7 +174,7 @@ func invokeCtxInner(ctx context.Context, pythonPath string, args []string, workD
 	// once and stops before Wait reaps the child, so there is no window to SIGKILL
 	// a recycled pgid after reaping.
 	setProcGroupKill(cmd)
-	cmd.WaitDelay = 5 * time.Second
+	cmd.WaitDelay = invokeWaitDelay
 
 	var stdoutBuf bytes.Buffer
 	if captureStdout {
