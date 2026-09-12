@@ -26,10 +26,16 @@ from utilities.rate_limiter import is_retryable_error  # noqa: E402
 
 # Verbatim adapter messages (str(e) of the raised exception is what reaches the
 # retry filter via core.analyzer._process_unit's except-branch error=str(e)).
-_EMPTY_ANTHROPIC = ("AnthropicAdapter returned no usable content (empty completion); "
-                    "the request may have been filtered or the response was malformed")
+# Post-#561 the anthropic producer embeds the raw stop in the parens and
+# branches the cause on it; the filtered arm is the retryable shape here.
+_EMPTY_ANTHROPIC = ("AnthropicAdapter returned no usable content (empty completion; "
+                    "stop_reason='end_turn'); the request may have been filtered "
+                    "or the response was malformed")
+# Post-#569 the google producer branches on the finish signal; the filtered
+# arm is the retryable shape tested here (the MAX_TOKENS arm carries the
+# budget marker and is pinned by test_issue569_budget_retry instead).
 _EMPTY_GEMINI = ("Gemini returned a candidate with no usable content (empty completion); "
-                 "the response may have been truncated (a thinking block)")
+                 "the response may have been filtered or malformed")
 # OpenAI Responses-API empty path: says "no usable content" but NOT
 # "empty completion" — the term must match the shared "no usable content"
 # phrase so this sibling is covered too. Both post-#569 producer arms (the
@@ -44,8 +50,12 @@ _EMPTY_OPENAI_RESPONSES_FILTERED = ("OpenAI Responses returned no usable content
 # translator) are silently not retried.
 _EMPTY_OPENAI_CHAT_NOCHOICES = ("OpenAIAdapter returned no choices (empty completion); "
                                 "the request may have been filtered or the response was malformed")
+# Post-#561/#569 the chat producer embeds the raw finish and branches the
+# cause; the filtered arm is the retryable shape here (the length arm
+# carries the budget marker, pinned by test_issue569_budget_retry).
 _EMPTY_OPENAI_CHAT_NOBLOCKS = ("OpenAIAdapter returned an empty completion (no text or tool "
-                               "calls); the request may have been filtered or malformed")
+                               "calls; finish_reason='stop'); the request may have been "
+                               "filtered or the response was malformed")
 _REFUSAL = ("AnthropicAdapter refused the request (stop_reason='refusal'); the model "
             "declined to answer for safety or policy reasons")
 
@@ -54,6 +64,7 @@ def test_empty_completion_is_retryable():
     assert is_retryable_error(_EMPTY_ANTHROPIC) is True
     assert is_retryable_error(_EMPTY_GEMINI) is True
     assert is_retryable_error(_EMPTY_OPENAI_RESPONSES) is True
+    assert is_retryable_error(_EMPTY_OPENAI_RESPONSES_FILTERED) is True
     assert is_retryable_error(_EMPTY_OPENAI_CHAT_NOCHOICES) is True
     assert is_retryable_error(_EMPTY_OPENAI_CHAT_NOBLOCKS) is True
 
@@ -98,6 +109,7 @@ def test_empty_completion_dict_is_retryable():
     assert is_retryable_error(_info(_EMPTY_ANTHROPIC)) is True
     assert is_retryable_error(_info(_EMPTY_GEMINI)) is True
     assert is_retryable_error(_info(_EMPTY_OPENAI_RESPONSES)) is True
+    assert is_retryable_error(_info(_EMPTY_OPENAI_RESPONSES_FILTERED)) is True
     assert is_retryable_error(_info(_EMPTY_OPENAI_CHAT_NOCHOICES)) is True
     assert is_retryable_error(_info(_EMPTY_OPENAI_CHAT_NOBLOCKS)) is True
 

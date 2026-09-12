@@ -83,6 +83,16 @@ _MODEL_ACCESS_HINT = (
 
 _NO_CREDENTIALS_MARKER = "could not resolve credentials"
 
+
+def _typed_credentials_error() -> type[BaseException]:
+    """The SDK's typed credential-error class, or a never-matching fallback
+    when the pinned anthropic predates it (>=1.5.0 carries CredentialsError;
+    the pyproject floor is >=0.40.0). Returns BaseException-substituted so
+    the except clause is syntactically valid on every floor version while
+    matching nothing on the old SDKs."""
+    cls = getattr(anthropic, "CredentialsError", None)
+    return cls if cls is not None else type("_NeverRaised", (BaseException,), {})
+
 # One-time warning when a config sets api_key on a bedrock provider.
 # Silent-ignoring config a user explicitly wrote would violate the
 # no-silent-drops rule the other adapters follow.
@@ -231,6 +241,19 @@ class BedrockAdapter:
             if _NO_CREDENTIALS_MARKER in str(exc):
                 raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
             raise
+        except _typed_credentials_error() as exc:
+            # Upgrade-defense (the review round's reachability correction):
+            # on the pinned 1.5.0 the BEDROCK signer still raises the bare
+            # RuntimeError the marker arm above already maps; the typed
+            # CredentialsError family is raised by the BASE client's
+            # auth-profile machinery, which AnthropicBedrock never invokes
+            # today — but an SDK narrowing (the direction 1.5.0 took the
+            # base-client raises) lands here first. Map it to the same typed
+            # auth path. getattr-guarded: the pyproject floor
+            # (anthropic>=0.40.0) predates the class — a bare
+            # `except anthropic.CredentialsError` would AttributeError on
+            # older SDKs at exactly the moment a real error propagates.
+            raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
 
         return _response_to_unified(response, adapter="BedrockAdapter")
 
@@ -265,6 +288,12 @@ class BedrockAdapter:
             if _NO_CREDENTIALS_MARKER in str(exc):
                 raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
             raise
+        except _typed_credentials_error() as exc:
+            # Upgrade-defense, mirrored from complete() (validate() is the
+            # FIRST call a scan makes — registry.validate at startup — and
+            # probe_registry_or_raise catches only LLMError, so a typed
+            # credential failure here would surface raw and unredacted.
+            raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
 
 
 # ----------------------------------------------------------------------

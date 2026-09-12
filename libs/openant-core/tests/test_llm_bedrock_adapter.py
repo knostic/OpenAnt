@@ -265,6 +265,35 @@ class TestErrorMapping:
         with pytest.raises(LLMAuthError):
             adapter.validate(model="us.anthropic.claude-sonnet-4-6")
 
+    def test_typed_credentials_error_maps_to_auth_error(self):
+        """1.5.0 narrowed the identity-token/auth-profile raises to the typed
+        CredentialsError (an AnthropicError subclass the APIStatusError arm
+        never sees); it must surface typed like the bare-RuntimeError marker.
+        The except is getattr-guarded — on SDKs older than 1.5.0 the arm
+        matches nothing (the helper returns a never-raised class)."""
+        cls = getattr(anthropic, "CredentialsError", None)
+        if cls is None:
+            pytest.skip("the pinned anthropic predates CredentialsError (>=1.5.0)")
+
+        # The message deliberately does NOT carry _NO_CREDENTIALS_MARKER —
+        # a marker-carrying message would pass via the RuntimeError arm if
+        # the class ever subclassed RuntimeError, and this test must prove
+        # the TYPED arm did the mapping.
+        def respond(**kw):
+            raise cls("identity token file is not readable")
+
+        adapter, _ = _stub_adapter(respond)
+        with pytest.raises(LLMAuthError) as exc_info:
+            _complete(adapter)
+        assert "AWS_ACCESS_KEY_ID" in str(exc_info.value)
+
+        # The startup probe takes the same typed path (validate() is the
+        # first call a scan makes; the probe catches only LLMError).
+        adapter, _ = _stub_adapter(respond)
+        with pytest.raises(LLMAuthError) as exc_info:
+            adapter.validate(model="us.anthropic.claude-sonnet-4-6")
+        assert "AWS_ACCESS_KEY_ID" in str(exc_info.value)
+
     def test_unrelated_runtime_error_propagates(self):
         """Only the SDK's no-credentials RuntimeError is auth-shaped;
         anything else must not be swallowed into the taxonomy."""
