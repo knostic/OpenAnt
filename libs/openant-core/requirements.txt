@@ -15,7 +15,7 @@ httpx2==2.12.0  # NOTE: never call httpx2.alias_httpx() here — it rebinds `imp
 httpcore2==2.12.0
 truststore==0.10.4
 idna==3.19
-jiter==0.16.0
+jiter==0.17.0
 pydantic==2.13.5
 python-dotenv==1.2.3
 sniffio==1.3.1
