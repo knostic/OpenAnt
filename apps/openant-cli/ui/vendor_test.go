@@ -215,7 +215,7 @@ func TestUIPagesLoadNoExternalScripts(t *testing.T) {
 			}
 			srcTags = append(srcTags, src)
 		}
-		if strings.Contains(s, `type="module"`) || strings.Contains(s, "type='module'") {
+		if regexp.MustCompile(`(?i)\btype\s*=\s*["']?module\b`).MatchString(s) {
 			t.Fatalf("%s: a module script is out of policy for the embedded pages (an import would be an external dependency the src guard cannot see)", page)
 		}
 		if uiHttpsImport.MatchString(s) {

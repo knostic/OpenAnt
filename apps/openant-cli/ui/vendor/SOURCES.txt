@@ -27,6 +27,14 @@
 # or hashes for the templates' inline <script> and <style> blocks: a design
 # change, deliberately out of this fix's scope).
 #
+# LIMITATION (the sha lock's blind spot, #578 review round): the lock
+# detects UNCOORDINATED drift only — a single commit that moves the blob
+# AND the sha256 here AND the pin table together passes every test. The
+# one guard for a coordinated swap is the REVIEWER's out-of-band
+# cross-check: on every bump, independently re-derive the npm tarball's
+# sha512 against the registry's dist.integrity and the inner file's
+# sha256 against the committed bytes — never trust the diff's own numbers.
+#
 # marked-12.0.2.min.js
 #   source: https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js
 #   npm anchor: registry.npmjs.org/marked/-/marked-12.0.2.tgz
