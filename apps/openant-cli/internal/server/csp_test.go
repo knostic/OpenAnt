@@ -11,9 +11,10 @@ import (
 	uifiles "github.com/knostic/open-ant-cli/ui"
 )
 
-// #578 follow-up A: the CSP contract. The four UI pages carry a per-response
-// nonce (header == every inline script/style tag); /report/{id} carries the
-// no-network policy; /assets carries none (not a document).
+// #578 follow-up A + 1a: the CSP contract. The four UI pages carry a
+// per-response nonce (header == every inline script/style tag); /report/{id}
+// carries the no-network policy; everything unwrapped carries the fail-closed
+// default (inert on non-documents).
 func TestCSPPoliciesPerRoute(t *testing.T) {
 	// The templates are parsed from the ui embed (same as New()) — a
 	// zero-value Server has nil templates and handleIndex would nil-panic.
@@ -118,7 +119,7 @@ func TestCSPPoliciesPerRoute(t *testing.T) {
 	t.Run("summary and disclosure routes carry the nonce policy", func(t *testing.T) {
 		// Even 404 responses from the UI-page routes carry the CSP header
 		// (the middleware sets it before the handler) — this pins the
-		// ROUTE classification (isUIPage) for the artifact-backed pages.
+		// ROUTE classification (the wrapper fires on the route, by construction) for the artifact-backed pages.
 		for _, path := range []string{"/summary/j1", "/disclosure/j1/d.md"} {
 			csp := get(path).Header().Get("Content-Security-Policy")
 			m := regexp.MustCompile(`'nonce-([0-9a-f]+)'`).FindStringSubmatch(csp)
@@ -168,13 +169,41 @@ func TestCSPPoliciesPerRoute(t *testing.T) {
 		}
 	})
 
-	t.Run("assets carry no CSP", func(t *testing.T) {
-		rec := get("/assets/marked-18.0.12.min.js")
-		if csp := rec.Header().Get("Content-Security-Policy"); csp != "" {
-			t.Errorf("GET /assets: unexpected CSP on a non-document: %q", csp)
+	t.Run("unwrapped routes carry the fail-closed default", func(t *testing.T) {
+		// #578 follow-up 1a: assets and API routes now carry the
+		// restrictive DEFAULT policy (inert on non-documents — CSP governs
+		// document loads). The load-bearing direction: a future HTML route
+		// registered WITHOUT a wrapper gets this too — scriptless and
+		// unstyled (loud), never silently CSP-less.
+		for _, path := range []string{"/assets/marked-18.0.12.min.js", "/disclosures/j1"} {
+			csp := get(path).Header().Get("Content-Security-Policy")
+			for _, want := range []string{
+				"default-src 'none'",
+				"script-src 'none'",
+				"connect-src 'none'",
+			} {
+				if !strings.Contains(csp, want) {
+					t.Errorf("GET %s: the fail-closed default is missing %q: %q", path, want, csp)
+				}
+			}
 		}
-		if xo := rec.Header().Get("X-Content-Type-Options"); xo != "nosniff" {
+		if xo := get("/assets/marked-18.0.12.min.js").Header().Get("X-Content-Type-Options"); xo != "nosniff" {
 			t.Errorf("GET /assets: nosniff lost: %q", xo)
+		}
+	})
+
+	t.Run("the scan-page 404 keeps the nonce policy (route-classified, not path-guessed)", func(t *testing.T) {
+		// The wrapper fires on the ROUTE, so a 404 from a mis-typed scan id
+		// still carries the nonce policy (previously isUIPage matched the
+		// path prefix — same behavior, now by construction not heuristic).
+		csp := get("/scan/nonexistent").Header().Get("Content-Security-Policy")
+		if !strings.Contains(csp, "'nonce-") {
+			t.Errorf("GET /scan/nonexistent: expected the nonce policy on the route's 404: %q", csp)
+		}
+		// The SSE logs route is NOT a UI page — it carries the default.
+		cspLogs := get("/scan/j1/logs").Header().Get("Content-Security-Policy")
+		if strings.Contains(cspLogs, "'nonce-") {
+			t.Errorf("GET /scan/j1/logs: the SSE stream must not carry the nonce policy: %q", cspLogs)
 		}
 	})
 }
