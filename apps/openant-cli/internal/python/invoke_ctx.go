@@ -89,9 +89,9 @@ func deadlineOutcome(stdoutBuf *bytes.Buffer, invokeTimeout time.Duration, onLog
 	// deep-refute (fable, strictness finding): the whole-buffer single-JSON
 	// requirement is stricter than the server's own noise premise —
 	// envelopeErrors exists because the stream can carry non-JSON log noise
-	// around the envelope. Scan lines bottom-up for the last well-formed
-	// envelope, the same tolerance; only when NO usable envelope exists is
-	// it a deadline kill.
+	// around the envelope. Scan for a well-formed envelope line (the FIRST
+	// match wins — the #585 review corrected an earlier "bottom-up" claim
+	// here); only when NO usable envelope exists is it a deadline kill.
 	recovered := ""
 	for _, line := range strings.Split(stdoutBuf.String(), "\n") {
 		line = strings.TrimSpace(line)
@@ -174,7 +174,7 @@ func invokeCtxInner(ctx context.Context, pythonPath string, args []string, workD
 	// once and stops before Wait reaps the child, so there is no window to SIGKILL
 	// a recycled pgid after reaping.
 	setProcGroupKill(cmd)
-	cmd.WaitDelay = 5 * time.Second
+	cmd.WaitDelay = invokeWaitDelay
 
 	var stdoutBuf bytes.Buffer
 	if captureStdout {
@@ -222,10 +222,13 @@ func invokeCtxInner(ctx context.Context, pythonPath string, args []string, workD
 		}
 		if ctx.Err() == context.DeadlineExceeded {
 			// The kill tripped the pipe-close path instead. The zombie-kill
-			// window (invoke.go:274-285's #319): the child already exited —
-			// SUCCESSFULLY — and only a descendant held a pipe; the
-			// watchdog's Cancel fired on the reaped zombie. A usable
-			// envelope wins; only when there is none is it a deadline kill.
+			// window (#319): the child already exited — SUCCESSFULLY — and
+			// only a descendant held a pipe. Mechanism (the #585 round's
+			// correction, traced against os/exec): Cancel is never called
+			// once the child is reaped; Wait blocks on the descendant-held
+			// pipe and the WaitDelay timer force-closes it at child-exit +
+			// invokeWaitDelay. A usable envelope in the captured stdout
+			// wins; only when there is none is it a deadline kill.
 			if cmd.ProcessState != nil && cmd.ProcessState.Success() {
 				// (deep-refute: Success() alone — the Len()>0 conjunct made
 				// the discard-stdout InvokeCtx mode report a successful

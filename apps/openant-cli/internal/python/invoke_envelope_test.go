@@ -84,7 +84,7 @@ exit 0
 	if res.ExitCode != 0 {
 		t.Fatalf("exit code = %d, want 0", res.ExitCode)
 	}
-	if strings.Contains(string(b), "result envelope was recovered") {
+	if strings.Contains(string(b), envelopeRecoveredMarker) {
 		t.Fatalf("the recovery notice printed without a fired deadline: %q", string(b))
 	}
 	if elapsed := time.Since(start); elapsed > 12*time.Second {
