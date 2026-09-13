@@ -1373,7 +1373,8 @@ def scan_repository(
     result.usage = tracking.get_usage()
     result.step_reports = collected_step_reports
 
-    _write_scan_report(output_dir, result, collected_step_reports)
+    _write_scan_report(output_dir, result, collected_step_reports,
+                       repo_path=repo_path)
     _print_summary(result)
 
     return result
@@ -1604,8 +1605,17 @@ def _write_scan_report(
     output_dir: str,
     result: ScanResult,
     step_reports: list[dict],
+    *,
+    repo_path: str,
 ) -> str:
-    """Write ``scan.report.json`` — the aggregate report for the full pipeline."""
+    """Write ``scan.report.json`` — the aggregate report for the full pipeline.
+
+    ``repo_path`` is the scan target, threaded by the caller (absolutized
+    once at the top of ``scan_repository``) and written verbatim under
+    ``inputs.repo_path`` — never re-``abspath``'d or relativized — matching
+    the per-step reports that carry the key (the parse step's, the
+    app-context step's, the enhance step's).
+    """
     total_cost = sum(sr.get("cost_usd", 0) for sr in step_reports)
     total_duration = sum(sr.get("duration_seconds", 0) for sr in step_reports)
     # #285: aggregate the per-step status and errors — the scan report must
@@ -1660,10 +1670,13 @@ def _write_scan_report(
             # re-pointable by a concurrent session mid-scan; the children
             # now resolve explicitly (utilities/child_interp.py), and this
             # record makes any residual skew detectable after the fact.
-            # RELATIVIZED when under the user's home: the adjacent
-            # inputs.repo_path is deliberately basename-only, and a raw
-            # absolute path here would leak the OS username into a
-            # diagnostic artifact likely to be attached to support tickets.
+            # RELATIVIZED when under the user's home: this key is the tool's
+            # INSTALL path (incidental disclosure, typically under home) — a
+            # different contract from inputs.repo_path (#613), which is the
+            # scan's primary INPUT and is recorded raw absolute exactly like
+            # every per-step report. Relativizing here limits incidental
+            # install-path disclosure; it does not make the report share-safe
+            # (the outputs block carries raw artifact paths too).
             "openant_core_path": _relativize_home(str(resolved_core_path())),
             # R5: provenance of a repo-supplied threat model. sha is absent (key
             # omitted) when no threat model was loaded — never the empty hash.
@@ -1695,7 +1708,12 @@ def _write_scan_report(
             # (directories), summed across languages from each scan-result file.
             "coverage": _collect_coverage(result),
         },
-        inputs={"repo_path": result.output_dir.replace(os.path.abspath("."), ".")},
+        # #613: the actual scan target — the caller-threaded, caller-absolutized
+        # repo path, written verbatim like every per-step inputs.repo_path (the
+        # parse report carries the same value in this directory). NOT the
+        # output directory: the old line fabricated the input from the output
+        # state, and its cwd-substring "relativizer" corrupted values outright.
+        inputs={"repo_path": repo_path},
         outputs={
             "dataset_path": result.dataset_path,
             "enhanced_dataset_path": result.enhanced_dataset_path,

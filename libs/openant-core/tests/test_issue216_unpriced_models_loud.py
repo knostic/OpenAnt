@@ -123,7 +123,8 @@ def test_scan_report_aggregate_or_aggregates_marker(tmp_path, monkeypatch):
          "token_usage": {"input_tokens": 5, "output_tokens": 5,
                          "total_tokens": 10}},
     ]
-    path = _write_scan_report(str(tmp_path), result, step_reports)
+    path = _write_scan_report(str(tmp_path), result, step_reports,
+                              repo_path=str(tmp_path / "repo"))
     agg = json.loads(Path(path).read_text())
     tu = agg["token_usage"]
     assert tu["cost_incomplete"] is True
@@ -141,7 +142,8 @@ def test_scan_report_aggregate_clean_when_all_steps_clean(tmp_path):
     step_reports = [{"step": "parse", "cost_usd": 0.1, "duration_seconds": 1.0,
                      "token_usage": {"input_tokens": 5, "output_tokens": 5,
                                      "total_tokens": 10}}]
-    path = _write_scan_report(str(tmp_path), result, step_reports)
+    path = _write_scan_report(str(tmp_path), result, step_reports,
+                              repo_path=str(tmp_path / "repo"))
     agg = json.loads(Path(path).read_text())
     assert "cost_incomplete" not in agg["token_usage"]
 

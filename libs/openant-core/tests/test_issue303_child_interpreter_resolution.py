@@ -127,7 +127,8 @@ def test_scan_report_records_the_resolved_core_path(tmp_path):
     result = ScanResult(output_dir=str(tmp_path))
     result.units_count = 1
     result.language = "python"
-    _write_scan_report(str(tmp_path), result, [])
+    _write_scan_report(str(tmp_path), result, [],
+                       repo_path=str(tmp_path / "repo"))
     report = json.loads((tmp_path / "scan.report.json").read_text())
     # leak hygiene: the recorded path is ~-relativized when under the
     # user's home (CI: /home/runner/... -> ~/...), never the raw absolute
