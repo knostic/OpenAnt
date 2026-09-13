@@ -194,14 +194,18 @@ func TestInvokeCtx_ZombieKillWindowKeepsSuccess(t *testing.T) {
 	// pipe-close and the test silently flips to the ErrWaitDelay branch
 	// (ctx.Err() == nil), where these pins pass vacuously without ever
 	// exercising the zombie window.
-	// 4s: the maximum under the ceiling with 1s of timer slack. RESIDUAL
-	// (documented): the measured full-suite stall band (2s-6s+, the
-	// envelope family's receipts) overlaps any sub-5s budget — a stall
-	// past 4s re-fires this test, but LOUDLY (the pins below name the
-	// wrong branch), never as a silent wrong-path pass. The structural
-	// way out is a production invokeWaitDelay raise — a maintainer
-	// decision, deliberately out of this test-only fix's scope.
-	const testDeadline = 4 * time.Second
+	// The #593 review round's follow-up (fable's alternative): the var is
+	// overridden HERE (the defaultInvokeTimeout precedent) so the deadline
+	// can adopt the envelope family's own 30s budget — the 2s-6s+ stall
+	// band no longer overlaps it, eliminating the 4s residual entirely
+	// (the old sub-5s budget re-fired on a long stall, loudly; now it
+	// cannot fire at all — the stall band sits far below the deadline).
+	// The ceiling invariant still holds by construction (35s > 30s) and is
+	// still asserted.
+	const testDeadline = 30 * time.Second
+	oldWaitDelay := invokeWaitDelay
+	invokeWaitDelay = 35 * time.Second
+	defer func() { invokeWaitDelay = oldWaitDelay }()
 	if !(testDeadline < invokeWaitDelay) {
 		t.Fatalf("the test deadline %v must stay strictly below invokeWaitDelay %v — the zombie-window branch is unreachable otherwise", testDeadline, invokeWaitDelay)
 	}
@@ -234,11 +238,12 @@ exit 0`)
 	}
 	// Sanity window, not a branch discriminator. The lower bound sits
 	// ABOVE the deadline: the correct path returns at child-exit +
-	// invokeWaitDelay (~5s), while any sub-deadline return (e.g. a
-	// WaitDelay reduced below the deadline) means the pipes closed before
-	// the ctx ever fired — the ErrWaitDelay branch, not the zombie window.
-	if el := time.Since(start); el < 4500*time.Millisecond || el > 15*time.Second {
-		t.Fatalf("elapsed %v outside the sanity window [4.5s, 15s]", el)
+	// invokeWaitDelay (~35s under the test override), while any
+	// sub-deadline return (e.g. a WaitDelay reduced below the deadline)
+	// means the pipes closed before the ctx ever fired — the ErrWaitDelay
+	// branch, not the zombie window.
+	if el := time.Since(start); el < 30*time.Second || el > 60*time.Second {
+		t.Fatalf("elapsed %v outside the sanity window [30s, 60s]", el)
 	}
 }
 
@@ -258,10 +263,12 @@ func TestInvokeCtx_DiscardStdoutNaturalExitZeroNotADeadline(t *testing.T) {
 	// INVARIANT as the zombie test: strictly below invokeWaitDelay, and
 	// the same above-deadline lower bound (any sub-deadline return is the
 	// ErrWaitDelay branch, not the zombie window).
-	// 4s: the maximum under the ceiling — the same documented RESIDUAL as
-	// the zombie test (the stall band overlaps any sub-5s budget; the
-	// failure is loud, never a silent wrong-path pass).
-	const testDeadline = 4 * time.Second
+	// The same var-override treatment as the zombie test: the family's 30s
+	// budget under a 35s test WaitDelay — the stall-band residual is gone.
+	const testDeadline = 30 * time.Second
+	oldWaitDelay := invokeWaitDelay
+	invokeWaitDelay = 35 * time.Second
+	defer func() { invokeWaitDelay = oldWaitDelay }()
 	if !(testDeadline < invokeWaitDelay) {
 		t.Fatalf("the test deadline %v must stay strictly below invokeWaitDelay %v", testDeadline, invokeWaitDelay)
 	}
@@ -276,10 +283,11 @@ exit 0`)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0", code)
 	}
-	// Sanity window (the correct path returns at child-exit + WaitDelay,
-	// ~5s; the lower bound rejects sub-deadline returns — a hung run is
-	// the go-test timeout's job, not an elapsed check's).
-	if el := time.Since(start); el < 4500*time.Millisecond || el > 15*time.Second {
-		t.Fatalf("elapsed %v outside the sanity window [4.5s, 15s]", el)
+	// Sanity window (the correct path returns at child-exit + the
+	// overridden WaitDelay, ~35s; the lower bound rejects sub-deadline
+	// returns — a hung run is the go-test timeout's job, not an elapsed
+	// check's).
+	if el := time.Since(start); el < 30*time.Second || el > 60*time.Second {
+		t.Fatalf("elapsed %v outside the sanity window [30s, 60s]", el)
 	}
 }

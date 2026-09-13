@@ -142,7 +142,11 @@ exit 0
 // pre-fix message promised a resume that cannot happen (parse writes no
 // checkpoints; the deadline's own design target is a hung parser).
 func TestInvoke_DeadlineDiagnosis_HintGatedBySubcommand(t *testing.T) {
-	t.Setenv("OPENANT_INVOKE_TIMEOUT", "300ms")
+	// 1s (the #593 de-flake's own start-window floor — GLM's sibling
+	// finding): 300ms sat below the floor the same PR established two
+	// files over; a >300ms start-side stall produced the start-shaped
+	// error and failed the diagnosis containment.
+	t.Setenv("OPENANT_INVOKE_TIMEOUT", "1s")
 	s := writeScript(t, "sleep 3\n")
 	// parse: no checkpoint clause
 	_, err := Invoke(s, []string{"parse", "."}, "", true, "")
