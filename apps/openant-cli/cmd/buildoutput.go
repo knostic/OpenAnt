@@ -81,7 +81,9 @@ func runBuildOutput(cmd *cobra.Command, args []string) {
 
 	pyArgs := []string{"build-output", resultsPath, "--output", buildOutputPath}
 	if buildOutputRepoName != "" {
-		pyArgs = append(pyArgs, "--repo-name", buildOutputRepoName)
+		// The "=" form: a name starting with "-" must never parse as a
+		// flag element (argparse treats "--repo-name -x" as a flag).
+		pyArgs = append(pyArgs, "--repo-name="+buildOutputRepoName)
 	}
 	if buildOutputRepoURL != "" {
 		// #562: normalize defensively (an init-recorded scp-form or

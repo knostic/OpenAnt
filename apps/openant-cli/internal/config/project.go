@@ -175,6 +175,16 @@ func NewProject(name, repoURL, repoPath, source, language, commitSHA string) *Pr
 
 // DeriveProjectName extracts "org/repo" from a URL or local path.
 //
+// #612: deliberately NOT unified with remoteurl.RepoSlug (the scan
+// path's name tier). The HTTPS branch below takes the FIRST two path
+// segments because its output feeds ProjectDir (an on-disk path) and
+// ListProjects' two-level scan — unifying THAT branch with RepoSlug's
+// full-namespace shape would silently relocate nested-namespace
+// projects on disk. (The scp branch keeps the whole post-colon path, so
+// nested namespaces already land deep today; the divergence that
+// matters is the https branch's shape + RepoSlug's slug charset.) The
+// divergence is load-bearing; do not unify.
+//
 // Examples:
 //
 //	https://github.com/grafana/grafana       → grafana/grafana

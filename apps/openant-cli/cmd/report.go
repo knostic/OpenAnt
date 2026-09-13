@@ -432,7 +432,9 @@ func buildReportArgs(resultsPath string, format string) []string {
 		pyArgs = append(pyArgs, "--pipeline-output", reportPipelineOutput)
 	}
 	if reportRepoName != "" {
-		pyArgs = append(pyArgs, "--repo-name", reportRepoName)
+		// The "=" form: a name starting with "-" must never parse as a
+		// flag element (argparse treats "--repo-name -x" as a flag).
+		pyArgs = append(pyArgs, "--repo-name="+reportRepoName)
 	}
 	if reportLLMConfig != "" {
 		pyArgs = append(pyArgs, "--llm-config", reportLLMConfig)

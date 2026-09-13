@@ -10,6 +10,7 @@ import (
 	"github.com/knostic/open-ant-cli/internal/languages"
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/knostic/open-ant-cli/internal/python"
+	"github.com/knostic/open-ant-cli/internal/remoteurl"
 	"github.com/spf13/cobra"
 )
 
@@ -116,6 +117,24 @@ func resolveRepoMetadataFull(name, url, sha string, ctx *projectContext, detecte
 	}
 	if url == "" && !flagURLSet && detectedURL != "" {
 		url = detectedURL
+	}
+	// #612: the name tier — when no name was supplied (flag or project),
+	// derive it from the WINNING url (flag/project tiers included, not
+	// just detection): a bare-path scan of a renamed checkout used to
+	// stamp the checkout directory's basename into reports and the LLM
+	// disclosure prompt (which receives ONLY the product name) even when
+	// a usable, normalized repository URL was available. The derivation
+	// is the honest-absence shape: a host-only URL derives nothing and
+	// the Python-side basename fallback (scanner.py) remains the terminal
+	// resort — Python-direct scans with a raw --repo-url and no name keep
+	// the basename. Known residuals in the same class (out of scope here):
+	// any LOCAL-PATH init input records Project.Name as the path basename
+	// (project.go — including a renamed checkout that HAS a usable remote:
+	// in project mode that basename then beats this URL tier, because the
+	// tier only fires when the name is empty), and buildoutput/report take
+	// --repo-name from the flag/project tiers with no URL derivation.
+	if name == "" && url != "" {
+		name = remoteurl.RepoSlug(url)
 	}
 	if sha == "" && detectedSHA != "" {
 		sha = detectedSHA
@@ -328,7 +347,9 @@ func runScan(cmd *cobra.Command, args []string) {
 			git.NormalizeRemote(scanRepoURL), detectedURL))
 	}
 	if repoName != "" {
-		pyArgs = append(pyArgs, "--repo-name", repoName)
+		// The "=" form: a name starting with "-" must never parse as a
+		// flag element (argparse treats "--repo-name -x" as a flag).
+		pyArgs = append(pyArgs, "--repo-name="+repoName)
 	}
 	if repoURL != "" {
 		pyArgs = append(pyArgs, "--repo-url", repoURL)
