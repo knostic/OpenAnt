@@ -205,3 +205,35 @@ jobs:
       - name: Clean the regen artifact
         working-directory: apps/openant-cli/internal/report/tailwind
         run: rm -f regen.css
+
+  browser-smoke:
+    name: Browser CSP smoke + golden render
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: apps/openant-cli/internal/server/testdata/browser-smoke/package-lock.json
+
+      - name: Install Playwright + Chromium
+        working-directory: apps/openant-cli/internal/server/testdata/browser-smoke
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: apps/openant-cli/go.mod
+
+      - name: Run the browser smoke (real-browser CSP enforcement + the golden render oracle)
+        working-directory: apps/openant-cli
+        env:
+          OPENANT_BROWSER_TESTS: "1"
+        run: go test ./internal/server/ -run TestBrowserSmoke -v -count=1

@@ -1,0 +1,8 @@
+{
+  "name": "openant-browser-smoke",
+  "private": true,
+  "comment": "#578 follow-ups 1c+4a: the pinned playwright for the browser-smoke CI job. Renovate bumps this = a Chromium bump, and the golden render diff is exactly what we want to see on such a branch.",
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}
