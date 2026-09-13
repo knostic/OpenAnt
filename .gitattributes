@@ -8,3 +8,5 @@ apps/openant-cli/internal/report/vendor/*.js -text -diff
 # autocrlf must never convert their bytes; the sha256 lock in
 # ui/vendor_test.go would correctly catch the change).
 apps/openant-cli/ui/vendor/*.js -text -diff
+apps/openant-cli/internal/server/testdata/browser-smoke/golden_expected.html text eol=lf
+apps/openant-cli/internal/server/testdata/browser-smoke/golden_input.md text eol=lf
