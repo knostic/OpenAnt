@@ -124,19 +124,22 @@ def test_scan_report_omits_sha_when_no_threat_model(tmp_path: Path):
 def test_coverage_probe_discloses_uninstrumented_languages(tmp_path: Path):
     """An uninstrumented parser (Go) is DISCLOSED, never summed as a false 0.
 
-    The Go fixture below is the REAL shape the Go parser emits — camelCase-only
-    statistics with NO snake_case coverage keys. Building it from the actual
-    interface (not a hand-simplified snake_case dict) is the whole point: an
-    earlier version of this test used a snake_case Go/JS fixture, which was a
-    fake looser than the real parser output and masked the false-0 bug. The
-    assertion keys on the coverage PROBE (was the language instrumented?), so a
-    fixture that lies about the parser's output can no longer make it pass.
+    The Go fixture is the UNINSTRUMENTED shape — camelCase-only statistics
+    with NO snake_case coverage keys — deliberately kept as the historical
+    pre-instrumentation shape so the probe's disclosure contract stays
+    exercised even now that the real Go parser emits the snake_case keys
+    (go_parser/types.go). Building it from the actual interface (not a
+    hand-simplified snake_case dict) remains the point: a fixture that lies
+    about a parser's output can mask the false-0 bug. The assertion keys on
+    the coverage PROBE (was the language instrumented?).
     """
     out = tmp_path / "run"
     (out / "python").mkdir(parents=True)
     (out / "go").mkdir()
     _scan_result_with_symlinks(out / "python", "python")  # instrumented, 2 skipped
-    # Real Go output: camelCase, no symlinks_skipped / directories_unreadable.
+    # The pre-instrumentation Go shape: camelCase, no coverage keys (the
+    # real parser emits them now — types.go; the fixture keeps the
+    # uninstrumented shape alive for the probe's contract).
     (out / "go" / "scan_results.json").write_text(json.dumps({
         "statistics": {
             "totalFiles": 4,
@@ -162,6 +165,12 @@ def test_coverage_probe_discloses_uninstrumented_languages(tmp_path: Path):
     # Go is disclosed as uninstrumented; a bare "0" would have been a false
     # assurance. python (instrumented) is NOT in the list.
     assert cov["languages_without_coverage_data"] == ["go"]
+    # #606: the per-key disclosure lists — Go (uninstrumented) is missing
+    # every key, so it appears in each key's exclusion list too (the
+    # generated present-only keys; the fixture predates Go's
+    # instrumentation).
+    assert "languages_without_symlinks_skipped_data" in cov
+    assert cov["languages_without_symlinks_skipped_data"] == ["go"]
 
 
 def test_coverage_missing_scan_file_is_disclosed_not_zeroed(tmp_path: Path):

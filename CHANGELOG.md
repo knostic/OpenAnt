@@ -3,6 +3,29 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-13] — Swift coverage counters + per-key disclosure (absence ≠ zero)
+
+### Fixed
+
+- **The Swift scanner now forwards the walker's symlink telemetry.** The
+  hand-built statistics dict copied only `directories_unreadable` while
+  rust/zig forward all three coverage keys — a Swift scan that refused
+  symlinks reported `symlinks_skipped` nowhere at all. All three keys
+  (`symlinks_skipped`, `symlink_examples`, `unreadable_examples`) are now
+  emitted, present-at-0 on a clean scan (absence remains the
+  uninstrumented signal, per the coverage contract).
+- **A partially instrumented parser can no longer produce a false
+  `symlinks_skipped: 0`.** The coverage aggregation's any-key probe passed
+  on the one key a language DID emit, then summed the absent key as 0 —
+  the exact coercion the aggregation's doctrine forbids. Each count key's
+  total now sums only the languages that reported it, and the new
+  `languages_without_symlinks_skipped_data` /
+  `languages_without_directories_unreadable_data` lists (generated from
+  the count-key tuple; supersets of `languages_without_coverage_data`)
+  disclose each total's exclusion set — a list's absence means the total is
+  complete, and for a listed language the count is unknown, not zero. The
+  generated summary's coverage line teaches the same semantics.
+
 ## [2026-08-14] — Recover reasoning-only (empty-completion) analyze responses
 
 ### Fixed
