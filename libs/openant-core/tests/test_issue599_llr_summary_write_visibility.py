@@ -151,6 +151,50 @@ def test_both_writes_fail_counts_two(monkeypatch, tmp_path):
     assert stats["checkpoint_summary_write_failures"] == 2
 
 
+def test_pass_start_failure_leaves_stale_done_suppressing_resume(
+        monkeypatch, tmp_path):
+    """The suppressed-resume hazard (the review round's catch): the prior
+    pass's phase="done" summary SURVIVES a failed pass-start write — the
+    Go resume sweep reads done && errors==0 and suppresses the prompt
+    entirely. All existing pass-start-failure tests use fresh dirs (the
+    absent case); this pins the STALE case."""
+    import json as _json
+    from core.llm_reachability import analyze_reachability
+    from tests.test_issue532_llr_resume import (
+        FakeAdapter, FakeTracker, _binding, _make_unit, _canned, _sig)
+
+    cp = str(tmp_path / "cp")
+    dataset = {"units": [_make_unit("a:f1")]}
+    canned = _canned(_sig("a:f1"))
+
+    # Seed a completed prior pass (phase=done).
+    analyze_reachability(
+        dataset, binding=_binding(FakeAdapter([canned])),
+        checkpoint_path=cp, tracker=FakeTracker(), stats={})
+    from pathlib import Path as _P
+    summary = _P(cp) / "_summary.json"
+    assert _json.loads(summary.read_text())["phase"] == "done"
+
+    # Fail ONLY the pass-start write (the first call); the final write
+    # succeeds (fresh responses served).
+    calls = {"n": 0}
+    real = StepCheckpoint.write_summary
+    def patched(self, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("injected pass-start failure")
+        return real(self, *a, **kw)
+    monkeypatch.setattr(StepCheckpoint, "write_summary", patched)
+
+    analyze_reachability(
+        dataset, binding=_binding(FakeAdapter([canned])),
+        checkpoint_path=cp, tracker=FakeTracker(), stats={})
+    # THE PIN: the stale done SURVIVED the failed write — the resume
+    # sweep would read it and suppress the prompt (the hazard the stderr
+    # message names).
+    assert _json.loads(summary.read_text())["phase"] == "done"
+
+
 def test_no_callback_prints_to_stderr(monkeypatch, tmp_path, capfd):
     """Without on_error BOTH phases print their [LLMReach]-prefixed,
     phase-named lines to stderr (the sibling idiom) — parametrized so a
@@ -216,9 +260,23 @@ def test_scanner_source_enumerates_the_key():
     only in-scan signal)."""
     src = (PROJECT_ROOT / "core" / "scanner.py").read_text()
     assert '"checkpoint_summary_write_failures": reach_stats.get(' in src
-    # and the guard: the key must NOT appear in the error_count fold —
-    # bounded at the fold's CLOSING paren, not a fixed window (a longer
-    # fold with the key in its tail must not evade the pin).
+    # and the guard: the key must NOT appear in the error_count fold.
+    # BALANCED-PAREN scan (the review round's catch: the first-`)` slice
+    # ended at the inner .get()'s paren — appending the key on a new line
+    # inside the fold passed the pin vacuously; the 2/8-green-on-master
+    # was the tell). Scan to depth 0 from the fold's opening paren.
     start = src.index('"error_count": (reach_stats.get("batches_dropped"')
-    fold = src[start:src.index(")", start) + 1]
-    assert "checkpoint_summary_write_failures" not in fold
+    open_paren = src.index("(", start)
+    depth = 0
+    end = open_paren
+    for i in range(open_paren, len(src)):
+        if src[i] == "(":
+            depth += 1
+        elif src[i] == ")":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    fold = src[start:end]
+    assert "checkpoint_summary_write_failures" not in fold, (
+        f"the key leaked into the error_count fold: {fold!r}")

@@ -886,7 +886,7 @@ def analyze_reachability(
             if on_error:
                 on_error(
                     "llm_reach final summary write failed "
-                    "(summary left at pass-start state; the resume sweep "
+                    "(summary left at its pre-final state; the resume sweep "
                     "may offer a needless resume): "
                     f"{exc}")
             else:
