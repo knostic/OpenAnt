@@ -58,6 +58,7 @@ import sys
 import threading
 from typing import Any, Optional
 
+import httpcore
 import httpx
 from google import genai
 from google.genai import errors as genai_errors
@@ -303,7 +304,14 @@ class GoogleAdapter:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.APIError as exc:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, httpx.TimeoutException) as exc:
+        # 4b (the real-transport guard's catch): the SDK does NOT wrap
+        # mid-connection transport failures (a reset mid-read surfaces as a
+        # raw httpcore.exceptions.TransportError subclass — ReadError/RemoteProtocolError
+        # — escaping its APIError family); proven live by the accept-then-
+        # close guard test. httpx re-exports its own subclasses of these, but
+        # the identity can differ across transport backends, so catch the
+        # httpcore base class — every httpx transport error inherits it.
+        except (httpx.TransportError, httpcore.NetworkError, httpcore.ProtocolError) as exc:
             raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
         return _response_to_unified(response)
@@ -332,7 +340,7 @@ class GoogleAdapter:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.APIError as exc:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, httpx.TimeoutException) as exc:
+        except (httpx.TransportError, httpcore.NetworkError, httpcore.ProtocolError) as exc:
             raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
 
