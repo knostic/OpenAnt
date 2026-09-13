@@ -117,7 +117,8 @@ class TestStatusContract:
             output_dir=str(tmp_path), language="python",
             units_count=2, languages=["python"],
         )
-        p = _write_scan_report(str(tmp_path), result, [clean, partial])
+        p = _write_scan_report(str(tmp_path), result, [clean, partial],
+                               repo_path=str(tmp_path / "repo"))
         with open(p) as fh:
             agg = json.load(fh)
         assert agg["status"] == "partial"

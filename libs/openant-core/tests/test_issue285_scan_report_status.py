@@ -105,7 +105,8 @@ def _write_scan(tmp_path: Path, step_reports: list[dict]):
                               protected=0, safe=0, errors=0)
     result = ScanResult(output_dir=str(tmp_path), units_count=0,
                         language="python", metrics=metrics)
-    return _write_scan_report(str(tmp_path), result, step_reports)
+    return _write_scan_report(str(tmp_path), result, step_reports,
+                              repo_path=str(tmp_path / "repo"))
 
 
 def test_aggregate_status_worst_wins(tmp_path: Path):
@@ -165,7 +166,8 @@ def test_scanresult_carries_derived_status(tmp_path):
          "cost_usd": 0.0, "duration_seconds": 1.0,
          "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}},
     ]
-    _write_scan_report(str(tmp_path), result, step_reports)
+    _write_scan_report(str(tmp_path), result, step_reports,
+                       repo_path=str(tmp_path / "repo"))
     assert result.scan_status == "partial"
     assert result.scan_errors == ["e1"]
     assert result.to_dict()["scan_status"] == "partial"

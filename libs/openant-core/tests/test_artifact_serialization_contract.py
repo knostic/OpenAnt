@@ -11,14 +11,19 @@ this contract they omitted three things that make a scan auditable:
   ``degraded`` …) — a merged or degraded scan was indistinguishable from a
   clean single-language one.
 * the walker's skipped-symlink / unreadable-directory counts, and the sha256 of
-  a repo-supplied threat model (R5 provenance).
+  a repo-supplied threat model (R5 provenance);
+* inputs provenance (#613) — ``inputs.repo_path`` is the actual scan target
+  (the caller-threaded repo path), never the output directory.
 
 These tests read the FILES ON DISK. Asserting on ``ScanResult.to_dict()`` is
 exactly what let the gap survive: ``to_dict()`` had the fields, but the code that
 wrote ``scan.report.json`` hand-built a summary that dropped them. The mutation
-that proves these tests bite: revert ``_write_scan_report`` to the hand-built
-summary (units_count/language/metrics/steps_* only) and every disk assertion
-below goes red while ``to_dict()`` stays green.
+that proves the summary assertions bite: revert ``_write_scan_report`` to the
+hand-built summary (units_count/language/metrics/steps_* only) and every
+summary-field disk assertion below goes red while ``to_dict()`` stays green.
+The inputs-provenance assertion (#613) has its own revert: drop the
+``repo_path`` threading and it goes red while every summary assertion stays
+green.
 """
 
 from __future__ import annotations
@@ -71,7 +76,8 @@ def test_scan_report_carries_threat_model_provenance_and_coverage(tmp_path: Path
         threat_model_sha256="deadbeef" * 8,
         threat_model_warnings=["every input source marked trusted"],
     )
-    report_path = _write_scan_report(str(out), result, step_reports=[])
+    report_path = _write_scan_report(str(out), result, step_reports=[],
+                                        repo_path=str(out.parent / "repo"))
 
     summary = _read(Path(report_path))["summary"]
 
@@ -98,6 +104,10 @@ def test_scan_report_carries_threat_model_provenance_and_coverage(tmp_path: Path
     # python instruments coverage, so it is NOT disclosed as missing data.
     assert cov["languages_without_coverage_data"] == []
 
+    # inputs provenance (#613): the scan target, not the output directory
+    inputs = _read(Path(report_path))["inputs"]
+    assert inputs["repo_path"] == str(out.parent / "repo")
+
 
 def test_scan_report_omits_sha_when_no_threat_model(tmp_path: Path):
     """Negative control: sha KEY ABSENT (not the empty-string hash) with no TM."""
@@ -110,7 +120,8 @@ def test_scan_report_omits_sha_when_no_threat_model(tmp_path: Path):
         units_count=1,
         context_source="generated",
     )
-    report_path = _write_scan_report(str(out), result, step_reports=[])
+    report_path = _write_scan_report(str(out), result, step_reports=[],
+                                        repo_path=str(out.parent / "repo"))
     summary = _read(Path(report_path))["summary"]
 
     assert summary["context_source"] == "generated"
@@ -156,7 +167,8 @@ def test_coverage_probe_discloses_uninstrumented_languages(tmp_path: Path):
             "go": {"output_dir": str(out / "go")},
         },
     )
-    report_path = _write_scan_report(str(out), result, step_reports=[])
+    report_path = _write_scan_report(str(out), result, step_reports=[],
+                                        repo_path=str(out.parent / "repo"))
     cov = _read(Path(report_path))["summary"]["coverage"]
 
     # Only python's skips are counted; Go's absent keys are NOT summed as 0.
@@ -178,7 +190,8 @@ def test_coverage_missing_scan_file_is_disclosed_not_zeroed(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir()
     result = ScanResult(output_dir=str(out), language="python", languages=["python"])
-    report_path = _write_scan_report(str(out), result, step_reports=[])
+    report_path = _write_scan_report(str(out), result, step_reports=[],
+                                        repo_path=str(out.parent / "repo"))
     cov = _read(Path(report_path))["summary"]["coverage"]
     assert cov["symlinks_skipped"] == 0
     assert cov["languages_without_coverage_data"] == ["python"]
