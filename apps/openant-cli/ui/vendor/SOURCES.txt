@@ -37,25 +37,22 @@
 # sha512 against the registry's dist.integrity and the inner file's
 # sha256 against the committed bytes — never trust the diff's own numbers.
 #
-# marked-18.0.12.min.js (the #578 follow-up B re-vendor from 12.0.2)
-#   source: https://cdn.jsdelivr.net/npm/marked@18.0.12/lib/marked.umd.js
-#   npm anchor: registry.npmjs.org/marked/-/marked-18.0.12.tgz
-#   dist.integrity (of the .tgz, not of the inner file): sha512-LEm4ga2YeI2T3GVHj9b0BaDPPk93LLTHMFeMyQbNIzPxc8vCI0y/scy0ZA6z6lXKyT9j9Nhl/OC6ZYKYGuFScA==
-#   sha256: fa0cfbf0181339312eaa3709b577ad698fc21a9baa42d580a3fd1f267b19b4a8
-#   verified: 2026-09-12 — the tarball sha512 was re-derived and MATCHED the
+# marked-18.0.13.min.js (the #583 patch bump from 18.0.12; the #332 recipe)
+#   source: https://cdn.jsdelivr.net/npm/marked@18.0.13/lib/marked.umd.js
+#   npm anchor: registry.npmjs.org/marked/-/marked-18.0.13.tgz
+#   dist.integrity (of the .tgz, not of the inner file): sha512-xTxVzZsBFwunP6HDmtBkabUQEYArnP7/rMDGmPj9SlrKlQ4i8MdYVow+nJL0eOqwpUqhzBoTBRADGN6uYwPyOw==
+#   sha256: b147274a9ce27d17276587167e49483d719f6893eeca3a3667a59797661d3556
+#   verified: 2026-09-13 — the tarball sha512 was re-derived and MATCHED the
 #         registry dist.integrity at write time; the committed bytes are the
-#         tarball's lib/marked.umd.js, verbatim (upstream esbuild-minified —
-#         the -<semver>.min.js NAME is kept for the version-suffix and
-#         notifier conventions; the marked tarball ships no root .min.js
-#         since v16.0.0 — the file IS upstream-minified, jsdelivr's
-#         synthesized .umd.min.js was deliberately NOT vendored: it strips
-#         the version banner and is not a registry artifact). Advisory gate:
-#         CVE-2026-41680 / GHSA-6v9c-7cg6-27q7 (OOM; reviewed range
-#         [18.0.0, 18.0.2), patched 18.0.2) — 18.0.12 clears it. The
-#         12.0.2 -> 18.0.12 render differential (two oracles: raw
-#         marked.parse AND post-DOMPurify output, over the pages' markdown
-#         shapes + the sanitize vector battery) was run as out-of-band
-#         verification evidence at this version — see the PR.
+#         tarball's lib/marked.umd.js, verbatim (the 18.x tarball ships no
+#         root .min.js since v16 — the -<semver>.min.js NAME is kept for the
+#         version-suffix + notifier conventions, as in the 18.0.12 entry).
+#         Upstream delta 18.0.12 -> 18.0.13: ONE bug fix ("allow tabs in the
+#         thematic break that ends a list item", #4087). The two-oracle
+#         render differential (raw + post-DOMPurify, the pages' markdown
+#         shapes + a corpus item exercising the fixed tab shape) ran as
+#         out-of-band verification at this version — see the PR; 0
+#         unexplained post-sanitize deltas expected, any delta named.
 #
 # dompurify-3.4.15.min.js
 #   source: https://cdn.jsdelivr.net/npm/dompurify@3.4.15/dist/purify.min.js
