@@ -20,6 +20,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
     "httpx>=0.24.0",
+    "httpcore>=1.0.0",  # 4b: the google adapter catches its bases directly (belt-and-braces under httpx)
     "PyYAML>=6.0",
     "requests>=2.31.0",
     "tree-sitter>=0.21.0",

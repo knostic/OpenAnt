@@ -58,6 +58,7 @@ import sys
 import threading
 from typing import Any, Optional
 
+import httpcore
 import httpx
 from google import genai
 from google.genai import errors as genai_errors
@@ -303,7 +304,23 @@ class GoogleAdapter:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.APIError as exc:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, httpx.TimeoutException) as exc:
+        # 4b (the real-transport guard's catch): the previous clause named
+        # six httpx classes individually and MISSED ReadError /
+        # RemoteProtocolError (a mid-connection reset escaped untyped —
+        # proven live by the accept-then-close guard test).
+        # httpx.TransportError is the single base of every transport error
+        # in the httpx family (connect, read, write, pool, remote-protocol,
+        # the timeout family) — strictly wider than the old list, never
+        # narrower. The httpcore bases are BELT-AND-BRACES for a raw
+        # httpcore exception arriving un-wrapped (httpx maps httpcore into
+        # its OWN hierarchy — httpx.ReadError is NOT httpcore.ReadError;
+        # the families chain via `raise ... from`, neither inherits the
+        # other). httpcore's roots are NetworkError / ProtocolError /
+        # TimeoutException (there is no httpcore.TransportError); all three
+        # are caught. A transport-backend flip (the httpx2 direction the
+        # anthropic/openai SDKs already took) changes which family arrives;
+        # this clause and the guard tests keep the mapping honest.
+        except (httpx.TransportError, httpcore.NetworkError, httpcore.ProtocolError, httpcore.TimeoutException) as exc:
             raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
         return _response_to_unified(response)
@@ -332,7 +349,8 @@ class GoogleAdapter:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.APIError as exc:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, httpx.TimeoutException) as exc:
+        # The same transport clause as complete()'s (see its comment).
+        except (httpx.TransportError, httpcore.NetworkError, httpcore.ProtocolError, httpcore.TimeoutException) as exc:
             raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
 
