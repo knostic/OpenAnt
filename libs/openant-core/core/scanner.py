@@ -1508,20 +1508,30 @@ def _language_scan_dirs(result: ScanResult) -> list[tuple[str, str]]:
 def _collect_coverage(result: ScanResult) -> dict:
     """Aggregate skipped-symlink / unreadable-dir figures across languages.
 
-    A language is "instrumented" iff its scan-result ``statistics`` carries at
-    least one coverage COUNT key. This is a presence PROBE, deliberately not a
-    hardcoded per-language allowlist: the parser set gains and loses coverage
-    instrumentation over time, and a stale allowlist would fail dangerously —
-    silently summing a de-instrumented language's absent keys as 0, i.e. a false
-    "nothing skipped". The probe fails safe instead: an uninstrumented language
-    is disclosed in ``languages_without_coverage_data`` rather than counted as 0,
-    so a ``symlinks_skipped: 0`` aggregate is trustworthy ONLY when that list is
-    empty. (JavaScript and Go do not yet instrument coverage; they appear in the
-    list until their parsers emit the snake_case keys.)
+    A language is "instrumented" iff its scan-result ``statistics`` carries
+    at least one coverage COUNT key. This is a presence PROBE, deliberately
+    not a hardcoded per-language allowlist: the parser set gains and loses
+    coverage instrumentation over time, and a stale allowlist would fail
+    dangerously — silently summing a de-instrumented language's absent keys
+    as 0, i.e. a false "nothing skipped". The probe fails safe instead: an
+    uninstrumented language is disclosed in ``languages_without_coverage_data``
+    rather than counted as 0.
+
+    #606: the probe guards the ANY-key-absent case; the PARTIALLY
+    instrumented case (a language emitting one coverage key and not
+    another) is disclosed PER KEY: each count key's total sums only the
+    languages that reported it, and the ``languages_without_{key}_data``
+    lists are that total's exclusion set — supersets of
+    ``languages_without_coverage_data`` (a fully uninstrumented language is
+    missing every key), emitted present-only (a list's ABSENCE means the
+    total is complete). The example keys stay merge-only — the absence of
+    examples is not a false-zero count. A dangling symlink lands in the
+    unreadable path (the stat-OSError branch), not the symlink count.
     """
     counts = {k: 0 for k in _COVERAGE_COUNT_KEYS}
     examples: dict[str, list] = {k: [] for k in _COVERAGE_EXAMPLE_KEYS}
     without_data: list[str] = []
+    without_key: dict[str, list[str]] = {k: [] for k in _COVERAGE_COUNT_KEYS}
     test_files: dict[str, int] = {}
     # #307 (review finding): a language may be coverage-instrumented (so it
     # passes the presence probe above) yet skip test files WITHOUT counting
@@ -1530,11 +1540,20 @@ def _collect_coverage(result: ScanResult) -> dict:
     no_test_skip_data: list[str] = []
     for lang, d in _language_scan_dirs(result):
         stats = _read_coverage_stats(d)
+        # #606: per-key presence disclosure, recorded BEFORE the any-key
+        # probe — a language missing ONE key must not be summed as a false
+        # zero for it (the any-key probe passes on the keys it DID emit).
+        for k in _COVERAGE_COUNT_KEYS:
+            if k not in stats:
+                without_key[k].append(lang or "unknown")
         if not any(k in stats for k in _COVERAGE_COUNT_KEYS):
             without_data.append(lang or "unknown")
             continue
+        # #606: the totals are known-language subtotals — only the
+        # languages that REPORTED the key enter the sum.
         for k in _COVERAGE_COUNT_KEYS:
-            counts[k] += int(stats.get(k, 0) or 0)
+            if k in stats:
+                counts[k] += int(stats[k] or 0)
         for k in _COVERAGE_EXAMPLE_KEYS:
             for ex in stats.get(k, []) or []:
                 if len(examples[k]) < 5 and ex not in examples[k]:
@@ -1564,6 +1583,20 @@ def _collect_coverage(result: ScanResult) -> dict:
         # not zero (the same absence-vs-zero doctrine as the list above).
         **({"languages_without_test_skip_data": sorted(set(no_test_skip_data))}
            if no_test_skip_data else {}),
+        # #606: per-key presence disclosure — each count key's total sums
+        # only the languages that reported it; these lists are that total's
+        # exclusion set, supersets of languages_without_coverage_data.
+        # Present-only (the same regime as the #307 test-skip list — NOT
+        # the always-present languages_without_coverage_data above): a
+        # list's absence means the total is complete. Names are GENERATED
+        # from the tuple — do not hand-add siblings here; a tuple entry
+        # literally named `coverage` or `test_skip` would collide with the
+        # hand-written keys above, and one named like an example key would
+        # be shadowed by the **examples merge (both guarded in test_issue606).
+        **(
+            {f"languages_without_{k}_data": sorted(set(without_key[k]))
+             for k in _COVERAGE_COUNT_KEYS if without_key[k]}
+        ),
     }
 
 

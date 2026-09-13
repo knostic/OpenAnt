@@ -128,6 +128,13 @@ class RepositoryScanner:
                 "directories_scanned": stats.get("directories_scanned", 0),
                 "directories_excluded": stats.get("directories_excluded", 0),
                 "directories_unreadable": stats.get("directories_unreadable", 0),
+                # #606: the walker's symlink telemetry, forwarded like
+                # rust/zig — a refused symlink that leaves no trace is a
+                # silent false negative; present-at-0 on a clean scan marks
+                # the parser as coverage-instrumented.
+                "symlinks_skipped": stats.get("symlinks_skipped", 0),
+                "symlink_examples": stats.get("symlink_examples", []),
+                "unreadable_examples": stats.get("unreadable_examples", []),
             },
         }
 
