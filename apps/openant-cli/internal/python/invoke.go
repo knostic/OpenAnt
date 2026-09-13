@@ -41,7 +41,11 @@ import (
 // The zombie-window tests assert their deadlines stay strictly BELOW this
 // (at or above it they flip to the ErrWaitDelay branch and their pins go
 // vacuous); a change here is a deliberate contract change.
-const invokeWaitDelay = 5 * time.Second
+// A VAR (not a const) for the same reason defaultInvokeTimeout is one: the
+// #585 de-flake round's tests override it locally (35s) so their deadlines
+// can adopt the family's 30s budget without the 2s-6s+ stall band
+// overlapping them — the production value never moves.
+var invokeWaitDelay = 5 * time.Second
 
 var defaultInvokeTimeout = 30 * time.Minute
 
