@@ -2,8 +2,10 @@ package server
 
 import (
 	"html/template"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"regexp"
 	"strings"
 	"testing"
@@ -174,8 +176,26 @@ func TestCSPPoliciesPerRoute(t *testing.T) {
 		// restrictive DEFAULT policy (inert on non-documents — CSP governs
 		// document loads). The load-bearing direction: a future HTML route
 		// registered WITHOUT a wrapper gets this too — scriptless and
-		// unstyled (loud), never silently CSP-less.
-		for _, path := range []string{"/assets/marked-18.0.12.min.js", "/disclosures/j1"} {
+		// unstyled (loud), never silently CSP-less. The asset path is
+		// DERIVED from the embed FS walk (the #583 review round: a
+		// hardcoded version literal went stale on every vendor bump and
+		// silently degraded this test from a served-asset probe to a 404
+		// probe — no guard caught it).
+		assetName := ""
+		err := fs.WalkDir(uifiles.FS, "vendor", func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || !strings.HasSuffix(p, ".js") {
+				return nil
+			}
+			assetName = path.Base(p)
+			return nil
+		})
+		if err != nil || assetName == "" {
+			t.Fatalf("walking the embedded vendor dir: %v (asset=%q)", err, assetName)
+		}
+		for _, path := range []string{"/assets/" + assetName, "/disclosures/j1"} {
 			csp := get(path).Header().Get("Content-Security-Policy")
 			for _, want := range []string{
 				"default-src 'none'",
@@ -187,7 +207,7 @@ func TestCSPPoliciesPerRoute(t *testing.T) {
 				}
 			}
 		}
-		if xo := get("/assets/marked-18.0.12.min.js").Header().Get("X-Content-Type-Options"); xo != "nosniff" {
+		if xo := get("/assets/" + assetName).Header().Get("X-Content-Type-Options"); xo != "nosniff" {
 			t.Errorf("GET /assets: nosniff lost: %q", xo)
 		}
 	})
