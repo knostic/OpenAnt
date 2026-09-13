@@ -463,6 +463,12 @@ def analyze_reachability(
     units_not_reviewed = 0
     batches_truncated = 0
     batches_failed = 0
+    # #599: the artifact-failure counter — summary-write failures are
+    # diagnostics, NOT coverage gaps (the pass succeeded; the persisted
+    # artifact is degraded). Like its sibling counters, it is bypassed by
+    # the empty-units early return (zero units means zero write attempts
+    # — absence is honest; the scanner defaults to 0).
+    checkpoint_summary_write_failures = 0
     # #558: the split-and-retry provenance counters (direction 4 — the
     # recovery never silently overwrites the coverage counts).
     batches_split_recovered = 0
@@ -595,8 +601,23 @@ def analyze_reachability(
                     usage=None,
                     incomplete=max(0, len(units) - len(adopted)),
                 )
-            except OSError:
-                pass
+            except OSError as exc:
+                # #599: this write is load-bearing for the resume sweep
+                # (a stale phase=done suppresses the fresh prompt) — its
+                # failure must be LOUD like the init/save siblings, never
+                # `pass` (which was silent even WITH an on_error), and
+                # counted so the report carries it without any callback.
+                if on_error:
+                    on_error(
+                        "llm_reach pass-start summary write failed "
+                        "(resume sweep may read a stale or absent phase): "
+                        f"{exc}")
+                else:
+                    print(
+                        "[LLMReach] pass-start summary write failed "
+                        "(resume sweep may read a stale or absent phase): "
+                        f"{exc}", file=sys.stderr)
+                checkpoint_summary_write_failures += 1
             # Restored cost lands as PRIOR usage — never zero, never this run's
             # new spend (the #26/#26b kill-vs-complete asymmetry lessons).
             if adopted and tracker is not None:
@@ -858,8 +879,23 @@ def analyze_reachability(
                 incomplete=incomplete,
             )
         except OSError as exc:
+            # #599: the final write previously surfaced ONLY through
+            # on_error — and the scanner passes none, so in scans this
+            # failure class never appeared anywhere. Loud like the
+            # siblings, counted into the stats the report carries.
             if on_error:
-                on_error(f"llm_reach checkpoint summary write failed: {exc}")
+                on_error(
+                    "llm_reach final summary write failed "
+                    "(summary left at its pre-final state; the resume sweep "
+                    "may offer a needless resume): "
+                    f"{exc}")
+            else:
+                print(
+                    "[LLMReach] final summary write failed "
+                    "(summary left at pass-start state; the resume sweep "
+                    "may offer a needless resume): "
+                    f"{exc}", file=sys.stderr)
+            checkpoint_summary_write_failures += 1
 
     if stats is not None:
         stats["batches_dropped"] = dropped_batches
@@ -872,6 +908,13 @@ def analyze_reachability(
         # #558: the split-and-retry provenance.
         stats["batches_split_recovered"] = batches_split_recovered
         stats["batches_split_lost"] = batches_split_lost
+        # #599: the summary-write diagnostic — an ARTIFACT failure, not a
+        # coverage gap. Must NOT fold into error_count (a failed write
+        # does not mean an incomplete review: the pass succeeded and the
+        # per-unit records persist; the persisted summary alone is
+        # degraded). Folding it would flip #541's partial contract wrongly.
+        stats["checkpoint_summary_write_failures"] = \
+            checkpoint_summary_write_failures
 
     return signals
 

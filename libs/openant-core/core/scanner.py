@@ -908,6 +908,15 @@ def scan_repository(
                         "batches_split_lost": reach_stats.get(
                             "batches_split_lost", 0),
                         "units_not_reviewed": reach_stats.get("units_not_reviewed", 0),
+                        # #599: the summary-write diagnostic. An ARTIFACT
+                        # failure, not a coverage gap — must stay OUT of
+                        # error_count below: a failed write does not mean
+                        # an incomplete review (the pass succeeded, the
+                        # per-unit records persist; the persisted summary
+                        # alone is degraded). Folding it in would flip the
+                        # step to partial wrongly.
+                        "checkpoint_summary_write_failures": reach_stats.get(
+                            "checkpoint_summary_write_failures", 0),
                         # #541 (the refute round): the #285/#376 partial-
                         # status contract — dropped + failed batches make
                         # the STEP read partial, never success/0/0.

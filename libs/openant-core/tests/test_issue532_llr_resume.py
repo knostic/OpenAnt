@@ -516,7 +516,18 @@ class TestDeepRefuteFixes:
     def test_pass_start_writes_in_progress_summary(self, tmp_path):
         """The stale-done hazard: a run killed mid-loop after a prior
         completed pass must leave phase=in_progress (the Go sweep reads
-        phase=='done' && errors==0 as nothing-to-resume, checkpoint.go:115)."""
+        phase=='done' && errors==0 as nothing-to-resume, checkpoint.go:115).
+
+        #599 (the vacuousness repair): the old form raised RuntimeError
+        from the adapter — but that is the PROVIDER-failure path (the
+        loop catches it at analyze_reachability's ``except Exception``
+        arm), so the FINAL write then rewrote the summary and the test
+        passed even with the pass-start write deleted. The repair kills
+        the pass with a BaseException sentinel (which no handler in the
+        loop swallows) and pins the ORDER: the pass-start write precedes
+        the first adapter call, so a killed pass leaves a pass-start-only
+        summary on disk — the genuinely load-bearing assertion.
+        """
         from core.checkpoint import StepCheckpoint
 
         cp = str(tmp_path / "llm_reach_checkpoints")
@@ -527,20 +538,40 @@ class TestDeepRefuteFixes:
             checkpoint_path=cp, tracker=FakeTracker(),
         )
         assert StepCheckpoint.read_summary(cp)["phase"] == "done"
-        # An interrupted re-run (one unit edited, killed before the loop can
-        # finish): simulate by checking the START summary of a fresh call —
-        # patch the adapter to raise mid-pass and verify the on-disk phase.
+
+        order = []  # ("write", phase) and ("adapter",) interleaved
+        orig_write = StepCheckpoint.write_summary
+
+        def recording_write(self, *args, **kwargs):
+            order.append(("write", kwargs.get("phase")))
+            return orig_write(self, *args, **kwargs)
+
+        class KilledMidPass(BaseException):
+            pass
+
         class KillMidPass(FakeAdapter):
             def complete(self, **kw):
-                raise RuntimeError("killed")
+                order.append(("adapter",))
+                raise KilledMidPass
 
-        # One unit edited: it re-runs, the pass dies mid-loop, and the
-        # START summary (in_progress) is what survives on disk.
+        # One unit edited: it re-runs; the pass dies INSIDE the loop, and
+        # the START summary (in_progress) is what survives on disk.
         dataset["units"][1]["code"]["primary_code"] = "def edited(): pass"
-        analyze_reachability(
-            dataset, binding=_binding(KillMidPass()), checkpoint_path=cp,
-            tracker=FakeTracker(),
-        )
+        import pytest
+        with pytest.raises(KilledMidPass):
+            StepCheckpoint.write_summary = recording_write
+            try:
+                analyze_reachability(
+                    dataset, binding=_binding(KillMidPass()), checkpoint_path=cp,
+                    tracker=FakeTracker(),
+                )
+            finally:
+                StepCheckpoint.write_summary = orig_write
+
+        # the ordering pin: the pass-start write precedes every adapter
+        # call, and no final write followed the kill.
+        assert order[0] == ("write", "in_progress")
+        assert ("write", "done") not in order
         s = StepCheckpoint.read_summary(cp)
         assert s["phase"] == "in_progress"
         assert s["incomplete"] >= 1
