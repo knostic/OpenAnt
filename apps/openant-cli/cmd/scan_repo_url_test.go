@@ -49,13 +49,16 @@ func TestNormalizeRemote(t *testing.T) {
 
 // TestResolveRepoMetadataURLTier pins the tier order for the URL (flag >
 // project-normalized > detected) — the #562 extension of the #557 table.
+// The NAME tier's contract lives in TestResolveRepoMetadataNameTier
+// (#612): this test pins the URL only, so the two tiers' contracts stay
+// independently assertable.
 func TestResolveRepoMetadataURLTier(t *testing.T) {
 	// The project tier normalizes defensively (the init-recorded scp form).
-	n, u, _, _ := resolveRepoMetadataFull("", "", "", &projectContext{
+	_, u, _, _ := resolveRepoMetadataFull("", "", "", &projectContext{
 		Project: nil,
 	}, "", "https://github.com/org/repo")
-	if u != "https://github.com/org/repo" || n != "" {
-		t.Errorf("bare-path detection = (%q, %q), want the detected URL only", n, u)
+	if u != "https://github.com/org/repo" {
+		t.Errorf("bare-path detection URL = %q, want the detected URL only", u)
 	}
 	// The project tier's scp form is normalized, not passed through.
 	_, u, _, _ = resolveRepoMetadataFull("", "", "",

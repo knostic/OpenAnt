@@ -1,9 +1,10 @@
-// Package remoteurl normalizes git remote URLs to plain browse URLs.
+// Package remoteurl normalizes git remote URLs to plain browse URLs, and
+// derives repository display names from them (RepoSlug).
 //
 // #568: the render boundary (report permalinks, the SARIF repositoryUri,
 // the server's pipeline-output patching) needs this defense without pulling
 // internal/git (which carries exec + subprocess dependencies a render
-// package should not acquire). The function is pure; the canonical
+// package should not acquire). The functions are pure; the canonical
 // implementation moved here from internal/git, which now re-exports it
 // so existing callers are unaffected.
 package remoteurl
@@ -153,4 +154,69 @@ func scpURLSafe(s string, path bool) bool {
 		}
 	}
 	return true
+}
+
+// slugSafe reports whether a single decoded path component is a sane
+// repository/namespace slug: the scpURLSafe path charset, "~" INCLUDED —
+// sr.ht's "~user/repo" namespaces are real repository identities, and
+// "~" is inert display text. One addition over the scp charset: a
+// segment must not LEAD with "-" (a real forge slug never does — see the
+// check in the body for the argv reason).
+// #612: the derived name lands in the LLM disclosure prompt and rendered
+// report headers as free text — a hostile remote's path (an escaped-
+// separator or control-character slug) must not reach those sinks, and a
+// rejection keeps the honest absence ("" — the caller's terminal basename
+// fallback still applies) rather than a partially-cleaned invention.
+func slugSafe(seg string) bool {
+	if !scpURLSafe(seg, true) {
+		return false
+	}
+	// A real forge slug never leads with "-", and a leading hyphen fails
+	// Python's argparse in the two-token forwarding form ("--repo-name
+	// -x" misparses; the "=" form does not — but an exported pure helper
+	// must not depend on any caller's forwarding discipline). A
+	// remote-controlled flag-shaped string must never become an argv
+	// element.
+	return !strings.HasPrefix(seg, "-")
+}
+
+// RepoSlug derives the repository display name (the URL's full path —
+// "org/repo"; a nested GitLab namespace stays "group/sub/repo") from a
+// NORMALIZED remote URL (Normalize's output — the path is already
+// browse-shaped, userinfo/fragment/query stripped, ".git" trimmed).
+// Returns "" when no usable path exists (a host-only URL), or when any
+// decoded component is empty, ".", "..", or outside the slug charset:
+// the honest absence, never a truncated or invented identity.
+//
+// #612: the canonical caller is resolveRepoMetadataFull's name tier (the
+// scan path), where the URL tiers have already resolved the winning URL.
+// DELIBERATELY NOT config.DeriveProjectName: that helper's HTTPS branch
+// takes the first two segments because its output feeds ProjectDir (an
+// on-disk path) and ListProjects' two-level scan — a future "unification"
+// of the two shapes would silently relocate nested-namespace projects on
+// disk. The divergence is load-bearing; do not unify (see the
+// cross-reference at DeriveProjectName).
+func RepoSlug(normalized string) string {
+	if normalized == "" {
+		return ""
+	}
+	u, err := url.Parse(normalized)
+	if err != nil {
+		return ""
+	}
+	// u.Path is the DECODED path: a "%2E%2E" segment arrives as ".." here
+	// and hits the guard below (EscapedPath would let it through); an
+	// escaped separator ("%2F") degrades to a harmless real separator
+	// (the result is still a clean, charset-checked slug).
+	trimmed := strings.Trim(u.Path, "/")
+	if trimmed == "" {
+		return "" // host-only: no path to derive from
+	}
+	parts := strings.Split(trimmed, "/")
+	for _, p := range parts {
+		if p == "" || p == "." || p == ".." || !slugSafe(p) {
+			return ""
+		}
+	}
+	return trimmed
 }

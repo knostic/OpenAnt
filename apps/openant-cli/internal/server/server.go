@@ -1312,6 +1312,14 @@ func (s *Server) runJob(job *Job) {
 	if isURL {
 		if _u := remoteurl.Normalize(job.Repo); _u != "" {
 			args = append(args, "--repo-url", _u)
+			// #612: the server holds the normalized URL — derive the name
+			// from it too, else the Python-side fallback stamps the clone
+			// dir's basename ("repo") as the scan's product identity. The
+			// single-element =-form (the argparse lesson: a leading-hyphen
+			// name kills the scan as a two-token flag).
+			if _n := remoteurl.RepoSlug(_u); _n != "" {
+				args = append(args, "--repo-name="+_n)
+			}
 		}
 	}
 	args = append(args, "--", localPath)
