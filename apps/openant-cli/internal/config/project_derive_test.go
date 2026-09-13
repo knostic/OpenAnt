@@ -9,10 +9,10 @@ func TestDeriveProjectName_SSHScheme(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"git@github.com:org/repo.git", "org/repo"},               // scp-like (already worked)
-		{"ssh://git@github.com/org/repo.git", "org/repo"},         // ssh:// scheme
-		{"ssh://git@github.com:22/org/repo.git", "org/repo"},      // ssh:// scheme with port
-		{"https://user@github.com/org/repo.git", "org/repo"},      // https with userinfo
+		{"git@github.com:org/repo.git", "org/repo"},          // scp-like (already worked)
+		{"ssh://git@github.com/org/repo.git", "org/repo"},    // ssh:// scheme
+		{"ssh://git@github.com:22/org/repo.git", "org/repo"}, // ssh:// scheme with port
+		{"https://user@github.com/org/repo.git", "org/repo"}, // https with userinfo
 		{"https://github.com/grafana/grafana.git", "grafana/grafana"},
 	}
 	for _, c := range cases {

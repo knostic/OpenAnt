@@ -131,8 +131,12 @@ func resolveRepoMetadataFull(name, url, sha string, ctx *projectContext, detecte
 	// any LOCAL-PATH init input records Project.Name as the path basename
 	// (project.go — including a renamed checkout that HAS a usable remote:
 	// in project mode that basename then beats this URL tier, because the
-	// tier only fires when the name is empty), and buildoutput/report take
-	// --repo-name from the flag/project tiers with no URL derivation.
+	// tier only fires when the name is empty; a nested-https init records
+	// the NAMESPACE as Project.Name — "g/sub" for g/sub/repo — per
+	// DeriveProjectName's first-two-segment on-disk-layout shape), and
+	// buildoutput/report take --repo-name from the flag/project tiers
+	// with no URL derivation (the SERVER, post-#612-fold, derives the
+	// name from its normalized URL alongside --repo-url).
 	if name == "" && url != "" {
 		name = remoteurl.RepoSlug(url)
 	}

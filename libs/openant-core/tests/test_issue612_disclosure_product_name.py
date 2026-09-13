@@ -1,5 +1,5 @@
 """#612 (the Python half of the acceptance seam): the repository name is
-the ONLY identifying metadata the disclosure prompt receives.
+the primary identifying metadata the disclosure prompt receives in the JSON payload.
 
 The Go tier's name derivation (cmd/scan.go's resolveRepoMetadataFull ->
 remoteurl.RepoSlug) fixes the PRODUCER of ``repository.name``; this pins
@@ -72,7 +72,7 @@ class ProductNameCaptureTests(unittest.TestCase):
 
         self.assertIn("renamed-org/real-repo", binding.captured_prompt,
                       "the product name must reach the disclosure prompt")
-        self.assertIn("product_name", binding.captured_prompt)
+        self.assertIn('"product_name": "renamed-org/real-repo"', binding.captured_prompt)  # the JSON payload key, not the {product_name} template placeholder
         self.assertIn("STUBBED DISCLOSURE for test_finding", text,
                       "the generated text is the stubbed completion")
 
