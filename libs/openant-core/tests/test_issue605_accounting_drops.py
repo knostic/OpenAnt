@@ -38,17 +38,20 @@ if str(PROJECT_ROOT) not in sys.path:
 import pytest  # noqa: E402
 import utilities.llm_client as llm_client  # noqa: E402
 from utilities.llm_client import (  # noqa: E402
+    reset_global_tracker,
     reset_warning_state,
 )
 
 
 @pytest.fixture(autouse=True)
 def _clean_accounting_counter():
-    """The module counter resets per test — a test that records an error
-    never leaks the marker into a later step-context assertion."""
-    reset_warning_state()
+    """The module counter AND the tracker reset per test — a test that
+    records an error (or an unpriced call) never leaks the marker or the
+    unpriced set into a later step-context assertion (the warning-state
+    reset alone leaves _unpriced_models on the singleton)."""
+    reset_global_tracker()
     yield
-    reset_warning_state()
+    reset_global_tracker()
 
 
 class _Binding:
@@ -161,8 +164,8 @@ def test_a_failed_end_snapshot_never_fabricates_a_delta(monkeypatch, tmp_path):
         pass
     report = json.loads((tmp_path / "test-step.report.json").read_text())
     # THE NEGATIVE-DELTA DISCRIMINATION: the healthy START carried a real
-    # baseline (the $0.008 recorded before the step); pristine's fabricated
-    # subtraction yielded cost = 0 - 0.008 < 0 — the post-fix shape is
+    # baseline (the $0.004 recorded before the step); pristine's fabricated
+    # subtraction yielded cost = 0 - 0.004 < 0 — the post-fix shape is
     # zero + the marker (never negative, never fabricated).
     assert report["cost_usd"] == 0.0
     assert report["cost_usd"] >= 0.0  # the pristine receipt was negative
@@ -263,3 +266,45 @@ def test_the_reset_clears_the_counter():
     assert llm_client.get_global_tracker().get_totals()["accounting_errors"] == 1
     reset_warning_state()
     assert "accounting_errors" not in llm_client.get_global_tracker().get_totals()
+
+def test_the_scan_aggregate_negative_is_silent(tmp_path):
+    """The control: step reports WITHOUT the marker never fabricate it
+    at the scan level (present-only, never a blanket key)."""
+    from core.schemas import ScanResult, AnalysisMetrics
+    from core.scanner import _write_scan_report
+    out = tmp_path / "out"
+    out.mkdir()
+    metrics = AnalysisMetrics(total=0, vulnerable=0, bypassable=0,
+                              inconclusive=0, protected=0, safe=0, errors=0)
+    result = ScanResult(output_dir=str(out), units_count=0,
+                        language="python", metrics=metrics)
+    step_reports = [{
+        "step": "parse", "status": "success", "cost_usd": 0.0,
+        "duration_seconds": 0.1,
+        "token_usage": {"input_tokens": 1, "output_tokens": 1,
+                        "total_tokens": 2},
+    }]
+    _write_scan_report(str(out), result, step_reports,
+                       repo_path=str(tmp_path / "repo"))
+    scan = json.loads((out / "scan.report.json").read_text())
+    assert "accounting_error" not in scan["token_usage"]
+    assert "cost_incomplete" not in scan["token_usage"]
+
+
+def test_unpriced_and_accounting_error_cooccur_all_keys(tmp_path):
+    """#216's marker and #605's co-occur on one step: cost_incomplete +
+    unpriced_models + accounting_error all present — never one displacing
+    the other."""
+    from core import step_report as sr_mod
+    from utilities.llm_client import record_accounting_error
+    tracker = llm_client.get_global_tracker()
+    # an unpriced call (the #598/#216 loud path) + a counted hand-off drop
+    tracker.record_call(model="mystery/model-x", input_tokens=10,
+                        output_tokens=5)
+    record_accounting_error()
+    with sr_mod.step_context("co-step", str(tmp_path)):
+        pass
+    tu = json.loads((tmp_path / "co-step.report.json").read_text())["token_usage"]
+    assert tu["cost_incomplete"] is True
+    assert tu["unpriced_models"] == ["mystery/model-x"]
+    assert tu["accounting_error"] is True
