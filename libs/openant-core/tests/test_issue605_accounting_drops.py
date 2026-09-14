@@ -96,8 +96,9 @@ def test_the_handoff_failure_is_counted_and_named(monkeypatch, capsys):
     def _poison(*a, **kw):
         raise RuntimeError("tracker is poisoned")
 
-    real_tracker = llm_client.get_global_tracker()
-    monkeypatch.setattr(real_tracker, "record_call", _poison)
+    # class-level: an instance-level patch leaves the attribute on the
+    # singleton past the test's undo
+    monkeypatch.setattr(llm_client.TokenTracker, "record_call", _poison)
     reporter_mod._record_usage_in_tracker(
         {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
         _Binding())
@@ -193,11 +194,17 @@ def test_a_failed_start_snapshot_does_not_charge_the_next_step(monkeypatch, tmp_
         return real_get_usage()
 
     monkeypatch.setattr("core.tracking.get_usage", _poisoned_first)
+    # the run carries an unpriced model — the healthy END snapshot's ids
+    # must SURVIVE the sentinel (the which-model disclosure is not lost
+    # to the start failure)
+    tracker.record_call(model="mystery/model-s", input_tokens=3,
+                        output_tokens=1)
     with sr_mod.step_context("test-step2", str(tmp_path)):
         pass
     report = json.loads((tmp_path / "test-step2.report.json").read_text())
     assert report["cost_usd"] == 0.0
     assert report["token_usage"]["accounting_error"] is True
+    assert report["token_usage"]["unpriced_models"] == ["mystery/model-s"]
 
 
 def test_a_healthy_local_step_never_flags(monkeypatch, tmp_path):

@@ -51,7 +51,9 @@ _unknown_pricing_warned: set[str] = set()
 _unknown_pricing_lock = threading.Lock()
 # #605: the accounting-failure counter — MODULE-LEVEL, never on the
 # tracker (a poisoned tracker cannot be trusted to count its own failure).
-# Surfaced through get_totals() -> UsageInfo -> the step/scan artifacts.
+# Read directly by core.step_report at step end; the get_totals() key is
+# present-only (UsageInfo has no field — the marker reaches the step
+# reports and the scan aggregate, not the typed usage envelope).
 _accounting_errors = 0
 _accounting_errors_lock = threading.Lock()
 
@@ -309,8 +311,10 @@ def reset_warning_state() -> None:
     stop/finish reasons, dropped block kinds, malformed tool JSON) are
     intentionally process-global, so production prints one line per
     novel value. Tests asserting "warned once" — and a brand-new scan —
-    want a clean slate. Adapter modules are imported lazily and guarded
-    so this stays safe even if a provider SDK isn't installed.
+    want a clean slate. ALSO zeroes the #605 accounting-error counter
+    (the two lifecycles are the same: per-scan, never mid-run). Adapter
+    modules are imported lazily and guarded so this stays safe even if a
+    provider SDK isn't installed.
     """
     global _accounting_errors
     with _unknown_pricing_lock:

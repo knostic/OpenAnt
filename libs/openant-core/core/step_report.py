@@ -130,6 +130,13 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
                 "cost_incomplete": True,
                 "accounting_error": True,
             }
+            # A healthy END snapshot's unpriced ids survive the sentinel:
+            # the delta is unavailable but the WHICH-MODEL disclosure is
+            # not (a start-failed step carrying the run's only unpriced
+            # spend must not lose the ids from the aggregate).
+            if end_snapshot and end_snapshot.get("unpriced_models"):
+                report.token_usage["unpriced_models"] = \
+                    end_snapshot["unpriced_models"]
         else:
             report.cost_usd = round(end_cost - start_cost, 6)
             report.token_usage = {
