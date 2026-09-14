@@ -285,12 +285,21 @@ def parse_response(
     batch_label: Optional[str] = None,
     on_batch_drop: Optional[Callable[[], None]] = None,
     stop_reason: Optional[str] = None,
+    on_signal_skip: Optional[Callable[..., None]] = None,
 ) -> List[ReachabilitySignal]:
+    # on_signal_skip (#602): called with reason/kind/confidence kwargs
     """Parse a single LLM response into validated ``ReachabilitySignal``s.
 
     Malformed entries are skipped (not raised); the optional ``on_error``
     callback receives a one-line description per skipped item, useful for
     logging.
+    #602: ``on_signal_skip`` receives ``reason="unknown_unit_id"``,
+    ``kind``, ``confidence`` for cross-batch signal skips — POLICY-FREE
+    kwargs (the promotable subset is derived at report time from the
+    promote_set, never here). The caller collects ATTEMPT-LOCALLY and
+    folds only accepted responses into its stage totals (the diagnostic
+    log fires for discarded attempts too — the counter is the accepted
+    metric, the log line may out-total it by design).
 
     #294: a batch-level drop names its failure SHAPE (see
     :func:`_classify_malformed`), carries the caller-supplied
@@ -347,7 +356,18 @@ def parse_response(
             log(f"signal #{idx}: invalid confidence {confidence!r} — skipped")
             continue
         if valid_unit_ids is not None and unit_id not in valid_unit_ids:
-            log(f"signal #{idx}: unknown unit_id {unit_id!r} — skipped")
+            # #602: the skip carries the signal's kind and confidence — an
+            # entry_point/high skip (could have promoted) is now
+            # distinguishable in the record from an external_input/low skip
+            # (could not). The old text is preserved for format consumers.
+            _where = f" in batch {batch_label}" if batch_label else ""
+            log(f"signal #{idx}: unknown unit_id {unit_id!r} "
+                f"(kind={kind!r}, confidence={confidence!r}) — skipped{_where}")
+            if on_signal_skip is not None:
+                # Policy-free kwargs; the caller decides what to count (the
+                # promotable subset needs promote_set, not this module).
+                on_signal_skip(reason="unknown_unit_id", kind=kind,
+                               confidence=confidence)
             continue
 
         out.append(
@@ -463,6 +483,11 @@ def analyze_reachability(
     units_not_reviewed = 0
     batches_truncated = 0
     batches_failed = 0
+    # #602: the skip-class counters — accepted-response occurrences only
+    # (see _attempt's commit point); policy-free (the promotable subset is
+    # derived at report time from promote_set, never here).
+    signals_skipped_unknown_unit = 0
+    signals_skipped_by_class: Dict[str, int] = {}
     # #599: the artifact-failure counter — summary-write failures are
     # diagnostics, NOT coverage gaps (the pass succeeded; the persisted
     # artifact is degraded). Like its sibling counters, it is bypassed by
@@ -652,7 +677,7 @@ def analyze_reachability(
         split-and-retry subtracts exactly what was applied (never an
         inferred shape — the refutation's negative-counter catch)."""
         nonlocal dropped_batches, units_not_reviewed, batches_truncated, \
-            batches_failed
+            batches_failed, signals_skipped_unknown_unit, signals_skipped_by_class
         prompt = build_prompt(
             sub_batch, app_context=app_context, max_code_bytes=max_code_bytes
         )
@@ -725,11 +750,22 @@ def analyze_reachability(
                 _delta["truncated"] += 1
             dropped.append(True)
 
+        # #602: attempt-LOCAL skip collection — the parent's skips are
+        # counted into the STAGE totals only when the batch COMMITS ("ok"):
+        # a max_tokens drop discards them with the batch, and a split-
+        # retry's halves contribute their own. No subtraction is ever
+        # needed (nothing un-counted).
+        _attempt_skips: list = []
+
+        def _count_skip(**kw):
+            _attempt_skips.append(kw)
+
         parsed = parse_response(
             text, valid_unit_ids=batch_ids, on_error=on_error,
             batch_label=f"{label}, units {first}..{last}",
             on_batch_drop=_count_drop,
             stop_reason=result.stop_reason,
+            on_signal_skip=_count_skip,
         )
         # #538 gate fold: a max_tokens reply drops the batch WHOLE (the
         # applied==adopted invariant; the salvage prefix discarded) —
@@ -745,6 +781,14 @@ def analyze_reachability(
             return [], "truncated", _delta
         if dropped:
             return [], "dropped", _delta
+        # The commit point: only ACCEPTED responses' skips enter the totals
+        # (the metric is unknown-ID signal occurrences in accepted
+        # responses — the diagnostic log may carry discarded attempts').
+        for kw in _attempt_skips:
+            signals_skipped_unknown_unit += 1
+            _key = f"{kw.get('kind', 'unknown')}/{kw.get('confidence', 'unknown')}"
+            signals_skipped_by_class[_key] = \
+                signals_skipped_by_class.get(_key, 0) + 1
         return parsed, "ok", _delta
 
     for i, batch in enumerate(batches):
@@ -900,6 +944,12 @@ def analyze_reachability(
     if stats is not None:
         stats["batches_dropped"] = dropped_batches
         stats["units_not_reviewed"] = units_not_reviewed
+        # #602: the skip-class telemetry — a skipped signal is NOT a
+        # coverage failure (the same doctrine as the write-failure counter:
+        # error_count stays dropped+failed batches only).
+        stats["signals_skipped_unknown_unit"] = signals_skipped_unknown_unit
+        stats["signals_skipped_unknown_unit_by_class"] = \
+            dict(signals_skipped_by_class)
         # #538: the truncation subclass — the recurrence's diagnosis lever.
         stats["batches_truncated"] = batches_truncated
         # #541: the provider-exception class — distinct from the parse

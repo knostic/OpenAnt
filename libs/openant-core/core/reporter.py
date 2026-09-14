@@ -760,13 +760,25 @@ def build_pipeline_output(
         # consumer — forward it present-only so pipeline_output carries the
         # signal that distinguishes genuinely-dead code from missing edges.
         for _tk in ("pruned_orphan_count", "pruned_in_dead_cluster_count",
-                    "pruned_forward_called_by_reachable_count"):
+                    "pruned_forward_called_by_reachable_count",
+                    # #602: the promoted-vs-retained decomposition — the
+                    # counterfactual structural baseline and the units the
+                    # LLM extras added beyond it (present-only: a language
+                    # that could not measure the baseline contributes
+                    # nothing, never a fabricated 0).
+                    "structural_reachable_units", "units_newly_reachable",
+                    "reachability_baseline_languages"):
             _tv = _reach.get(_tk)
             if isinstance(_tv, int):
                 _reach_telemetry[_tk] = _tv
         _bf = _reach.get("pruned_by_file")
         if isinstance(_bf, dict):
             _reach_telemetry["pruned_by_file"] = _bf
+        # #602: the synthetic-only baseline marker (a str) — forwarded
+        # like the advisory below, not summed.
+        _bl = _reach.get("reachability_baseline")
+        if isinstance(_bl, str) and _bl:
+            _reach_telemetry["reachability_baseline"] = _bl
         _oa = _reach.get("orphan_advisory")
         if isinstance(_oa, str) and _oa:
             _reach_telemetry["orphan_advisory"] = _oa
