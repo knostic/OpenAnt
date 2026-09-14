@@ -50,6 +50,9 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
 
     # Snapshot starting cost so we can compute the delta
     start_cost, start_tokens = _snapshot_usage()
+    # #605: a failed START snapshot must not become a fabricated zero
+    # baseline — the delta is unavailable, not zero.
+    _accounting_error = start_cost is None
 
     try:
         yield report
@@ -112,20 +115,45 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
 
         # Capture cost delta
         end_cost, end_snapshot = _snapshot_usage()
-        report.cost_usd = round(end_cost - start_cost, 6)
-        report.token_usage = {
-            "input_tokens": end_snapshot.get("input", 0) - start_tokens.get("input", 0),
-            "output_tokens": end_snapshot.get("output", 0) - start_tokens.get("output", 0),
-            "total_tokens": end_snapshot.get("total", 0) - start_tokens.get("total", 0),
-        }
-        # #216: a step whose cost is incomplete (any call on an unpriced
-        # model) must say so IN the artifact — OR the end snapshot's marker
-        # (run-cumulative, so a step after unpriced spend also flags).
-        if end_snapshot.get("cost_incomplete"):
-            report.token_usage["cost_incomplete"] = True
-            report.token_usage["unpriced_models"] = end_snapshot.get(
-                "unpriced_models", [])
-
+        if end_cost is None:
+            _accounting_error = True
+        if _accounting_error:
+            # #605: either endpoint failed — the DELTA is unavailable.
+            # Write zeros WITHOUT subtracting (a fabricated baseline yields
+            # negative cost/tokens or charges another step's spend) and
+            # mark the step's accounting as errored, never complete-looking.
+            report.cost_usd = 0.0
+            report.token_usage = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cost_incomplete": True,
+                "accounting_error": True,
+            }
+        else:
+            report.cost_usd = round(end_cost - start_cost, 6)
+            report.token_usage = {
+                "input_tokens": end_snapshot.get("input", 0) - start_tokens.get("input", 0),
+                "output_tokens": end_snapshot.get("output", 0) - start_tokens.get("output", 0),
+                "total_tokens": end_snapshot.get("total", 0) - start_tokens.get("total", 0),
+            }
+            # #216: a step whose cost is incomplete (any call on an unpriced
+            # model) must say so IN the artifact — OR the end snapshot's marker
+            # (run-cumulative, so a step after unpriced spend also flags).
+            if end_snapshot.get("cost_incomplete"):
+                report.token_usage["cost_incomplete"] = True
+                report.token_usage["unpriced_models"] = end_snapshot.get(
+                    "unpriced_models", [])
+            # #605: a mid-run accounting drop (another phase's hand-off)
+            # surfaces here too — the marker is run-cumulative through the
+            # tracker totals, the same accepted trade as #216's.
+            from utilities.llm_client import _accounting_error_count
+            if _accounting_error_count():
+                # A mid-run drop is an INCOMPLETE-COST condition too: the
+                # step's (and the scan's) cost figure does not include the
+                # dropped spend — both markers, never one without the other.
+                report.token_usage["accounting_error"] = True
+                report.token_usage["cost_incomplete"] = True
         report.write(output_dir)
         print(
             f"[{step}] Report: {output_dir}/{step}.report.json "
@@ -134,11 +162,13 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
         )
 
 
-def _snapshot_usage() -> tuple[float, dict]:
+def _snapshot_usage() -> tuple[float | None, dict | None]:
     """Return (cost_usd, {input, output, total, cost_incomplete,
     unpriced_models}) from the global tracker.
 
-    Returns zeroes if the tracker isn't available (e.g. for local-only steps).
+    Returns (None, None) on failure — the caller must skip the delta
+    subtraction and mark the accounting errored (#605: never a
+    complete-looking zero snapshot).
     """
     try:
         from core.tracking import get_usage
@@ -150,6 +180,11 @@ def _snapshot_usage() -> tuple[float, dict]:
             "cost_incomplete": usage.cost_incomplete,
             "unpriced_models": usage.unpriced_models,
         }
-    except Exception:
-        return 0.0, {"input": 0, "output": 0, "total": 0,
-                     "cost_incomplete": False, "unpriced_models": []}
+    except Exception as exc:
+        # #605: a failed snapshot is a SENTINEL, never a complete-looking
+        # zero — the caller must skip the subtraction (a fabricated baseline
+        # produces negative deltas or charges another step's spend) and
+        # mark the step's accounting incomplete.
+        print(f"[step-report] accounting snapshot failed ({type(exc).__name__}): "
+              f"{exc}", file=sys.stderr)
+        return None, None
