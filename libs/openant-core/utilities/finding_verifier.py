@@ -483,13 +483,46 @@ class FindingVerifier:
             self._log("debug", f"Iteration {iterations}", iterations=iterations)
 
             # Adapter handles the rate-limiter wait/report dance internally.
-            response = self.binding.adapter.complete(
-                model=self.binding.model,
-                max_tokens=MAX_TOKENS_PER_RESPONSE,
-                system=system_prompt,
-                tools=self._tool_defs,
-                messages=messages,
-            )
+            # #616: a mid-conversation raise must not vanish the accumulated
+            # usage — the conversation's spend (the frame-local accumulation
+            # plus the raising turn's own reported tokens) reaches the
+            # tracker BEFORE the re-raise (the #537/#549 idiom, applied at
+            # the boundary the verifier actually uses — this loop bypasses
+            # helpers.simple_completion). Exactly-once: every normal exit
+            # returns immediately after its own record_call, so this handler
+            # can only fire on a path no other record took.
+            try:
+                response = self.binding.adapter.complete(
+                    model=self.binding.model,
+                    max_tokens=MAX_TOKENS_PER_RESPONSE,
+                    system=system_prompt,
+                    tools=self._tool_defs,
+                    messages=messages,
+                )
+            except Exception as exc:
+                exc_in = int(getattr(exc, "input_tokens", 0) or 0)
+                exc_out = int(getattr(exc, "output_tokens", 0) or 0)
+                # Only LLMResponseError carries the raising turn's tokens;
+                # connection/auth/limit errors contribute nothing (and a
+                # turn-1 failure with zero accumulated usage writes NO
+                # record — the helpers' guard, mirrored: record_call
+                # appends a $0 call record unconditionally otherwise).
+                if (total_input_tokens or total_output_tokens
+                        or exc_in or exc_out):
+                    # The raising turn's usage is ONLY on the exception
+                    # (the accumulation below runs after complete returns);
+                    # its per-turn list entry is None — the documented
+                    # None-entry contract, so the list length equals the
+                    # turns billed. Conversation-level record, never
+                    # relabeled per-request.
+                    self.tracker.record_call(
+                        model=self.binding.model,
+                        input_tokens=total_input_tokens + exc_in,
+                        output_tokens=total_output_tokens + exc_out,
+                        pricing=lookup_pricing(self.binding),
+                        usage_details=per_turn_usage_details + [None],
+                    )
+                raise
 
             total_input_tokens += response.input_tokens
             total_output_tokens += response.output_tokens
