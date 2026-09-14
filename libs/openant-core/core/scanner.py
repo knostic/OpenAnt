@@ -1863,6 +1863,11 @@ def _write_scan_report(
             # Aggregate of what the walker refused (symlinks) or could not read
             # (directories), summed across languages from each scan-result file.
             "coverage": _collect_coverage(result),
+            # #600: the discovery block beside coverage — the serialization
+            # contract names scan.report.json one of the operator's two
+            # artifacts; idempotent re-derivation from the same on-disk scan
+            # artifacts (the Step-6 bridge reads them too).
+            "discovery": _collect_discovery(_probe_from_result(result)),
         },
         # #613: the actual scan target — the caller-threaded, caller-absolutized
         # repo path, written verbatim like every per-step inputs.repo_path (the

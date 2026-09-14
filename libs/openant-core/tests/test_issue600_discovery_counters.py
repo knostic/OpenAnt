@@ -29,11 +29,31 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from parsers.python.repository_scanner import RepositoryScanner  # noqa: E402
+from parsers.rust.repository_scanner import (  # noqa: E402
+    RepositoryScanner as RustScanner,
+)
+from parsers.swift.repository_scanner import (  # noqa: E402
+    RepositoryScanner as SwiftScanner,
+)
+from parsers.zig.repository_scanner import (  # noqa: E402
+    RepositoryScanner as ZigScanner,
+)
+from parsers.c.repository_scanner import (  # noqa: E402
+    RepositoryScanner as CScanner,
+)
+from parsers.php.repository_scanner import (  # noqa: E402
+    RepositoryScanner as PhpScanner,
+)
+from parsers.ruby.repository_scanner import (  # noqa: E402
+    RepositoryScanner as RubyScanner,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -83,9 +103,16 @@ def test_entry_relative_examples_per_reserved_name(tmp_path):
 
 def test_repeated_scans_reset_and_recount(tmp_path):
     """The histogram lives in scan()'s reset (not __init__): a second scan
-    of the same tree reports the same counts, not doubled ones."""
-    first = _scan_repo(tmp_path, ["build"])
-    second = RepositoryScanner(str(tmp_path / "repo")).scan()
+    of the same tree — the SAME instance — reports the same counts, not
+    doubled ones (an __init__-only histogram must not satisfy this)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "build").mkdir()
+    (repo / "build" / "m.py").write_text("x = 1\n")
+    (repo / "root.py").write_text("y = 2\n")
+    scanner = RepositoryScanner(str(repo))
+    first = scanner.scan()
+    second = scanner.scan()
     assert first["statistics"]["excluded_dir_names"] == \
         second["statistics"]["excluded_dir_names"]
     assert second["statistics"]["excluded_dir_names"]["build"] == 1
@@ -112,27 +139,6 @@ def test_dynamic_name_saturation_discloses_overflow(tmp_path):
     assert stats["directories_excluded"] == 30  # the exact total
 
 
-def test_attacker_hostile_names_never_reach_the_artifact(tmp_path):
-    """Names with control characters / newlines / absurd length are
-    producer-side sanitized: they count, but never become JSON keys or
-    prompt tokens."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    # PORTABLE hostile names only on the FILESYSTEM (control characters
-    # are illegal on NTFS — the control-char class is covered by the
-    # recorder-unit test below). A 120-char name is legal on every
-    # supported filesystem and over the 100-char artifact bound.
-    for name in ("y" * 120 + "-1.0.egg-info", "a" * 99 + "b-1.0.egg-info"):
-        d = repo / name
-        d.mkdir()
-        (d / "m.py").write_text("x = 1\n")
-    out = RepositoryScanner(str(repo)).scan()
-    hist = out["statistics"]["excluded_dir_names"]
-    for k in hist:
-        assert all(32 <= ord(c) <= 126 for c in k), repr(k)
-        assert len(k) <= 100, repr(k)
-
-
 def test_hostile_control_names_at_the_recorder_unit():
     """The control-character class — recorder-UNIT (no filesystem: control
     chars in names are illegal on NTFS, so the FS fixture cannot cover
@@ -146,6 +152,20 @@ def test_hostile_control_names_at_the_recorder_unit():
     assert r.names == {"build": 1}
     assert r.overflow == 3
     assert r.examples == {"build": ["build"]}
+
+
+def test_nonascii_name_counts_into_overflow_never_keys():
+    """A legitimate non-ASCII NAME ('données') counts toward the overflow
+    and never keys the artifact — the documented bound (the name-gate half
+    of the count/example split; the non-ASCII-ancestor test covers the
+    path half)."""
+    from core.repo_walk import ExcludedDirRecorder
+    r = ExcludedDirRecorder({"build"})
+    r.note("données", "x")
+    r.note("build", "build")
+    assert r.names == {"build": 1}
+    assert r.overflow == 1
+    assert list(r.examples) == ["build"]
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +266,19 @@ def test_failed_language_disclosed_never_fell_back(tmp_path):
     assert block["per_language"]["python"]["directories_excluded"] == 1
 
 
+def test_language_without_any_artifact_is_disclosed_not_zeroed(tmp_path):
+    """A language whose output dir carries NO scan artifact (the Go
+    pipeline-mode runtime contract: `go_parser all` writes neither probed
+    filename) lands in languages_without_discovery_data — disclosed,
+    never zeroed, never a failed-language entry."""
+    empty = tmp_path / "go-out"
+    empty.mkdir()
+    block, _ = _discovery_result(go=str(empty))
+    assert block["per_language"] == {}
+    assert block["languages_without_discovery_data"] == ["go"]
+    assert "failed_languages" not in block
+
+
 # ---------------------------------------------------------------------------
 # the consumers: both entry points construct parse.report.json
 # ---------------------------------------------------------------------------
@@ -291,6 +324,19 @@ def test_scan_path_parse_report_carries_discovery(monkeypatch, tmp_path):
         return pr
     monkeypatch.setattr(parser_adapter, "parse_repository",
                          _stub_with_scan_result)
+    # #600: wrap the scaffold's fake build_pipeline_output to CAPTURE the
+    # Step-6 kwargs — the bridge's discovery kwarg is the pin; the fake
+    # (which writes "{}") stays the writer.
+    import core.reporter as _reporter_mod
+    _captured = {}
+    _scaffold_fake = _reporter_mod.build_pipeline_output
+
+    def _capturing_build_output(*args, **kwargs):
+        _captured.update(kwargs)
+        return _scaffold_fake(*args, **kwargs)
+
+    monkeypatch.setattr(_reporter_mod, "build_pipeline_output",
+                        _capturing_build_output)
     monkeypatch.chdir(tmp_path)
     scanner_mod.scan_repository(
         repo_path="repo", output_dir="out",
@@ -300,6 +346,14 @@ def test_scan_path_parse_report_carries_discovery(monkeypatch, tmp_path):
     report = json.loads((tmp_path / "out" / "parse.report.json").read_text())
     disc = report["summary"]["discovery"]
     assert disc["per_language"]["python"]["excluded_dir_names"]["build"] == 1
+    # The Step-6 bridge forwards the same block to build_pipeline_output
+    # (captured past the scaffold's fake — the real call site), and the
+    # operator's aggregate report carries it beside coverage.
+    assert _captured["discovery"]["per_language"]["python"][
+        "excluded_dir_names"]["build"] == 1
+    sr = json.loads((tmp_path / "out" / "scan.report.json").read_text())
+    assert sr["summary"]["discovery"]["per_language"]["python"][
+        "excluded_dir_names"]["build"] == 1
 
 
 def test_standalone_parse_report_carries_discovery(monkeypatch, tmp_path):
@@ -334,42 +388,76 @@ def test_summary_template_states_the_discovery_line():
     assert "fields_missing_by_language" in src  # the per-field qualification
 
 
+def test_step_report_forwarder_is_best_effort():
+    """#600: _discovery_from_step_reports forwards the parse report's
+    block; a parse output elsewhere drops it (present-only downstream)."""
+    from openant.cli import _discovery_from_step_reports
+    block = {"per_language": {"python": {"directories_excluded": 1}}}
+    assert _discovery_from_step_reports(
+        [{"step": "parse", "summary": {"discovery": block}}]) == block
+    # a non-parse step's block is never forwarded
+    assert _discovery_from_step_reports(
+        [{"step": "analyze", "summary": {"discovery": block}}]) is None
+    # an empty summary, and no step reports at all
+    assert _discovery_from_step_reports(
+        [{"step": "parse", "summary": {}}]) is None
+    assert _discovery_from_step_reports(None) is None
+
+
+def test_pipeline_output_discovery_is_present_only(tmp_path):
+    """#600: build_pipeline_output emits the discovery key only when
+    supplied — present-only beside coverage (absent upstream stays absent
+    downstream; the standalone build-output/report lanes depend on it)."""
+    from core.reporter import build_pipeline_output
+    results = tmp_path / "results.json"
+    results.write_text(json.dumps({"results": [], "metrics": {}}))
+    out1 = tmp_path / "po-none.json"
+    build_pipeline_output(str(results), str(out1), repo_name="fixture")
+    assert "discovery" not in json.loads(out1.read_text())
+    out2 = tmp_path / "po-with.json"
+    block = {"per_language": {"python": {"directories_excluded": 1}}}
+    build_pipeline_output(str(results), str(out2), repo_name="fixture",
+                          discovery=block)
+    assert json.loads(out2.read_text())["discovery"] == block
+
+
 # ---------------------------------------------------------------------------
 # the producer census: ALL SEVEN Python-family scanners (the hunt's R05 fix —
 # a single-scanner test let swift's false-zero and ruby's absence slip)
 # ---------------------------------------------------------------------------
 
 _SCANNERS = [
-    ("python", "parsers.python.repository_scanner", "RepositoryScanner", ".py"),
-    ("rust", "parsers.rust.repository_scanner", "RepositoryScanner", ".rs"),
-    ("zig", "parsers.zig.repository_scanner", "RepositoryScanner", ".zig"),
-    ("swift", "parsers.swift.repository_scanner", "RepositoryScanner", ".swift"),
-    ("c", "parsers.c.repository_scanner", "RepositoryScanner", ".c"),
-    ("php", "parsers.php.repository_scanner", "RepositoryScanner", ".php"),
-    ("ruby", "parsers.ruby.repository_scanner", "RepositoryScanner", ".rb"),
+    ("python", RepositoryScanner, ".py"),
+    ("rust", RustScanner, ".rs"),
+    ("zig", ZigScanner, ".zig"),
+    ("swift", SwiftScanner, ".swift"),
+    ("c", CScanner, ".c"),
+    ("php", PhpScanner, ".php"),
+    ("ruby", RubyScanner, ".rb"),
 ]
 
 
-def test_all_scanners_name_their_excluded_dirs(tmp_path, request):
+@pytest.mark.parametrize("lang,scanner_cls,ext", _SCANNERS)
+def test_all_scanners_name_their_excluded_dirs(tmp_path, lang, scanner_cls,
+                                               ext):
     """The parametrized census: every Python-family scanner names build/ with
     the exact count and an entry-relative example — the test that would have
-    caught swift's false-zero projection and ruby's missing instrumentation."""
-    import importlib
-    for lang, mod_name, cls_name, ext in _SCANNERS:
-        repo = tmp_path / f"repo-{lang}"
-        repo.mkdir()
-        (repo / "build").mkdir()
-        (repo / "build" / f"lib{ext}").write_text("x = 1\n")
-        (repo / f"root{ext}").write_text("y = 2\n")
-        mod = importlib.import_module(mod_name)
-        scanner = getattr(mod, cls_name)(str(repo))
-        stats = scanner.scan()["statistics"]
-        assert stats.get("excluded_dir_names", {}).get("build") == 1, (
-            f"{lang}: the histogram must name build/ (got "
-            f"{stats.get('excluded_dir_names')})")
-        assert stats["directories_excluded"] >= 1, lang
-        ex = stats.get("excluded_dir_examples", {}).get("build", [])
-        assert ex and ex[0] == "build", f"{lang}: entry-relative example (got {ex})"
+    caught swift's false-zero projection and ruby's missing instrumentation
+    (parametrized so one scanner's failure never masks another's; the
+    scanners statically imported — no dynamic import surface)."""
+    repo = tmp_path / f"repo-{lang}"
+    repo.mkdir()
+    (repo / "build").mkdir()
+    (repo / "build" / f"lib{ext}").write_text("x = 1\n")
+    (repo / f"root{ext}").write_text("y = 2\n")
+    scanner = scanner_cls(str(repo))
+    stats = scanner.scan()["statistics"]
+    assert stats.get("excluded_dir_names", {}).get("build") == 1, (
+        f"{lang}: the histogram must name build/ (got "
+        f"{stats.get('excluded_dir_names')})")
+    assert stats["directories_excluded"] >= 1, lang
+    ex = stats.get("excluded_dir_examples", {}).get("build", [])
+    assert ex and ex[0] == "build", f"{lang}: entry-relative example (got {ex})"
 
 
 def test_second_scan_same_instance_does_not_double(tmp_path):

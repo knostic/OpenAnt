@@ -138,6 +138,8 @@ class RepositoryScanner:
                 "symlinks_skipped": stats.get("symlinks_skipped", 0),
                 "symlink_examples": stats.get("symlink_examples", []),
                 "unreadable_examples": stats.get("unreadable_examples", []),
+                # #600: the histogram must survive this hand-rebuilt
+                # projection or the walker instrumentation disappears.
                 "excluded_dir_names": stats.get("excluded_dir_names", {}),
                 "excluded_dir_examples": stats.get("excluded_dir_examples", {}),
                 "excluded_dir_names_overflow": stats.get("excluded_dir_names_overflow", 0),
