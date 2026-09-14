@@ -3,6 +3,12 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-14] — The errored unit's usage reaches the tracker (#616)
+
+### Fixed
+
+- **A mid-conversation adapter raise no longer vanishes the verify stage's spend.** `verify_result`'s conversation loop had no try/except around the adapter call: a raise mid-conversation lost the accumulated usage and the errored unit read $0 / 0 tokens while the provider billed both. The fix (the #537/#549 idiom, at the boundary the verifier actually uses — the loop bypasses the helpers): the accumulated conversation usage **plus the raising turn's own tokens** (only `LLMResponseError` carries them; connection/auth/limit raises billed nothing and append no turn entry) reaches the tracker *before* the re-raise, exactly once (the try stays narrow — widening it double-records on the record-then-parse exits). A turn-1 failure with nothing accumulated writes no record; KeyboardInterrupt propagates uncaught. The harvest, the checkpoint's usage, and the resume's "already spent" sum now carry the real spend — **first-resume-true**: a retried unit's checkpoint is overwritten by its retry's usage, so a resume-of-a-resume sees only the retry's spend (the pre-existing overwrite shape, now material — a named follow-up). The #598 pricing census is 17 sites (the new exception-path record passes `pricing=`).
+
 ## [2026-09-14] — Silent accounting drops become loud (#605)
 
 ### Fixed

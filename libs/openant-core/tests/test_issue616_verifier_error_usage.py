@@ -13,11 +13,16 @@ fix lands at the boundary the verifier actually uses.
 The contract (the process notes): conversation-level record, exactly-once
 (every normal exit returns immediately after its own record_call), the
 raising turn's own tokens folded in (they live ONLY on the exception — the
-accumulation runs after complete returns), a None per-turn entry for the
-raising turn, a zero-token guard (a turn-1 connection failure writes NO
-$0 call record), and KeyboardInterrupt propagates uncaught (BaseException
-— the :983/:1024 handlers keep their shape). No conversation record is
-ever relabeled a request.
+accumulation runs after complete returns), a per-turn entry for the
+raising turn ONLY when the exception carries its tokens (LLMResponseError;
+connection/auth/limit raises billed nothing — no entry), a zero-token
+guard (a turn-1 connection failure writes NO $0 call record), and
+KeyboardInterrupt propagates uncaught (BaseException — the :1017/:1058
+handlers keep their shape). No conversation record is ever relabeled a
+request. Residual, disclosed: a NON-adapter raise after accumulation (a
+malformed CompletionResult, an unserializable tool result) still loses
+the usage — the try stays narrow because widening it double-records on
+the record-then-parse exits.
 """
 
 import sys
@@ -199,6 +204,9 @@ def test_rate_limit_raise_records_accumulated_only():
         pass
     assert len(v.tracker.calls) == 1
     assert v.tracker.calls[0]["input_tokens"] == 7
+    # the None-entry contract: the raising turn billed nothing → NO entry
+    # appended for it — the list is the completed turn's entry alone
+    assert v.tracker.calls[0]["usage_details"] == [None]
 
 
 def test_keyboard_interrupt_propagates_unrecorded():

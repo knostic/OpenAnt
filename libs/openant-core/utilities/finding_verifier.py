@@ -510,17 +510,20 @@ class FindingVerifier:
                 if (total_input_tokens or total_output_tokens
                         or exc_in or exc_out):
                     # The raising turn's usage is ONLY on the exception
-                    # (the accumulation below runs after complete returns);
-                    # its per-turn list entry is None — the documented
-                    # None-entry contract, so the list length equals the
-                    # turns billed. Conversation-level record, never
-                    # relabeled per-request.
+                    # (the accumulation below runs after complete returns).
+                    # Its per-turn list entry is appended ONLY when the
+                    # exception carries tokens (LLMResponseError) — a
+                    # connection/auth/limit raise billed nothing for the
+                    # raising turn, so no entry is added for it (the list
+                    # length equals the turns billed). Conversation-level
+                    # record, never relabeled per-request.
                     self.tracker.record_call(
                         model=self.binding.model,
                         input_tokens=total_input_tokens + exc_in,
                         output_tokens=total_output_tokens + exc_out,
                         pricing=lookup_pricing(self.binding),
-                        usage_details=per_turn_usage_details + [None],
+                        usage_details=per_turn_usage_details
+                        + ([None] if (exc_in or exc_out) else []),
                     )
                 raise
 
