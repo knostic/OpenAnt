@@ -19,7 +19,7 @@ On completion, a final ``scan.report.json`` aggregates all step reports.
 import json
 import os
 import shutil
-from typing import Dict
+from typing import Any, Dict
 import sys
 from pathlib import Path
 
@@ -124,10 +124,15 @@ def _relativize_home(path_str: str) -> str:
 
 
 def _promotable_skip_count(by_class: dict, promote_set) -> int:
-    """#602: the skipped signals that COULD have promoted — entry_point
-    skips whose confidence is in THIS run's promote set (the promote gate
-    at apply_signals). Factored for testability: the guard tolerates
-    malformed keys (never a report-assembly crash)."""
+    """#602: the skipped signals that COULD have promoted — an UPPER
+    BOUND: entry_point skips whose confidence is in THIS run's promote
+    set (the promote gate at apply_signals). Upper bound because the
+    skipped signal's target is outside its batch by construction — the
+    count cannot know whether the id exists in another batch (a real
+    lost promotion candidate) or nowhere in the dataset (a hallucinated
+    id, promotable by no gate), nor whether the target was already an
+    entry point. Factored for testability: the guard tolerates malformed
+    keys (never a report-assembly crash)."""
     total = 0
     for k, v in (by_class or {}).items():
         if (not isinstance(k, str) or not isinstance(v, int)
@@ -696,7 +701,7 @@ def scan_repository(
                     # #294: collect parse-level batch-drop stats so the
                     # step report's units_reviewed stops implying full
                     # coverage when batches were dropped.
-                    reach_stats: Dict[str, int] = {}
+                    reach_stats: Dict[str, Any] = {}
                     signals = analyze_reachability(
                         dataset=dataset,
                         app_context=app_ctx_payload,
@@ -985,10 +990,13 @@ def scan_repository(
                             "signals_skipped_unknown_unit", 0),
                         "signals_skipped_unknown_unit_by_class": reach_stats.get(
                             "signals_skipped_unknown_unit_by_class", {}),
-                        # #602: the promotable subset — sized at REPORT time
-                        # from this run's own promote_set (the promote gate:
-                        # kind=entry_point, confidence in promote_set), never
-                        # by parse_response (which must stay policy-free).
+                        # #602: the promotable subset — sized at REPORT
+                        # time from this run's own promote_set (the promote
+                        # gate: kind=entry_point, confidence in promote_set),
+                        # never by parse_response (which must stay
+                        # policy-free). An UPPER BOUND: the skipped id is
+                        # outside its batch by construction — it may exist
+                        # in another batch or nowhere in the dataset.
                         "signals_skipped_promotable":
                             _promotable_skip_count(
                                 reach_stats.get(

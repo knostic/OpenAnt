@@ -52,17 +52,20 @@ def _sig(unit_id, kind="entry_point", confidence="high"):
 
 def test_skip_line_carries_kind_confidence_and_batch(capsys):
     """The unknown-unit_id line names WHAT was skipped — an entry_point/high
-    skip is distinguishable in the record from an external_input/low one."""
+    skip is distinguishable in the record from an external_input/low one —
+    and WHERE (the batch label, without a doubled 'batch batch')."""
     body = json.dumps({"signals": [
         _sig("b.py:other"),
         _sig("b.py:x", "external_input", "low")]})
-    parse_response(body, valid_unit_ids={"a.py:f"})
+    parse_response(body, valid_unit_ids={"a.py:f"},
+                   batch_label="batch 1/1")
     err = capsys.readouterr().err
     assert "unknown unit_id 'b.py:other'" in err
     assert "kind='entry_point'" in err
     assert "confidence='high'" in err
     assert "kind='external_input'" in err
     assert "confidence='low'" in err
+    assert "— skipped in batch 1/1" in err  # the batch segment, once
 
 
 def test_on_signal_skip_receives_the_class():
@@ -375,7 +378,10 @@ def test_step_report_carries_the_skip_keys(monkeypatch, tmp_path):
         lambda dataset, signals: {"signals_applied": 0,
                                   "entry_points_promoted": 0,
                                   "units_touched": 0,
-                                  "promote_set": ["high"]})
+                                  # a NON-default set — a regression that
+                                  # ignores the run's promote_set (the #345
+                                  # class) must flip this test's result
+                                  "promote_set": ["medium"]})
     monkeypatch.setattr(lr, "signals_to_json", lambda signals: [])
 
     scanner_mod.scan_repository(
@@ -390,8 +396,9 @@ def test_step_report_carries_the_skip_keys(monkeypatch, tmp_path):
     assert s["signals_skipped_unknown_unit"] == 2
     assert s["signals_skipped_unknown_unit_by_class"] == {
         "entry_point/high": 1, "external_input/low": 1}
-    # the promotable subset: entry_point/high (in promote_set) only
-    assert s["signals_skipped_promotable"] == 1
+    # the promotable subset: entry_point/high is NOT in THIS run's
+    # promote_set (["medium"]) — a hardcoded "high" would fabricate 1
+    assert s["signals_skipped_promotable"] == 0
 
 
 def test_reporter_forwards_the_decomposition_executed(tmp_path):
@@ -418,9 +425,10 @@ def test_promotable_sizing_the_real_function():
     by_class = {"entry_point/high": 1, "entry_point/medium": 1,
                 "external_input/high": 5}
     assert _promotable_skip_count(by_class, ["high"]) == 1
-    # a malformed key (no slash / a non-int) never crashes
+    # a malformed key (no slash / a non-int value / a NON-STR key) never
+    # crashes the report assembly
     assert _promotable_skip_count(
-        {"entry_point": 3, "x/y": "not-int"}, ["y"]) == 0
+        {"entry_point": 3, "x/y": "not-int", 42: 3}, ["y"]) == 0
 
 
 def test_baseline_marker_for_the_synthetic_only_case(tmp_path):

@@ -505,9 +505,11 @@ def apply_reachability_filter(
             _baseline_ids = _baseline_analyzer.get_all_reachable()
         else:
             # #602: the decomposition's most-informative case — the LLM
-            # extras are the ONLY real seeds; the baseline cannot run (an
-            # empty-real-seed BFS closure is the empty set). Disclosed,
-            # never silently absent.
+            # extras are the ONLY real seeds; synthetic-harness seeds are
+            # not real entry points, so there is no structural baseline to
+            # measure against (the structural-only run would have kept ALL
+            # units — the extras can only narrow, and by an unmeasurable
+            # amount). Disclosed, never silently absent.
             _baseline_unmeasurable = "no_real_structural_seeds"
     if extra_entry_points:
         entry_points = entry_points | extra_entry_points

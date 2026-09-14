@@ -359,8 +359,9 @@ def parse_response(
             # #602: the skip carries the signal's kind and confidence — an
             # entry_point/high skip (could have promoted) is now
             # distinguishable in the record from an external_input/low skip
-            # (could not). The old text is preserved for format consumers.
-            _where = f" in batch {batch_label}" if batch_label else ""
+            # (could not). The old PREFIX is preserved (no in-repo consumer
+            # matches the full old line).
+            _where = f" in {batch_label}" if batch_label else ""
             log(f"signal #{idx}: unknown unit_id {unit_id!r} "
                 f"(kind={kind!r}, confidence={confidence!r}) — skipped{_where}")
             if on_signal_skip is not None:
@@ -405,7 +406,7 @@ def analyze_reachability(
     max_code_bytes: int = DEFAULT_MAX_CODE_BYTES,
     max_units: Optional[int] = None,
     on_error: Optional[Callable[[str], None]] = None,
-    stats: Optional[Dict[str, int]] = None,
+    stats: Optional[Dict[str, Any]] = None,
     checkpoint_path: Optional[str] = None,
     tracker: Optional[Any] = None,
 ) -> List[ReachabilitySignal]:

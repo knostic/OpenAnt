@@ -17,21 +17,23 @@ All notable changes to OpenAnt are documented in this file.
   responses only (a dropped/truncated batch's skips are discarded with
   it; split-retry halves commit their own). The step report carries
   `signals_skipped_promotable` — the skipped signals that could have
-  promoted, sized at report time from this run's own promote set. A
-  skipped signal is not a coverage failure: `error_count` stays
-  dropped+failed batches only.
+  promoted, an upper bound (a skipped id may exist in another batch or
+  nowhere in the dataset), sized at report time from this run's own
+  promote set. A skipped signal is not a coverage failure: `error_count`
+  stays dropped+failed batches only.
 - **`entry_points_promoted` is decomposed.** The structural baseline
   (detector + library seeds, without the LLM extras — a side computation
   on a copy, the filter itself unchanged) gives
   `structural_reachable_units` + `units_newly_reachable` per language,
   lifted through the aggregation whitelist with
-  `reachability_baseline_languages` (the denominator honesty), forwarded
-  present-only into `pipeline_output.json`, and rendered by the summary
-  prompt. The keys stay absent when unmeasurable; the
-  synthetic-only-seeds case is disclosed by the `reachability_baseline`
-  marker (never a silent absence). Telemetry only: retained unit sets are
-  byte-identical for every pre-existing shape (verified base-vs-head on
-  the parse-level reachable path, the llr path, and the keep-all path).
+  `reachability_baseline_languages` (the denominator honesty) and
+  forwarded present-only into `pipeline_output.json`. The keys stay
+  absent when unmeasurable; the synthetic-only-seeds case is disclosed
+  by the `reachability_baseline` marker (never a silent absence).
+  Telemetry only: retained unit sets are unchanged for every
+  pre-existing shape (the base-vs-head artifact differential on the
+  parse-level reachable path; the llr and keep-all paths pinned by
+  executed tests).
 
 ## [2026-09-14] — Discovery counters: the excluded directories are NAMED (#600)
 
