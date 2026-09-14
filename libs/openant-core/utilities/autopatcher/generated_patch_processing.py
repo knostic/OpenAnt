@@ -73,12 +73,18 @@ class ProcessedPatch:
     (the patch was already applicable, or reconstruction wasn't
     requested) -- never a fabricated "not attempted" sentinel distinct
     from "genuinely didn't run".
+
+    ``empty_hunks_removed`` is the number of hunks stripped by strip_
+    empty_hunks (0 whenever the patch was already applicable, or none of
+    its hunks were empty, or the strip attempt failed/didn't apply --
+    see that function's own docstring for why removal is always safe).
     """
     patch: str
     repair_result: RepairResult
     hygiene_findings: list
     applicability_result: dict
     context_expansion: "ContextExpansionResult | None" = None
+    empty_hunks_removed: int = 0
 
 
 def process_generated_patch(
@@ -89,8 +95,18 @@ def process_generated_patch(
         repair_hunk_headers
         check_patch (hygiene)
         check_applicability
+        [if still inapplicable and repo_root:
+            strip_empty_hunks, then re-check_applicability (+ hygiene)]
         [if still inapplicable and allow_context_reconstruction and repo_root:
             reconstruct_hunk_context, then re-check_applicability]
+
+    The empty-hunk strip runs unconditionally on failure (not gated by
+    `allow_context_reconstruction`) because dropping a hunk with zero
+    added/removed lines can never change what the patch does -- it is a
+    strictly safe, always-worth-trying deterministic step, cheaper than
+    and independent of context reconstruction. Running it BEFORE context
+    reconstruction also means a hunk with no real content is never handed
+    to that content-anchored mechanism in the first place.
 
     Every step already fails soft on its own (repair_hunk_headers and
     check_patch never raise by their own contract; check_applicability
@@ -130,6 +146,23 @@ def process_generated_patch(
             "exit_code": None, "stderr": "",
         }
 
+    empty_hunks_removed = 0
+    if applicability_result.get("applicable") is False and repo_root:
+        try:
+            from .diff_hunk_repair import strip_empty_hunks
+            stripped_patch, empty_hunks_removed = strip_empty_hunks(patch)
+            if empty_hunks_removed:
+                from .patch_applicability import check_applicability as _check_applicability_after_strip
+                patch = stripped_patch
+                applicability_result = _check_applicability_after_strip(patch, repo_root)
+                try:
+                    from .patch_hygiene import check_patch as _check_patch_after_strip
+                    hygiene_findings = _check_patch_after_strip(patch)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            empty_hunks_removed = 0
+
     context_expansion = None
     if allow_context_reconstruction and applicability_result.get("applicable") is False and repo_root:
         try:
@@ -145,4 +178,5 @@ def process_generated_patch(
     return ProcessedPatch(
         patch=patch, repair_result=repair_result, hygiene_findings=hygiene_findings,
         applicability_result=applicability_result, context_expansion=context_expansion,
+        empty_hunks_removed=empty_hunks_removed,
     )

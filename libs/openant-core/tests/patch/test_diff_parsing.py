@@ -1,4 +1,4 @@
-from utilities.autopatcher.diff_parsing import DiffHunk, parse_diff, semantic_delta
+from utilities.autopatcher.diff_parsing import DiffHunk, parse_diff, semantic_delta, semantic_delta_preserved
 
 
 def test_empty_input_returns_no_files_or_hunks():
@@ -203,3 +203,56 @@ class TestSemanticDelta:
         delta = semantic_delta(diff)
         assert delta["a.py"] == (["+a_new", "+a_new2"], ["-a_old", "-a_old2"])
         assert delta["b.py"] == (["+b_new"], ["-b_old"])
+
+
+# ---------------------------------------------------------------------------
+# semantic_delta_preserved -- the bounded gate an applicability-aware LLM
+# retry's output can be checked against before its candidate is accepted.
+# ---------------------------------------------------------------------------
+
+class TestSemanticDeltaPreserved:
+    _ORIGINAL = (
+        "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n line1\n-old_a\n+new_a\n"
+        "--- a/b.py\n+++ b/b.py\n@@ -1,2 +1,2 @@\n line1\n-old_b\n+new_b\n"
+    )
+
+    def test_identical_patch_is_always_preserved(self):
+        assert semantic_delta_preserved(self._ORIGINAL, self._ORIGINAL) is True
+
+    def test_rejects_when_non_guarded_file_edit_disappears(self):
+        candidate = "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n line1\n-old_a\n+new_a\n"
+        assert semantic_delta_preserved(self._ORIGINAL, candidate, unguarded_files=["a.py"]) is False
+
+    def test_rejects_when_non_guarded_file_line_changes(self):
+        candidate = (
+            "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n line1\n-old_a\n+new_a\n"
+            "--- a/b.py\n+++ b/b.py\n@@ -1,2 +1,2 @@\n line1\n-old_b\n+DIFFERENT\n"
+        )
+        assert semantic_delta_preserved(self._ORIGINAL, candidate, unguarded_files=["a.py"]) is False
+
+    def test_accepts_when_only_guarded_file_changes(self):
+        candidate = (
+            "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n line1\n-old_a\n+new_a_fixed\n"
+            "--- a/b.py\n+++ b/b.py\n@@ -1,2 +1,2 @@\n line1\n-old_b\n+new_b\n"
+        )
+        assert semantic_delta_preserved(self._ORIGINAL, candidate, unguarded_files=["a.py"]) is True
+
+    def test_position_and_context_differences_in_guarded_file_do_not_matter(self):
+        """The gate compares semantics, not text/position -- a non-guarded
+        file's hunk can move to a different line number with different
+        surrounding context and still pass, as long as its own +/- content
+        is identical."""
+        candidate = (
+            "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n line1\n-old_a\n+new_a\n"
+            "--- a/b.py\n+++ b/b.py\n@@ -9,2 +9,2 @@\n different_ctx\n-old_b\n+new_b\n"
+        )
+        assert semantic_delta_preserved(self._ORIGINAL, candidate) is True
+
+    def test_rejects_when_candidate_invents_a_brand_new_non_guarded_file(self):
+        candidate = self._ORIGINAL + "--- a/c.py\n+++ b/c.py\n@@ -1,1 +1,2 @@\n ctx\n+new_c\n"
+        assert semantic_delta_preserved(self._ORIGINAL, candidate) is False
+
+    def test_no_unguarded_files_argument_means_every_file_is_guarded_by_nothing(self):
+        # unguarded_files=None (the default) checks every file.
+        candidate = "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n line1\n-old_a\n+new_a\n"
+        assert semantic_delta_preserved(self._ORIGINAL, candidate) is False

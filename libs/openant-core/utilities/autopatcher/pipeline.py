@@ -4282,6 +4282,174 @@ def _run_planner_claim_verification(
         return result
 
 
+# ---------------------------------------------------------------------------
+# Evidence-Gap Strategy Fallback -- sits between Final Strategy's first
+# (S2) call and the Final-Target Remediation Slice (S3). Addresses one
+# specific, structurally-detectable deadlock: Final Strategy correctly
+# refuses to name a target because the candidate context it was given was
+# too small/mistruncated to decide from (not because it looked and found
+# nothing) -- and, unrecovered, guided context acquisition (S3) can never
+# run to fetch more, because S3 itself is gated on Final Strategy already
+# having named a target (see pipeline.run()'s own S3 gate). Without this,
+# that is a genuine deadlock, demonstrated by a real urllib3/CVE-2023-43804
+# run whose captured artifacts this module's tests replay.
+#
+# Authority boundary (see remediation_planner.build_final_target_slice's
+# own docstring: "from generate_remediation_strategy()'s VERIFIED result
+# only -- never the earlier, exploratory Target Discovery candidates"):
+# the Planner's target_files/target_symbols are used here ONLY as
+# retrieval seeds for the existing, deterministic, no-LLM-call
+# build_planner_evidence()/build_planner_source_excerpts() path -- never
+# as, or to construct, a RemediationStrategyResult/FinalTargetSliceResult/
+# IntendedEdit/EditReadinessResult. Only a SECOND, genuine
+# generate_remediation_strategy() call may produce anything downstream
+# treats as authoritative; if that second call also fails to name a
+# target, the run fails closed exactly as it already does today -- this
+# module never retries a third time and never substitutes Planner data
+# for a Strategy decision.
+# ---------------------------------------------------------------------------
+
+def _evidence_gap_fallback_trigger(strategy_result) -> bool:
+    """True exactly when Final Strategy #1 evaluated a real response,
+    named zero authoritative targets, and explicitly reported non-empty
+    `insufficient_evidence` -- the one structural signal (no prose/keyword
+    inspection) that distinguishes "the evidence I was given was too
+    thin to decide from" from a genuine "I looked and there is no viable
+    target here" decision (which has `insufficient_evidence == []` and
+    must never trigger this fallback -- see RemediationStrategyResult's
+    own docstring on why an empty target list is never, by itself, a
+    signal to retry)."""
+    return bool(
+        strategy_result is not None
+        and strategy_result.evaluated
+        and not (strategy_result.target_files or strategy_result.target_symbols)
+        and strategy_result.insufficient_evidence
+    )
+
+
+def _run_evidence_gap_strategy_fallback(
+    *, plan_result, repo_root, vulnerability_text, investigation_context,
+    planner_evidence_ctx, budget_controller, llm,
+    repo_grounding_ctx, repository_understanding_ctx, discovery_plan_ctx,
+):
+    """One-shot, bounded recovery attempted only when
+    `_evidence_gap_fallback_trigger` fires on Final Strategy #1's result
+    (checked by the caller before this is ever invoked). Never calls this
+    more than once per run -- there is no loop here, and the caller never
+    calls this function a second time in the same run regardless of what
+    it returns.
+
+    Step 1 (deterministic, zero LLM calls): re-run the exact same
+    Planner-evidence bridge Stage 1 already ran
+    (`remediation_planner.build_planner_evidence`, using the SAME Planner
+    proposal and the SAME InvestigationContext -- no new repository parse,
+    no new candidate discovery), but at the larger, already-existing
+    Final-Target Slice ceiling
+    (`remediation_planner.FINAL_TARGET_SLICE_MAX_CHARS`, itself subject to
+    whatever `budget_controller` this run already has -- never a new
+    budget constant, never a change to `--max-context-budget-windows`)
+    instead of Stage 1's small, fixed, pre-Strategy budget. Planner's
+    `target_files`/`target_symbols` are used here ONLY as the seeds that
+    bridge already verifies and reads source for -- nothing here
+    constructs a RemediationStrategyResult, FinalTargetSliceResult,
+    IntendedEdit, or EditReadinessResult from them.
+
+    "New evidence actually acquired" is determined the simplest possible
+    deterministic way: a byte-for-byte string comparison between the
+    freshly recomputed evidence text and the `planner_evidence_ctx`
+    Strategy #1 already saw. Identical (or empty) text means the larger
+    budget genuinely couldn't fit anything Strategy #1 didn't already
+    have -- a second Strategy call would be pointless, so none is made,
+    and the caller's existing fail-closed behavior applies unchanged.
+
+    Step 2 (one bounded LLM call, only if Step 1's text differs): call
+    `remediation_planner.generate_remediation_strategy` again -- same
+    function, same prompt/schema, unmodified -- with the enriched
+    evidence. This is Final Strategy #2. Its result is the ONLY thing
+    this function returns that the caller may treat as authoritative;
+    Planner's own target_files/target_symbols are never returned here at
+    all.
+
+    Returns a dict (never raises -- any internal failure degrades to "no
+    recovery this run", identical to every other best-effort section in
+    this module):
+      attempted                    : bool -- always True when this function
+                                      is called (the caller already checked
+                                      the trigger); kept for a single,
+                                      uniform observability shape even if a
+                                      future caller invokes this
+                                      unconditionally.
+      evidence_acquired            : bool -- Step 1 produced text that
+                                      differs from `planner_evidence_ctx`.
+      rerun_performed              : bool -- Step 2 (Strategy #2) was
+                                      actually called.
+      enriched_planner_evidence_ctx: str | None -- Step 1's text, only when
+                                      evidence_acquired.
+      strategy_result               : RemediationStrategyResult | None --
+                                      Strategy #2's result, only when
+                                      rerun_performed.
+      skip_reason                  : str | None -- why no rerun happened,
+                                      for observability only (never
+                                      branched on downstream).
+    """
+    result = {
+        "attempted": True, "evidence_acquired": False, "rerun_performed": False,
+        "enriched_planner_evidence_ctx": None, "strategy_result": None, "skip_reason": None,
+    }
+    if plan_result is None or not (plan_result.target_files or plan_result.target_symbols):
+        result["skip_reason"] = "no_planner_targets_to_seed_from"
+        return result
+    if not repo_root:
+        result["skip_reason"] = "no_repo_root"
+        return result
+
+    try:
+        from .remediation_planner import build_planner_evidence, FINAL_TARGET_SLICE_MAX_CHARS
+        # Mirrors remediation_planner._effective_final_target_max exactly
+        # (that helper is private to remediation_planner.py, so its two
+        # lines are reproduced here rather than imported across the module
+        # boundary) -- the SAME shared Final-Target Slice ceiling Slices
+        # 2/3/4 already use, never a new, separate budget.
+        new_max_chars = (
+            budget_controller.effective_budget("final_target_slice", FINAL_TARGET_SLICE_MAX_CHARS)
+            if budget_controller is not None else FINAL_TARGET_SLICE_MAX_CHARS
+        )
+        new_ctx = build_planner_evidence(
+            plan_result, repo_root, vulnerability_text, investigation_context, max_chars=new_max_chars,
+        )
+    except Exception as exc:
+        result["skip_reason"] = f"acquisition_failed:{type(exc).__name__}"
+        return result
+
+    if not new_ctx or new_ctx == planner_evidence_ctx:
+        result["skip_reason"] = "no_new_evidence"
+        return result
+
+    result["evidence_acquired"] = True
+    result["enriched_planner_evidence_ctx"] = new_ctx
+
+    try:
+        from .remediation_planner import generate_remediation_strategy
+        strategy_v2 = generate_remediation_strategy(
+            vulnerability_text, llm, repo_root, investigation_context,
+            repo_grounding_ctx=repo_grounding_ctx,
+            repository_understanding_ctx=repository_understanding_ctx,
+            discovery_plan_ctx=discovery_plan_ctx,
+            planner_evidence_ctx=new_ctx,
+        )
+    except ModelUnavailableError:
+        # Same explicit execution/configuration-decision exception every
+        # other LLM call in this module family re-raises unconditionally.
+        raise
+    except Exception as exc:
+        result["skip_reason"] = f"rerun_failed:{type(exc).__name__}"
+        return result
+
+    result["rerun_performed"] = True
+    result["strategy_result"] = strategy_v2
+    return result
+
+
 def _build_retry_hint(stderr: str, failed_file: str) -> str:
     excerpt_lines = (stderr or "").splitlines()[:_RETRY_STDERR_LINES]
     excerpt = "\n".join(excerpt_lines)
@@ -4648,6 +4816,7 @@ def _run_patch_generation_and_investigation(
                 build_post_patch_recovery_hint, build_recovery_targets,
                 check_patch_target_conformance,
                 post_patch_recovery_trigger_reasons, recover_post_patch_source,
+                remove_final_target_slice_section,
             )
             # Patch Target Conformance is checked against ReadyEdit ONLY --
             # "currently approved edit intent" -- never against the
@@ -4699,7 +4868,18 @@ def _run_patch_generation_and_investigation(
                         _post_patch_recovery.slice_result.rendered if _post_patch_recovery.slice_result else ""
                     )
                     if _recovered_rendered:
-                        _recovery_context = (code_context + "\n\n" if code_context else "") + _recovered_rendered
+                        # code_context may already carry a stale "## Final-Target
+                        # Remediation Slice" section built against the pre-recovery
+                        # (unverified/mis-targeted) Final Strategy targets -- drop it
+                        # before appending the freshly recovered slice so the
+                        # regeneration prompt carries the corrected evidence exactly
+                        # once, not the old copy plus the new one. Target resolution/
+                        # approval itself is untouched: this only removes an already-
+                        # superseded rendered copy from the prompt text.
+                        _recovery_context = remove_final_target_slice_section(code_context)
+                        _recovery_context = (
+                            (_recovery_context + "\n\n" if _recovery_context else "") + _recovered_rendered
+                        )
 
                     try:
                         _regenerated_raw = generate_patch(
@@ -4894,6 +5074,12 @@ def _run_patch_generation_and_investigation(
         hygiene_findings = _processed.hygiene_findings
         applicability_result = _processed.applicability_result
         _context_expansion = _processed.context_expansion
+        if _processed.empty_hunks_removed:
+            print(
+                f"[pipeline] Deterministic repair removed {_processed.empty_hunks_removed} "
+                f"zero-change hunk(s) — applicable={applicability_result.get('applicable')}",
+                file=sys.stderr,
+            )
         if _context_expansion is not None:
             if _context_expansion.succeeded:
                 print(
@@ -5021,13 +5207,33 @@ def _run_patch_generation_and_investigation(
                         _r_repair_meta = _r_processed.repair_result
                         retry_patch = r_patch_raw
                         if r_app.get("applicable") is True:
-                            retry_succeeded = True
-                            patch = r_patch_raw
-                            hygiene_findings = r_hygiene
-                            applicability_result = r_app
-                            if _r_repair_meta is not None:
-                                _final_repair_meta = _r_repair_meta
-                            print("[pipeline] Retry succeeded — patch applies cleanly.", file=sys.stderr)
+                            # Applicability alone is not sufficient to accept a
+                            # regenerated patch: the retry was asked only to fix
+                            # `failed_files`, so every OTHER file's own semantic
+                            # edits (additions/removals) must survive unchanged --
+                            # reusing the same semantic_delta() invariant
+                            # reconstruct_hunk_context() already uses to guard its
+                            # own deterministic reconstruction, applied here to the
+                            # LLM's output instead. No new LLM call, no repair --
+                            # a candidate that fails this is simply rejected and
+                            # the original (pre-retry) patch is kept, exactly like
+                            # the existing "did not apply" fallback below.
+                            from .diff_parsing import semantic_delta_preserved
+                            if semantic_delta_preserved(original_patch, r_patch_raw, failed_files):
+                                retry_succeeded = True
+                                patch = r_patch_raw
+                                hygiene_findings = r_hygiene
+                                applicability_result = r_app
+                                if _r_repair_meta is not None:
+                                    _final_repair_meta = _r_repair_meta
+                                print("[pipeline] Retry succeeded — patch applies cleanly.", file=sys.stderr)
+                            else:
+                                print(
+                                    "[pipeline] Retry applied but changed semantic edits in a "
+                                    "file it was not asked to repair — rejecting, keeping "
+                                    "original patch.",
+                                    file=sys.stderr,
+                                )
                         else:
                             print("[pipeline] Retry did not apply; keeping original patch.", file=sys.stderr)
             except Exception as exc:
@@ -6316,10 +6522,82 @@ def run(
         except Exception as exc:
             print(f"[pipeline] Final remediation strategy unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
 
+    # Evidence-Gap Strategy Fallback: Final Strategy #1 evaluated a real
+    # response, named zero authoritative targets, and explicitly reported
+    # non-empty insufficient_evidence -- a structurally-detectable "the
+    # evidence I was given was too thin" case, distinct from a genuine "no
+    # viable target" decision (insufficient_evidence == []), which must
+    # never trigger this. One-shot: this block runs at most once per run,
+    # and _run_evidence_gap_strategy_fallback itself never calls Final
+    # Strategy more than the single extra time documented in its own
+    # docstring -- if THAT second call (Strategy #2) also comes back with
+    # evaluated=True, no targets, and non-empty insufficient_evidence, no
+    # third attempt is made; the existing fail-closed behavior below
+    # (Branch B, "Final Strategy ran but selected no evidence-backed
+    # target") applies to Strategy #2's result exactly as it would have to
+    # Strategy #1's. Planner's target_files/target_symbols are used inside
+    # _run_evidence_gap_strategy_fallback ONLY as retrieval seeds for
+    # deterministic, no-LLM-call source acquisition -- never promoted into
+    # a synthetic RemediationStrategyResult/FinalTargetSliceResult/
+    # IntendedEdit/EditReadinessResult, and never returned by that
+    # function as something downstream may treat as authoritative; only
+    # Strategy #2's OWN result (also produced by the same, unmodified
+    # generate_remediation_strategy call every ordinary run already makes)
+    # is ever substituted below.
+    _evidence_gap_fallback = None
+    if _evidence_gap_fallback_trigger(_strategy_result):
+        _evidence_gap_fallback = _run_evidence_gap_strategy_fallback(
+            plan_result=_plan_result,
+            repo_root=repo_root,
+            vulnerability_text=vulnerability_text,
+            investigation_context=_investigation_context,
+            planner_evidence_ctx=_planner_evidence_ctx,
+            budget_controller=budget_controller,
+            llm=llm,
+            repo_grounding_ctx=_repo_code,
+            repository_understanding_ctx=_repository_understanding_ctx,
+            discovery_plan_ctx=_plan_ctx,
+        )
+        print(
+            f"[pipeline] Evidence-gap Strategy fallback: evidence_acquired="
+            f"{_evidence_gap_fallback['evidence_acquired']} rerun_performed="
+            f"{_evidence_gap_fallback['rerun_performed']} skip_reason="
+            f"{_evidence_gap_fallback['skip_reason']}",
+            file=sys.stderr,
+        )
+        if _evidence_gap_fallback["rerun_performed"]:
+            # Strategy #2 is now the ONLY authoritative Strategy result --
+            # every downstream reader (Final-Target Remediation Slice,
+            # Edit Readiness, Patch Generation's own context concatenation)
+            # keys off these same two locals and needs no other change.
+            _strategy_result = _evidence_gap_fallback["strategy_result"]
+            _strategy_ctx = _strategy_result.rendered if _strategy_result is not None else ""
+            _planner_evidence_ctx = _evidence_gap_fallback["enriched_planner_evidence_ctx"]
+            if _strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols):
+                print(
+                    "[pipeline] Evidence-gap Strategy fallback recovered authoritative "
+                    f"target(s): target_files={_strategy_result.target_files} "
+                    f"target_symbols={_strategy_result.target_symbols}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "[pipeline] Evidence-gap Strategy fallback: Strategy #2 still selected "
+                    "no evidence-backed target -- no further retry this run.",
+                    file=sys.stderr,
+                )
+
     # Batch B2: finish S2. artifact is the real RemediationStrategyResult
     # (rendered + target_files/target_symbols/warnings/extended_mechanism/
     # required_edits/security_invariant) -- the actual structured output a
-    # future Stage-3/Stage-4 replay would need, not a summary.
+    # future Stage-3/Stage-4 replay would need, not a summary. Also
+    # records the Evidence-Gap Strategy Fallback's own outcome (never a
+    # new stage/execution record -- see this section's own comment above)
+    # so a trace/replay can distinguish the normal Strategy path from an
+    # evidence-gap recovery attempt without re-deriving it from prose;
+    # deliberately omits Planner's own target_files/target_symbols here --
+    # they are retrieval seeds only and must never appear anywhere that
+    # could be read as an authoritative target list.
     _s2_rec = None
     if execution_recorder is not None:
         if _strategy_result is not None:
@@ -6331,7 +6609,18 @@ def run(
         _s2_rec = execution_recorder.finish(
             _s2_handle,
             outcome=_s2_outcome,
-            artifact={"strategy_result": to_jsonable(_strategy_result)},
+            artifact={
+                "strategy_result": to_jsonable(_strategy_result),
+                "evidence_gap_fallback": to_jsonable(
+                    {
+                        "attempted": _evidence_gap_fallback["attempted"],
+                        "evidence_acquired": _evidence_gap_fallback["evidence_acquired"],
+                        "rerun_performed": _evidence_gap_fallback["rerun_performed"],
+                        "skip_reason": _evidence_gap_fallback["skip_reason"],
+                    }
+                    if _evidence_gap_fallback is not None else None
+                ),
+            },
         )
 
     # Final-Target Remediation Slice: deterministic, bounded exact source
@@ -7005,7 +7294,7 @@ def run(
     _s7_rec = None
     if patch and patch.strip():
         print("[pipeline] Step 3/4 – Reviewing patch …", file=sys.stderr)
-        review = review_patch(vulnerability_text, patch, llm)
+        review = review_patch(vulnerability_text, patch, llm, finding_calibration=finding_calibration)
         if execution_recorder is not None:
             _s7_rec = execution_recorder.finish(_s7_handle, outcome="settled", artifact={"review": review})
             # Batch B4: begin recording S8 (confidence_scoring), right after
@@ -7023,6 +7312,7 @@ def run(
         score_text = score_confidence(
             vulnerability_text, patch, review, llm,
             code_context=(challenger_context if _post_patch_evidence_current else code_context),
+            finding_calibration=finding_calibration,
         )
     else:
         print(

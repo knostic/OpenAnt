@@ -427,6 +427,63 @@ def _bounded_declaration_block(lines: "list[str]", decl_line0: int) -> int:
     return decl_line0
 
 
+_DECLARATION_FORM_SCAN_LINES = 5
+"""Bounded lookahead (lines), used only to classify a declaration's OWN
+signature as brace-scoped or indentation-scoped BEFORE deciding whether
+_bounded_declaration_block's brace-depth scan even applies -- large enough
+for a realistic multi-line function/method signature, far smaller than
+_FALLBACK_MAX_BLOCK_SCAN (which scans the whole body, not just the
+signature)."""
+
+
+def _declaration_is_brace_scoped(lines: "list[str]", decl_line0: int) -> bool:
+    """Best-effort, syntax-only classification of the declaration starting
+    at `decl_line0`: does its OWN signature open a brace-delimited block
+    (a `{` at the top level of the signature, outside any `(...)`/`[...]`
+    the signature itself contains -- e.g. `function foo() {`, `class Foo
+    {`), or does it terminate in a bare trailing `:` with no such brace
+    first -- the indentation-scoped shape every `def`/`class` declaration
+    in Python (and any similarly indentation-scoped language) always uses?
+
+    This exists because `_bounded_declaration_block`'s brace-depth counter
+    was written for brace-delimited languages and has no notion of
+    indentation-scoped ones at all: a Python declaration whose docstring
+    or a nearby comment happens to contain a BALANCED pair of literal `{`
+    `}` characters (e.g. a format-string example like `{backoff factor}`)
+    makes that counter's depth return to zero right there, long before the
+    declaration's real body -- silently mis-truncating the block. This
+    check runs first and skips the brace counter entirely for a
+    declaration whose own signature is unambiguously indentation-scoped,
+    so a docstring or comment appearing later can never be mistaken for
+    the declaration's own closing brace.
+
+    Scans forward at most `_DECLARATION_FORM_SCAN_LINES` lines (the
+    signature only, never the body), tracking `(`/`[` nesting so a `{`
+    used as a default-argument value (e.g. `def f(x: dict = {}):`) is not
+    mistaken for the signature's own block-opening brace. Returns True
+    (brace-scoped) the moment a top-level `{` is seen; False
+    (indentation-scoped) the moment a line, with top-level nesting closed,
+    ends in a bare `:`. Defaults to True -- preserving
+    `_bounded_declaration_block`'s existing behavior completely unchanged
+    -- if neither is found within the bounded window; this function only
+    ever ADDS one new, narrow early-exit, it never removes or weakens the
+    existing brace-scan path for anything it can't confidently classify."""
+    limit = min(len(lines), decl_line0 + _DECLARATION_FORM_SCAN_LINES)
+    nesting = 0
+    for i in range(decl_line0, limit):
+        line = lines[i]
+        for ch in line:
+            if ch in "([":
+                nesting += 1
+            elif ch in ")]":
+                nesting = max(0, nesting - 1)
+            elif ch == "{" and nesting == 0:
+                return True
+        if nesting == 0 and line.rstrip().endswith(":"):
+            return False
+    return True
+
+
 def _deterministic_identifier_fallback(
     name: str, candidate_files: "list[str]", repo_root: Path,
 ) -> "_SymbolMatch | None":
@@ -498,7 +555,16 @@ def _deterministic_identifier_fallback(
     if n_lines == 0:
         return None
 
-    block_end0 = _bounded_declaration_block(lines, line0)
+    # Only run the brace-depth scanner for a declaration whose own
+    # signature actually opens a brace-delimited block -- an
+    # indentation-scoped declaration (Python's `def`/`class`, and any
+    # similarly-scoped language) never does, and a brace appearing later
+    # (e.g. inside its docstring) must never be mistaken for its closing
+    # brace. See _declaration_is_brace_scoped's own docstring.
+    if _declaration_is_brace_scoped(lines, line0):
+        block_end0 = _bounded_declaration_block(lines, line0)
+    else:
+        block_end0 = line0  # indentation-scoped -- go straight to the fixed window below
     if block_end0 > line0:
         start_line = line0 + 1
         end_line = min(n_lines, block_end0 + 1)
@@ -805,6 +871,7 @@ def build_planner_source_excerpts(
     symbol_locations: "dict[str, _SymbolMatch]",
     repo_root: Path,
     context,
+    max_chars: "int | None" = None,
 ) -> str:
     """
     Two deterministic passes over the already-verified Planner candidates
@@ -830,11 +897,25 @@ def build_planner_source_excerpts(
 
     Best-effort throughout: any failure returns "" so the caller falls
     back to structural evidence alone.
+
+    `max_chars=None` (the default, and every existing caller) preserves
+    the exact prior behavior byte-for-byte: the shared budget is
+    `evidence_fusion.DEFAULT_MAX_CHARS`, exactly as before this parameter
+    existed. Passing an explicit `max_chars` overrides that budget for
+    this call only -- used by the evidence-gap Strategy fallback (see
+    pipeline.py) to re-run this SAME deterministic, no-LLM-call selection
+    at the larger, already-existing Final-Target Slice ceiling instead of
+    a new, separate budget constant. Every other candidate-selection rule
+    above (priority order, whole-block-or-omit, Pass 1 before Pass 2) is
+    completely unaffected by which budget value is in force.
     """
     if not candidates:
         return ""
 
-    from .evidence_fusion import DEFAULT_MAX_CHARS as _budget
+    if max_chars is None:
+        from .evidence_fusion import DEFAULT_MAX_CHARS as _budget
+    else:
+        _budget = max_chars
 
     blocks: "list[str]" = []
     symbol_omitted: "list[str]" = []
@@ -934,6 +1015,7 @@ def build_planner_evidence(
     repo_root,
     vulnerability_text: str,
     context,
+    max_chars: "int | None" = None,
 ) -> str:
     """
     Best-effort bridge: verify the Planner's proposals against the target
@@ -944,6 +1026,16 @@ def build_planner_evidence(
     raises -- if there is no repo_root, nothing was proposed, nothing
     verified, or any downstream step fails; the caller's existing context
     is always left untouched either way.
+
+    `max_chars=None` (the default, and every existing caller) preserves
+    the exact prior behavior byte-for-byte -- passed straight through to
+    build_planner_source_excerpts, which itself defaults to
+    evidence_fusion.DEFAULT_MAX_CHARS unchanged. An explicit override
+    widens ONLY the source-excerpt budget for this call; the structural
+    (`_render_planner_evidence`) portion never depends on it and is
+    identical either way, so two calls that only differ in `max_chars`
+    return identical text unless the larger budget actually let more
+    verified source fit.
     """
     if not repo_root or not (plan.target_files or plan.target_symbols):
         return ""
@@ -993,7 +1085,9 @@ def build_planner_evidence(
             return ""
 
         try:
-            source_block = build_planner_source_excerpts(candidates, symbol_locations, root, context)
+            source_block = build_planner_source_excerpts(
+                candidates, symbol_locations, root, context, max_chars=max_chars,
+            )
         except Exception:
             source_block = ""
 
@@ -1351,6 +1445,56 @@ _SLICE_DISCLAIMER = (
     "definitions are repository text, verbatim. Consumer windows are "
     "deterministic discovered usage, not a claim of complete coverage.*"
 )
+
+
+def _remove_top_level_section(text: str, heading: str) -> str:
+    """Remove one top-level ("## ") Markdown section from `text`,
+    identified by an exact-line match on `heading` -- from that heading
+    line up to (but not including) the next line that starts a
+    DIFFERENT top-level section (a line starting with "## ", the same
+    heading level every section in an assembled `code_context` uses), or
+    the end of `text` if no further top-level heading follows. Sub-
+    headings inside the removed section (###, ####, e.g. this module's
+    own "#### Target definition:") are removed as part of the block --
+    never scanned for individually.
+
+    A pure text operation: no repository access, no re-resolution, no
+    change to what was already resolved/approved -- only to which
+    already-rendered copy of a section survives in `text`. No-op
+    (returns `text` unchanged) if `heading` doesn't appear as an exact
+    line anywhere.
+    """
+    lines = text.splitlines(keepends=True)
+    start = None
+    for i, line in enumerate(lines):
+        if line.rstrip("\r\n") == heading:
+            start = i
+            break
+    if start is None:
+        return text
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].rstrip("\r\n").startswith("## "):
+            end = j
+            break
+    return ("".join(lines[:start]) + "".join(lines[end:])).rstrip("\n")
+
+
+def remove_final_target_slice_section(text: str) -> str:
+    """Remove a previously-rendered "## Final-Target Remediation Slice"
+    section (this module's own _SLICE_HEADING) from already-assembled
+    context text.
+
+    Used by Post-Patch Recovery (pipeline.py's Slice-4) so a stale copy
+    of the slice -- built against the pre-recovery Final Strategy
+    targets, before Patch Target Conformance triggered recovery -- is
+    dropped before the freshly recovered slice is appended, rather than
+    carried alongside it. Scoped narrowly to this one, already-known
+    heading; never touches any other section, and never changes what a
+    slice resolved, covered, or approved -- see _remove_top_level_section.
+    """
+    return _remove_top_level_section(text, _SLICE_HEADING)
+
 
 # Conservative, deterministic, order-preserving identifier shapes. No
 # stopword list is needed: an ordinary English word in prose has no dot,
@@ -1745,9 +1889,55 @@ def _disambiguate_constant_candidates(
     return None, f"ambiguous: {len(candidates)} equal-priority constant candidates named {name!r}"
 
 
-def _render_definition_block(path: str, label: str, start: int, end: int, source: str) -> str:
+_CATEGORY2_HEADING_LABEL = "Related definition (context only, not an approved edit target)"
+"""The heading label Category 2 (SUPPORTING-context, strategy-prose-
+identifier lookup) renders under when its own resolved span does NOT
+coincide with an already-verified Final Strategy target's own span -- see
+_build_final_target_slice_inner's Category 2 block and
+_render_definition_block's own docstring for why this must differ from
+the default "Target definition" every genuine edit-target category uses.
+
+Rendering under a different heading is presentation-only: a Category 2
+block can still be exactly what makes a FILE-LEVEL intended edit "ready"
+(via FinalTargetSliceResult.identifier_definition_covered -- see
+check_edit_readiness), so check_patch_target_conformance must keep
+recognizing it as edit-target-role source for that file, unchanged --
+see _EDIT_TARGET_HEADING_PREFIXES, which _edit_target_source_for_file /
+_edit_target_line_ranges_for_file match against instead of the single
+literal "#### Target definition:" string, so this heading and that
+parsing can never drift out of sync with each other again."""
+
+_EDIT_TARGET_HEADING_PREFIXES = (
+    "#### Target definition:",
+    f"#### {_CATEGORY2_HEADING_LABEL}:",
+)
+"""Every heading _render_definition_block can produce for EDIT-TARGET-role
+content (categories 1, 3b, 4, one-hop, Post-Patch Recovery's own
+_wrap_post_patch_window -- default heading_label -- AND Category 2 --
+_CATEGORY2_HEADING_LABEL) -- the complete set _edit_target_source_for_file
+/ _edit_target_line_ranges_for_file must recognize so a rendering-only
+heading change here can never silently change what check_patch_target_
+conformance treats as approved source."""
+
+
+def _render_definition_block(
+    path: str, label: str, start: int, end: int, source: str,
+    heading_label: str = "Target definition",
+) -> str:
+    """Render one resolved-symbol source block under a "#### {heading_label}:"
+    heading. Defaults to "Target definition" -- byte-identical to every
+    call site that existed before this parameter did (categories 1 and 4,
+    the one-hop expansion step, and Post-Patch Recovery's own
+    _wrap_post_patch_window -- all genuine EDIT-TARGET-role content that
+    check_patch_target_conformance's _edit_target_source_for_file /
+    _edit_target_line_ranges_for_file must keep recognizing). Category 2
+    (_build_final_target_slice_inner's own SUPPORTING-context lookup from
+    strategy-prose identifiers -- never a verified Final Strategy target)
+    is the one caller that passes a different heading_label, so its
+    blocks are never visually indistinguishable from an approved edit
+    target in the rendered slice."""
     return (
-        f"#### Target definition: `{path}:{label}` (lines {start}–{end})\n\n"
+        f"#### {heading_label}: `{path}:{label}` (lines {start}–{end})\n\n"
         f"```python\n{source.rstrip()}\n```\n"
     )
 
@@ -2133,6 +2323,18 @@ def _build_final_target_slice_inner(
     # edit-target candidate (categories 1, 3b, 4) has already been tried.
     category2_candidates: "list[tuple[str, str]]" = []  # (rendered_text, file)
     target_identity = _target_identity_by_bare_name(symbol_matches)
+    # A bare-name Category 2 lookup can resolve to the EXACT SAME (file,
+    # line, end_line) span as an already-verified Final Strategy target
+    # (e.g. a function target: Category 1 only resolves constants, so a
+    # verified function symbol's own span is still unclaimed in
+    # used_definition_keys when Category 2 runs, and Category 2 -- not
+    # 3b/4 -- ends up being the block that actually satisfies it; see
+    # Category 4's own "key in used_definition_keys" short-circuit below).
+    # That span IS a verified edit target, just reached via this lookup
+    # path -- it must keep the default "Target definition" heading, never
+    # _CATEGORY2_HEADING_LABEL, which is reserved for a genuinely
+    # unverified/merely-referenced identifier with no matching target span.
+    _verified_target_spans = {(m.file, m.line, m.end_line) for m in symbol_matches.values()}
     for term in strategy_terms:
         found = _lookup_identifier_definition(term, preferred_files, context, target_identity=target_identity)
         if found is None:
@@ -2156,7 +2358,11 @@ def _build_final_target_slice_inner(
         if source is None:
             continue
         used_definition_keys.add(key)  # decided now; committed later (key stays unpadded -- see _padded_line_range)
-        text = _render_definition_block(found.file, found.label, render_start, render_end, source)
+        _heading = "Target definition" if key in _verified_target_spans else _CATEGORY2_HEADING_LABEL
+        text = _render_definition_block(
+            found.file, found.label, render_start, render_end, source,
+            heading_label=_heading,
+        )
         category2_candidates.append((text, found.file))
 
     # --- Category 3 candidates (usage/consumer windows) -- CANDIDATES
@@ -2818,7 +3024,7 @@ def _sniff_rendered_kind(rendered_text: str) -> "str | None":
     """Classify which of this module's own, fully-controlled block
     headers is present -- for RetrievalAttempt.source_kind only, never
     consulted by any readiness or budget decision."""
-    if "#### Target definition:" in rendered_text:
+    if any(prefix in rendered_text for prefix in _EDIT_TARGET_HEADING_PREFIXES):
         return "exact_definition"
     if "#### Discovered consumer:" in rendered_text:
         return "usage_window"
@@ -4115,9 +4321,9 @@ def _edit_target_source_for_file(rendered: str, file: str) -> str:
     """Concatenated CODE content of every EDIT-TARGET-role block for
     exactly `file` inside an already-rendered Final-Target Slice --
     reads back this module's own, fully-controlled block headers
-    (_render_definition_block's "Target definition" and
-    _render_full_file_block's "Full file (last resort)") via
-    _extract_fenced_code (reused, not re-implemented). Deliberately
+    (_render_definition_block's headings -- see _EDIT_TARGET_HEADING_
+    PREFIXES -- and _render_full_file_block's "Full file (last resort)")
+    via _extract_fenced_code (reused, not re-implemented). Deliberately
     excludes _render_usage_window_block's "Discovered consumer" blocks --
     a consumer's own text must never satisfy conformance for a different
     edit target (see PatchTargetConformanceResult's docstring)."""
@@ -4125,7 +4331,7 @@ def _edit_target_source_for_file(rendered: str, file: str) -> str:
         return ""
     blocks: "list[str]" = []
     for part in re.split(r"\n(?=#### )", rendered):
-        if not part.startswith("#### Target definition:") and not part.startswith("#### Full file (last resort):"):
+        if not part.startswith(_EDIT_TARGET_HEADING_PREFIXES) and not part.startswith("#### Full file (last resort):"):
             continue
         header_line = part.splitlines()[0] if part.splitlines() else ""
         m = re.search(r"`([^`]+)`", header_line)
@@ -4162,7 +4368,7 @@ def _edit_target_line_ranges_for_file(rendered: str, file: str) -> "list[tuple[i
         return []
     ranges: "list[tuple[int, int]]" = []
     for part in re.split(r"\n(?=#### )", rendered):
-        if not part.startswith("#### Target definition:"):
+        if not part.startswith(_EDIT_TARGET_HEADING_PREFIXES):
             continue
         header_line = part.splitlines()[0] if part.splitlines() else ""
         m = re.search(r"`([^`]+)`", header_line)
@@ -5214,6 +5420,27 @@ def recover_post_patch_source(
     )
 
 
+_FENCED_DIFF_RE = re.compile(r"^```(?:diff|patch|udiff)?[ \t]*\r?\n(.*?)\n```[ \t]*$", re.DOTALL)
+
+
+def _unfenced_diff(text: str) -> str:
+    """Strip exactly one already-present ``` fence wrapper from `text`, if
+    the whole (stripped) string is one such fenced block -- returns
+    `text` unchanged (stripped) otherwise.
+
+    `patch_generator.classify_patch_response`'s "valid" result is always
+    pre-fenced (`"```diff\\n" + body + "```"`, see its own docstring), and
+    that is exactly what reaches this module as `patch`/`failed_patch`.
+    Embedding it under a second, freshly-added fence would nest one
+    fenced block inside another instead of producing one -- this
+    unwraps any such existing fence first so a caller that always wraps
+    its own fence around the result (see build_post_patch_recovery_hint)
+    produces exactly one, regardless of whether its input arrived
+    already fenced or not."""
+    m = _FENCED_DIFF_RE.match(text.strip())
+    return m.group(1) if m else text.strip()
+
+
 def build_post_patch_recovery_hint(
     conformance: PatchConformanceReport, recovery: PostPatchRecoveryResult, failed_patch: str,
 ) -> str:
@@ -5257,5 +5484,5 @@ def build_post_patch_recovery_hint(
     if failed_patch and failed_patch.strip():
         lines.append("")
         lines.append("The previous (unverified) attempt, shown only to identify the intended semantic edit:")
-        lines.append(f"```diff\n{failed_patch.strip()}\n```")
+        lines.append(f"```diff\n{_unfenced_diff(failed_patch)}\n```")
     return "\n".join(lines)

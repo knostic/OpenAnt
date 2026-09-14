@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 
-from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers, RepairResult
+from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers, strip_empty_hunks, RepairResult
 
 
 # ---------------------------------------------------------------------------
@@ -1152,3 +1152,110 @@ class TestRelocationTelemetry:
         assert len(meta.relocations) == 2
         assert {r.file for r in meta.relocations} == {"f1.py", "f2.py"}
         assert all(r.relocation_reason == "unique_match" for r in meta.relocations)
+
+
+# ---------------------------------------------------------------------------
+# strip_empty_hunks — deterministic removal of zero-change hunks
+#
+# A hunk with no added/removed lines is invalid to `git apply` regardless of
+# whether its header counts are arithmetically correct (verified directly:
+# `git apply --check` rejects a well-formed, correctly-counted, all-context
+# hunk). repair_hunk_headers' own count-recomputation can never fix this --
+# there is no count that makes a no-op hunk valid. strip_empty_hunks is the
+# deterministic action on the same "no changed lines" diagnosis patch_
+# hygiene.py's own `_check_empty_hunks` already reports.
+# ---------------------------------------------------------------------------
+
+class TestStripEmptyHunks:
+    def test_multi_file_removes_only_the_empty_hunk(self):
+        patch = (
+            "--- a/mod_a.py\n+++ b/mod_a.py\n"
+            "@@ -1,3 +1,3 @@\n line1\n-old_a\n+new_a\n line3\n"
+            "--- a/mod_b.py\n+++ b/mod_b.py\n"
+            "@@ -1,2 +1,2 @@\n something\n unrelated\n"
+        )
+        result, removed = strip_empty_hunks(patch)
+        assert removed == 1
+        assert "mod_b.py" not in result
+        # The real hunk survives byte-for-byte, including its own header.
+        assert "@@ -1,3 +1,3 @@\n line1\n-old_a\n+new_a\n line3\n" in result
+
+    def test_empty_hunk_with_already_correct_header_counts_is_still_removed(self):
+        """Item 2: header counts (2 old, 2 new) already match the 2-line
+        all-context body exactly -- arithmetic correctness alone must not
+        save it from removal."""
+        patch = (
+            "--- a/mod_a.py\n+++ b/mod_a.py\n"
+            "@@ -1,3 +1,3 @@\n line1\n-old_a\n+new_a\n line3\n"
+            "--- a/mod_b.py\n+++ b/mod_b.py\n"
+            "@@ -1,2 +1,2 @@\n something\n unrelated\n"
+        )
+        result, removed = strip_empty_hunks(patch)
+        assert removed == 1
+        assert "@@ -1,2 +1,2 @@" not in result
+
+    def test_file_with_only_empty_hunks_is_dropped_entirely(self):
+        patch = (
+            "--- a/mod_a.py\n+++ b/mod_a.py\n"
+            "@@ -1,2 +1,2 @@\n line1\n-old_a\n+new_a\n"
+            "--- a/mod_b.py\n+++ b/mod_b.py\n"
+            "@@ -1,2 +1,2 @@\n ctx1\n ctx2\n"
+        )
+        result, removed = strip_empty_hunks(patch)
+        assert removed == 1
+        assert "mod_b.py" not in result
+        assert "--- a/mod_a.py" in result and "+++ b/mod_a.py" in result
+
+    def test_no_empty_hunks_returns_patch_unchanged(self):
+        patch = "--- a/mod_a.py\n+++ b/mod_a.py\n@@ -1,2 +1,2 @@\n line1\n-old_a\n+new_a\n"
+        result, removed = strip_empty_hunks(patch)
+        assert removed == 0
+        assert result == patch
+
+    def test_real_hunk_with_equal_old_and_new_counts_is_never_removed(self):
+        """A single-line replacement (1 removed + 1 added, no context) has
+        old_count == new_count too -- must never be mistaken for empty."""
+        patch = "--- a/mod_a.py\n+++ b/mod_a.py\n@@ -1,1 +1,1 @@\n-old_a\n+new_a\n"
+        result, removed = strip_empty_hunks(patch)
+        assert removed == 0
+        assert result == patch
+
+    def test_markdown_fences_preserved(self):
+        patch = (
+            "```diff\n"
+            "--- a/mod_a.py\n+++ b/mod_a.py\n"
+            "@@ -1,3 +1,3 @@\n line1\n-old_a\n+new_a\n line3\n"
+            "--- a/mod_b.py\n+++ b/mod_b.py\n"
+            "@@ -1,2 +1,2 @@\n something\n unrelated\n"
+            "```"
+        )
+        result, removed = strip_empty_hunks(patch)
+        assert removed == 1
+        assert result.startswith("```diff\n")
+        assert result.rstrip("\n").endswith("```")
+        assert "mod_b.py" not in result
+        assert "new_a" in result
+
+    def test_unparseable_patch_fails_closed(self):
+        patch = "this is not a diff at all"
+        result, removed = strip_empty_hunks(patch)
+        assert removed == 0
+        assert result == patch
+
+    def test_empty_string_is_a_safe_noop(self):
+        result, removed = strip_empty_hunks("")
+        assert removed == 0
+        assert result == ""
+
+    def test_two_empty_hunks_in_same_file_both_removed(self):
+        patch = (
+            "--- a/mod_a.py\n+++ b/mod_a.py\n"
+            "@@ -1,2 +1,2 @@\n ctx1\n ctx2\n"
+            "@@ -10,2 +10,2 @@\n ctx3\n ctx4\n"
+            "--- a/mod_b.py\n+++ b/mod_b.py\n"
+            "@@ -1,2 +1,2 @@\n line1\n-old_b\n+new_b\n"
+        )
+        result, removed = strip_empty_hunks(patch)
+        assert removed == 2
+        assert "mod_a.py" not in result
+        assert "new_b" in result

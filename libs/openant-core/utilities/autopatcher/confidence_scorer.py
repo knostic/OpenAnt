@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .finding_calibration import format_calibration_for_prompt
 from .llm_client import LLMClient
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "confidence_scorer.md"
@@ -20,6 +21,7 @@ def score_confidence(
     review: str,
     llm: LLMClient,
     code_context: str = "",
+    finding_calibration: "list[dict] | None" = None,
 ) -> str:
     """
     Assign a confidence score to the generated patch.
@@ -39,6 +41,17 @@ def score_confidence(
         Optional repository evidence selected by static analysis. When
         provided it is prepended to the user message so the scorer reasons
         from the same evidence the patch generator used.
+    finding_calibration:
+        Optional, already-computed output of
+        :func:`finding_calibration.calibrate_findings` (a list of
+        {"original", "group", "reworded"} dicts). When given, it is
+        rendered as a concise, clearly-labeled section appended to the
+        prompt so the score is assigned consistently with the pipeline's
+        own already-calibrated conclusions, instead of the scorer
+        independently re-deriving (and potentially contradicting) a
+        concern calibration already resolved. Omitted (the default)
+        preserves the exact prior prompt -- every existing caller is
+        unaffected.
 
     Returns
     -------
@@ -60,4 +73,7 @@ def score_confidence(
         + "\n\n## Patch review\n\n"
         + review
     )
+    calibration_section = format_calibration_for_prompt(finding_calibration)
+    if calibration_section:
+        user_message += "\n\n" + calibration_section
     return llm.complete(system_prompt, user_message, stage="confidence_scorer")

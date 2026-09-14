@@ -950,6 +950,169 @@ class TestDeterministicIdentifierFallback:
 
 
 # ---------------------------------------------------------------------------
+# _declaration_is_brace_scoped() -- the small syntactic pre-check that
+# routes a fallback-resolved declaration to _bounded_declaration_block's
+# brace-depth scan (brace-scoped languages) or straight to the existing
+# fixed window (indentation-scoped languages, e.g. Python). Fixes a real
+# bug: a Python class whose docstring happens to contain a balanced pair
+# of literal `{`/`}` characters (a format-string documentation example)
+# made the brace-depth counter -- written with no notion of
+# indentation-scoped languages at all -- return to depth zero right there,
+# long before the class's real body, mis-truncating the fallback source
+# window.
+# ---------------------------------------------------------------------------
+
+class TestDeclarationFormClassification:
+    def test_python_class_declaration_is_indentation_scoped(self):
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["class Retry:", '    """docstring"""', "    ATTR = 1"]
+        assert _declaration_is_brace_scoped(lines, 0) is False
+
+    def test_python_def_declaration_is_indentation_scoped(self):
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["def foo(x, y):", "    return x + y"]
+        assert _declaration_is_brace_scoped(lines, 0) is False
+
+    def test_multiline_python_signature_is_indentation_scoped(self):
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["def foo(", "    x,", "    y,", "):", "    return x + y"]
+        assert _declaration_is_brace_scoped(lines, 0) is False
+
+    def test_dict_default_value_in_signature_does_not_confuse_classification(self):
+        """A `{}`/dict-shaped default argument value inside the
+        signature's own parentheses must not be mistaken for a
+        block-opening brace -- the declaration is still indentation-scoped."""
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["def foo(x: dict = {}):", "    return x"]
+        assert _declaration_is_brace_scoped(lines, 0) is False
+
+    def test_js_function_declaration_is_brace_scoped(self):
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["function foo(x, y) {", "    return x + y;", "}"]
+        assert _declaration_is_brace_scoped(lines, 0) is True
+
+    def test_js_class_declaration_is_brace_scoped(self):
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["class Foo {", "    bar() { return 1; }", "}"]
+        assert _declaration_is_brace_scoped(lines, 0) is True
+
+    def test_neither_brace_nor_colon_within_scan_window_defaults_to_brace_scoped(self):
+        """Ambiguous/unclear input preserves _bounded_declaration_block's
+        existing behavior completely unchanged -- this check only ever
+        ADDS a new early-exit, it never removes the existing brace-scan
+        path for anything it can't confidently classify."""
+        from utilities.autopatcher.remediation_planner import _declaration_is_brace_scoped
+        lines = ["some_identifier"] * 6  # exceeds the bounded scan window; no `{` or trailing `:` anywhere
+        assert _declaration_is_brace_scoped(lines, 0) is True
+
+
+class TestBoundedDeclarationBlockUnchangedForBraceScoped:
+    """_bounded_declaration_block's own brace-counting semantics must be
+    completely untouched by this fix -- proven by calling it directly."""
+
+    def test_brace_scoped_block_end_still_found_by_brace_counting(self):
+        from utilities.autopatcher.remediation_planner import _bounded_declaration_block
+        lines = ["function foo() {", "    return 1;", "}", "function bar() {}"]
+        assert _bounded_declaration_block(lines, 0) == 2  # the matching `}`, unchanged
+
+
+class TestPythonDocstringBraceRegressionFix:
+    """End-to-end regression for the real bug, through the full
+    _resolve_symbol_details -> _deterministic_identifier_fallback path: a
+    bare Python class name resolves via the deterministic identifier
+    fallback (no function/constant-table entry for the class name itself
+    -- only its own attributes are indexed as separate constants), and its
+    docstring contains a balanced `{`/`}` pair (a realistic format-string
+    documentation example, modeled on urllib3's real Retry docstring).
+    Before this fix, the brace-depth counter mistook that docstring
+    content for the class's own closing brace. After the fix, the
+    declaration is recognized as indentation-scoped and the window comes
+    from the existing fixed +/-40-line fallback instead -- which, for a
+    docstring short enough to fit within that window (unlike this fix's
+    real motivating case, whose docstring spans ~140 lines), reaches real
+    class-body content beyond the docstring."""
+
+    _FIXTURE = (
+        'class Example:\n'
+        '    """Configuration object.\n'
+        "\n"
+        "    Some sleeps are computed as::\n"
+        "\n"
+        "        {backoff factor} * (2 ** ({number of previous retries}))\n"
+        "\n"
+        "    See the module documentation for more detail.\n"
+        '    """\n'
+        "\n"
+        '    DEFAULT_ALLOWED_METHODS = frozenset(["GET"])\n'
+        "\n"
+        '    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])\n'
+        "\n"
+        "    def __init__(self):\n"
+        "        pass\n"
+    )
+
+    def test_class_name_not_bounded_by_brace_depth_scanning(self, tmp_path):
+        (tmp_path / "example.py").write_text(self._FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("Example", tmp_path, context, verified_files=["example.py"])
+        assert match is not None
+        assert match.kind == "constant"
+
+        lines = self._FIXTURE.splitlines()
+        # The OLD (buggy) behavior truncated the window exactly at the
+        # docstring's own "{backoff factor}..." line -- assert the window
+        # extends past it.
+        brace_example_line = next(i for i, l in enumerate(lines, start=1) if "{backoff factor}" in l)
+        assert match.end_line > brace_example_line
+
+    def test_fallback_source_window_reaches_class_body_beyond_docstring(self, tmp_path):
+        (tmp_path / "example.py").write_text(self._FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("Example", tmp_path, context, verified_files=["example.py"])
+        assert match is not None
+
+        lines = self._FIXTURE.splitlines()
+        window = "\n".join(lines[match.line - 1:match.end_line])
+        assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in window
+
+
+class TestJsBraceScopedRegressionUnchanged:
+    """Companion regression: a brace-scoped (JS-style) class declaration
+    must retain the EXISTING brace-depth-scan behavior unchanged -- this
+    fix must never disable brace-aware extraction for a language that
+    actually uses it."""
+
+    _FIXTURE = (
+        "class Example {\n"
+        "    constructor() {\n"
+        "        this.value = 1;\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "function unrelated() {}\n"
+    )
+
+    def test_brace_scoped_class_still_uses_brace_depth_scan(self, tmp_path):
+        (tmp_path / "example.js").write_text(self._FIXTURE, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("Example", tmp_path, context, verified_files=["example.js"])
+        assert match is not None
+        lines = self._FIXTURE.splitlines()
+        window = "\n".join(lines[match.line - 1:match.end_line])
+        # The brace-depth scan finds the class's own closing brace -- not
+        # the padded fixed window, which would also reach "unrelated"
+        # below it.
+        assert "constructor" in window
+        assert "unrelated" not in window
+
+
+# ---------------------------------------------------------------------------
 # build_planner_candidates() -- the adapter into RepositoryCandidate shape
 # ---------------------------------------------------------------------------
 
@@ -1214,6 +1377,66 @@ class TestBuildPlannerSourceExcerpts:
         assert "loaded from the target repository" in result
         assert "proposed by the Remediation Planner" in result
         assert "does not prove" in result
+
+
+# ---------------------------------------------------------------------------
+# build_planner_source_excerpts() -- optional `max_chars` override (Evidence-
+# Gap Strategy Fallback follow-up). `max_chars=None` (every existing caller)
+# must remain byte-for-byte unchanged; an explicit override widens ONLY the
+# shared budget for that one call, never introducing an unbounded/full-repo
+# read.
+# ---------------------------------------------------------------------------
+
+class TestBuildPlannerSourceExcerptsMaxCharsOverride:
+    def _candidate(self, path):
+        from utilities.autopatcher.remediation_planner import DiscoveryEvidence, RepositoryCandidate
+        return RepositoryCandidate(
+            path=path,
+            evidence=[DiscoveryEvidence(pass_name="planner_proposed", tier=0, matched_tokens=None,
+                                         total_occurrences=None, hit_line=0, resolution_strategy="planner_file_only")],
+            best_tier=None,
+        )
+
+    def test_default_none_matches_prior_no_max_chars_call_exactly(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        (tmp_path / "medium.py").write_text("x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8")
+        candidate = self._candidate("medium.py")
+
+        result_no_kwarg = build_planner_source_excerpts([candidate], {}, tmp_path, None)
+        result_explicit_none = build_planner_source_excerpts([candidate], {}, tmp_path, None, max_chars=None)
+        assert result_no_kwarg == result_explicit_none
+
+    def test_larger_max_chars_includes_content_omitted_under_default_budget(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        # Sized to exceed the default 4,000-char budget but fit comfortably
+        # under a larger one -- exactly the shape of the real motivating
+        # gap (a symbol too big for Stage 1's small pre-Strategy budget,
+        # but small enough for the larger Final-Target Slice ceiling).
+        (tmp_path / "medium.py").write_text("x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8")
+        candidate = self._candidate("medium.py")
+
+        result_default = build_planner_source_excerpts([candidate], {}, tmp_path, None)
+        assert "#### Verified source" not in result_default
+        assert "omitted to stay within" in result_default
+
+        result_bigger = build_planner_source_excerpts(
+            [candidate], {}, tmp_path, None, max_chars=DEFAULT_MAX_CHARS * 3,
+        )
+        assert "#### Verified source: `medium.py`" in result_bigger
+
+    def test_max_chars_override_still_bounded_not_unbounded(self, tmp_path):
+        """An explicit override is still a hard ceiling -- a file bigger
+        than the override is still omitted whole, never truncated or read
+        as a full/unbounded file."""
+        from utilities.autopatcher.remediation_planner import build_planner_source_excerpts
+        (tmp_path / "huge.py").write_text("x = 1\n" * 5000, encoding="utf-8")
+        candidate = self._candidate("huge.py")
+
+        result = build_planner_source_excerpts([candidate], {}, tmp_path, None, max_chars=100)
+        assert "#### Verified source" not in result
+        assert "omitted to stay within the 100-character budget" in result
 
 
 # ---------------------------------------------------------------------------
@@ -1667,6 +1890,42 @@ class TestBuildPlannerEvidence:
         assert "### Verified source from Planner-proposed candidates" in result
         # structural evidence still precedes the source subsection
         assert result.index("## Planner-Proposed Candidate Evidence") < result.index("### Verified source")
+
+
+class TestBuildPlannerEvidenceMaxCharsOverride:
+    """`max_chars=None` (every existing caller) must produce byte-for-byte
+    identical output to before this parameter existed; an explicit
+    override is threaded straight through to build_planner_source_excerpts
+    and can surface source that did not fit under the default budget --
+    used by the Evidence-Gap Strategy Fallback (pipeline.py) to re-run
+    this SAME deterministic bridge at the larger, already-existing
+    Final-Target Slice ceiling instead of a new budget constant."""
+
+    def test_default_none_matches_omitted_call_exactly(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        (tmp_path / "medium.py").write_text("x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8")
+        plan = RemediationPlanResult(rendered="", target_files=["medium.py"], target_symbols=[])
+
+        result_no_kwarg = build_planner_evidence(plan, str(tmp_path), "vuln", None)
+        result_explicit_none = build_planner_evidence(plan, str(tmp_path), "vuln", None, max_chars=None)
+        assert result_no_kwarg == result_explicit_none
+
+    def test_larger_max_chars_surfaces_more_source_than_default(self, tmp_path):
+        from utilities.autopatcher.evidence_fusion import DEFAULT_MAX_CHARS
+        from utilities.autopatcher.remediation_planner import build_planner_evidence
+        (tmp_path / "medium.py").write_text(
+            "x = 1\n" * (DEFAULT_MAX_CHARS // 4), encoding="utf-8",
+        )
+        plan = RemediationPlanResult(rendered="", target_files=["medium.py"], target_symbols=[])
+
+        result_default = build_planner_evidence(plan, str(tmp_path), "vuln", None)
+        result_bigger = build_planner_evidence(
+            plan, str(tmp_path), "vuln", None, max_chars=DEFAULT_MAX_CHARS * 3,
+        )
+        assert "#### Verified source" not in result_default
+        assert "#### Verified source: `medium.py`" in result_bigger
+        assert result_bigger != result_default
 
 
 # ---------------------------------------------------------------------------
@@ -3165,7 +3424,16 @@ class TestClassOnlyTargetDiscovery:
         result = build_final_target_slice(strategy, str(tmp_path), context)
 
         assert "policy.py" in result.covered_target_files
-        assert "Target definition: `policy.py:Policy.ALLOWED_VALUES`" in result.rendered
+        # target_symbols is empty -- this is discovered by Category 2
+        # (strategy-prose identifier lookup), never a verified Final
+        # Strategy target, so it must render under Category 2's own
+        # context-only heading, never the EDIT-TARGET "Target definition:"
+        # heading (see _CATEGORY2_HEADING_LABEL / _render_definition_block).
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`policy.py:Policy.ALLOWED_VALUES`" in result.rendered
+        )
+        assert "Target definition: `policy.py:Policy.ALLOWED_VALUES`" not in result.rendered
 
 
 class TestDefinitionAndUsageLookupVerification:
@@ -6913,3 +7181,278 @@ class TestPipelineBoundedTargetFileFallback:
         assert stage_calls.count("guided_context_request") >= 1
         assert stage_calls.count("remediation_planning") == 1
         assert stage_calls.count("remediation_strategy") == 1
+
+
+# ---------------------------------------------------------------------------
+# Post-Patch Recovery context de-duplication (urllib3-trace cleanup, item 2)
+#
+# Regression shape: Post-Patch Recovery re-verifies a target whose earlier
+# (pre-recovery) "## Final-Target Remediation Slice" is ALREADY baked into
+# `code_context` (built during guided_context_acquisition, before Patch
+# Generation's first call). Appending the freshly recovered slice on top of
+# that stale copy -- rather than replacing it -- carried an old, superseded
+# slice's full text into the regeneration prompt for no benefit. This
+# exercises remove_final_target_slice_section, the exact primitive
+# pipeline.py's Slice-4 recovery path now uses to drop the stale copy
+# before appending the corrected one.
+# ---------------------------------------------------------------------------
+
+class TestRemoveFinalTargetSliceSection:
+    def test_noop_when_heading_absent(self):
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+        text = "## Some Other Section\n\nnothing to remove here\n"
+        assert remove_final_target_slice_section(text) == text
+
+    def test_removes_to_end_of_text_when_nothing_follows(self):
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+        text = (
+            "## Earlier Section\n\nkeep me\n\n"
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `a.py:X` (lines 1–2)\n\n"
+            "```python\nold\n```\n"
+        )
+        result = remove_final_target_slice_section(text)
+        assert "## Final-Target Remediation Slice" not in result
+        assert "old" not in result
+        assert "## Earlier Section" in result
+        assert "keep me" in result
+
+    def test_stops_at_the_next_top_level_heading_never_removes_past_it(self):
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+        text = (
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `a.py:X` (lines 1–2)\n\n"
+            "```python\nold\n```\n\n"
+            "## Final-target source coverage warning\n\n"
+            "keep this warning\n"
+        )
+        result = remove_final_target_slice_section(text)
+        assert "## Final-Target Remediation Slice" not in result
+        assert "old" not in result
+        assert "## Final-target source coverage warning" in result
+        assert "keep this warning" in result
+
+    def test_leaves_sub_headings_of_other_sections_untouched(self):
+        """A "#### Target definition:" sub-heading belonging to a
+        DIFFERENT, unrelated top-level section (never the removed one)
+        must survive -- only the exact-line-matched heading's own
+        section is scoped for removal."""
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+        text = (
+            "## Some Other Section\n\n"
+            "#### Target definition: `unrelated.py:Y` (lines 1–2)\n\n"
+            "```python\nunrelated\n```\n\n"
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `a.py:X` (lines 1–2)\n\n"
+            "```python\nold\n```\n"
+        )
+        result = remove_final_target_slice_section(text)
+        assert "unrelated.py:Y" in result
+        assert "old" not in result
+
+
+class TestPostPatchRecoveryContextDeduplication:
+    def test_recovery_context_contains_slice_heading_exactly_once(self):
+        """The exact regression this item fixes: code_context already
+        carries one (now-stale) "## Final-Target Remediation Slice" from
+        before Patch Target Conformance triggered recovery. Composing the
+        recovery context the way pipeline.py's Slice-4 path now does --
+        strip the stale section, then append the freshly recovered one --
+        must leave exactly one occurrence of the heading, never two, and
+        must not lose unrelated context that came before the slice."""
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+
+        code_context = (
+            "## Repository Understanding\n\n"
+            "some earlier, unrelated context\n\n"
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `retry.py:RequestHistory.redirect_location` (lines 33–39)\n\n"
+            "```python\nurl: str | None\n```\n"
+        )
+        recovered_rendered = (
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `retry.py:Retry.DEFAULT_REMOVE_HEADERS_ON_REDIRECT` (lines 177–203)\n\n"
+            "```python\nDEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset([\"Authorization\"])\n```\n"
+        )
+
+        stripped = remove_final_target_slice_section(code_context)
+        recovery_context = (stripped + "\n\n" if stripped else "") + recovered_rendered
+
+        assert recovery_context.count("## Final-Target Remediation Slice") == 1
+        assert "RequestHistory.redirect_location" not in recovery_context  # stale target gone
+        assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in recovery_context  # corrected target present
+        assert "some earlier, unrelated context" in recovery_context  # unrelated context preserved
+
+    def test_recovery_context_falls_back_to_recovered_slice_alone_when_code_context_had_none(self):
+        """code_context with no pre-existing slice at all (e.g. the initial
+        Final-Target Slice was empty/unavailable) must still produce a
+        clean, single-heading recovery context -- remove_final_target_
+        slice_section is a no-op here, exactly as it is for any other
+        text without the heading."""
+        from utilities.autopatcher.remediation_planner import remove_final_target_slice_section
+
+        code_context = "## Repository Understanding\n\nsome earlier context\n"
+        recovered_rendered = (
+            "## Final-Target Remediation Slice\n\n"
+            "*disclaimer*\n\n"
+            "#### Target definition: `a.py:X` (lines 1–2)\n\n"
+            "```python\nnew\n```\n"
+        )
+        stripped = remove_final_target_slice_section(code_context)
+        recovery_context = (stripped + "\n\n" if stripped else "") + recovered_rendered
+
+        assert recovery_context.count("## Final-Target Remediation Slice") == 1
+        assert "some earlier context" in recovery_context
+        assert "new" in recovery_context
+
+
+# ---------------------------------------------------------------------------
+# build_post_patch_recovery_hint fencing (urllib3-trace cleanup, item 3)
+#
+# Regression shape: `failed_patch` reaching build_post_patch_recovery_hint
+# is always patch_generator.classify_patch_response's "valid" result, which
+# is already wrapped in its own "```diff\n...\n```" fence. Wrapping it in a
+# SECOND fence produced a literal nested "```diff\n```diff\n...\n```" in the
+# regeneration prompt.
+# ---------------------------------------------------------------------------
+
+class TestPostPatchRecoveryHintFencing:
+    def _conformance_and_recovery(self):
+        from utilities.autopatcher.remediation_planner import PatchConformanceReport, PostPatchRecoveryResult
+        conformance = PatchConformanceReport(
+            results=[], all_conformant=False, edited_files=["mod.py"],
+            unexpected_files=[], uncovered_files=["mod.py"], no_match_files=[],
+        )
+        recovery = PostPatchRecoveryResult(
+            triggered=True, trigger_reasons=["uncovered_target"], recovery_targets=["mod.py"],
+            slice_result=None, attempts=[], ready_for_regeneration=True, failure_reason=None,
+        )
+        return conformance, recovery
+
+    def test_already_fenced_patch_produces_exactly_one_fence(self):
+        """The real-world shape: `failed_patch` is patch_generator's own
+        pre-fenced "valid" result."""
+        from utilities.autopatcher.remediation_planner import build_post_patch_recovery_hint
+        conformance, recovery = self._conformance_and_recovery()
+        already_fenced = "```diff\n--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 2\n```"
+
+        hint = build_post_patch_recovery_hint(conformance, recovery, already_fenced)
+
+        assert hint.count("```diff") == 1
+        assert "```diff\n```diff" not in hint
+        assert hint.count("```") == 2  # one opener, one closer -- never a nested pair
+        assert "-X = 1" in hint and "+X = 2" in hint
+
+    def test_unfenced_patch_still_produces_exactly_one_fence(self):
+        """Defensive: a caller that ever passes an unfenced diff (not the
+        current production shape, but not assumed away either) must still
+        get exactly one fence, never zero."""
+        from utilities.autopatcher.remediation_planner import build_post_patch_recovery_hint
+        conformance, recovery = self._conformance_and_recovery()
+        unfenced = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 2\n"
+
+        hint = build_post_patch_recovery_hint(conformance, recovery, unfenced)
+
+        assert hint.count("```diff") == 1
+        assert hint.count("```") == 2
+        assert "-X = 1" in hint and "+X = 2" in hint
+
+    def test_no_failed_patch_omits_the_section_entirely(self):
+        from utilities.autopatcher.remediation_planner import build_post_patch_recovery_hint
+        conformance, recovery = self._conformance_and_recovery()
+        hint = build_post_patch_recovery_hint(conformance, recovery, "")
+        assert "```" not in hint
+
+
+# ---------------------------------------------------------------------------
+# Category 2 heading differentiation (urllib3-trace cleanup, item 4)
+#
+# Category 2 (SUPPORTING-context, strategy-prose-identifier lookup) must
+# never render under the same "#### Target definition:" heading a genuine,
+# verified Final Strategy target (Category 1/3b/4/one-hop) uses -- the
+# exact real-world confusion the urllib3 trace surfaced: a same-headed but
+# unrelated/unapproved block reading as if it were an approved edit target.
+# ---------------------------------------------------------------------------
+
+class TestCategory2HeadingDifferentiation:
+    def test_category2_only_supporting_block_uses_context_only_heading(self, tmp_path):
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        context = _make_context(
+            constants={"policy.py": {
+                "Policy.ALLOWED_VALUES": {
+                    "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                    "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                },
+            }},
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        # No verified target_symbols -- ALLOWED_VALUES is only discoverable
+        # via Category 2's strategy-prose lookup, never a verified target.
+        strategy = _make_strategy(
+            target_files=["policy.py"], target_symbols=[],
+            extended_mechanism="Policy.ALLOWED_VALUES",
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`policy.py:Policy.ALLOWED_VALUES`" in result.rendered
+        )
+        assert "Target definition: `policy.py:Policy.ALLOWED_VALUES`" not in result.rendered
+
+    def test_verified_target_keeps_target_definition_heading_alongside_category2_block(self, tmp_path):
+        """Both a genuine, verified Final Strategy target (Category 1,
+        `Policy.ALLOWED_VALUES`) AND a merely-referenced, unverified
+        strategy-prose identifier (Category 2, `Other.UNRELATED_NOTE`) in
+        the same rendered slice -- the two must be visually
+        distinguishable: the verified one keeps "Target definition:", the
+        supporting one does not."""
+        (tmp_path / "policy.py").write_text(
+            "class Policy:\n    ALLOWED_VALUES = frozenset([\"a\"])\n", encoding="utf-8",
+        )
+        (tmp_path / "other.py").write_text(
+            "class Other:\n    UNRELATED_NOTE = 1\n", encoding="utf-8",
+        )
+        context = _make_context(
+            constants={
+                "policy.py": {
+                    "Policy.ALLOWED_VALUES": {
+                        "qualified_name": "Policy.ALLOWED_VALUES", "class_name": "Policy",
+                        "name": "ALLOWED_VALUES", "line": 2, "end_line": 2,
+                    },
+                },
+                "other.py": {
+                    "Other.UNRELATED_NOTE": {
+                        "qualified_name": "Other.UNRELATED_NOTE", "class_name": "Other",
+                        "name": "UNRELATED_NOTE", "line": 2, "end_line": 2,
+                    },
+                },
+            },
+            repo_path=tmp_path,
+        )
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=["policy.py"], target_symbols=["policy.py:Policy.ALLOWED_VALUES"],
+            extended_mechanism="Other.UNRELATED_NOTE",
+        )
+
+        result = build_final_target_slice(
+            strategy, str(tmp_path), context, planner_evidence_files=["other.py"],
+        )
+
+        assert "Target definition: `policy.py:Policy.ALLOWED_VALUES`" in result.rendered
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`other.py:Other.UNRELATED_NOTE`" in result.rendered
+        )
+        assert "Target definition: `other.py:Other.UNRELATED_NOTE`" not in result.rendered
+        assert "policy.py:Policy.ALLOWED_VALUES" in result.covered_target_symbols

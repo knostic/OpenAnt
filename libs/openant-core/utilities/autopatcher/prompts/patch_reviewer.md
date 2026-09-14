@@ -27,3 +27,29 @@ works correctly and does not introduce regressions, for example:
 - Edge cases to consider
 - Integration or regression tests to add or update
 - Tool-based checks (static analysis, fuzzing, etc.)
+
+## Already-calibrated findings
+
+If an "## Already-calibrated findings" section is present below, it was
+produced by an earlier pipeline stage reasoning from the same evidence you
+are given here. Treat its "Observed" items as already-established fact for
+this review -- do not re-derive or contradict them from general/prior
+knowledge. Its "Hypothesis" items are still-open questions you may discuss
+further; its "Hardening" items are out of scope for this advisory.
+
+Calibrated findings establish only the exact factual claims they state.
+You may combine them with other supplied evidence or analysis, but a new
+factual conclusion is established only when every factual link required
+for that conclusion is itself supported by the supplied evidence. Do not
+silently assume an intermediate assignment, transformation, normalization,
+mutation, configuration, default application, runtime state, or other
+missing link. If such a link is not established, present the resulting
+conclusion as unresolved or requiring validation, not as an established
+defect or established behavior -- this does not prevent you from combining
+evidence when the complete chain actually is shown.
+
+Do not describe a newly-derived conclusion as established by calibrated
+findings unless that exact conclusion is itself present in the calibrated
+findings. Do not claim that an unresolved derived concern determines
+whether the patch is effective unless the supplied evidence establishes
+that dependency.

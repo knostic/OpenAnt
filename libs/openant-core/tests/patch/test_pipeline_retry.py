@@ -990,3 +990,253 @@ class TestDeterministicContextReconstructionFallbackPreservesRetry:
     def test_retry_still_succeeds(self, tmp_path):
         result, _ = self._run(tmp_path)
         assert result.retry_succeeded is True
+
+
+# ---------------------------------------------------------------------------
+# Deterministic empty-hunk removal prevents the retry entirely
+#
+# Regression shape: the initial patch contains one real, valid semantic hunk
+# plus one hunk with zero added/removed lines (a redundant/invalid hunk that
+# fails `git apply --check` regardless of its header counts). The retry must
+# never fire when the deterministic strip alone already makes the patch
+# applicable -- this uses a REAL git repo and the REAL check_applicability
+# (git apply --check), not a mock, so the assertion is against actual git
+# behavior, not a stand-in for it.
+# ---------------------------------------------------------------------------
+
+class TestEmptyHunkRemovalAvoidsRetry:
+    def _init_git_repo(self, tmp_path: Path) -> None:
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, capture_output=True)
+
+    def test_empty_hunk_removed_real_hunk_preserved_no_retry(self, tmp_path):
+        self._init_git_repo(tmp_path)
+        mod_a = tmp_path / "pkg" / "mod_a.py"
+        mod_a.parent.mkdir(parents=True, exist_ok=True)
+        mod_a.write_text("line1\nold_a\nline3\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True)
+
+        # One real semantic hunk (mod_a.py) + one zero-change hunk (mod_b.py,
+        # which need not even exist on disk -- its whole section is dropped
+        # regardless of whether its content would have matched anything real).
+        multi_file_diff = """\
+```diff
+--- a/pkg/mod_a.py
++++ b/pkg/mod_a.py
+@@ -1,3 +1,3 @@
+ line1
+-old_a
++new_a
+ line3
+--- a/pkg/mod_b.py
++++ b/pkg/mod_b.py
+@@ -1,2 +1,2 @@
+ something
+ unrelated
+```"""
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       return_value=multi_file_diff) as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            # check_applicability is deliberately NOT mocked here -- real git
+            # apply --check against the real repo is exactly what this proves.
+        ):
+            from utilities.autopatcher.pipeline import run
+            report = run("test vuln", api_key="", repo_root=str(tmp_path))
+
+        # The applicability-aware LLM retry must never have been invoked:
+        # exactly one generate_patch_raw call (the initial generation).
+        assert mock_gen.call_count == 1
+        # The zero-change hunk is gone; the real edit survives byte-for-byte.
+        assert "mod_b.py" not in report
+        assert "-old_a" in report or "old_a" in report
+        assert "+new_a" in report
+
+    def test_empty_hunk_with_correct_header_counts_is_still_removed(self, tmp_path):
+        """Item 2: a zero-change hunk whose header counts are already
+        arithmetically correct (2 old lines, 2 new lines, matching its own
+        2-line all-context body) must still be removed -- git itself
+        rejects any hunk with zero added/removed lines regardless of count
+        correctness, so header-count correctness alone is never a reason
+        to keep it."""
+        self._init_git_repo(tmp_path)
+        mod_a = tmp_path / "mod_a.py"
+        mod_a.write_text("line1\nold_a\nline3\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True)
+
+        multi_file_diff = """\
+```diff
+--- a/mod_a.py
++++ b/mod_a.py
+@@ -1,3 +1,3 @@
+ line1
+-old_a
++new_a
+ line3
+--- a/mod_b.py
++++ b/mod_b.py
+@@ -1,2 +1,2 @@
+ something
+ unrelated
+```"""
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       return_value=multi_file_diff) as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("test vuln", api_key="", repo_root=str(tmp_path))
+
+        assert mock_gen.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Retry semantic-preservation gate
+#
+# The retry is only ever asked to repair `failed_files`. Every OTHER file's
+# semantic delta (added/removed lines, via diff_parsing.semantic_delta) must
+# survive the regeneration unchanged; a candidate that drops, alters, or
+# invents such a file's edit must be rejected and the pre-retry patch kept.
+# ---------------------------------------------------------------------------
+
+class TestRetrySemanticPreservation:
+    _ORIGINAL_DIFF = """\
+```diff
+--- a/pkg/mod_a.py
++++ b/pkg/mod_a.py
+@@ -1,2 +1,2 @@
+ line1
+-old_a
++new_a
+--- a/pkg/mod_b.py
++++ b/pkg/mod_b.py
+@@ -1,2 +1,2 @@
+ line1
+-old_b
++new_b
+```"""
+
+    _STDERR = (
+        "error: patch failed: pkg/mod_a.py:1\n"
+        "error: pkg/mod_a.py: patch does not apply\n"
+    )
+
+    def _run(self, tmp_path, retry_diff):
+        mod_a = tmp_path / "pkg" / "mod_a.py"
+        mod_a.parent.mkdir(parents=True, exist_ok=True)
+        mod_a.write_text("line1\nold_a\n", encoding="utf-8")
+
+        first_app = {
+            "applicable": False, "skipped": False, "stderr": self._STDERR,
+            "exit_code": 1, "skipped_reason": None, "error": None,
+        }
+        retry_app = {
+            "applicable": True, "skipped": False, "stderr": "",
+            "exit_code": 0, "skipped_reason": None, "error": None,
+        }
+
+        captured_result = {}
+        import utilities.autopatcher.pipeline as _pipeline_mod
+        original_build_report = _pipeline_mod._build_report
+
+        def capture(r):
+            captured_result["result"] = r
+            return original_build_report(r)
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient"),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw",
+                       side_effect=[self._ORIGINAL_DIFF, retry_diff]) as mock_gen,
+            mock.patch("utilities.autopatcher.patch_applicability.check_applicability",
+                       side_effect=_sequential_then_repeat(first_app, retry_app)),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", return_value={}),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch("utilities.autopatcher.pipeline._build_report", side_effect=capture),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("test vuln", api_key="", repo_root=str(tmp_path))
+        return captured_result["result"], mock_gen
+
+    def test_rejected_when_retry_omits_non_failing_file_edit(self, tmp_path):
+        # mod_b.py's edit is entirely absent from the retry's response.
+        retry_diff = """\
+```diff
+--- a/pkg/mod_a.py
++++ b/pkg/mod_a.py
+@@ -1,2 +1,2 @@
+ line1
+-old_a
++new_a_fixed
+```"""
+        result, mock_gen = self._run(tmp_path, retry_diff)
+        assert mock_gen.call_count == 2  # the retry WAS attempted
+        assert result.retry_succeeded is False
+        # Conservative fallback: the pre-retry patch is kept, unchanged --
+        # same invariant the existing "did not apply" rejection already uses.
+        assert result.patch == result.original_patch
+        assert "old_b" in result.patch and "new_b" in result.patch
+
+    def test_rejected_when_retry_changes_non_failing_file_line(self, tmp_path):
+        # mod_b.py is present in the retry's response, but its added line
+        # differs from the original by one word.
+        retry_diff = """\
+```diff
+--- a/pkg/mod_a.py
++++ b/pkg/mod_a.py
+@@ -1,2 +1,2 @@
+ line1
+-old_a
++new_a_fixed
+--- a/pkg/mod_b.py
++++ b/pkg/mod_b.py
+@@ -1,2 +1,2 @@
+ line1
+-old_b
++DIFFERENT_new_b
+```"""
+        result, mock_gen = self._run(tmp_path, retry_diff)
+        assert mock_gen.call_count == 2
+        assert result.retry_succeeded is False
+        assert result.patch == result.original_patch
+        assert "new_b" in result.patch and "DIFFERENT_new_b" not in result.patch
+
+    def test_accepted_when_only_failing_file_changes(self, tmp_path):
+        # mod_b.py's hunk is repositioned (different header line, different
+        # surrounding context) but carries the IDENTICAL added/removed
+        # content -- proving the gate compares semantic delta, not exact
+        # hunk text or position.
+        retry_diff = """\
+```diff
+--- a/pkg/mod_a.py
++++ b/pkg/mod_a.py
+@@ -1,2 +1,2 @@
+ line1
+-old_a
++new_a_fixed
+--- a/pkg/mod_b.py
++++ b/pkg/mod_b.py
+@@ -5,2 +5,2 @@
+ different_context_line
+-old_b
++new_b
+```"""
+        result, mock_gen = self._run(tmp_path, retry_diff)
+        assert mock_gen.call_count == 2
+        assert result.retry_succeeded is True
+        assert "new_a_fixed" in result.patch
+        assert "new_b" in result.patch

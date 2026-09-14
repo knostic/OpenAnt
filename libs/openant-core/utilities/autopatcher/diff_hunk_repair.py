@@ -31,6 +31,11 @@ appears.
 
 Public API:
     repair_hunk_headers(patch: str, repo_root: Path | str | None = None) -> tuple[str, RepairResult]
+    strip_empty_hunks(patch: str) -> tuple[str, int]
+        Deterministically drops any hunk with zero added/removed lines
+        (the same shape patch_hygiene.py's own `_check_empty_hunks`
+        already flags as `empty_hunk`) from an already repair_hunk_
+        headers()-normalized patch. See its own docstring.
 
 RepairResult fields:
     normalization_applied : bool  — True if any @@ line was changed, or any
@@ -665,6 +670,82 @@ def _render_section(sec: "_RSection") -> str:
 
 def _render_sections(sections: "list[_RSection]") -> str:
     return "".join(_render_section(s) for s in sections)
+
+
+def _hunk_has_changes(body: "list[str]") -> bool:
+    """True if `body` (a hunk's raw, marker-prefixed lines) contains at
+    least one added ('+') or removed ('-') line -- the same "no changed
+    lines" test patch_hygiene.py's own `_check_empty_hunks` already
+    applies at the whole-file level, applied here per-hunk. `body` lines
+    are always hunk-body lines as collected by `_parse_repaired_sections`
+    (never a stray '--- '/'+++ ' file-header line), so no further
+    disambiguation is needed here."""
+    return any(line[:1] in ("+", "-") for line in body)
+
+
+def strip_empty_hunks(patch: str) -> "tuple[str, int]":
+    """Deterministically drop every hunk that adds or removes nothing --
+    pure unchanged context under an '@@ ... @@' header, contributing no
+    semantic change. This is the exact "no changed lines" shape
+    patch_hygiene.py's own `_check_empty_hunks` already flags as a HIGH-
+    severity `empty_hunk` finding; this function is what actually acts on
+    that diagnosis instead of only reporting it.
+
+    Dropping such a hunk can never alter what a patch does: by definition
+    it has zero added/removed lines, so its old_count always equals its
+    new_count (see _count_body) -- a net line-count delta of zero -- so
+    removing it never requires renumbering any other hunk, in this file or
+    any other. A file left with zero hunks after stripping contributed no
+    actual change at all; its own '--- '/'+++ ' header pair is dropped too,
+    rather than emitting a headers-only, hunk-less file section.
+
+    Every real (semantically non-empty) hunk is preserved byte-for-byte,
+    in its original order, via `_RHunk.raw_header`/`.body` (re-rendered
+    verbatim by `_render_section`, never reconstructed).
+
+    Parses via `_parse_repaired_sections`, so this must be called on an
+    already `repair_hunk_headers()`-normalized patch (single header-pair
+    per file, non-interleaved) -- exactly where generated_patch_
+    processing.py already calls it, immediately after repair_hunk_headers
+    and before falling through to any LLM-based repair. Strips/restores
+    markdown fences exactly like repair_hunk_headers itself does (via the
+    same `_strip_md_fences`), since that is the shape its output -- this
+    function's own expected input -- actually has. Fails closed (returns
+    `patch` unchanged, 0) for any patch this parser doesn't recognise --
+    never a best-effort/partial strip.
+
+    Returns (patch_with_empty_hunks_removed, hunks_removed). Returns the
+    ORIGINAL `patch` unchanged, with hunks_removed == 0, whenever nothing
+    was removed (including when parsing fails) -- a no-op is always safe
+    to return verbatim.
+    """
+    if not patch or not patch.strip():
+        return patch, 0
+
+    open_fence, clean, close_fence = _strip_md_fences(patch)
+    sections = _parse_repaired_sections(clean)
+    if sections is None:
+        return patch, 0
+
+    removed = 0
+    kept_sections: "list[_RSection]" = []
+    for sec in sections:
+        kept_hunks = [h for h in sec.hunks if _hunk_has_changes(h.body)]
+        removed += len(sec.hunks) - len(kept_hunks)
+        if kept_hunks:
+            kept_sections.append(
+                _RSection(
+                    header_a=sec.header_a, header_b=sec.header_b,
+                    file_key=sec.file_key, hunks=kept_hunks,
+                    is_deletion=sec.is_deletion,
+                )
+            )
+        # else: every hunk in this file section was empty -- drop the
+        # whole section, including its '--- '/'+++ ' header pair.
+
+    if removed == 0:
+        return patch, 0
+    return open_fence + _render_sections(kept_sections) + close_fence, removed
 
 
 def _single_hunk_patch(sec: "_RSection", h: "_RHunk") -> str:

@@ -102,3 +102,40 @@ def semantic_delta(patch: str) -> Dict[str, Tuple[List[str], List[str]]]:
         )
         for f, hunks in file_hunks.items()
     }
+
+
+def semantic_delta_preserved(
+    original: str, candidate: str, unguarded_files: "Optional[List[str]]" = None,
+) -> bool:
+    """True if `candidate`'s semantic_delta() matches `original`'s for
+    every file EXCEPT those named in `unguarded_files`.
+
+    The bounded safety gate an LLM-driven patch regeneration (e.g. an
+    applicability-aware retry) can be checked against before its output
+    is accepted, reusing the exact same semantic_delta() invariant
+    `diff_hunk_repair.reconstruct_hunk_context` already uses to guard its
+    own deterministic reconstruction (see that function's own module
+    docstring) — applied here to an LLM's output instead.
+
+    A file present on only one side is treated as having an empty delta
+    ([], []) on the other -- so a file that disappears entirely from
+    `candidate`, or a brand-new file that appears in `candidate` but was
+    never in `original` and is not itself unguarded, both count as a
+    change and fail this check, exactly like an in-place edit to that
+    file's existing hunk would.
+
+    `unguarded_files` names the file(s) the caller EXPECTS -- and
+    permits -- to differ (e.g. the file(s) an applicability retry was
+    actually asked to repair); every other file's additions/removals
+    must be identical, in order, or this returns False.
+    """
+    orig = semantic_delta(original)
+    cand = semantic_delta(candidate)
+    unguarded = set(unguarded_files or ())
+    empty: Tuple[List[str], List[str]] = ([], [])
+    for f in set(orig) | set(cand):
+        if f in unguarded:
+            continue
+        if orig.get(f, empty) != cand.get(f, empty):
+            return False
+    return True
