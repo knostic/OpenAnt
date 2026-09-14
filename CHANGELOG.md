@@ -3,6 +3,16 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-14] — Dependencies: the dual http stack bumped to 2.13.0 (#632)
+
+### Dependencies
+
+- **`httpx2` 2.12.0 → 2.13.0 and its peer `httpcore2` 2.12.0 → 2.13.0,
+  together.** `httpx2` pins its `httpcore2` peer exactly, so the two bumps
+  are one atomic change — each alone fails `pip install -r requirements.txt`
+  with a dependency conflict (the peer renovate PR that bumped only
+  `httpcore2` is superseded by this pair).
+
 ## [2026-09-14] — LLM-reach report gaps: the skip class + the promoted-vs-retained decomposition (#602)
 
 ### Fixed
