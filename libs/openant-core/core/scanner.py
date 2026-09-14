@@ -19,7 +19,7 @@ On completion, a final ``scan.report.json`` aggregates all step reports.
 import json
 import os
 import shutil
-from typing import Dict
+from typing import Any, Dict
 import sys
 from pathlib import Path
 
@@ -123,6 +123,27 @@ def _relativize_home(path_str: str) -> str:
     return path_str
 
 
+def _promotable_skip_count(by_class: dict, promote_set) -> int:
+    """#602: the skipped signals that COULD have promoted — an UPPER
+    BOUND: entry_point skips whose confidence is in THIS run's promote
+    set (the promote gate at apply_signals). Upper bound because the
+    skipped signal's target is outside its batch by construction — the
+    count cannot know whether the id exists in another batch (a real
+    lost promotion candidate) or nowhere in the dataset (a hallucinated
+    id, promotable by no gate), nor whether the target was already an
+    entry point. Factored for testability: the guard tolerates malformed
+    keys (never a report-assembly crash)."""
+    total = 0
+    for k, v in (by_class or {}).items():
+        if (not isinstance(k, str) or not isinstance(v, int)
+                or "/" not in k):
+            continue
+        kind, confidence = k.split("/", 1)
+        if kind == "entry_point" and confidence in (promote_set or []):
+            total += v
+    return total
+
+
 def aggregate_reachability_telemetry(per_lang: dict) -> dict:
     """#301: sum the per-language prune telemetry into the top-level record.
 
@@ -139,13 +160,22 @@ def aggregate_reachability_telemetry(per_lang: dict) -> dict:
     agg: Dict[str, int] = {}
     by_file: Dict[str, int] = {}
     asym = 0
+    # #602: the reachability-decomposition keys join the per-language sum —
+    # a new per-language key is silently DROPPED by this whitelist (the
+    # #328 class). Present-only per record: a language whose filter could
+    # not measure the baseline (keep-all/none) contributes nothing —
+    # never a fabricated 0.
+    _measured_languages = 0
     for record in per_lang.values():
         if not isinstance(record, dict):
             continue
-        for key in ("pruned_orphan_count", "pruned_in_dead_cluster_count"):
+        for key in ("pruned_orphan_count", "pruned_in_dead_cluster_count",
+                    "structural_reachable_units", "units_newly_reachable"):
             v = record.get(key)
             if isinstance(v, int):
                 agg[key] = agg.get(key, 0) + v
+                if key == "units_newly_reachable":
+                    _measured_languages += 1
         v = record.get("pruned_forward_called_by_reachable_count")
         if isinstance(v, int):
             asym += v
@@ -156,13 +186,32 @@ def aggregate_reachability_telemetry(per_lang: dict) -> dict:
                     by_file[f] = by_file.get(f, 0) + c
     out: dict = {}
     out.update(agg)
-    if agg or asym:
+    # #602: how many languages actually MEASURED the baseline — the
+    # decomposition's denominator honesty (the rest could not: no LLM
+    # extras / unfilterable / synthetic-only).
+    if _measured_languages:
+        out["reachability_baseline_languages"] = _measured_languages
+    # #602 guard: the asym key's presence is keyed on the PRUNE telemetry
+    # specifically — NOT on agg's truthiness (the decomposition keys make
+    # agg truthy; a record with only structural/newly-reachable telemetry
+    # must not fabricate a pruned_forward_called_by_reachable_count of 0 —
+    # the exact #328-class trap this function's callers hit before).
+    if asym or any(k in agg for k in
+                   ("pruned_orphan_count", "pruned_in_dead_cluster_count")):
         # the hard invariant is always present when the classification ran —
         # a measured 0 is the healthy signal, not a fabricated one
         out["pruned_forward_called_by_reachable_count"] = asym
     if by_file:
         top = sorted(by_file.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
         out["pruned_by_file"] = dict(top)
+    # #602: the synthetic-only baseline marker lifts language-prefixed
+    # (a string cannot sum) — the same shape as the warning lift above,
+    # SORTED like its sibling so the joined string is deterministic.
+    _bl = [f"{lang}: {r['reachability_baseline']}"
+           for lang, r in sorted(per_lang.items())
+           if isinstance(r, dict) and r.get("reachability_baseline")]
+    if _bl:
+        out["reachability_baseline"] = "; ".join(_bl)
     # per-language orphan advisories lift to the top level (the same shape
     # as the warning lift; its own key, never the reserved warning slot).
     advisories = [
@@ -652,7 +701,7 @@ def scan_repository(
                     # #294: collect parse-level batch-drop stats so the
                     # step report's units_reviewed stops implying full
                     # coverage when batches were dropped.
-                    reach_stats: Dict[str, int] = {}
+                    reach_stats: Dict[str, Any] = {}
                     signals = analyze_reachability(
                         dataset=dataset,
                         app_context=app_ctx_payload,
@@ -926,6 +975,34 @@ def scan_repository(
                         # step to partial wrongly.
                         "checkpoint_summary_write_failures": reach_stats.get(
                             "checkpoint_summary_write_failures", 0),
+                        # #602: the skip-class telemetry — unknown-ID signal
+                        # occurrences in ACCEPTED responses (the diagnostic
+                        # log may carry discarded attempts; the counter is
+                        # the accepted-response metric). A skipped signal is
+                        # NOT a coverage failure: error_count stays
+                        # dropped+failed batches only. Two known exclusions:
+                        # adopted units bypass parse on resume (their skips
+                        # were never persisted); a SPLIT batch narrows
+                        # valid_unit_ids per half, so a cross-half reference
+                        # reads as a skip — the metric is not batch-geometry-
+                        # invariant, and split-recovered runs read higher.
+                        "signals_skipped_unknown_unit": reach_stats.get(
+                            "signals_skipped_unknown_unit", 0),
+                        "signals_skipped_unknown_unit_by_class": reach_stats.get(
+                            "signals_skipped_unknown_unit_by_class", {}),
+                        # #602: the promotable subset — sized at REPORT
+                        # time from this run's own promote_set (the promote
+                        # gate: kind=entry_point, confidence in promote_set),
+                        # never by parse_response (which must stay
+                        # policy-free). An UPPER BOUND: the skipped id is
+                        # outside its batch by construction — it may exist
+                        # in another batch or nowhere in the dataset.
+                        "signals_skipped_promotable":
+                            _promotable_skip_count(
+                                reach_stats.get(
+                                    "signals_skipped_unknown_unit_by_class",
+                                    {}) or {},
+                                summary.get("promote_set") or []),
                         # #541 (the refute round): the #285/#376 partial-
                         # status contract — dropped + failed batches make
                         # the STEP read partial, never success/0/0.

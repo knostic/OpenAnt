@@ -481,6 +481,36 @@ def apply_reachability_filter(
     # Detect entry points structurally, then seed with any extras (e.g. LLM-promoted).
     detector = EntryPointDetector(functions, call_graph)
     entry_points = detector.detect_entry_points()
+    # #602: the STRUCTURAL baseline (detector + library seeds, WITHOUT the
+    # LLM-promoted extras) is a SIDE COMPUTATION on a copy, inserted before
+    # the union — the union below is unchanged, and the seed unions are set
+    # operations ((D ∪ X) ∪ B = (D ∪ B) ∪ X; the BFS closure is
+    # seed-order-independent), so the main filter's inputs and outputs are
+    # identical for every pre-existing shape. The side computation gives
+    # the counterfactual: what the structural pass alone retains.
+    # The baseline counts DATASET units (not graph ids — the analyzer's
+    # reachable set can include ids absent from the dataset).
+    _baseline_seed = set(entry_points)
+    if library_mode:
+        _baseline_seed |= library_seed_ids(functions)
+    _baseline_ids = None
+    _baseline_unmeasurable = None
+    if extra_entry_points:
+        if real_entry_point_ids(_baseline_seed, functions):
+            _baseline_analyzer = ReachabilityAnalyzer(
+                functions=functions,
+                reverse_call_graph=reverse_call_graph,
+                entry_points=_baseline_seed,
+            )
+            _baseline_ids = _baseline_analyzer.get_all_reachable()
+        else:
+            # #602: the decomposition's most-informative case — the LLM
+            # extras are the ONLY real seeds; synthetic-harness seeds are
+            # not real entry points, so there is no structural baseline to
+            # measure against (the structural-only run would have kept ALL
+            # units — the extras can only narrow, and by an unmeasurable
+            # amount). Disclosed, never silently absent.
+            _baseline_unmeasurable = "no_real_structural_seeds"
     if extra_entry_points:
         entry_points = entry_points | extra_entry_points
     # Library-mode (opt-in): the public API is the entry surface. Union-only —
@@ -523,6 +553,12 @@ def apply_reachability_filter(
         # must not read as "no signal" when synthetic-only seeding was the cause.
         _rec["structural_entry_points"], _rec["incidental_entry_points"] = (
             _epd.classify_seeds(detector.entry_point_details))
+        # #602: the decomposition's most-informative case lands HERE — the
+        # LLM extras were the only seeds and the structural baseline could
+        # not run. The marker (never silent absence — absence reads as
+        # "no LLM extras").
+        if _baseline_unmeasurable is not None:
+            _rec["reachability_baseline"] = _baseline_unmeasurable
         # #328 (wave r1, opus+fable): the effective level on the pass-through
         # path is "all" — nothing was pruned — and this is the case where
         # recording it matters MOST: without it the record looks identical to
@@ -565,7 +601,7 @@ def apply_reachability_filter(
     )
     _structural_eps, _incidental_eps = _epd.classify_seeds(
         detector.entry_point_details)
-    dataset.setdefault("metadata", {})["reachability_filter"] = {
+    _filter_rec = {
         "original_units": original_count,
         "entry_points": len(entry_points),
         "structural_entry_points": _structural_eps,
@@ -574,6 +610,26 @@ def apply_reachability_filter(
         "filtered_out": original_count - len(filtered_units),
         "reduction_percentage": reduction_pct,
     }
+    # #602: the decomposition — units_newly_reachable is derived from the
+    # counterfactual baseline (the DATASET units the combined seeds retain
+    # that the structural-only closure does NOT), making the promoted-vs-
+    # retained relationship self-explaining. The key is ABSENT when the
+    # baseline is unmeasurable (no LLM extras: nothing to decompose; the
+    # keep-all path: retained units are NOT proven reachable — reporting
+    # them as LLM gains would be a fabrication).
+    if _baseline_ids is not None:
+        _filter_rec["structural_reachable_units"] = sum(
+            1 for u in units if u.get("id", "") in _baseline_ids)
+        _filter_rec["units_newly_reachable"] = sum(
+            1 for u in filtered_units
+            if u.get("id", "") not in _baseline_ids)
+    elif _baseline_unmeasurable is not None:
+        # The synthetic-only case — the most-informative decomposition:
+        # the LLM extras were the ONLY real seeds. The keys stay absent;
+        # the marker explains WHY (never silent absence — absence alone
+        # reads as "no LLM extras").
+        _filter_rec["reachability_baseline"] = _baseline_unmeasurable
+    dataset.setdefault("metadata", {})["reachability_filter"] = _filter_rec
 
     print(f"  Entry points detected: {len(entry_points)}", file=sys.stderr)
     print(
