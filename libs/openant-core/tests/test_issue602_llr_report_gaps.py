@@ -271,16 +271,143 @@ def test_aggregate_lifts_the_new_keys():
     assert out4["reachability_baseline"] == "python: no_real_structural_seeds"
 
 
-def test_summary_key_shapes_in_scanner_source():
-    """Source-level pin: the llr step summary enumerates the skip keys
-    explicitly (the stats never reach the report without this block)."""
-    src = (PROJECT_ROOT / "core" / "scanner.py").read_text()
-    assert '"signals_skipped_unknown_unit": reach_stats.get(' in src
-    assert '"signals_skipped_unknown_unit_by_class": reach_stats.get(' in src
-    assert "_promotable_skip_count(" in src
-    # the promotable sizing keys off THIS run's promote_set (not a fresh
-    # env read, not a hard-coded confidence)
-    assert 'summary.get("promote_set")' in src
+def test_split_batch_halves_commit_their_own_skips():
+    """The claimed receipt, made real: a max_tokens parent batch discards
+    its own skip; each split half commits ITS OWN skips exactly once
+    (nothing subtracted, nothing double-counted) — and the cross-half
+    references read as skips by batching geometry (the disclosed
+    non-invariance: split-recovered runs read higher)."""
+    from utilities.llm import CompletionResult, TextBlock
+    parent_body = json.dumps({"signals": [
+        _sig("ghost.py:x")]})  # discarded with the truncated batch
+    halves_body = json.dumps({"signals": [
+        _sig("a.py:f"),                            # the half's own unit
+        _sig("b.py:g", "external_input", "low"),   # the OTHER half — a skip
+    ]})
+
+    class _SplitAdapter:
+        model = "claude-test"
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, **kw):
+            self.calls += 1
+            if self.calls == 1:  # the full batch — truncated, split fires
+                return CompletionResult(
+                    content=[TextBlock(parent_body)],
+                    stop_reason="max_tokens", input_tokens=1,
+                    output_tokens=1, usage_details=None)
+            return CompletionResult(  # each half — accepted
+                content=[TextBlock(halves_body)], stop_reason="end_turn",
+                input_tokens=1, output_tokens=1, usage_details=None)
+
+    stats = {}
+    analyze_reachability(
+        {"units": [_unit("a.py:f"), _unit("b.py:g")]},
+        binding=_Binding(_SplitAdapter()), stats=stats, batch_size=4)
+    assert stats["signals_skipped_unknown_unit"] == 2  # one per half
+    assert stats["signals_skipped_unknown_unit_by_class"] == {
+        "entry_point/high": 1, "external_input/low": 1}
+    assert stats["batches_split_recovered"] == 1
+    assert stats["batches_dropped"] == 0
+    assert stats["batches_truncated"] == 0
+
+
+def test_step_report_carries_the_skip_keys(monkeypatch, tmp_path):
+    """The EXECUTED artifact pin (the source-string pin retired): the real
+    scan path's llm-reachability.report.json carries the skip counters AND
+    the promotable subset sized from THIS run's promote_set."""
+    from pathlib import Path
+    import utilities.llm as llm_mod
+    from core import parser_adapter, analyzer, reporter, tracking
+    from core import scanner as scanner_mod
+    from core.schemas import AnalysisMetrics
+    import core.llm_reachability as lr
+
+    monkeypatch.setattr(llm_mod, "probe_registry_or_raise",
+                        lambda reg: None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-offline-000")
+
+    class _ParseResult:
+        def __init__(self, output_dir):
+            self.dataset_path = str(Path(output_dir) / "dataset.json")
+            self.analyzer_output_path = str(Path(output_dir) / "analyzer.json")
+            self.units_count = 3
+            self.language = "python"
+            self.processing_level = "reachable"
+
+    def _fake_parse(*, output_dir, **kwargs):
+        pr = _ParseResult(output_dir)
+        Path(pr.dataset_path).write_text('{"units": [], "metadata": {}}')
+        Path(pr.analyzer_output_path).write_text("{}")
+        return pr
+
+    metrics = AnalysisMetrics(total=3, vulnerable=0, bypassable=0,
+                              inconclusive=0, protected=0, safe=3, errors=0)
+
+    class _AnalyzeResult:
+        def __init__(self, output_dir):
+            self.results_path = str(Path(output_dir) / "results.json")
+            Path(self.results_path).write_text("[]")
+            self.metrics = metrics
+
+    monkeypatch.setattr(parser_adapter, "parse_repository", _fake_parse)
+    monkeypatch.setattr(analyzer, "run_analysis",
+                        lambda *, output_dir, **kw: _AnalyzeResult(output_dir))
+    monkeypatch.setattr(
+        reporter, "build_pipeline_output",
+        lambda *, results_path, output_path, **kw:
+        (Path(output_path).write_text("{}"), output_path)[1])
+    tracking.reset_tracking()
+
+    def _fake_analyze(*, dataset, app_context, binding, max_code_bytes,
+                      stats=None, **kw):
+        assert isinstance(stats, dict), "scanner must pass a stats dict"
+        stats["signals_skipped_unknown_unit"] = 2
+        stats["signals_skipped_unknown_unit_by_class"] = {
+            "entry_point/high": 1, "external_input/low": 1}
+        return []
+
+    monkeypatch.setattr(lr, "analyze_reachability", _fake_analyze)
+    monkeypatch.setattr(
+        lr, "apply_signals",
+        lambda dataset, signals: {"signals_applied": 0,
+                                  "entry_points_promoted": 0,
+                                  "units_touched": 0,
+                                  "promote_set": ["high"]})
+    monkeypatch.setattr(lr, "signals_to_json", lambda signals: [])
+
+    scanner_mod.scan_repository(
+        repo_path=str(tmp_path), output_dir=str(tmp_path / "out"),
+        generate_context=False, enhance=False, verify=False,
+        generate_report=False, dynamic_test=False,
+        llm_reachability=True, processing_level="reachable")
+
+    report = json.loads(
+        (tmp_path / "out" / "llm-reachability.report.json").read_text())
+    s = report["summary"]
+    assert s["signals_skipped_unknown_unit"] == 2
+    assert s["signals_skipped_unknown_unit_by_class"] == {
+        "entry_point/high": 1, "external_input/low": 1}
+    # the promotable subset: entry_point/high (in promote_set) only
+    assert s["signals_skipped_promotable"] == 1
+
+
+def test_reporter_forwards_the_decomposition_executed(tmp_path):
+    """The EXECUTED forwarding pin (the AST source pin retired): the three
+    int keys and the string marker reach pipeline_output.json's
+    pipeline_stats through the REAL build_pipeline_output."""
+    from tests.test_issue301_prune_telemetry_deliverable import _write_scan
+    po = _write_scan(tmp_path, telemetry={
+        "structural_reachable_units": 10, "units_newly_reachable": 3,
+        "reachability_baseline_languages": 1,
+        "reachability_baseline": "python: no_real_structural_seeds"})
+    ps = po["pipeline_stats"]
+    assert ps["structural_reachable_units"] == 10
+    assert ps["units_newly_reachable"] == 3
+    assert ps["reachability_baseline_languages"] == 1
+    assert ps["reachability_baseline"] == "python: no_real_structural_seeds"
 
 
 def test_promotable_sizing_the_real_function():
@@ -296,25 +423,6 @@ def test_promotable_sizing_the_real_function():
         {"entry_point": 3, "x/y": "not-int"}, ["y"]) == 0
 
 
-def test_reporter_forwards_the_decomposition(tmp_path):
-    """The promoted-vs-retained decomposition reaches pipeline_output.json's
-    pipeline_stats — the reporter's forwarding whitelist is where a new
-    per-language key went to die before this test (the hunt's P2)."""
-    import ast
-    src = (PROJECT_ROOT / "core" / "reporter.py").read_text()
-    tree = ast.parse(src)
-    # the forwarding loop must name the decomposition keys
-    found = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if node.value in ("structural_reachable_units",
-                              "units_newly_reachable",
-                              "reachability_baseline_languages"):
-                found.append(node.value)
-    assert {"structural_reachable_units", "units_newly_reachable",
-            "reachability_baseline_languages"} <= set(found)
-
-
 def test_baseline_marker_for_the_synthetic_only_case(tmp_path):
     """The most-informative decomposition case — the LLM extras are the ONLY
     real seeds (the structural pass found none): the baseline is
@@ -324,6 +432,22 @@ def test_baseline_marker_for_the_synthetic_only_case(tmp_path):
               "code": {"primary_code": "def f(): pass"}}]
     ds, tmp = _run_refilter(units, {}, {}, {},
                             extra_eps={"x.py:f"}, tmp_path=tmp_path)
+    rec = ds["metadata"]["reachability_filter"]
+    assert rec.get("reachability_baseline") == "no_real_structural_seeds"
+    assert "units_newly_reachable" not in rec
+
+
+def test_baseline_marker_on_the_keep_all_pass_through(tmp_path):
+    """The pass-through (keep-all) branch of the marker: extras present but
+    every seed synthetic — the most-informative case disclosed on the
+    keep-all path too, not only the filtered one."""
+    units = [{"id": "x.py:f", "unit_type": "function",
+              "code": {"primary_code": "def f(): pass"}}]
+    functions = {"x.py:fuzz": {"file": "x.py", "name": "fuzz",
+                               "synthetic_harness": True,
+                               "unit_type": "main"}}
+    ds, tmp = _run_refilter(units, functions, {}, {},
+                            extra_eps={"x.py:fuzz"}, tmp_path=tmp_path)
     rec = ds["metadata"]["reachability_filter"]
     assert rec.get("reachability_baseline") == "no_real_structural_seeds"
     assert "units_newly_reachable" not in rec

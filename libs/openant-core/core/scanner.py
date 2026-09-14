@@ -130,7 +130,8 @@ def _promotable_skip_count(by_class: dict, promote_set) -> int:
     malformed keys (never a report-assembly crash)."""
     total = 0
     for k, v in (by_class or {}).items():
-        if not isinstance(v, int) or "/" not in k:
+        if (not isinstance(k, str) or not isinstance(v, int)
+                or "/" not in k):
             continue
         kind, confidence = k.split("/", 1)
         if kind == "entry_point" and confidence in (promote_set or []):
@@ -199,9 +200,10 @@ def aggregate_reachability_telemetry(per_lang: dict) -> dict:
         top = sorted(by_file.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
         out["pruned_by_file"] = dict(top)
     # #602: the synthetic-only baseline marker lifts language-prefixed
-    # (a string cannot sum) — the same shape as the warning lift above.
+    # (a string cannot sum) — the same shape as the warning lift above,
+    # SORTED like its sibling so the joined string is deterministic.
     _bl = [f"{lang}: {r['reachability_baseline']}"
-           for lang, r in per_lang.items()
+           for lang, r in sorted(per_lang.items())
            if isinstance(r, dict) and r.get("reachability_baseline")]
     if _bl:
         out["reachability_baseline"] = "; ".join(_bl)
@@ -973,7 +975,12 @@ def scan_repository(
                         # log may carry discarded attempts; the counter is
                         # the accepted-response metric). A skipped signal is
                         # NOT a coverage failure: error_count stays
-                        # dropped+failed batches only.
+                        # dropped+failed batches only. Two known exclusions:
+                        # adopted units bypass parse on resume (their skips
+                        # were never persisted); a SPLIT batch narrows
+                        # valid_unit_ids per half, so a cross-half reference
+                        # reads as a skip — the metric is not batch-geometry-
+                        # invariant, and split-recovered runs read higher.
                         "signals_skipped_unknown_unit": reach_stats.get(
                             "signals_skipped_unknown_unit", 0),
                         "signals_skipped_unknown_unit_by_class": reach_stats.get(

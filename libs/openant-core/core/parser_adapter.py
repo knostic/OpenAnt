@@ -482,10 +482,12 @@ def apply_reachability_filter(
     detector = EntryPointDetector(functions, call_graph)
     entry_points = detector.detect_entry_points()
     # #602: the STRUCTURAL baseline (detector + library seeds, WITHOUT the
-    # LLM-promoted extras) is computed BEFORE the union — the seed unions
-    # are set operations ((D ∪ X) ∪ B = (D ∪ B) ∪ X; the BFS closure is
-    # seed-order-independent), so this reorder is behavior-preserving and
-    # gives the counterfactual: what the structural pass alone retains.
+    # LLM-promoted extras) is a SIDE COMPUTATION on a copy, inserted before
+    # the union — the union below is unchanged, and the seed unions are set
+    # operations ((D ∪ X) ∪ B = (D ∪ B) ∪ X; the BFS closure is
+    # seed-order-independent), so the main filter's inputs and outputs are
+    # identical for every pre-existing shape. The side computation gives
+    # the counterfactual: what the structural pass alone retains.
     # The baseline counts DATASET units (not graph ids — the analyzer's
     # reachable set can include ids absent from the dataset).
     _baseline_seed = set(entry_points)

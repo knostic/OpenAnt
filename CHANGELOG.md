@@ -3,6 +3,36 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-14] — LLM-reach report gaps: the skip class + the promoted-vs-retained decomposition (#602)
+
+### Fixed
+
+- **The unknown-unit_id skip line carries its class.** A signal naming a
+  unit outside its batch used to log only the id — an `entry_point/high`
+  skip (could have promoted) was indistinguishable in the record from an
+  `external_input/low` one (could not). The line now carries
+  kind/confidence/batch, `parse_response` gains a policy-free
+  `on_signal_skip` callback, and the stage counts
+  `signals_skipped_unknown_unit` + a by-class histogram — accepted
+  responses only (a dropped/truncated batch's skips are discarded with
+  it; split-retry halves commit their own). The step report carries
+  `signals_skipped_promotable` — the skipped signals that could have
+  promoted, sized at report time from this run's own promote set. A
+  skipped signal is not a coverage failure: `error_count` stays
+  dropped+failed batches only.
+- **`entry_points_promoted` is decomposed.** The structural baseline
+  (detector + library seeds, without the LLM extras — a side computation
+  on a copy, the filter itself unchanged) gives
+  `structural_reachable_units` + `units_newly_reachable` per language,
+  lifted through the aggregation whitelist with
+  `reachability_baseline_languages` (the denominator honesty), forwarded
+  present-only into `pipeline_output.json`, and rendered by the summary
+  prompt. The keys stay absent when unmeasurable; the
+  synthetic-only-seeds case is disclosed by the `reachability_baseline`
+  marker (never a silent absence). Telemetry only: retained unit sets are
+  byte-identical for every pre-existing shape (verified base-vs-head on
+  the parse-level reachable path, the llr path, and the keep-all path).
+
 ## [2026-09-14] — Discovery counters: the excluded directories are NAMED (#600)
 
 ### Fixed
