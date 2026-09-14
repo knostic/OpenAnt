@@ -1107,6 +1107,9 @@ def scan_repository(
                     "error_count": enhance_result.error_count,
                     "classifications": enhance_result.classifications,
                     "mode": enhance_mode,
+                    # #611: the three-bucket identity's own fields
+                    "incomplete_count": enhance_result.incomplete_count,
+                    "total_units": enhance_result.total_units,
                 }
                 if enhance_result.error_summary:
                     ctx.summary["error_summary"] = enhance_result.error_summary
