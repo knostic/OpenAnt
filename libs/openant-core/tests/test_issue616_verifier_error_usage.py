@@ -17,8 +17,8 @@ accumulation runs after complete returns), a per-turn entry for the
 raising turn ONLY when the exception carries its tokens (LLMResponseError;
 connection/auth/limit raises billed nothing — no entry), a zero-token
 guard (a turn-1 connection failure writes NO $0 call record), and
-KeyboardInterrupt propagates uncaught (BaseException — the :1017/:1058
-handlers keep their shape). No conversation record is ever relabeled a
+KeyboardInterrupt propagates uncaught (BaseException — the sequential and
+parallel batch handlers keep their shape). No conversation record is ever relabeled a
 request. Residual, disclosed: a NON-adapter raise after accumulation (a
 malformed CompletionResult, an unserializable tool result) still loses
 the usage — the try stays narrow because widening it double-records on
@@ -71,10 +71,13 @@ class _Tracker:
         pass
 
     def get_unit_usage(self):
+        # the REAL TokenTracker.get_unit_usage emits input/output/cost
+        # (+cost_incomplete/unpriced when applicable) — no total_tokens;
+        # the stub mirrors that key set exactly
         t_in = sum(c.get("input_tokens", 0) for c in self.calls)
         t_out = sum(c.get("output_tokens", 0) for c in self.calls)
         return {"input_tokens": t_in, "output_tokens": t_out,
-                "total_tokens": t_in + t_out, "cost_usd": 0.0}
+                "cost_usd": 0.0}
 
     def add_prior_usage(self, *a, **kw):
         pass
@@ -211,7 +214,7 @@ def test_rate_limit_raise_records_accumulated_only():
 
 def test_keyboard_interrupt_propagates_unrecorded():
     """BaseException: KeyboardInterrupt never enters the except-Exception
-    handler — the :983/:1024 handlers keep their shape."""
+    handler — the batch handlers keep their shape."""
     adapter = _Adapter()
     adapter.script = [KeyboardInterrupt()]
     v = _verifier(adapter)
@@ -262,4 +265,4 @@ def test_verify_one_harvests_the_errored_units_real_usage():
         result, code_by_route={"a.py:f": "def f(): pass"})
     assert detail == "error"
     assert usage["input_tokens"] == 100  # the harvest: real spend, not $0
-    assert usage["total_tokens"] == 110
+    assert usage["output_tokens"] == 10
