@@ -200,5 +200,5 @@ def test_extras_and_names_parse():
     pins = _pins_from_requirements((CORE_ROOT / "requirements.txt").read_text())
     # the pin follows the live file (renovate bump #475: 1.2.0 -> 1.3.0)
     assert pins["anthropic"] is not None
-    assert pins["httpx2"] == Version("2.12.0")   # the NOTE-commented line
+    assert pins["httpx2"] == Version("2.13.0")   # the NOTE-commented line (the pin follows the live file — renovate bump)
     assert pins["pyyaml"] == Version("6.0")      # the shared floor lines
