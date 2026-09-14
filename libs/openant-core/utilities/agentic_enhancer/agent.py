@@ -106,6 +106,12 @@ class AgentResult:
         cost_usd: float = 0.0,
         unpriced_models: Optional[list] = None,
         usage_details: Optional[list] = None,
+        # #615: WHICH degenerate exit produced this incomplete — the four
+        # exits differ in kind and remedy (three cheap model-behavior
+        # exits vs the budget-exhaustion one); a consumer reading only
+        # classification cannot split the 4-vs-41. Empty string = a
+        # completed analysis (NOT an incomplete marker).
+        exit_kind: str = "",
     ):
         self.include_functions = include_functions
         self.usage_context = usage_context
@@ -124,6 +130,7 @@ class AgentResult:
         self.unpriced_models = unpriced_models
         # #211 pass-through capture: per-turn detail dicts, verbatim.
         self.usage_details = usage_details
+        self.exit_kind = exit_kind
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -133,6 +140,9 @@ class AgentResult:
             "security_classification": self.security_classification,
             "classification_reasoning": self.classification_reasoning,
             "confidence": self.confidence,
+            # #615: present-only — a completed analysis (exit_kind="")
+            # serializes without the key (the legacy byte-identity).
+            **({"exit_kind": self.exit_kind} if self.exit_kind else {}),
             "agent_metadata": {
                 "iterations": self.iterations,
                 "total_tokens": self.total_tokens,
@@ -335,6 +345,7 @@ class ContextAgent:
                     security_classification=INCOMPLETE_CLASSIFICATION,
                     classification_reasoning="Analysis incomplete",
                     confidence=0.3,
+                    exit_kind="end_turn_without_finish",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
                     is_entry_point=is_entry_point,
@@ -410,6 +421,7 @@ class ContextAgent:
                     security_classification=INCOMPLETE_CLASSIFICATION,
                     classification_reasoning="Analysis incomplete - finish call truncated",
                     confidence=0.3,
+                    exit_kind="finish_truncated",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
                     is_entry_point=is_entry_point,
@@ -483,6 +495,7 @@ class ContextAgent:
                     security_classification=INCOMPLETE_CLASSIFICATION,
                     classification_reasoning="Analysis incomplete - no tool calls",
                     confidence=0.3,
+                    exit_kind="no_tool_calls",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
                     is_entry_point=is_entry_point,
@@ -516,6 +529,7 @@ class ContextAgent:
             security_classification=INCOMPLETE_CLASSIFICATION,
             classification_reasoning="Could not complete analysis within iteration limit",
             confidence=0.2,
+            exit_kind="max_iterations",
             iterations=iterations,
             total_tokens=total_input_tokens + total_output_tokens,
             is_entry_point=is_entry_point,

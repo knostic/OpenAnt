@@ -296,6 +296,9 @@ class EnhanceResult:
     error_count: int = 0
     error_summary: dict = field(default_factory=dict)
     classifications: dict = field(default_factory=dict)
+    # #615: the degenerate-exit kind histogram (exit_kind's aggregate);
+    # None = no incompletes (the present-only serialization)
+    incomplete_summary: dict = field(default_factory=dict)
     usage: UsageInfo = field(default_factory=UsageInfo)
 
     def to_dict(self) -> dict:
@@ -308,6 +311,8 @@ class EnhanceResult:
         }
         if self.error_summary:
             result["error_summary"] = self.error_summary
+        if self.incomplete_summary:
+            result["incomplete_summary"] = self.incomplete_summary
         return result
 
 
