@@ -1263,7 +1263,11 @@ def _record_usage_in_tracker(usage: dict, binding):
 
 
 def _usage_to_info(usage: dict):
-    """Convert a usage dict to a UsageInfo dataclass."""
+    """Convert a usage dict to a UsageInfo dataclass.
+
+    #598: the incompleteness metadata flows through — the CLI report's
+    usage must never claim a complete cost the pipeline did not have
+    (the same #216 contract the tracker path enforces)."""
     from core.schemas import UsageInfo
     return UsageInfo(
         total_calls=1,
@@ -1271,4 +1275,6 @@ def _usage_to_info(usage: dict):
         total_output_tokens=usage.get("output_tokens", 0),
         total_tokens=usage.get("total_tokens", 0),
         total_cost_usd=usage.get("cost_usd", 0.0),
+        cost_incomplete=bool(usage.get("cost_incomplete", False)),
+        unpriced_models=list(usage.get("unpriced_models") or []),
     )

@@ -246,12 +246,15 @@ def run_dynamic_tests(
     _prior_input = 0
     _prior_output = 0
     _prior_cost = 0.0
+    _prior_unpriced: set[str] = set()  # #598: forward the marker on resume
     for _cp in checkpointed.values():
         _prior_cost += _cp.get("generation_cost_usd", 0) or 0
         _prior_input += _cp.get("generation_input_tokens", 0) or 0
         _prior_output += _cp.get("generation_output_tokens", 0) or 0
+        _prior_unpriced.update(_cp.get("unpriced_models") or [])
     if _prior_cost > 0 or _prior_input > 0 or _prior_output > 0:
-        tracker.add_prior_usage(_prior_input, _prior_output, _prior_cost)
+        tracker.add_prior_usage(_prior_input, _prior_output, _prior_cost,
+                             unpriced_models=sorted(_prior_unpriced) or None)
         # #333 (wave r1 opus): refresh the caller's phase-line baseline AT
         # the injection — the restored checkpoints' spend was reported by
         # their ORIGINAL run's console line, and a pre-injection snapshot

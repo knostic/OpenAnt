@@ -136,4 +136,10 @@ type UsageInfo struct {
 	TotalTokens       int      `json:"total_tokens"`
 	TotalCostUSD      float64  `json:"total_cost_usd"`
 	Models            []string `json:"models"`
+	// #598: the incompleteness metadata — a dispatched model without a
+	// pricing record means the cost figure is incomplete ($0 attributed,
+	// the ids listed); the terminal cost line must never read as a
+	// complete figure it is not.
+	CostIncomplete bool     `json:"cost_incomplete,omitempty"`
+	UnpricedModels []string `json:"unpriced_models,omitempty"`
 }

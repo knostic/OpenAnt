@@ -747,7 +747,8 @@ class ContextEnhancer:
             # Inject prior usage into tracker so step_report captures the total
             if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
                 self.tracker.add_prior_usage(
-                    _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+                    _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
+                    unpriced_models=sorted(_summary_unpriced) or None)
                 # #281: refresh the caller's phase baseline AFTER the
                 # injection so its "Enhance" delta excludes restored usage.
                 if phase_baseline is not None:

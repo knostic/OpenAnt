@@ -111,8 +111,24 @@ func PrintScanSummary(data map[string]any) {
 		cost := floatFromAny(usage["total_cost_usd"])
 		inputTokens := intFromAny(usage["total_input_tokens"])
 		outputTokens := intFromAny(usage["total_output_tokens"])
+		// #598: an incomplete figure must never read as complete.
+		incomplete, _ := usage["cost_incomplete"].(bool)
+		unpriced, _ := usage["unpriced_models"].([]any)
 
-		PrintKeyValue("Cost", fmt.Sprintf("$%.4f", cost))
+		costLabel := "Cost"
+		if incomplete {
+			costLabel = "Cost (incomplete — at least one model unpriced)"
+		}
+		PrintKeyValue(costLabel, fmt.Sprintf("$%.4f", cost))
+		if len(unpriced) > 0 {
+			ids := make([]string, 0, len(unpriced))
+			for _, u := range unpriced {
+				if id, ok := u.(string); ok {
+					ids = append(ids, id)
+				}
+			}
+			PrintKeyValue("Unpriced models", strings.Join(ids, ", "))
+		}
 		PrintKeyValue("Tokens", fmt.Sprintf("%d input / %d output", inputTokens, outputTokens))
 	}
 
@@ -446,8 +462,24 @@ func PrintScanSummaryV2(data map[string]any) {
 		cost := floatFromAny(usage["total_cost_usd"])
 		inputTokens := intFromAny(usage["total_input_tokens"])
 		outputTokens := intFromAny(usage["total_output_tokens"])
+		// #598: an incomplete figure must never read as complete.
+		incomplete, _ := usage["cost_incomplete"].(bool)
+		unpriced, _ := usage["unpriced_models"].([]any)
 
-		PrintKeyValue("Cost", fmt.Sprintf("$%.4f", cost))
+		costLabel := "Cost"
+		if incomplete {
+			costLabel = "Cost (incomplete — at least one model unpriced)"
+		}
+		PrintKeyValue(costLabel, fmt.Sprintf("$%.4f", cost))
+		if len(unpriced) > 0 {
+			ids := make([]string, 0, len(unpriced))
+			for _, u := range unpriced {
+				if id, ok := u.(string); ok {
+					ids = append(ids, id)
+				}
+			}
+			PrintKeyValue("Unpriced models", strings.Join(ids, ", "))
+		}
 		PrintKeyValue("Tokens", fmt.Sprintf("%d input / %d output", inputTokens, outputTokens))
 	}
 
