@@ -109,7 +109,12 @@ class RepositoryScanner:
         # iterator stack that records unreadable/too-deep subtrees in `stats`
         # rather than silently dropping them (os.walk vanishes a path past
         # PATH_MAX), and bounds symlink cycles. Matches the other parsers.
-        _recorder = ExcludedDirRecorder(self.EXCLUDE_DIRS | set(self.exclude_patterns))
+        # #600: test-dir names belong to the EFFECTIVE exclusion set
+        # whenever skip_tests prunes them (the pipeline default) —
+        # reserved, never subject to the dynamic bound.
+        _recorder = ExcludedDirRecorder(self.EXCLUDE_DIRS
+                                        | set(self.exclude_patterns)
+                                        | set(self.TEST_DIR_NAMES))
         walk_repository(
             self.repo_path,
             should_exclude_directory=_should_exclude,

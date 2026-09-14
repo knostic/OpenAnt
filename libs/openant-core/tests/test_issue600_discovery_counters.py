@@ -168,14 +168,28 @@ def test_nonascii_name_counts_into_overflow_never_keys():
     assert list(r.examples) == ["build"]
 
 
+def test_oversized_example_path_withheld_count_kept():
+    """A retained name whose example path exceeds the path bound still
+    counts and stays retained — only its example is withheld (the path
+    gate's length half; the name gate caps names, the path gate caps the
+    ancestor chain — repo content is attacker-controlled up to PATH_MAX)."""
+    from core.repo_walk import ExcludedDirRecorder
+    r = ExcludedDirRecorder({"build"})
+    r.note("build", "d/" * 150 + "build")  # ~300 chars — over the bound
+    r.note("build", "build")
+    assert r.names == {"build": 2}
+    assert r.examples == {"build": ["build"]}  # the oversized one withheld
+
+
 # ---------------------------------------------------------------------------
 # the walker-delegating producers: the histogram survives their
 # hand-rebuilt statistics projections (rust/zig reconstruct their dicts)
 # ---------------------------------------------------------------------------
 
 def test_walker_scanners_project_the_histogram(tmp_path):
-    """Every walker-delegating scanner's RETURNED statistics carry the
-    histogram — the walker instrumentation survives the projection."""
+    """A walker-delegating scanner's hand-rebuilt RETURNED statistics carry
+    the histogram (rust here — the parametrized census below covers every
+    scanner; this pins the projection shape at the recorder unit's site)."""
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "build").mkdir()
@@ -247,6 +261,22 @@ def test_the_js_camelcase_alias_supplies_the_count_only(tmp_path):
         block["fields_missing_by_language"]["javascript"]
 
 
+def test_single_language_camelcase_alias_folds_identically(tmp_path):
+    """The PASSTROUGH branch folds the camelCase alias identically to the
+    per-language branch (one shared helper — the two must not drift): the
+    canonical spelling always wins, the alias is always removed."""
+    from core.scanner import ScanResult, _collect_discovery
+    _write_scan_result(tmp_path, {"directoriesExcluded": 5,
+                                  "directories_excluded": 3})
+    r = ScanResult(output_dir=str(tmp_path), language="javascript",
+                   languages=["javascript"])  # per_language stays {}
+    block = _collect_discovery(r)
+    stats = block["per_language"]["javascript"]
+    assert stats["directories_excluded"] == 3  # canonical wins
+    assert "directoriesExcluded" not in stats  # the alias always removed
+    assert "excluded_dir_names" in block["fields_missing_by_language"]["javascript"]
+
+
 def test_failed_language_disclosed_never_fell_back(tmp_path):
     """A failed parse's stale artifact is never read; it is disclosed."""
     ok_dir = _write_scan_result(tmp_path / "py-out", {
@@ -288,7 +318,7 @@ def test_scan_path_parse_report_carries_discovery(monkeypatch, tmp_path):
     the discovery block (read off disk; the offline scaffold)."""
     from core import scanner as scanner_mod
     from tests.test_pr69_report_llmconfig_forwarding import (
-        _install_minimal_pipeline, _offline_registry,  # noqa: F401
+        _install_minimal_pipeline,
     )
     from core import parser_adapter
     (tmp_path / "repo").mkdir()
@@ -296,12 +326,14 @@ def test_scan_path_parse_report_carries_discovery(monkeypatch, tmp_path):
     (tmp_path / "repo" / "build" / "m.py").write_text("x = 1\n")
     (tmp_path / "repo" / "root.py").write_text("y = 2\n")
     _install_minimal_pipeline(monkeypatch)
-    # Self-sufficient offline guarantees (the shared plugin fixture is a
-    # belt; this is the braces): the probe neutered MODULE-LOCALLY (the
-    # call-time import resolves utilities.llm at scan time — patching the
-    # module attribute takes effect), and the dummy key for any adapter
-    # construction. NO request can go out: the probe is a no-op and every
-    # LLM stage is off/stubbed.
+    # Self-sufficient offline guarantees — THE ONLY guard (the pr69
+    # module's _offline_registry autouse fixture never engages for THIS
+    # module — a fixture declared in another test module is not inherited;
+    # the function-local import of it is inert): the probe neutered
+    # MODULE-LOCALLY (the call-time import resolves utilities.llm at scan
+    # time — patching the module attribute takes effect), and the dummy
+    # key for any adapter construction. NO request can go out: the probe
+    # is a no-op and every LLM stage is off/stubbed. Do not drop these.
     import utilities.llm as _llm_mod
     monkeypatch.setattr(_llm_mod, "probe_registry_or_raise",
                         lambda *a, **k: None, raising=True)
@@ -460,20 +492,27 @@ def test_all_scanners_name_their_excluded_dirs(tmp_path, lang, scanner_cls,
     assert ex and ex[0] == "build", f"{lang}: entry-relative example (got {ex})"
 
 
-def test_second_scan_same_instance_does_not_double(tmp_path):
-    """The c/php reset hazard: ONE scanner instance, TWO scan() calls — the
-    histogram must not double while the flat count resets."""
+@pytest.mark.parametrize("lang,scanner_cls,ext", [
+    ("c", CScanner, ".c"),
+    ("php", PhpScanner, ".php"),
+    ("ruby", RubyScanner, ".rb"),
+])
+def test_second_scan_same_instance_does_not_double(tmp_path, lang,
+                                                   scanner_cls, ext):
+    """The c/php/ruby reset hazard: ONE scanner instance, TWO scan() calls —
+    the histogram must not double while the flat count resets (python's
+    reset is pinned by the same-instance recount test; rust/swift/zig are
+    structurally immune — their recorder is scan()-local)."""
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "build").mkdir()
-    (repo / "build" / "lib.c").write_text("int x;\n")
-    (repo / "root.c").write_text("int y;\n")
-    from parsers.c.repository_scanner import RepositoryScanner as CScanner
-    sc = CScanner(str(repo))
-    first = sc.scan()["statistics"]
-    second = sc.scan()["statistics"]
+    (repo / "build" / f"lib{ext}").write_text("x = 1\n")
+    (repo / f"root{ext}").write_text("y = 2\n")
+    scanner = scanner_cls(str(repo))
+    first = scanner.scan()["statistics"]
+    second = scanner.scan()["statistics"]
     assert first["excluded_dir_names"] == second["excluded_dir_names"]
-    assert second["excluded_dir_names"]["build"] == 1
+    assert second["excluded_dir_names"]["build"] == 1, lang
 
 
 def test_stale_artifact_not_misattributed(tmp_path):

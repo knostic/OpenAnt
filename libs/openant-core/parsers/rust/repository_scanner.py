@@ -97,7 +97,12 @@ class RepositoryScanner:
         # #600: the excluded-dir recorder — reserved retention is the
         # scanner's EFFECTIVE exclusion set (EXCLUDE_DIRS + the configured
         # patterns); dynamic names bounded with the overflow disclosed.
-        _recorder = ExcludedDirRecorder(self.EXCLUDE_DIRS | set(self.exclude_patterns))
+        # #600: test-dir names belong to the EFFECTIVE exclusion set
+        # whenever skip_tests prunes them (the pipeline default) —
+        # reserved, never subject to the dynamic bound.
+        _recorder = ExcludedDirRecorder(self.EXCLUDE_DIRS
+                                        | set(self.exclude_patterns)
+                                        | set(self.TEST_DIR_NAMES))
         walk_repository(
             self.repo_path,
             should_exclude_directory=_should_exclude,

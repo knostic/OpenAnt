@@ -632,7 +632,9 @@ Every parser that prunes directories reports, beside the flat
 `directories_excluded` count:
 
 - `excluded_dir_names` — the name-keyed histogram `{name: count}`;
-- `excluded_dir_examples` — 1-2 entry-relative example paths per retained name;
+- `excluded_dir_examples` — up to 2 entry-relative example paths per
+  retained name (withheld for non-ASCII or oversized paths — the count
+  stands);
 - `excluded_dir_names_overflow` — the occurrence count of unretained names.
 
 Mechanize with `core.repo_walk.ExcludedDirRecorder`: construct it in

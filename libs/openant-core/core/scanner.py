@@ -1526,24 +1526,31 @@ def _read_stats_fields(dir_path: str, keys) -> dict:
     artifact beside the current one (the singular and plural filenames
     differ by parser); prefer the NEWEST by mtime so a stale file is never
     misattributed to the current language — and an mtime TIE between the
-    two is disclosed (read neither) rather than guessed by filename order."""
+    two is disclosed (read neither) rather than guessed by filename order.
+    (The arbitration runs when both filenames are present; a language whose
+    parser writes NO scan artifact into a reused directory has no
+    current-run file to prefer — the parse-start recency guard is the
+    named follow-up, shared with the coverage lane's identical hole.)"""
     candidates = [os.path.join(dir_path, n) for n in _SCAN_RESULT_FILENAMES]
     candidates = [c for c in candidates if os.path.isfile(c)]
     if not candidates:
         return {}
-    mtimes = {os.path.getmtime(c) for c in candidates}
-    if len(mtimes) == 1 and len(candidates) > 1:
-        # Both artifacts carry the SAME mtime (a reused dir written within
-        # one coarse-granularity tick): genuinely ambiguous which language
-        # produced which — disclose (read NEITHER) rather than guess by
-        # filename order.
-        return {}
-    newest = max(candidates, key=os.path.getmtime)
     try:
+        mtimes = {os.path.getmtime(c) for c in candidates}
+        if len(mtimes) == 1 and len(candidates) > 1:
+            # Both artifacts carry the SAME mtime (a reused dir written within
+            # one coarse-granularity tick): genuinely ambiguous which language
+            # produced which — disclose (read NEITHER) rather than guess by
+            # filename order.
+            return {}
+        newest = max(candidates, key=os.path.getmtime)
         stats = read_json(newest).get("statistics", {}) or {}
-    except Exception:
+        return {k: stats[k] for k in keys if k in stats}
+    except (OSError, TypeError, ValueError, AttributeError):
+        # #600 review: a candidate vanishing between isfile and getmtime,
+        # or a non-dict statistics value — telemetry must never abort a
+        # successful parse step; disclose (no data) instead of guessing.
         return {}
-    return {k: stats[k] for k in keys if k in stats}
 
 
 def _language_scan_dirs(result: ScanResult) -> list[tuple[str, str]]:
@@ -1658,6 +1665,18 @@ def _collect_coverage(result: ScanResult) -> dict:
     }
 
 
+def _fold_camel_alias(stats: dict) -> None:
+    """#600: the JS scanner's camelCase count alias supplies the canonical
+    spelling only when the canonical is absent; the alias is ALWAYS removed
+    (a both-spellings artifact must not leak two keys for one figure).
+    Shared by the per-language branch and the single-language passthrough —
+    one home, so the two cannot drift."""
+    if "directoriesExcluded" in stats:
+        if "directories_excluded" not in stats:
+            stats["directories_excluded"] = stats["directoriesExcluded"]
+        del stats["directoriesExcluded"]
+
+
 def _probe_from_result(result: ScanResult) -> ScanResult:
     """#600: a probe carrying the result's per-language map for the
     discovery aggregator (the report step reuses the parse step's
@@ -1712,15 +1731,9 @@ def _collect_discovery(result: ScanResult) -> dict:
         if not stats:
             without_data.append(lang or "unknown")
             continue
-        # The camelCase alias (JS) supplies the count; the histogram stays
-        # unknown for that language (disclosed, not zero).
-        # The canonical spelling always wins; the camelCase alias is
-        # ALWAYS removed (a both-spellings artifact must not leak two keys
-        # for one figure).
-        if "directoriesExcluded" in stats:
-            if "directories_excluded" not in stats:
-                stats["directories_excluded"] = stats["directoriesExcluded"]
-            del stats["directoriesExcluded"]
+        # The camelCase alias (JS) supplies the count only; the histogram
+        # stays unknown for that language (disclosed, not zero).
+        _fold_camel_alias(stats)
         per_lang[lang or "unknown"] = stats
         absent = [f for f in _DISCOVERY_ALL_FIELDS
                    if f not in stats and f not in _DISCOVERY_OPTIONAL_KEYS]
@@ -1732,13 +1745,7 @@ def _collect_discovery(result: ScanResult) -> dict:
         stats = _read_stats_fields(result.output_dir,
                                    _DISCOVERY_ALL_FIELDS +
                                    ("directoriesExcluded",))
-        # The canonical spelling always wins; the camelCase alias is
-        # ALWAYS removed (a both-spellings artifact must not leak two keys
-        # for one figure).
-        if "directoriesExcluded" in stats:
-            if "directories_excluded" not in stats:
-                stats["directories_excluded"] = stats["directoriesExcluded"]
-            del stats["directoriesExcluded"]
+        _fold_camel_alias(stats)
         lang = result.language or "unknown"
         if not stats:
             without_data.append(lang)

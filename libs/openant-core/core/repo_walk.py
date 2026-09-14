@@ -76,6 +76,7 @@ STAT_KEYS = (
 _EXCLUDED_NAME_DYNAMIC_BOUND = 12
 _EXCLUDED_NAME_MAX_LEN = 100
 _EXCLUDED_NAME_EXAMPLES_PER_NAME = 2
+_EXCLUDED_EXAMPLE_PATH_MAX_LEN = 200
 
 
 class ExcludedDirRecorder:
@@ -124,7 +125,14 @@ class ExcludedDirRecorder:
             # without fabricating a retained-name count we stopped tracking.
             self.overflow += 1
             return
-        _path_ok = all(32 <= ord(c) <= 126 for c in str(relative_path))
+        # The path gate bounds LENGTH too: names are capped at 100 chars,
+        # and an unbounded ancestor chain (attacker-controlled repo content
+        # up to PATH_MAX) would reach the reports and the LLM prompt
+        # uncapped — the same withheld-example disclosure as non-ASCII.
+        _path_ok = (
+            len(str(relative_path)) <= _EXCLUDED_EXAMPLE_PATH_MAX_LEN
+            and all(32 <= ord(c) <= 126 for c in str(relative_path))
+        )
         if _path_ok:
             ex = self.examples.setdefault(name, [])
             if len(ex) < _EXCLUDED_NAME_EXAMPLES_PER_NAME:
