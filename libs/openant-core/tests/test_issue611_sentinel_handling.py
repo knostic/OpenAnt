@@ -125,12 +125,6 @@ def test_the_sentinel_hint_is_omitted():
         classification_reasoning=sentinel_unit["agent_context"][
             "classification_reasoning"])
     assert "Pre-analysis hint" not in prompt
-    clean_unit = {
-        "id": "a.py:g", "unit_type": "function",
-        "route": {"file": "a.py", "name": "g"},
-        "code": {"primary_code": "def g(): pass"},
-        "agent_context": {"security_classification": "safe"},
-    }
     prompt2 = get_analysis_prompt(
         code="def g(): pass", language="python", route="a.py:g",
         security_classification="safe")
