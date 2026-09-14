@@ -395,6 +395,102 @@ class TestFailClosedAfterEstablishedContradiction:
         spy_revise.assert_not_called()
 
 
+class TestRevisionResponseWithWrapperProseIsUsable:
+    """Real-trace regression (Planner structured-output parsing hardening):
+    the bounded revision's raw LLM completion contains explanatory prose
+    before an otherwise fully valid, Planner-shaped JSON object -- the exact
+    shape a real minimist run produced. generate_remediation_plan's own
+    parser (remediation_planner._parse_json_response) must recover the
+    object, and this orchestration must NOT set forced_skip merely because
+    of wrapper prose that the Planner prompt asked it not to include.
+
+    Deliberately does NOT mock generate_remediation_plan or
+    _parse_json_response -- only the raw `llm.complete()` return value --
+    so this exercises the real, unmocked parser end to end, unlike every
+    other test in this file (which mocks generate_remediation_plan directly
+    via the `_run` helper, and is therefore blind to parsing behavior)."""
+
+    def test_leading_prose_before_valid_json_does_not_force_skip(self):
+        from utilities.autopatcher.pipeline import _run_planner_claim_verification
+
+        revised_plan_json = {
+            "remediation_mechanism": "a narrower, evidence-backed mechanism",
+            "target_files": ["target.py"], "target_symbols": ["target.py:foo"],
+            "security_invariant": "the unsafe condition must not occur",
+            "narrower_alternative_decision": "SELECTED",
+            "narrower_alternative_considered": "considered and selected",
+            "required_edits": ["edit one"], "approaches_to_avoid": [], "explicit_unknowns": [],
+        }
+        raw_revision_response = (
+            "Let me trace through the exploit path carefully before committing "
+            "to a final answer, walking each step against the verified source.\n\n"
+            + json.dumps(revised_plan_json)
+        )
+        llm = mock.MagicMock()
+        llm.complete.return_value = raw_revision_response
+
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_verifier.verify_planner_claim",
+                side_effect=[_verdict("CONTRADICTED", contradiction="c1"), _verdict("SUPPORTED")],
+            ) as spy_verify,
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence",
+                return_value="revised evidence",
+            ),
+        ):
+            result = _run_planner_claim_verification(
+                vulnerability_text="some vuln", llm=llm, repo_root="/tmp/repo",
+                investigation_context=None, evidence_so_far="evidence so far",
+                plan_result=_plan(), planner_evidence_ctx="verified evidence", mode="REJECTED",
+            )
+
+        # The wrapper prose alone must never force a skip -- the real parser
+        # recovered a fully usable revised plan.
+        assert result["forced_skip"] is False
+        assert result["revised_plan_result"] is not None
+        assert result["revised_plan_result"].target_files == ["target.py"]
+        assert result["revised_plan_result"].narrower_alternative_decision == "SELECTED"
+        # The flow proceeded to the next verification step (v2) -- it did
+        # not stop at the revision-usability check.
+        assert spy_verify.call_count == 2
+
+    def test_genuinely_unusable_revision_still_forces_skip(self):
+        """Companion negative case, in this same real-parser style: a
+        revision response with NO recoverable JSON object at all (pure
+        prose, no Planner-shaped candidate anywhere) must still force skip
+        exactly as before -- this fix only recovers genuinely unambiguous
+        wrapper-prose cases, it does not weaken the fail-closed default."""
+        from utilities.autopatcher.pipeline import _run_planner_claim_verification
+
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "I was unable to identify a concrete revised mechanism from the "
+            "available evidence."
+        )
+
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_verifier.verify_planner_claim",
+                side_effect=[_verdict("CONTRADICTED", contradiction="c1")],
+            ) as spy_verify,
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence",
+                return_value="revised evidence",
+            ),
+        ):
+            result = _run_planner_claim_verification(
+                vulnerability_text="some vuln", llm=llm, repo_root="/tmp/repo",
+                investigation_context=None, evidence_so_far="evidence so far",
+                plan_result=_plan(), planner_evidence_ctx="verified evidence", mode="REJECTED",
+            )
+
+        assert result["forced_skip"] is True
+        assert result["authoritative"] == "none"
+        assert "did not produce a usable result" in result["skip_reason"]
+        assert spy_verify.call_count == 1  # v2 never ran -- nothing usable to re-verify
+
+
 class TestBroadeningUnresolvedCorrection:
     """Review fix 3: `broadening_unresolved` must reflect a genuine semantic
     UNRESOLVED (the verifier actually reasoned about the claim), never an

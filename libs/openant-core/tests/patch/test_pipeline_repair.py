@@ -1013,6 +1013,199 @@ class TestAcceptRepair:
         assert accept_repair(classified, [_observed(_BYPASS_TEXT)], True) is False
 
 
+# ---------------------------------------------------------------------------
+# accept_repair -- still_vulnerable monotonicity gate (release-blocking
+# repair-selection follow-up).
+#
+# Regression shape: a real trace's repair candidate applied cleanly and its
+# own Challenger's free-text edge_cases/potential_issues happened to word
+# the remaining risk in a way that classified as plausible_risk (never
+# confirmed_defect/behavioral_defect) -- so _repair_eligible_calibration_
+# entries returned empty and the pre-existing "nothing to gate on -> accept
+# on applicability alone" rule fired, even though the SAME Challenger
+# response's own structured `still_vulnerable` field said `True`, while the
+# ORIGINAL candidate's Challenger had said `False`. accept_repair must
+# check `still_vulnerable` directly -- never routed through classification/
+# calibration -- and reject exactly that regression, without making
+# still_vulnerable=True an unconditional rejection (a repair may still
+# improve an already-vulnerable original).
+# ---------------------------------------------------------------------------
+
+class TestAcceptRepairStillVulnerableMonotonicity:
+    def _classified(self, challenger):
+        from utilities.autopatcher.pipeline import _classify_challenger
+        return _classify_challenger(challenger)
+
+    def test_reject_when_original_false_and_repair_still_vulnerable_true(self):
+        """The exact regression this fix targets: v1 was NOT vulnerable, v2's
+        own Challenger reports it still IS -- must reject even though v2 has
+        NO repair-eligible classified findings at all, which the pre-existing
+        rule alone would have accepted on applicability alone."""
+        from utilities.autopatcher.pipeline import accept_repair
+        v2_challenger = {
+            "still_vulnerable": True,
+            "edge_cases": [], "potential_issues": [],
+            "summary": "the reported issue remains reachable through an unaddressed path",
+        }
+        classified = self._classified(v2_challenger)
+        # Confirms the pre-existing rule alone would have accepted this: no
+        # finding here classifies confirmed_defect/behavioral_defect at all.
+        assert classified["confirmed_defect_count"] == 0
+        assert classified["behavioral_defect_count"] == 0
+        assert accept_repair(classified, None, True, original_still_vulnerable=False) is False
+
+    def test_default_original_still_vulnerable_is_false(self):
+        """The new parameter defaults to False -- an existing call site that
+        doesn't pass it gets the same fail-closed rejection for a
+        still_vulnerable=True repair as an explicit False would."""
+        from utilities.autopatcher.pipeline import accept_repair
+        v2_challenger = {
+            "still_vulnerable": True, "edge_cases": [], "potential_issues": [],
+            "summary": "still vulnerable",
+        }
+        classified = self._classified(v2_challenger)
+        assert accept_repair(classified, None, True) is False
+
+    def test_both_still_vulnerable_true_still_accepted_by_existing_rule(self):
+        """v1 was ALREADY vulnerable -- the new rule must not fire, and the
+        pre-existing 'nothing repair-eligible to gate on' rule accepts, since
+        a repair may still improve an already-vulnerable original."""
+        from utilities.autopatcher.pipeline import accept_repair
+        v2_challenger = {
+            "still_vulnerable": True, "edge_cases": [], "potential_issues": [],
+            "summary": "still vulnerable, but narrower than before",
+        }
+        classified = self._classified(v2_challenger)
+        assert accept_repair(classified, None, True, original_still_vulnerable=True) is True
+
+    def test_both_still_vulnerable_true_still_rejected_by_existing_calibration_rule(self):
+        """v1 was already vulnerable and v2 still carries a calibration-
+        confirmed repair-eligible finding -- the new rule doesn't fire, but
+        the pre-existing calibration gate correctly rejects on its own,
+        proving the new check is additive, not a replacement."""
+        from utilities.autopatcher.pipeline import accept_repair
+        v2_challenger = {
+            "still_vulnerable": True, "edge_cases": [_BYPASS_TEXT], "potential_issues": [],
+            "summary": "still vulnerable",
+        }
+        classified = self._classified(v2_challenger)
+        assert accept_repair(classified, [_observed(_BYPASS_TEXT)], True, original_still_vulnerable=True) is False
+
+    def test_original_true_repair_false_is_allowed(self):
+        """v1 was vulnerable, v2's Challenger reports it is no longer -- a
+        genuine improvement the new rule must never block."""
+        from utilities.autopatcher.pipeline import accept_repair
+        v2_challenger = {
+            "still_vulnerable": False, "edge_cases": [], "potential_issues": [],
+            "summary": "no longer vulnerable",
+        }
+        classified = self._classified(v2_challenger)
+        assert accept_repair(classified, None, True, original_still_vulnerable=True) is True
+
+    def test_both_false_unchanged(self):
+        """Existing behavior, explicitly reproduced with the new parameter
+        set to match: still_vulnerable never regresses, so the new rule is
+        inert and the pre-existing rule alone decides."""
+        from utilities.autopatcher.pipeline import accept_repair
+        v2_challenger = {
+            "still_vulnerable": False, "edge_cases": [], "potential_issues": [],
+            "summary": "clean",
+        }
+        classified = self._classified(v2_challenger)
+        assert accept_repair(classified, None, True, original_still_vulnerable=False) is True
+
+
+class TestStillVulnerableRegressionEndToEnd:
+    """Full pipeline.run() coverage for the still_vulnerable monotonicity
+    gate: original candidate is NOT vulnerable and triggers repair through
+    the existing (unmodified) Observed-behavioral_defect mechanism; the
+    regenerated candidate is applicable but its own Challenger reports
+    still_vulnerable=True, worded so that none of its individual edge_cases/
+    potential_issues classify as confirmed_defect/behavioral_defect --
+    reproducing the exact real-trace shape (a repair that would have been
+    accepted by the pre-existing calibration-only gate) in domain-neutral
+    form."""
+
+    @staticmethod
+    def _calibrate_group(group):
+        def _side_effect(vulnerability_text, patch, findings, llm, code_context=""):
+            return [{"original": f, "group": group, "reworded": f} for f in findings]
+        return _side_effect
+
+    _REPAIR_STILL_VULNERABLE_CHALLENGER = {
+        "still_vulnerable": True,
+        "edge_cases": ["A secondary code path was not addressed by the patch"],
+        "potential_issues": ["No regression tests were added for the new path"],
+        "summary": "the reported issue remains reachable through an unaddressed path",
+    }
+
+    def test_repair_attempted_and_rejected_original_preserved(self, tmp_path):
+        result, mock_gen, mock_chall = _capture_result(
+            tmp_path,
+            patches_gen=[_CLEAN_DIFF, _REPAIR_DIFF],
+            patches_app=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            patches_chall=[_CHALLENGER_WITH_BEHAVIORAL_DEFECT, self._REPAIR_STILL_VULNERABLE_CHALLENGER],
+            calibration_side_effect=self._calibrate_group("observed"),
+        )
+        # Repair was attempted (the pre-existing trigger mechanism, itself
+        # untouched, correctly fired on the Observed behavioral_defect).
+        assert result.repair_attempted is True
+        # ... but rejected: the regenerated candidate regressed
+        # still_vulnerable from False to True.
+        assert result.repair_succeeded is False
+        # No third generation attempt.
+        assert mock_gen.call_count == 1
+        assert mock_chall.call_count == 2
+        # The original patch remains authoritative.
+        assert result.patch == _CLEAN_DIFF
+        assert "repaired" not in result.patch
+        # The original Challenger result remains authoritative.
+        assert result.challenger == _CHALLENGER_WITH_BEHAVIORAL_DEFECT
+        assert result.challenger["still_vulnerable"] is False
+
+    def test_rejection_uses_existing_outcome_vocabulary(self, tmp_path):
+        """No new outcome label is introduced -- an applicable-but-rejected
+        repair reports through the SAME 'attempted_applicable_rejected'
+        mechanism used for every other repair-rejection reason."""
+        import json
+        from utilities.autopatcher.execution_recorder import ExecutionRecorder
+        from utilities.autopatcher import pipeline as pipeline_mod
+
+        recorder = ExecutionRecorder(
+            call_log=[], run_dir=str(tmp_path / "run"), artifacts_dir=tmp_path / "run" / "executions",
+        )
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient") as mock_llm_cls,
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", return_value=_CLEAN_DIFF),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=[_REPAIR_DIFF]),
+            mock.patch(
+                "utilities.autopatcher.patch_applicability.check_applicability",
+                side_effect=[_APPLICABILITY_CLEAN, _APPLICABILITY_CLEAN],
+            ),
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok review"),
+            mock.patch(
+                "utilities.autopatcher.pipeline.challenge_patch",
+                side_effect=[_CHALLENGER_WITH_BEHAVIORAL_DEFECT, self._REPAIR_STILL_VULNERABLE_CHALLENGER],
+            ),
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="Confidence score: 0.8"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+            mock.patch(
+                "utilities.autopatcher.pipeline.calibrate_findings",
+                side_effect=self._calibrate_group("observed"),
+            ),
+        ):
+            mock_llm_cls.return_value = mock.MagicMock()
+            pipeline_mod.run(
+                "test vuln", api_key="", repo_root=str(tmp_path), execution_recorder=recorder,
+            )
+        s6 = next(e for e in recorder.executions if e["canonical_stage"] == "patch_repair_and_calibration")
+        artifact = json.loads(open(s6["artifact_path"], encoding="utf-8").read())
+        assert artifact["repair_outcome"] == "attempted_applicable_rejected"
+        assert artifact["authoritative_candidate"]["source"] == "original"
+        assert artifact["authoritative_candidate"]["patch"] == _CLEAN_DIFF
+
+
 class TestRepairGateEndToEnd:
     """pipeline.run() coverage for the deterministic repair gate: same
     scenarios as TestShouldAutoRepair/TestAcceptRepair, exercised through

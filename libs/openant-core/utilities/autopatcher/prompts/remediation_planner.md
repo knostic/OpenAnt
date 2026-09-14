@@ -69,6 +69,13 @@ straight from "what the exploit looks like" to "what to forbid."
      change relative to the vulnerable baseline, directly prevents or
      constrains the unsafe transition/state from step 1, and preserves
      more unrelated legitimate behavior than the broader candidate.
+   - **If the candidate you are about to select still rejects a name,
+     token, input category, operation, or state class categorically,
+     compare it once more against the precise `security_invariant` you
+     identified in step 1.** Ask whether the evidence supports checking
+     that unsafe runtime state or value directly, instead of rejecting the
+     whole category by name. If it does, that state-sensitive version is
+     the narrower candidate you must evaluate — not the category-based one.
    - **None of the following count as a narrower alternative** — if this
      is all you have, you have not satisfied this step: leaving the
      vulnerable code unchanged; relying only on protections already

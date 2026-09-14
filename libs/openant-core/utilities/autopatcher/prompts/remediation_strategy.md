@@ -29,6 +29,33 @@ pseudocode.
   evidence shows that extension would be incorrect. State in
   `extended_mechanism` exactly which existing mechanism you are extending,
   or state clearly that none exists and a new one is warranted.
+- Extending an existing mechanism is justified only when the extension
+  preserves the semantics the evidence supports -- structural similarity to
+  an existing check (e.g. adding another equality/membership comparison
+  alongside one already present) is not, by itself, evidence that every new
+  category member needs identical treatment.
+- Before finalizing a mechanism that rejects, blocks, filters, or sanitizes
+  an entire input, category, name, token, or state class, verify from the
+  supplied evidence that the whole category needs that treatment. If the
+  evidence instead shows the operation is unsafe only when an additional
+  runtime state or value condition also holds, and that condition can be
+  checked directly from the supplied source, prefer the narrower
+  state-sensitive mechanism over the categorical one -- a categorical
+  rejection must not replace a state-sensitive one merely because it is
+  simpler or resembles an existing check. Do not require proof that a real
+  consumer currently relies on a safe category member before preferring the
+  narrower mechanism -- the burden is on the evidence to justify treating
+  the whole category as unsafe, not on the evidence to justify that a safe
+  use exists. Never invent a state-sensitive check the supplied source does
+  not support merely to appear narrower; if the evidence cannot determine
+  whether a narrower predicate is sufficient, say so in
+  `insufficient_evidence` rather than silently treating the broader
+  mechanism as safe for the rest of the category.
+- This preference for a narrower mechanism never overrides security
+  completeness: select the state-sensitive version only when the evidence
+  shows it closes every evidence-backed unsafe path; if the evidence shows
+  the categorical treatment is required for every such path, the
+  categorical mechanism remains correct.
 - Each `required_edit` must identify the existing mechanism it extends or
   replaces, not just describe a desired outcome.
 - If the earlier Target Discovery output proposed a file or symbol that the

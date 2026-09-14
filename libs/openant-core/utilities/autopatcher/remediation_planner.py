@@ -139,6 +139,106 @@ class RemediationPlanResult(NamedTuple):
 _EMPTY_PLAN_RESULT = RemediationPlanResult(rendered="", target_files=[], target_symbols=[])
 
 
+def _find_balanced_json_objects(text: str) -> "list[str]":
+    """Find every top-level, brace-balanced ``{...}`` substring in `text`,
+    respecting JSON string-literal syntax (a ``{``/``}`` inside a quoted
+    string value never confuses the depth count) -- but NOT respecting
+    intent: a bare, code-formatted ``{}`` sitting in the model's own
+    explanatory prose (never inside a JSON string at all) is, syntactically,
+    an equally valid top-level balanced object, and this scanner has no way
+    to tell it apart from that. Purely syntactic bracket-matching -- no
+    JSON parsing, no semantic interpretation, no repair -- so a returned
+    substring is only a CANDIDATE; the caller still runs it through
+    `json.loads`, and (for this module) a Planner-specific shape check
+    (`_has_plan_shape`), before trusting it.
+
+    Duplicated, byte-for-byte, from remediation_verifier.py's own
+    `_find_balanced_json_objects` (itself duplicated from
+    test_plan_discovery.py) -- proven there against real urllib3 and
+    minimist incidents with this exact failure shape, now separately
+    reproduced against a real minimist Planner revision response that
+    prefixed a fully valid Planner object with explanatory prose containing
+    several bare `{}` snippets. Kept as a local duplicate rather than a
+    cross-module import: this is a small (~25-line), fully self-contained,
+    dependency-free primitive, and this module family already duplicates
+    its other small parsing primitives per stage (`_FENCE_RE`/
+    `_parse_json_response` are themselves already duplicated between this
+    module and remediation_verifier.py) rather than sharing them across
+    otherwise-unrelated canonical stages -- a new shared module for one
+    ~25-line function would be more invasive than this duplication, not
+    less."""
+    objects: "list[str]" = []
+    depth = 0
+    start = None
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objects.append(text[start:i + 1])
+                start = None
+    return objects
+
+
+_PLAN_SHAPE_FIELDS = (
+    "remediation_mechanism", "target_files", "target_symbols",
+    "security_invariant", "narrower_alternative_decision",
+)
+"""The Planner-specific structural fingerprint `_has_plan_shape` requires
+ALL of, together -- deliberately a combination, not "any one known field":
+a single shared field name (e.g. just `target_files`) is common enough in
+ordinary prose-adjacent JSON-like fragments that it would not reliably
+distinguish a genuine Planner object from incidental noise, whereas this
+exact 5-field combination -- the finding's own root condition
+(`security_invariant`), its proposed fix (`remediation_mechanism`), its
+scope (`target_files`/`target_symbols`), and its structured narrowing
+decision (`narrower_alternative_decision`, unique to this schema) -- is
+specific to a genuine Planner response. `required_edits`/
+`approaches_to_avoid`/`explicit_unknowns` are deliberately excluded from
+the fingerprint: the 5 required here are already sufficient to be specific,
+and every field actually read downstream already tolerates a missing key
+(see RemediationPlanResult's own construction) -- this is a shape check on
+KEY PRESENCE only, never a value/type check, so it stays a pure
+disambiguator and never becomes a second schema validator."""
+
+
+def _has_plan_shape(parsed) -> bool:
+    """The Planner-specific structural discriminator used to disambiguate a
+    real candidate from prose-embedded brace noise: a dict declaring ALL of
+    `_PLAN_SHAPE_FIELDS` as keys (any value, including `null`/empty-list --
+    this checks key PRESENCE, not field validity). Nothing more -- this is
+    NOT schema validation (that remains generate_remediation_plan's own
+    job, run afterward, unchanged, on whatever this accepts); it exists
+    only to tell "this looks like it could be our response at all" apart
+    from a bare `{}` or some other object shape the model's own prose
+    happened to contain. A candidate that passes this check can still end
+    up with every field normalized to `None`/`[]` by the existing
+    downstream logic exactly as before -- this function narrows AMBIGUITY,
+    it does not narrow validity. Mirrors remediation_verifier.py's own
+    `_has_verifier_shape` in role and placement, adapted to a
+    multi-field fingerprint since the Planner schema has no single field
+    as distinctively load-bearing as the verifier's own `status`."""
+    if not isinstance(parsed, dict):
+        return False
+    return all(field in parsed for field in _PLAN_SHAPE_FIELDS)
+
+
 def _parse_json_response(raw: str) -> "dict | None":
     if not raw or not isinstance(raw, str):
         return None
@@ -146,11 +246,41 @@ def _parse_json_response(raw: str) -> "dict | None":
     m = _FENCE_RE.match(text)
     if m:
         text = m.group(1).strip()
+
+    # Fast path -- UNCHANGED: the whole (fence-stripped) response parses as
+    # JSON on its own. This is the only path taken for a well-formed
+    # response, and the only path that existed before this fix.
     try:
         parsed = json.loads(text)
     except (json.JSONDecodeError, ValueError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+
+    # Fallback -- only reached when the whole response did NOT parse as
+    # JSON on its own (e.g. explanatory prose before the JSON object, the
+    # exact shape a real minimist Planner revision response took). Scan for
+    # every top-level, brace-balanced substring and keep only the ones that
+    # look like a Planner response at all (_has_plan_shape) -- this is what
+    # tells the real object apart from bare `{}` snippets (or other
+    # incidental JSON-shaped fragments) the model's own prose can otherwise
+    # contain. Exactly one surviving candidate is accepted; zero or more
+    # than one both fail closed exactly like the pre-fix behavior already
+    # did for an unparseable response -- this never selects, merges, or
+    # guesses among competing candidates, and never prefers the first one
+    # found over another.
+    candidates = []
+    for substring in _find_balanced_json_objects(text):
+        try:
+            candidate = json.loads(substring)
+        except (json.JSONDecodeError, ValueError):
+            continue  # not valid JSON on its own -- e.g. a stray "{" in prose
+        if _has_plan_shape(candidate):
+            candidates.append(candidate)
+
+    if len(candidates) == 1:
+        return candidates[0]
+    return None  # zero or ambiguous (>1) candidates -- fail closed, same as before
 
 
 def _render_plan(plan: dict) -> str:
@@ -1184,6 +1314,17 @@ class RemediationStrategyResult(NamedTuple):
     it. Existing callers that never asked this question (report
     rendering, `_render_strategy`, `_verify_strategy_targets`) are
     entirely unaffected -- this field is additive.
+
+    `rejected_targets` is an additive field mirroring the same pattern as
+    `extended_mechanism`/`required_edits`/`security_invariant` above: the
+    same already-parsed `rejected_targets` JSON value `_STRATEGY_SECTIONS`
+    already renders into `rendered`, ALSO kept here structurally. No
+    prompt or schema change -- this key already existed in the parsed
+    response; this only stops discarding it after rendering. Read by the
+    verified-narrower-authority Strategy target/concretization-only block
+    (see `_render_strategy_target_block`) so a target Strategy explicitly
+    rejected stays visible to Patch Generation without also carrying
+    Strategy's mechanism-bearing prose.
     """
 
     rendered: str
@@ -1195,12 +1336,13 @@ class RemediationStrategyResult(NamedTuple):
     security_invariant: "str | None" = None
     insufficient_evidence: "list[str]" = []
     evaluated: bool = False
+    rejected_targets: "list[str]" = []
 
 
 _EMPTY_STRATEGY_RESULT = RemediationStrategyResult(
     rendered="", target_files=[], target_symbols=[], warnings=[],
     extended_mechanism=None, required_edits=[], security_invariant=None,
-    insufficient_evidence=[], evaluated=False,
+    insufficient_evidence=[], evaluated=False, rejected_targets=[],
 )
 
 
@@ -1360,7 +1502,128 @@ def generate_remediation_strategy(
         # every other field above ended up empty -- see RemediationStrategyResult's
         # own docstring on why `evaluated` is never inferred from the other fields).
         evaluated=True,
+        rejected_targets=_string_list(plan.get("rejected_targets")),
     )
+
+
+# ---------------------------------------------------------------------------
+# Verified-narrower authority split (deterministic, no new LLM call)
+#
+# Activated only when pipeline.py's own `_verified_narrower_authoritative`
+# gate is True: an INDEPENDENTLY VERIFIED Planner narrower-alternative
+# decision (Planner `narrower_alternative_decision == "SELECTED"`, Planner
+# Claim Verifier `status == "SUPPORTED"`,
+# `authoritative_remediation_matches_selected_alternative is True`)
+# becomes semantic authority for Patch Generation in place of Strategy's
+# own mechanism-bearing prose. Both functions below are pure, deterministic
+# renderers -- no LLM call, no parsing, no new schema -- mirroring exactly
+# how `_render_plan`/`_render_strategy` already render already-parsed
+# structured fields into Markdown. The split is enforced by WHICH text
+# occupies the flat `code_context` string (see pipeline.py's `_ctx_parts`
+# assembly), never by comparing Planner's and Strategy's prose against
+# each other -- Strategy's mechanism-bearing fields simply never reach
+# this position in the string when the gate is True, regardless of what
+# they say.
+# ---------------------------------------------------------------------------
+
+_VERIFIED_AUTHORITATIVE_HEADING = "## Verified Authoritative Remediation Semantics"
+_VERIFIED_AUTHORITATIVE_DISCLAIMER = (
+    "*The Planner's own selected narrower alternative was independently "
+    "verified by the Planner Claim Verifier against the verified "
+    "repository evidence above: the verifier confirmed the authoritative "
+    "remediation matches the selected alternative. This section -- not "
+    "any Strategy mechanism/required-edits text below -- is the binding "
+    "remediation semantics for Patch Generation. Strategy's own role "
+    "below is limited to target verification/concretization: WHERE this "
+    "mechanism applies, not a separate or replacement mechanism.*"
+)
+
+_VERIFIED_AUTHORITATIVE_SECTIONS = [
+    ("remediation_mechanism", "Remediation mechanism", False),
+    ("security_invariant", "Security invariant", False),
+    ("narrower_alternative_considered", "Narrower alternative considered (verified)", False),
+    ("required_edits", "Required edits", True),
+    ("approaches_to_avoid", "Approaches to avoid", True),
+]
+
+
+def _render_verified_authoritative_semantics(plan_result: RemediationPlanResult) -> str:
+    """Deterministic rendering of ONLY the 5 verified Planner semantic
+    fields (`remediation_mechanism`, `security_invariant`,
+    `narrower_alternative_considered`, `required_edits`,
+    `approaches_to_avoid`) -- no LLM call, no parsing, no new schema.
+    Deliberately does NOT reuse `_render_plan`'s "exploratory -- not
+    authoritative" heading/wording: under the verified-narrower-authority
+    gate this Planner result IS authoritative, and labeling it otherwise
+    would misstate that. Introduces no new semantic conclusion of its
+    own -- every word here already exists on `plan_result`, produced by
+    the ordinary (already-existing) Planner call and Planner Claim
+    Verifier, both unmodified by this function. Returns "" (a complete,
+    correct answer, not an error) when none of the 5 fields have
+    content, mirroring `_render_strategy`'s own empty-body convention."""
+    body: "list[str]" = []
+    for attr, label, is_list in _VERIFIED_AUTHORITATIVE_SECTIONS:
+        value = getattr(plan_result, attr)
+        if is_list:
+            if not value:
+                continue
+            body.append(f"\n**{label}:**")
+            body.extend(f"- {item}" for item in value)
+        else:
+            if not value:
+                continue
+            body.append(f"\n**{label}:** {value}")
+
+    if not body:
+        return ""
+
+    return "\n".join([_VERIFIED_AUTHORITATIVE_HEADING, "", _VERIFIED_AUTHORITATIVE_DISCLAIMER] + body) + "\n"
+
+
+_STRATEGY_TARGET_BLOCK_HEADING = "## Strategy-Verified Targets (concretization only)"
+_STRATEGY_TARGET_BLOCK_DISCLAIMER = (
+    "*The remediation mechanism is independently verified and "
+    "authoritative -- see \"Verified Authoritative Remediation Semantics\" "
+    "above. The items below are Strategy's own independently re-verified "
+    "target output only: WHERE the verified mechanism applies, not a "
+    "separate or replacement mechanism. Strategy's own mechanism/"
+    "required-edits/security-invariant text is deliberately omitted from "
+    "this section.*"
+)
+
+
+def _render_strategy_target_block(strategy_result: RemediationStrategyResult) -> str:
+    """Deterministic rendering of ONLY Strategy's target/concretization
+    fields -- `target_files`, `target_symbols`, `rejected_targets`,
+    `insufficient_evidence`, `warnings` -- used in place of `.rendered`
+    for the `code_context` position under the verified-narrower-authority
+    gate. Deliberately, BY CONSTRUCTION, excludes `extended_mechanism`,
+    `security_invariant`, and `required_edits`: this is a hard-coded field
+    allowlist, not a semantic filter -- it never inspects what those
+    fields say, it simply never reads them. No LLM call, no parsing, no
+    new schema. Returns "" (a complete, correct answer, not an error) when
+    none of the allowed fields have content."""
+    body: "list[str]" = []
+    if strategy_result.target_files:
+        body.append("\n**Verified target files:**")
+        body.extend(f"- {f}" for f in strategy_result.target_files)
+    if strategy_result.target_symbols:
+        body.append("\n**Verified target symbols:**")
+        body.extend(f"- {s}" for s in strategy_result.target_symbols)
+    if strategy_result.rejected_targets:
+        body.append("\n**Rejected discovery targets:**")
+        body.extend(f"- {t}" for t in strategy_result.rejected_targets)
+    if strategy_result.insufficient_evidence:
+        body.append("\n**Implementation evidence gap (reported by Strategy):**")
+        body.extend(f"- {e}" for e in strategy_result.insufficient_evidence)
+    if strategy_result.warnings:
+        body.append("\n**Unverified items removed:**")
+        body.extend(f"- {w}" for w in strategy_result.warnings)
+
+    if not body:
+        return ""
+
+    return "\n".join([_STRATEGY_TARGET_BLOCK_HEADING, "", _STRATEGY_TARGET_BLOCK_DISCLAIMER] + body) + "\n"
 
 
 # ---------------------------------------------------------------------------

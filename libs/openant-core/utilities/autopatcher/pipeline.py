@@ -1461,6 +1461,8 @@ def accept_repair(
     classified_challenger_v2: dict,
     finding_calibration_v2: list[dict] | None,
     applicable: bool,
+    *,
+    original_still_vulnerable: bool = False,
 ) -> bool:
     """v2 acceptance gate -- symmetric with should_auto_repair, applied to
     the repaired patch's own (freshly re-challenged, freshly calibrated)
@@ -1487,8 +1489,27 @@ def accept_repair(
     repair, so a patch that fixes one repair-eligible finding while
     introducing (or leaving behind) another one of either category is
     still rejected.
+
+    `original_still_vulnerable`: v1's own Challenger `still_vulnerable`
+    verdict, checked directly -- never routed through classification/
+    calibration, because it is already a structured Challenger result, not
+    a free-text finding needing that interpretation layer. Monotonicity
+    gate, applied BEFORE the calibration-based logic above: if v1 was
+    `still_vulnerable=False` and v2's own Challenger says
+    `still_vulnerable=True`, v2 is rejected outright regardless of what its
+    classified/calibrated findings say -- a repair must never trade
+    security completeness for behavioral preservation. This is
+    deliberately NOT an unconditional "reject any still_vulnerable=True
+    v2": when v1 was ALSO `still_vulnerable=True`, v2 may still represent
+    a genuine improvement, so this check does not fire and the existing
+    calibration-based logic decides alone, exactly as before this
+    parameter existed. `original_still_vulnerable=False` (the default)
+    preserves prior behavior for any caller that hasn't been updated to
+    pass it.
     """
     if not applicable:
+        return False
+    if classified_challenger_v2.get("still_vulnerable") and not original_still_vulnerable:
         return False
     entries = _repair_eligible_calibration_entries(classified_challenger_v2, finding_calibration_v2)
     if not entries:
@@ -5501,7 +5522,10 @@ def _run_patch_repair_and_calibration(
                         print(f"[pipeline] Finding calibration (v2) failed (non-fatal): {_exc}", file=sys.stderr)
                     _known_findings_v2 = _build_known_findings(_r_classified, _calibration_v2)
 
-                    if accept_repair(_r_classified, _calibration_v2, _r_applicable):
+                    if accept_repair(
+                        _r_classified, _calibration_v2, _r_applicable,
+                        original_still_vulnerable=_repair_classified.get("still_vulnerable") is True,
+                    ):
                         repair_succeeded = True
                         patch = _r_raw
                         challenger = _r_challenger
@@ -5513,6 +5537,14 @@ def _run_patch_repair_and_calibration(
                         print(
                             "[pipeline] Repair succeeded – 0 calibration-confirmed "
                             "issue(s) after re-challenge.", file=sys.stderr
+                        )
+                    elif _r_classified.get("still_vulnerable") and not (
+                        _repair_classified.get("still_vulnerable") is True
+                    ):
+                        print(
+                            "[pipeline] Repair rejected – original Challenger reported "
+                            "still_vulnerable=False, repair Challenger reports "
+                            "still_vulnerable=True; keeping original.", file=sys.stderr,
                         )
                     else:
                         print(
@@ -5774,6 +5806,17 @@ def _run_repository_analysis_and_remediation_planning(
     _verifier_forced_skip = False
     _verifier_skip_reason = None
     _verifier_broadening_unresolved = False
+    # Verified-narrower authority split defaults -- ALWAYS defined for the
+    # same "locals()/_s1_result always carries these keys" reason as the
+    # verifier defaults above. `_active_verifier_result` is whichever of
+    # verifier_v1/verifier_v2 is bound to the Planner result that actually
+    # became authoritative (see the three-way branch below); it stays None
+    # whenever no verifier ran, or the verifier resolved to "none" (neither
+    # v1 nor v2 cleared). `_plan_authority_version` records which Planner
+    # version ("v1"/"v2") that verifier result corresponds to, purely for
+    # observability -- never consumed as a branching condition itself.
+    _active_verifier_result = None
+    _plan_authority_version = None
     if not _plan_text:
         try:
             from .remediation_planner import build_planner_evidence, generate_remediation_plan
@@ -5845,6 +5888,11 @@ def _run_repository_analysis_and_remediation_planning(
                         _plan_result = _verification["revised_plan_result"]
                         _plan_ctx = _verification["revised_plan_ctx"]
                         _planner_evidence_ctx = _verification["revised_planner_evidence_ctx"]
+                        # Bind the verifier result that actually vouches for
+                        # THIS (revised) Planner result -- never verifier_v1,
+                        # which verified the superseded pre-revision claim.
+                        _active_verifier_result = _verifier_v2
+                        _plan_authority_version = "v2"
                     elif _verification["authoritative"] == "none":
                         # A contradiction was found and the one bounded
                         # revision did not clear it (cases C/D). Neither v1
@@ -5859,6 +5907,18 @@ def _run_repository_analysis_and_remediation_planning(
                         # the Edit Readiness/Strategy gates to reach the same
                         # conclusion on their own by coincidence.
                         _planner_evidence_ctx = ""
+                        # Neither verifier cleared -- no Planner result is
+                        # independently verified, so no active verifier
+                        # result/authority version exists (stays at the
+                        # "no verifier ran" default set above).
+                    else:
+                        # "v1" -- the exhaustive default: v1 already
+                        # SUPPORTED (mode B) or the counterexample was
+                        # invalidated (mode A), so the original Planner
+                        # result stands unmodified; verifier_v1 is the
+                        # result that vouches for it.
+                        _active_verifier_result = _verifier_v1
+                        _plan_authority_version = "v1"
                 except ModelUnavailableError:
                     raise
                 except Exception as exc:
@@ -6403,6 +6463,28 @@ def run(
     _verifier_forced_skip = _s1_result["_verifier_forced_skip"]
     _verifier_skip_reason = _s1_result["_verifier_skip_reason"]
     _verifier_broadening_unresolved = _s1_result["_verifier_broadening_unresolved"]
+    _active_verifier_result = _s1_result["_active_verifier_result"]
+    _plan_authority_version = _s1_result["_plan_authority_version"]
+
+    # Verified-narrower authority split (deterministic, structural
+    # activation only -- see remediation_planner._render_verified_
+    # authoritative_semantics/_render_strategy_target_block for what this
+    # gates). All three conditions are read from already-computed
+    # structured fields/enums; nothing here compares or inspects any
+    # prose. `_active_verifier_result` is already bound to whichever of
+    # verifier_v1/verifier_v2 vouches for the CURRENT `_plan_result`
+    # (see the three-way branch in _run_repository_analysis_and_
+    # remediation_planning above), so this can never bind the wrong
+    # verifier to the wrong Planner version. When False (the default for
+    # every path other than SELECTED+SUPPORTED+match=True), every line
+    # below this point behaves exactly as it did before this change.
+    _verified_narrower_authoritative = (
+        _plan_result is not None
+        and _plan_result.narrower_alternative_decision == "SELECTED"
+        and _active_verifier_result is not None
+        and _active_verifier_result.status == "SUPPORTED"
+        and _active_verifier_result.authoritative_remediation_matches_selected_alternative is True
+    )
 
     # Batch B2: finish S1's execution -- outcome reflects which of the three
     # sub-paths above actually settled; the artifact carries the REAL
@@ -6469,6 +6551,19 @@ def run(
                     "forced_skip": _verifier_forced_skip,
                     "skip_reason": _verifier_skip_reason,
                     "broadening_necessity_unresolved": _verifier_broadening_unresolved,
+                    # Verified-narrower authority split observability
+                    # (additive only -- never read by any decision logic;
+                    # see the `_verified_narrower_authoritative` computation
+                    # above for the actual, structural activation gate).
+                    # `semantic_authority_plan_version` is deliberately None
+                    # whenever the split is not active, even if a verifier
+                    # ran and cleared -- it answers "which Planner version
+                    # is patch-generation-authoritative", not "which
+                    # version did a verifier look at".
+                    "verified_narrower_authoritative": _verified_narrower_authoritative,
+                    "semantic_authority_plan_version": (
+                        _plan_authority_version if _verified_narrower_authoritative else None
+                    ),
                 },
             },
         )
@@ -6620,6 +6715,33 @@ def run(
                     }
                     if _evidence_gap_fallback is not None else None
                 ),
+                # Verified-narrower authority split observability --
+                # additive, never read by any decision logic (see the
+                # `_verified_narrower_authoritative` computation above for
+                # the actual, structural activation gate). `target_
+                # authority_source` is always "strategy": this split only
+                # ever moves semantic (mechanism) authority, never target
+                # authority -- see Section 5 of the architecture this
+                # implements. `strategy_reported_implementation_gap` is
+                # Strategy's own `insufficient_evidence` reduced to a
+                # single boolean signal -- observability only, never a
+                # trigger for falling back to Strategy's mechanism text
+                # (see _run_guided_context_acquisition/build_intended_edits,
+                # which already derive edits from target_files/
+                # target_symbols only, never from mechanism prose).
+                "verified_authority": {
+                    "verified_narrower_authoritative": _verified_narrower_authoritative,
+                    "semantic_authority_source": (
+                        "planner" if _verified_narrower_authoritative else "strategy"
+                    ),
+                    "target_authority_source": "strategy",
+                    "semantic_authority_plan_version": (
+                        _plan_authority_version if _verified_narrower_authoritative else None
+                    ),
+                    "strategy_reported_implementation_gap": bool(
+                        _strategy_result is not None and _strategy_result.insufficient_evidence
+                    ),
+                },
             },
         )
 
@@ -6693,17 +6815,50 @@ def run(
             },
         )
 
+    # Verified-narrower authority split: when `_verified_narrower_
+    # authoritative` is True, an INDEPENDENTLY VERIFIED Planner decision
+    # becomes semantic authority for Patch Generation in place of
+    # Strategy's own mechanism-bearing prose. This is enforced purely by
+    # WHICH rendered text occupies the `code_context` positions below --
+    # never by comparing Planner's and Strategy's prose against each
+    # other. `_verified_authoritative_ctx` carries ONLY the 5 verified
+    # Planner semantic fields (see _render_verified_authoritative_
+    # semantics); `_strategy_ctx` is replaced with a target/
+    # concretization-only view of the SAME already-computed
+    # `_strategy_result` (see _render_strategy_target_block) that
+    # deliberately, by field allowlist, omits `extended_mechanism`,
+    # Strategy's own `security_invariant`, and Strategy's own
+    # `required_edits`. Strategy's independently re-verified
+    # target_files/target_symbols/rejected_targets remain fully present --
+    # target authority is untouched; only semantic (mechanism) authority
+    # moves. When False (every path other than SELECTED + SUPPORTED +
+    # match=True), neither local is touched and both variables keep
+    # exactly the values already computed above, unchanged.
+    _verified_authoritative_ctx = ""
+    if _verified_narrower_authoritative:
+        from .remediation_planner import (
+            _render_strategy_target_block,
+            _render_verified_authoritative_semantics,
+        )
+        _verified_authoritative_ctx = _render_verified_authoritative_semantics(_plan_result)
+        if _strategy_result is not None:
+            _strategy_ctx = _render_strategy_target_block(_strategy_result)
+
     # Assemble final context, in order: hand-authored Patch Plan → original
     # Repository Grounding → vuln patterns → ordinary Repository
     # Understanding → Target Discovery Plan (exploratory) → Planner-Proposed
-    # Candidate Evidence (deterministically verified) → Final
-    # Evidence-Backed Remediation Strategy → Final-Target Remediation Slice
-    # (the last source-bearing section before Patch Generation) →
-    # final-target source coverage warning, only when incomplete.
+    # Candidate Evidence (deterministically verified) → Verified
+    # Authoritative Remediation Semantics (only under the verified-narrower
+    # authority split above; empty otherwise) → Final Evidence-Backed
+    # Remediation Strategy (or, under that same split, its target/
+    # concretization-only view) → Final-Target Remediation Slice (the last
+    # source-bearing section before Patch Generation) → final-target source
+    # coverage warning, only when incomplete.
     _ctx_parts = [
         p for p in [
             _plan_text, _repo_code, _pattern_ctx, _repository_understanding_ctx,
-            _plan_ctx, _planner_evidence_ctx, _strategy_ctx, _slice_ctx, _coverage_warning_ctx,
+            _plan_ctx, _planner_evidence_ctx, _verified_authoritative_ctx, _strategy_ctx,
+            _slice_ctx, _coverage_warning_ctx,
         ]
         if p and p.strip()
     ]

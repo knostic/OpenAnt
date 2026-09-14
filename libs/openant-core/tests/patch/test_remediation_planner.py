@@ -142,6 +142,220 @@ class TestParsing:
         assert "Required edits:" not in result.rendered
 
 
+# ---------------------------------------------------------------------------
+# Prose-around-JSON extraction (real minimist Planner-revision regression).
+#
+# A real bounded Planner revision response was a fully valid, complete
+# Planner JSON object, prefaced with several paragraphs of exploit-tracing
+# prose the prompt explicitly says not to include ("Output exactly one JSON
+# object. Nothing before it, nothing after it."). Strict whole-response
+# json.loads() rejected the entire response -- including several literal
+# `{}` snippets in that same prose (e.g. "`o[key] = {}`"), which a naive
+# first-`{`-to-last-`}` extraction would also have mis-selected -- see
+# remediation_planner.py's _find_balanced_json_objects/_has_plan_shape
+# docstrings for the full incident writeup. Mirrors
+# test_remediation_verifier.py's own TestGenericProseWithBraceNoise/
+# TestTrueAmbiguityStillFailsClosed/TestNoVerifierShapedCandidate coverage
+# for the sibling verifier module's identical fallback pattern.
+# ---------------------------------------------------------------------------
+
+def _plan_shaped(**overrides) -> dict:
+    """A minimal, fully Planner-shaped dict (all 5 _PLAN_SHAPE_FIELDS
+    present) for the prose-extraction tests below -- kept separate from
+    _WELL_FORMED (which omits narrower_alternative_decision and is used by
+    many pre-existing fast-path tests this module must not disturb)."""
+    plan = {
+        "remediation_mechanism": "a narrower, evidence-backed mechanism",
+        "target_files": ["target.py"], "target_symbols": ["target.py:foo"],
+        "security_invariant": "the unsafe condition must not occur",
+        "narrower_alternative_decision": "SELECTED",
+        "narrower_alternative_considered": "considered and selected",
+        "required_edits": ["edit one"], "approaches_to_avoid": [], "explicit_unknowns": [],
+    }
+    plan.update(overrides)
+    return plan
+
+
+class TestLeadingAndTrailingProseExtraction:
+    def test_leading_prose_before_valid_json_is_extracted(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        plan = _plan_shaped()
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Let me trace through the exploit path carefully before "
+            "committing to a final answer.\n\n" + json.dumps(plan)
+        )
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == plan["target_files"]
+        assert result.target_symbols == plan["target_symbols"]
+        assert result.narrower_alternative_decision == "SELECTED"
+
+    def test_valid_json_with_trailing_prose_is_extracted(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        plan = _plan_shaped()
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            json.dumps(plan) + "\n\nLet me know if any of this needs clarification."
+        )
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == plan["target_files"]
+        assert result.narrower_alternative_decision == "SELECTED"
+
+
+class TestGenericProseWithBraceNoise:
+    """Repository-agnostic version of the real trace's own failure shape:
+    explanatory prose containing several literal `{}` snippets (as inline
+    code notation), followed by exactly one real Planner JSON object."""
+
+    def test_recovers_the_one_real_candidate_among_brace_noise(self):
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        plan = _plan_shaped()
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Let me walk through this claim step by step.\n\n"
+            "At the first step, the code does `state = {}` to create a fresh object.\n"
+            "At the second step, another branch also does `target[key] = {}` before continuing.\n"
+            "A third, unrelated example elsewhere in the codebase uses `{}` as a default argument.\n\n"
+            "Given all of that, here is my conclusion:\n\n" + json.dumps(plan)
+        )
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == plan["target_files"]
+        assert result.remediation_mechanism == plan["remediation_mechanism"]
+
+
+class TestMultipleJsonObjectsDisambiguation:
+    def test_one_planner_shaped_object_among_a_non_planner_shaped_one_is_accepted(self):
+        """A second, unrelated JSON object (e.g. verifier-shaped, no
+        Planner fields at all) must never block extraction of the one
+        genuine Planner-shaped candidate."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        plan = _plan_shaped()
+        other_object = {"status": "SUPPORTED", "reason": "an unrelated verifier-shaped object"}
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Here is an unrelated analysis first:\n\n" + json.dumps(other_object)
+            + "\n\nAnd here is the actual plan:\n\n" + json.dumps(plan)
+        )
+        result = generate_remediation_plan("some vuln", llm)
+        assert result.target_files == plan["target_files"]
+        assert result.narrower_alternative_decision == "SELECTED"
+
+    def test_two_planner_shaped_objects_reject_without_selecting_either(self):
+        """Genuine ambiguity, not brace noise: two separate, independently
+        Planner-shaped JSON objects. No arbitrary selection -- must fail
+        closed exactly like an unparseable response, never pick the
+        first/last/either one."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        plan_one = _plan_shaped(target_files=["one.py"])
+        plan_two = _plan_shaped(target_files=["two.py"])
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Here is one analysis:\n\n" + json.dumps(plan_one)
+            + "\n\nActually, let me reconsider and give a second analysis instead:\n\n"
+            + json.dumps(plan_two)
+        )
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+
+class TestMalformedOrNoPlannerShapedCandidate:
+    def test_malformed_json_candidate_in_prose_rejects(self):
+        """A balanced-brace substring that is NOT valid JSON on its own
+        (single-quoted keys/strings) must be skipped as a candidate, not
+        repaired -- with no other candidate present, this rejects."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Here is my plan, informally:\n\n"
+            "{'remediation_mechanism': 'x', 'target_files': [], 'target_symbols': [], "
+            "'security_invariant': 'y', 'narrower_alternative_decision': 'SELECTED'}"
+        )
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+    def test_only_incidental_braces_with_no_planner_shaped_object_rejects(self):
+        """Brace noise only, with no object that even looks like a Planner
+        response (none of the 5 required fields present anywhere) -- must
+        degrade exactly like today's existing malformed-response behavior,
+        never attempt to promote an empty `{}` fragment."""
+        from utilities.autopatcher.remediation_planner import generate_remediation_plan
+        llm = mock.MagicMock()
+        llm.complete.return_value = (
+            "Consider the expression x = {} and note that y = {} as well; "
+            "walking through the logic step by step does not yield a concrete plan yet."
+        )
+        assert generate_remediation_plan("some vuln", llm) == _EMPTY
+
+
+# ---------------------------------------------------------------------------
+# Direct unit coverage for the extraction primitives themselves, mirroring
+# test_remediation_verifier.py's own depth for its analogous functions.
+# ---------------------------------------------------------------------------
+
+class TestFindBalancedJsonObjects:
+    def test_finds_single_top_level_object(self):
+        from utilities.autopatcher.remediation_planner import _find_balanced_json_objects
+        text = 'prose before {"a": 1} prose after'
+        assert _find_balanced_json_objects(text) == ['{"a": 1}']
+
+    def test_braces_inside_string_literals_do_not_confuse_depth(self):
+        from utilities.autopatcher.remediation_planner import _find_balanced_json_objects
+        text = '{"note": "contains a brace { and } inside a string"}'
+        assert _find_balanced_json_objects(text) == [text]
+
+    def test_finds_every_top_level_object_including_empty_ones(self):
+        from utilities.autopatcher.remediation_planner import _find_balanced_json_objects
+        text = 'a {} b {"x": 1} c {}'
+        assert _find_balanced_json_objects(text) == ["{}", '{"x": 1}', "{}"]
+
+    def test_no_braces_returns_empty_list(self):
+        from utilities.autopatcher.remediation_planner import _find_balanced_json_objects
+        assert _find_balanced_json_objects("no braces here at all") == []
+
+    def test_unbalanced_opening_brace_yields_no_candidate(self):
+        from utilities.autopatcher.remediation_planner import _find_balanced_json_objects
+        assert _find_balanced_json_objects('prose { "a": 1') == []
+
+
+class TestHasPlanShape:
+    def test_full_planner_object_matches(self):
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        assert _has_plan_shape(_plan_shaped()) is True
+
+    def test_empty_dict_does_not_match(self):
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        assert _has_plan_shape({}) is False
+
+    def test_non_dict_does_not_match(self):
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        assert _has_plan_shape(["not", "a", "dict"]) is False
+        assert _has_plan_shape(None) is False
+
+    def test_a_single_known_field_alone_is_not_sufficient(self):
+        """The fingerprint is a COMBINATION, not "any one known field" --
+        this is what disambiguates a genuine Planner object from a
+        coincidental single-field fragment in prose."""
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        assert _has_plan_shape({"target_files": ["x.py"]}) is False
+        assert _has_plan_shape({"remediation_mechanism": "x"}) is False
+
+    def test_missing_narrower_alternative_decision_does_not_match(self):
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        incomplete = _plan_shaped()
+        del incomplete["narrower_alternative_decision"]
+        assert _has_plan_shape(incomplete) is False
+
+    def test_null_or_empty_field_values_still_match_key_presence_only(self):
+        """This is a structural (key-presence) check, not a value/type
+        check -- a null or empty value for a required key still counts as
+        present, since value validity remains generate_remediation_plan's
+        own separate, unchanged job."""
+        from utilities.autopatcher.remediation_planner import _has_plan_shape
+        plan = _plan_shaped(
+            remediation_mechanism=None, target_files=[], target_symbols=[],
+            security_invariant=None, narrower_alternative_decision=None,
+        )
+        assert _has_plan_shape(plan) is True
+
+
 class TestNarrowerAlternativeConsideredField:
     """`narrower_alternative_considered` -- additive, optional scalar field.
     Like `security_invariant`/`remediation_mechanism` before it, it is
@@ -2362,8 +2576,146 @@ def _STRATEGY_PROMPT_PATH_TEXT() -> str:
 class TestFinalStrategyPromptRepositoryAgnostic:
     def test_no_hardcoded_domain_terms_in_universal_prompt(self):
         text = _STRATEGY_PROMPT_PATH_TEXT().lower()
-        for term in ("urllib3", "cookie", "header", "redirect", "python"):
+        for term in (
+            "urllib3", "cookie", "header", "redirect", "python",
+            "minimist", "cve-2021-44906", "constructor", "prototype", "__proto__",
+            "javascript", "prototype pollution",
+        ):
             assert term not in text, f"prompt hardcodes domain-specific term: {term!r}"
+
+
+def _STRATEGY_PROMPT_NORMALIZED() -> str:
+    """Whitespace-collapsed, lowercased Strategy prompt text -- same
+    convention as _PLANNER_PROMPT_NORMALIZED below, so a phrase check
+    survives the source .md file's own line wrapping."""
+    return " ".join(_STRATEGY_PROMPT_PATH_TEXT().lower().split())
+
+
+# ---------------------------------------------------------------------------
+# Semantic-narrowness authority check (minimist CVE-2021-44906 real-trace
+# follow-up).
+#
+# Regression shape: the Planner identified a precise runtime condition
+# (danger only when a traversal step resolves to a specific dangerous
+# runtime state) but selected a categorical name/token-based rejection
+# instead, and explicitly recorded the resulting compatibility risk in its
+# own explicit_unknowns. The Final Remediation Strategy's ground rules had
+# no obligation of their own to check this -- Strategy simply adopted the
+# Planner's mechanism as authoritative, "extending" the existing guard by
+# adding more name-equality comparisons alongside it. This is the primary
+# gap: Strategy is the patch-authoritative boundary, yet had no independent
+# semantic-narrowness check of its own to fail.
+#
+# SCOPE NOTE: same limitation as every other prompt-contract test in this
+# file -- reasoning quality remains entirely LLM-judgment based on the
+# prompt text; these tests do NOT and cannot prove an LLM will reason
+# correctly or comply with this contract. What IS testable: (a) the prompt
+# contains the new obligation, worded generically, (b) it is additive to
+# (not a replacement for) the pre-existing ground rules, and (c) it is
+# domain-neutral.
+# ---------------------------------------------------------------------------
+
+class TestFinalStrategySemanticNarrownessContract:
+    def test_categorical_rejection_must_be_justified_for_the_whole_category(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "before finalizing a mechanism that rejects, blocks, filters, or "
+            "sanitizes an entire input, category, name, token, or state class, "
+            "verify from the supplied evidence that the whole category needs "
+            "that treatment" in text
+        )
+
+    def test_state_sensitive_mechanism_preferred_when_it_closes_every_path(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "prefer the narrower state-sensitive mechanism over the categorical "
+            "one" in text
+        )
+        assert (
+            "select the state-sensitive version only when the evidence shows it "
+            "closes every evidence-backed unsafe path" in text
+        )
+
+    def test_structural_similarity_to_existing_guard_is_not_sufficient(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "structural similarity to an existing check" in text
+            and "is not, by itself, evidence that every new category member "
+            "needs identical treatment" in text
+        )
+        assert "extending an existing mechanism is justified only when the extension" in text
+
+    def test_absence_of_known_consumers_is_not_proof_categorical_block_is_safe(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "do not require proof that a real consumer currently relies on a "
+            "safe category member before preferring the narrower mechanism" in text
+        )
+        assert (
+            "the burden is on the evidence to justify treating the whole "
+            "category as unsafe, not on the evidence to justify that a safe "
+            "use exists" in text
+        )
+
+    def test_must_not_invent_unsupported_state_sensitive_predicates(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert (
+            "never invent a state-sensitive check the supplied source does not "
+            "support merely to appear narrower" in text
+        )
+        assert (
+            "if the evidence cannot determine whether a narrower predicate is "
+            "sufficient, say so in `insufficient_evidence`" in text
+        )
+
+    def test_security_completeness_still_overrides_behavioral_preservation(self):
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert "this preference for a narrower mechanism never overrides security completeness" in text
+        assert (
+            "if the evidence shows the categorical treatment is required for "
+            "every such path, the categorical mechanism remains correct" in text
+        )
+
+    def test_existing_ground_rules_still_present_and_additive(self):
+        """Additive, not a replacement -- every pre-existing ground rule must
+        remain present (whitespace-collapsed, so incidental re-wrapping of
+        the source .md file can never break this check)."""
+        text = _STRATEGY_PROMPT_NORMALIZED()
+        assert "every `target_file` you name must already appear in the verified evidence" in text
+        assert "extend that existing policy, validation, filtering, sanitization, or boundary" in text
+        assert "each `required_edit` must identify the existing mechanism it extends or" in text
+        assert "list it in `rejected_targets` with a short reason" in text
+        assert "if the verified evidence is insufficient to select a concrete mechanism," in text
+        assert "do not propose unrelated changes. do not propose a menu of options" in text
+
+    def test_no_new_schema_field_introduced(self):
+        """This is a ground-rules-only change -- the output schema block
+        itself must declare exactly the same seven pre-existing field names,
+        same convention as TestPlannerSchemaFieldSet below (plain regex, not
+        json.loads -- the schema block's type placeholders aren't valid JSON
+        values, only valid JSON keys)."""
+        text = _STRATEGY_PROMPT_PATH_TEXT()
+        schema_start = text.index("## Output schema")
+        schema_block = text[schema_start:]
+        found = set(re.findall(r'"([a-zA-Z_]+)":', schema_block))
+        assert found == {
+            "extended_mechanism", "target_files", "target_symbols",
+            "required_edits", "rejected_targets", "security_invariant",
+            "insufficient_evidence",
+        }
+
+    def test_new_ground_rules_wording_is_domain_neutral(self):
+        """Scoped tightly to just the new paragraphs added by this follow-up."""
+        text = _STRATEGY_PROMPT_PATH_TEXT()
+        start = text.index("Extending an existing mechanism is justified only")
+        end = text.index("Each `required_edit` must identify")
+        added_text = text[start:end].lower()
+        for forbidden in (
+            "minimist", "cve-2021-44906", "constructor", "prototype", "__proto__",
+            "javascript", "prototype pollution", "urllib3", "cookie", "header",
+            "redirect", "python",
+        ):
+            assert forbidden not in added_text
 
 
 def _PLANNER_PROMPT_PATH_TEXT() -> str:
@@ -2414,6 +2766,85 @@ class TestPlannerPromptReasoningDiscipline:
         # -- the pre-existing single-mechanism rule must survive verbatim.
         text = _PLANNER_PROMPT_PATH_TEXT()
         assert "Propose exactly one remediation mechanism, not a menu of options." in text
+
+
+# ---------------------------------------------------------------------------
+# Categorical-vs-state-sensitive self-check (minimist CVE-2021-44906 real-
+# trace follow-up).
+#
+# Regression shape: the Planner correctly derived a precise runtime
+# condition (step 1) but, when selecting its narrower alternative, only
+# compared it against much broader structural rewrites -- never against a
+# state-sensitive version of that SAME candidate derived from the runtime
+# condition it had just identified. This is a deliberately small, targeted
+# addition -- NOT another restatement of the several-paragraph narrower-
+# alternative contract already covered by TestPlannerPromptReasoningDiscipline
+# above, which remains unchanged.
+#
+# SCOPE NOTE: same limitation as every other prompt-contract test in this
+# file -- cannot prove an LLM will reason correctly; proves only that the
+# added self-check exists, is additive, and is domain-neutral.
+# ---------------------------------------------------------------------------
+
+class TestPlannerCategoricalVersusStateSensitiveSelfCheck:
+    def test_self_check_compares_categorical_candidate_against_security_invariant(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert (
+            "if the candidate you are about to select still rejects a name, "
+            "token, input category, operation, or state class categorically, "
+            "compare it once more against the precise `security_invariant` "
+            "you identified in step 1" in text
+        )
+
+    def test_self_check_asks_whether_the_state_can_be_tested_directly(self):
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert (
+            "ask whether the evidence supports checking that unsafe runtime "
+            "state or value directly, instead of rejecting the whole category "
+            "by name" in text
+        )
+        assert (
+            "that state-sensitive version is the narrower candidate you must "
+            "evaluate" in text
+        )
+
+    def test_self_check_is_a_short_addition_not_a_second_narrower_contract(self):
+        """This must remain one short sub-bullet, not a duplicate of the
+        several-paragraph narrower-alternative contract (steps 3-6) already
+        covered elsewhere -- a crude proxy for "kept concise" is that the
+        added bullet is a small fraction of that contract's own length."""
+        text = _PLANNER_PROMPT_PATH_TEXT()
+        start = text.index("If the candidate you are about to select still rejects")
+        end = text.index("None of the following count as a narrower alternative")
+        added = text[start:end]
+        full_narrower_contract_start = text.index("3. **Find the smallest change")
+        full_narrower_contract_end = text.index("## Rules")
+        full_contract = text[full_narrower_contract_start:full_narrower_contract_end]
+        assert len(added) < len(full_contract) / 4
+
+    def test_existing_narrower_alternative_rules_remain_intact(self):
+        """Additive, not a replacement -- the pre-existing genuine-narrower-
+        alternative definition and its companion rules must remain present."""
+        text = _PLANNER_PROMPT_NORMALIZED()
+        assert (
+            "a genuine narrower alternative** requires an actual code or logic "
+            "change relative to the vulnerable baseline" in text
+        )
+        assert "preserves more unrelated legitimate behavior than the broader candidate" in text
+        assert "none of the following count as a narrower alternative" in text
+
+    def test_wording_is_domain_neutral(self):
+        """Scoped tightly to just the new self-check sub-bullet."""
+        text = _PLANNER_PROMPT_PATH_TEXT()
+        start = text.index("If the candidate you are about to select still rejects")
+        end = text.index("None of the following count as a narrower alternative")
+        added_text = text[start:end].lower()
+        for forbidden in (
+            "minimist", "cve-2021-44906", "constructor", "prototype", "__proto__",
+            "javascript", "prototype pollution", "urllib3", "cookie", "header",
+            "redirect", "python",
+        ):
+            assert forbidden not in added_text
 
 
 class TestPlannerPromptRepositoryAgnostic:
