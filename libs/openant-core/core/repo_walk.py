@@ -59,6 +59,84 @@ STAT_KEYS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# #600: the excluded-directory recorder — ONE policy home for every scanner.
+# The walker knows only that a directory was pruned; the SCANNER knows its
+# effective exclusion set. The recorder splits retention accordingly:
+# RESERVED names (the scanner's effective exclusion set — build/, env/,
+# migrations/ ... the first-party examples the issue is about) are always
+# retained (their counts keep increasing after any dynamic saturation);
+# DYNAMIC names (pattern-excluded: .egg-info suffixes, test dirs) are
+# bounded with the overflow DISCLOSED as an occurrence count. Hostile
+# names (control characters, non-printable, absurd length) count toward
+# the overflow but NEVER key the artifact — the histogram's keys land in
+# reports and the LLM summary prompt (producer-side sanitization).
+# ---------------------------------------------------------------------------
+
+_EXCLUDED_NAME_DYNAMIC_BOUND = 12
+_EXCLUDED_NAME_MAX_LEN = 100
+_EXCLUDED_NAME_EXAMPLES_PER_NAME = 2
+
+
+class ExcludedDirRecorder:
+    """Records pruned directories by name, with per-name entry-relative
+    examples and disclosed truncation.
+
+    The statistics projection shape (each scanner merges this after its
+    walk): ``excluded_dir_names`` (name -> exact prune count, retained
+    names only), ``excluded_dir_examples`` (name -> up to 2 relative
+    paths), ``excluded_dir_names_overflow`` (the occurrence count of
+    unretained names — hostile or beyond the dynamic bound). The bare
+    ``directories_excluded`` count stays authoritative for the TOTAL.
+    """
+
+    def __init__(self, effective_exclusion_names):
+        self._reserved = {str(n) for n in (effective_exclusion_names or ())}
+        self.names = {}
+        self.examples = {}
+        self.overflow = 0
+        self._dynamic = 0
+
+    def note(self, name, relative_path):
+        # The NAME gate decides COUNTING (hostile/oversized names overflow,
+        # never key the artifact); the PATH gate decides EXAMPLES only —
+        # a legitimate name under a non-ASCII ancestor still COUNTS and is
+        # retained (the exact-total contract), its example path merely
+        # withheld (hostile bytes never reach the artifact).
+        if (
+            not name
+            or len(name) > _EXCLUDED_NAME_MAX_LEN
+            or any(ord(c) < 32 or ord(c) > 126 for c in name)
+        ):
+            # Hostile, oversized, OR NON-ASCII: counted, never keyed — the
+            # histogram's keys land in reports and LLM prompts, and a
+            # non-ASCII name routes to overflow deliberately (a documented
+            # bound, not a sanitization claim).
+            self.overflow += 1
+            return
+        if name in self._reserved or name in self.names:
+            self.names[name] = self.names.get(name, 0) + 1
+        elif self._dynamic < _EXCLUDED_NAME_DYNAMIC_BOUND:
+            self.names[name] = 1
+            self._dynamic += 1
+        else:
+            # A dynamic name beyond the bound: its OCCURRENCE is disclosed
+            # without fabricating a retained-name count we stopped tracking.
+            self.overflow += 1
+            return
+        _path_ok = all(32 <= ord(c) <= 126 for c in str(relative_path))
+        if _path_ok:
+            ex = self.examples.setdefault(name, [])
+            if len(ex) < _EXCLUDED_NAME_EXAMPLES_PER_NAME:
+                ex.append(str(relative_path))
+
+    def merge_into(self, stats):
+        stats["excluded_dir_names"] = dict(self.names)
+        stats["excluded_dir_examples"] = {
+            k: list(v) for k, v in self.examples.items()
+        }
+        stats["excluded_dir_names_overflow"] = self.overflow
+
 def walk_repository(
     root: Path,
     *,
@@ -66,8 +144,15 @@ def walk_repository(
     on_file: Callable[[Path, str], None],
     stats: dict,
     unreadable_examples_limit: int = 5,
+    note_excluded=None,
 ) -> None:
     """Walk ``root``, calling ``on_file`` for every regular file.
+
+    #600: ``note_excluded(name, relative_path)`` is the optional
+    excluded-directory callback — the SCANNER owns the retention policy
+    (via ExcludedDirRecorder below); the walker reports only the name and
+    its entry-relative path. The histogram lives in the CALLER's stats
+    (never this walker's STAT_KEYS — those are 0-seeded numerics).
 
     Args:
         root: Repository root to walk.
@@ -156,6 +241,10 @@ def walk_repository(
         if stat.S_ISDIR(mode):
             if should_exclude_directory(entry.name):
                 stats["directories_excluded"] = stats.get("directories_excluded", 0) + 1
+                if note_excluded is not None:
+                    # #600: the scanner's own policy decides retention — the
+                    # walker reports the name and its entry-relative path only.
+                    note_excluded(entry.name, entry_relative)
                 continue
             if not safe_to_descend(entry, repo_real, seen_dirs):
                 stats["symlinks_skipped"] = stats.get("symlinks_skipped", 0) + 1

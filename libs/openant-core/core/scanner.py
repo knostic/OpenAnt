@@ -404,6 +404,15 @@ def scan_repository(
             "language": parse_result.language,
             "processing_level": parse_result.processing_level,
         }
+        # #600: the discovery block (outcomes — the excluded dirs NAMED;
+        # skip_tests stays in the inputs: it is config, not a result). The
+        # per-language spec is read via getattr BEFORE ScanResult
+        # population (duck-typed stub ParseResults carry per_language=None).
+        _pl = getattr(parse_result, "per_language", None) or {}
+        _probe = ScanResult(output_dir=output_dir,
+                            language=parse_result.language or "unknown")
+        _probe.per_language = _pl
+        ctx.summary["discovery"] = _collect_discovery(_probe)
         # If the parse step generated a diff_stats report, attach it.
         _diff_report = os.path.join(output_dir, "diff_filter.report.json")
         if os.path.exists(_diff_report):
@@ -1244,6 +1253,10 @@ def scan_repository(
             excluded_languages=result.excluded_languages,
             degraded=result.degraded,
             coverage=_collect_coverage(result),
+            # #600: the discovery block for the deliverable — re-derived
+            # from the same on-disk scan artifacts (idempotent; the parse
+            # step computed the same block into its own summary).
+            discovery=_collect_discovery(_probe_from_result(result)),
             # Authoritative skip data so pipeline_output.json reflects real
             # pipeline status (esp. a non-aborting verify failure) instead of
             # always reporting "nothing skipped". At this point (Step 6) all
@@ -1459,6 +1472,18 @@ _COVERAGE_EXAMPLE_KEYS = ("symlink_examples", "unreadable_examples")
 # Parsers disagree on the filename: the in-process Python parser writes
 # scan_result.json (singular); the subprocess parsers write scan_results.json.
 _SCAN_RESULT_FILENAMES = ("scan_result.json", "scan_results.json")
+# #600: the discovery-stage fields. Counters are flat; the histogram and
+# its examples are per-name MAPPINGS (never coerced through the numeric
+# reducer). The JS scanner writes the camelCase count alias.
+_DISCOVERY_COUNT_KEYS = ("directories_excluded",)
+# shebang_files_detected is PYTHON-ONLY — deliberately NOT in the universal
+# set, or every other language reads permanently "missing" (noise that
+# dilutes the real gaps); it forwards when present (the read is field-wise).
+_DISCOVERY_OPTIONAL_KEYS = ("shebang_files_detected",)
+_DISCOVERY_MAP_KEYS = ("excluded_dir_names", "excluded_dir_examples")
+_DISCOVERY_OVERFLOW_KEY = "excluded_dir_names_overflow"
+_DISCOVERY_ALL_FIELDS = (*_DISCOVERY_COUNT_KEYS, *_DISCOVERY_MAP_KEYS,
+                        _DISCOVERY_OVERFLOW_KEY, *_DISCOVERY_OPTIONAL_KEYS)
 
 
 def _read_coverage_stats(dir_path: str) -> dict:
@@ -1487,6 +1512,38 @@ def _read_coverage_stats(dir_path: str) -> dict:
             if k in stats
         }
     return {}
+
+
+def _read_stats_fields(dir_path: str, keys) -> dict:
+    """Read the GIVEN statistics fields (present ones only) from a
+    directory's scan-result file — the #600 discovery reader (the sibling
+    of _read_coverage_stats above; the coverage reader KEEPS its own
+    filename-order loop — routing it through this freshness logic would
+    change the coverage lane's behavior and is a named follow-up, not
+    folded silently here).
+
+    #600 freshness: a REUSED output directory can carry a prior language's
+    artifact beside the current one (the singular and plural filenames
+    differ by parser); prefer the NEWEST by mtime so a stale file is never
+    misattributed to the current language — and an mtime TIE between the
+    two is disclosed (read neither) rather than guessed by filename order."""
+    candidates = [os.path.join(dir_path, n) for n in _SCAN_RESULT_FILENAMES]
+    candidates = [c for c in candidates if os.path.isfile(c)]
+    if not candidates:
+        return {}
+    mtimes = {os.path.getmtime(c) for c in candidates}
+    if len(mtimes) == 1 and len(candidates) > 1:
+        # Both artifacts carry the SAME mtime (a reused dir written within
+        # one coarse-granularity tick): genuinely ambiguous which language
+        # produced which — disclose (read NEITHER) rather than guess by
+        # filename order.
+        return {}
+    newest = max(candidates, key=os.path.getmtime)
+    try:
+        stats = read_json(newest).get("statistics", {}) or {}
+    except Exception:
+        return {}
+    return {k: stats[k] for k in keys if k in stats}
 
 
 def _language_scan_dirs(result: ScanResult) -> list[tuple[str, str]]:
@@ -1600,6 +1657,105 @@ def _collect_coverage(result: ScanResult) -> dict:
         ),
     }
 
+
+def _probe_from_result(result: ScanResult) -> ScanResult:
+    """#600: a probe carrying the result's per-language map for the
+    discovery aggregator (the report step reuses the parse step's
+    output dirs; no re-derivation of the statistics)."""
+    probe = ScanResult(output_dir=result.output_dir,
+                       language=result.language or "unknown")
+    probe.per_language = result.per_language or {}
+    return probe
+
+
+def _collect_discovery(result: ScanResult) -> dict:
+    """#600: the discovery-stage exclusion counters, per language.
+
+    The excluded directories are NAMED, not a bare count: each language
+    carries the fields its scanner instruments (the flat counts, the
+    name-keyed histogram with entry-relative examples, the overflow
+    disclosure, the shebang count) — and the absence doctrine holds at
+    TWO granularities: a language with NO discovery field is listed in
+    ``languages_without_discovery_data`` (uninstrumented), and a language
+    with SOME fields is listed in ``fields_missing_by_language`` for each
+    field it lacks (a language carrying the flat count but not the
+    histogram is partially instrumented — never summed as if complete).
+
+    Language attribution: the histogram is per language BY CONSTRUCTION —
+    the cross-language "total" of the flat count measures prune
+    observations, not unique excluded directories, and is only forwarded
+    as the per-language flat counts. A FAILED language (``ok`` false or
+    a parse error) is disclosed in ``failed_languages`` — its stale
+    scan-result file, if any, is never read (a failed parse's artifact
+    is not this run's data) and NEVER falls back to another language's.
+    """
+    per_lang: dict[str, dict] = {}
+    without_data: list[str] = []
+    missing_fields: dict[str, list[str]] = {}
+    failed: list[str] = []
+    for lang, spec in (result.per_language or {}).items():
+        out = spec.get("output_dir") if isinstance(spec, dict) else None
+        ok = spec.get("ok", True) if isinstance(spec, dict) else True
+        if not ok:
+            # The outcome's own record says the parse failed: disclose,
+            # never read its possibly-stale artifact. NOTE the asymmetry:
+            # _collect_coverage (above) still reads failed languages' dirs
+            # (pre-existing behavior, #606-era); this block deliberately does
+            # not — the discovery disclosure is the newer contract, pinned
+            # by test. Aligning coverage is its own follow-up, not folded
+            # silently here.
+            failed.append(lang or "unknown")
+            continue
+        stats = _read_stats_fields(out or result.output_dir,
+                                   _DISCOVERY_ALL_FIELDS +
+                                   ("directoriesExcluded",))
+        if not stats:
+            without_data.append(lang or "unknown")
+            continue
+        # The camelCase alias (JS) supplies the count; the histogram stays
+        # unknown for that language (disclosed, not zero).
+        # The canonical spelling always wins; the camelCase alias is
+        # ALWAYS removed (a both-spellings artifact must not leak two keys
+        # for one figure).
+        if "directoriesExcluded" in stats:
+            if "directories_excluded" not in stats:
+                stats["directories_excluded"] = stats["directoriesExcluded"]
+            del stats["directoriesExcluded"]
+        per_lang[lang or "unknown"] = stats
+        absent = [f for f in _DISCOVERY_ALL_FIELDS
+                   if f not in stats and f not in _DISCOVERY_OPTIONAL_KEYS]
+        if absent:
+            missing_fields[lang or "unknown"] = absent
+    if not result.per_language:
+        # The single-language passthrough (the standalone parse and the
+        # single-language scan) writes straight into result.output_dir.
+        stats = _read_stats_fields(result.output_dir,
+                                   _DISCOVERY_ALL_FIELDS +
+                                   ("directoriesExcluded",))
+        # The canonical spelling always wins; the camelCase alias is
+        # ALWAYS removed (a both-spellings artifact must not leak two keys
+        # for one figure).
+        if "directoriesExcluded" in stats:
+            if "directories_excluded" not in stats:
+                stats["directories_excluded"] = stats["directoriesExcluded"]
+            del stats["directoriesExcluded"]
+        lang = result.language or "unknown"
+        if not stats:
+            without_data.append(lang)
+        else:
+            per_lang[lang] = stats
+            absent = [f for f in _DISCOVERY_ALL_FIELDS
+                       if f not in stats and f not in _DISCOVERY_OPTIONAL_KEYS]
+            if absent:
+                missing_fields[lang] = absent
+    block: dict = {"per_language": per_lang}
+    if without_data:
+        block["languages_without_discovery_data"] = sorted(set(without_data))
+    if missing_fields:
+        block["fields_missing_by_language"] = missing_fields
+    if failed:
+        block["failed_languages"] = sorted(set(failed))
+    return block
 
 def _write_scan_report(
     output_dir: str,

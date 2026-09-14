@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from utilities.file_io import open_utf8
-from core.repo_walk import walk_repository
+from core.repo_walk import ExcludedDirRecorder, walk_repository
 
 
 class RepositoryScanner:
@@ -84,8 +84,11 @@ class RepositoryScanner:
             'directories_excluded': 0,
             'test_files_skipped': 0,
         }
-
         self.files: List[Dict] = []
+        # #600: a seed so the public scan_directory() never AttributeErrors
+        # pre-scan(); scan() RESETS it (the authoritative construction).
+        self._excluded_recorder = ExcludedDirRecorder(self.exclude_patterns)
+
 
     def should_exclude_directory(self, dir_name: str) -> bool:
         """Check if a directory should be excluded."""
@@ -163,6 +166,7 @@ class RepositoryScanner:
             should_exclude_directory=self.should_exclude_directory,
             on_file=_on_file,
             stats=self.stats,
+            note_excluded=self._excluded_recorder.note,
         )
 
     def scan(self) -> Dict:
@@ -181,8 +185,13 @@ class RepositoryScanner:
             'directories_excluded': 0,
             'test_files_skipped': 0,
         }
+        # #600: the recorder resets WITH the stats (a second scan() on one
+        # instance must not double the histogram).
+        self._excluded_recorder = ExcludedDirRecorder(self.exclude_patterns)
 
         self.scan_directory(self.repo_path)
+        # #600: fold the excluded-dir histogram into the stats
+        self._excluded_recorder.merge_into(self.stats)
 
         self.files.sort(key=lambda f: f['path'])
 

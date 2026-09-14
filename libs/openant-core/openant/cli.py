@@ -420,6 +420,14 @@ def cmd_parse(args):
                 "processing_level": result.processing_level,
                 "excluded_languages": result.excluded_languages,
             }
+            # #600: the discovery block reaches the STANDALONE parse too —
+            # both entry points construct parse.report.json.
+            from core.scanner import _collect_discovery
+            _probe = type("P", (), {})()
+            _probe.per_language = getattr(result, "per_language", None)
+            _probe.output_dir = output_dir
+            _probe.language = getattr(result, "language", "unknown")
+            ctx.summary["discovery"] = _collect_discovery(_probe)
             # Surface diff stats in the parse step report if present.
             diff_report = os.path.join(output_dir, "diff_filter.report.json")
             if os.path.exists(diff_report):
@@ -738,6 +746,22 @@ def cmd_verify(args):
         return 2
 
 
+
+def _discovery_from_step_reports(step_reports):
+    """#600: the discovery block recorded by the parse step's summary —
+    forwarded to the standalone build-output/report pipeline-output
+    constructions (both load step reports; the block lives there, no
+    re-derivation needed). BEST-EFFORT: the parse report must sit in the
+    loaded step-reports directory (the same one the costs/durations read);
+    a parse output elsewhere drops the block (present-only downstream)."""
+    for sr in step_reports or []:
+        if isinstance(sr, dict) and sr.get("step") == "parse":
+            summary = sr.get("summary") or {}
+            block = summary.get("discovery")
+            if isinstance(block, dict) and block:
+                return block
+    return None
+
 def cmd_build_output(args):
     """Build pipeline_output.json from analysis results."""
     from core.reporter import build_pipeline_output
@@ -764,6 +788,7 @@ def cmd_build_output(args):
                 application_type=args.app_type or "unknown",
                 processing_level=args.processing_level,
                 step_reports=step_reports,
+                discovery=_discovery_from_step_reports(step_reports),
             )
 
             ctx.outputs = {"pipeline_output_path": path}
@@ -892,6 +917,7 @@ def cmd_report(args):
                     output_path=pipeline_output_path,
                     repo_name=args.repo_name,
                     step_reports=step_reports,
+                    discovery=_discovery_from_step_reports(step_reports),
                 )
 
             if fmt == "html":
