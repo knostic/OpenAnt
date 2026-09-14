@@ -263,10 +263,15 @@ def test_scan_path_parse_report_carries_discovery(monkeypatch, tmp_path):
     (tmp_path / "repo" / "build" / "m.py").write_text("x = 1\n")
     (tmp_path / "repo" / "root.py").write_text("y = 2\n")
     _install_minimal_pipeline(monkeypatch)
-    # Offline credentialing: the adapter construction requires a key even
-    # when the probe is neutered (CI has none; the local env may) — the
-    # standard dummy-key pattern; no request ever goes out (the probe is
-    # stubbed and the parse is fake).
+    # Self-sufficient offline guarantees (the shared plugin fixture is a
+    # belt; this is the braces): the probe neutered MODULE-LOCALLY (the
+    # call-time import resolves utilities.llm at scan time — patching the
+    # module attribute takes effect), and the dummy key for any adapter
+    # construction. NO request can go out: the probe is a no-op and every
+    # LLM stage is off/stubbed.
+    import utilities.llm as _llm_mod
+    monkeypatch.setattr(_llm_mod, "probe_registry_or_raise",
+                        lambda *a, **k: None, raising=True)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-offline-000")
     # The shared scaffold's parse stub does not write scan_result.json (the
     # aggregator's input artifact) — wrap it to write a REAL one so this
