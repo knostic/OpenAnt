@@ -383,6 +383,9 @@ def run_dynamic_tests(
                 result.details = f"Test generation raised {_gen_exc_message[:2000]}"
             result.generation_input_tokens = unit_usage["input_tokens"]
             result.generation_output_tokens = unit_usage["output_tokens"]
+            # #598: persist the generation spend's unpriced ids — the
+            # resume reader was wired for this key; nothing wrote it.
+            result.unpriced_models = list(unit_usage.get("unpriced_models") or [])
             results.append(result)
             if checkpoint:
                 checkpoint.save(finding_id, result.to_dict())
@@ -469,6 +472,9 @@ def run_dynamic_tests(
         result.retry_count = retry_count
         result.generation_input_tokens = unit_usage["input_tokens"]
         result.generation_output_tokens = unit_usage["output_tokens"]
+        # #598: persist the generation spend's unpriced ids — the resume
+        # reader was wired for this key; nothing wrote it.
+        result.unpriced_models = list(unit_usage.get("unpriced_models") or [])
         results.append(result)
 
         # Save checkpoint and update summary after each finding.

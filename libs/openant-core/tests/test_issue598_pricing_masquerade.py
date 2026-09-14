@@ -154,8 +154,12 @@ def test_every_production_call_site_passes_pricing():
         rel = py.relative_to(root)
         parts = rel.parts
         # tests are the only intentional loud-path callers; venvs and
-        # fixtures are not the tree
-        if "test" in py.name or "venv" in parts or "fixtures" in parts:
+        # fixtures are not the tree. Exclusion is PATH-based ("tests" in
+        # parts), NOT name-based — a name filter ("test" in py.name) hid
+        # production modules like dynamic_tester/test_generator.py and
+        # parsers/*/test_pipeline.py from the census (none call record_call
+        # today; now they are walked and would be caught if they ever do).
+        if "tests" in parts or "venv" in parts or "fixtures" in parts:
             continue
         try:
             tree = ast.parse(py.read_text())
@@ -185,3 +189,42 @@ def test_the_fallback_is_absent_from_source():
     assert 'pricing = pricing_map("anthropic").get(model)' not in src
     gen = (PROJECT_ROOT / "report" / "generator.py").read_text()
     assert "from utilities.llm_client import MODEL_PRICING" not in gen
+
+
+def test_seed_summary_returns_the_prior_unpriced_ids():
+    """The resume READER, EXECUTED: _seed_summary (the real function the
+    analyzer's resume path runs) returns the prior run's unpriced ids
+    from the per-unit checkpoint rows — the half the resume forwarding
+    consumes."""
+    from core.analyzer import _seed_summary
+    seed = _seed_summary({
+        "u1": {"result": {"verdict": "safe"},
+               "usage": {"input_tokens": 10, "output_tokens": 5,
+                          "cost_usd": 0.01, "cost_incomplete": True,
+                          "unpriced_models": ["m/a", "m/b"]}},
+        "u2": {"result": {"verdict": "error"},
+               "usage": {"input_tokens": 1, "output_tokens": 1,
+                          "cost_usd": 0.0}},
+    })
+    assert seed["unpriced_models"] == {"m/a", "m/b"}
+    assert seed["input_tokens"] == 11  # usage over ALL rows, errored included
+
+
+def test_every_resume_forwarding_passes_the_ids():
+    """The five add_prior_usage call sites (the four this PR threaded +
+    llm-reach, pre-existing) forward the unpriced ids — the regression
+    was collected-but-dropped at the call. A source pin (the call sites
+    sit inside heavy resume machinery; the reader is pinned EXECUTED
+    above and the tracker merge by #216's tests)."""
+    import re
+    for path in ("core/analyzer.py",
+                 "utilities/finding_verifier.py",
+                 "utilities/context_enhancer.py",
+                 "utilities/dynamic_tester/__init__.py",
+                 "core/llm_reachability.py"):
+        src = (PROJECT_ROOT / path).read_text()
+        calls = re.findall(r"add_prior_usage\(", src)
+        forwarded = re.findall(r"unpriced_models=", src)
+        assert calls and len(forwarded) >= len(calls), (
+            f"{path}: {len(calls)} add_prior_usage call(s), "
+            f"{len(forwarded)} unpriced_models forwarding(s)")

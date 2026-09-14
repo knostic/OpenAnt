@@ -1042,6 +1042,11 @@ class ContextEnhancer:
                 "input_tokens": meta.get("input_tokens", 0),
                 "output_tokens": meta.get("output_tokens", 0),
                 "cost_usd": meta.get("cost_usd", 0.0),
+                # #598: the per-unit unpriced ids — agent_metadata carries
+                # them (the #216 set); dropping them here made the resume
+                # reader (which forwards them into the tracker) read
+                # nothing on a real enhance resume.
+                "unpriced_models": list(meta.get("unpriced_models") or []),
             }
         # #317: collision-safe AND under the save lock (this runs in a
         # ThreadPoolExecutor worker — the resolve+write pair must be
