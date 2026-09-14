@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional
 
 from utilities.file_io import write_json
 from utilities.path_filters import should_exclude_directory
+from core.repo_walk import ExcludedDirRecorder
 
 
 class RepositoryScanner:
@@ -107,12 +108,23 @@ class RepositoryScanner:
                     or self._matches_exclude_pattern(name)
                     or (self.skip_tests and self._is_test_directory(name)))
 
+        # #600: the excluded-dir recorder — reserved retention is the
+        # scanner's effective exclusion set; the histogram must survive the
+        # hand-rebuilt statistics projection below.
+        # #600: test-dir names belong to the EFFECTIVE exclusion set
+        # whenever skip_tests prunes them (the pipeline default) —
+        # reserved, never subject to the dynamic bound.
+        _recorder = ExcludedDirRecorder(self.EXCLUDE_DIRS
+                                        | set(self.exclude_patterns)
+                                        | set(self.TEST_DIR_NAMES))
         walk_repository(
             self.repo_path,
             should_exclude_directory=_should_exclude,
             on_file=_on_file,
             stats=stats,
+            note_excluded=_recorder.note,
         )
+        _recorder.merge_into(stats)
         directories_scanned = stats.get("directories_scanned", 0)
         directories_excluded = stats.get("directories_excluded", 0)
         self.walk_stats = stats
@@ -138,6 +150,9 @@ class RepositoryScanner:
                 # a visible coverage gap rather than a silent false negative.
                 "symlinks_skipped": stats.get("symlinks_skipped", 0),
                 "symlink_examples": stats.get("symlink_examples", []),
+                "excluded_dir_names": stats.get("excluded_dir_names", {}),
+                "excluded_dir_examples": stats.get("excluded_dir_examples", {}),
+                "excluded_dir_names_overflow": stats.get("excluded_dir_names_overflow", 0),
             },
         }
 

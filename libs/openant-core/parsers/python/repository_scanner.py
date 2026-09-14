@@ -33,6 +33,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from utilities.file_io import open_utf8, safe_to_read
+from core.repo_walk import ExcludedDirRecorder
 
 
 class RepositoryScanner:
@@ -123,6 +124,10 @@ class RepositoryScanner:
 
         # Results
         self.files: List[Dict] = []
+        # #600: a seed so the public scan_directory() never AttributeErrors
+        # pre-scan(); scan() RESETS it (the authoritative construction).
+        self._excluded_recorder = ExcludedDirRecorder(self.exclude_patterns)
+
 
     def should_exclude_directory(self, dir_name: str) -> bool:
         """Check if a directory should be excluded."""
@@ -318,6 +323,7 @@ class RepositoryScanner:
             if stat.S_ISDIR(mode):
                 if self.should_exclude_directory(entry.name):
                     self.stats['directories_excluded'] += 1
+                    self._excluded_recorder.note(entry.name, entry_relative)
                     continue
                 if not self._safe_to_descend(entry, repo_real, seen_dirs):
                     self._note_symlink(entry)
@@ -400,6 +406,11 @@ class RepositoryScanner:
 
         # Reset state
         self.files = []
+        # #600: the excluded-dir recorder — reserved retention is the
+        # scanner's EFFECTIVE exclusion set (exclude_patterns: build/, env/,
+        # migrations/ ... the first-party names), dynamic names bounded with
+        # the overflow disclosed. Reset per scan; merged after the walk.
+        self._excluded_recorder = ExcludedDirRecorder(self.exclude_patterns)
         self.stats = {
             'total_files': 0,
             'total_size_bytes': 0,
@@ -422,6 +433,10 @@ class RepositoryScanner:
 
         # Sort files by path for consistent output
         self.files.sort(key=lambda f: f['path'])
+
+        # #600: fold the excluded-dir histogram into the statistics the
+        # artifact carries (the names reach the parse step report).
+        self._excluded_recorder.merge_into(self.stats)
 
         return {
             'repository': str(self.repo_path),

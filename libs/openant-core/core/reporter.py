@@ -326,6 +326,9 @@ def build_pipeline_output(
     excluded_languages: dict | None = None,
     degraded: bool | None = None,
     coverage: dict | None = None,
+    # #600: the discovery block (the excluded dirs NAMED, per language) —
+    # present-only beside coverage.
+    discovery: dict | None = None,
 ) -> tuple[str, int]:
     """Build ``pipeline_output.json`` from analysis results.
 
@@ -802,6 +805,7 @@ def build_pipeline_output(
            if excluded_languages is not None else {}),
         **({"degraded": degraded} if degraded is not None else {}),
         **({"coverage": coverage} if coverage is not None else {}),
+        **({"discovery": discovery} if discovery is not None else {}),
         # Which path supplied the security model (Plan DoD #9). Additive key;
         # Go consumers use comma-ok access so it is safe to add.
         "context_source": context_source,

@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from core.repo_walk import walk_repository
+from core.repo_walk import ExcludedDirRecorder, walk_repository
 from utilities.file_io import write_json
 from utilities.path_filters import should_exclude_directory
 
@@ -109,12 +109,20 @@ class RepositoryScanner:
         # iterator stack that records unreadable/too-deep subtrees in `stats`
         # rather than silently dropping them (os.walk vanishes a path past
         # PATH_MAX), and bounds symlink cycles. Matches the other parsers.
+        # #600: test-dir names belong to the EFFECTIVE exclusion set
+        # whenever skip_tests prunes them (the pipeline default) —
+        # reserved, never subject to the dynamic bound.
+        _recorder = ExcludedDirRecorder(self.EXCLUDE_DIRS
+                                        | set(self.exclude_patterns)
+                                        | set(self.TEST_DIR_NAMES))
         walk_repository(
             self.repo_path,
             should_exclude_directory=_should_exclude,
             on_file=_on_file,
             stats=stats,
+            note_excluded=_recorder.note,
         )
+        _recorder.merge_into(stats)
 
         total_size = sum(f["size"] for f in files)
 
@@ -135,6 +143,11 @@ class RepositoryScanner:
                 "symlinks_skipped": stats.get("symlinks_skipped", 0),
                 "symlink_examples": stats.get("symlink_examples", []),
                 "unreadable_examples": stats.get("unreadable_examples", []),
+                # #600: the histogram must survive this hand-rebuilt
+                # projection or the walker instrumentation disappears.
+                "excluded_dir_names": stats.get("excluded_dir_names", {}),
+                "excluded_dir_examples": stats.get("excluded_dir_examples", {}),
+                "excluded_dir_names_overflow": stats.get("excluded_dir_names_overflow", 0),
             },
         }
 

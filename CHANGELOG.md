@@ -3,6 +3,36 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-14] — Discovery counters: the excluded directories are NAMED (#600)
+
+### Fixed
+
+- **The excluded-directory count is no longer nameless.** A directory-name
+  prune now records a name-keyed histogram (`excluded_dir_names`) with up
+  to 2 entry-relative example paths per retained name (an example is
+  withheld for non-ASCII or oversized paths — the count stands) and an
+  overflow disclosure (`excluded_dir_names_overflow`) — retention reserved
+  for the scanner's effective exclusion set (the first-party names:
+  `build/`, `env/`, `migrations/` …, and the test-dir names the
+  skip-tests pipeline prunes), dynamic names bounded with the overflow
+  disclosed as an occurrence count; hostile/oversized/non-ASCII names
+  count but never key the artifact. Seven scanners instrumented (python,
+  c, php, ruby, rust, swift, zig); JS remains count-only (camelCase
+  alias) and Go's pipeline mode writes no scan-result artifact — both
+  disclosed, never zeroed. What is excluded is unchanged; only what the
+  artifacts record.
+- **The counters reach the artifacts operators read.** The discovery block
+  (per language, per field — absence ≠ zero at both granularities) now
+  reaches: the parse step report (the scan path and the standalone
+  `parse`), `pipeline_output.json` (the Step-6 bridge and the standalone
+  `build-output`/`report`, best-effort), `scan.report.json` (beside
+  coverage), and the generated summary's per-field Discovery section. A
+  failed language is disclosed and its stale artifact never read; in a
+  reused output directory the newest artifact wins by mtime when both
+  probed filenames are present, and an mtime tie is disclosed rather than
+  guessed (the parse-start recency guard — shared with the coverage
+  lane's identical pre-existing hole — is a named follow-up).
+
 ## [2026-09-13] — Swift coverage counters + per-key disclosure (absence ≠ zero)
 
 ### Fixed
