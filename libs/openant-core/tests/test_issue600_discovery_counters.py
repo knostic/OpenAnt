@@ -118,18 +118,34 @@ def test_attacker_hostile_names_never_reach_the_artifact(tmp_path):
     prompt tokens."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    # NOTE: a 300-char name exceeds the FILESYSTEM limit (ENAMETOOLONG),
-    # not the recorder's — the recorder's length gate is tested via a
-    # 120-char name (legal on disk, over the 100-char artifact bound).
-    for name in ("evil\n\u001b[31m", "y" * 120, "evil\tname"):
+    # PORTABLE hostile names only on the FILESYSTEM (control characters
+    # are illegal on NTFS — the control-char class is covered by the
+    # recorder-unit test below). A 120-char name is legal on every
+    # supported filesystem and over the 100-char artifact bound.
+    for name in ("y" * 120 + "-1.0.egg-info", "a" * 99 + "b-1.0.egg-info"):
         d = repo / name
         d.mkdir()
         (d / "m.py").write_text("x = 1\n")
     out = RepositoryScanner(str(repo)).scan()
     hist = out["statistics"]["excluded_dir_names"]
     for k in hist:
-        assert all(ord(c) >= 32 and ord(c) < 127 for c in k), repr(k)
+        assert all(32 <= ord(c) <= 126 for c in k), repr(k)
         assert len(k) <= 100, repr(k)
+
+
+def test_hostile_control_names_at_the_recorder_unit():
+    """The control-character class — recorder-UNIT (no filesystem: control
+    chars in names are illegal on NTFS, so the FS fixture cannot cover
+    them on every platform)."""
+    from core.repo_walk import ExcludedDirRecorder
+    r = ExcludedDirRecorder({"build"})
+    r.note("evil\nname", "evil\nname")
+    r.note("evil\u001b[31m", "x")
+    r.note("", "empty")
+    r.note("build", "build")  # the clean one still works
+    assert r.names == {"build": 1}
+    assert r.overflow == 3
+    assert r.examples == {"build": ["build"]}
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +263,11 @@ def test_scan_path_parse_report_carries_discovery(monkeypatch, tmp_path):
     (tmp_path / "repo" / "build" / "m.py").write_text("x = 1\n")
     (tmp_path / "repo" / "root.py").write_text("y = 2\n")
     _install_minimal_pipeline(monkeypatch)
+    # Offline credentialing: the adapter construction requires a key even
+    # when the probe is neutered (CI has none; the local env may) — the
+    # standard dummy-key pattern; no request ever goes out (the probe is
+    # stubbed and the parse is fake).
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-offline-000")
     # The shared scaffold's parse stub does not write scan_result.json (the
     # aggregator's input artifact) — wrap it to write a REAL one so this
     # test exercises the reader end to end.
@@ -269,7 +290,7 @@ def test_scan_path_parse_report_carries_discovery(monkeypatch, tmp_path):
     scanner_mod.scan_repository(
         repo_path="repo", output_dir="out",
         generate_context=False, enhance=False, verify=False,
-        generate_report=False, dynamic_test=False,
+        generate_report=False, dynamic_test=False, llm_reachability=False,
     )
     report = json.loads((tmp_path / "out" / "parse.report.json").read_text())
     disc = report["summary"]["discovery"]
@@ -390,9 +411,11 @@ def test_hostile_names_that_are_actually_excluded(tmp_path):
     vacuous-test P3)."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    # hostile names that match the .egg-info exclusion pattern
-    (repo / "evil\n\x1b[31m-1.0.egg-info").mkdir()
-    (repo / "evil\tname-1.0.egg-info").mkdir()
+    # hostile names that match the .egg-info exclusion pattern — PORTABLE
+    # hostility only (oversized-but-legal; the control-char class is at
+    # the recorder-unit level — NTFS cannot create those names)
+    (repo / ("y" * 120 + "-1.0.egg-info")).mkdir()
+    (repo / ("z" * 105 + "-2.0.egg-info")).mkdir()
     (repo / "build").mkdir()
     (repo / "build" / "m.py").write_text("x = 1\n")
     out = RepositoryScanner(str(repo)).scan()["statistics"]
