@@ -84,6 +84,7 @@ def budget_retry_cap(index: int, budget_set: set, binding=None) -> int | None:
 from core.analysis_core import (
     analyze_unit,
 )
+from core.verdict_taxonomy import SENTINEL_CLASSIFICATIONS
 
 # Import application context (optional)
 try:
@@ -273,7 +274,15 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
     for i, unit in enumerate(units):
         uid = unit.get("id", f"unit_{i}")
         cp_data = checkpointed.get(uid)
-        if cp_data and not _cp_is_error(cp_data):
+        # #611 recovery blocker: a sentinel-stamped analyze checkpoint (the
+        # prior run analyzed a unit whose enhancement had not completed)
+        # re-analyzes when re-enhancement CHANGES its classification — the
+        # two-sided predicate (a completed-classification checkpoint stays
+        # adopted; a still-sentinel checkpoint stays adopted too, matching
+        # the run's own dataset; only the transition re-analyzes — the
+        # sentinel→completed migration off the old hint policy).
+        cp_is_stale = bool(cp_data) and _cp_is_stale(cp_data, unit)
+        if cp_data and not _cp_is_error(cp_data) and not cp_is_stale:
             results[i] = cp_data.get("result", {})
             code_by_route[cp_data.get("route_key", uid)] = cp_data.get("code_for_route", "")
         else:
@@ -387,6 +396,31 @@ def _interrupt_report(results, total):
         f"({not_started} not started); progress saved to checkpoints")
 
 
+def _result_security_classification(result) -> str | None:
+    """#611: a results-row's enhancement classification, mode-agnostic:
+    the row stamp (the agentic path), falling back to None (the
+    single-shot row carries no stamp today — the counter's documented
+    agentic-only scope)."""
+    cls = (result or {}).get("security_classification")
+    return cls if isinstance(cls, str) else None
+
+
+def _cp_is_stale(cp_data, unit):
+    """#611 recovery blocker: is this adoptable checkpoint STALE — a
+    sentinel-stamped analyze row whose unit now carries a COMPLETED
+    classification (re-enhancement migrated it off the old hint policy)?
+    Two-sided: a completed-classification checkpoint is never stale; a
+    still-sentinel checkpoint matches the run's own dataset and stays
+    adopted."""
+    cp_cls = (cp_data.get("result", {}) or {}).get("security_classification")
+    current_cls = _unit_security_classification(unit)
+    return (
+        cp_cls in SENTINEL_CLASSIFICATIONS
+        and current_cls is not None
+        and current_cls not in SENTINEL_CLASSIFICATIONS
+    )
+
+
 def _cp_is_error(cp_data):
     """Is this checkpointed unit an error (must be re-analyzed, not adopted)?
 
@@ -398,7 +432,8 @@ def _cp_is_error(cp_data):
     return analyze_result_is_error(res)
 
 
-def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None) -> dict:
+def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None,
+                  units: list | None = None) -> dict:
     """Seed the _summary.json counters from checkpointed rows.
 
     Counts as completed ONLY the rows adoption will keep: an errored row
@@ -427,10 +462,20 @@ def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None) -> di
     output_tokens = 0
     cost_usd = 0.0
     unpriced: set = set()
+    _unit_by_id = {u.get("id"): u for u in (units or [])}
     for _id, _cp in existing.items():
         if unit_ids is not None and _id not in unit_ids:
             continue
-        if not analyze_result_is_error(_cp.get("result") or {}):
+        # #611: a STALE row (sentinel-stamped, re-enhancement migrated it)
+        # is re-analyzed — seeding it as completed double-counts on the
+        # migration resume. Its USAGE still accumulates (the spend happened
+        # regardless; the row is this run's unit — the same shape as the
+        # errored-row gate below).
+        _stale = bool(
+            units is not None and _id in _unit_by_id
+            and _cp_is_stale(_cp, _unit_by_id[_id]))
+        if (not _stale
+                and not analyze_result_is_error(_cp.get("result") or {})):
             completed += 1
         _usage = _cp.get("usage", {})
         input_tokens += _usage.get("input_tokens", 0)
@@ -700,7 +745,14 @@ def run_analysis(
             keep = ("exploitable", "vulnerable_internal")
         # Read classification mode-agnostically (agent_context OR llm_context)
         # so single-shot-enhanced datasets are not silently dropped.
-        classified = sum(1 for u in units if _unit_security_classification(u) is not None)
+        # #611: a sentinel-stamped unit is NOT classified for this census
+        # (the guard fired only when NONE carried a classification, but a
+        # dataset whose every unit is sentinel-stamped is the same
+        # un-enhanced shape the warning exists for).
+        classified = sum(
+            1 for u in units
+            if _unit_security_classification(u) is not None
+            and _unit_security_classification(u) not in SENTINEL_CLASSIFICATIONS)
         units = [u for u in units if _unit_security_classification(u) in keep]
         # Loud guard: a filter that matches nothing because the dataset carries
         # NO classifications at all is almost always an un-enhanced / wrong-mode
@@ -735,7 +787,8 @@ def run_analysis(
     # verify's verification.incomplete or enhance's INCOMPLETE_CLASSIFICATION.
     # The third bucket stays 0 here but is still emitted for shape consistency.
     _summary_incomplete = 0
-    _seed = _seed_summary(_existing, {u.get("id") for u in units})
+    _seed = _seed_summary(_existing, {u.get("id") for u in units},
+                          units=units)
     _summary_completed = _seed["completed"]
     _summary_errors = 0  # errored rows are re-analyzed; _summary_callback owns them
     _summary_input_tokens = _seed["input_tokens"]
@@ -899,11 +952,20 @@ def run_analysis(
                 consistency_corrections += 1
         if consistency_corrections:
             print(f"  Consistency corrections: {consistency_corrections}", file=sys.stderr)
-            counts = _count_verdicts(results)
+            counts = _count_verdicts(results)  # rebuilt: the #611 counter lands AFTER this
     except ImportError:
         print("[Analyze] Stage 1 consistency check not available, skipping.", file=sys.stderr)
     except Exception as e:
         print(f"[Analyze] Consistency check error (non-fatal): {e}", file=sys.stderr)
+
+    # #611: how many units were analyzed WITHOUT a completed enhancement
+    # classification — the sentinel-stamped rows. Placed AFTER the consistency
+    # check's rebuild (the counter would vanish on correction-runs otherwise).
+    # NOT a third analyze state (#293 stands — an input-provenance counter).
+    counts["enhance_unclassified_analyzed"] = sum(
+        1 for r in results
+        if r is not None
+        and _result_security_classification(r) in SENTINEL_CLASSIFICATIONS)
 
     # --- Write results ---
     results_path = os.path.join(output_dir, "results.json")
