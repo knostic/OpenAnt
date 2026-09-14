@@ -39,15 +39,11 @@ def _extract_usage(
     """Build the usage dict from token counts.
 
     ``pricing`` is the adapter's rates for ``model`` (issue #65 §9 —
-    pricing lives on the adapter, not on a shared global). When
-    omitted, we fall back to the legacy ``MODEL_PRICING`` global so
-    older call sites still produce a number; new code should always
-    pass ``binding.adapter.pricing.get(binding.model)``.
+    pricing lives on the adapter). Every production call site passes
+    ``lookup_pricing(binding)``; a lookup miss (None) is UNKNOWN
+    pricing (#598: the legacy MODEL_PRICING substitution deleted) and
+    the usage dict marks cost_incomplete — never a substituted rate.
     """
-    if pricing is None:
-        from utilities.llm_client import MODEL_PRICING
-
-        pricing = MODEL_PRICING.get(model)
     if pricing is None:
         # Same one-time warning record_call emits, so an unknown model's
         # $0 cost isn't silently inconsistent between the two paths.
@@ -67,8 +63,11 @@ def _extract_usage(
     }
     if pricing is None:
         # #216: this fallback costs OUTSIDE the tracker — the usage dict
-        # must not claim a complete cost it does not have.
+        # must not claim a complete cost it does not have. #598: carry the
+        # model attribution so the CLI report's UsageInfo can surface the
+        # unpriced ids (parity with the tracker path).
         usage["cost_incomplete"] = True
+        usage["unpriced_models"] = [model]
     if usage_details is not None:
         # #211 pass-through capture: verbatim, informational only.
         usage["usage_details"] = usage_details
@@ -83,13 +82,27 @@ def _merge_usage(usages: list[dict]) -> dict:
     shape the agentic loops record — never summed, never in cost.
     """
     merged = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+    _unpriced: list[str] = []
     for u in usages:
         if u.get("cost_incomplete"):
             merged["cost_incomplete"] = True
+        # #598: the unpriced attribution unions across the merged usages
+        # (parity with the tracker path — the CLI report surfaces the ids).
+        for m in (u.get("unpriced_models") or []):
+            if m not in _unpriced:
+                _unpriced.append(m)
         merged["input_tokens"] += u["input_tokens"]
         merged["output_tokens"] += u["output_tokens"]
         merged["total_tokens"] += u["total_tokens"]
         merged["cost_usd"] = round(merged["cost_usd"] + u["cost_usd"], 6)
+    if _unpriced:
+        # #598: sorted for determinism (the sibling producers all sort —
+        # the disclosure path merges in as_completed order). The flag
+        # hardens with the ids: a source carrying ids without the flag
+        # (unreachable today — both producers pair the keys) still
+        # surfaces incomplete, never complete-with-ids.
+        merged["unpriced_models"] = sorted(_unpriced)
+        merged["cost_incomplete"] = True
     details = [u.get("usage_details") for u in usages if u.get("usage_details") is not None]
     if details:
         merged["usage_details"] = details

@@ -26,23 +26,23 @@ import threading
 from core.model_registry import pricing_map
 
 
-# Pricing per million tokens. LEGACY fallback: issue #65 moved pricing onto
-# each adapter, and ``config/models.json`` (read by core.model_registry) is now
-# the source of truth for BOTH the adapters and this global. ``MODEL_PRICING``
-# still backstops call sites that don't pass an adapter-provided ``pricing``
-# (record_call's fallback, report/generator) and the drift guard, but it is
-# served LAZILY from the registry via module ``__getattr__`` below — never a
-# frozen import-time snapshot — so it can neither drift from the adapter table
-# nor price from a stale copy, and a missing config fails LOUD at first use
-# instead of pricing every model at $0. Retired/unknown ids are omitted
+# Pricing per million tokens. Issue #65 moved pricing onto each adapter, and
+# ``config/models.json`` (read by core.model_registry) is the source of truth
+# for BOTH the adapters and this global. ``MODEL_PRICING`` remains for the
+# drift guard and any legacy importers (#598: record_call's substitution
+# fallback is DELETED — a missing price is the #216 loud path, never a
+# substituted Anthropic rate), served LAZILY from the registry via module
+# ``__getattr__`` below — never a frozen import-time snapshot — so it can
+# neither drift from the adapter table nor price from a stale copy, and a
+# missing config fails LOUD at first use. Retired/unknown ids are omitted
 # (lookup miss -> warn + $0).
 
 
 def __getattr__(name: str):
     # PEP 562 hook: resolve MODEL_PRICING on demand. Fires for attribute access
-    # and ``from utilities.llm_client import MODEL_PRICING`` — but NOT for a bare
-    # ``MODEL_PRICING`` reference inside this module, which is why record_call
-    # calls ``pricing_map("anthropic")`` directly.
+    # and ``from utilities.llm_client import MODEL_PRICING``. (#598: record_call
+    # no longer touches the Anthropic map — the substitution is deleted; this
+    # hook serves only the drift guard and legacy importers.)
     if name == "MODEL_PRICING":
         return pricing_map("anthropic")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -106,14 +106,13 @@ class TokenTracker:
             input_tokens: Number of input tokens.
             output_tokens: Number of output tokens.
             pricing: Optional ``{"input": $/Mtok, "output": $/Mtok}``
-                from the adapter that made the call. When provided,
-                this is authoritative — adapters own their rates per
-                issue #65. When omitted, we fall back to the legacy
-                global ``MODEL_PRICING`` so call sites that haven't
-                been threaded through yet still produce a number
-                (with a one-time stderr warning on miss). New code
-                should always pass ``pricing`` via
-                ``binding.adapter.pricing.get(binding.model)``.
+                from the adapter that made the call — authoritative;
+                adapters own their rates per issue #65. Every production
+                call site passes ``pricing`` via
+                ``binding.adapter.pricing.get(binding.model)``; a lookup
+                miss (None) is UNKNOWN pricing and takes the #216 loud
+                path (a one-time warning + $0 + cost_incomplete) — never
+                a substituted rate (#598: the masquerade deleted).
             usage_details: Pass-through capture (#211): provider-supplied
                 billing-relevant DETAIL fields (reasoning tokens; cache
                 read/write tokens) VERBATIM — a dict for a single call,
@@ -128,8 +127,13 @@ class TokenTracker:
             Dict with call details including cost.
         """
         if pricing is None:
-            pricing = pricing_map("anthropic").get(model)
-        if pricing is None:
+            # #598: an omitted/missing ``pricing`` is UNKNOWN pricing — the
+            # #216 loud path below. The legacy Anthropic-catalogue
+            # substitution (deleted) silently reported a plausible
+            # wrong-rate cost with cost_incomplete=False — the masquerade.
+            # Every production call site passes pricing (census-pinned in
+            # tests/test_issue598_pricing_masquerade.py); a None here is a
+            # lookup miss (a misconfigured adapter), never a threaded call.
             _warn_unknown_pricing(model)
             total_cost = 0.0
             # #216: an unpriced-but-dispatched model must be LOUD in the

@@ -759,7 +759,8 @@ def run_analysis(
     # Inject prior usage into tracker so step_report captures the total
     if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
         get_global_tracker().add_prior_usage(
-            _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+            _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
+            unpriced_models=sorted(_summary_unpriced) or None)
         # #281: re-snapshot the phase baseline AFTER the injection — the
         # pre-injection baseline made the "Stage 1" delta include the prior
         # session's tokens/cost (calls exclude restored units while

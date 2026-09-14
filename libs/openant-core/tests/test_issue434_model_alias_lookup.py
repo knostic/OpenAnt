@@ -15,7 +15,7 @@ page with the documented Jan-1-2027 step to $1.50/$7.50).
 The fix: pricing_map emits each priced record under its conventional ALIAS spellings
 too (vendor-prefixed and bare, dotted and dashed versions — the #344 family
 conventions), so every existing exact-key consumer (the adapters'
-`binding.adapter.pricing.get(binding.model)`, record_call's fallback,
+`binding.adapter.pricing.get(binding.model)`, the (#598-deleted) record_call fallback,
 report/generator) resolves aliases with zero consumer changes; find_model gets the
 same family-normalized fallback for structural lookups. Same-family records agree on
 price by the #344 cross-check, so an alias landing on a sibling record is cost-safe by

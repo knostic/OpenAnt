@@ -747,7 +747,8 @@ class ContextEnhancer:
             # Inject prior usage into tracker so step_report captures the total
             if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
                 self.tracker.add_prior_usage(
-                    _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+                    _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
+                    unpriced_models=sorted(_summary_unpriced) or None)
                 # #281: refresh the caller's phase baseline AFTER the
                 # injection so its "Enhance" delta excludes restored usage.
                 if phase_baseline is not None:
@@ -1036,11 +1037,20 @@ class ContextEnhancer:
             cp_data["code"] = unit["code"]
         # Include per-unit usage from agent_metadata (agentic only)
         meta = ctx.get("agent_metadata", {}) if isinstance(ctx, dict) else {}
-        if meta.get("input_tokens") or meta.get("output_tokens"):
+        # #598 review: the unpriced term — a zero-token call whose only
+        # trace is the unpriced id must still write the usage block, or
+        # a resume loses the marker.
+        if (meta.get("input_tokens") or meta.get("output_tokens")
+                or meta.get("unpriced_models")):
             cp_data["usage"] = {
                 "input_tokens": meta.get("input_tokens", 0),
                 "output_tokens": meta.get("output_tokens", 0),
                 "cost_usd": meta.get("cost_usd", 0.0),
+                # #598: the per-unit unpriced ids — agent_metadata carries
+                # them (the #216 set); dropping them here made the resume
+                # reader (which forwards them into the tracker) read
+                # nothing on a real enhance resume.
+                "unpriced_models": list(meta.get("unpriced_models") or []),
             }
         # #317: collision-safe AND under the save lock (this runs in a
         # ThreadPoolExecutor worker — the resolve+write pair must be
