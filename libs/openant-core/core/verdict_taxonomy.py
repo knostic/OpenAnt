@@ -150,3 +150,11 @@ def severity_display_verdict(result: dict) -> str:
     if str(justification).strip() == "Max iterations reached":
         return "inconclusive"
     return verdict
+
+# #611: the enhance non-verdict sentinels — a classification in this set
+# is NOT a verdict: the unit's enhancement did not complete (degenerate
+# agent exits, raise-class errors, or the single-shot unknown). The durable
+# signal is the per-row stamp (security_classification on every results
+# row); these values must never reach the Stage-1 prompt as a
+# "classification" hint, and the census/counter treat them as unclassified.
+SENTINEL_CLASSIFICATIONS = frozenset({"incomplete", "error", "unknown"})

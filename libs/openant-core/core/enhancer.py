@@ -211,5 +211,8 @@ def enhance_dataset(
         error_count=error_count,
         error_summary=error_summary,
         classifications=classifications,
+        # #611: the identity's own fields
+        incomplete_count=incomplete_count,
+        total_units=len(units),
         usage=usage,
     )
