@@ -3,6 +3,12 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-14] — Silent accounting drops become loud (#605)
+
+### Fixed
+
+- **Two failure paths that silently discarded cost/token accounting now surface.** The report-phase tracker hand-off (the only route by which the report step's spend reaches the tracker) sat inside `except Exception: pass` — a binding or pricing failure there silently dropped the step's tokens, and the report step read as $0 / 0 tokens with `cost_incomplete=false`. The step-report cost snapshot substituted a complete-looking zero on any tracker exception — and a fabricated baseline corrupted the step-over-step deltas (a failed end yielded NEGATIVE deltas; a failed start charged another step's spend). Both are fixed: the hand-off failure is counted (a module-level counter — a poisoned tracker cannot count its own failure) and named on stderr; a failed snapshot is a sentinel, the delta is written as zeros WITHOUT subtracting, and the step's token_usage carries `accounting_error: true` + `cost_incomplete: true` (both markers, never one without the other). The marker OR-aggregates at the scan level. In production the counter's incrementer runs inside the report step itself — the observable effect is the **report step's own artifact** being marked (a future pre-report incrementer would mark later steps too; no such site exists today). A healthy run's artifacts are byte-identical (present-only keys). Scope limit, disclosed: the marker reaches the step reports + the scan aggregate only — `UsageInfo` has no field, so the console cost line and the typed Go usage cannot show it.
+
 ## [2026-09-14] — Unknown pricing never substituted: the masquerade deleted (#598)
 
 ### Fixed

@@ -1984,6 +1984,12 @@ def _write_scan_report(
                                                      .get("unpriced_models") or [])}),
             } if any(sr.get("token_usage", {}).get("cost_incomplete")
                      for sr in step_reports) else {}),
+            # #605: the accounting-drop marker OR-aggregates across the step
+            # reports the same way — a silently-dropped accounting failure
+            # must not vanish at the scan level either.
+            **({"accounting_error": True}
+               if any(sr.get("token_usage", {}).get("accounting_error")
+                      for sr in step_reports) else {}),
         },
     )
 

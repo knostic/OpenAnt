@@ -49,6 +49,30 @@ def __getattr__(name: str):
 
 _unknown_pricing_warned: set[str] = set()
 _unknown_pricing_lock = threading.Lock()
+# #605: the accounting-failure counter — MODULE-LEVEL, never on the
+# tracker (a poisoned tracker cannot be trusted to count its own failure).
+# Read directly by core.step_report at step end; the get_totals() key is
+# present-only (UsageInfo has no field — the marker reaches the step
+# reports and the scan aggregate, not the typed usage envelope).
+_accounting_errors = 0
+_accounting_errors_lock = threading.Lock()
+
+
+def record_accounting_error() -> None:
+    """#605: count a silently-swallowed accounting failure (the report-phase
+    tracker hand-off) — surfaced in get_totals() (present-only) and carried
+    by the step reports' token_usage + the scan aggregate's OR (never a
+    complete-looking artifact). NOTE: UsageInfo itself has no field; the
+    marker flows through the step-report snapshots and the aggregate, not
+    the CLI's typed usage envelope."""
+    global _accounting_errors
+    with _accounting_errors_lock:
+        _accounting_errors += 1
+
+
+def _accounting_error_count() -> int:
+    with _accounting_errors_lock:
+        return _accounting_errors
 
 
 def _warn_unknown_pricing(model: str) -> None:
@@ -253,7 +277,7 @@ class TokenTracker:
             Dict with totals only
         """
         with self._lock:
-            return {
+            out = {
                 "total_calls": len(self.calls),
                 "total_input_tokens": self.total_input_tokens,
                 "total_output_tokens": self.total_output_tokens,
@@ -262,6 +286,13 @@ class TokenTracker:
                 "cost_incomplete": bool(self._unpriced_models),
                 "unpriced_models": sorted(self._unpriced_models),
             }
+            # #605: present-only — a healthy run's totals serialize
+            # byte-identical to pre-#605.
+            _errs = _accounting_error_count()
+            if _errs:
+                out["accounting_errors"] = _errs
+            return out
+
 
 
 # Global tracker instance for session-wide tracking
@@ -280,9 +311,12 @@ def reset_warning_state() -> None:
     stop/finish reasons, dropped block kinds, malformed tool JSON) are
     intentionally process-global, so production prints one line per
     novel value. Tests asserting "warned once" — and a brand-new scan —
-    want a clean slate. Adapter modules are imported lazily and guarded
-    so this stays safe even if a provider SDK isn't installed.
+    want a clean slate. ALSO zeroes the #605 accounting-error counter
+    (the two lifecycles are the same: per-scan, never mid-run). Adapter
+    modules are imported lazily and guarded so this stays safe even if a
+    provider SDK isn't installed.
     """
+    global _accounting_errors
     with _unknown_pricing_lock:
         _unknown_pricing_warned.clear()
     for modname in ("anthropic", "openai", "google"):
@@ -293,6 +327,9 @@ def reset_warning_state() -> None:
         reset = getattr(mod, "reset_warnings", None)
         if callable(reset):
             reset()
+
+    with _accounting_errors_lock:
+        _accounting_errors = 0
 
 
 def reset_global_tracker():

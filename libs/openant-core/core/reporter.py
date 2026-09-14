@@ -1258,8 +1258,25 @@ def _record_usage_in_tracker(usage: dict, binding):
                 # usage dict carries it; never in the cost math.
                 usage_details=usage.get("usage_details"),
             )
-    except Exception:
-        pass  # Best effort — don't break report generation
+    except Exception as exc:
+        # #605: the drop is COUNTED and NAMED, never silent — the report
+        # generation continues (the artifact is already written), but the
+        # accounting failure surfaces in the step/scan artifacts (the
+        # module-level counter) and on stderr with the exception class.
+        # The counter import is GUARDED separately: the swallowed exception
+        # may itself have been the import failure inside the try — the
+        # fallback never re-raises out of this handler (the pristine `pass`
+        # never raised; the fix must not either).
+        try:
+            from utilities.llm_client import record_accounting_error
+            record_accounting_error()
+        except Exception:
+            # The counting mechanism is unavailable: the stderr line below
+            # is the only remaining signal — still never silent.
+            print("[report] accounting hand-off failed AND the counter "
+                  "is unavailable", file=sys.stderr)
+        print(f"[report] accounting hand-off failed "
+              f"({type(exc).__name__}): {exc}", file=sys.stderr)
 
 
 def _usage_to_info(usage: dict):
