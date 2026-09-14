@@ -71,11 +71,7 @@ cases:
 
   - id: curl
     repo: https://github.com/curl/curl.git
-    # ghsa: GHSA-7xmh-mw7w-rr97  -- informational only; this case is invoked via
-    # advisory_file (file mode), not --ghsa, so it is not a live field (see
-    # INPUT_FIELDS mutual-exclusivity in scripts/smoke_eval_cases.sh and
-    # evaluation/grounding/case_loader.py).
-    advisory_file: examples/curl-cve-2022-27774.md
+    ghsa: GHSA-7xmh-mw7w-rr97
     cve: CVE-2022-27774
     tag: curl-7_82_0
     sha: 64db5c575d9c5536bd273a890f50777ad1ca7c13
@@ -84,10 +80,7 @@ cases:
   - id: node-semver-cve-2022-25883
     display_name: node-semver
     repo: https://github.com/npm/node-semver.git
-    # ghsa: GHSA-c2qf-rxjj-qqgw  -- informational only; see the same
-    # advisory_file/ghsa mutual-exclusivity note as the curl case above.
-    # Also stated inside examples/node-semver-cve-2022-25883.md itself.
-    advisory_file: examples/node-semver-cve-2022-25883.md
+    ghsa: GHSA-c2qf-rxjj-qqgw
     cve: CVE-2022-25883
     tag: v7.5.1
     sha: aa016a67162c195938f7873ea29a73dac47ff9ba
