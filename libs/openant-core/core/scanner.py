@@ -1110,6 +1110,10 @@ def scan_repository(
                 }
                 if enhance_result.error_summary:
                     ctx.summary["error_summary"] = enhance_result.error_summary
+                # #615: the degenerate-exit kind histogram
+                if getattr(enhance_result, "incomplete_summary", None):
+                    ctx.summary["incomplete_summary"] = \
+                        enhance_result.incomplete_summary
                 ctx.outputs = {
                     "enhanced_dataset_path": enhance_result.enhanced_dataset_path,
                 }
