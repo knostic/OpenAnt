@@ -252,7 +252,11 @@ def run_dynamic_tests(
         _prior_input += _cp.get("generation_input_tokens", 0) or 0
         _prior_output += _cp.get("generation_output_tokens", 0) or 0
         _prior_unpriced.update(_cp.get("unpriced_models") or [])
-    if _prior_cost > 0 or _prior_input > 0 or _prior_output > 0:
+    if _prior_cost > 0 or _prior_input > 0 or _prior_output > 0 \
+            or _prior_unpriced:
+        # (#598 review: the unpriced term keeps this guard in agreement
+        # with its three sibling resume blocks — a zero-token unpriced
+        # checkpoint must still forward the marker.)
         tracker.add_prior_usage(_prior_input, _prior_output, _prior_cost,
                              unpriced_models=sorted(_prior_unpriced) or None)
         # #333 (wave r1 opus): refresh the caller's phase-line baseline AT
@@ -313,6 +317,10 @@ def run_dynamic_tests(
                 generation_cost_usd=cp_data.get("generation_cost_usd", 0),
                 generation_input_tokens=cp_data.get("generation_input_tokens", 0),
                 generation_output_tokens=cp_data.get("generation_output_tokens", 0),
+                # #598: restore the per-unit unpriced ids too — the fresh
+                # rows carry them; a resumed run's results JSON must not
+                # contradict its own checkpoint rows.
+                unpriced_models=list(cp_data.get("unpriced_models") or []),
                 retry_count=cp_data.get("retry_count", 0),
                 test_code=cp_data.get("test_code", ""),
                 dockerfile=cp_data.get("dockerfile", ""),

@@ -1037,7 +1037,11 @@ class ContextEnhancer:
             cp_data["code"] = unit["code"]
         # Include per-unit usage from agent_metadata (agentic only)
         meta = ctx.get("agent_metadata", {}) if isinstance(ctx, dict) else {}
-        if meta.get("input_tokens") or meta.get("output_tokens"):
+        # #598 review: the unpriced term — a zero-token call whose only
+        # trace is the unpriced id must still write the usage block, or
+        # a resume loses the marker.
+        if (meta.get("input_tokens") or meta.get("output_tokens")
+                or meta.get("unpriced_models")):
             cp_data["usage"] = {
                 "input_tokens": meta.get("input_tokens", 0),
                 "output_tokens": meta.get("output_tokens", 0),

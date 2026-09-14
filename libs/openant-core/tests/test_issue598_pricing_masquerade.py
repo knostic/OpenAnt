@@ -159,10 +159,11 @@ def test_every_production_call_site_passes_pricing():
         # production modules like dynamic_tester/test_generator.py and
         # parsers/*/test_pipeline.py from the census (none call record_call
         # today; now they are walked and would be caught if they ever do).
-        if "tests" in parts or "venv" in parts or "fixtures" in parts:
+        if "tests" in parts or "venv" in parts or ".venv" in parts \
+                or "fixtures" in parts:
             continue
         try:
-            tree = ast.parse(py.read_text())
+            tree = ast.parse(py.read_text(encoding="utf-8"))
         except SyntaxError:
             continue
         for node in ast.walk(tree):
@@ -185,9 +186,9 @@ def test_every_production_call_site_passes_pricing():
 def test_the_fallback_is_absent_from_source():
     """The masquerade's own shape never returns: the Anthropic-catalogue
     substitution must not exist in either consumer's pricing resolution."""
-    src = (PROJECT_ROOT / "utilities" / "llm_client.py").read_text()
+    src = (PROJECT_ROOT / "utilities" / "llm_client.py").read_text(encoding="utf-8")
     assert 'pricing = pricing_map("anthropic").get(model)' not in src
-    gen = (PROJECT_ROOT / "report" / "generator.py").read_text()
+    gen = (PROJECT_ROOT / "report" / "generator.py").read_text(encoding="utf-8")
     assert "from utilities.llm_client import MODEL_PRICING" not in gen
 
 
@@ -202,12 +203,15 @@ def test_seed_summary_returns_the_prior_unpriced_ids():
                "usage": {"input_tokens": 10, "output_tokens": 5,
                           "cost_usd": 0.01, "cost_incomplete": True,
                           "unpriced_models": ["m/a", "m/b"]}},
-        "u2": {"result": {"verdict": "error"},
+        "u2": {"result": {"verdict": "ERROR"},
                "usage": {"input_tokens": 1, "output_tokens": 1,
                           "cost_usd": 0.0}},
     })
     assert seed["unpriced_models"] == {"m/a", "m/b"}
-    assert seed["input_tokens"] == 11  # usage over ALL rows, errored included
+    # usage over ALL rows — the ERRORED row's tokens count too (the
+    # #316/#324 contract; lowercase "error" would NOT be an errored row
+    # under analyze_result_is_error — exact "ERROR")
+    assert seed["input_tokens"] == 11
 
 
 def test_every_resume_forwarding_passes_the_ids():
@@ -222,9 +226,52 @@ def test_every_resume_forwarding_passes_the_ids():
                  "utilities/context_enhancer.py",
                  "utilities/dynamic_tester/__init__.py",
                  "core/llm_reachability.py"):
-        src = (PROJECT_ROOT / path).read_text()
+        src = (PROJECT_ROOT / path).read_text(encoding="utf-8")
         calls = re.findall(r"add_prior_usage\(", src)
         forwarded = re.findall(r"unpriced_models=", src)
         assert calls and len(forwarded) >= len(calls), (
             f"{path}: {len(calls)} add_prior_usage call(s), "
             f"{len(forwarded)} unpriced_models forwarding(s)")
+
+
+def test_the_enhancer_checkpoint_writer_persists_the_ids(tmp_path):
+    """The fix round's WRITER, EXECUTED (the deep-refute's catch: reverting
+    it passed every other test): _save_unit_checkpoint — the real function,
+    self-free — persists agent_metadata's unpriced ids into the per-unit
+    usage block, including the zero-token unpriced edge."""
+    import json
+    from utilities.context_enhancer import ContextEnhancer
+    unit = {"id": "u.py:f", "agent_context": {"agent_metadata": {
+        "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.01,
+        "unpriced_models": ["m/a"]}}}
+    ContextEnhancer._save_unit_checkpoint(None, unit, str(tmp_path))
+    # the filename is disambiguated (case-collision-safe) — glob it
+    cp = json.loads(next(iter(tmp_path.glob("*.json"))).read_text())
+    assert cp["id"] == "u.py:f"
+    assert cp["usage"]["unpriced_models"] == ["m/a"]
+    # the zero-token unpriced edge writes the block too (the gate term)
+    unit2 = {"id": "u2.py:f", "agent_context": {"agent_metadata": {
+        "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+        "unpriced_models": ["m/b"]}}}
+    ContextEnhancer._save_unit_checkpoint(None, unit2, str(tmp_path))
+    cps = {json.loads(p.read_text())["id"]:
+           json.loads(p.read_text()) for p in tmp_path.glob("*.json")}
+    assert cps["u2.py:f"]["usage"]["unpriced_models"] == ["m/b"]
+
+
+def test_the_dynamic_test_writer_and_restore_are_pinned():
+    """The dynamic-test side: (a) a source pin on the two writer lines and
+    the restore line (the deep-refute showed each revertibly invisibly);
+    (b) the to_dict roundtrip EXECUTED — the persisted schema carries the
+    ids. The full run-harness writer test (the #333-shape extension) is
+    the named follow-up."""
+    src = (PROJECT_ROOT / "utilities" / "dynamic_tester" / "__init__.py"
+           ).read_text(encoding="utf-8")
+    assert src.count('result.unpriced_models = list(unit_usage.get('
+                     '"unpriced_models") or [])') == 2
+    assert ('unpriced_models=list(cp_data.get("unpriced_models") '
+            'or []),') in src
+    from utilities.dynamic_tester.models import DynamicTestResult
+    d = DynamicTestResult(finding_id="F1", status="CONFIRMED", details="",
+                          unpriced_models=["m/a"]).to_dict()
+    assert d["unpriced_models"] == ["m/a"]
