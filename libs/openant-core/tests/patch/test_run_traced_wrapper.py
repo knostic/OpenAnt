@@ -288,6 +288,8 @@ class TestTraceHooksHermetic:
             "total_cost_usd": pytest.approx(
                 (1000 / 1_000_000) * 15.0 + (500 / 1_000_000) * 75.0
             ),
+            "cost_incomplete": False,
+            "unpriced_models": [],
         }
 
     def test_default_summary_is_human_readable_not_json(self, run_traced, tmp_path, monkeypatch, capsys):
