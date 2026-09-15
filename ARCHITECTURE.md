@@ -19,7 +19,7 @@ everything about analysis. They speak over a deliberately narrow contract.
 ```mermaid
 flowchart TB
     subgraph go["Go CLI — apps/openant-cli"]
-        cmd["cmd/*.go<br/>init · scan · parse · report"]
+        cmd["cmd/*.go<br/>init · scan · parse · report · serve"]
         invoke["internal/python/invoke.go<br/>process lifecycle, timeouts, signals"]
         gocfg["internal/config<br/>~/.config/openant/config.json"]
         golang_["internal/languages<br/>reads config/languages.json"]

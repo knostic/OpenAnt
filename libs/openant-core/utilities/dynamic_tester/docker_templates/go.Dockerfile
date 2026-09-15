@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine
+FROM golang:1.27-alpine
 WORKDIR /test
 COPY test_exploit.go .
 # Initialize a fresh module and resolve dependencies in the container.

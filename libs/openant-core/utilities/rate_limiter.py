@@ -23,6 +23,7 @@ Usage:
 """
 
 import random
+import re
 import sys
 import threading
 import time
@@ -219,6 +220,13 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     - connection: Network connectivity issues
     - timeout: Request timeout
     - api_status with 500+: Server errors (not client errors like 400)
+    - parse_error: Malformed (unparseable) LLM response; re-generating the
+      completion often yields well-formed output.
+    - no usable content: an adapter's "... returned no usable content ..."
+      LLMResponseError (empty completion) — a transient thinking-truncation /
+      malformed reply, across anthropic/google/openai. Deterministic refusals
+      (LLMRefusalError, "refused the request") are NOT matched and stay
+      non-retryable.
 
     Args:
         error_info: The error field from agent_context or similar.
@@ -228,19 +236,39 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     """
     if not error_info:
         return False
-    
+
     if isinstance(error_info, dict):
         error_type = error_info.get("type", "")
-        
-        # Always retry these transient error types
-        if error_type in ("rate_limit", "connection", "timeout"):
+
+        # Always retry these transient error types. "parse_error" is a malformed
+        # LLM response (unparseable JSON): re-generating the completion often
+        # yields well-formed output, so it is treated as transient here.
+        if error_type in ("rate_limit", "connection", "timeout", "parse_error"):
             return True
-        
+
+        # #292: the transient empty-completion raise is honoured on the DICT
+        # shape too. New dicts carry type "empty_completion"
+        # (context_enhancer._build_error_info); the message backstop below
+        # also catches dicts built before that classification existed (stored
+        # agent_context adopted on resume). Before this, the dict branch
+        # classified the same exception as api_status and looked for a
+        # status_code the raise never carries — enhance never retried the one
+        # error class that actually occurred.
+        if error_type == "empty_completion":
+            return True
+
         # Retry server errors (5xx), but not client errors (4xx)
         if error_type == "api_status":
+            # #292 message backstop: an old-shape dict (type api_status, no
+            # status_code) built from an empty-completion raise. Same
+            # substrings + refusal guard as the string branch below.
+            msg = str(error_info.get("message", "")).lower()
+            if "refused the request" not in msg and (
+                    "no usable content" in msg or "empty completion" in msg):
+                return True
             status_code = error_info.get("status_code", 0)
             return status_code >= 500
-        
+
         return False
     
     # String-based error checking.
@@ -253,13 +281,92 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
     # above already retries it via status_code >= 500; mirror that here so the
     # string path is not silently non-retryable.
     error_str = str(error_info).lower()
-    return any(term in error_str for term in (
+    # #212: a DETERMINISTIC refusal is never retryable, regardless of what
+    # the provider's verbatim refusal text contains — the refusal message now
+    # embeds that text, which could incidentally contain a retryable-looking
+    # substring ("timeout", a 5xx code, ...). The cross-adapter refusal
+    # marker wins over the substring scan.
+    if "refused the request" in error_str:
+        return False
+    # #292: status codes are PARSED bounded numbers tested against the SAME
+    # explicit allowlist as before — not a 5xx range (501 is a deterministic
+    # "not implemented", deliberately excluded; 505/506 likewise), and not an
+    # unanchored substring scan, which matched "byte offset 5000" /
+    # "read 15002 bytes". Residual, accepted: a standalone "500" in
+    # non-status context ("token count 500") still parses as the code.
+    # Transient Anthropic/Cloudflare-edge 5xx. 529 ("overloaded") is the
+    # Anthropic overload signal; 520/522/523/524 are Cloudflare edge failures
+    # (unknown error / connection timed out / origin unreachable / timeout)
+    # that are equally transient.
+    _RETRYABLE_STATUS_CODES = frozenset(
+        ("500", "502", "503", "504", "520", "522", "523", "524", "529"))
+    status_hit = any(
+        code in _RETRYABLE_STATUS_CODES
+        for code in re.findall(r"\b5\d{2}\b", error_str))
+    # #569 (choice c): a length-stop empty completion is a DETERMINISTIC
+    # budget exhaustion (#561 named the cause) — a same-cap retry pays for a
+    # coin flip. The caller re-runs those units ONCE at a HIGHER cap
+    # (is_budget_exhausted_error) instead of the same-cap #292 re-roll; every
+    # other empty completion keeps the #292 rationale (a malformed/overloaded
+    # reply that re-generating usually recovers).
+    # NOTE (openant-kb CONC-C2, corrected post-#564): the empty-completion
+    # raise now CARRIES the rejected reply's usage, so a retry is billed AND
+    # recorded — the old "billed-but-unrecorded" trade note described the
+    # pre-#537/#564 shape.
+    return status_hit or any(term in error_str for term in (
         "rate_limit", "connection", "timeout",
-        # Transient Anthropic/Cloudflare-edge 5xx. 529 ("overloaded") is the
-        # Anthropic overload signal; 520/522/523/524 are Cloudflare edge
-        # failures (unknown error / connection timed out / origin unreachable /
-        # timeout) that are equally transient. 501 is a deterministic
-        # "not implemented" and is deliberately excluded.
-        "500", "502", "503", "504", "520", "522", "523", "524", "529",
         "overloaded",
+        # A provider adapter raises LLMResponseError on an empty completion (no
+        # text/tool block) — typically a thinking-block truncation or a
+        # malformed/overloaded reply, which re-generating usually recovers. The
+        # phrasing differs across adapters, so BOTH substrings are needed to cover
+        # every empty path without missing one:
+        #   "no usable content" — anthropic.py:368, google.py:453,
+        #                          openai.py:730 (Responses API "status=...")
+        #   "empty completion"  — anthropic.py:368 / google.py:453 (also carry
+        #                          it), openai.py:760 "no choices (empty
+        #                          completion)", openai.py:816 "empty completion
+        #                          (no text or tool calls)"
+        # The DETERMINISTIC content-filter case is a distinct exception
+        # (LLMRefusalError, "refused the request") and Gemini's deterministic
+        # prompt-block ("no candidates (prompt blocked...)") — neither contains
+        # either substring, so both stay non-retryable.
+        # NOTE (openant-kb CONC-C2, superseded post-#537/#564 — see the
+        # corrected note at the head of this function: the raise now CARRIES
+        # the rejected reply's usage, so a retry is billed AND recorded).
+        # DELIBERATELY NOT matched: OpenRouter's finish_reason='error'
+        # (openrouter.py, "the completion is incomplete") is left to that adapter's
+        # original handling (surface as ERROR). Unlike the direct-provider empty
+        # completions above (unambiguously transient truncations), that channel is
+        # MIXED — it also carries deterministic output-moderation / token-limit
+        # failures — and OpenRouter's structured error.metadata.error_type (the
+        # signal needed to retry only transient subtypes) is discarded at the
+        # adapter, so a precise fix belongs in openrouter.py, not this term.
+        "no usable content",
+        "empty completion",
+    ))
+
+
+def is_budget_exhausted_error(error_info) -> bool:
+    """#569 (choice c): True when the error is the DETERMINISTIC budget-
+    exhaustion empty completion (#561's named cause — the message carries
+    'the output budget was consumed' and a length/max_tokens stop). The
+    caller retries these ONCE at a raised cap instead of the same-cap
+    #292 re-roll; returns False for every other error shape (including
+    other empty completions — the filtered/malformed class keeps the
+    #292 same-cap retry rationale).
+    """
+    error_str = error_info if isinstance(error_info, str) else str(
+        (error_info or {}).get("error")
+        or (error_info or {}).get("message")
+        or error_info)
+    # The budget-exhaustion wording across the adapters (#561 + the #569
+    # review round's parity extension): the openai chat + anthropic
+    # branches say "the output budget was consumed"; Gemini says "consumed
+    # the token budget"; the OpenAI Responses path says "reasoning consumed
+    # the budget". All three names of the same deterministic cause.
+    return any(marker in error_str for marker in (
+        "output budget was consumed",
+        "consumed the token budget",
+        "reasoning consumed the budget",
     ))

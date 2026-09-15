@@ -18,10 +18,13 @@ transport:
   the pinned SDK, so ``api_key`` is IGNORED here (with a one-time
   warning when set). This keeps the config schema and the Go CLI
   untouched.
-* **Region:** resolved by the SDK — ``AWS_REGION`` env var, then the
-  boto3 session (``~/.aws/config``), then a warned ``us-east-1``
-  fallback. ``base_url`` is still honoured as a full endpoint override
-  (VPC endpoints, internal gateways).
+* **Region:** resolved by the SDK — ``AWS_REGION`` /
+  ``AWS_DEFAULT_REGION`` env vars, then the boto3 session
+  (``~/.aws/config``, incl. profile region). Since anthropic 1.0 there
+  is NO ``us-east-1`` fallback: an unresolvable region raises the
+  SDK's ``ValueError``, mapped here to ``LLMAuthError`` with the fix
+  spelled out. ``base_url`` is still honoured as a full endpoint
+  override (VPC endpoints, internal gateways).
 * **Model IDs are inference profiles:** prefixed ``us.`` / ``eu.`` /
   ``global.`` — e.g. ``us.anthropic.claude-sonnet-4-6`` or
   ``global.anthropic.claude-haiku-4-5-20251001-v1:0`` (the version
@@ -79,6 +82,16 @@ _MODEL_ACCESS_HINT = (
 )
 
 _NO_CREDENTIALS_MARKER = "could not resolve credentials"
+
+
+def _typed_credentials_error() -> type[BaseException]:
+    """The SDK's typed credential-error class, or a never-matching fallback
+    when the pinned anthropic predates it (>=1.5.0 carries CredentialsError;
+    the pyproject floor is >=0.40.0). Returns BaseException-substituted so
+    the except clause is syntactically valid on every floor version while
+    matching nothing on the old SDKs."""
+    cls = getattr(anthropic, "CredentialsError", None)
+    return cls if cls is not None else type("_NeverRaised", (BaseException,), {})
 
 # One-time warning when a config sets api_key on a bedrock provider.
 # Silent-ignoring config a user explicitly wrote would violate the
@@ -154,10 +167,20 @@ class BedrockAdapter:
         if base_url is not None:
             kwargs["base_url"] = base_url
         # Deliberately no aws_* kwargs: region and credentials resolve
-        # through the SDK's own chain (AWS_REGION env → boto3 session →
-        # us-east-1 fallback) so `openant` behaves exactly like the
-        # aws CLI on the same machine.
-        self._client = anthropic.AnthropicBedrock(**kwargs)
+        # through the SDK's own chain (AWS_REGION / AWS_DEFAULT_REGION
+        # env → boto3 session/profile region) so `openant` behaves
+        # exactly like the aws CLI on the same machine. anthropic>=1.0
+        # REMOVED the old warned us-east-1 fallback and raises a bare
+        # ValueError when nothing resolves; map it to a typed,
+        # actionable error instead of crashing adapter construction.
+        try:
+            self._client = anthropic.AnthropicBedrock(**kwargs)
+        except ValueError as exc:
+            raise LLMAuthError(
+                f"Bedrock region could not be resolved: {exc}. "
+                "Set AWS_REGION / AWS_DEFAULT_REGION or a region in your "
+                "AWS profile (~/.aws/config)."
+            ) from redacted_cause_from(exc)
 
     # ------------------------------------------------------------------
     # Public API
@@ -218,6 +241,19 @@ class BedrockAdapter:
             if _NO_CREDENTIALS_MARKER in str(exc):
                 raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
             raise
+        except _typed_credentials_error() as exc:
+            # Upgrade-defense (the review round's reachability correction):
+            # on the pinned 1.5.0 the BEDROCK signer still raises the bare
+            # RuntimeError the marker arm above already maps; the typed
+            # CredentialsError family is raised by the BASE client's
+            # auth-profile machinery, which AnthropicBedrock never invokes
+            # today — but an SDK narrowing (the direction 1.5.0 took the
+            # base-client raises) lands here first. Map it to the same typed
+            # auth path. getattr-guarded: the pyproject floor
+            # (anthropic>=0.40.0) predates the class — a bare
+            # `except anthropic.CredentialsError` would AttributeError on
+            # older SDKs at exactly the moment a real error propagates.
+            raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
 
         return _response_to_unified(response, adapter="BedrockAdapter")
 
@@ -252,6 +288,12 @@ class BedrockAdapter:
             if _NO_CREDENTIALS_MARKER in str(exc):
                 raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
             raise
+        except _typed_credentials_error() as exc:
+            # Upgrade-defense, mirrored from complete() (validate() is the
+            # FIRST call a scan makes — registry.validate at startup — and
+            # probe_registry_or_raise catches only LLMError, so a typed
+            # credential failure here would surface raw and unredacted.
+            raise LLMAuthError(_no_credentials_message(exc)) from redacted_cause_from(exc)
 
 
 # ----------------------------------------------------------------------

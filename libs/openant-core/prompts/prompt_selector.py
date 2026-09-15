@@ -4,7 +4,7 @@ Prompt Selector Module
 Routes to the vulnerability analysis prompt.
 """
 
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, TYPE_CHECKING
 
 from . import vulnerability_analysis
 

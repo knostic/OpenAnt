@@ -26,7 +26,7 @@ from utilities.llm import (
     load_config_file,
     resolve_llm_config,
 )
-from utilities.file_io import normalize_results, read_json, write_json, open_utf8
+from utilities.file_io import normalize_results, read_json, open_utf8
 
 
 
@@ -53,6 +53,79 @@ def should_skip_for_language(file_path: str, scan_language: str | None) -> tuple
         "skipped instead of generating an untemplated test"
     )
 
+def _summary_counts_from_checkpoints(checkpointed) -> dict:
+    """#311: derive write_summary's counts from the SAVED UNIT FILES.
+
+    The loop previously accumulated `_completed`/`_errors` locally, which
+    (a) bypassed the generation-failure `continue` — an errored run wrote
+    `errors: 0` — and (b) counted errors as a SUBSET of completed while
+    `StepCheckpoint.status()` recomputes them as DISJOINT, so the two
+    sources disagreed even without the bypass. Deriving from the same
+    source `status()` reads makes the two structurally incapable of
+    drifting. The retry contract is unchanged: an ERROR checkpoint is
+    still classified not-done and retried on resume.
+
+    #432: also derive error_breakdown — the error_type -> count dict the
+    summary schema supports and the analyze pipeline populates, which this
+    stage hardcoded to {} (a live content-filtered run produced 5 errors
+    with an EMPTY breakdown, forcing a post-mortem to open every unit file
+    to learn they were all generation failures). The category comes from
+    the details prefixes result_collector.py writes: `Test generation ...`
+    -> generation; `Docker build failed` -> build; `Container execution
+    timed out` -> timeout; the remaining execution shapes -> execution;
+    anything else (including absent details) -> other.
+    """
+    if not checkpointed:
+        return {"completed": 0, "errors": 1 if checkpointed is False else 0,
+                "error_breakdown": {}}
+    completed = errors = 0
+    breakdown: dict = {}
+    for cp in checkpointed.values():
+        if not isinstance(cp, dict):
+            continue
+        if cp.get("status") == "ERROR":
+            errors += 1
+            cat = _error_category(cp.get("details"))
+            breakdown[cat] = breakdown.get(cat, 0) + 1
+        else:
+            completed += 1
+            # wave r1 (sonnet): the collector writes "Container execution
+            # timed out" with status INCONCLUSIVE, never ERROR — the timeout
+            # bucket was dead code (real timeouts invisible in BOTH errors
+            # and the breakdown). A timed-out unit is a timeout for triage
+            # regardless of its terminal status: counted here WITHOUT
+            # inflating `errors` (it is not an error; the counts stay the
+            # #311 disjoint semantics).
+            det = cp.get("details")
+            if isinstance(det, str) and det.strip().startswith("Container execution timed out"):
+                breakdown["timeout"] = breakdown.get("timeout", 0) + 1
+    return {"completed": completed, "errors": errors, "error_breakdown": breakdown}
+
+
+def _error_category(details) -> str:
+    """Bucket an ERROR unit file by its failure stage (#432)."""
+    if not isinstance(details, str) or not details:
+        return "other"
+    d = details.strip()
+    if d.startswith("Test generation"):
+        return "generation"
+    if d.startswith("Docker build failed"):
+        return "build"
+    if d.startswith("Container execution timed out"):
+        # famD panel (opus, documented-not-deleted): today the collector
+        # writes this details prefix with status INCONCLUSIVE (counted on
+        # the completed side by the wave-r1 timeout bucket, not as an
+        # error) — this branch is unreachable for the CURRENT collector.
+        # Kept as a defensive fallback: if a future collector ever writes
+        # an ERROR row with this prefix, it must bucket to timeout, not
+        # "other".
+        return "timeout"
+    if (d.startswith("Docker execution was not attempted")
+            or d.startswith("Container did not produce valid JSON output")):
+        return "execution"
+    return "other"
+
+
 def run_dynamic_tests(
     pipeline_output_path: str,
     output_dir: str | None = None,
@@ -61,6 +134,7 @@ def run_dynamic_tests(
     repo_path: str | None = None,
     registry: PhaseRegistry | None = None,
     llm_config_name: str | None = None,
+    usage_baseline: dict | None = None,
 ) -> list[DynamicTestResult]:
     """Run dynamic tests for all findings in a pipeline output file.
 
@@ -111,6 +185,13 @@ def run_dynamic_tests(
         "language": pipeline.get("repository", {}).get("language") or "unknown",
         "application_type": pipeline.get("application_type", "unknown"),
     }
+    # #521: the declared-runtime channel — mechanically derived from the repo
+    # root's manifests (go.mod / .python-version / requires-python / engines /
+    # .tool-versions), allowlist-validated, degrade-to-absent on anything else.
+    # NEVER raises (that would abort the whole dynamic-test step before any
+    # finding is tested); absent repo_path (the None default) derives {}.
+    from utilities.dynamic_tester.declared_runtime import derive_declared_runtimes
+    repo_info["declared_runtimes"] = derive_declared_runtimes(repo_path)
 
     if not findings:
         print("No findings to test.", file=sys.stderr)
@@ -148,6 +229,15 @@ def run_dynamic_tests(
     # Use the global tracker so step_context captures dynamic-test cost in
     # dynamic-test.report.json (same as enhance/analyze/verify).
     tracker = get_global_tracker()
+    # #333: the tracker is SHARED with the earlier LLM phases of a full scan,
+    # so a raw read at the end is the whole RUN's cost. Snapshot now — at step
+    # entry, BEFORE the checkpoint prior-usage injection below (those injected
+    # costs are this step's OWN spend from earlier attempts, meant to show
+    # "total cost across runs") — and report the delta, mirroring
+    # core/step_report.py:63. The markdown `**Total Cost:**` line and
+    # dynamic_test_results.json were the two of the step's three cost outputs
+    # still reading the cumulative (#280 fixed the console lines only).
+    _baseline_cost_usd = tracker.total_cost_usd
 
     # Inject prior usage from ALL existing checkpoints (both successful and
     # errored) so the report shows total cost across runs. The errored
@@ -156,24 +246,48 @@ def run_dynamic_tests(
     _prior_input = 0
     _prior_output = 0
     _prior_cost = 0.0
+    _prior_unpriced: set[str] = set()  # #598: forward the marker on resume
     for _cp in checkpointed.values():
         _prior_cost += _cp.get("generation_cost_usd", 0) or 0
         _prior_input += _cp.get("generation_input_tokens", 0) or 0
         _prior_output += _cp.get("generation_output_tokens", 0) or 0
-    if _prior_cost > 0 or _prior_input > 0 or _prior_output > 0:
-        tracker.add_prior_usage(_prior_input, _prior_output, _prior_cost)
+        _prior_unpriced.update(_cp.get("unpriced_models") or [])
+    if _prior_cost > 0 or _prior_input > 0 or _prior_output > 0 \
+            or _prior_unpriced:
+        # (#598 review: the unpriced term keeps this guard in agreement
+        # with its three sibling resume blocks — a zero-token unpriced
+        # checkpoint must still forward the marker.)
+        tracker.add_prior_usage(_prior_input, _prior_output, _prior_cost,
+                             unpriced_models=sorted(_prior_unpriced) or None)
+        # #333 (wave r1 opus): refresh the caller's phase-line baseline AT
+        # the injection — the restored checkpoints' spend was reported by
+        # their ORIGINAL run's console line, and a pre-injection snapshot
+        # double-counted it here (the #281 cross-phase contract, extended to
+        # the dynamic-test step).
+        if usage_baseline is not None:
+            _tot = tracker.get_totals()
+            usage_baseline["cost_usd"] = _tot.get("total_cost_usd",
+                                                 usage_baseline["cost_usd"])
+            usage_baseline["tokens"] = _tot.get("total_tokens",
+                                                usage_baseline["tokens"])
+            usage_baseline["calls"] = _tot.get("total_calls",
+                                               usage_baseline["calls"])
 
     results: list[DynamicTestResult] = []
 
     total = len(findings)
     restored = len(successful_ids)
     remaining = total - restored
-    _completed = restored
-    _errors = 0
 
-    # Write initial summary so Go CLI can show accurate counts
+    # Write initial summary so Go CLI can show accurate counts.
+    # #311: DERIVED from the saved unit files (the same source status()
+    # recomputes from) — not loop-local accumulators, which bypassed the
+    # generation-failure path and wrote errors: 0 for errored runs.
+    _counts = _summary_counts_from_checkpoints(checkpointed)
+    _completed = _counts["completed"]
+    _errors = _counts["errors"]
     checkpoint.ensure_dir()
-    checkpoint.write_summary(total, _completed, _errors, {}, phase="in_progress")
+    checkpoint.write_summary(total, _completed, _errors, _counts["error_breakdown"], phase="in_progress")
 
     print(f"Dynamic testing {total} findings from {repo_info['name']} "
           f"({restored} already done, {remaining} remaining)",
@@ -181,7 +295,10 @@ def run_dynamic_tests(
 
     try:
       for i, finding in enumerate(findings):
-        finding_id = finding.get("id", f"FINDING-{i+1}")
+        # str() at the boundary: id is repo/JSON-derived and may be non-str; it flows
+        # to run_single_container's finding_id.lower() and checkpoint's safe_filename,
+        # both of which would raise on a non-str and abort the whole run.
+        finding_id = str(finding.get("id", f"FINDING-{i+1}"))
 
         # Skip already-checkpointed findings, but ONLY if they succeeded.
         # Errored findings fall through to fresh test generation + Docker run,
@@ -191,12 +308,19 @@ def run_dynamic_tests(
         if cp_data and cp_data.get("status") != "ERROR":
             result = DynamicTestResult(
                 finding_id=finding_id,
+                # #314: thread the identity through resume so a checkpointed
+                # verdict merges on the same key as a fresh one.
+                identity_key=finding.get("identity_key", ""),
                 status=cp_data.get("status", "ERROR"),
                 details=cp_data.get("details", ""),
                 elapsed_seconds=cp_data.get("elapsed_seconds", 0),
                 generation_cost_usd=cp_data.get("generation_cost_usd", 0),
                 generation_input_tokens=cp_data.get("generation_input_tokens", 0),
                 generation_output_tokens=cp_data.get("generation_output_tokens", 0),
+                # #598: restore the per-unit unpriced ids too — the fresh
+                # rows carry them; a resumed run's results JSON must not
+                # contradict its own checkpoint rows.
+                unpriced_models=list(cp_data.get("unpriced_models") or []),
                 retry_count=cp_data.get("retry_count", 0),
                 test_code=cp_data.get("test_code", ""),
                 dockerfile=cp_data.get("dockerfile", ""),
@@ -217,13 +341,16 @@ def run_dynamic_tests(
         # Placed AFTER the checkpoint hit: a finding CONFIRMED by an
         # earlier run must keep that verdict on resume, not be downgraded
         # to SKIPPED and lose its exploit evidence.
-        _loc = finding.get("location", {})
-        _file = _loc.get("file", "") if isinstance(_loc, dict) else ""
+        _loc = finding.get("location")
+        _file = _loc.get("file") if isinstance(_loc, dict) else None
+        _file = _file if isinstance(_file, str) else ""  # location.file may be non-str (JSON)
         _skip, _reason = should_skip_for_language(_file, repo_info.get("language"))
         if _skip:
             print(f"\n[{i+1}/{total}] SKIPPED {finding_id}: {_reason}", file=sys.stderr)
             results.append(DynamicTestResult(
-                finding_id=finding_id, status="SKIPPED", details=_reason,
+                finding_id=finding_id,
+                identity_key=finding.get("identity_key", ""),
+                status="SKIPPED", details=_reason,
                 elapsed_seconds=0,
             ))
             continue
@@ -235,33 +362,74 @@ def run_dynamic_tests(
         # finding in addition to cost.
         tracker.start_unit_tracking()
 
-        # Step 1: Generate test
+        # Step 1: Generate test. #431: a RAISED exception (live repro: the
+        # adapter hit the provider content filter and raised LLMResponseError
+        # after its internal retries) previously escaped unhandled — it
+        # aborted the whole loop (remaining findings never attempted) and the
+        # on-disk _summary.json kept errors: 0, the exact #311 defect on the
+        # raise route. Treat a raise exactly like a None return: record the
+        # ERROR unit file, derive the summary from the files, continue.
         print("  Generating test...", file=sys.stderr)
-        generation = generate_test(finding, repo_info, dynamic_test_binding, tracker)
+        try:
+            generation = generate_test(finding, repo_info, dynamic_test_binding, tracker)
+        except Exception as gen_exc:
+            generation = None
+            print(f"  Test generation raised: {type(gen_exc).__name__}", file=sys.stderr)
+            _gen_exc_message = str(gen_exc)
+            _gen_exc_raised = True
+        else:
+            _gen_exc_raised = False
+            _gen_exc_message = ""
         unit_usage = tracker.get_unit_usage()
         generation_cost = unit_usage["cost_usd"]
 
         if generation is None:
             print("  Test generation failed.", file=sys.stderr)
             result = collect_result(finding, None, None, generation_cost)
+            if _gen_exc_raised:
+                # keep the raised exception's own words (the None path has none)
+                result.details = f"Test generation raised {_gen_exc_message[:2000]}"
             result.generation_input_tokens = unit_usage["input_tokens"]
             result.generation_output_tokens = unit_usage["output_tokens"]
+            # #598: persist the generation spend's unpriced ids — the
+            # resume reader was wired for this key; nothing wrote it.
+            result.unpriced_models = list(unit_usage.get("unpriced_models") or [])
             results.append(result)
             if checkpoint:
                 checkpoint.save(finding_id, result.to_dict())
+                # #311: the saved ERROR unit file IS the count — derive the
+                # summary from the unit files so this branch can no longer
+                # write errors: 0 for an errored run.
+                _counts = _summary_counts_from_checkpoints(checkpoint.load())
+                _completed = _counts["completed"]
+                _errors = _counts["errors"]
+                checkpoint.write_summary(total, _completed, _errors, _counts["error_breakdown"],
+                                         phase="in_progress")
             continue
 
         print(f"  Generated (${generation_cost:.4f}). Running in Docker...",
               file=sys.stderr)
 
-        # Resolve the vulnerable source file for pre-staging.
+        # Resolve the vulnerable source file for pre-staging. location.file is a
+        # DETERMINISTIC repo-derived path (reporter.py sets it to route_key.split(":")[0],
+        # the parser's repo-relative path of the unit) — repo-author-controlled, and in a
+        # standalone run the findings JSON is fully caller-supplied. A `..`/absolute value,
+        # or an in-repo symlink pointing outside, would make the copy escape repo_path and
+        # read a HOST file into the Docker build context (read/exfil). Confine the resolved
+        # path under repo_path (realpath also blocks the symlink case); skip on escape —
+        # source_file stays None, the already-supported no-source path. Guard the types too:
+        # `location` may be a non-dict and `file` a non-str (JSON), which must not raise
+        # (an unwrapped raise aborts the whole run — see docker_executor._refuse_compose).
         source_file = None
         if repo_path:
-            rel_path = finding.get("location", {}).get("file", "")
-            if rel_path:
-                candidate = os.path.join(repo_path, rel_path)
-                if os.path.isfile(candidate):
-                    source_file = candidate
+            _loc = finding.get("location")
+            rel_path = _loc.get("file", "") if isinstance(_loc, dict) else ""
+            if isinstance(rel_path, str) and rel_path:
+                repo_root = os.path.realpath(repo_path)
+                resolved = os.path.realpath(os.path.join(repo_path, rel_path))
+                if ((resolved == repo_root or resolved.startswith(repo_root + os.sep))
+                        and os.path.isfile(resolved)):
+                    source_file = resolved
 
         # Step 2: Execute in Docker and retry on errors
         execution = run_single_container(generation, finding_id,
@@ -312,25 +480,40 @@ def run_dynamic_tests(
         result.retry_count = retry_count
         result.generation_input_tokens = unit_usage["input_tokens"]
         result.generation_output_tokens = unit_usage["output_tokens"]
+        # #598: persist the generation spend's unpriced ids — the resume
+        # reader was wired for this key; nothing wrote it.
+        result.unpriced_models = list(unit_usage.get("unpriced_models") or [])
         results.append(result)
 
-        # Save checkpoint and update summary after each finding
+        # Save checkpoint and update summary after each finding.
+        # #311: the counts are re-derived from the saved unit files (the
+        # checkpoint was just saved, so the derivation includes it).
         if checkpoint:
             checkpoint.save(finding_id, result.to_dict())
-            _completed += 1
-            if result.status == "ERROR":
-                _errors += 1
-            checkpoint.write_summary(total, _completed, _errors, {}, phase="in_progress")
+            _counts = _summary_counts_from_checkpoints(checkpoint.load())
+            _completed = _counts["completed"]
+            _errors = _counts["errors"]
+            checkpoint.write_summary(total, _completed, _errors, _counts["error_breakdown"], phase="in_progress")
 
         print(f"  Result: {result.status} ({result.elapsed_seconds:.1f}s)",
               file=sys.stderr)
     except KeyboardInterrupt:
         print("\n[Dynamic Test] Interrupted — progress saved to checkpoints",
               file=sys.stderr, flush=True)
-        return results
+        # #419 (the #417 class): `return results` here swallowed the
+        # interrupt AND handed the caller partial results, which then wrote
+        # DYNAMIC_TEST_RESULTS.md as a completion artifact for an
+        # interrupted run. The checkpoints hold the progress (every
+        # completed finding is saved as it completes — the resume story);
+        # the interrupt itself PROPAGATES so the CLI exits 130 with an
+        # interrupted envelope, never a success one.
+        raise
 
     # Generate report
-    total_cost = tracker.total_cost_usd
+    # #333: the STEP's cost (the entry-snapshot delta), not the run's
+    # cumulative — prior-phase spend on the shared tracker must not appear
+    # here (the JSON step-report on the same run already reads the delta).
+    total_cost = tracker.total_cost_usd - _baseline_cost_usd
     report_md = generate_report(results, repo_info["name"], total_cost)
 
     report_path = os.path.join(output_dir, "DYNAMIC_TEST_RESULTS.md")
@@ -352,6 +535,10 @@ def run_dynamic_tests(
     # Mark done. Checkpoints are preserved as a permanent artifact alongside
     # results — allows retroactive retry of errored findings after fixes.
     if checkpoint:
-        checkpoint.write_summary(total, _completed, _errors, {}, phase="done")
+        # #311: the final summary derives from the unit files too — the
+        # authoritative record, structurally identical to status().
+        _counts = _summary_counts_from_checkpoints(checkpoint.load())
+        checkpoint.write_summary(total, _counts["completed"],
+                                 _counts["errors"], _counts["error_breakdown"], phase="done")
 
     return results

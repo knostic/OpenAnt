@@ -25,6 +25,11 @@ from ..llm import (
     ToolUseBlock,
     lookup_pricing,
 )
+# #290 sibling: same shape as finding_verifier — this loop bypasses
+# simple_text and previously pinned its own 4096, so PR #242's raised default
+# never reached enhance either. Shares the thinking-era budget; see
+# llm/helpers.py:DEFAULT_MAX_TOKENS.
+from ..llm.helpers import DEFAULT_MAX_TOKENS
 from .repository_index import RepositoryIndex
 from .tools import TOOL_DEFINITIONS, ToolExecutor
 from .prompts import SYSTEM_PROMPT, get_user_prompt
@@ -34,7 +39,7 @@ from .reachability_analyzer import ReachabilityAnalyzer
 
 # Safety limits
 MAX_ITERATIONS = 20
-MAX_TOKENS_PER_RESPONSE = 4096
+MAX_TOKENS_PER_RESPONSE = DEFAULT_MAX_TOKENS
 
 # Classification stamped on a degenerate exit (agent ended without a completed
 # `finish` tool call: bare end_turn, no tool calls, or MAX_ITERATIONS reached).
@@ -99,6 +104,8 @@ class AgentResult:
         input_tokens: int = 0,
         output_tokens: int = 0,
         cost_usd: float = 0.0,
+        unpriced_models: Optional[list] = None,
+        usage_details: Optional[list] = None,
     ):
         self.include_functions = include_functions
         self.usage_context = usage_context
@@ -113,6 +120,10 @@ class AgentResult:
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.cost_usd = cost_usd
+        # #216: this unit's unpriced models (incomplete-cost marker).
+        self.unpriced_models = unpriced_models
+        # #211 pass-through capture: per-turn detail dicts, verbatim.
+        self.usage_details = usage_details
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -128,6 +139,13 @@ class AgentResult:
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
                 "cost_usd": self.cost_usd,
+                # #216: the unit's unpriced models — flows into the
+                # per-unit checkpoint record so resume restores the marker.
+                **({"cost_incomplete": True, "unpriced_models": self.unpriced_models}
+                   if self.unpriced_models else {}),
+                # #211: verbatim when captured; never summed, never in cost.
+                **({"usage_details": self.usage_details}
+                   if self.usage_details is not None else {}),
             },
             "reachability": {
                 "is_entry_point": self.is_entry_point,
@@ -205,6 +223,16 @@ class ContextAgent:
         Returns:
             AgentResult with gathered context
         """
+        # #216: begin per-unit usage tracking on THIS thread — the unit's
+        # unpriced-model set (thread-local) is what the AgentResult
+        # construction sites read for agent_metadata. Without this call the
+        # getattr chain always sees the default empty set and the marker is
+        # dead code on the enhance path (union-checkpoint catch: no caller
+        # on the worker thread ever started tracking).
+        _start = getattr(self.tracker, "start_unit_tracking", None)
+        if _start is not None:
+            _start()
+
         is_entry_point = unit_id in self.entry_points
         reachable_from_entry: Optional[bool] = None
         entry_point_path: Optional[List[str]] = None
@@ -215,6 +243,9 @@ class ContextAgent:
             if reachable_from_entry:
                 entry_point_path = self.reachability.get_entry_point_path(unit_id)
                 reaching_entry_point = self.reachability.get_reaching_entry_point(unit_id)
+
+        # Set static deps on tool executor for get_static_dependencies tool
+        self.tool_executor.set_unit_context(static_deps, static_callers)
 
         # Build initial prompt with reachability info
         user_prompt = get_user_prompt(
@@ -236,6 +267,8 @@ class ContextAgent:
         iterations = 0
         total_input_tokens = 0
         total_output_tokens = 0
+        # #211 pass-through capture: per-turn usage detail dicts, verbatim.
+        per_turn_usage_details: list = []
 
         while iterations < MAX_ITERATIONS:
             iterations += 1
@@ -269,6 +302,7 @@ class ContextAgent:
 
             total_input_tokens += result.input_tokens
             total_output_tokens += result.output_tokens
+            per_turn_usage_details.append(result.usage_details)
 
             assistant_content = result.content
             stop_reason = result.stop_reason
@@ -293,6 +327,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return AgentResult(
                     include_functions=[],
@@ -308,6 +343,10 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
+                    unpriced_models=sorted(getattr(
+                        getattr(self.tracker, "_thread_local", None),
+                        "unit_unpriced", set())) or None,
+                    usage_details=per_turn_usage_details,
                 )
 
             tool_results: list[ToolResultBlock] = []
@@ -363,6 +402,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return AgentResult(
                     include_functions=[],
@@ -378,6 +418,10 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
+                    unpriced_models=sorted(getattr(
+                        getattr(self.tracker, "_thread_local", None),
+                        "unit_unpriced", set())) or None,
+                    usage_details=per_turn_usage_details,
                 )
 
             # If finish was called, return result
@@ -388,6 +432,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
 
                 return AgentResult(
@@ -404,6 +449,10 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
+                    unpriced_models=sorted(getattr(
+                        getattr(self.tracker, "_thread_local", None),
+                        "unit_unpriced", set())) or None,
+                    usage_details=per_turn_usage_details,
                 )
 
             # Add assistant message and tool results to conversation.
@@ -426,6 +475,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return AgentResult(
                     include_functions=[],
@@ -441,6 +491,10 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
+                    unpriced_models=sorted(getattr(
+                        getattr(self.tracker, "_thread_local", None),
+                        "unit_unpriced", set())) or None,
+                    usage_details=per_turn_usage_details,
                 )
 
         # Max iterations reached
@@ -453,6 +507,7 @@ class ContextAgent:
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
+            usage_details=per_turn_usage_details,
         )
 
         return AgentResult(
@@ -469,6 +524,10 @@ class ContextAgent:
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             cost_usd=call_record.get("cost_usd", 0.0),
+            unpriced_models=sorted(getattr(
+                getattr(self.tracker, "_thread_local", None),
+                "unit_unpriced", set())) or None,
+            usage_details=per_turn_usage_details,
         )
 
 

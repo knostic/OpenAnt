@@ -196,11 +196,59 @@ USER_INPUT_PATTERNS = [
     # Rust CLI / stdin / env input surfaces: a function that reads these IS a
     # user-input entry point even when it carries no route/main marker of its
     # own (e.g. a helper called from `main` via `std::env::args()`).
+    # #355: std::env::var — the ORDINARY env read — was missing (args was
+    # listed; var was not), so a Rust config reader seeded through neither
+    # route.
     r'std::env::args',
-    r'\benv::args\b',
+    r'\benv::args(?:_os)?\b',
+    r'std::env::var',
+    # wave r1 (fable): the trailing \b rejected env::var_os / env::vars —
+    # after `use std::env;` (the idiomatic import) the short forms were
+    # unseeded through BOTH routes while the fully-qualified form matched.
+    r'\benv::var(?:s|_os)?\b',
     r'\bstd::io::stdin\b',
     r'\bio::stdin\b',
     r'\bstdin\(\)',
+    # #355: JavaScript/TypeScript CLI / env / stdin — Node reads argv through
+    # process.argv, configuration AND SECRETS through process.env, and stdin
+    # through process.stdin; the argv-parse libraries and readline are the same
+    # surface as Python's argparse/click block above. The JS parser assigns
+    # these units unit_type=function (typescript_analyzer.js) with NO
+    # cli_handler classifier, so without this block NEITHER check seeds them.
+    r'process\.argv',
+    r'process\.env',
+    r'process\.stdin',
+    r'\byargs\b',
+    r'\bcommander\b',
+    r'\bminimist\b',
+    r'\breadline\b',
+    # #355: Go env reads — os.Getenv / os.LookupEnv. argv needs no idiom (the
+    # parser classifies os.Args code as cli_handler, extractor.go:344, so
+    # Check 1 seeds it), but env had no route at all; flag. is the CLI-args
+    # idiom for the flag package (flag.Parse/flag.String).
+    r'\bos\.Getenv\s*\(',
+    r'\bos\.LookupEnv\s*\(',
+    r'\bflag\.',
+    # #355: C CLI / env — getenv( and argc/argv: a non-`main` helper taking
+    # argc/argv is seeded only under apps/ via the parser's cli_handler gate
+    # (c/function_extractor.py:353-356), a property of the DIRECTORY, not of
+    # the code; the idiom closes the gap for every directory. Over-seeding is
+    # the safe direction (a false entry point costs analysis budget; a missing
+    # one silently drops a unit and everything reachable only through it).
+    # `\bgetenv\s*\(` also covers PHP's getenv() — the lists are not
+    # language-scoped (the documented \bgets\b accident above).
+    r'\bgetenv\s*\(',
+    r'\bargv\b',
+    r'\bargc\b',
+    # #355: PHP CLI forms — the web-superglobal pattern covers
+    # $_SERVER['argv'] and $_ENV by accident; the direct CLI forms matched
+    # nothing.
+    r'\$argv\b',
+    # #355: Zig CLI / env — std.process args (one prefix covers args and
+    # argsAlloc) and the env-var reader. The Zig parser assigns
+    # unit_type=function with no cli route.
+    r'std\.process\.args',
+    r'getEnvVarOwned',
 ]
 
 # Patterns that indicate module-level scripts with user input
@@ -232,8 +280,12 @@ class EntryPointDetector:
     """
     Detects entry points in a codebase where user input enters the application.
 
-    Entry points are the starting points for taint analysis - if vulnerable code
-    is not reachable from any entry point, it cannot be exploited by external users.
+    Entry points are the starting points for reachability filtering. What the
+    filter computes today is call-graph reachability: a unit with no recorded
+    call path from any entry point is dropped — a claim about the parsed
+    call graph, not a proof of unexploitability (an edge the parser did not
+    record produces the same result as dead code). "Taint analysis" is the
+    roadmap framing, not a description of the current filter.
 
     Attributes:
         functions: Dict of func_id -> func_data from extractor
@@ -284,6 +336,18 @@ class EntryPointDetector:
                     'reasons': reasons,
                     'unit_type': _unit_type(func_data),
                     'name': func_data.get('name'),
+                    # A synthesized fuzz harness seeds the BFS (unit_type=main) but
+                    # is NOT a real structural entry point; record the tag so the
+                    # blackout advisory can exclude it from the structural count.
+                    'synthetic_harness': bool(
+                        func_data.get('synthetic_harness')
+                        or func_data.get('syntheticHarness')),
+                    # A build.rs / examples/ / benches/ `main` seeds the BFS
+                    # (unit_type=main) but is NOT the crate's runtime entry point;
+                    # tag it so the blackout advisory excludes it from the
+                    # structural count (the seed is kept).
+                    'non_runtime_main': _is_non_runtime_main(
+                        func_data.get('file_path') or func_data.get('filePath') or ''),
                 }
 
         return self.entry_points
@@ -413,6 +477,28 @@ def library_seed_ids(functions):
     return seeds
 
 
+def real_entry_point_ids(entry_points, functions):
+    """Entry-point ids that are REAL structural seeds — excludes synthesized
+    fuzz harnesses.
+
+    A libFuzzer ``fuzz_target!`` harness is lifted as an entry point with
+    ``unit_type=main`` (so it seeds the BFS) but it is NOT a program root: it is
+    tagged ``synthetic_harness=True``. When the ONLY seeds are synthetic
+    harnesses — a pure-library-plus-fuzz target whose real public API is often
+    macro-hidden from the call graph — the keep-all blackout net must still fire
+    instead of trusting the harness-only reachable set, which would silently drop
+    the un-reached exported surface. Shared by ``core.parser_adapter`` and the
+    rust pipeline so the two nets cannot drift. Both key casings are accepted
+    (subprocess pipelines normalize to camelCase while the on-disk call_graph is
+    snake_case), matching ``library_seed_ids``.
+    """
+    return {
+        ep for ep in entry_points
+        if not (functions.get(ep, {}).get("synthetic_harness")
+                or functions.get(ep, {}).get("syntheticHarness"))
+    }
+
+
 # Reason categories that indicate a STRUCTURAL entry point — a real route, program
 # main, CLI command, framework handler, or decorator-marked endpoint — as opposed
 # to an INCIDENTAL match (code merely contains an input-reading pattern). A result
@@ -421,20 +507,101 @@ def library_seed_ids(functions):
 _STRUCTURAL_REASON_CATEGORIES = {"unit_type", "decorator", "name"}
 
 
+def classify_seeds(entry_point_details):
+    """(structural, incidental) counts over the real seeds.
+
+    Shared by the blackout advisory and the reachability_filter metadata so
+    the three pipeline call sites (core/parser_adapter, the rust and swift
+    test_pipelines) cannot drift apart. Mirrors the advisory's rule exactly:
+    synthetic harnesses and non-runtime mains are excluded from both counts.
+    """
+    structural = incidental = 0
+    for d in (entry_point_details or {}).values():
+        if d.get("synthetic_harness") or d.get("non_runtime_main"):
+            continue
+        if any(r.split(":", 1)[0] in _STRUCTURAL_REASON_CATEGORIES
+               for r in d.get("reasons", [])):
+            structural += 1
+        else:
+            incidental += 1
+    return structural, incidental
+
+
+def _is_non_runtime_main(file_path: str) -> bool:
+    """True when a `main` in this file runs at build/example/bench time rather
+    than as the crate's deployed runtime entry point, so it must NOT count as a
+    structural entry point for the blackout advisory. The main is still SEEDED
+    (over-seeding is reachability-safe); only the advisory's structural count
+    excludes it. Mirrors the ``synthetic_harness`` exclusion, path-based on Cargo
+    conventions:
+
+      * a crate-root ``build.rs`` (compile-time build script), and
+      * ``examples/`` and ``benches/`` targets (auxiliary binaries that consume
+        the public API rather than being it).
+
+    A file UNDER ``src/`` is an ordinary module, never one of these targets, so
+    it is left alone (a ``src/build.rs`` module or ``src/examples/`` submodule
+    stays structural).
+
+    Scope note: this is a purely path-based check applied to every language's
+    functions (the detector is shared across all parsers), not gated to Rust.
+    ``build.rs`` is Rust-specific, but ``examples/`` and ``benches/`` are a
+    common cross-language layout for non-runtime auxiliary code, so treating a
+    top-level ``examples/``/``benches/`` main as non-structural is intended for
+    any language — a Go/Python ``examples/`` demo is a consumer of the API, not
+    its structural entry point. The effect is confined to the advisory string
+    (never seeding), so the worst case is the library-blackout advisory firing
+    for a project whose only entry lives under ``examples/`` — which is itself a
+    library-shaped project the advisory means to flag.
+
+    Documented residual limits: a build script renamed via Cargo's
+    ``build = "custom.rs"`` manifest key is not recognised; a non-crate-root file
+    literally named ``build.rs`` (e.g. ``scripts/build.rs``) is over-tagged
+    (advisory noise only); and — pre-existing, orthogonal to this change — the
+    advisory itself is written only to ``metadata.reachability_filter.warning``
+    and stderr, not the CLI JSON/exit envelope, so a correctly-fired warning is
+    not yet surfaced to a CI consumer. This is a conservative check: an
+    unknown/empty path returns False (counts structural, i.e. pre-fix
+    behaviour), never dropping a real structural seed.
+    """
+    if not file_path:
+        return False
+    parts = file_path.replace("\\", "/").split("/")
+    ancestors = parts[:-1]
+    if "src" in ancestors:
+        return False
+    if parts[-1] == "build.rs":
+        return True
+    return "examples" in ancestors or "benches" in ancestors
+
+
 def blackout_warning(entry_point_details, original_count, reachable_count,
-                     library_mode=False, reduction_threshold=0.90):
+                     library_mode=False, reduction_threshold=0.90,
+                     extra_seed_count=0):
     """Advisory string when a reachability result looks like a silent library
     blackout, else None. This is ADVISORY ONLY — it never changes which units
     are kept.
 
+    ``extra_seed_count`` (the fable+astra fold, #520): the number of
+    ACCEPTED-EFFECTIVE caller-supplied seeds (deduplicated, resolved to graph
+    nodes — never the raw list length). Empty detector details with extras
+    present is no longer a mute (the old >=0.90 fire there was silently
+    dropped — the #520 class re-created): the extras are NAMED as
+    unclassified instead. Extras are never claimed structural or incidental.
+
     Two triggers (both off when ``library_mode`` is set, since then the public
     API was deliberately seeded and a high reduction is the intended result):
       * total blackout — 0 of N units kept (no seedable frontier); or
-      * partial blackout — >= ``reduction_threshold`` pruned AND no STRUCTURAL
-        entry point was found (every seed is an incidental ``input_pattern``
-        match). This is the case that slips past the zero-seed net: a handful of
-        incidental seeds yield a 96%+ reduction that looks like success while the
-        real public API surface was never analysed (e.g. a C/JS parser library).
+      * incidental-only seeding — NO STRUCTURAL entry point was found (every
+        real seed is an incidental ``input_pattern`` match). #520: the old
+        ``reduction >= threshold`` gate made this advisory provably silent for
+        exactly the measured class (an 87.9% collapse sits under a 0.90 band)
+        — the gate is dropped; the advisory fires at any reduction, with the
+        wording scaled to what actually happened (a sub-threshold reduction
+        kept most units and must not claim the core was dropped). This is the
+        case that slips past the zero-seed net: a handful of incidental seeds
+        yield a high reduction that looks like success while the real public
+        API surface was never analysed (e.g. a C/JS parser library).
     """
     if original_count <= 0 or library_mode:
         return None
@@ -443,15 +610,63 @@ def blackout_warning(entry_point_details, original_count, reachable_count,
                 f"(no entry point could seed the frontier). If this is a library, "
                 f"re-run with --library-mode to seed the exported public API surface.")
     reduction = 1.0 - (reachable_count / original_count)
-    structural = sum(
-        1 for d in (entry_point_details or {}).values()
-        if any(r.split(":", 1)[0] in _STRUCTURAL_REASON_CATEGORIES
-               for r in d.get("reasons", []))
-    )
-    if reduction >= reduction_threshold and structural == 0:
-        return (f"Reachability kept {reachable_count} of {original_count} units "
-                f"({reduction * 100:.0f}% pruned) but found NO structural entry point "
-                f"(route/main/CLI/handler) — only incidental code-pattern seeds. This is "
-                f"the library-blackout pattern: the public API was not seeded, so the core "
-                f"was dropped. Re-run with --library-mode to seed the exported public API.")
+    structural, incidental = classify_seeds(entry_point_details)
+    # #520 (the fable+astra fold): the ratio gate is dropped — the advisory
+    # fires whenever NO seed is structural, at any reduction, with the wording
+    # scaled to what actually happened. EMPTY details is no longer a mute
+    # (the old gate fired there at >=90% — silencing it re-created the #520
+    # class on the LLM path): the caller-supplied seeds are NAMED as
+    # unclassified instead. The caller passes the accepted-effective seed
+    # count (deduplicated, resolved to graph nodes) via extra_seed_count.
+    if structural == 0:
+        if not entry_point_details and extra_seed_count:
+            # Caller-supplied roots only: describe them, never mute — the
+            # provenance says "chosen by the caller", not "structural".
+            if reduction >= reduction_threshold:
+                return (f"Reachability kept {reachable_count} of {original_count} units "
+                        f"({reduction * 100:.0f}% pruned) with NO structural entry point "
+                        f"detected (route/main/CLI/handler) — the {extra_seed_count} "
+                        f"caller-supplied root(s) that seeded this run are unclassified. "
+                        "If this is a library, the public API surface may not have been "
+                        "seeded — re-run with --library-mode to seed it explicitly.")
+            return (f"Reachability found NO structural entry point "
+                    f"(route/main/CLI/handler) — the {extra_seed_count} "
+                    f"caller-supplied root(s) that seeded this run are unclassified "
+                    f"({reachable_count} of {original_count} units kept, "
+                    f"{reduction * 100:.0f}% pruned). If this is a library, "
+                    "re-run with --library-mode to seed the public API explicitly.")
+        if not entry_point_details and not extra_seed_count:
+            # No detector details AND no caller seeds: the old code was silent
+            # here below the threshold too — unchanged (nothing seeded the run
+            # that the keep-all net did not already catch).
+            return None
+        if extra_seed_count:
+            # Mixed: detector found incidental seeds AND caller supplied some.
+            # Name both; never claim "only incidental" while extras exist.
+            if reduction >= reduction_threshold:
+                return (f"Reachability kept {reachable_count} of {original_count} units "
+                        f"({reduction * 100:.0f}% pruned) but found NO structural entry point "
+                        f"(route/main/CLI/handler) — {incidental} incidental code-pattern "
+                        f"seed(s) and {extra_seed_count} caller-supplied unclassified "
+                        f"root(s). This is the library-blackout pattern: the public API "
+                        f"was not seeded, so the core may have been dropped. Re-run with "
+                        f"--library-mode to seed the exported public API.")
+            return (f"Reachability found NO structural entry point "
+                    f"(route/main/CLI/handler) — {incidental} incidental code-pattern "
+                    f"seed(s) and {extra_seed_count} caller-supplied unclassified "
+                    f"root(s) ({reachable_count} of {original_count} units kept, "
+                    f"{reduction * 100:.0f}% pruned). The public API surface was "
+                    f"not seeded; if this is a library, re-run with "
+                    f"--library-mode to seed it explicitly.")
+        if reduction >= reduction_threshold:
+            return (f"Reachability kept {reachable_count} of {original_count} units "
+                    f"({reduction * 100:.0f}% pruned) but found NO structural entry point "
+                    f"(route/main/CLI/handler) — only incidental code-pattern seeds. This is "
+                    f"the library-blackout pattern: the public API was not seeded, so the core "
+                    f"was dropped. Re-run with --library-mode to seed the exported public API.")
+        return (f"Reachability found NO structural entry point (route/main/CLI/"
+                f"handler) — only incidental code-pattern seeds ({reachable_count} "
+                f"of {original_count} units kept, {reduction * 100:.0f}% pruned). "
+                f"The public API surface was not seeded; if this is a library, "
+                f"re-run with --library-mode to seed it explicitly.")
     return None

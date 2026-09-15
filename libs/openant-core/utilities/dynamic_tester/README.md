@@ -146,10 +146,18 @@ pipeline_output.json
 | `docker_executor.py` | Builds images, runs containers, handles compose and cleanup |
 | `result_collector.py` | Parses container stdout JSON, classifies results |
 | `reporter.py` | Generates the Markdown report |
-| `docker_templates/python.Dockerfile` | Reference Dockerfile for Python tests (`python:3.11-slim`) |
-| `docker_templates/node.Dockerfile` | Reference Dockerfile for Node.js tests (`node:20-slim`) |
-| `docker_templates/go.Dockerfile` | Reference Dockerfile for Go tests (`golang:1.22-alpine`) |
-| `docker_templates/attacker_server.py` | HTTP capture server for SSRF/exfiltration tests (port 9999) |
+| `docker_templates/python.Dockerfile` | Reference Dockerfile for Python tests (documentation only) |
+| `docker_templates/node.Dockerfile` | Reference Dockerfile for Node.js tests (documentation only) |
+| `docker_templates/go.Dockerfile` | Reference Dockerfile for Go tests (documentation only) |
+| `docker_templates/attacker_server.py` | HTTP capture server for SSRF/exfiltration tests (port 9999) — the only file here the executor reads |
+
+Note: the `*.Dockerfile` templates are **reference documentation, not the
+runtime**. The Dockerfile actually built for each test is LLM-generated per
+finding (`generation["dockerfile"]`, written by `docker_executor.py`); the
+only prompt-pinned base image is Go (`test_generator.py`); Python/Node base
+images are chosen per generation; the attacker sidecar's image is inlined in
+`docker_executor.py`. Do not reason about test runtimes from the template
+files — that has misled review before (see #351's correction comment).
 
 ## Container Output Contract
 
@@ -184,15 +192,22 @@ All debug output must go to stderr. The result collector looks for the last vali
 
 All containers run with strict isolation:
 
-- **Read-only filesystem** (`--read-only`) with `/tmp` as a writable tmpfs
+- **Read-only filesystem** (`--read-only`) with `/tmp` and `/root` as writable tmpfs
 - **No privilege escalation** (`--security-opt no-new-privileges`)
+- **All capabilities dropped** (`--cap-drop ALL`)
+- **PID limit** — 256 (`--pids-limit`)
 - **Memory limit** — 512 MB (`--memory 512m`)
 - **CPU limit** — 1 CPU (`--cpus 1`)
-- **Isolated network** — each test gets its own Docker network
-- **No host volume mounts** — containers cannot access the host filesystem
+- **Isolated network** — single-container tests run with `--network none`; multi-service
+  tests run on an `internal: true` Docker network (no external gateway)
+- **No host volume mounts / no privileged mode** — enforced, not assumed: an untrusted
+  multi-service `docker-compose` is *reconstructed* from an allowlist (see below), so
+  `privileged`, `cap_add`, host `volumes`, `pid`/`ipc`/`network_mode`, `devices`, etc.
+  cannot reach the runtime
 - **Timeouts** — 120s for execution, 300s for builds
 
-Multi-service tests (e.g., those needing the attacker capture server) use Docker Compose with a bridge network.
+Multi-service tests (e.g., those needing the attacker capture server) use Docker Compose
+on an internal network, with each service reconstructed and hardened identically.
 
 ## Attacker Capture Server
 

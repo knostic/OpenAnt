@@ -9,7 +9,6 @@ from utilities.llm import (
     ConfigError,
     LLMConfig,
     PhaseRef,
-    ProviderConfig,
     parse_config,
     serialise_config,
 )

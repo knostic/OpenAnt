@@ -1,7 +1,6 @@
 """CLI entry point: python -m utilities.dynamic_tester pipeline_output.json [--output-dir DIR]"""
 
 import argparse
-import sys
 
 from utilities.dynamic_tester import run_dynamic_tests
 

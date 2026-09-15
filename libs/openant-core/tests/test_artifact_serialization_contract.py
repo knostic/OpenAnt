@@ -11,14 +11,19 @@ this contract they omitted three things that make a scan auditable:
   ``degraded`` …) — a merged or degraded scan was indistinguishable from a
   clean single-language one.
 * the walker's skipped-symlink / unreadable-directory counts, and the sha256 of
-  a repo-supplied threat model (R5 provenance).
+  a repo-supplied threat model (R5 provenance);
+* inputs provenance (#613) — ``inputs.repo_path`` is the actual scan target
+  (the caller-threaded repo path), never the output directory.
 
 These tests read the FILES ON DISK. Asserting on ``ScanResult.to_dict()`` is
 exactly what let the gap survive: ``to_dict()`` had the fields, but the code that
 wrote ``scan.report.json`` hand-built a summary that dropped them. The mutation
-that proves these tests bite: revert ``_write_scan_report`` to the hand-built
-summary (units_count/language/metrics/steps_* only) and every disk assertion
-below goes red while ``to_dict()`` stays green.
+that proves the summary assertions bite: revert ``_write_scan_report`` to the
+hand-built summary (units_count/language/metrics/steps_* only) and every
+summary-field disk assertion below goes red while ``to_dict()`` stays green.
+The inputs-provenance assertion (#613) has its own revert: drop the
+``repo_path`` threading and it goes red while every summary assertion stays
+green.
 """
 
 from __future__ import annotations
@@ -71,7 +76,8 @@ def test_scan_report_carries_threat_model_provenance_and_coverage(tmp_path: Path
         threat_model_sha256="deadbeef" * 8,
         threat_model_warnings=["every input source marked trusted"],
     )
-    report_path = _write_scan_report(str(out), result, step_reports=[])
+    report_path = _write_scan_report(str(out), result, step_reports=[],
+                                        repo_path=str(out.parent / "repo"))
 
     summary = _read(Path(report_path))["summary"]
 
@@ -98,6 +104,10 @@ def test_scan_report_carries_threat_model_provenance_and_coverage(tmp_path: Path
     # python instruments coverage, so it is NOT disclosed as missing data.
     assert cov["languages_without_coverage_data"] == []
 
+    # inputs provenance (#613): the scan target, not the output directory
+    inputs = _read(Path(report_path))["inputs"]
+    assert inputs["repo_path"] == str(out.parent / "repo")
+
 
 def test_scan_report_omits_sha_when_no_threat_model(tmp_path: Path):
     """Negative control: sha KEY ABSENT (not the empty-string hash) with no TM."""
@@ -110,7 +120,8 @@ def test_scan_report_omits_sha_when_no_threat_model(tmp_path: Path):
         units_count=1,
         context_source="generated",
     )
-    report_path = _write_scan_report(str(out), result, step_reports=[])
+    report_path = _write_scan_report(str(out), result, step_reports=[],
+                                        repo_path=str(out.parent / "repo"))
     summary = _read(Path(report_path))["summary"]
 
     assert summary["context_source"] == "generated"
@@ -124,19 +135,22 @@ def test_scan_report_omits_sha_when_no_threat_model(tmp_path: Path):
 def test_coverage_probe_discloses_uninstrumented_languages(tmp_path: Path):
     """An uninstrumented parser (Go) is DISCLOSED, never summed as a false 0.
 
-    The Go fixture below is the REAL shape the Go parser emits — camelCase-only
-    statistics with NO snake_case coverage keys. Building it from the actual
-    interface (not a hand-simplified snake_case dict) is the whole point: an
-    earlier version of this test used a snake_case Go/JS fixture, which was a
-    fake looser than the real parser output and masked the false-0 bug. The
-    assertion keys on the coverage PROBE (was the language instrumented?), so a
-    fixture that lies about the parser's output can no longer make it pass.
+    The Go fixture is the UNINSTRUMENTED shape — camelCase-only statistics
+    with NO snake_case coverage keys — deliberately kept as the historical
+    pre-instrumentation shape so the probe's disclosure contract stays
+    exercised even now that the real Go parser emits the snake_case keys
+    (go_parser/types.go). Building it from the actual interface (not a
+    hand-simplified snake_case dict) remains the point: a fixture that lies
+    about a parser's output can mask the false-0 bug. The assertion keys on
+    the coverage PROBE (was the language instrumented?).
     """
     out = tmp_path / "run"
     (out / "python").mkdir(parents=True)
     (out / "go").mkdir()
     _scan_result_with_symlinks(out / "python", "python")  # instrumented, 2 skipped
-    # Real Go output: camelCase, no symlinks_skipped / directories_unreadable.
+    # The pre-instrumentation Go shape: camelCase, no coverage keys (the
+    # real parser emits them now — types.go; the fixture keeps the
+    # uninstrumented shape alive for the probe's contract).
     (out / "go" / "scan_results.json").write_text(json.dumps({
         "statistics": {
             "totalFiles": 4,
@@ -153,7 +167,8 @@ def test_coverage_probe_discloses_uninstrumented_languages(tmp_path: Path):
             "go": {"output_dir": str(out / "go")},
         },
     )
-    report_path = _write_scan_report(str(out), result, step_reports=[])
+    report_path = _write_scan_report(str(out), result, step_reports=[],
+                                        repo_path=str(out.parent / "repo"))
     cov = _read(Path(report_path))["summary"]["coverage"]
 
     # Only python's skips are counted; Go's absent keys are NOT summed as 0.
@@ -162,6 +177,12 @@ def test_coverage_probe_discloses_uninstrumented_languages(tmp_path: Path):
     # Go is disclosed as uninstrumented; a bare "0" would have been a false
     # assurance. python (instrumented) is NOT in the list.
     assert cov["languages_without_coverage_data"] == ["go"]
+    # #606: the per-key disclosure lists — Go (uninstrumented) is missing
+    # every key, so it appears in each key's exclusion list too (the
+    # generated present-only keys; the fixture predates Go's
+    # instrumentation).
+    assert "languages_without_symlinks_skipped_data" in cov
+    assert cov["languages_without_symlinks_skipped_data"] == ["go"]
 
 
 def test_coverage_missing_scan_file_is_disclosed_not_zeroed(tmp_path: Path):
@@ -169,7 +190,8 @@ def test_coverage_missing_scan_file_is_disclosed_not_zeroed(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir()
     result = ScanResult(output_dir=str(out), language="python", languages=["python"])
-    report_path = _write_scan_report(str(out), result, step_reports=[])
+    report_path = _write_scan_report(str(out), result, step_reports=[],
+                                        repo_path=str(out.parent / "repo"))
     cov = _read(Path(report_path))["summary"]["coverage"]
     assert cov["symlinks_skipped"] == 0
     assert cov["languages_without_coverage_data"] == ["python"]

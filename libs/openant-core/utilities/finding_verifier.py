@@ -49,19 +49,55 @@ from .llm import (
     ToolUseBlock,
     lookup_pricing,
 )
+# #290: this loop bypasses simple_text (it needs raw content blocks for the
+# tool conversation), so it takes its output budget from the SAME constant as
+# simple_text's default — a private 4096 here is how PR #242's raise never
+# reached verify on any route.
+from .llm.helpers import DEFAULT_MAX_TOKENS
 
 # Null logger that discards all messages (used when no logger provided)
 _null_logger = logging.getLogger("null_verifier")
 _null_logger.addHandler(logging.NullHandler())
 from .agentic_enhancer.repository_index import RepositoryIndex
 from .agentic_enhancer.tools import ToolExecutor
+# #291: the enhance loop has capped its conversation input since PR #133
+# (MAX_PROMPT_CHARS on inlined primary_code, cap_tool_result_content on every
+# serialized tool result) with a comment naming the failure mode — unbounded
+# input growth until context overflow (400). This loop is structurally
+# identical (20-iteration tool conversation) and applied NEITHER cap: raw
+# json.dumps(outcome) appended every turn, so verify's input grew without
+# bound. Reuse the enhance caps rather than redefining them, so the two
+# loops cannot drift apart.
+from .agentic_enhancer.agent import (
+    MAX_PROMPT_CHARS,
+    cap_tool_result_content,
+)
+# RE-EXPORT, not unused: core/verifier.py imports MAX_TOOL_RESULT_CHARS
+# from THIS module (it feeds the "max_tool_result_chars" key in the
+# verify output schema). A same-file usage scan will not see it — the
+# #482-trap's from-import form. Keep the explicit re-export + noqa.
+from .agentic_enhancer.agent import MAX_TOOL_RESULT_CHARS as MAX_TOOL_RESULT_CHARS  # noqa: F401
 from prompts.verification_prompts import (
-    VERIFICATION_SYSTEM_PROMPT,
     get_verification_prompt,
     get_verification_system_prompt,
     get_consistency_check_prompt
 )
-from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+from core.verdict_taxonomy import DISCLOSURE_DROPPED, FINDING_VERDICT_ORDER
+
+# #448 (wave r1, three axes): the correction targets are the verify `finish`
+# enum — FINDING_VERDICT_ORDER, nothing else. STAGE2_VERDICTS is a DIFFERENT
+# key (the reporter's derived stage2_verdict display field: no producer ever
+# writes confirmed/agreed/unverified/rejected into `finding`, and admitting
+# them re-opened the exact bucket-drop this fix closes — a conformant-looking
+# "confirmed" is a MORE plausible model emission than "MAYBE VULNERABLE").
+# error and insufficient_context are legitimate STATES of `finding` but not
+# legitimate CORRECTION TARGETS: both are outside DISCLOSURE_DROPPED, so
+# admitting them let a pattern-similarity pass move a conclusively-EXPLOITABLE
+# row to an uncounted/unverified shape PAST the F-KB-1b guard (the exact class
+# #195/#243 closed). With FINDING_VERDICT_ORDER alone, every admitted
+# non-DROPPED value is vulnerable/bypassable — the guard's complement is
+# well-defined.
+_CORRECTABLE_STAGE2_FINDINGS = frozenset(FINDING_VERDICT_ORDER)
 
 # Import application context type for type hints
 try:
@@ -71,7 +107,28 @@ except ImportError:
 
 
 MAX_ITERATIONS = 20
-MAX_TOKENS_PER_RESPONSE = 4096
+# #290: was a private 4096 — half of simple_text's raised default, on the
+# largest units in the scan, by a route PR #242 could not reach. A truncated
+# finish call is deliberately downgraded to verification-incomplete (FN-safe
+# direction), so an undersized cap silently converts adjudications into
+# needs_review. Shares simple_text's thinking-era budget; see
+# llm/helpers.py:DEFAULT_MAX_TOKENS.
+MAX_TOKENS_PER_RESPONSE = DEFAULT_MAX_TOKENS
+
+# #296: the ONE incomplete-verification marker the conclusive-exploit-path
+# guards exact-match today. Deliberately a single string — introducing the
+# constant must NOT change which inputs match. Widening it to the other
+# incomplete markers ("Verification incomplete (finish call truncated at
+# max_tokens)", "... (no tool calls)", the errored note, or model-authored
+# text) would make BOTH guards return False more often, and for both that
+# is the false-negative direction traced in #296: _has_conclusive_exploit_path
+# stops protecting the Stage-1 verdict, and _has_conclusive_exploitable_path
+# stops blocking the downgrade into DISCLOSURE_DROPPED — re-opening the
+# silent vulnerable->safe/inconclusive/rejected family PR #195/#243 closed.
+# Any behavior change here must be direction-aware first (see #296's
+# suggested-fix section): an unfinished verification must not become the
+# reason a finding is downgraded out of disclosure.
+INCOMPLETE_VERIFICATION_MARKER = "Max iterations reached"
 
 
 # Expected JSON shape of a verifier `finish` response — handed to JSONCorrector
@@ -273,6 +330,15 @@ class VerificationResult:
     # lets the reporter render "unverified" (not "rejected") and lets the
     # metrics bucket it as needs-review (not "safe").
     incomplete: bool = False
+    # #521: the model-supplied verdict withheld by the incomplete-finish
+    # severity rule, verbatim (None when nothing was withheld). Serialized
+    # so the triager can see what the unfinished verification proposed.
+    withheld_correct_finding: Optional[str] = None
+    # #211 pass-through capture: per-turn provider usage detail dicts
+    # (verbatim; None entries for turns that reported none). Serialized
+    # into the unit's verification record so results_verified.json is
+    # reconcilable against a provider bill; never summed, never in cost.
+    usage_details: Optional[list] = None
 
     def to_dict(self) -> dict:
         result = {
@@ -282,6 +348,8 @@ class VerificationResult:
             "iterations": self.iterations,
             "total_tokens": self.total_tokens
         }
+        if self.usage_details is not None:
+            result["usage_details"] = self.usage_details
         if self.exploit_path:
             result["exploit_path"] = self.exploit_path.to_dict()
         if self.security_weakness:
@@ -289,6 +357,8 @@ class VerificationResult:
         # Always serialize the incomplete flag so downstream consumers
         # (core/reporter.py, core/verifier.py) can branch on it explicitly.
         result["incomplete"] = self.incomplete
+        if self.withheld_correct_finding is not None:
+            result["withheld_correct_finding"] = self.withheld_correct_finding
         return result
 
 
@@ -377,6 +447,13 @@ class FindingVerifier:
         Returns:
             VerificationResult with verdict, exploit path, and explanation
         """
+        # #291: cap the inlined unit code the way the enhance loop caps its
+        # primary_code (MAX_PROMPT_CHARS) — an oversized unit otherwise
+        # overflows the model context on turn 1. Explicit marker so the model
+        # knows content was elided.
+        if len(code) > MAX_PROMPT_CHARS:
+            marker = "\n... (truncated)"
+            code = code[: MAX_PROMPT_CHARS - len(marker)] + marker
         user_prompt = get_verification_prompt(
             code=code,
             finding=finding,
@@ -395,6 +472,10 @@ class FindingVerifier:
         iterations = 0
         total_input_tokens = 0
         total_output_tokens = 0
+        # #211 pass-through capture: per-turn provider usage detail dicts,
+        # verbatim (None entries for turns whose provider reported none).
+        # Passed to record_call as a list; never summed, never in cost.
+        per_turn_usage_details: list = []
 
         while iterations < MAX_ITERATIONS:
             iterations += 1
@@ -402,16 +483,53 @@ class FindingVerifier:
             self._log("debug", f"Iteration {iterations}", iterations=iterations)
 
             # Adapter handles the rate-limiter wait/report dance internally.
-            response = self.binding.adapter.complete(
-                model=self.binding.model,
-                max_tokens=MAX_TOKENS_PER_RESPONSE,
-                system=system_prompt,
-                tools=self._tool_defs,
-                messages=messages,
-            )
+            # #616: a mid-conversation raise must not vanish the accumulated
+            # usage — the conversation's spend (the frame-local accumulation
+            # plus the raising turn's own reported tokens) reaches the
+            # tracker BEFORE the re-raise (the #537/#549 idiom, applied at
+            # the boundary the verifier actually uses — this loop bypasses
+            # helpers.simple_completion). Exactly-once: every normal exit
+            # returns immediately after its own record_call, so this handler
+            # can only fire on a path no other record took.
+            try:
+                response = self.binding.adapter.complete(
+                    model=self.binding.model,
+                    max_tokens=MAX_TOKENS_PER_RESPONSE,
+                    system=system_prompt,
+                    tools=self._tool_defs,
+                    messages=messages,
+                )
+            except Exception as exc:
+                exc_in = int(getattr(exc, "input_tokens", 0) or 0)
+                exc_out = int(getattr(exc, "output_tokens", 0) or 0)
+                # Only LLMResponseError carries the raising turn's tokens;
+                # connection/auth/limit errors contribute nothing (and a
+                # turn-1 failure with zero accumulated usage writes NO
+                # record — the helpers' guard, mirrored: record_call
+                # appends a $0 call record unconditionally otherwise).
+                if (total_input_tokens or total_output_tokens
+                        or exc_in or exc_out):
+                    # The raising turn's usage is ONLY on the exception
+                    # (the accumulation below runs after complete returns).
+                    # Its per-turn list entry is appended ONLY when the
+                    # exception carries tokens (LLMResponseError) — a
+                    # connection/auth/limit raise billed nothing for the
+                    # raising turn, so no entry is added for it (the list
+                    # length equals the turns billed). Conversation-level
+                    # record, never relabeled per-request.
+                    self.tracker.record_call(
+                        model=self.binding.model,
+                        input_tokens=total_input_tokens + exc_in,
+                        output_tokens=total_output_tokens + exc_out,
+                        pricing=lookup_pricing(self.binding),
+                        usage_details=per_turn_usage_details
+                        + ([None] if (exc_in or exc_out) else []),
+                    )
+                raise
 
             total_input_tokens += response.input_tokens
             total_output_tokens += response.output_tokens
+            per_turn_usage_details.append(response.usage_details)
 
             assistant_content = response.content
             stop_reason = response.stop_reason
@@ -420,7 +538,8 @@ class FindingVerifier:
             if stop_reason == "end_turn":
                 result = self._try_parse_text_response(
                     assistant_content, finding, iterations,
-                    total_input_tokens, total_output_tokens
+                    total_input_tokens, total_output_tokens,
+                    usage_details=per_turn_usage_details,
                 )
                 if result:
                     return result
@@ -442,10 +561,12 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return VerificationResult(
                     agree=False,
                     correct_finding=finding,
+                    usage_details=per_turn_usage_details,
                     explanation="Verification incomplete",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
@@ -480,7 +601,12 @@ class FindingVerifier:
                             ToolResultBlock(
                                 tool_use_id=tool_use_id,
                                 name=tool_name,
-                                content=json.dumps(outcome),
+                                # #291: capped, not raw json.dumps — the
+                                # enhance loop's cap_tool_result_content
+                                # (PR #133) with the same 24k limit; raw
+                                # appends grew verify's input without bound
+                                # across the 20 iterations.
+                                content=cap_tool_result_content(outcome),
                             )
                         )
 
@@ -497,10 +623,12 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return VerificationResult(
                     agree=False,
                     correct_finding=finding,
+                    usage_details=per_turn_usage_details,
                     explanation="Verification incomplete (finish call truncated at max_tokens)",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
@@ -513,10 +641,12 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 return self._parse_finish_result(
                     finish_result, finding, iterations,
-                    total_input_tokens + total_output_tokens
+                    total_input_tokens + total_output_tokens,
+                    usage_details=per_turn_usage_details,
                 )
 
             # Echo only the block kinds the loop consumes (Text + ToolUse);
@@ -534,12 +664,14 @@ class FindingVerifier:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
+                    usage_details=per_turn_usage_details,
                 )
                 # Fail-safe (R4-7): see the :380 path above. Don't auto-agree;
                 # keep the Stage-1 verdict surfaced for human triage.
                 return VerificationResult(
                     agree=False,
                     correct_finding=finding,
+                    usage_details=per_turn_usage_details,
                     explanation="Verification incomplete (no tool calls)",
                     iterations=iterations,
                     total_tokens=total_input_tokens + total_output_tokens,
@@ -553,12 +685,14 @@ class FindingVerifier:
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
+            usage_details=per_turn_usage_details,
         )
         # Fail-safe (R4-7): exhausting the iteration budget is not agreement.
         # Don't auto-agree; keep the Stage-1 verdict surfaced for human triage.
         return VerificationResult(
             agree=False,
             correct_finding=finding,
+            usage_details=per_turn_usage_details,
             explanation="Max iterations reached",
             iterations=iterations,
             total_tokens=total_input_tokens + total_output_tokens,
@@ -573,6 +707,7 @@ class FindingVerifier:
         workers: int = 10,
         checkpoint=None,
         restored_callback: Optional[Callable] = None,
+        phase_baseline: dict | None = None,
     ) -> list:
         """
         Verify a batch of results with consistency cross-check.
@@ -601,18 +736,35 @@ class FindingVerifier:
             checkpointed = checkpoint.load()
 
         def _cp_is_error(cp_data):
-            """A verify checkpoint is errored if verification is missing/empty
-            or correct_finding == 'error'."""
+            """A verify checkpoint is errored (retryable on resume) when:
+            verification is missing/empty, correct_finding == 'error',
+            OR the checkpoint carries the adapter-raise ``error`` string.
+
+            #286: the verify ERROR path (adapter raise — the retryable
+            class) writes the error string on the RESULT dict; the checkpoint
+            writer now copies it into ``cp_data["error"]``. That field is
+            the SURGICAL retry signal. ``verification.incomplete`` alone is
+            deliberately NOT a retry signal: five non-error fail-safe
+            writers set incomplete=True (degenerate finish, truncated
+            finish, no tool calls, max iterations, plus the error path) —
+            those are deterministic outcomes, and retrying them on every
+            resume is unbounded waste (wave catches F1/F2: Opus 5 refusals
+            are deterministic; they would retry forever).
+            """
             if not cp_data:
                 return True
             v = cp_data.get("verification", {})
             if not v:
                 return True
-            return v.get("correct_finding") == "error"
+            if v.get("correct_finding") == "error":
+                return True
+            return bool(cp_data.get("error"))
 
         # Separate already-done (successful) from to-do (new + errored)
         results_to_verify = []
         _restored_ok = 0
+        _restored_incomplete = 0
+        _errored_retried = 0
         for r in results:
             key = r.get("unit_id") or r.get("route_key", "unknown")
             cp_data = checkpointed.get(key)
@@ -624,28 +776,39 @@ class FindingVerifier:
                     r["finding"] = cp_data["finding"]
                 if "verification_note" in cp_data:
                     r["verification_note"] = cp_data["verification_note"]
-                _restored_ok += 1
+                # #293: a restored INCOMPLETE checkpoint (verdict present but
+                # incomplete) is restored work, but not a completion — seed
+                # the third bucket so the summary never counts it completed.
+                _ver = cp_data.get("verification", {})
+                if isinstance(_ver, dict) and _ver.get("incomplete"):
+                    _restored_incomplete += 1
+                else:
+                    _restored_ok += 1
             else:
                 # Either no checkpoint, or an errored one — re-verify
                 results_to_verify.append(r)
+                if cp_data:
+                    _errored_retried += 1
 
-        if _restored_ok:
-            print(f"[Verify] Restored {_restored_ok} findings from checkpoints",
-                  file=sys.stderr, flush=True)
+        if _restored_ok or _restored_incomplete:
+            print(f"[Verify] Restored {_restored_ok + _restored_incomplete} findings "
+                  f"from checkpoints", file=sys.stderr, flush=True)
             if restored_callback:
-                restored_callback(_restored_ok)
-        errored_retries = len(checkpointed) - _restored_ok
+                restored_callback(_restored_ok + _restored_incomplete)
+        errored_retries = _errored_retried
         if errored_retries:
             print(f"[Verify] Retrying {errored_retries} previously errored findings",
                   file=sys.stderr, flush=True)
 
         # Initialize summary tracking for _summary.json
         _summary_completed = _restored_ok
+        _summary_incomplete = _restored_incomplete
         _summary_errors = 0
         _summary_error_breakdown = {}
         _summary_input_tokens = 0
         _summary_output_tokens = 0
         _summary_cost_usd = 0.0
+        _summary_unpriced: set[str] = set()
 
         # Sum usage from ALL existing checkpoints (including errored ones
         # — their cost was already spent in a prior run)
@@ -654,29 +817,49 @@ class FindingVerifier:
             _summary_input_tokens += _cp_usage.get("input_tokens", 0)
             _summary_output_tokens += _cp_usage.get("output_tokens", 0)
             _summary_cost_usd += _cp_usage.get("cost_usd", 0.0)
+            # #216: restore the incomplete-cost marker per unit.
+            _summary_unpriced.update(_cp_usage.get("unpriced_models") or [])
 
         def _usage_dict():
-            return {"input_tokens": _summary_input_tokens,
-                    "output_tokens": _summary_output_tokens,
-                    "cost_usd": round(_summary_cost_usd, 6)}
+            usage = {"input_tokens": _summary_input_tokens,
+                     "output_tokens": _summary_output_tokens,
+                     "cost_usd": round(_summary_cost_usd, 6)}
+            # #216: persist the unpriced set into _summary.json (mirrors
+            # analyzer's — a resume-of-resume keeps the marker).
+            if _summary_unpriced:
+                usage["cost_incomplete"] = True
+                usage["unpriced_models"] = sorted(_summary_unpriced)
+            return usage
 
         # Inject prior usage into tracker so step_report captures the total
-        if _summary_input_tokens or _summary_output_tokens:
+        if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
             self.tracker.add_prior_usage(
-                _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+                _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
+                unpriced_models=sorted(_summary_unpriced) or None)
+            # #281: refresh the caller's phase baseline AFTER the injection
+            # so its "Stage 2" delta excludes the restored usage.
+            if phase_baseline is not None:
+                from core import tracking as _tracking
+                phase_baseline["usage"] = _tracking.get_usage()
 
         if checkpoint is not None:
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                      _summary_error_breakdown, phase="in_progress",
-                                     usage=_usage_dict())
+                                     usage=_usage_dict(), incomplete=_summary_incomplete)
 
         def _summary_callback(detail, usage=None):
             """Update summary counters after each unit. Called from main thread."""
-            nonlocal _summary_completed, _summary_errors, _summary_error_breakdown
+            nonlocal _summary_completed, _summary_incomplete, _summary_errors
+            nonlocal _summary_error_breakdown
             nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
             if detail == "error":
                 _summary_errors += 1
                 _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
+            elif detail.startswith("incomplete"):
+                # #293: the third state — the loop never reached a verdict.
+                # _verify_one tags incomplete units "incomplete:<finding>"
+                # (our own deterministic prefix, not model text).
+                _summary_incomplete += 1
             else:
                 _summary_completed += 1
             if usage:
@@ -686,12 +869,19 @@ class FindingVerifier:
             if checkpoint is not None:
                 checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                          _summary_error_breakdown, phase="in_progress",
-                                         usage=_usage_dict())
+                                         usage=_usage_dict(), incomplete=_summary_incomplete)
 
         remaining = len(results_to_verify)
+        # #542 (the #435 family, PR #472's verify sibling): "already done"
+        # derives from the RESTORED-COMPLETE counts, not the raw checkpoint
+        # store — the store includes the errored rows being re-queued, so
+        # the old line narrated "3 to verify (3 already done)" over a
+        # population of 4 (1 complete + 2 being retried). Done + remaining
+        # must reconcile to the findings population.
+        _done = _restored_ok + _restored_incomplete
         mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
         print(f"[Verify] Mode: {mode}, {remaining} findings to verify "
-              f"({len(checkpointed)} already done)", file=sys.stderr, flush=True)
+              f"({_done} already done)", file=sys.stderr, flush=True)
 
         if workers <= 1:
             self._verify_batch_sequential(
@@ -706,7 +896,7 @@ class FindingVerifier:
         if checkpoint is not None:
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                      _summary_error_breakdown, phase="done",
-                                     usage=_usage_dict())
+                                     usage=_usage_dict(), incomplete=_summary_incomplete)
 
         # Step 2: Consistency cross-check (barrier — needs all results)
         results = self._check_consistency(results, code_by_route)
@@ -737,7 +927,28 @@ class FindingVerifier:
 
             result["verification"] = verification.to_dict()
 
-            if verification.agree:
+            # #293: an INCOMPLETE verification (the loop never reached a
+            # verdict) is neither a completion nor a disagreement — it is
+            # un-adjudicated. Before this branch it fell into the disagreed
+            # else: counted as a completion by the summary callback AND
+            # stamped with the false "Changed from X to X" note (Stage-1
+            # verdict is preserved in incomplete results, so X == X).
+            if verification.incomplete:
+                # FAM-REPORT-2 (wave catch): the self-contradictory-finish
+                # path returns incomplete=True with correct_finding set to
+                # the MORE-SEVERE verdict — propagate it or the upgraded
+                # vuln is silently dropped at the reporter's disclosure
+                # filter. For the ordinary incomplete paths correct_finding
+                # IS the Stage-1 verdict, so this is a no-op there.
+                result["finding"] = verification.correct_finding
+                detail = f"incomplete:{verification.correct_finding}"
+                result["verification_note"] = (
+                    f"Verification incomplete: {verification.explanation}"
+                    if verification.explanation else "Verification incomplete")
+                self._log("info", f"Verification incomplete: {stage1_finding}",
+                          unit_id=route_key, total_tokens=verification.total_tokens,
+                          iterations=verification.iterations)
+            elif verification.agree:
                 detail = f"agreed:{verification.correct_finding}"
                 self._log("info", f"Verification agreed: {verification.correct_finding}",
                           unit_id=route_key, total_tokens=verification.total_tokens,
@@ -790,6 +1001,15 @@ class FindingVerifier:
                         "finding": result.get("finding", ""),
                         "verification_note": result.get("verification_note", ""),
                     }
+                    # #286: the adapter-raise error string lives on the
+                    # RESULT dict — copy it into the checkpoint so the
+                    # resume classifier can distinguish a retryable ERROR
+                    # (adapter raised) from a deterministic incomplete
+                    # (max-iterations / truncated finish / no tool calls —
+                    # those are stable outcomes, retrying them forever is
+                    # unbounded waste).
+                    if result.get("error"):
+                        cp_data["error"] = result["error"]
                     if usage:
                         cp_data["usage"] = usage
                     checkpoint.save(key, cp_data)
@@ -800,6 +1020,12 @@ class FindingVerifier:
         except KeyboardInterrupt:
             print("[Verify] Interrupted — progress saved to checkpoints",
                   file=sys.stderr, flush=True)
+            # #419 (the #417 class): the checkpoints hold the progress (every
+            # completed unit is saved as it completes) — the interrupt itself
+            # PROPAGATES so the CLI exits 130 with an interrupted envelope.
+            # Falling through made the scan continue with partially-verified
+            # results and complete with a SUCCESS envelope.
+            raise
 
     def _verify_batch_parallel(self, results, code_by_route, progress_callback, workers,
                                 checkpoint=None, summary_callback=None):
@@ -821,6 +1047,10 @@ class FindingVerifier:
                         "finding": result.get("finding", ""),
                         "verification_note": result.get("verification_note", ""),
                     }
+                    # #286: copy the adapter-raise error into the
+                    # checkpoint (see the sequential writer's note).
+                    if result.get("error"):
+                        cp_data["error"] = result["error"]
                     if usage:
                         cp_data["usage"] = usage
                     checkpoint.save(key, cp_data)
@@ -834,7 +1064,18 @@ class FindingVerifier:
             executor.shutdown(wait=False, cancel_futures=True)
             print("[Verify] Progress saved to checkpoints",
                   file=sys.stderr, flush=True)
-            return
+            # #419 (the #417 class): a bare `return` here swallowed the
+            # interrupt on the parallel path — the scan completed with a
+            # success envelope, no exit 130. Propagate (the checkpoints hold
+            # the completed units). Wave r1 (opus) residual, documented:
+            # cancel_futures cancels only QUEUED work — the <=workers
+            # in-flight verification loops keep running in non-daemon
+            # threads, and under the Go CLI the raise is bounded by the 5s
+            # SIGKILL; a DIRECT python -m openant invocation blocks in
+            # interpreter shutdown until they finish. Not a regression, and
+            # their results are not checkpointed (the save loop has exited)
+            # — the retry owns them on resume.
+            raise
         executor.shutdown(wait=False)
 
     def _check_consistency(
@@ -858,7 +1099,23 @@ class FindingVerifier:
             if len(group) < 2:
                 continue
 
-            verdicts = set(r.get("verification", {}).get("correct_finding") or r.get("finding") for r in group)
+            # #448 (wave r2 opus): normalize HERE — _parse_finish_result stores
+            # correct_finding verbatim, so a group all-vulnerable but stamped
+            # "VULNERABLE"/"vulnerable" read as inconsistent and spent a full
+            # _resolve_inconsistency LLM call on every batch, every run. This
+            # compare ALWAYS runs; the round-1 fix normalized only the (rarely
+            # reachable) apply-side compare.
+            def _norm_v(r):
+                v = (r.get("verification", {}).get("correct_finding")
+                     or r.get("finding"))
+                # #448 (wave r6 opus): a NON-STRING verdict (a list/dict from a
+                # text-mode reply or a checkpoint restore — never
+                # type-coerced on the way in) must not reach the set()
+                # construction: unhashable values crashed the Verify phase
+                # HERE, in the detector that ALWAYS runs. The Stage-1 twin
+                # coerces to "" on the same line (stage1_consistency.py:224).
+                return v.strip().lower() if isinstance(v, str) else ""
+            verdicts = set(_norm_v(r) for r in group)
             if len(verdicts) > 1:
                 inconsistent_groups.append((pattern, group))
 
@@ -868,32 +1125,183 @@ class FindingVerifier:
 
         # Fix inconsistencies
         for pattern, group in inconsistent_groups:
-            verdicts = [r.get("verification", {}).get("correct_finding") or r.get("finding") for r in group]
+            # #448 (wave r3 opus): the LOG keeps the RAW stamps — a
+            # case/whitespace anomaly in stored data is the same
+            # upstream-bug signal the audit `from` field preserves, and with
+            # the detector now normalized this line is the only surface where
+            # the anomaly is visible for an inconsistent group.
+            verdicts = [
+                (r.get("verification", {}).get("correct_finding") or r.get("finding"))
+                for r in group]
             self._log("warning", f"Inconsistency detected in pattern: {pattern}",
-                      details={"findings": [r.get('route_key') for r in group], "verdicts": verdicts})
+                      details={"findings": [r.get('route_key') for r in group],
+                               "verdicts": verdicts})
 
             # Run consistency check
             consistency_result = self._resolve_inconsistency(group, code_by_route)
 
             if consistency_result:
-                # Apply consistent verdict, but respect exploit path analysis
+                # Apply consistent verdict, but respect exploit path analysis.
+                # #448 (wave r3 opus): an update is scoped to the GROUP that
+                # fired the call — a hallucinated route_key naming any OTHER
+                # row in the batch previously moved that row (or stamped its
+                # audit) regardless of the pattern the model was shown. The
+                # apply gate's threat model (a fully hallucinated
+                # findings_to_update payload) is precisely the case where the
+                # route_key is hallucinated too.
+                _group_rks = {r.get("route_key") for r in group}
                 for finding_update in consistency_result.findings_updated:
+                    # #448 (wave r4 opus): the ELEMENT is guarded — the
+                    # hallucinated payload's members may be strings, numbers,
+                    # or null (the shipped prompt never defines the key's
+                    # shape); .get on a non-dict crashed the Verify phase.
+                    if not isinstance(finding_update, dict):
+                        self._log("warning",
+                                  f"Malformed consistency update "
+                                  f"{finding_update!r}; ignored",
+                                  step="verify")
+                        continue
                     route_key = finding_update.get("route_key")
-                    new_verdict = finding_update.get("should_be")
+                    # #448 (wave r4 fable): a NON-STRING route_key (list/dict)
+                    # must not reach the set membership — r3's in-check raised
+                    # TypeError where the pre-r3 == compare harmlessly missed
+                    # (a hallucinated list-valued route_key IS the threat
+                    # model).
+                    if (not isinstance(route_key, str)
+                            or route_key not in _group_rks):
+                        self._log("warning",
+                                  f"Consistency update named out-of-group route "
+                                  f"{route_key!r}; ignored (the reply is "
+                                  "hallucinated or misaddressed)",
+                                  unit_id=route_key if isinstance(route_key, str) else None)
+                        continue
+                    raw_should_be = finding_update.get("should_be")
+                    # #448 (the #425 escape's Stage-2 twin): should_be is
+                    # unconstrained model output — this site wrote it into
+                    # `finding` VERBATIM (no strip, no validation), the key
+                    # `_count_verdicts` and the disclosure filters read FIRST:
+                    # a garbage value ("MAYBE VULNERABLE") passed the downgrade
+                    # guard (not in DISCLOSURE_DROPPED) and silently dropped a
+                    # real VULNERABLE finding from every count and from
+                    # disclosure; a PADDED value ("  vulnerable  ") landed raw
+                    # and missed every downstream lowercase vocabulary read.
+                    # Normalize (strip/lower — this module's storage
+                    # convention is lowercase `correct_finding`), then validate
+                    # against the canonical `finding` vocabulary; unrecognized
+                    # values are REJECTED with an audit record (the
+                    # #316/#324/#425/#427 producer discipline).
+                    #
+                    # REACHABILITY NOTE (wave r2 opus+fable, re-derived
+                    # twice): the shipped consistency prompt asks only for
+                    # should_be_consistent / consistent_verdict / explanation —
+                    # it NEVER requests findings_to_update, so on a
+                    # prompt-conformant reply this apply loop does not fire
+                    # (findings_updated is empty) and the parsed
+                    # consistent_verdict is unused downstream. The loop IS the
+                    # defense layer for NON-conformant replies, and the
+                    # reachability mechanism is _parse_json_from_text's DIRECT
+                    # brace-slice json.loads (filters NO keys — a hallucinated
+                    # findings_to_update in any well-formed JSON object passes
+                    # straight through). The JSON-corrector branch CANNOT
+                    # deliver the payload for a consistency-shaped reply (it
+                    # requires the verify keys agree/correct_finding/
+                    # explanation and errors out otherwise) — do not cite it as
+                    # the path. The hallucinated-Stage-1-shape reply is the
+                    # exact untrusted-model-output class this gate exists for.
+                    # Wiring consistent_verdict through would ACTIVATE
+                    # pattern-corrections that never ran — a new capability,
+                    # out of scope per the fixes-only rule; recorded as the
+                    # follow-up question.
+                    new_verdict = (raw_should_be.strip().lower()
+                                   if isinstance(raw_should_be, str) else "")
+                    if not new_verdict:
+                        # #448 (wave r2 fable, r3 opus): None or any string
+                        # that normalizes empty (whitespace-only) = "no
+                        # proposal" — silent skip; a NON-STRING (list/dict/
+                        # number) is a MALFORMED proposal — audited, not
+                        # silently dropped (the reject-with-audit contract).
+                        if raw_should_be is not None and not isinstance(raw_should_be, str):
+                            for result in results:
+                                if result.get("route_key") == route_key:
+                                    result["consistency_invalid_verdict_blocked"] = {
+                                        "proposed": raw_should_be,
+                                        "reason": finding_update.get("reason"),
+                                        "pattern": consistency_result.pattern_identified,
+                                    }
+                        continue
+                    if new_verdict not in _CORRECTABLE_STAGE2_FINDINGS:
+                        for result in results:
+                            if result.get("route_key") == route_key:
+                                result["consistency_invalid_verdict_blocked"] = {
+                                    "proposed": raw_should_be,
+                                    "reason": finding_update.get("reason"),
+                                    "pattern": consistency_result.pattern_identified,
+                                }
+                                self._log(
+                                    "warning",
+                                    f"Blocked consistency correction of {route_key} "
+                                    f"to unrecognized verdict: {raw_should_be!r}",
+                                    unit_id=route_key)
+                        continue
 
                     for result in results:
                         if result.get("route_key") == route_key:
                             # Check if this result has conclusive exploit path analysis
-                            if self._has_conclusive_exploit_path(result):
+                            # (#296's direction-aware fix: an INCOMPLETE
+                            # verification never counts as conclusive, even
+                            # with a populated exploit_path — the finish-path
+                            # shapes (agree-missing, self-contradictory)
+                            # preserve the path and model text while marking
+                            # the run incomplete, and that unfinished evidence
+                            # must not veto a correction. The marker check
+                            # below stays: it covers the same signal for
+                            # rows that predate the structured flag.)
+                            verification = result.get("verification", {})
+                            if verification.get("incomplete"):
+                                self._log("debug",
+                                          f"Skipping conclusive-path check for {route_key}: "
+                                          "verification is incomplete",
+                                          unit_id=route_key)
+                            elif self._has_conclusive_exploit_path(result):
                                 self._log("debug", f"Skipping {route_key}: has conclusive exploit path analysis",
                                           unit_id=route_key)
                                 continue
 
+                            # #296 + astra-round guard: a correction of an
+                            # INCOMPLETE verification into any DISCLOSURE_DROPPED
+                            # verdict is blocked (mirroring the conclusive-
+                            # exploitable block below). The mirror alone cannot
+                            # catch the broken-path shapes: its return requires
+                            # a reached sink, attacker control, and no break —
+                            # so an incomplete result with a broken path would
+                            # pass straight through into a disclosure drop.
+                            if (verification.get("incomplete")
+                                    and str(new_verdict or "").strip().lower() in DISCLOSURE_DROPPED):
+                                self._log("warning",
+                                          f"Blocked disclosure-dropping correction of incomplete {route_key} -> {new_verdict}",
+                                          unit_id=route_key)
+                                result["consistency_downgrade_blocked"] = {
+                                    "proposed": new_verdict,
+                                    "reason": finding_update.get("reason"),
+                                    "pattern": consistency_result.pattern_identified,
+                                    "incomplete": True,
+                                }
+                                continue
+
                             # F-KB-1b: a conclusively-exploitable finding must not be
-                            # silently downgraded to safe by pattern matching (mirror of
-                            # the conclusive-broken guard above).
+                            # silently downgraded to ANY disclosure-dropping verdict by
+                            # pattern matching (mirror of the conclusive-broken guard
+                            # above). The block-set MUST reference
+                            # core.verdict_taxonomy.DISCLOSURE_DROPPED directly rather
+                            # than a hardcoded {safe, protected}: the original guard
+                            # covered only {safe, protected} while DISCLOSURE_DROPPED also
+                            # contains {inconclusive, rejected}, so a downgrade to
+                            # inconclusive/rejected silently dropped the finding from
+                            # disclosure (an identical security false-negative) while
+                            # bypassing the guard. Referencing the canonical set keeps the
+                            # two from drifting apart again — that drift WAS the bug.
                             if (self._has_conclusive_exploitable_path(result)
-                                    and str(new_verdict or "").strip().lower() in ("safe", "protected")):
+                                    and str(new_verdict or "").strip().lower() in DISCLOSURE_DROPPED):
                                 self._log("warning",
                                           f"Blocked consistency downgrade of conclusively-exploitable {route_key} -> {new_verdict}",
                                           unit_id=route_key)
@@ -904,14 +1312,27 @@ class FindingVerifier:
                                 }
                                 continue
 
-                            old_verdict = result.get("verification", {}).get("correct_finding") or result.get("finding")
+                            # #448 (wave r1/r2): the old side is normalized
+                            # for the COMPARE (an uppercase-stamped row vs a
+                            # normalized proposal must not produce a spurious
+                            # record) — but the audit `from` field keeps the RAW
+                            # stored stamp (wave r2 fable+sonnet+opus): a
+                            # case/whitespace anomaly in stored data is itself
+                            # an upstream-bug signal, and experiment.py prints
+                            # this field verbatim. The Stage-1 twin keeps raw
+                            # in `from` while comparing normalized — same
+                            # convention.
+                            raw_old = (result.get("verification", {}).get("correct_finding")
+                                       or result.get("finding"))
+                            old_verdict = (raw_old.strip().lower()
+                                          if isinstance(raw_old, str) else raw_old)
                             if old_verdict != new_verdict:
                                 result["finding"] = new_verdict
                                 if "verification" not in result:
                                     result["verification"] = {}
                                 result["verification"]["correct_finding"] = new_verdict
                                 result["consistency_update"] = {
-                                    "from": old_verdict,
+                                    "from": raw_old,
                                     "to": new_verdict,
                                     "reason": finding_update.get("reason"),
                                     "pattern": consistency_result.pattern_identified
@@ -938,7 +1359,8 @@ class FindingVerifier:
         verification = result.get("verification", {})
 
         # If max iterations was reached, the analysis is not conclusive
-        if verification.get("explanation") == "Max iterations reached":
+        # (#296: the marker is a named constant; the match set is UNCHANGED)
+        if verification.get("explanation") == INCOMPLETE_VERIFICATION_MARKER:
             return False
 
         # Check for exploit path analysis. A model may emit ``exploit_path``
@@ -969,7 +1391,12 @@ class FindingVerifier:
         shows the path IS reachable, attacker-controlled, and unbroken. Defaults
         require proof — a missing field must NOT read as exploitable."""
         verification = result.get("verification", {})
-        if verification.get("explanation") == "Max iterations reached":
+        # #296: the marker is a named constant; the match set is UNCHANGED.
+        # DO NOT widen this test without reading #296 first: this guard
+        # BLOCKS the downgrade into DISCLOSURE_DROPPED — making it False
+        # more often re-opens the silent vulnerable->safe family PR
+        # #195/#243 closed.
+        if verification.get("explanation") == INCOMPLETE_VERIFICATION_MARKER:
             return False
         exploit_path = verification.get("exploit_path")
         if not isinstance(exploit_path, dict):
@@ -1029,10 +1456,38 @@ class FindingVerifier:
             result = self._parse_json_from_text(text)
 
             if result:
+                # #448 (wave r2 fable): honor the one conformant field that
+                # says DO NOT APPLY — a reply carrying should_be_consistent
+                # FALSE plus a hallucinated findings_to_update (the exact
+                # non-conformant shape the apply-gate exists for) must not
+                # apply its hallucinated corrections anyway.
+                # #448 (wave r3 fable+opus): the tolerant read — the reply
+                # class this gate exists for is NON-conformant; a
+                # "should_be_consistent": "false" / "no" / 0 must not sail
+                # past an identity check on True/False only.
+                sbc = result.get("should_be_consistent")
+                if sbc is not None and str(sbc).strip().lower() in ("false", "no", "0"):
+                    return None
+                # #448 (wave r4 fable+opus): the payload CONTAINER is coerced —
+                # a hallucinated "findings_to_update": null / string / dict
+                # previously reached the apply loop and crashed the Verify
+                # phase (after every per-unit LLM call was paid for): null
+                # raised TypeError at the for; a string iterated characters
+                # and AttributeError'd at .get. The Stage-1 twin wraps its
+                # apply loop in try/except; this site coerces at the source.
+                ftu = result.get("findings_to_update")
+                if ftu is None:
+                    ftu = []
+                elif not isinstance(ftu, list):
+                    self._log("warning",
+                              f"findings_to_update is not a list "
+                              f"({type(ftu).__name__}); ignored",
+                              step="verify")
+                    ftu = []
                 return ConsistencyCheckResult(
                     pattern_identified=result.get("pattern_identified", "unknown"),
                     consistent_verdict=result.get("consistent_verdict", "inconclusive"),
-                    findings_updated=result.get("findings_to_update", []),
+                    findings_updated=ftu,
                     explanation=result.get("explanation", "")
                 )
 
@@ -1049,7 +1504,8 @@ class FindingVerifier:
         finish_result: dict,
         original_finding: str,
         iterations: int,
-        total_tokens: int
+        total_tokens: int,
+        usage_details: list | None = None,
     ) -> VerificationResult:
         """Parse the finish tool result into VerificationResult."""
         # Parse exploit path if present
@@ -1082,8 +1538,10 @@ class FindingVerifier:
         # incomplete=False.
         agree_missing = "agree" not in finish_result
         agree = finish_result.get("agree", False)
-        correct_finding = finish_result.get("correct_finding", original_finding)
+        supplied_correct_finding = finish_result.get("correct_finding", original_finding)
+        correct_finding = supplied_correct_finding
         incomplete = agree_missing
+        withheld_correct_finding = None
 
         # FAM-REPORT-2: a self-contradictory finish — `agree=True` (claims to
         # agree with Stage-1) while `correct_finding` diverges from the Stage-1
@@ -1100,9 +1558,37 @@ class FindingVerifier:
         # Mirrors this file's R4-7 fail-safe philosophy (abnormal signal ->
         # surface, don't silently resolve).
         if agree and str(correct_finding or "").strip().lower() != str(original_finding or "").strip().lower():
-            correct_finding = _more_severe(original_finding, correct_finding)
+            # FAM-REPORT-2: contradiction detected. The verdict resolution
+            # lives in the shared incomplete rule below (one site), so the
+            # withheld audit record fires here too (agree=True + downgrade).
             agree = False
             incomplete = True
+
+        # #521 finding 2: an INCOMPLETE finish never authors a downgrade.
+        # One rule, stated once, shared with FAM-REPORT-2 above: whether the
+        # finish was self-contradictory or simply did not assert `agree`, an
+        # unfinished verification's model-supplied verdict may not move a
+        # row DOWN FINDING_VERDICT_ORDER — a downgrade here wrote result
+        # ["finding"] and the row silently left disclosure (verifier's
+        # confirmed_findings admits only vulnerable|bypassable) while the
+        # metrics still counted it needs_review. Upgrades are honoured; the
+        # withheld supplied verdict is recorded for the triager (the
+        # consistency pass's #518 block may separately record its own
+        # withheld proposal on the same row — both should be visible).
+        if incomplete:
+            normalized = str(supplied_correct_finding or "").strip().lower()
+            if not normalized:
+                # a null/blank supplied verdict: the Stage-1 verdict stands
+                correct_finding = original_finding
+            else:
+                # normalize the returned verdict (the #448 storage convention)
+                correct_finding = _more_severe(original_finding, normalized)
+                if str(correct_finding or "").strip().lower() != normalized:
+                    # a downgrade was withheld — record the supplied verdict
+                    # for the triager (the consistency pass's #518 block may
+                    # separately record its own withheld proposal on the same
+                    # row; both should be visible)
+                    withheld_correct_finding = supplied_correct_finding
 
         return VerificationResult(
             agree=agree,
@@ -1110,9 +1596,11 @@ class FindingVerifier:
             explanation=finish_result.get("explanation", ""),
             iterations=iterations,
             total_tokens=total_tokens,
+            usage_details=usage_details,
             exploit_path=exploit_path,
             security_weakness=finish_result.get("security_weakness"),
             incomplete=incomplete,
+            withheld_correct_finding=withheld_correct_finding,
         )
 
     def _try_parse_text_response(
@@ -1121,7 +1609,8 @@ class FindingVerifier:
         original_finding: str,
         iterations: int,
         total_input_tokens: int,
-        total_output_tokens: int
+        total_output_tokens: int,
+        usage_details: list | None = None,
     ) -> Optional[VerificationResult]:
         """Try to parse a text response as JSON."""
         for block in assistant_content:
@@ -1133,10 +1622,12 @@ class FindingVerifier:
                         input_tokens=total_input_tokens,
                         output_tokens=total_output_tokens,
                         pricing=lookup_pricing(self.binding),
+                        usage_details=usage_details,
                     )
                     return self._parse_finish_result(
                         result, original_finding, iterations,
-                        total_input_tokens + total_output_tokens
+                        total_input_tokens + total_output_tokens,
+                        usage_details=usage_details,
                     )
         return None
 

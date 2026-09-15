@@ -33,7 +33,6 @@ import json
 import types
 from pathlib import Path
 
-import pytest
 
 from utilities.file_io import normalize_results, write_json
 

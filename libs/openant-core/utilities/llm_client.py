@@ -26,29 +26,53 @@ import threading
 from core.model_registry import pricing_map
 
 
-# Pricing per million tokens. LEGACY fallback: issue #65 moved pricing onto
-# each adapter, and ``config/models.json`` (read by core.model_registry) is now
-# the source of truth for BOTH the adapters and this global. ``MODEL_PRICING``
-# still backstops call sites that don't pass an adapter-provided ``pricing``
-# (record_call's fallback, report/generator) and the drift guard, but it is
-# served LAZILY from the registry via module ``__getattr__`` below — never a
-# frozen import-time snapshot — so it can neither drift from the adapter table
-# nor price from a stale copy, and a missing config fails LOUD at first use
-# instead of pricing every model at $0. Retired/unknown ids are omitted
+# Pricing per million tokens. Issue #65 moved pricing onto each adapter, and
+# ``config/models.json`` (read by core.model_registry) is the source of truth
+# for BOTH the adapters and this global. ``MODEL_PRICING`` remains for the
+# drift guard and any legacy importers (#598: record_call's substitution
+# fallback is DELETED — a missing price is the #216 loud path, never a
+# substituted Anthropic rate), served LAZILY from the registry via module
+# ``__getattr__`` below — never a frozen import-time snapshot — so it can
+# neither drift from the adapter table nor price from a stale copy, and a
+# missing config fails LOUD at first use. Retired/unknown ids are omitted
 # (lookup miss -> warn + $0).
 
 
 def __getattr__(name: str):
     # PEP 562 hook: resolve MODEL_PRICING on demand. Fires for attribute access
-    # and ``from utilities.llm_client import MODEL_PRICING`` — but NOT for a bare
-    # ``MODEL_PRICING`` reference inside this module, which is why record_call
-    # calls ``pricing_map("anthropic")`` directly.
+    # and ``from utilities.llm_client import MODEL_PRICING``. (#598: record_call
+    # no longer touches the Anthropic map — the substitution is deleted; this
+    # hook serves only the drift guard and legacy importers.)
     if name == "MODEL_PRICING":
         return pricing_map("anthropic")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _unknown_pricing_warned: set[str] = set()
 _unknown_pricing_lock = threading.Lock()
+# #605: the accounting-failure counter — MODULE-LEVEL, never on the
+# tracker (a poisoned tracker cannot be trusted to count its own failure).
+# Read directly by core.step_report at step end; the get_totals() key is
+# present-only (UsageInfo has no field — the marker reaches the step
+# reports and the scan aggregate, not the typed usage envelope).
+_accounting_errors = 0
+_accounting_errors_lock = threading.Lock()
+
+
+def record_accounting_error() -> None:
+    """#605: count a silently-swallowed accounting failure (the report-phase
+    tracker hand-off) — surfaced in get_totals() (present-only) and carried
+    by the step reports' token_usage + the scan aggregate's OR (never a
+    complete-looking artifact). NOTE: UsageInfo itself has no field; the
+    marker flows through the step-report snapshots and the aggregate, not
+    the CLI's typed usage envelope."""
+    global _accounting_errors
+    with _accounting_errors_lock:
+        _accounting_errors += 1
+
+
+def _accounting_error_count() -> int:
+    with _accounting_errors_lock:
+        return _accounting_errors
 
 
 def _warn_unknown_pricing(model: str) -> None:
@@ -80,6 +104,9 @@ class TokenTracker:
             self.total_input_tokens = 0
             self.total_output_tokens = 0
             self.total_cost_usd = 0.0
+            # #216: models dispatched without a pricing record (their cost
+            # contributes $0 — the run's cost figure is incomplete).
+            self._unpriced_models: set[str] = set()
 
     @property
     def total_tokens(self) -> int:
@@ -93,6 +120,7 @@ class TokenTracker:
         output_tokens: int,
         *,
         pricing: dict[str, float] | None = None,
+        usage_details: dict | list | None = None,
     ) -> dict:
         """
         Record a single LLM call.
@@ -102,23 +130,45 @@ class TokenTracker:
             input_tokens: Number of input tokens.
             output_tokens: Number of output tokens.
             pricing: Optional ``{"input": $/Mtok, "output": $/Mtok}``
-                from the adapter that made the call. When provided,
-                this is authoritative — adapters own their rates per
-                issue #65. When omitted, we fall back to the legacy
-                global ``MODEL_PRICING`` so call sites that haven't
-                been threaded through yet still produce a number
-                (with a one-time stderr warning on miss). New code
-                should always pass ``pricing`` via
-                ``binding.adapter.pricing.get(binding.model)``.
+                from the adapter that made the call — authoritative;
+                adapters own their rates per issue #65. Every production
+                call site passes ``pricing`` via
+                ``binding.adapter.pricing.get(binding.model)``; a lookup
+                miss (None) is UNKNOWN pricing and takes the #216 loud
+                path (a one-time warning + $0 + cost_incomplete) — never
+                a substituted rate (#598: the masquerade deleted).
+            usage_details: Pass-through capture (#211): provider-supplied
+                billing-relevant DETAIL fields (reasoning tokens; cache
+                read/write tokens) VERBATIM — a dict for a single call,
+                or a list of per-turn dicts for an agentic loop. Stored
+                on the call record for reconciliation against a provider
+                bill; NEVER summed into totals and NEVER in the cost
+                formula (whether a provider's ``completion_tokens``
+                already includes reasoning differs by route — summing
+                would double-count on including routes).
 
         Returns:
             Dict with call details including cost.
         """
         if pricing is None:
-            pricing = pricing_map("anthropic").get(model)
-        if pricing is None:
+            # #598: an omitted/missing ``pricing`` is UNKNOWN pricing — the
+            # #216 loud path below. The legacy Anthropic-catalogue
+            # substitution (deleted) silently reported a plausible
+            # wrong-rate cost with cost_incomplete=False — the masquerade.
+            # Every production call site passes pricing (census-pinned in
+            # tests/test_issue598_pricing_masquerade.py); a None here is a
+            # lookup miss (a misconfigured adapter), never a threaded call.
             _warn_unknown_pricing(model)
             total_cost = 0.0
+            # #216: an unpriced-but-dispatched model must be LOUD in the
+            # artifacts, not just stderr — record it so get_totals exposes
+            # cost_incomplete + unpriced_models (flows to UsageInfo → step
+            # reports → scan.report.json).
+            with self._lock:
+                self._unpriced_models.add(model)
+            tl = self._thread_local
+            if hasattr(tl, "unit_unpriced"):
+                tl.unit_unpriced.add(model)
         else:
             input_cost = (input_tokens / 1_000_000) * pricing["input"]
             output_cost = (output_tokens / 1_000_000) * pricing["output"]
@@ -128,7 +178,12 @@ class TokenTracker:
             "model": model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cost_usd": round(total_cost, 6)
+            "cost_usd": round(total_cost, 6),
+            # #211 pass-through capture: stored VERBATIM (absent when the
+            # provider supplied none — never a fabricated empty dict; in the
+            # per-turn list form, turns without details appear as None
+            # ENTRIES), never summed into the totals below, never in cost.
+            **({"usage_details": usage_details} if usage_details is not None else {}),
         }
 
         # Update totals (thread-safe)
@@ -147,16 +202,22 @@ class TokenTracker:
 
         return call_record
 
-    def add_prior_usage(self, input_tokens: int, output_tokens: int, cost_usd: float):
+    def add_prior_usage(self, input_tokens: int, output_tokens: int, cost_usd: float,
+                        unpriced_models: list[str] | None = None):
         """Inject usage from a prior run (e.g. restored checkpoints).
 
         This ensures step reports capture the total cost across all runs,
-        not just the current run's API calls.
+        not just the current run's API calls. ``unpriced_models`` restores
+        the #216 incomplete-cost marker across a resume (the tracker resets
+        per process; without this, a resumed run's cost silently looks
+        complete again).
         """
         with self._lock:
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
             self.total_cost_usd += cost_usd
+            if unpriced_models:
+                self._unpriced_models.update(unpriced_models)
 
     def start_unit_tracking(self):
         """Start tracking usage for the current unit on this thread.
@@ -169,15 +230,23 @@ class TokenTracker:
         tl.unit_input = 0
         tl.unit_output = 0
         tl.unit_cost = 0.0
+        tl.unit_unpriced: set[str] = set()
 
     def get_unit_usage(self) -> dict:
         """Return usage accumulated since ``start_unit_tracking()`` on this thread."""
         tl = self._thread_local
-        return {
+        usage = {
             "input_tokens": getattr(tl, "unit_input", 0),
             "output_tokens": getattr(tl, "unit_output", 0),
             "cost_usd": round(getattr(tl, "unit_cost", 0.0), 6),
         }
+        # #216: the unit's own unpriced models — persisted into the unit's
+        # checkpoint record so a resume restores the incomplete-cost marker.
+        unpriced = getattr(tl, "unit_unpriced", set())
+        if unpriced:
+            usage["cost_incomplete"] = True
+            usage["unpriced_models"] = sorted(unpriced)
+        return usage
 
     def get_summary(self) -> dict:
         """
@@ -193,6 +262,10 @@ class TokenTracker:
                 "total_output_tokens": self.total_output_tokens,
                 "total_tokens": self.total_input_tokens + self.total_output_tokens,
                 "total_cost_usd": round(self.total_cost_usd, 6),
+                # #216: the cost figure is INCOMPLETE when any dispatched
+                # model had no pricing (its tokens counted, its dollars $0).
+                "cost_incomplete": bool(self._unpriced_models),
+                "unpriced_models": sorted(self._unpriced_models),
                 "calls": list(self.calls),
             }
 
@@ -204,13 +277,22 @@ class TokenTracker:
             Dict with totals only
         """
         with self._lock:
-            return {
+            out = {
                 "total_calls": len(self.calls),
                 "total_input_tokens": self.total_input_tokens,
                 "total_output_tokens": self.total_output_tokens,
                 "total_tokens": self.total_input_tokens + self.total_output_tokens,
                 "total_cost_usd": round(self.total_cost_usd, 6),
+                "cost_incomplete": bool(self._unpriced_models),
+                "unpriced_models": sorted(self._unpriced_models),
             }
+            # #605: present-only — a healthy run's totals serialize
+            # byte-identical to pre-#605.
+            _errs = _accounting_error_count()
+            if _errs:
+                out["accounting_errors"] = _errs
+            return out
+
 
 
 # Global tracker instance for session-wide tracking
@@ -229,9 +311,12 @@ def reset_warning_state() -> None:
     stop/finish reasons, dropped block kinds, malformed tool JSON) are
     intentionally process-global, so production prints one line per
     novel value. Tests asserting "warned once" — and a brand-new scan —
-    want a clean slate. Adapter modules are imported lazily and guarded
-    so this stays safe even if a provider SDK isn't installed.
+    want a clean slate. ALSO zeroes the #605 accounting-error counter
+    (the two lifecycles are the same: per-scan, never mid-run). Adapter
+    modules are imported lazily and guarded so this stays safe even if a
+    provider SDK isn't installed.
     """
+    global _accounting_errors
     with _unknown_pricing_lock:
         _unknown_pricing_warned.clear()
     for modname in ("anthropic", "openai", "google"):
@@ -242,6 +327,9 @@ def reset_warning_state() -> None:
         reset = getattr(mod, "reset_warnings", None)
         if callable(reset):
             reset()
+
+    with _accounting_errors_lock:
+        _accounting_errors = 0
 
 
 def reset_global_tracker():

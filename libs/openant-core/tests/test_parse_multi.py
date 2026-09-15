@@ -19,7 +19,7 @@ import subprocess
 import pytest
 
 from core import parser_adapter
-from core.parser_adapter import LanguageParseOutcome, parse_repository_multi
+from core.parser_adapter import parse_repository_multi
 from core.schemas import ParseResult
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "sample_multilang_repo")

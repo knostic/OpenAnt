@@ -34,10 +34,18 @@ class DynamicTestResult:
     generation_cost_usd: float = 0.0
     generation_input_tokens: int = 0
     generation_output_tokens: int = 0
+    # #598: the generation spend's unpriced ids — persisted beside the
+    # generation_* fields so a resumed dynamic-test step restores the
+    # incompleteness marker (the resume reader existed; this is the writer
+    # it was missing — the reader read a key nothing wrote).
+    unpriced_models: list = field(default_factory=list)
     retry_count: int = 0
+    # #314: the run-stable identity from the pipeline finding — the join
+    # key the report merge verifies (VULN-NNN is positional, not stable).
+    identity_key: str = ""
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "finding_id": self.finding_id,
             "status": self.status,
             "details": self.details,
@@ -49,5 +57,11 @@ class DynamicTestResult:
             "generation_cost_usd": round(self.generation_cost_usd, 6),
             "generation_input_tokens": self.generation_input_tokens,
             "generation_output_tokens": self.generation_output_tokens,
+            # #598: flat, sibling to the generation_* fields — the resume
+            # reader's key (run_dynamic_tests reads _cp["unpriced_models"]).
+            "unpriced_models": list(self.unpriced_models),
             "retry_count": self.retry_count,
         }
+        if self.identity_key:
+            d["identity_key"] = self.identity_key
+        return d

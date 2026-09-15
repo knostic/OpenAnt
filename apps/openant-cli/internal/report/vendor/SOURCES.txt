@@ -1,0 +1,46 @@
+# Provenance + integrity record for the vendored report assets (#332/#540 —
+# the report scripts AND the build-time report.css).
+# The sha256s below are ENFORCED by report_vendor_test.go
+# (TestVendoredReportScriptHashes). An upgrade is the full recipe: the
+# vendored blob + the sha256 here + the go:embed list and vendorScripts names
+# in report.go + the template literals + the version banner marker in
+# report_issue332_test.go (a regen changes the banner) + the version-pin
+# freshness binding in test_class_coverage_test.go — all in one commit.
+# Tampering in git is detectable. Renovate never touches this file:
+# config:recommended's :ignoreModulesAndTests preset adds **/vendor/** to
+# ignorePaths (verified: a no-extends config extracts it, the preset one
+# does not) and the standard ignores are deliberately not overridden —
+# provenance here is hand-maintained.
+#
+# report.css
+#   source: BUILT — tailwind/ (the #540 prebuilt-CSS migration; the
+#         runtime compiler was retired). Regen recipe (documented in
+#         tailwind/package.json): cd tailwind && npm ci --ignore-scripts
+#         && ./node_modules/.bin/tailwindcss -c tailwind.config.js
+#         -i input.css -o ../vendor/report.css --minify
+#         Then update the sha256 below AND in report_vendor_test.go.
+#         (ALWAYS ./node_modules/.bin/tailwindcss — NEVER npx, which can
+#         fetch a different version on resolution failure.) The clean-
+#         runner reproducibility of this recipe is enforced in CI (the
+#         Report CSS reproducibility job: regen + cmp vs the committed
+#         bytes). The palette lives in tailwind/palette.json (the single
+#         source of truth, read by the Go coverage test); the version pin
+#         in tailwind/package.json (the npm channel is LIVE for the CLI —
+#         a v3 security bump is a valid regen; v4 is a config-format
+#         migration, capped <4 in renovate.json).
+#         The OLD blob (tailwindcss-3.4.17.js, the Play-CDN runtime
+#         compiler) was deleted by this migration — its 26 lines of
+#         channel history are in git.
+#   sha256: 9c146ec362d03090688714f48f0241b4262ea6b19c819bbe020c75a6526d477e
+#
+# chart-4.5.1.umd.min.js
+#   source: https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js
+#   npm anchor: registry.npmjs.org/chart.js/-/chart.js-4.5.1.tgz
+#     dist.integrity: sha512-GIjfiT9dbmHRiYi6Nl2yFCq7kkwdkp1W/lp2J99rX0yo9tgJGn3lKQATztIjb5tVtevcBtIdICNWqlq5+E8/Pw==
+#     (the fetched tarball hashes to it; its inner dist/chart.umd.min.js is the
+#      bytes below — jsdelivr serves the same file, both verified 2026-09-05)
+#   sha256: 48444a82d4edcb5bec0f1965faacdde18d9c17db3063d042abada2f705c9f54a
+#
+# chartjs-plugin-datalabels-2.2.0.min.js
+#   source: https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js
+#   sha256: 20c08f3d9c6d2ef76df6d6a6f1127c0013339fe32add24222276c398c6308c38

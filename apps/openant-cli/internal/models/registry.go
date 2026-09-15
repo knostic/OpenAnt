@@ -62,6 +62,12 @@ var tierModel = map[string]map[string]string{
 	"anthropic": {"strong": "claude-opus-4-8", "light": "claude-sonnet-4-6"},
 	"openai":    {"strong": "gpt-4o", "light": "gpt-4o-mini"},
 	"google":    {"strong": "gemini-1.5-pro", "light": "gemini-2.0-flash"},
+	// Local models: free, so tier maps to capability, not cost. Qwen3.8
+	// (27B) is the current-gen local default; qwen3.5:9b (6.6GB) is the
+	// modest-hardware light tier — the models.json entry ships it for
+	// exactly this (hunt r3: both tiers mapping to the 27B made the
+	// wizard's per-phase tiering a no-op for Ollama).
+	"ollama": {"strong": "qwen3.8:27b", "light": "qwen3.5:9b"},
 }
 
 // FindConfig locates config/models.json by walking up from the executable path

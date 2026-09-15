@@ -93,7 +93,9 @@ The module expects a JSON file with the following structure:
       "cwe_name": "Authorization Bypass Through User-Controlled Key",
       "stage1_verdict": "vulnerable",
       "stage2_verdict": "vulnerable",
-      "dynamic_testing": true,
+      "severity": "high",
+      "severity_source": "model",
+      "dynamic_testing": {"status": "CONFIRMED", "tested": "Docker container, <Month Year>"}, // #319: ONLY for a CONFIRMED test; every other status carries "dynamic_testing_attempted" (status/details/evidence/attempted) — never a verification
       "description": "Brief description of the vulnerability.",
       "vulnerable_code": "code snippet here",
       "impact": [
@@ -184,6 +186,6 @@ Uses Claude Opus 4.5 (`claude-opus-4-5-20250514`).
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - `anthropic` package
 - `ANTHROPIC_API_KEY` in `.env` file (project root) or environment variable

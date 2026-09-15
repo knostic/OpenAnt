@@ -624,3 +624,24 @@ A shared cross-parser *resolver* is tempting but leaky — it no-ops on a langua
 ## Questions?
 
 Open an issue on GitHub or check existing parser implementations for examples.
+
+
+## The discovery statistics contract (#600)
+
+Every parser that prunes directories reports, beside the flat
+`directories_excluded` count:
+
+- `excluded_dir_names` — the name-keyed histogram `{name: count}`;
+- `excluded_dir_examples` — up to 2 entry-relative example paths per
+  retained name (withheld for non-ASCII or oversized paths — the count
+  stands);
+- `excluded_dir_names_overflow` — the occurrence count of unretained names.
+
+Mechanize with `core.repo_walk.ExcludedDirRecorder`: construct it in
+`scan()`'s reset (never `__init__` — a second `scan()` on one instance must
+not double the histogram; a `__init__` seed is fine as a defensive default),
+pass `note_excluded=_recorder.note` to `walk_repository`, and call
+`_recorder.merge_into(stats)` after the walk. Scanners that hand-REBUILD
+their statistics dict (rust/zig/swift) must FORWARD these keys — the
+projection is where walker instrumentation goes to die. The aggregator
+discloses per-language missing fields; absence is never zero.

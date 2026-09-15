@@ -33,6 +33,8 @@ def get_context_review_prompt(code: str, route: str, handler: str, files_include
     and identify what additional files might be needed.
     """
     files_list = "\n".join(f"- {f}" for f in files_included)
+    from prompts._fence import safe_code_fence
+    _cf = safe_code_fence(code[:50000])
 
     return f"""You are reviewing code context assembled for a security analysis.
 
@@ -44,9 +46,9 @@ def get_context_review_prompt(code: str, route: str, handler: str, files_include
 {files_list}
 
 ## Assembled Code
-```javascript
+{_cf}javascript
 {code[:50000]}
-```
+{_cf}
 {f"[... truncated, {len(code)} total chars ...]" if len(code) > 50000 else ""}
 
 ## Your Task
@@ -108,6 +110,8 @@ def get_targeted_search_prompt(missing_item: dict, files_content: str) -> str:
     """
     Generate a prompt to search for a specific missing item.
     """
+    from prompts._fence import safe_code_fence
+    _ff = safe_code_fence(files_content)
     return f"""You are searching for a specific file needed for security analysis.
 
 ## What We Need
@@ -117,9 +121,9 @@ def get_targeted_search_prompt(missing_item: dict, files_content: str) -> str:
 **Hints:** {missing_item.get('hints', 'none')}
 
 ## Available Files
-```
+{_ff}
 {files_content}
-```
+{_ff}
 
 ## Your Task
 Find the file(s) that match what we're looking for.

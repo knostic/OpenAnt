@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/knostic/open-ant-cli/internal/remoteurl"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -34,6 +35,44 @@ func gitRevParse(repoPath, ref string) (string, error) {
 		return "", fmt.Errorf("git rev-parse %s: %w: %s", ref, err, strings.TrimSpace(stderr.String()))
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// NormalizeRemote re-exports remoteurl.Normalize (the canonical home as of
+// #568 — the render packages need the normalization without this package's
+// exec dependencies).
+func NormalizeRemote(raw string) string {
+	return remoteurl.Normalize(raw)
+}
+
+// RemoteURL returns the origin remote's URL for the repo at repoPath, or ""
+// when there is no origin remote (a local-only repo, a non-git path). The
+// RAW string is returned — normalization is the caller's separate pure step
+// (the #562 split: detection is a subprocess fact; normalization is policy).
+func RemoteURL(repoPath string) string {
+	out, err := exec.Command("git", "-C", repoPath, "remote", "get-url",
+		"origin").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// HeadSHA returns the working-tree HEAD commit of the repo at repoPath, or
+// "" when the path is not inside a git work tree (a bare-path scan of a
+// non-repo directory is legal; the caller treats "" as "not detected").
+// It deliberately reads HEAD rather than any requested ref — #557's
+// metadata tier mirrors the incremental manifest's head_sha semantics
+// (the tree that will actually be scanned), never a checkout intent.
+func HeadSHA(repoPath string) string {
+	// An unborn repo (a fresh `git init`) errors here (rev-parse HEAD:
+	// ambiguous argument) — the empty return covers it; no zero-id is
+	// ever emitted, so no zero-guard is needed (the review round's catch:
+	// the earlier zero-id comment was a false claim about git).
+	out, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // CurrentBranch returns the name of the branch HEAD points at, or "" if
@@ -103,6 +142,16 @@ func runGit(repoPath string, stderr *bytes.Buffer, args ...string) error {
 	return nil
 }
 
+// StagedRef is the synthetic base ref written into the manifest for staged
+// scans. The on-disk SHA fields hold HEAD (the staged-against commit) and a
+// zero placeholder for "head" since the index has no SHA.
+const StagedRef = "STAGED"
+
+// stagedHeadSHA is the placeholder HeadSHA written for staged manifests.
+// We can't resolve the index to a SHA without writing a tree, and downstream
+// consumers only read it as a string identifier.
+const stagedHeadSHA = "0000000000000000000000000000000000000000"
+
 // ChangedFiles returns the files changed between baseSHA and HEAD using the
 // symmetric diff BASE...HEAD. Rename detection is enabled; the new-side path
 // is returned for renamed files.
@@ -130,6 +179,65 @@ func ChangedFiles(repoPath, baseSHA string) ([]string, error) {
 	}
 	sort.Strings(files)
 	return files, nil
+}
+
+// StagedChangedFiles returns the files with staged (index) changes against
+// HEAD. Rename detection is enabled; the new-side path is returned for
+// renamed files. Untracked files are not included — `git add` them first
+// to bring them into the index.
+func StagedChangedFiles(repoPath string) ([]string, error) {
+	// -z for the same reason as ChangedFiles: staged paths with non-ASCII
+	// names, spaces, or embedded newlines are core.quotepath-escaped in the
+	// default output and would be dropped from the scan (a false negative,
+	// which matters most in a SAST tool). NUL-separated output is exact.
+	cmd := exec.Command("git", "-C", repoPath, "diff",
+		"--cached", "--name-only", "-z", "--find-renames")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git diff --cached --name-only -z: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	var files []string
+	for _, path := range strings.Split(string(out), "\x00") {
+		if path != "" {
+			files = append(files, path)
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+// StagedHunksForFile returns the new-side [start, end] line ranges for
+// staged changes to a single file. Pure-deletion hunks (count=0 on the new
+// side) are skipped.
+func StagedHunksForFile(repoPath, file string) ([][2]int, error) {
+	cmd := exec.Command("git", "-C", repoPath, "diff",
+		"--cached", "--unified=0", "--", file)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git diff --cached --unified=0 -- %s: %w: %s", file, err, strings.TrimSpace(stderr.String()))
+	}
+	var ranges [][2]int
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		m := hunkHeaderRe.FindStringSubmatch(scanner.Text())
+		if m == nil {
+			continue
+		}
+		start, _ := strconv.Atoi(m[1])
+		count := 1
+		if m[2] != "" {
+			count, _ = strconv.Atoi(m[2])
+		}
+		if count == 0 {
+			continue
+		}
+		ranges = append(ranges, [2]int{start, start + count - 1})
+	}
+	return ranges, nil
 }
 
 // hunkHeaderRe captures the new-side start and count from a unified-diff
@@ -198,6 +306,47 @@ func BuildManifest(repoPath, baseRef, scope string, prNumber int) (*Manifest, er
 	hunks := make(map[string][][2]int, len(files))
 	for _, f := range files {
 		r, err := HunksForFile(repoPath, baseSHA, f)
+		if err != nil {
+			return nil, err
+		}
+		if len(r) > 0 {
+			hunks[f] = r
+		}
+	}
+	m.Hunks = hunks
+	return m, nil
+}
+
+// BuildStagedManifest assembles a Manifest from the staged (index) diff
+// against HEAD. Used by `openant scan --staged` and `openant diff --staged`
+// for pre-commit hook style scanning. scope must be a valid scope. The
+// BaseRef is set to StagedRef, BaseSHA is HEAD, HeadSHA is a zero placeholder
+// since the index has no SHA.
+func BuildStagedManifest(repoPath, scope string) (*Manifest, error) {
+	if !IsValidScope(scope) {
+		return nil, fmt.Errorf("invalid scope %q", scope)
+	}
+	headSHA, err := gitRevParse(repoPath, "HEAD")
+	if err != nil {
+		return nil, fmt.Errorf("resolve HEAD: %w", err)
+	}
+	files, err := StagedChangedFiles(repoPath)
+	if err != nil {
+		return nil, err
+	}
+	m := &Manifest{
+		BaseRef:      StagedRef,
+		BaseSHA:      headSHA,
+		HeadSHA:      stagedHeadSHA,
+		Scope:        scope,
+		ChangedFiles: files,
+	}
+	if scope == ScopeChangedFiles {
+		return m, nil
+	}
+	hunks := make(map[string][][2]int, len(files))
+	for _, f := range files {
+		r, err := StagedHunksForFile(repoPath, f)
 		if err != nil {
 			return nil, err
 		}

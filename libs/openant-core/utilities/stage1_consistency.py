@@ -16,6 +16,31 @@ from dataclasses import dataclass
 
 from utilities.llm_client import TokenTracker
 from utilities.llm import PhaseBinding, simple_text
+from core.verdict_taxonomy import (
+    DISCLOSURE_DROPPED, FINDING_VERDICT_ORDER, SEVERITY_FINDING_VERDICTS,
+)
+
+# #425: the verdict vocabulary a Stage-1 consistency correction may write —
+# DERIVED from the canonical taxonomy (wave r1 fable: a third hand-copied
+# set is the drift this module rejected 250 lines earlier, and it already
+# disagreed — INSUFFICIENT_CONTEXT is in neither DISCLOSURE_ELIGIBLE nor
+# DISCLOSURE_DROPPED). INSUFFICIENT_CONTEXT is deliberately EXCLUDED (wave
+# r1, fable+sonnet): the consistency prompt's enum is
+# VULNERABLE | SAFE | INCONCLUSIVE — the pass is never asked for it — and
+# admitting it whitelisted a no-evidence downgrade AROUND F-KB-1a (it is in
+# neither block-set), leaving a split-brain row: verdict moved off
+# VULNERABLE by pattern similarity while finding stayed vulnerable — a
+# disclosed unit mislabeled in verdict-keyed surfaces. Rejection preserves
+# the row unchanged.
+_CORRECTABLE_STAGE1_VERDICTS = frozenset(
+    v.upper() for v in FINDING_VERDICT_ORDER)
+
+# Uppercase mirror of the canonical disclosure-dropped set (this module compares
+# verdicts .upper()'d). Keyed off core.verdict_taxonomy so the guard's block-set
+# cannot drift from the partition — the same canonical-reference fix #243 applied to
+# the Stage-2 verifier, extended here to the Stage-1 consistency guard (#243 did not
+# touch Stage-1, so its guard still blocked only ->{SAFE,PROTECTED}).
+_DISCLOSURE_DROPPED_UPPER = frozenset(v.upper() for v in DISCLOSURE_DROPPED)
 
 
 MAX_TOKENS = 4096
@@ -33,17 +58,33 @@ class Stage1ConsistencyResult:
 def get_stage1_consistency_prompt(findings: list, code_samples: dict) -> str:
     """Generate prompt for Stage 1 consistency check."""
     findings_text = ""
+    from prompts._fence import safe_code_fence, collapse_inline
     for i, f in enumerate(findings, 1):
         route_key = f.get("route_key", "unknown")
         code_snippet = code_samples.get(route_key, "")[:800]
+        code_fence = safe_code_fence(code_snippet)
+        # route_key (scanned file:function) is an inline header label; a newline in
+        # it would forge a `### Finding`/instruction line. Collapse control chars so
+        # it stays one inert line. reasoning is prior-stage LLM output (untrusted) and
+        # was interpolated raw beside the (now-fenced) code — give it its own
+        # length-adaptive fence so it can't inject prompt directives. verdict is
+        # model-derived (a raw verdict string still passes through analysis_core's
+        # normalization, so a newline survives) — collapse it too.
+        rk_label = collapse_inline(route_key) or "unknown"
+        verdict_label = collapse_inline(f.get('verdict', 'unknown')) or "unknown"
+        reasoning = str(f.get("reasoning", "N/A"))[:300]
+        rf = safe_code_fence(reasoning)
         findings_text += f"""
-### Finding {i}: {route_key}
-- Current verdict: {f.get('verdict', 'unknown')}
-- Reasoning: {f.get('reasoning', 'N/A')[:300]}...
+### Finding {i}: {rk_label}
+- Current verdict: {verdict_label}
+- Reasoning:
+{rf}
+{reasoning}
+{rf}
 - Code:
-```
+{code_fence}
 {code_snippet}
-```
+{code_fence}
 """
 
     return f"""You are checking Stage 1 detection consistency across similar code patterns.
@@ -235,20 +276,66 @@ def run_stage1_consistency_check(
                 for update in consistency_result.findings_updated:
                     route_key = update.get("route_key")
                     raw_should_be = update.get("should_be")
-                    new_verdict = raw_should_be.upper() if isinstance(raw_should_be, str) else ""
+                    # .strip() before .upper() so a whitespace-padded verdict cannot
+                    # bypass the downgrade guard (and get written verbatim as an invalid
+                    # verdict). new_verdict is unconstrained LLM `should_be` output.
+                    new_verdict = raw_should_be.strip().upper() if isinstance(raw_should_be, str) else ""
 
                     if not new_verdict:
+                        continue
+
+                    # #425: VALIDITY gate — the F-KB-1a block below is a
+                    # downgrade guard, not a validity gate, so anything
+                    # outside _DISCLOSURE_DROPPED_UPPER ("MAYBE VULNERABLE",
+                    # "probably fine") landed in result["verdict"] verbatim,
+                    # after _normalize_result's gates had already run — the
+                    # same escape #316/#324 closed at the OTHER producers.
+                    # new_verdict is unconstrained LLM `should_be` output: a
+                    # value outside the Stage-1 verdict vocabulary (the
+                    # _normalize_result finding_to_verdict map, uppercased) is
+                    # model noise. REJECT the proposal with an audit record —
+                    # the row keeps its valid pre-consistency verdict, and
+                    # overwriting it with garbage (or with ERROR) would
+                    # destroy a valid verdict this pass did not earn the
+                    # authority to replace.
+                    if new_verdict not in _CORRECTABLE_STAGE1_VERDICTS:
+                        for result in results:
+                            if result.get("route_key") == route_key:
+                                result["stage1_consistency_invalid_verdict_blocked"] = {
+                                    "from": result.get("verdict", "UNKNOWN"),
+                                    "proposed": new_verdict,
+                                    "reason": update.get("reason"),
+                                    "pattern": consistency_result.pattern_identified,
+                                }
+                                log("warning",
+                                    f"Blocked Stage-1 consistency correction to "
+                                    f"unrecognized verdict: {new_verdict!r}",
+                                    step="detect", unit_id=route_key)
                         continue
 
                     for result in results:
                         if result.get("route_key") == route_key:
                             old_verdict = result.get("verdict", "UNKNOWN")
-                            old_verdict_norm = old_verdict.upper() if isinstance(old_verdict, str) else ""
+                            old_verdict_norm = old_verdict.strip().upper() if isinstance(old_verdict, str) else ""
                             # F-KB-1a: pattern-consistency must not silently downgrade a
                             # surfaced Stage-1 finding to safe. At Stage 1 there is no
                             # per-finding exploit evidence, only pattern similarity (the
+                            # #425 note: REJECTED proposals now land at the validity
+                            # gate FIRST (invalid_verdict_blocked — REJECTED is not in
+                            # the correctable set), so this branch fires for the
+                            # DROPPED values the set admits: INCONCLUSIVE, PROTECTED,
+                            # SAFE.
                             # weakest signal); block the downgrade and record it for audit.
-                            if old_verdict_norm in ("VULNERABLE", "BYPASSABLE") and new_verdict in ("SAFE", "PROTECTED"):
+                            # F-KB-1a (extends #243's canonical-set fix to Stage-1):
+                            # widen the BLOCK-set from the hardcoded {SAFE,PROTECTED} to the
+                            # full DISCLOSURE_DROPPED. A pattern-consistency (no-evidence)
+                            # downgrade of a surfaced VULNERABLE/BYPASSABLE finding to
+                            # INCONCLUSIVE or REJECTED drops it from disclosure just as
+                            # silently as ->SAFE — the identical false-negative #243 fixed
+                            # in the Stage-2 verifier but which still lived here at Stage-1.
+                            # Old-side kept at {VULNERABLE,BYPASSABLE} to match Stage-1's
+                            # existing scope and #243's non-over-block stance.
+                            if old_verdict_norm in ("VULNERABLE", "BYPASSABLE") and new_verdict in _DISCLOSURE_DROPPED_UPPER:
                                 result["stage1_consistency_downgrade_blocked"] = {
                                     "from": old_verdict,
                                     "proposed": new_verdict,
@@ -260,6 +347,44 @@ def run_stage1_consistency_check(
                                 continue
                             if old_verdict_norm != new_verdict:
                                 result["verdict"] = new_verdict
+                                # #331: canonical downstream reads are
+                                # finding-first (`str(r.get("finding") or
+                                # r.get("verdict", "")).lower()`,
+                                # core/verifier.py:118) and ingestion ALWAYS
+                                # sets a lowercase finding (core/analyzer.py:
+                                # 149-152), so writing only `verdict` leaves
+                                # the correction shadowed by the stale finding
+                                # — a safe->VULNERABLE correction was counted
+                                # safe, filtered out of Stage 2, and absent
+                                # from disclosure. GATE the write on the
+                                # Stage-1 FINDING verdicts (wave r1, three
+                                # axes): `new_verdict` is unvalidated model
+                                # output (the :281 comment), and
+                                # DISCLOSURE_ELIGIBLE admitted Stage-2
+                                # vocabulary (unverified/confirmed/agreed/
+                                # error) that every finding-first reader
+                                # REJECTS — writing finding="unverified" on a
+                                # VULNERABLE row dropped it from Stage-2
+                                # input, confirmed_findings, and disclosure:
+                                # the net's own failure mode reintroduced
+                                # through the gate. The set that matches the
+                                # readers is {vulnerable, bypassable} —
+                                # SEVERITY_FINDING_VERDICTS. The :287
+                                # block-list covers only DISCLOSURE_DROPPED,
+                                # so an unrecognised downgrade
+                                # (VULNERABLE -> INSUFFICIENT_CONTEXT) passes
+                                # unblocked and the stale finding remains
+                                # the ACCIDENTAL SAFETY NET keeping the row
+                                # disclosed.
+                                if str(new_verdict).lower() in SEVERITY_FINDING_VERDICTS:
+                                    result["finding"] = str(new_verdict).lower()
+                                    # wave r1 (fable): a promoted ERRORED row
+                                    # carries a stale `error` key (the adapter
+                                    # raise that errored it) — one row would
+                                    # count as BOTH a confirmed finding and an
+                                    # error. The correction asserts a finding;
+                                    # the error key is cleared with it.
+                                    result.pop("error", None)
                                 result["stage1_consistency_update"] = {
                                     "from": old_verdict,
                                     "to": new_verdict,

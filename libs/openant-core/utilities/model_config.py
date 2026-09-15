@@ -8,8 +8,9 @@ per-phase models and ``utilities/context_enhancer.py``'s
 **Pricing no longer lives here.** Per-provider pricing moved to the shared
 ``config/models.json`` registry, read by ``core/model_registry.py`` (Python) and
 ``apps/openant-cli/internal/models`` (Go). The adapters' ``pricing``,
-``utilities/llm_client.MODEL_PRICING`` and the report generator now resolve rates
-lazily from ``core.model_registry.pricing_map(<provider>)`` — retired/unknown ids
+``utilities.llm_client.MODEL_PRICING`` and the report generator resolve rates
+lazily from ``core.model_registry.pricing_map(<provider>)`` (#598: a lookup
+miss is the #216 loud path — never a substituted rate) — retired/unknown ids
 are omitted there so they can never price at a silent \\$0. The model-ID constants
 remain here as the irreducible compile-time defaults, VALIDATED against the
 registry (``tests/test_model_registry.py``) rather than being unchecked assertions.

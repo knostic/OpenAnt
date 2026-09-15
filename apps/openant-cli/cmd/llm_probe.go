@@ -19,9 +19,14 @@ var anthropicAPIURL = "https://api.anthropic.com/v1/messages"
 // show the user a tailored message ("bad key" vs "model not found" vs
 // "couldn't reach the endpoint") without re-parsing the HTTP body.
 type AnthropicProbeError struct {
-	Kind    string // "auth", "model_not_found", "network", "other"
+	Kind    string // "auth", "model_not_found", "network", "timeout", "other"
 	Status  int    // HTTP status code (0 if no response)
 	Message string // user-facing description
+	// Body is the response body (truncated) — captured so provider-specific
+	// wrappers can discriminate shapes the status code alone cannot (the
+	// Ollama not-pulled 404 vs a base_url-misconfig 404). Empty when the
+	// response had no body.
+	Body string
 }
 
 func (e *AnthropicProbeError) Error() string {

@@ -63,6 +63,9 @@ func runVerify(cmd *cobra.Command, args []string) {
 		if verifyAnalyzerOutput == "" {
 			verifyAnalyzerOutput = ctx.scanFile("analyzer_output.json")
 		}
+		if verifyAppContext == "" {
+			verifyAppContext = ctx.scanFile("application_context.json")
+		}
 		if verifyRepoPath == "" {
 			verifyRepoPath = ctx.RepoPath
 		}

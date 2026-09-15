@@ -5,7 +5,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _helpers import build, extract, edges, leaf  # noqa: E402
+from _helpers import build, extract, edges  # noqa: E402
 
 
 def test_toplevel_try_await_daemon_root(tmp_path):

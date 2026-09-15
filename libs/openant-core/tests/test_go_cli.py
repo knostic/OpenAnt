@@ -7,7 +7,6 @@ so they use parse-only commands that don't require an API key.
 import json
 import os
 import subprocess
-import shutil
 import sys
 from pathlib import Path
 
@@ -165,6 +164,28 @@ class TestParse:
         # Should always produce valid JSON on stdout when --json is used
         envelope = json.loads(result.stdout)
         assert "status" in envelope
+
+
+class TestGenerateContextHelp:
+    """Tests for `openant generate-context --help`."""
+
+    def test_help(self):
+        result = run_cli("generate-context", "--help")
+        assert result.returncode == 0
+        output = result.stdout + result.stderr
+        assert "repository" in output.lower()
+        assert "context" in output.lower()
+
+
+class TestGenerateContext:
+    """Tests for `openant generate-context` (no API key)."""
+
+    def test_requires_api_key(self, sample_python_repo):
+        """generate-context should fail without an API key."""
+        result = run_cli("generate-context", sample_python_repo)
+        output = result.stderr + result.stdout
+        assert result.returncode != 0
+        assert "api key" in output.lower()
 
 
 class TestApiKeyHandling:

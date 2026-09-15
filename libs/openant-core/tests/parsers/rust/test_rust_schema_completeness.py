@@ -32,9 +32,16 @@ def _run(tmp_path):
 
 
 def test_every_extracted_function_has_a_unit(tmp_path):
+    # Every extracted function has a dataset unit — EXCEPT a synthesized
+    # `fuzz_target!` harness, which is seed-only: it seeds reachability but is not
+    # itself an analysis target (kept in analyzer_output for call-graph symmetry).
+    # See test_rust_fuzz_target.test_synthetic_harness_seed_only_not_analyzed.
     ext, dataset, _ = _run(tmp_path)
     unit_ids = {u["id"] for u in dataset["units"]}
-    assert unit_ids == set(ext["functions"].keys())
+    analysis_functions = {
+        fid for fid, fi in ext["functions"].items() if not fi.get("synthetic_harness")
+    }
+    assert unit_ids == analysis_functions
 
 
 def test_unit_required_fields_present(tmp_path):

@@ -90,8 +90,9 @@ Wizard defaults reflect the project's per-phase recommendations (stronger reason
 | `google` | [aistudio.google.com](https://aistudio.google.com/apikey) | NOT included in Gemini Advanced — separate billing. |
 | `bedrock` | — (AWS credential chain) | Claude on AWS Bedrock. No `api_key`: credentials come from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars or a `~/.aws` profile, region from `AWS_REGION`. Model IDs are inference profiles (`us.anthropic.claude-sonnet-4-6`, `global.anthropic.claude-haiku-4-5-20251001-v1:0`, ...) — enable them under "Model access" in the Bedrock console and list them with `aws bedrock list-inference-profiles`. Offered by `openant setup llm` (leave the API key blank — AWS credential chain, probe skipped) — full guide: [`utilities/llm/providers/BEDROCK.md`](libs/openant-core/utilities/llm/providers/BEDROCK.md). |
 | `openrouter` | [openrouter.ai](https://openrouter.ai/settings/keys) | Gateway to many providers with one key and one prepaid balance (also reads `OPENROUTER_API_KEY`). Model IDs are `vendor/model` slugs (`anthropic/claude-sonnet-4.6`, `openai/gpt-4o-mini`, ...) — browse them at [openrouter.ai/models](https://openrouter.ai/models). Offered by `openant setup llm` (leave the base URL blank for the OpenRouter default) — full guide: [`utilities/llm/providers/OPENROUTER.md`](libs/openant-core/utilities/llm/providers/OPENROUTER.md). |
+| `ollama` | — (local server) | Local models via [Ollama](https://ollama.com). No `api_key`: leave it blank (a placeholder is sent automatically); base URL defaults to `http://localhost:11434/v1`. Models must be pulled first (`ollama pull <model>`); model IDs are exactly what `ollama list` shows. Local inference is free — $0 cost reporting. Offered by `openant setup llm` — full guide: [`utilities/llm/providers/OLLAMA.md`](libs/openant-core/utilities/llm/providers/OLLAMA.md). |
 
-All four support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop.
+All of them support tool calling, so any of them can drive the `enhance` and `verify` phases that use the agentic tool-use loop. For Ollama, pick a tools-capable model for those phases — very small local models may not handle tool calls reliably.
 
 #### Quick path for Anthropic-only setups
 
@@ -190,6 +191,73 @@ Or run the full pipeline in one command:
 
 ```bash
 openant scan --verify
+```
+
+#### Exit codes (important for CI)
+
+`openant scan` — and each step verb (`analyze`, `verify`, …) when run step-by-step —
+exits **1 when it finds vulnerabilities** — that is the tool working, not failing. The
+contract:
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Clean scan — no vulnerabilities found |
+| 1 | **Vulnerabilities found** (a successful run) |
+| 2 | Error — the scan itself failed (check `errors` in the JSON envelope on stdout) |
+
+Generic CI steps and process supervisors treat any non-zero exit as a failure, which
+misclassifies a healthy findings run. Gate on the contract instead of parsing stdout:
+
+```bash
+rc=0
+openant scan --verify /path/to/repo || rc=$?   # || captures: set -e safe
+if [ "$rc" -gt 1 ]; then
+  echo "scan FAILED (exit $rc)" >&2; exit "$rc"
+fi
+# rc 0 = clean, rc 1 = findings found — both are successful runs
+```
+
+The `|| rc=$?` form matters: CI defaults to `set -e` (GitHub Actions `run:`, Jenkins `sh`),
+where a bare `openant scan` exiting 1 would terminate the script before the capture line —
+reproducing exactly the misclassification this section exists to prevent.
+
+### Web UI
+
+`openant serve` starts a local web UI over the same scan pipeline: submit a
+repository URL or local path, watch the scan logs stream live, and read the HTML
+report, markdown summary, and disclosures — all from the browser.
+
+```bash
+openant serve                       # http://127.0.0.1:8080, opens your browser
+openant serve --addr 127.0.0.1:9000 # choose a port
+```
+
+The server binds to loopback only (it refuses any non-loopback `--addr`) and is
+intended for local single-user use. Scan outputs persist under
+`~/.openant/webui/` across restarts. Analysis still sends source code to your
+configured LLM provider, the same as the CLI.
+
+### Incremental and diff-based scans
+
+For repositories where a full scan is too slow or expensive, OpenAnt can
+restrict the pipeline to units whose bodies overlap a git diff hunk:
+
+```bash
+openant scan --diff-base origin/main          # diff vs a ref
+openant scan --pr 123                         # diff vs the base of a GitHub PR
+openant scan --staged                         # diff vs HEAD using the staged index
+openant scan --incremental                    # diff vs the last successful scan
+```
+
+`--staged` reads `git diff --cached` and is intended for pre-commit hooks or
+local "scan what I'm about to commit" runs. The base is HEAD; the head is the
+index, so files staged with `git add` are scanned and worktree-only edits are
+not.
+
+The shorter `openant diff` form takes the same flags, e.g.:
+
+```bash
+openant diff --staged --skip-dynamic-test
 ```
 
 ### 3. Remediate a finding
@@ -343,9 +411,9 @@ A clean apply and passing hygiene checks mean the patch is well-formed — not t
 
 Things on the list, in no particular order:
 
-- **More provider adapters.** Ollama (local models), vLLM, Cohere, Mistral, Groq, Azure OpenAI — each is a small Python adapter recipe (plus a few Go wizard/probe touch-points if you want it offered by `openant setup llm`) per the contributor guide. Lower the barrier to local / on-prem inference.
+- **More provider adapters.** vLLM, Cohere, Mistral, Groq, Azure OpenAI — each is a small Python adapter recipe (plus a few Go wizard/probe touch-points if you want it offered by `openant setup llm`) per the contributor guide. Lower the barrier to local / on-prem inference. (Local inference via Ollama shipped in this release — [`OLLAMA.md`](libs/openant-core/utilities/llm/providers/OLLAMA.md).)
 - **Subscription-based auth.** ChatGPT / Codex, Claude Pro / Max, and Gemini Advanced subscriptions don't currently grant API quota — users have to maintain a separate API-tier key per provider. OAuth-based adapters that ride the consumer subscription would close that gap.
-- **Cross-provider tool-call quirks.** All three shipped adapters support tool calling, but the long tail (parallel tool calls, strict-mode schema enforcement, retry semantics on partial JSON) behaves differently per provider. Real-world scans surface these — PRs welcome.
+- **Cross-provider tool-call quirks.** All the shipped adapters support tool calling, but the long tail (parallel tool calls, strict-mode schema enforcement, retry semantics on partial JSON) behaves differently per provider. Real-world scans surface these — PRs welcome.
 - **More languages.** The supported-languages list above is current coverage. Java and C# come up frequently.
 - **Hosted scan service.** Knostic offers free scans for OSS projects today via the form linked above; a self-serve API for trusted partners is a future possibility.
 

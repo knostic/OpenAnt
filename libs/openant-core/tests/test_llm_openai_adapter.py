@@ -244,7 +244,6 @@ from utilities.llm.providers.openai import (
     _token_param,
     _RESPONSES_MIN_OUTPUT_TOKENS,
     _messages_to_responses,
-    _tool_to_responses,
 )
 
 G5 = "gpt-5.6"
@@ -473,6 +472,39 @@ def test_empty_output_raises_response_error():
     adapter, _ = _stub_resp(lambda **kw: _resp(output=[_reasoning()]))   # reasoning only, no content
     with pytest.raises(LLMResponseError):
         adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+
+
+def test_empty_output_max_tokens_stop_carries_budget_wording():
+    # #569 producer-side pin: an empty output with a max_tokens stop (the
+    # incomplete/max_output_tokens shape) carries "reasoning consumed the
+    # budget" (the raised-cap retry class).
+    adapter, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason="max_output_tokens",
+                                               output=[_reasoning()]))
+    with pytest.raises(LLMResponseError, match="reasoning consumed the budget"):
+        adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+
+
+def test_empty_output_unknown_incomplete_reason_has_no_budget_wording():
+    # #569 follow-up (2c): the unknown-reason relabel sets stop_reason =
+    # "max_tokens" (the honest not-a-clean-finish signal for PARTIAL
+    # content), but an EMPTY response under that exotic shape must NOT
+    # carry the budget marker — the raised-cap retry class stays precise
+    # (raw status+reason only); the old derived-stop_reason gate keyed the
+    # marker on shapes that never exhausted a budget.
+    adapter, _ = _stub_resp(lambda **kw: _resp(status="incomplete", incomplete_reason="future_reason",
+                                               output=[_reasoning()]))
+    with pytest.raises(LLMResponseError) as ei:
+        adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert "consumed the budget" not in str(ei.value)
+
+
+def test_empty_output_filtered_shape_has_no_budget_wording():
+    # #569 producer-side pin: a filtered empty output keeps the #292
+    # same-cap rationale — its raise must NOT carry the budget marker.
+    adapter, _ = _stub_resp(lambda **kw: _resp(output=[_reasoning()]))
+    with pytest.raises(LLMResponseError) as ei:
+        adapter.complete(model=G5, system=None, messages=_hi(), max_tokens=8)
+    assert "consumed the budget" not in str(ei.value)
 
 
 def test_failed_status_raises_response_error():

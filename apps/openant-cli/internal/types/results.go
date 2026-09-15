@@ -65,6 +65,20 @@ type ScanData struct {
 	Usage               UsageInfo   `json:"usage"`
 	StepReports         []any       `json:"step_reports"`
 	SkippedSteps        []string    `json:"skipped_steps"`
+	// #307: the multi-language coverage fields the CHANGELOG claims.
+	// NOTE (review finding, corrected): ScanData is not currently
+	// unmarshaled anywhere in the CLI (the formatter renders the
+	// untyped envelope), and ScanResult.to_dict serializes
+	// per_language/parse_errors/excluded_languages/degraded but NOT
+	// coverage — so these fields are FORWARD-DECLARED surface only:
+	// they populate once a typed decode is wired (or from
+	// pipeline_output.json, where the reporter emits them). They are
+	// additive/omitempty and change nothing observable today.
+	PerLanguage       map[string]any `json:"per_language,omitempty"`
+	ParseErrors       []any          `json:"parse_errors,omitempty"`
+	ExcludedLanguages map[string]any `json:"excluded_languages,omitempty"`
+	Degraded          *bool          `json:"degraded,omitempty"`
+	Coverage          map[string]any `json:"coverage,omitempty"`
 }
 
 // ScanMetrics holds vulnerability counts from a full pipeline scan.
@@ -122,4 +136,10 @@ type UsageInfo struct {
 	TotalTokens       int      `json:"total_tokens"`
 	TotalCostUSD      float64  `json:"total_cost_usd"`
 	Models            []string `json:"models"`
+	// #598: the incompleteness metadata — a dispatched model without a
+	// pricing record means the cost figure is incomplete ($0 attributed,
+	// the ids listed); the terminal cost line must never read as a
+	// complete figure it is not.
+	CostIncomplete bool     `json:"cost_incomplete,omitempty"`
+	UnpricedModels []string `json:"unpriced_models,omitempty"`
 }

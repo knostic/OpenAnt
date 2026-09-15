@@ -254,6 +254,54 @@ class RepositoryIndex:
         except Exception:
             return None
 
+    def resolve_dependencies(self, dep_names: list[str]) -> list[dict]:
+        """
+        Resolve dependency names from static analysis to function entries.
+
+        Handles both full function IDs (file:Class.method) and simple names.
+
+        Args:
+            dep_names: List of function IDs or names from static analysis
+
+        Returns:
+            List of {name, id, file, className} for each resolved dependency
+        """
+        results = []
+        seen_ids = set()
+
+        for name in dep_names:
+            # First try as a direct function ID
+            func = self.functions.get(name)
+            if func and name not in seen_ids:
+                seen_ids.add(name)
+                results.append({
+                    "name": name,
+                    "id": name,
+                    "file": name.rsplit(":", 1)[0] if ":" in name else "",
+                    "className": func.get("className")
+                })
+                continue
+
+            # Try exact name match
+            matches = self.search_by_name(name, exact=True)
+            if not matches:
+                # Try just the method part (e.g., "Class.method" -> "method")
+                parts = name.rsplit(".", 1)
+                if len(parts) == 2:
+                    matches = self.search_by_name(parts[1], exact=True)
+
+            for m in matches:
+                if m["id"] not in seen_ids:
+                    seen_ids.add(m["id"])
+                    results.append({
+                        "name": name,
+                        "id": m["id"],
+                        "file": m["id"].rsplit(":", 1)[0] if ":" in m["id"] else "",
+                        "className": m.get("className")
+                    })
+
+        return results
+
     def get_all_function_ids(self) -> list[str]:
         """
         Get list of all function IDs.

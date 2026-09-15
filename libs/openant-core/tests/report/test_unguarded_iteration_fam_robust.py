@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
 
 from core.reporter import _dedup_caller_callee, build_pipeline_output
 from utilities.file_io import write_json

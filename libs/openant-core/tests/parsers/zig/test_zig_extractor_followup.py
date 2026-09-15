@@ -27,7 +27,6 @@ importlib to avoid any sys.modules cache collision.
 """
 
 import importlib.util
-import os
 import sys
 import tempfile
 from pathlib import Path

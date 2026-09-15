@@ -78,3 +78,34 @@ def test_verdictonly_disagreed_still_vulnerable_is_confirmed():
         f"verdict-only disagreed-still-vulnerable must NOT fold into safe, "
         f"got disagreed={counts['disagreed']}"
     )
+
+
+def test_disagreed_corrected_to_inconclusive_is_not_safe():
+    """The ->inconclusive arm (#509): a disagreement whose corrected finding is
+    ``inconclusive`` is NOT a safe verdict — the verifier explicitly could not
+    confirm it. It must land in its own bucket (``disagreed_inconclusive``),
+    never in ``disagreed`` (which the scanner folds into ``safe``). The live
+    repro: two command-injection sinks reclassified to inconclusive read as
+    safe 6 / inconclusive 0 in scan.report.json while results_verified.json
+    carried safe 4 / inconclusive 2."""
+    verified_results = [
+        {  # Stage 2 disagreed and could NOT confirm -> inconclusive
+            "route_key": "s:1", "finding": "inconclusive",
+            "verification": {"agree": False, "correct_finding": "inconclusive",
+                             "incomplete": False},
+        },
+        {  # genuine downgrade to safe — still the only true "disagreed"
+            "route_key": "s:2", "finding": "safe",
+            "verification": {"agree": False, "correct_finding": "safe",
+                             "incomplete": False},
+        },
+    ]
+    counts = _count_verification_outcomes(verified_results)
+    assert counts["disagreed"] == 1, (
+        f"only the downgrade-to-safe may be 'disagreed' (safe-folding); "
+        f"got {counts['disagreed']}"
+    )
+    assert counts.get("disagreed_inconclusive") == 1, (
+        f"the corrected-to-inconclusive disagreement must land in its own "
+        f"bucket, got {counts}"
+    )

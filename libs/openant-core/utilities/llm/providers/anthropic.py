@@ -308,6 +308,28 @@ def _tool_to_anthropic(tool: ToolDef) -> dict[str, Any]:
     }
 
 
+def _extract_usage_details(usage: Any) -> Optional[dict]:
+    """Pass-through capture (#211): provider-supplied cache billing fields.
+
+    Copies ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
+    VERBATIM when the provider reported them; returns ``None`` when neither
+    is present (absent ≠ 0 — fabricated zeros would poison reconciliation
+    against a provider bill). These fields NEVER feed the cost formula:
+    ``TokenTracker`` stores them verbatim, unsummed. (Anthropic's
+    ``output_tokens`` includes thinking tokens; there is no separate
+    reasoning field to capture on this path.)
+    """
+    if usage is None:
+        return None
+    details: dict = {}
+    for field_name in ("cache_read_input_tokens",
+                       "cache_creation_input_tokens"):
+        value = getattr(usage, field_name, None)
+        if value is not None:
+            details[field_name] = value
+    return details or None
+
+
 def _response_to_unified(
     response: Any, *, adapter: str = "AnthropicAdapter"
 ) -> CompletionResult:
@@ -364,9 +386,24 @@ def _response_to_unified(
     # response (ToolUseBlock present, no text) is VALID and is not caught
     # here because ``content_blocks`` is non-empty.
     if not content_blocks:
+        # #561: the same cause-clause branch as the openai chat path — a
+        # max_tokens stop is the budget, not a filter; anything else keeps
+        # the honest non-assertion (#212).
+        _cause = ("the output budget was consumed before any visible "
+                  "content (reasoning models spend it on hidden reasoning)"
+                  if raw_stop == "max_tokens"
+                  else "the request may have been filtered or the response "
+                       "was malformed")
+        # #564: the rejected reply's usage travels ON the error (the #537
+        # carriage the openai sites already have — the successful return
+        # below reads the same response object; the guard used to raise
+        # before the read, recording 0/0 for a call the provider may have
+        # billed).
         raise LLMResponseError(
-            f"{adapter} returned no usable content (empty completion); the "
-            "request may have been filtered or the response was malformed"
+            f"{adapter} returned no usable content (empty completion; "
+            f"stop_reason={raw_stop!r}); {_cause}",
+            input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
+            output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
         )
 
     if raw_stop not in _ANTHROPIC_STOP_REASONS:
@@ -392,6 +429,7 @@ def _response_to_unified(
         content=content_blocks,
         input_tokens=getattr(usage, "input_tokens", 0),
         output_tokens=getattr(usage, "output_tokens", 0),
+        usage_details=_extract_usage_details(usage),
         # R2-C: an unknown/abnormal stop_reason defaults to "max_tokens" (not
         # "end_turn") — as the warning above notes, treating a refusal/abnormal
         # termination as end_turn masks false negatives. Known values (end_turn/

@@ -59,13 +59,12 @@ Output (JSON):
 
 import ast
 import json
-import os
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
-from utilities.file_io import read_json, write_json, open_utf8
+from typing import Dict, List, Optional, Set, Tuple
+from utilities.file_io import read_json, open_utf8
 
 
 class FunctionExtractor:
@@ -208,6 +207,94 @@ class FunctionExtractor:
         segments = {s.lower() for s in p.with_suffix('').parts}
         return token.lower() in segments
 
+    # Constructors whose returned object is a route-registering router/app. A
+    # module-level `name = <one of these>()` makes `@name.<verb>(...)` a route.
+    _ROUTER_CTORS = frozenset({
+        "APIRouter", "FastAPI", "Starlette",   # FastAPI / Starlette
+        "Blueprint", "Flask",            # Flask
+        "RouteTableDef",                 # aiohttp (`web.RouteTableDef()`)
+    })
+
+    def _collect_router_vars(self, content: str) -> frozenset:
+        """Lowercased names of module variables bound to a router/app constructor.
+
+        Receiver identity — not path syntax — is the correct route signal (a
+        `@cache.get("/k")` cache decorator has a slash-path too). Handles bare and
+        attribute-qualified constructors (`APIRouter()`, `web.RouteTableDef()`),
+        plain and annotated assignments, and multiple targets.
+        """
+        names = set()
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return frozenset()
+        # Local names that resolve to a router ctor, incl. import aliases
+        # (`from fastapi import APIRouter as AR` -> `AR` is a router ctor).
+        ctor_names = set(self._ROUTER_CTORS)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    if a.name in self._ROUTER_CTORS and a.asname:
+                        ctor_names.add(a.asname)
+        # Collect (target_name, value) bindings from every LOCAL binding form:
+        # plain Assign (incl. multi-target `a = b = ...`), AnnAssign, and walrus
+        # NamedExpr (`(r := ...)`) anywhere. For a value that is itself a walrus
+        # (`x = (y := r)`) the outer target binds to the walrus's inner value, so
+        # both x and y alias r. (Interprocedural forms -- factory returns, imported
+        # routers, attribute targets `self.router` -- stay documented FN limits.)
+        bindings = []   # list[(name_lower, value_node)]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                pairs = [(t, node.value) for t in node.targets]
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                pairs = [(node.target, node.value)]
+            elif isinstance(node, ast.NamedExpr):
+                pairs = [(node.target, node.value)]
+            else:
+                continue
+            for tgt, val in pairs:
+                while isinstance(val, ast.NamedExpr):   # unwrap x = (y := r)
+                    val = val.value
+                if isinstance(tgt, ast.Name):
+                    bindings.append((tgt.id.lower(), val))
+        # Ctor-bound routers: `name = <RouterCtor>()` (bare or attribute-qualified
+        # like `web.RouteTableDef()`), across all binding forms above.
+        for name, val in bindings:
+            if not isinstance(val, ast.Call):
+                continue
+            f = val.func
+            ctor = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+            if ctor in ctor_names:
+                names.add(name)
+        # Alias propagation (B-FN-02): `r = <known router>` (plain, annotated, or
+        # walrus) makes `r` a router too. Build the Name->targets alias-edge map in
+        # ONE pass, then BFS from the ctor-bound routers over it (O(V+E)) -- not a
+        # per-round full-AST re-walk, which was O(n^2) on long alias chains (a DoS
+        # risk on untrusted scanned repos). Pure recall: a non-router RHS is never a
+        # BFS source, so `r = cache` is not promoted.
+        # (KNOWN over-seed, reachability-safe & documented: names are `.lower()`d to
+        # match the lowercased decorator string, so two vars differing only in case
+        # -- `APP=FastAPI()` + `app=cache` -- collide; contrived, and an over-seed
+        # only mislabels a non-route AS reachable, never drops a route.)
+        alias_edges = {}
+        for name, val in bindings:
+            if isinstance(val, ast.Name):
+                alias_edges.setdefault(val.id.lower(), set()).add(name)
+        frontier = list(names)
+        while frontier:
+            src_name = frontier.pop()
+            for tgt in alias_edges.get(src_name, ()):
+                if tgt not in names:
+                    names.add(tgt)
+                    frontier.append(tgt)
+        return frozenset(names)
+
+    def _router_vars_for(self, file_path: str, content: str) -> frozenset:
+        cache = self.__dict__.setdefault("_router_var_cache", {})
+        if file_path not in cache:
+            cache[file_path] = self._collect_router_vars(content)
+        return cache[file_path]
+
     def classify_function(self, func_name: str, decorators: List[str],
                           class_name: Optional[str], file_path: str) -> str:
         """Classify a function by its type/purpose."""
@@ -232,6 +319,16 @@ class FunctionExtractor:
         # receiver is a route. This is ADDED alongside (never replaces) those checks;
         # over-approximating a route is reachability-safe.
         if re.search(r'@(api|v1|router)\.\w', dec_str):
+            return 'route_handler'
+        # FIX (silent-FN, precise): a decorator `@<var>.<httpverb>(` is a route ONLY when
+        # <var> is a known router INSTANCE (`admin = APIRouter()`, `auth = Blueprint()`,
+        # `v2 = FastAPI()`, `routes = web.RouteTableDef()`, ...) collected per-file from the
+        # module AST. This catches custom-named routers the fixed allowlist above misses
+        # (the silent reachability false-negative) WITHOUT the over-match a bare
+        # `@\w+.<verb>(` regex causes (e.g. `@cache.get(...)` on a non-router object, which
+        # would mislabel a cache helper as an attacker-facing route and mis-prime the LLM).
+        m = re.search(r'@(\w+)\.(get|post|put|delete|patch|options|head|websocket_route|websocket|route|api_route)\s*\(', dec_str)
+        if m and m.group(1) in getattr(self, '_active_router_vars', frozenset()):
             return 'route_handler'
         # F4 additive: aiohttp RouteTableDef — `routes = web.RouteTableDef()` then
         # `@routes.get(...)` / `@routes.post(...)` / `@routes.view(...)` / `@routes.route(...)`.
@@ -429,7 +526,8 @@ class FunctionExtractor:
         return bodies
 
     def _descend_into_blocks(self, stmts: list, file_path: Path, content: str,
-                             enclosing_class: Optional[str] = None) -> None:
+                             enclosing_class: Optional[str] = None,
+                             function_local: bool = False) -> None:
         """Find def/class nodes inside block statements at ANY depth and emit them.
 
         A `def`/`class` inside an `if`/`try`/`for`/`while`/`with`/`match` block is
@@ -454,8 +552,10 @@ class FunctionExtractor:
                                                     class_name=enclosing_class)
                     elif isinstance(child, ast.ClassDef):
                         self._process_class_tree(child, file_path, content,
-                                                 outer_qualifier=enclosing_class)
-                self._descend_into_blocks(body, file_path, content, enclosing_class)
+                                                 outer_qualifier=enclosing_class,
+                                                 function_local=function_local)
+                self._descend_into_blocks(body, file_path, content, enclosing_class,
+                                          function_local=function_local)
 
     def _process_function_tree(self, node: ast.AST, file_path: Path, content: str,
                                class_name: Optional[str] = None) -> None:
@@ -478,19 +578,24 @@ class FunctionExtractor:
                 # function in its own right; do not attribute it to a class.
                 self._process_function_tree(child, file_path, content, class_name=None)
             elif isinstance(child, ast.ClassDef):
-                self._process_class_tree(child, file_path, content, outer_qualifier=None)
+                self._process_class_tree(child, file_path, content,
+                                         outer_qualifier=None,
+                                         function_local=True)
         # defs/classes wrapped in a block inside this function's body
-        self._descend_into_blocks(node.body, file_path, content)
+        self._descend_into_blocks(node.body, file_path, content,
+                                  function_local=True)
 
     def _process_class_tree(self, node: ast.ClassDef, file_path: Path, content: str,
-                            outer_qualifier: Optional[str] = None) -> None:
+                            outer_qualifier: Optional[str] = None,
+                            function_local: bool = False) -> None:
         """Register a class, its methods, and any classes nested within it.
 
         `outer_qualifier` is the dotted prefix of any enclosing class
         (e.g. 'Outer' so an inner class method is keyed 'Outer.Inner.deep').
         """
         class_id, class_data, method_nodes = self.process_class(
-            node, str(file_path), content, outer_qualifier=outer_qualifier
+            node, str(file_path), content, outer_qualifier=outer_qualifier,
+            function_local=function_local
         )
         existing = self.classes.get(class_id)
         if existing is None:
@@ -510,24 +615,77 @@ class FunctionExtractor:
             self._process_function_tree(method_node, file_path, content, class_name=method_class_name)
 
         # Recurse into nested classes so their methods are extracted.
+        # (panel r4): forward function_local — a class nested inside a
+        # function-local class is itself function-local; dropping the flag
+        # here mis-keyed the nested declaration as module-level.
         for item in node.body:
             if isinstance(item, ast.ClassDef):
-                self._process_class_tree(item, file_path, content, outer_qualifier=qualified_class)
+                self._process_class_tree(item, file_path, content,
+                                          outer_qualifier=qualified_class,
+                                          function_local=function_local)
         # defs/classes wrapped in a block inside the class body (e.g. an
         # `if TYPE_CHECKING:` block declaring conditional members). Thread the
         # class so a block-nested def stays a method of this class.
         self._descend_into_blocks(node.body, file_path, content,
-                                  enclosing_class=qualified_class)
+                                  enclosing_class=qualified_class,
+                                  function_local=function_local)
 
     @staticmethod
     def _merge_class_data(existing: Dict, new: Dict) -> None:
         """Union a second declaration of a same-keyed class into the first.
 
-        Only additive: bases/methods/decorators are unioned (order-preserving),
-        the line range is widened, and a missing docstring is backfilled. Never
-        drops data the existing declaration already carried.
+        Additive for methods/decorators/line-range/docstring. ``bases`` is
+        the ONE reset-union split (wave r4, both panels): on a scope
+        mismatch the file-scope ``bases`` RESETS to the module-level side's
+        (the merged entry under a file-scope key is the module-level class
+        the name binds to at every other call site), while ``all_bases``
+        UNIONS everything — the module side's bases, the local side's
+        bases, and any ``all_bases`` the existing entry already carried
+        (a third same-named declaration must not discard the first local's
+        bases), preserving the self/super walks inside the function-local
+        declaration's methods.
         """
-        for key in ('bases', 'methods', 'decorators'):
+        new_local = bool(new.get('function_local'))
+        old_local = bool(existing.get('function_local'))
+        # #318 (wave r3): a function-local declaration's BASES do not belong
+        # to a module-level namesake. The merged entry under a file-scope key
+        # represents the MODULE-LEVEL class (that is what the name binds at
+        # every other call site), so on a scope mismatch the bases RESET to
+        # the module-level side's — whichever direction the declarations
+        # arrived in. Same-scope declarations union.
+        if old_local != new_local:
+            # #318 (deep-refute): the file-scope ``bases`` is the module
+            # side's (the typed-receiver walk's hijack guard), but the
+            # self/super walks read the SAME entry from inside the
+            # function-local declaration's methods — for those, the UNION
+            # survives (``all_bases``): resetting both severed
+            # self.m()/super().m() inside the local class (a correct-to-
+            # wrong regression the parent's union did not have).
+            module_side = new if not new_local else existing
+            local_side = existing if not new_local else new
+            # Sonnet (panel r4): local_side IS existing in the
+            # module-after-local order — capture its bases BEFORE the
+            # reset, or the aliasing silently reads the post-reset module
+            # bases twice and the local declaration's bases vanish from
+            # the union.
+            local_bases = list(local_side.get('bases', []))
+            existing['bases'] = list(module_side.get('bases', []))
+            # Fable (panel r4): union the PRE-EXISTING all_bases too — a
+            # third same-named declaration (local -> module -> local) must
+            # not discard the first local's bases.
+            all_bases = list(existing.get('all_bases', []))
+            for item in list(existing['bases']) + local_bases:
+                if item not in all_bases:
+                    all_bases.append(item)
+            existing['all_bases'] = all_bases
+        else:
+            for item in new.get('bases', []):
+                if item not in existing['bases']:
+                    existing['bases'].append(item)
+            for item in new.get('bases', []):
+                if item not in existing.setdefault('all_bases', list(existing['bases'])):
+                    existing['all_bases'].append(item)
+        for key in ('methods', 'decorators'):
             for item in new.get(key, []):
                 if item not in existing[key]:
                     existing[key].append(item)
@@ -535,6 +693,11 @@ class FunctionExtractor:
         existing['end_line'] = max(existing['end_line'], new['end_line'])
         if not existing.get('docstring'):
             existing['docstring'] = new.get('docstring')
+        # #318 (wave r2): the function-local flag is ANDed — the merged key
+        # is function-local only if EVERY declaration of it is (a module-
+        # level namesake declared after a function-local one must not
+        # inherit the flag, or its inherited methods go unresolved).
+        existing['function_local'] = old_local and new_local
 
     def extract_assigned_lambdas(self, tree: ast.AST, file_path: Path, content: str) -> None:
         """Emit a function unit for each module-level `name = lambda ...`.
@@ -607,6 +770,9 @@ class FunctionExtractor:
         docstring = self.get_docstring(node)
         code = self.get_source_segment(content, node)
         is_async = isinstance(node, ast.AsyncFunctionDef)
+        # Router-instance set for THIS file drives precise route classification
+        # (`@<router_var>.<verb>(` -> route_handler; a non-router receiver does not).
+        self._active_router_vars = self._router_vars_for(file_path, content)
         unit_type = self.classify_function(func_name, decorators, class_name, relative_path)
 
         # The captured `code` (get_source_segment) includes any decorator lines,
@@ -635,7 +801,8 @@ class FunctionExtractor:
         return func_id, func_data
 
     def process_class(self, node: ast.ClassDef, file_path: str, content: str,
-                      outer_qualifier: Optional[str] = None) -> Tuple[str, Dict, List[Tuple]]:
+                      outer_qualifier: Optional[str] = None,
+                      function_local: bool = False) -> Tuple[str, Dict, List[Tuple]]:
         """Process a class definition and extract metadata.
 
         `outer_qualifier` is the dotted name of any enclosing class, so a class
@@ -653,6 +820,16 @@ class FunctionExtractor:
                 bases.append(base.id)
             elif isinstance(base, ast.Attribute):
                 bases.append(self._get_attribute_string(base))
+            elif isinstance(base, ast.Subscript):
+                # #318 (wave r1, both axes): a subscripted base —
+                # ``class Sub(Base[int])``, the Generic idiom — must not
+                # sever the chain: unwrap to the subscripted value
+                # (``Base[int]`` -> ``Base`` / ``pkg.Base``).
+                inner = base.value
+                if isinstance(inner, ast.Name):
+                    bases.append(inner.id)
+                elif isinstance(inner, ast.Attribute):
+                    bases.append(self._get_attribute_string(inner))
 
         decorators = self.extract_decorators(node)
 
@@ -673,6 +850,12 @@ class FunctionExtractor:
             'bases': bases,
             'decorators': decorators,
             'docstring': self.get_docstring(node),
+            # #318 (wave r1): a class defined INSIDE a function is keyed at
+            # file scope (``app.py:Foo``) but its name is only bound within
+            # that function — at any other call site the name resolves to the
+            # module-level binding (an import or a module-level class). The
+            # flag lets the resolver skip the hijack.
+            'function_local': function_local,
         }
 
         return class_id, class_data, [(m, class_name) for m in method_funcs]

@@ -1,5 +1,11 @@
 """Rendering a custom threat model into analysis and verification prompts.
 
+NOTE: every field rendered below originates from an attacker-authored
+OPENANT.THREATMODEL.md (a scanned repo can commit it; it is auto-loaded on every
+default scan). Each is spliced onto its own prompt line, so any interpolated value
+MUST be passed through ``collapse_inline`` first — otherwise an embedded newline
+forges a new instruction/bullet line and steers the analyzer/verifier LLM.
+
 Without a threat model OpenAnt hardcodes a single attacker — "on the internet,
 with a browser and nothing else" — and a single binary lever
 (``suppress_local_only``) deciding whether local-only findings count. That
@@ -13,6 +19,8 @@ vulnerability. These renderers turn that declaration into prompt text.
 The legacy path is untouched — callers branch on ``has_threat_model()`` and
 only reach this module when a threat model is present.
 """
+
+from prompts._fence import collapse_inline
 
 
 def render_attacker_personas(ctx) -> str:
@@ -40,19 +48,27 @@ def render_attacker_personas(ctx) -> str:
         "",
     ]
     for profile in profiles:
-        lines.append(f"### Profile: {profile.get('id', 'unnamed')} "
-                     f"({profile.get('position', 'unspecified')})")
+        # Every profile field is attacker-authored (from OPENANT.THREATMODEL.md) and
+        # spliced onto its own prompt line, so collapse each to one inert line or an
+        # embedded newline forges a directive line into the Stage-2 verifier prompt.
+        lines.append(f"### Profile: {collapse_inline(profile.get('id', 'unnamed'))} "
+                     f"({collapse_inline(profile.get('position', 'unspecified'))})")
         if profile.get("description"):
-            lines.append(profile["description"])
+            # Prefix with a literal label so the attacker-authored value cannot BE a
+            # whole forged line: collapse_inline removes newlines, but a bare col-0
+            # emission lets a single-line value like "### SYSTEM OVERRIDE ..." or a lone
+            # "```" fence forge a structural/directive line with no newline at all. A
+            # non-empty prefix (like every sibling field here) keeps it mid-line and inert.
+            lines.append("Description: " + collapse_inline(profile["description"]))
         if profile.get("capabilities"):
-            lines.append("You CAN: " + "; ".join(profile["capabilities"]))
+            lines.append("You CAN: " + collapse_inline("; ".join(profile["capabilities"])))
         if profile.get("cannot"):
-            lines.append("You CANNOT: " + "; ".join(profile["cannot"]))
+            lines.append("You CANNOT: " + collapse_inline("; ".join(profile["cannot"])))
         if profile.get("entry_via"):
             lines.append("Entry points available to you: "
-                         + ", ".join(profile["entry_via"]))
+                         + collapse_inline(", ".join(profile["entry_via"])))
         if profile.get("impact"):
-            lines.append(f"Success means: {profile['impact']}")
+            lines.append(f"Success means: {collapse_inline(profile['impact'])}")
         lines.append("")
 
     lines.append(
@@ -74,18 +90,18 @@ def render_threat_model_context(ctx, *, for_verification: bool = False) -> str:
     lines = ["## Threat Model", ""]
 
     if ctx.classification:
-        lines.append(f"**Classification:** {ctx.classification}")
-    lines.append(f"**Purpose:** {ctx.purpose}")
+        lines.append(f"**Classification:** {collapse_inline(ctx.classification)}")
+    lines.append(f"**Purpose:** {collapse_inline(ctx.purpose)}")
 
     if ctx.components:
         lines.append("")
         lines.append("**Components:**")
         for component in ctx.components:
-            paths = ", ".join(component.get("paths", []))
+            paths = collapse_inline(", ".join(component.get("paths", [])))
             lines.append(
-                f"- {component.get('name', '?')} "
-                f"({component.get('component_type', 'unspecified')}, "
-                f"exposure: {component.get('exposure', 'unspecified')})"
+                f"- {collapse_inline(component.get('name', '?'))} "
+                f"({collapse_inline(component.get('component_type', 'unspecified'))}, "
+                f"exposure: {collapse_inline(component.get('exposure', 'unspecified'))})"
                 + (f" — {paths}" if paths else "")
             )
 
@@ -96,10 +112,11 @@ def render_threat_model_context(ctx, *, for_verification: bool = False) -> str:
         # having to collate them itself.
         by_trust: dict[str, list[str]] = {}
         for name, spec in ctx.input_sources.items():
-            trust = str(spec.get("trust", "unspecified")).lower()
+            trust = collapse_inline(str(spec.get("trust", "unspecified")).lower())
             description = spec.get("description", "")
             by_trust.setdefault(trust, []).append(
-                f"{name}" + (f" — {description}" if description else "")
+                f"{collapse_inline(name)}"
+                + (f" — {collapse_inline(description)}" if description else "")
             )
         for trust in ("untrusted", "semi_trusted", "trusted"):
             for entry in by_trust.get(trust, []):
@@ -118,19 +135,20 @@ def render_threat_model_context(ctx, *, for_verification: bool = False) -> str:
         # to check something it was never shown.
         for profile in ctx.attacker_profiles:
             lines.append(
-                f"- {profile.get('id', '?')} ({profile.get('position', '?')}): "
-                f"{profile.get('description', '')}"
+                f"- {collapse_inline(profile.get('id', '?'))} "
+                f"({collapse_inline(profile.get('position', '?'))}): "
+                f"{collapse_inline(profile.get('description', ''))}"
             )
             if profile.get("capabilities"):
-                lines.append(f"  CAN: {'; '.join(profile['capabilities'])}")
+                lines.append(f"  CAN: {collapse_inline('; '.join(profile['capabilities']))}")
             if profile.get("cannot"):
-                lines.append(f"  CANNOT: {'; '.join(profile['cannot'])}")
+                lines.append(f"  CANNOT: {collapse_inline('; '.join(profile['cannot']))}")
 
     if ctx.vulnerability_criteria:
         lines.append("")
         lines.append("**These ARE vulnerabilities in this threat model:**")
         for item in ctx.vulnerability_criteria:
-            lines.append(f"- {item}")
+            lines.append(f"- {collapse_inline(item)}")
 
     if ctx.not_a_vulnerability:
         lines.append("")
@@ -139,14 +157,14 @@ def render_threat_model_context(ctx, *, for_verification: bool = False) -> str:
         # prompt size; a custom threat model's list is authoritative and a
         # dropped entry means a false positive the author explicitly excluded.
         for item in ctx.not_a_vulnerability:
-            lines.append(f"- {item}")
+            lines.append(f"- {collapse_inline(item)}")
 
     if for_verification and ctx.impact_statement:
         lines.append("")
-        lines.append(f"**Impact if compromised:** {ctx.impact_statement}")
+        lines.append(f"**Impact if compromised:** {collapse_inline(ctx.impact_statement)}")
 
     if ctx.security_model:
         lines.append("")
-        lines.append(f"**Security model:** {ctx.security_model}")
+        lines.append(f"**Security model:** {collapse_inline(ctx.security_model)}")
 
     return "\n".join(lines)

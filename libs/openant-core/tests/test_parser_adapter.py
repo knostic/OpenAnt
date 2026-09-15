@@ -1,5 +1,4 @@
 """Tests for core/parser_adapter.py — language detection and Python parsing."""
-import os
 from pathlib import Path
 
 import pytest

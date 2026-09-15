@@ -15,6 +15,7 @@ from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
 from .schema import validate_pipeline_output, ValidationError
 from utilities.file_io import normalize_results, open_utf8, read_json
 from utilities.llm import (
+    DEFAULT_MAX_TOKENS,
     PhaseBinding,
     PhaseRegistry,
     build_phase_registry,
@@ -32,20 +33,17 @@ def _extract_usage(
     input_tokens: int,
     output_tokens: int,
     model: str,
+    usage_details: dict | None = None,
     pricing: dict[str, float] | None = None,
 ) -> dict:
     """Build the usage dict from token counts.
 
     ``pricing`` is the adapter's rates for ``model`` (issue #65 §9 —
-    pricing lives on the adapter, not on a shared global). When
-    omitted, we fall back to the legacy ``MODEL_PRICING`` global so
-    older call sites still produce a number; new code should always
-    pass ``binding.adapter.pricing.get(binding.model)``.
+    pricing lives on the adapter). Every production call site passes
+    ``lookup_pricing(binding)``; a lookup miss (None) is UNKNOWN
+    pricing (#598: the legacy MODEL_PRICING substitution deleted) and
+    the usage dict marks cost_incomplete — never a substituted rate.
     """
-    if pricing is None:
-        from utilities.llm_client import MODEL_PRICING
-
-        pricing = MODEL_PRICING.get(model)
     if pricing is None:
         # Same one-time warning record_call emits, so an unknown model's
         # $0 cost isn't silently inconsistent between the two paths.
@@ -57,22 +55,57 @@ def _extract_usage(
         input_cost = (input_tokens / 1_000_000) * pricing["input"]
         output_cost = (output_tokens / 1_000_000) * pricing["output"]
         total_cost = input_cost + output_cost
-    return {
+    usage = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
         "cost_usd": round(total_cost, 6),
     }
+    if pricing is None:
+        # #216: this fallback costs OUTSIDE the tracker — the usage dict
+        # must not claim a complete cost it does not have. #598: carry the
+        # model attribution so the CLI report's UsageInfo can surface the
+        # unpriced ids (parity with the tracker path).
+        usage["cost_incomplete"] = True
+        usage["unpriced_models"] = [model]
+    if usage_details is not None:
+        # #211 pass-through capture: verbatim, informational only.
+        usage["usage_details"] = usage_details
+    return usage
 
 
 def _merge_usage(usages: list[dict]) -> dict:
-    """Merge multiple usage dicts into one."""
+    """Merge multiple usage dicts into one.
+
+    #211 pass-through: per-completion ``usage_details`` (when any completion
+    captured provider detail fields) are carried VERBATIM as a list — same
+    shape the agentic loops record — never summed, never in cost.
+    """
     merged = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+    _unpriced: list[str] = []
     for u in usages:
+        if u.get("cost_incomplete"):
+            merged["cost_incomplete"] = True
+        # #598: the unpriced attribution unions across the merged usages
+        # (parity with the tracker path — the CLI report surfaces the ids).
+        for m in (u.get("unpriced_models") or []):
+            if m not in _unpriced:
+                _unpriced.append(m)
         merged["input_tokens"] += u["input_tokens"]
         merged["output_tokens"] += u["output_tokens"]
         merged["total_tokens"] += u["total_tokens"]
         merged["cost_usd"] = round(merged["cost_usd"] + u["cost_usd"], 6)
+    if _unpriced:
+        # #598: sorted for determinism (the sibling producers all sort —
+        # the disclosure path merges in as_completed order). The flag
+        # hardens with the ids: a source carrying ids without the flag
+        # (unreachable today — both producers pair the keys) still
+        # surfaces incomplete, never complete-with-ids.
+        merged["unpriced_models"] = sorted(_unpriced)
+        merged["cost_incomplete"] = True
+    details = [u.get("usage_details") for u in usages if u.get("usage_details") is not None]
+    if details:
+        merged["usage_details"] = details
     return merged
 
 
@@ -98,9 +131,18 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
     # never calls `.get()` on a bare string/number.
     normalize_results(dynamic_data)
     results_by_id = {}
+    duplicate_ids = 0
     for result in dynamic_data.get("results", []):
         fid = result.get("finding_id")
         if fid:
+            if fid in results_by_id:
+                # verify-wave (sonnet, state-machine axis — F2): a duplicate
+                # finding_id silently last-wins with zero visibility — the
+                # exact anti-pattern this merge's own "what happened is
+                # SURFACED, never silent" rule exists to stop. Counted and
+                # warned below; the last-wins order is unchanged (documented
+                # behavior, not silently chosen).
+                duplicate_ids += 1
             results_by_id[fid] = result
 
     if not results_by_id:
@@ -109,18 +151,126 @@ def merge_dynamic_results(pipeline_data: dict, pipeline_path: str) -> dict:
     from datetime import datetime
     date_str = datetime.fromtimestamp(dynamic_path.stat().st_mtime).strftime("%B %Y")
 
+    # #314: the merge verifies the IDENTITY, not just the positional ID.
+    # VULN-NNN is assigned by list position — drop or add one finding
+    # anywhere but the end and every later ID shifts, so a stale
+    # results file left in the scan directory merges one finding's
+    # result into a DIFFERENT finding, stamped with the stale file's
+    # mtime and nothing marking it. Three rules, each surfaced (never
+    # silent):
+    #   - positional match + identity_key AGREES -> merge (auditable)
+    #   - positional match + identity_key DISAGREES -> REFUSE (the stale
+    #     case: a different finding) — the mis-join is refused
+    #   - results without identity_key (a legacy/pre-fix file) -> ABSTAIN
+    #     (never silently fall back to the positional ID: that is the
+    #     defect)
+    merged_count = 0
+    attempted_count = 0
+    skipped_count = 0
+    refused_count = 0
+    abstained_count = 0
     for finding in pipeline_data.get("findings", []):
         fid = finding.get("id")
-        if fid and fid in results_by_id:
-            r = results_by_id[fid]
+        if not fid or fid not in results_by_id:
+            continue
+        r = results_by_id[fid]
+        r_key = r.get("identity_key")
+        f_key = finding.get("identity_key")
+        if not r_key or not f_key:
+            abstained_count += 1
+            continue
+        if r_key != f_key:
+            refused_count += 1
+            continue
+        # verify-wave (opus, consumers axis — F1, reproduced): a finding
+        # can enter the merge carrying a PRE-EXISTING dynamic_testing block
+        # (a stale one from an earlier run, or a forged one — pipeline_output
+        # is model-supplied per fa18). The merge previously only ADDED, so a
+        # forged CONFIRMED block coexisted with a fresh ERROR result and
+        # every consumer's dynamic_testing-first preference rendered
+        # "Verified via dynamic testing" — the exact false verification
+        # this fix exists to remove, re-entering through the artifact
+        # channel. The merge is the single authority for a finding's
+        # dynamic-verification state: clear both block keys on every
+        # matched finding BEFORE attaching, so the "cannot render a failed
+        # test as a verification by omission" contract holds
+        # unconditionally for every finding the merge touched.
+        finding.pop("dynamic_testing", None)
+        finding.pop("dynamic_testing_attempted", None)
+        # fa17 hardening (wave r2 + the deep-refute): the results file is
+        # model-supplied — ANY status outside the harness's own VALID set
+        # (exact-case) normalises to UNKNOWN: a non-string, a lowercase
+        # "confirmed" (which would self-contradict the banner), whitespace,
+        # or a newline-bearing string must not leak into the
+        # externally-facing banner. The allowlist is the harness's own.
+        from utilities.dynamic_tester.models import VALID_STATUSES
+        _raw_status = r.get("status")
+        if (not isinstance(_raw_status, str)
+                or _raw_status not in VALID_STATUSES):
+            status = "UNKNOWN"
+        else:
+            status = _raw_status
+        # #319 (wave r1): SKIPPED is "never executed" (models.py: "distinct
+        # from ERROR (a test ran and failed)") — the harness had no Docker
+        # template for the finding's language. Attaching an ATTEMPTED block
+        # (an attempted date, a "test SKIPPED" failure stamp) would be the
+        # mirror of the defect this issue fixes: asserting a container
+        # action that never happened, inverted. SKIPPED attaches nothing;
+        # it is surfaced in the merge's stderr line like the abstain count.
+        if status == "SKIPPED":
+            skipped_count += 1
+            continue
+        # #319: the verification block attaches ONLY for a CONFIRMED test —
+        # an ERRORED or NOT_REPRODUCED test rendered as "Verified via
+        # dynamic testing" in the disclosure (both consumers keyed on the
+        # block's EXISTENCE), and the unconditional `tested` Docker string
+        # asserted a container run that never happened. Every other status
+        # attaches a separate ATTEMPTED block: the transparency (status,
+        # details, evidence, the date-stamped ATTEMPT) without the
+        # verification claim — a template cannot render a failed test as a
+        # verification by omission.
+        if status == "CONFIRMED":
             finding["dynamic_testing"] = {
-                "status": r.get("status"),
+                "status": status,
                 "details": r.get("details"),
                 "evidence": r.get("evidence", []),
                 "tested": f"Docker container, {date_str}",
+                # the join is auditable after the fact
+                "identity_key": r_key,
             }
+            merged_count += 1
+        else:
+            finding["dynamic_testing_attempted"] = {
+                "status": status,
+                "details": r.get("details"),
+                "evidence": r.get("evidence", []),
+                # NOT `tested`: the container claim is reserved for a test
+                # that ran and confirmed. `attempted` carries the date.
+                "attempted": date_str,
+                "identity_key": r_key,
+            }
+            attempted_count += 1
 
-    print(f"  Merged {len(results_by_id)} dynamic test results from {dynamic_path.name}", file=sys.stderr)
+    # #314 suggestion 3: what happened is SURFACED, never silent
+    print(f"  Merged {merged_count} dynamic test results from {dynamic_path.name}", file=sys.stderr)
+    if attempted_count:
+        print(f"  [Info] {attempted_count} dynamic test result(s) NOT confirmed "
+              f"(attached as dynamic_testing_attempted — never a verification)", file=sys.stderr)
+    if skipped_count:
+        print(f"  [Info] {skipped_count} dynamic test result(s) SKIPPED — never "
+              f"executed (no harness for the language); nothing attached", file=sys.stderr)
+    if refused_count:
+        print(f"  [Warning] Refused {refused_count} dynamic test result(s) whose "
+              f"identity_key disagrees with the finding — a stale results file "
+              f"from a previous run; re-run the dynamic tests to regenerate",
+              file=sys.stderr)
+    if duplicate_ids:
+        print(f"  [Warning] {duplicate_ids} duplicate finding_id(s) in {dynamic_path.name} "
+              f"— the LAST entry for each id was used", file=sys.stderr)
+    if abstained_count:
+        print(f"  [Warning] Skipped {abstained_count} dynamic test result(s) with "
+              f"no identity_key (a legacy results file); re-run the dynamic "
+              f"tests to regenerate", file=sys.stderr)
     return pipeline_data
 
 
@@ -131,6 +281,32 @@ def _compact_for_summary(pipeline_data: dict) -> dict:
     from findings to avoid exceeding the context window.
     """
     compact = {k: v for k, v in pipeline_data.items() if k != "findings"}
+    # #568: the render boundary never carries a raw remote — an old
+    # pipeline_output.json (or a raw --repo-url) can hold a
+    # credential-bearing or scp-form repository.url. Swap in a url-less
+    # COPY unless it is a clean http(s) browse URL (the honest absence);
+    # name/language stay, and the caller's dict is never mutated (the
+    # shallow copy above aliases the nested objects).
+    _repo = compact.get("repository")
+    if not isinstance(_repo, dict):
+        # a non-dict repository is hand-edited garbage — the honest absence
+        compact["repository"] = {}
+    elif "url" in _repo:
+        _url = _repo.get("url")
+        if not isinstance(_url, str):
+            _url = ""  # a non-string url is garbage — treated as absent
+        _scheme, _sep, _rest = _url.partition("://")
+        _authority = _rest.partition("/")[0]
+        if (
+            not _sep
+            or _scheme not in ("http", "https")
+            or "@" in _authority
+            or "?" in _url
+            or "#" in _url
+        ):
+            compact["repository"] = {
+                k: v for k, v in _repo.items() if k != "url"
+            }
     compact["findings"] = []
     for f in pipeline_data.get("findings", []):
         compact["findings"].append({
@@ -142,7 +318,16 @@ def _compact_for_summary(pipeline_data: dict) -> dict:
             "cwe_name": f.get("cwe_name"),
             "stage1_verdict": f.get("stage1_verdict"),
             "stage2_verdict": f.get("stage2_verdict"),
+            # #215: the stamped severity + its provenance reach the summary
+            # LLM — without these the "Severity" column in the template is
+            # model-guessed, not read from the scan.
+            "severity": f.get("severity"),
+            "severity_source": f.get("severity_source"),
             "dynamic_testing": f.get("dynamic_testing"),
+            # #319 (the e2e-caught gap): the ATTEMPTED block must reach the
+            # summary LLM too — without it a failed test rendered "static"
+            # (safe, but the failure was invisible to the reader).
+            "dynamic_testing_attempted": f.get("dynamic_testing_attempted"),
             "impact": f.get("impact"),
         })
     return compact
@@ -157,20 +342,285 @@ def _context_provenance_header(pipeline_data: dict) -> str:
     hostile file can suppress by steering the report prompt. Returns "" for the
     built-in/generated path so the banner never fires on a trusted context.
     """
-    if pipeline_data.get("context_source") != "threat_model":
+    source = pipeline_data.get("context_source")
+    if source == "threat_model":
+        lines = [
+            "> **⚠ Security model supplied by a repo-controlled file.**",
+            "> This scan's attacker model came from `OPENANT.THREATMODEL.md` inside "
+            "the scanned repository, which is attacker-influenceable. Treat the "
+            "findings' scope as only as trustworthy as that file.",
+        ]
+        sha = pipeline_data.get("threat_model_sha256")
+        if sha:
+            lines.append(f"> Threat-model sha256: `{sha}`")
+        for warning in pipeline_data.get("threat_model_warnings") or []:
+            lines.append(f"> - {warning}")
+        return "\n".join(lines) + "\n\n"
+    if source == "repo_manual":
+        # #322: the manual-override branch (OPENANT.json / OPENANT.md
+        # committed by the scanned repo) was recorded as "generated", so
+        # this banner never fired for the path a hostile file actually
+        # controls. Disclose it the same deterministic way.
+        fname = pipeline_data.get("manual_override_filename") or ""
+        named = ("`" + fname + "`") if fname else "a repo-committed override file"
+        lines = [
+            "> **⚠ Security override supplied by a repo-committed file.**",
+            "> This scan honored " + named + " committed inside "
+            "the scanned repository, which is attacker-influenceable — its "
+            "`not_a_vulnerability` entries suppress findings. Treat the "
+            "findings' scope as only as trustworthy as that file.",
+        ]
+        n = pipeline_data.get("manual_exclusions")
+        if isinstance(n, int):
+            lines.append(
+                f"> Active repo-supplied exclusions: {n} "
+                "(the findings they suppress are not reported)")
+        for warning in pipeline_data.get("manual_override_warnings") or []:
+            lines.append(f"> - {warning}")
+        return "\n".join(lines) + "\n\n"
+    return ""
+
+
+def _reachability_header(pipeline_data: dict) -> str:
+    """#323: a deterministic banner when the reachability filter warned.
+
+    The blackout advisory ("entry-point seeding found no seeds; the filter was
+    blacked out and ALL units were kept") previously reached only
+    ``pipeline_stats.reachability_warnings`` (an artifact field CI must parse)
+    and a prompt INSTRUCTION (model-discretionary — a hostile prompt could
+    suppress it). Same class of disclosure as
+    ``_context_provenance_header`` ("the scan may have covered nothing"),
+    so it gets the same deterministic treatment: rendered from
+    ``pipeline_output.json`` fields without the LLM, prepended to the
+    summary so steering the report prompt cannot suppress it. Returns "" for
+    a clean run (no warnings).
+    """
+    stats = pipeline_data.get("pipeline_stats")
+    if not isinstance(stats, dict):
         return ""
-    lines = [
-        "> **⚠ Security model supplied by a repo-controlled file.**",
-        "> This scan's attacker model came from `OPENANT.THREATMODEL.md` inside "
-        "the scanned repository, which is attacker-influenceable. Treat the "
-        "findings' scope as only as trustworthy as that file.",
-    ]
-    sha = pipeline_data.get("threat_model_sha256")
-    if sha:
-        lines.append(f"> Threat-model sha256: `{sha}`")
-    for warning in pipeline_data.get("threat_model_warnings") or []:
-        lines.append(f"> - {warning}")
+    warnings = stats.get("reachability_warnings")
+    if not warnings:
+        return ""
+    lines = ["> **⚠ Reachability advisory.**"]
+    reachable = stats.get("reachable_units")
+    original = stats.get("original_units")
+    if isinstance(reachable, int) and isinstance(original, int):
+        # "in scope" (the filter's kept/original counts), NOT "analyzed"
+        # (wave r1 fable): the analyzed count is total_units — a --limit
+        # run would otherwise print "120 of 120 analyzed" directly above a
+        # warning saying only a subset was analyzed.
+        lines.append(f"> Units in scope: {reachable} of {original} ({stats.get('reachability_reduction_percentage', 0)}% reduction)")
+    for w in warnings:
+        if isinstance(w, str) and w.strip():
+            lines.append(f"> - {w.strip()}")
+    lines.append(
+        "> Treat the scan's coverage as only as trustworthy as this advisory.")
     return "\n".join(lines) + "\n\n"
+
+
+
+
+# ---------------------------------------------------------------------------
+# #535: server-rendered numeric/eligibility surfaces for SUMMARY_REPORT.md
+# ---------------------------------------------------------------------------
+
+_SUMMARY_SERVER_SECTIONS = (
+    "Pipeline Statistics", "Per-Step Durations", "Per-Step Costs",
+    "Results", "Confirmed Vulnerabilities", "Not Confirmed",
+)
+
+
+
+
+def _fmt_duration(seconds: float) -> str:
+    """A duration string that can't mis-render 10.22s as '10m 13s'."""
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    if seconds >= 60:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds:.1f}s"
+
+
+def _strip_server_sections(text: str) -> str:
+    """Remove any model-emitted duplicate of a server-owned section.
+
+    The prompt is advisory; the model may still transcribe a '## Pipeline
+    Statistics' block from the JSON dump. Every heading in
+    _SUMMARY_SERVER_SECTIONS is server-owned — strip from its heading to the
+    next heading (or end) so the deliverable carries exactly one copy (the
+    same pattern as _splice_code_section's duplicate-block strip). The
+    heading is ANCHORED (a '## Results Overview' narrative section survives)
+    and matched case-insensitively with an optional numbering prefix.
+    """
+    import re as _re
+    for heading in _SUMMARY_SERVER_SECTIONS:
+        text = _re.sub(
+            r"^##\s+(?:\d+[.)]\s*)?" + _re.escape(heading)
+            + r"\s*:(?:\n(?!## ).*)*\n?",
+            "", text, flags=_re.M | _re.I)
+        text = _re.sub(
+            r"^##\s+(?:\d+[.)]\s*)?" + _re.escape(heading)
+            + r"\s*$(?:\n(?!## ).*)*\n?",
+            "", text, flags=_re.M | _re.I)
+    return text
+
+
+
+
+def _verified_tier(f: dict) -> str:
+    """The 4-tier Verified cell, the same dynamic-then-stage2 priority the
+    disclosure header encodes (#319; the summary and disclosure tables must
+    agree for the same finding)."""
+    dt = f.get("dynamic_testing")
+    dta = f.get("dynamic_testing_attempted")
+    if isinstance(dt, dict) and dt.get("status") == "CONFIRMED":
+        return "dynamic"
+    if isinstance(dta, dict) and dta.get("status"):
+        return f"dynamic test failed ({dta.get('status')})"
+    v = str(f.get("stage2_verdict", "")).lower()
+    if v in _STAGE2_CONFIRMED:
+        return "verified"
+    return "static"
+
+
+def _summary_statistics_block(pipeline_data: dict) -> str:
+    """The server-rendered numeric facts (the #535 core).
+
+    Every line present-only — an old artifact without the new keys renders
+    with omitted lines, never fabricated zeros. Numbers come from
+    pipeline_stats only (the reporter folded the step reports in; the
+    generator never saw them).
+    """
+    stats = pipeline_data.get("pipeline_stats") or {}
+    lines: list[str] = []
+    parsed = stats.get("parsed_units")
+    if isinstance(parsed, int) and not isinstance(parsed, bool):
+        lines.append(f"- Parsed: {parsed} units")
+    if stats.get("reachability_filter_applied"):
+        orig = stats.get("original_units")
+        reach = stats.get("reachable_units")
+        if isinstance(orig, int) and isinstance(reach, int) and orig > 0:
+            pct = stats.get("reachability_reduction_percentage")
+            pct_str = f"{pct}" if isinstance(pct, (int, float)) else (
+                f"{round(100 * (orig - reach) / orig, 1)}")
+            lines.append(f"- In scope after reachability filter: {reach} of "
+                         f"{orig} units ({pct_str}% pruned)")
+    analyzed = stats.get("units_analyzed")
+    total = stats.get("total_units")
+    if isinstance(analyzed, int) and not isinstance(analyzed, bool):
+        extra = ""
+        s1err = stats.get("stage1_errors")
+        if isinstance(s1err, int) and s1err:
+            extra = f" ({s1err} errored)"
+        base = f"- Analyzed in Stage 1: {analyzed} units"
+        if isinstance(total, int) and total != analyzed:
+            base += f" of {total}"
+        lines.append(base + extra)
+    vi = stats.get("findings_input")
+    va = stats.get("units_analyzed_total")
+    if isinstance(vi, int) and isinstance(va, int):
+        adj = f"- Adjudicated in Stage 2: {vi} of {va} analyzed units"
+        down, up = stats.get("downgraded"), stats.get("upgraded")
+        if isinstance(down, int) or isinstance(up, int):
+            adj += f" ({down or 0} downgraded, {up or 0} upgraded)"
+        lines.append(adj)
+    if stats.get("same_model_verification"):
+        lines.append(
+            "- Stage 2 ran on the same model as Stage 1 and is not an "
+            "independent instrument")
+    if not lines:
+        return ""
+    return "## Pipeline Statistics\n\n" + "\n".join(lines) + "\n\n"
+
+
+def _summary_tables_block(pipeline_data: dict) -> str:
+    """The server-rendered Results / durations / costs / Confirmed tables."""
+    stats = pipeline_data.get("pipeline_stats") or {}
+    parts: list[str] = []
+
+    results = pipeline_data.get("results") or {}
+    if results:
+        rows = []
+        for label, key in (("Vulnerable", "vulnerable"), ("Safe", "safe"),
+                           ("Protected", "protected"),
+                           ("Inconclusive", "inconclusive"),
+                           ("Needs review", "needs_review"),
+                           ("Errored", "errors"),
+                           ("Deduplicated away", "deduplicated")):
+            v = results.get(key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                rows.append(f"| {label} | {v} |")
+        if rows:
+            parts.append("## Results\n\n| Outcome | Units |\n|---|---|\n"
+                         + "\n".join(rows) + "\n")
+
+    durations = stats.get("durations") or {}
+    if durations:
+        rows = [f"| {step} | {_fmt_duration(float(sec))} |"
+                for step, sec in durations.items()
+                if isinstance(sec, (int, float))]
+        total = sum(float(v) for v in durations.values()
+                    if isinstance(v, (int, float)))
+        rows.append(f"| **Total** | **{_fmt_duration(total)}** |")
+        parts.append("## Per-Step Durations\n\n| Step | Duration |\n"
+                     "|---|---|\n" + "\n".join(rows) + "\n")
+
+    costs = stats.get("costs") or {}
+    if costs:
+        rows = [f"| {step} | ${float((c or {}).get('actual') or 0):.2f} |"
+                for step, c in costs.items()]
+        total = sum(float((c or {}).get("actual") or 0) for c in costs.values())
+        rows.append(f"| **Total** | **${total:.2f}** |")
+        parts.append("## Per-Step Costs\n\n| Step | Actual |\n|---|---|\n"
+                     + "\n".join(rows) + "\n")
+
+    findings = pipeline_data.get("findings") or []
+    if findings:
+        confirmed = [f for f in findings
+                     if str(f.get("stage2_verdict", "")).lower()
+                     in _STAGE2_CONFIRMED]
+        not_confirmed = [f for f in findings if f not in confirmed]
+        if confirmed:
+            rows = []
+            for i, f in enumerate(confirmed, 1):
+                sev = f.get("severity")
+                rows.append(f"| {i} | {f.get('name', '?')} | "
+                            f"{(f.get('location') or {}).get('file', '?')}:"
+                            f"{(f.get('location') or {}).get('function', '?')} | "
+                            f"CWE-{f.get('cwe_id', '')} | {sev if sev else ''} | "
+                            f"{_verified_tier(f)} |")
+            parts.append(
+                "## Confirmed Vulnerabilities\n\n"
+                "| # | Vulnerability | Location | CWE | Severity | Verified |\n"
+                "|---|---|---|---|---|---|\n" + "\n".join(rows) + "\n")
+        else:
+            parts.append("## Confirmed Vulnerabilities\n\n"
+                         "No vulnerabilities were confirmed by Stage 2.\n")
+        if not_confirmed:
+            rows = []
+            for i, f in enumerate(not_confirmed, 1):
+                rows.append(f"| {i} | {f.get('name', '?')} | "
+                            f"{str(f.get('stage2_verdict', '')).lower()} |")
+            parts.append(
+                "## Not Confirmed\n\n"
+                "The following findings were not confirmed by Stage 2 "
+                "(unverified, incomplete, reclassified, or not re-examined):\n\n"
+                "| # | Finding | Stage 2 |\n|---|---|---|\n"
+                + "\n".join(rows) + "\n")
+    elif not parts:
+        parts.append("No findings to report.\n")
+
+    return ("\n\n".join(parts) + "\n\n") if parts else ""
+
+
+def _strip_summary_placeholders(text: str) -> str:
+    """The empty-case placeholder tables must never render literally."""
+    import re as _re
+    text = _re.sub(r"^\| \{step\} \| \{reason\} \|\n?", "", text, flags=_re.M)
+    text = _re.sub(
+        r"^\| \{name\} \| \{verdict\} \| \{verdict\} \| "
+        r"\{one_sentence_reason\} \|\n?", "", text, flags=_re.M)
+    return text
 
 
 def generate_summary_report(
@@ -185,7 +635,9 @@ def generate_summary_report(
 
     Returns:
         (report_text, usage_dict) where usage_dict has input_tokens,
-        output_tokens, total_tokens, cost_usd.
+        output_tokens, total_tokens, cost_usd — plus a verbatim
+        ``usage_details`` key when the provider supplied usage detail
+        fields (#211 pass-through; never summed, never in cost).
     """
     from utilities.llm import Message, TextBlock
 
@@ -197,20 +649,193 @@ def generate_summary_report(
 
     result = binding.adapter.complete(
         model=binding.model,
-        max_tokens=4096,
+        max_tokens=DEFAULT_MAX_TOKENS,
         system=system_prompt,
         messages=[Message(role="user", content=[TextBlock(user_prompt)])],
     )
 
     text = "\n".join(b.text for b in result.content if isinstance(b, TextBlock))
-    # Prepend the provenance banner deterministically (see helper docstring).
-    text = _context_provenance_header(pipeline_data) + text
+    # #209: refuse to bless an empty summary. An empty/whitespace completion
+    # (e.g. the Claude-5 thinking/empty-completion path) otherwise produces a
+    # summary-free SUMMARY_REPORT.md — an empty deliverable is wrong regardless
+    # of what status it is recorded under. (Historically this also left the
+    # report step's status="success" with summary_path in its outputs; that
+    # half is now fixed by core/step_report.py's #209 errors->status
+    # derivation, so the report step correctly reports "error" when this guard
+    # fires.) Guard the raw LLM output HERE, before the deterministic
+    # provenance banner is prepended: on a threat-model scan the banner is
+    # non-empty, so a guard on the banner+text combination would miss exactly
+    # this case. Raising here also covers the standalone `python -m report
+    # summary` path, which calls this producer directly.
+    if not text.strip():
+        raise RuntimeError(
+            "summary report generation returned empty output; refusing to write "
+            "a summary-free SUMMARY_REPORT.md"
+            + (" (stop_reason=max_tokens: the whole budget went to hidden "
+               "reasoning, not the answer)" if result.stop_reason == "max_tokens" else "")
+        )
+    # #512: a TRUNCATED (but non-empty) summary must say so in the
+    # deliverable itself — the banner joins the deterministic provenance/
+    # reachability headers (stderr alone is lost in CI and quiet runs).
+    if result.stop_reason == "max_tokens":
+        text = (
+            "> [!WARNING]\n"
+            "> This summary was TRUNCATED at the model's output budget "
+            "(stop_reason=max_tokens) — the reply was cut mid-generation "
+            "and the sections below may be incomplete.\n\n" + text
+        )
+    # #535: the numeric/eligibility surfaces are SERVER-rendered. The model
+    # keeps the narrative; the server owns the numbers (the receipt: the
+    # model transcribed 10.22s as "10m 13s" and put unverified rows in the
+    # Confirmed table). Strip any model-emitted duplicate of a server-owned
+    # section, strip literal placeholder tables, then splice the server
+    # blocks after the deterministic headers.
+    text = _strip_server_sections(text)
+    text = _strip_summary_placeholders(text)
+    server_blocks = (_summary_statistics_block(pipeline_data)
+                     + _summary_tables_block(pipeline_data))
+    # Splice the server blocks AFTER the model's H1/metadata block (the
+    # banners may precede the title; whole H2 sections may not — the #535
+    # review round: prepending put four tables above the document title).
+    # The gate fold (fable+astra, the m.start()>0 inversion): the
+    # H1-at-offset-0 canonical reply took the prepend branch — the tables
+    # rendered ABOVE the title. The boundary is normalized instead: find
+    # the first heading; skip its line and any following non-heading
+    # metadata lines; insert before the NEXT heading (or the end when the
+    # metadata block runs to the end). EVERY shape — H1 at 0, banners
+    # before the H1, metadata after, metadata-only-to-the-end — inserts
+    # AFTER the metadata block, never above the title.
+    import re as _re
+    m = _re.search(r"^#{1,2} ", text, flags=_re.M)
+    if m:
+        line_end = text.index("\n", m.start()) if "\n" in text[m.start():] else len(text)
+        m2 = _re.search(r"^#{1,2} ", text[line_end:], flags=_re.M)
+        insert_at = line_end + (m2.start() if m2 else len(text) - line_end)
+        text = text[:insert_at] + server_blocks + text[insert_at:]
+    else:
+        # No heading at all: the fallback document gets a canonical title
+        # (the banners + tables, then the model prose) — the banners
+        # prepend EXACTLY ONCE here (the old path prepended them twice:
+        # once in this branch and once in the unconditional prepend below).
+        text = (server_blocks + text)
+    # The banners prepend exactly once, unconditionally, at the very top.
+    text = (_context_provenance_header(pipeline_data)
+            + _reachability_header(pipeline_data) + text)
     return text, _extract_usage(
         result.input_tokens,
         result.output_tokens,
         binding.model,
         pricing=lookup_pricing(binding),
+        usage_details=result.usage_details,
     )
+
+
+# #210: the only verdicts Stage-2 attacker simulation positively adjudicated.
+# Every OTHER DISCLOSURE_ELIGIBLE verdict — unverified (Stage-2 attempted but
+# incomplete), and vulnerable / bypassable / error (per the taxonomy these
+# arise ONLY on the no-Stage-2 path, core/verdict_taxonomy.py + reporter.py's
+# verdict reducer) — is NOT Stage-2-confirmed. `bypassable` especially must not
+# read as confirmed: it is a bare Stage-1 finding verdict, so stamping it
+# "CONFIRMED by Stage-2" would be the exact false-confirmation this banner
+# exists to remove. Such findings are still disclosed (over-seed safety),
+# labeled UNVERIFIED.
+_STAGE2_CONFIRMED = frozenset({"confirmed", "agreed"})
+
+
+def _disclosure_verdict_header(vulnerability_data: dict) -> str:
+    """Deterministic, server-stamped verification banner for a disclosure.
+
+    Lets a reader distinguish an attacker-simulation-confirmed finding from a
+    not-yet-confirmed one without trusting the LLM to render the "Verified via
+    ..." line (dropped in most documents), and stamps the real file/function
+    location the "{affected_versions}" prompt field never carries. Placement
+    is deterministic; the explanation line's CONTENT is Stage-2 model text
+    (repo-influenced) — deterministically placed, not server-authored.
+    """
+    verdict = str(vulnerability_data.get("stage2_verdict") or "").lower()
+    stage1 = str(vulnerability_data.get("stage1_verdict") or "").lower()
+    # #319: the dynamic dimension stamps FIRST — a CONFIRMED Docker test is
+    # the strongest verification; an attempted-but-failed one must say NOT
+    # confirmed (never "Verified via dynamic testing" for an ERROR/
+    # NOT_REPRODUCED test).
+    dt = vulnerability_data.get("dynamic_testing")
+    dta = vulnerability_data.get("dynamic_testing_attempted")
+    # #319 (wave r1): the dimensions COMPOSE — the dynamic line ADDS as a
+    # second line, never REPLACES the Stage-2 stamp (the wave's regression:
+    # a Stage-2 CONFIRMED finding whose harness ERRORED read "NOT confirmed
+    # by dynamic testing" with the Stage-2 confirmation DROPPED — the
+    # reader could not distinguish it from a Stage-1-only finding; #283's
+    # ADJUDICATED wording likewise became unreachable).
+    dt_line = ""
+    if isinstance(dt, dict) and dt.get("status") == "CONFIRMED":
+        dt_line = "CONFIRMED by dynamic testing (Docker container)"
+    elif isinstance(dta, dict) and dta.get("status"):
+        dt_line = f"NOT confirmed by dynamic testing (test {dta.get('status')})"
+    if verdict in _STAGE2_CONFIRMED:
+        status = f"CONFIRMED by Stage-2 attacker simulation ({verdict})"
+    elif (verdict in ("vulnerable", "bypassable")
+          and stage1 and stage1 != verdict):
+        # #283: stage1 != stage2 on a still-real verdict is the Stage-2
+        # RECLASSIFICATION signal (e.g. vulnerable -> bypassable, adjudicated
+        # by attacker simulation). "UNVERIFIED — not confirmed by Stage-2"
+        # would be FALSE here: Stage 2 DID adjudicate. When stage1 == stage2
+        # (or stage1 is absent) the finding may not have been through Stage 2
+        # at all — the conservative UNVERIFIED wording stays.
+        status = (
+            f"ADJUDICATED by Stage-2 attacker simulation — reclassified "
+            f"{stage1} -> {verdict}, still a real finding"
+        )
+    else:  # unverified / error / same-verdict vulnerable/bypassable
+        status = (
+            "UNVERIFIED — not confirmed by Stage-2 attacker simulation "
+            f"({verdict or 'unknown'})"
+        )
+    lines = [f"> **Verification:** {status}"]
+    if dt_line:
+        lines.append(f"> **Dynamic testing:** {dt_line}")
+    loc = vulnerability_data.get("location")
+    if isinstance(loc, dict) and (loc.get("file") or loc.get("function")):
+        where = ":".join(str(x) for x in (loc.get("file"), loc.get("function")) if x)
+        lines.append(f"> **Location:** {where}")
+    # #534: the Stage-2 QUALIFICATION line, stated verbatim — the one piece
+    # of Stage 2's reasoning a reader must not lose to the model's prose. The
+    # banner is deterministic and server-stamped, so the qualification cannot
+    # be dropped the way the in-body "Verification:" line was (the receipt:
+    # a disclosure asserted the exact path Stage 2's explanation said was
+    # gated).
+    qual = str(vulnerability_data.get("verification_explanation") or "").strip()
+    if qual:
+        # #534: blockquote-safe — a multi-paragraph explanation must stay
+        # inside the banner block (a bare \n\n would dump the rest as
+        # top-level prose above the model's H1). The gate fold adds newline
+        # normalization first: CommonMark treats \r\n and bare \r as line
+        # endings, so an unnormalized \r would escape the > prefix (fable's
+        # finding — a Windows/legacy-model output shape would break out).
+        _norm = qual.replace("\r\n", "\n").replace("\r", "\n")
+        _had_update = isinstance(vulnerability_data.get("consistency_update"), dict)
+        _label = ("Stage-2 explanation (pre-dating the consistency update — "
+                  "the verdict shown above was changed after this reasoning):"
+                  if _had_update else "Stage-2 explanation:")
+        # The banner length is DELIBERATELY UNBOUNDED (the fable+astra gate
+        # decision, recorded here): the explanation's gate clause ("the path
+        # is gated by...") is the entire point of #534 — a cap risks cutting
+        # it when it appears late in a multi-paragraph analysis. Both
+        # sibling consumers cap at 300 for their own surfaces (the CLI
+        # summary; the HTML justification line); this surface — the
+        # reporter-facing disclosure body — preserves the full reasoning by
+        # design. The docstring records the decision; the multi-paragraph
+        # test pins the containment.
+        lines.append(f"> **{_label}** " + _norm.replace("\n", "\n> "))
+        # The gate fold: attribute the verdict transition when it happened.
+        cu = vulnerability_data.get("consistency_update")
+        if _had_update:
+            _from = str(cu.get("from") or "?").strip()
+            _to = str(cu.get("to") or "?").strip()
+            _reason = str(cu.get("reason") or "").strip()
+            _reason_part = f" — {_reason}" if _reason else ""
+            lines.append(f"> **Consistency update:** {_from} → {_to}{_reason_part}")
+
+    return "\n".join(lines) + "\n\n"
 
 
 def _splice_code_section(llm_output: str, code_section: str) -> str:
@@ -289,7 +914,7 @@ def generate_disclosure(
 
     result = binding.adapter.complete(
         model=binding.model,
-        max_tokens=4096,
+        max_tokens=DEFAULT_MAX_TOKENS,
         system=system_prompt,
         messages=[Message(role="user", content=[TextBlock(user_prompt)])],
     )
@@ -298,12 +923,29 @@ def generate_disclosure(
         b.text for b in result.content if isinstance(b, TextBlock)
     )
     final_output = _splice_code_section(llm_output, code_section)
+    # #512: a TRUNCATED disclosure must say so in the deliverable itself
+    # (stderr alone is lost in CI and quiet runs).
+    if result.stop_reason == "max_tokens":
+        final_output = (
+            "> [!WARNING]\n"
+            "> This disclosure was TRUNCATED at the model's output budget "
+            "(stop_reason=max_tokens) — the reply was cut mid-generation "
+            "and the sections below may be incomplete.\n\n" + final_output
+        )
+    # #210: stamp the verification status + location deterministically from the
+    # server-truth stage2_verdict, the same way the vulnerable code is spliced
+    # in above. The prompt otherwise asks the LLM to render "Verified via ..."
+    # (dropped in most documents) and an "{affected_versions}" field that is
+    # never populated — so an unadjudicated Stage-1 candidate reads identically
+    # to an attacker-simulation-confirmed finding.
+    final_output = _disclosure_verdict_header(vulnerability_data) + final_output
 
     return final_output, _extract_usage(
         result.input_tokens,
         result.output_tokens,
         binding.model,
         pricing=lookup_pricing(binding),
+        usage_details=result.usage_details,
     )
 
 
@@ -361,9 +1003,12 @@ def generate_all(
         print(f"Generating disclosure for {finding['short_name']}...")
         disclosure, _usage = generate_disclosure(finding, product_name, report_binding)
 
-        # short_name passes validation on presence only, so it may be null/empty;
-        # fall back to id so a null short_name can't crash disclosure generation.
-        safe_name = (finding.get("short_name") or finding.get("id") or "finding").replace(" ", "_").upper()
+        # short_name passes validation on presence only, so it may be null/empty,
+        # a non-str (JSON), or contain a "/" — fall back to id, coerce to str, and
+        # basename it so a null/typed/traversal short_name can't crash disclosure
+        # generation (AttributeError / FileNotFoundError writing into a missing dir).
+        safe_name = (os.path.basename(str(finding.get("short_name") or finding.get("id") or "finding"))
+                     or "finding").replace(" ", "_").upper()
         filename = f"DISCLOSURE_{i:02d}_{safe_name}.md"
         with open_utf8(disclosures_dir / filename, "w") as f:
             f.write(disclosure)

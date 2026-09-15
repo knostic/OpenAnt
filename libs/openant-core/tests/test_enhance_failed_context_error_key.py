@@ -11,7 +11,6 @@ Bug (enhancer-failed-context-no-error-key):
 
 No network: ``simple_text`` is monkeypatched to raise / return junk.
 """
-import pytest
 
 
 class _FakeAdapter:

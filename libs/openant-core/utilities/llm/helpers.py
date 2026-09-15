@@ -14,11 +14,27 @@ inspect content blocks and continue the conversation.
 
 from __future__ import annotations
 
+import sys
+import threading
 from typing import Optional
 
 from ..llm_client import TokenTracker, get_global_tracker
-from .adapter import Message, TextBlock
+from .adapter import CompletionResult, LLMResponseError, Message, TextBlock
 from .registry import PhaseBinding
+
+# Thinking-era output budget (the simple_text default; PR #242 raised it from
+# 8192). Claude-5 / Gemini-2.5+ / OpenAI o-series spend output budget on hidden
+# reasoning; 8192 can be fully consumed by reasoning on a large unit, yielding a
+# reasoning-only (empty) completion that the adapter drops -> hard "no usable
+# content" error. 20000 is under the Anthropic non-streaming 10-min ceiling
+# (32000 is rejected with a "Streaming is required" ValueError; 20000 is
+# accepted) and is a CAP, not a floor on generation -- models still stop at
+# end_turn on small prompts, so this does not raise cost for short answers.
+# #290: the multi-turn tool-using agent loops (finding_verifier,
+# agentic_enhancer/agent) bypass simple_text and call adapter.complete
+# directly, so they import THIS constant instead of pinning their own 4096 —
+# the two budget paths cannot drift apart again.
+DEFAULT_MAX_TOKENS = 20000
 
 
 def lookup_pricing(binding: PhaseBinding) -> Optional[dict]:
@@ -33,12 +49,80 @@ def lookup_pricing(binding: PhaseBinding) -> Optional[dict]:
     return getattr(binding.adapter, "pricing", {}).get(binding.model)
 
 
+_TRUNCATION_WARNED: set = set()
+_TRUNCATION_WARNED_LOCK = threading.Lock()
+
+
+def reset_truncation_warnings() -> None:
+    """Clear the one-time truncation warning set (for tests)."""
+    with _TRUNCATION_WARNED_LOCK:
+        _TRUNCATION_WARNED.clear()
+
+
+def simple_completion(
+    binding: PhaseBinding,
+    prompt: str,
+    *,
+    system: Optional[str] = None,
+    # See DEFAULT_MAX_TOKENS above for why this is 20000, not 8192.
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    tracker: Optional[TokenTracker] = None,
+) -> CompletionResult:
+    """Send one user-prompt completion, return the raw result.
+
+    The typed-result sibling of :func:`simple_text`: same call, same
+    tracking — for callers that need the structured fields
+    (``stop_reason``), e.g. the app-context phase, which must name the
+    truncation in its parse-failure error instead of a bare "could not
+    parse LLM response".
+    """
+    used_tracker = tracker if tracker is not None else get_global_tracker()
+
+    messages = [Message(role="user", content=[TextBlock(prompt)])]
+    try:
+        result = binding.adapter.complete(
+            model=binding.model,
+            system=system,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+    except LLMResponseError as exc:
+        # #537: a rejected completion's returned usage is recorded BEFORE
+        # the re-raise — the call's tokens must not vanish from accounting
+        # (what the provider actually charged is unknowable from the
+        # artifact and stays unclaimed; the token counts are what the
+        # response carried).
+        if exc.input_tokens or exc.output_tokens:
+            used_tracker.record_call(
+                model=binding.model,
+                input_tokens=exc.input_tokens,
+                output_tokens=exc.output_tokens,
+                pricing=lookup_pricing(binding),
+            )
+        raise
+    # Pricing lives on the adapter (issue #65 §9). Pass it through
+    # so the tracker isn't forced to consult a shared global per
+    # provider — the result is per-model accuracy without
+    # cross-provider drift.
+    used_tracker.record_call(
+        model=binding.model,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        pricing=lookup_pricing(binding),
+        # #211 pass-through capture: provider detail fields verbatim
+        # (never in the cost math — see TokenTracker.record_call).
+        usage_details=result.usage_details,
+    )
+    return result
+
+
 def simple_text(
     binding: PhaseBinding,
     prompt: str,
     *,
     system: Optional[str] = None,
-    max_tokens: int = 8192,
+    # See DEFAULT_MAX_TOKENS above for why this is 20000, not 8192.
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     tracker: Optional[TokenTracker] = None,
 ) -> str:
     """Send one user-prompt completion, return the concatenated text reply.
@@ -54,33 +138,37 @@ def simple_text(
             to the global tracker so callers that don't care about
             multi-tracker setups don't have to thread one through.
 
-    Returns:
-        Concatenated text from every :class:`TextBlock` in the
+    Returns: Concatenated text from every :class:`TextBlock` in the
         response. Non-text blocks (e.g. a stray ``tool_use`` if the
         model misbehaves) are dropped — this is the "I just want
         text" helper, so callers that need richer handling should
         use ``binding.adapter.complete()`` directly.
     """
-    used_tracker = tracker if tracker is not None else get_global_tracker()
-
-    messages = [Message(role="user", content=[TextBlock(prompt)])]
-    result = binding.adapter.complete(
-        model=binding.model,
-        system=system,
-        messages=messages,
-        max_tokens=max_tokens,
+    result = simple_completion(
+        binding, prompt, system=system, max_tokens=max_tokens, tracker=tracker
     )
-    # Pricing lives on the adapter (issue #65 §9). Pass it through
-    # so the tracker isn't forced to consult a shared global per
-    # provider — the result is per-model accuracy without
-    # cross-provider drift.
-    used_tracker.record_call(
-        model=binding.model,
-        input_tokens=result.input_tokens,
-        output_tokens=result.output_tokens,
-        pricing=lookup_pricing(binding),
-    )
-
+    # #512: a truncated reply is otherwise a SILENT quality degradation —
+    # reasoning models can spend the whole budget on hidden reasoning and
+    # return a fence fragment or an empty completion (#242), which then
+    # surfaces as a bare JSON-parse failure downstream. Warn once per
+    # (phase, model, cap) so a run's logs name the cause without per-call
+    # spam. simple_text runs inside thread-pool workers, so the warned-set
+    # is lock-guarded. NOTE: several providers map UNKNOWN stop reasons to
+    # "max_tokens", so the wording includes the unrecognized case. The join
+    # below still returns whatever text exists.
+    if result.stop_reason == "max_tokens":
+        key = (getattr(binding, "phase", None), binding.model, max_tokens)
+        with _TRUNCATION_WARNED_LOCK:
+            if key not in _TRUNCATION_WARNED:
+                _TRUNCATION_WARNED.add(key)
+                print(
+                    f"warning: {getattr(binding, 'provider_name', '?')}/{binding.model} "
+                    f"(phase {getattr(binding, 'phase', '?')}) hit max_tokens="
+                    f"{max_tokens} (output_tokens={result.output_tokens}); reply "
+                    "truncated — reasoning models can spend the whole budget "
+                    "on hidden reasoning",
+                    file=sys.stderr,
+                )
     return "\n".join(
         block.text for block in result.content if isinstance(block, TextBlock)
     )

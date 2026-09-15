@@ -24,11 +24,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .model_config import CLAUDE_SONNET_4_20250514
-from .llm_client import TokenTracker, get_global_tracker, reset_global_tracker
+from .llm_client import TokenTracker, get_global_tracker
 from .llm import (
     LLMAuthError,
     LLMConnectionError,
-    LLMError,
     LLMNotFoundError,
     LLMRateLimitError,
     LLMResponseError,
@@ -36,12 +35,11 @@ from .llm import (
     simple_text,
 )
 from .agentic_enhancer import (
-    RepositoryIndex,
     enhance_unit_with_agent,
     load_index_from_file,
     INCOMPLETE_CLASSIFICATION,
 )
-from .rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
+from .rate_limiter import get_rate_limiter, is_retryable_error
 from .file_io import read_json, write_json
 
 # Avoid circular import — import checkpoint at usage site
@@ -71,13 +69,20 @@ MAX_RETRY_ROUNDS = 3
 # Expected JSON shape of an enhancer response — handed to JSONCorrector so a
 # malformed-but-recoverable enhancer reply is repaired into THIS shape (no
 # verdict) rather than the default vuln schema.
+# #321 (wave r1): the corrector's recovery schema carries the classification
+# too — a strictly-schema-following corrector model re-emitted the reply
+# WITHOUT the field, and the validated literal then wrote "unknown": an
+# exploitable unit whose reply needed correction was silently excluded from
+# --exploitable-only, the exact bug class this issue fixes, surviving on the
+# correction sub-path.
 _ENHANCE_JSON_SCHEMA = """{
     "missing_dependencies": [{"name": "functionName", "reason": "why missed", "likely_location": "file or module"}],
     "additional_callers": [{"name": "callerName", "reason": "why it likely calls the target"}],
     "data_flow": {"inputs": [], "outputs": [], "tainted_variables": [], "security_relevant_flows": []},
     "imports": [{"module": "name", "used_for": "purpose"}],
     "reasoning": "Brief explanation of your analysis",
-    "confidence": 0.0
+    "confidence": 0.0,
+    "security_classification": "exploitable | vulnerable_internal | security_control | neutral | unknown"
 }"""
 
 
@@ -108,6 +113,15 @@ def _build_error_info(exc: Exception) -> dict:
         info["type"] = "not_found"
     elif isinstance(exc, LLMResponseError):
         info["type"] = "api_status"
+        # #292: the transient empty-completion raise is its OWN type, so the
+        # retry decision does not depend on a status_code the exception
+        # cannot carry (the raise is bare — no `from`, no __cause__). Same
+        # substrings + refusal guard as is_retryable_error's string branch;
+        # LLMRefusalError subclasses LLMResponseError, so the guard matters.
+        msg = str(exc).lower()
+        if "refused the request" not in msg and (
+                "no usable content" in msg or "empty completion" in msg):
+            info["type"] = "empty_completion"
 
     # Best-effort diagnostics. The unified LLMError taxonomy is
     # provider-neutral and does not itself carry status_code/request_id,
@@ -157,6 +171,7 @@ def get_context_enhancement_prompt(
         static_callers: Callers identified by static analysis
         context_functions: Other functions in the same file
     """
+    from prompts._fence import safe_code_fence
     deps_list = "\n".join(f"- {d}" for d in static_deps) if static_deps else "- None identified"
     callers_list = "\n".join(f"- {c}" for c in static_callers) if static_callers else "- None identified"
 
@@ -168,7 +183,8 @@ def get_context_enhancement_prompt(
             code_preview = f.get('code', '')[:200]
             if len(f.get('code', '')) > 200:
                 code_preview += '...'
-            context_section += f"```javascript\n{code_preview}\n```\n\n"
+            _pf = safe_code_fence(code_preview)
+            context_section += f"{_pf}javascript\n{code_preview}\n{_pf}\n\n"
     else:
         context_section = "## Other Functions in Same File\nNo other functions in file.\n"
 
@@ -180,9 +196,9 @@ def get_context_enhancement_prompt(
 **Type:** {unit_type}
 {f'**Class:** {class_name}' if class_name else ''}
 
-```javascript
+{safe_code_fence(function_code)}javascript
 {function_code}
-```
+{safe_code_fence(function_code)}
 
 ## Static Analysis Results
 **Already identified dependencies (functions called):**
@@ -200,6 +216,10 @@ Analyze this function and identify:
 2. **Additional Callers**: Functions that likely call this function based on naming patterns
 3. **Data Flow**: What data flows in and out, especially security-relevant data
 4. **Imports**: External modules/files this function depends on
+5. **Security Classification**: whether this unit is exploitable (vulnerable +
+   reachable from user input), vulnerable_internal (vulnerable but not user-reachable),
+   security_control (defensive code), or neutral (no security relevance) — the same
+   enum the agentic enhancer uses; write "unknown" only if you genuinely cannot tell
 
 ## Response Format
 Respond with JSON only:
@@ -225,7 +245,8 @@ Respond with JSON only:
     {{"module": "./utils", "used_for": "helper functions"}}
   ],
   "reasoning": "Brief explanation of your analysis",
-  "confidence": 0.0-1.0
+  "confidence": 0.0-1.0,
+  "security_classification": "exploitable | vulnerable_internal | security_control | neutral | unknown"
 }}
 ```"""
 
@@ -344,13 +365,27 @@ class ContextEnhancer:
                     self.stats["data_flows_extracted"] += 1
 
                 # Add enhancement to unit
+                # #321: security_classification is threaded, VALIDATED to the
+                # agentic enum — the six-key literal dropped it even when the
+                # model volunteered it, so --exploitable-only/-all selected
+                # ZERO units after every single-shot enhance (a total false
+                # negative; analyzer.py:59-74 reads a key nobody wrote). One
+                # shape ALWAYS: an in-enum value verbatim, anything else the
+                # explicit "unknown" — the consumer's contract holds and the
+                # [Enhance] Classifications counter is honest.
+                _cls = analysis.get("security_classification")
                 unit["llm_context"] = {
                     "missing_dependencies": analysis.get("missing_dependencies", []),
                     "additional_callers": analysis.get("additional_callers", []),
                     "data_flow": analysis.get("data_flow", {}),
                     "imports": analysis.get("imports", []),
                     "reasoning": analysis.get("reasoning", ""),
-                    "confidence": analysis.get("confidence", 0.5)
+                    "confidence": analysis.get("confidence", 0.5),
+                    "security_classification": (
+                        _cls if isinstance(_cls, str)
+                        and _cls in ("exploitable", "vulnerable_internal",
+                                     "security_control", "neutral")
+                        else "unknown"),
                 }
             else:
                 # enhancer-failed-context: a parse failure is an error, not a
@@ -376,6 +411,8 @@ class ContextEnhancer:
         progress_callback: Optional[Callable] = None,
         workers: int = 10,
         checkpoint_path: str = None,
+        restored_callback: Optional[Callable] = None,
+        phase_baseline: dict | None = None,
     ) -> dict:
         """
         Enhance all units in a dataset (single-shot mode).
@@ -395,6 +432,9 @@ class ContextEnhancer:
             workers: Number of parallel workers (default: 10).
             checkpoint_path: Path to a checkpoint directory (enables resume).
                 When None, no checkpoints are written (prior behavior).
+            restored_callback: Optional callback(count) invoked once with the
+                number of units restored from a checkpoint, so the progress
+                reporter can exclude them from the session rate (#218).
 
         Returns:
             Enhanced dataset
@@ -426,20 +466,39 @@ class ContextEnhancer:
             )
             os.makedirs(checkpoint_dir, exist_ok=True)
             processed_ids = self._load_completed_units(checkpoint_dir, context_key="llm_context")
+            _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
             # Restore llm_context for already-completed units.
             for unit in units:
                 unit_id = unit.get("id")
                 if unit_id in processed_ids:
-                    cp_file = os.path.join(checkpoint_dir, f"{self._safe_filename(unit_id)}.json")
-                    if os.path.exists(cp_file):
+                    cp_file = _ckpt_map.get(unit_id)
+                    if cp_file:
                         cp_data = read_json(cp_file)
-                        unit["llm_context"] = cp_data.get("llm_context", {})
+                        restored_ctx = cp_data.get("llm_context", {})
+                        # #321 (wave r1 finding 2): a checkpoint written by a
+                        # pre-fix run (or the current release resuming a
+                        # pre-fix scan) carries the six-key shape with NO
+                        # security_classification — restored verbatim, those
+                        # units still yield None from the reader and
+                        # --exploitable-only/-limit treat them exactly as
+                        # pre-fix, silently. "One shape ALWAYS" holds across
+                        # resume too: backfill the explicit "unknown" (an
+                        # old artifact is honest about what it knows; the
+                        # unit can be re-enhanced deliberately if needed).
+                        if "security_classification" not in restored_ctx:
+                            restored_ctx["security_classification"] = "unknown"
+                        unit["llm_context"] = restored_ctx
                         if "code" in cp_data:
                             unit["code"] = cp_data["code"]
             if processed_ids:
                 self._log("info",
                           f"Restored {len(processed_ids)} already-processed units from checkpoints",
                           units=len(processed_ids))
+                # #218: rebase the progress reporter's session baseline so the
+                # restored units are excluded from the per-unit rate — the
+                # single-shot resume path needs this exactly as the agentic one.
+                if restored_callback:
+                    restored_callback(len(processed_ids))
 
         self._log("info", f"Enhancing {total} units with LLM context (single-shot mode)", units=total)
         self._log("info", f"Provider: {self.binding.provider_name}, Model: {self.binding.model}")
@@ -472,7 +531,12 @@ class ContextEnhancer:
                         progress_callback(uid, classification, elapsed)
             except KeyboardInterrupt:
                 self._log("warning", "Interrupted — progress saved to checkpoints")
-                return dataset
+                # #417: stop swallowing the interrupt. The per-unit checkpoints
+                # are already on disk and logged; returning the dataset let the
+                # pipeline continue (analyze → verify → report) and the Go layer
+                # never saw an interrupt (empty-stdout short-circuit never
+                # fires → no exit 130) — the analyze stage's #313 fix, mirrored.
+                raise
         else:
             executor = ThreadPoolExecutor(max_workers=workers)
             futures = {executor.submit(_process_one, unit): unit for unit in units_to_process}
@@ -485,7 +549,10 @@ class ContextEnhancer:
                 self._log("warning", "Interrupted — cancelling pending work...")
                 executor.shutdown(wait=False, cancel_futures=True)
                 self._log("info", "Progress saved to checkpoints")
-                return dataset
+                # #417: same contract as the sequential path — after cancelling
+                # pending work and logging the checkpoint state, RE-RAISE so
+                # the interrupt reaches the caller (never complete the scan).
+                raise
             executor.shutdown(wait=False)
 
         # Recompute stats from unit results (thread-safe)
@@ -547,6 +614,7 @@ class ContextEnhancer:
         progress_callback: Optional[Callable] = None,
         restored_callback: Optional[Callable] = None,
         workers: int = 10,
+        phase_baseline: dict | None = None,
     ) -> dict:
         """
         Enhance all units using agentic approach with tool use.
@@ -601,13 +669,14 @@ class ContextEnhancer:
 
             # Load completed unit IDs from per-unit checkpoint files
             processed_ids = self._load_completed_units(checkpoint_dir)
+            _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
 
             # Restore agent_context from checkpoint files into units
             for unit in units:
                 unit_id = unit.get("id")
                 if unit_id in processed_ids:
-                    cp_file = os.path.join(checkpoint_dir, f"{self._safe_filename(unit_id)}.json")
-                    if os.path.exists(cp_file):
+                    cp_file = _ckpt_map.get(unit_id)
+                    if cp_file:
                         cp_data = read_json(cp_file)
                         unit["agent_context"] = cp_data.get("agent_context", {})
                         if "code" in cp_data:
@@ -621,12 +690,21 @@ class ContextEnhancer:
         # Initialize summary tracking for _summary.json
         # Counts are updated in the main thread (as_completed loop) — no lock needed.
         _summary_cp = None
-        _summary_completed = len(processed_ids)
+        # #293: restored INCOMPLETE units (agent degenerate exit) are restored
+        # work but not completions — seed the third bucket, not completed.
+        _restored_incomplete = sum(
+            1 for u in units
+            if u.get("id") in processed_ids
+            and (u.get("agent_context", {}) or {}).get("security_classification")
+                == INCOMPLETE_CLASSIFICATION)
+        _summary_completed = len(processed_ids) - _restored_incomplete
+        _summary_incomplete = _restored_incomplete
         _summary_errors = 0
         _summary_error_breakdown = {}
         _summary_input_tokens = 0
         _summary_output_tokens = 0
         _summary_cost_usd = 0.0
+        _summary_unpriced: set[str] = set()
 
         if checkpoint_dir:
             SC = _get_step_checkpoint()
@@ -635,10 +713,11 @@ class ContextEnhancer:
             _summary_cp.dir = checkpoint_dir
 
             # Count errors and sum usage from already-loaded checkpoints
+            _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
             for unit in units:
                 uid = unit.get("id", "")
-                cp_file = os.path.join(checkpoint_dir, f"{self._safe_filename(uid)}.json")
-                if not os.path.exists(cp_file):
+                cp_file = _ckpt_map.get(uid)
+                if not cp_file:
                     continue
                 try:
                     cp_data = read_json(cp_file)
@@ -647,6 +726,8 @@ class ContextEnhancer:
                     _summary_input_tokens += cp_usage.get("input_tokens", 0)
                     _summary_output_tokens += cp_usage.get("output_tokens", 0)
                     _summary_cost_usd += cp_usage.get("cost_usd", 0.0)
+                    # #216: restore the incomplete-cost marker per unit.
+                    _summary_unpriced.update(cp_usage.get("unpriced_models") or [])
                     # Count errors for non-completed units
                     if uid not in processed_ids and cp_data.get("agent_context", {}).get("error"):
                         _summary_errors += 1
@@ -658,14 +739,21 @@ class ContextEnhancer:
 
             _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                       _summary_error_breakdown, phase="in_progress",
+                                      incomplete=_summary_incomplete,
                                       usage={"input_tokens": _summary_input_tokens,
                                              "output_tokens": _summary_output_tokens,
                                              "cost_usd": round(_summary_cost_usd, 6)})
 
             # Inject prior usage into tracker so step_report captures the total
-            if _summary_input_tokens or _summary_output_tokens:
+            if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
                 self.tracker.add_prior_usage(
-                    _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+                    _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
+                    unpriced_models=sorted(_summary_unpriced) or None)
+                # #281: refresh the caller's phase baseline AFTER the
+                # injection so its "Enhance" delta excludes restored usage.
+                if phase_baseline is not None:
+                    from core import tracking as _tracking
+                    phase_baseline["usage"] = _tracking.get_usage()
 
         remaining = total - len(processed_ids)
         self._log("info", f"Enhancing {remaining} units with agentic analysis ({len(processed_ids)} already done)", units=remaining)
@@ -732,7 +820,8 @@ class ContextEnhancer:
 
         def _update_summary(classification, unit):
             """Update summary counters after a unit completes. Called from main thread."""
-            nonlocal _summary_completed, _summary_errors, _summary_error_breakdown
+            nonlocal _summary_completed, _summary_incomplete, _summary_errors
+            nonlocal _summary_error_breakdown
             nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
             if _summary_cp is None:
                 return
@@ -741,6 +830,10 @@ class ContextEnhancer:
                 err = unit.get("agent_context", {}).get("error", {})
                 err_type = err.get("type", "unknown") if isinstance(err, dict) else "unknown"
                 _summary_error_breakdown[err_type] = _summary_error_breakdown.get(err_type, 0) + 1
+            elif classification == INCOMPLETE_CLASSIFICATION:
+                # #293: the agent's degenerate exit (no completed finish call)
+                # is the third state — not a completion, not an error.
+                _summary_incomplete += 1
             else:
                 _summary_completed += 1
             # Accumulate per-unit usage
@@ -748,11 +841,16 @@ class ContextEnhancer:
             _summary_input_tokens += meta.get("input_tokens", 0)
             _summary_output_tokens += meta.get("output_tokens", 0)
             _summary_cost_usd += meta.get("cost_usd", 0.0)
+            _summary_unpriced.update(meta.get("unpriced_models") or [])
+            _usage = {"input_tokens": _summary_input_tokens,
+                      "output_tokens": _summary_output_tokens,
+                      "cost_usd": round(_summary_cost_usd, 6)}
+            if _summary_unpriced:
+                _usage["cost_incomplete"] = True
+                _usage["unpriced_models"] = sorted(_summary_unpriced)
             _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                       _summary_error_breakdown, phase="in_progress",
-                                      usage={"input_tokens": _summary_input_tokens,
-                                             "output_tokens": _summary_output_tokens,
-                                             "cost_usd": round(_summary_cost_usd, 6)})
+                                      usage=_usage, incomplete=_summary_incomplete)
 
         if workers <= 1:
             # Sequential mode
@@ -764,7 +862,12 @@ class ContextEnhancer:
                         progress_callback(uid, classification, elapsed)
             except KeyboardInterrupt:
                 self._log("warning", "Interrupted — progress saved to checkpoints")
-                return dataset
+                # #417: stop swallowing the interrupt. The per-unit checkpoints
+                # are already on disk and logged; returning the dataset let the
+                # pipeline continue (analyze → verify → report) and the Go layer
+                # never saw an interrupt (empty-stdout short-circuit never
+                # fires → no exit 130) — the analyze stage's #313 fix, mirrored.
+                raise
         else:
             # Parallel mode
             executor = ThreadPoolExecutor(max_workers=workers)
@@ -780,7 +883,10 @@ class ContextEnhancer:
                 self._log("warning", "Interrupted — cancelling pending work...")
                 executor.shutdown(wait=False, cancel_futures=True)
                 self._log("info", "Progress saved to checkpoints")
-                return dataset
+                # #417: same contract as the sequential path — after cancelling
+                # pending work and logging the checkpoint state, RE-RAISE so
+                # the interrupt reaches the caller (never complete the scan).
+                raise
             executor.shutdown(wait=False)
 
         # Auto-retry failed units with transient errors (rate limit, connection,
@@ -818,8 +924,14 @@ class ContextEnhancer:
                 unit["agent_context"] = {}
                 uid, classification, elapsed, _ = _enhance_one(unit)
 
-                # Update summary: retry succeeded → flip error to completed
-                if classification != "error":
+                # Update summary: retry produced an outcome → flip the error
+                # to completed OR incomplete (#293: a retried unit can land
+                # on the agent's degenerate exit, which is not a completion)
+                if classification == INCOMPLETE_CLASSIFICATION:
+                    round_recovered += 1
+                    _summary_errors = max(0, _summary_errors - 1)
+                    _summary_incomplete += 1
+                elif classification != "error":
                     round_recovered += 1
                     _summary_errors = max(0, _summary_errors - 1)
                     _summary_completed += 1
@@ -833,6 +945,7 @@ class ContextEnhancer:
                 if _summary_cp is not None:
                     _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                               _summary_error_breakdown, phase="in_progress",
+                                              incomplete=_summary_incomplete,
                                               usage={"input_tokens": _summary_input_tokens,
                                                      "output_tokens": _summary_output_tokens,
                                                      "cost_usd": round(_summary_cost_usd, 6)})
@@ -853,6 +966,7 @@ class ContextEnhancer:
         if _summary_cp is not None:
             _summary_cp.write_summary(total, _summary_completed, _summary_errors,
                                       _summary_error_breakdown, phase="done",
+                                      incomplete=_summary_incomplete,
                                       usage={"input_tokens": _summary_input_tokens,
                                              "output_tokens": _summary_output_tokens,
                                              "cost_usd": round(_summary_cost_usd, 6)})
@@ -894,9 +1008,15 @@ class ContextEnhancer:
         return dataset
 
     @staticmethod
-    def _safe_filename(unit_id: str) -> str:
-        from utilities.safe_filename import safe_filename
-        return safe_filename(unit_id)
+    def _id_keyed_checkpoint_map(checkpoint_dir: str) -> dict:
+        """#317: {unit_id: checkpoint path} keyed by the id INSIDE each file
+        (one listdir+read pass) — restoration must not compute filenames:
+        a computed lookup strands old-scheme files (detected complete,
+        restore no-ops -> empty contexts -> fewer findings) and restores
+        the WRONG unit's data when the computed name is taken by a
+        case-only sibling."""
+        from core.checkpoint import id_keyed_checkpoint_map
+        return id_keyed_checkpoint_map(checkpoint_dir)
 
     def _save_unit_checkpoint(self, unit: dict, checkpoint_dir: str, context_key: str = "agent_context"):
         """Save a single unit's result to its own checkpoint file.
@@ -906,8 +1026,6 @@ class ContextEnhancer:
         The key is recorded so resume knows where to restore.
         """
         unit_id = unit.get("id", "unknown")
-        filename = self._safe_filename(unit_id) + ".json"
-        filepath = os.path.join(checkpoint_dir, filename)
         ctx = unit.get(context_key, {})
         cp_data = {
             "id": unit_id,
@@ -919,13 +1037,26 @@ class ContextEnhancer:
             cp_data["code"] = unit["code"]
         # Include per-unit usage from agent_metadata (agentic only)
         meta = ctx.get("agent_metadata", {}) if isinstance(ctx, dict) else {}
-        if meta.get("input_tokens") or meta.get("output_tokens"):
+        # #598 review: the unpriced term — a zero-token call whose only
+        # trace is the unpriced id must still write the usage block, or
+        # a resume loses the marker.
+        if (meta.get("input_tokens") or meta.get("output_tokens")
+                or meta.get("unpriced_models")):
             cp_data["usage"] = {
                 "input_tokens": meta.get("input_tokens", 0),
                 "output_tokens": meta.get("output_tokens", 0),
                 "cost_usd": meta.get("cost_usd", 0.0),
+                # #598: the per-unit unpriced ids — agent_metadata carries
+                # them (the #216 set); dropping them here made the resume
+                # reader (which forwards them into the tracker) read
+                # nothing on a real enhance resume.
+                "unpriced_models": list(meta.get("unpriced_models") or []),
             }
-        write_json(filepath, cp_data)
+        # #317: collision-safe AND under the save lock (this runs in a
+        # ThreadPoolExecutor worker — the resolve+write pair must be
+        # serialized against a case sibling in flight).
+        from core.checkpoint import save_checkpoint_under_lock
+        save_checkpoint_under_lock(checkpoint_dir, unit_id, cp_data)
 
     def _load_completed_units(self, checkpoint_dir: str, context_key: str = "agent_context") -> set:
         """Load the set of completed unit IDs from per-unit checkpoint files.
@@ -1056,7 +1187,13 @@ class ContextEnhancer:
             },
             "imports": [],
             "reasoning": "LLM analysis failed, using static analysis only",
-            "confidence": 0.3
+            "confidence": 0.3,
+            # #321 (wave r2): the error path too carries the one shape — an
+            # explicit "unknown" (never a verification; the reader surfaces
+            # unknown and the errored unit is never selected), so the CSV
+            # and the [Enhance] counters see the same vocabulary as the
+            # success path.
+            "security_classification": "unknown",
         }
         if error is not None:
             ctx["error"] = error

@@ -58,17 +58,25 @@ def test_model_ids_are_unique():
 
 
 def test_price_nullness_matches_status():
-    """current => real positive price; retired/unknown => null (never $0).
+    """current => real positive price (cloud) or explicit $0 (local); retired/unknown => null.
 
     This is the invariant the cost path depends on: a priced model is dispatchable
     and costs real money; an un-priced model must be omitted from pricing_map so it
-    can never resolve to a silent $0.
+    can never resolve to a silent $0. Local-inference providers
+    (``mr._LOCAL_PROVIDERS``) are the deliberate exception: their $0 is truthful
+    and provenanced ("free by definition"), so a current local model must carry
+    an EXPLICIT zero dict — never null (which would omit it from pricing_map and
+    route it to the unknown-model warn path) and never an unverified vendor quote.
     """
     for rec in mr.load_models():
         price = rec["price"]
         if rec["status"] == "current":
-            assert price and price["input"] > 0 and price["output"] > 0, (
-                f"{rec['id']}: current model must carry a positive price")
+            if rec["provider"] in mr._LOCAL_PROVIDERS:
+                assert price and price["input"] == 0.0 and price["output"] == 0.0, (
+                    f"{rec['id']}: local model must carry an explicit $0 price, not {price}")
+            else:
+                assert price and price["input"] > 0 and price["output"] > 0, (
+                    f"{rec['id']}: current model must carry a positive price")
         else:
             assert price is None, (
                 f"{rec['id']}: {rec['status']} model must have null price, not {price}")

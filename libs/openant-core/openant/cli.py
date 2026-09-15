@@ -5,6 +5,7 @@ OpenAnt CLI — Unified command-line interface for vulnerability analysis.
 Commands:
     openant scan /path/to/repo --output /tmp/results
     openant parse /path/to/repo --output /tmp/results
+    openant generate-context /path/to/repo -o /tmp/results/application_context.json
     openant enhance dataset.json --analyzer-output ao.json --repo-path /repo -o enhanced.json
     openant analyze dataset.json --output /tmp/results
     openant verify results.json --analyzer-output ao.json --output /tmp/results
@@ -33,6 +34,41 @@ from core.verdict_taxonomy import FINDING_VERDICT_ORDER
 from utilities.file_io import normalize_results, read_json
 
 
+def _reachability_envelope_block(pipeline_output: dict) -> dict | None:
+    """#323: build the reachability block for the scan exit envelope.
+
+    The blackout advisory reaches ``pipeline_stats.reachability_warnings``
+    (pipeline_output.json) but previously no CI-visible surface — the
+    envelope carried nothing, so a blacked-out scan read as a clean small
+    run. The block rides whenever a filter was applied OR a warning was
+    recorded (wave r1, three axes): the NO-RECORD warning class
+    ("filtering was requested but no reachability_filter record was found;
+    reachable_units falls back to total_units and may overstate
+    reachability") fires exactly when ``reachability_filter_applied`` is
+    False — gating on the flag alone would silence the warning that
+    overstates coverage, the exact class this fix closes.
+    """
+    stats = pipeline_output.get("pipeline_stats")
+    if not isinstance(stats, dict):
+        return None
+    warnings = stats.get("reachability_warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    warnings = [str(w) for w in warnings if isinstance(w, str) and w.strip()]
+    if not stats.get("reachability_filter_applied") and not warnings:
+        return None
+    block = {
+        "reachable_units": stats.get("reachable_units"),
+        "original_units": stats.get("original_units"),
+    }
+    if warnings:
+        block["reachability_warnings"] = warnings
+    pct = stats.get("reachability_reduction_percentage")
+    if isinstance(pct, (int, float)):
+        block["reachability_reduction_percentage"] = pct
+    return block
+
+
 def _output_json(data: dict):
     """Write JSON to stdout."""
     json.dump(data, sys.stdout, indent=2)
@@ -50,6 +86,113 @@ def _positive_int(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
     return parsed
+
+
+from core.verdict_taxonomy import (SEVERITIES as _SEVERITY_ORDER, SEVERITY_FINDING_VERDICTS,
+                                   severity_display_verdict)
+
+
+def _severity_for_result(result: dict, displayed_verdict: str = None) -> str:
+    """#215: the severity for one report-data finding — FINDING-ONLY (empty
+    for non-findings: no badge, no SARIF severity), computed from the
+    DISPLAYED verdict (wave round-2: the "Max iterations reached" downgrade
+    must not leave a CRITICAL badge on an inconclusive row). A model value
+    keeps; corrected/derived re-derive from that verdict."""
+    verdict = (displayed_verdict if displayed_verdict is not None
+               else severity_display_verdict(result))
+    verdict = verdict.strip().lower()
+    if verdict not in SEVERITY_FINDING_VERDICTS:
+        return ""
+    sev = result.get("severity")
+    src = result.get("severity_source")
+    if sev in _SEVERITY_ORDER and src == "model":
+        return sev
+    return "high" if verdict == "vulnerable" else "medium"
+
+
+def _severity_source_for_result(result: dict, displayed_verdict: str = None) -> str:
+    """The provenance matching _severity_for_result (empty when no severity)."""
+    if _severity_for_result(result, displayed_verdict) == "":
+        return ""
+    sev = result.get("severity")
+    src = result.get("severity_source")
+    if sev in _SEVERITY_ORDER and src == "model":
+        return "model"
+    return src if src in ("corrected", "derived") else "derived"
+
+
+def _unit_start_line(unit: dict) -> int:
+    """#305 (the adjacent finding in the issue comment): the parsers emit
+    ``start_line`` inside ``code.primary_origin`` and it survives
+    enhancement — the report boundary dropped it, so the SARIF region had
+    nothing to anchor to. Every malformed/hostile shape resolves to 0
+    (unknown → file-scoped region), never a crash."""
+    origin = unit.get("code") or {}
+    if not isinstance(origin, dict):
+        return 0
+    origin = origin.get("primary_origin") or {}
+    if not isinstance(origin, dict):
+        return 0
+    start_line = origin.get("start_line") or 0
+    if not isinstance(start_line, int) or isinstance(start_line, bool):
+        return 0
+    return start_line
+
+
+def _excluded_languages_for_report(summary: dict) -> list[str]:
+    """#305 (wave catch BLOCKER 1+2): the scan summary's excluded_languages
+    is a {lang: reason} DICT everywhere in Python — the Go consumer
+    unmarshals []string, so an unconverted dict would break the JSON
+    unmarshal outright. Format it as a list; and an operator --languages
+    opt-out ("not requested via --languages") is a legitimate scoping
+    choice, NOT a degradation — only involuntary exclusions reach the
+    report/SARIF."""
+    excl = (summary or {}).get("excluded_languages") or {}
+    if isinstance(excl, dict):
+        return sorted(
+            f"{lang} ({reason})" for lang, reason in excl.items()
+            if "not requested" not in str(reason))
+    if isinstance(excl, list):
+        return [str(x) for x in excl]
+    return []
+
+
+def _step_report_rows(step_reports: list[dict],
+                      skip_reasons: dict | None = None) -> list[dict]:
+    """Project step reports into the Go consumer's row shape (#305).
+
+    The five display fields plus the degradation data the SARIF
+    invocations block needs: per-step ``error_count`` (the #285 flat key,
+    falling back to the raw errors list length) and the ``errors``
+    themselves (capped — a pathological step must not balloon the report
+    payload), and each step's disambiguated skip reason from the scan
+    aggregate's ``steps_skipped_reasons``.
+    """
+    skip_reasons = skip_reasons or {}
+    rows = []
+    for sr in step_reports:
+        duration = sr.get("duration_seconds", 0)
+        cost = sr.get("cost_usd", 0)
+        dur_str = f"{duration / 60:.1f}m" if duration >= 60 else f"{duration:.1f}s"
+        cost_str = f"${cost:.2f}" if cost > 0 else "-"
+        errors = [str(e) for e in (sr.get("errors") or [])][:5]
+        summary = sr.get("summary") or {}
+        error_count = summary.get("error_count")
+        if not isinstance(error_count, int) or isinstance(error_count, bool):
+            error_count = len(sr.get("errors") or [])
+        step = sr.get("step", "unknown")
+        rows.append({
+            "step": step,
+            "duration": dur_str,
+            "cost": cost_str,
+            "status": sr.get("status", "unknown"),
+            "timestamp": sr.get("timestamp", ""),
+            # #305: the degradation channel
+            "error_count": error_count,
+            "errors": errors,
+            "skipped_reason": str(skip_reasons.get(step, "")),
+        })
+    return rows
 
 
 def _load_step_reports(directory: str) -> list[dict]:
@@ -114,12 +257,18 @@ def cmd_scan(args):
         # Surface the diff block on the envelope so the Go CLI banner can
         # render an "Incremental: base..head" line on success. The block
         # is the same one written into pipeline_output.json by reporter.py.
+        # #323: the reachability block rides the same pattern — the blackout
+        # advisory previously reached no deterministic human/CI surface (the
+        # terminal was silent, the envelope carried nothing).
         if result.pipeline_output_path and os.path.exists(result.pipeline_output_path):
             try:
                 po = read_json(result.pipeline_output_path)
                 diff_block = po.get("diff")
                 if isinstance(diff_block, dict) and diff_block.get("mode") == "incremental":
                     scan_payload["diff"] = diff_block
+                reach_block = _reachability_envelope_block(po)
+                if reach_block:
+                    scan_payload["reachability"] = reach_block
             except (json.JSONDecodeError, OSError):
                 pass
         _output_json(success(scan_payload))
@@ -159,13 +308,26 @@ def _select_languages_for(args):
     selection/exclusion banner is the mitigation, so the coverage change is never
     silent.
     """
+    from core.parser_adapter import detect_languages
     explicit = getattr(args, "language", "auto") not in (None, "auto")
     multi = (getattr(args, "languages", None)
              or getattr(args, "all_languages", False)
              or getattr(args, "multi_language", False))
     if explicit and not multi:
-        return None
-    from core.parser_adapter import detect_languages
+        # #308: the -l path previously returned None BEFORE detection ran,
+        # so the exclusion set was never computed — `excluded_languages: {}`
+        # was indistinguishable from "genuinely nothing was excluded" while
+        # identical --languages scans reported the gap. Build the selection
+        # now so the exclusions are computed and reported; `selected` is the
+        # named language only, so WHAT GETS SCANNED DOES NOT CHANGE (a
+        # single-element selection takes the same legacy branch below).
+        # ValueError (a source-free repo, or the language absent from it)
+        # falls back to today's exit-0 behaviour — those are the only two
+        # reachable raises (argparse constrains -l to supported languages).
+        try:
+            return resolve_language_selection(args, detect_languages(args.repo))
+        except ValueError:
+            return None
 
     return resolve_language_selection(args, detect_languages(args.repo))
 
@@ -271,6 +433,14 @@ def cmd_parse(args):
                 "processing_level": result.processing_level,
                 "excluded_languages": result.excluded_languages,
             }
+            # #600: the discovery block reaches the STANDALONE parse too —
+            # both entry points construct parse.report.json.
+            from core.scanner import _collect_discovery
+            _probe = type("P", (), {})()
+            _probe.per_language = getattr(result, "per_language", None)
+            _probe.output_dir = output_dir
+            _probe.language = getattr(result, "language", "unknown")
+            ctx.summary["discovery"] = _collect_discovery(_probe)
             # Surface diff stats in the parse step report if present.
             diff_report = os.path.join(output_dir, "diff_filter.report.json")
             if os.path.exists(diff_report):
@@ -284,6 +454,81 @@ def cmd_parse(args):
             }
 
         _output_json(success(result.to_dict()))
+        return 0
+
+    except Exception as e:
+        _output_json(error(str(e)))
+        return 2
+
+
+def cmd_generate_context(args):
+    """Generate application security context for a repository."""
+    from pathlib import Path
+    from context.application_context import (
+        generate_application_context,
+        save_context,
+        format_context_for_prompt,
+    )
+    from core.schemas import success, error
+    from core.step_report import step_context
+    from utilities.llm import (
+        build_phase_registry,
+        load_config_file,
+        probe_registry_or_raise,
+        resolve_llm_config,
+    )
+
+    # Default output to the CWD, NOT the scanned repo root: writing the context
+    # into the checkout would let a later scan silently auto-load it as
+    # finding-suppression config. Suppression must be an explicit operator act.
+    output_path = args.output or os.path.join(os.getcwd(), "application_context.json")
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+
+    try:
+        with step_context("generate-context", output_dir, inputs={
+            "repo_path": os.path.abspath(args.repo),
+            "force": args.force,
+        }) as ctx:
+            # generate_application_context requires a PhaseBinding for the
+            # app_context phase (model + adapter live in the binding, not
+            # caller-side). Same registry idiom as the threat-model command.
+            cf = load_config_file()
+            registry = build_phase_registry(
+                cf, resolve_llm_config(cf, getattr(args, "llm_config", None))
+            )
+            probe_registry_or_raise(registry)
+            app_context = generate_application_context(
+                Path(args.repo),
+                registry.get("app_context"),
+                force_regenerate=args.force,
+            )
+            # generate_application_context returns None when the LLM yields an
+            # incomplete context; surface a clear message instead of letting
+            # save_context(None) raise an opaque asdict() error.
+            if app_context is None:
+                _output_json(error("Could not generate application context (LLM returned an incomplete result)."))
+                return 2
+            save_context(app_context, Path(output_path))
+
+            ctx.summary = {
+                "application_type": app_context.application_type,
+                "confidence": app_context.confidence,
+                "source": app_context.source,
+            }
+            ctx.outputs = {"app_context_path": os.path.abspath(output_path)}
+
+        result = {
+            "app_context_path": os.path.abspath(output_path),
+            "application_type": app_context.application_type,
+            "purpose": app_context.purpose,
+            "confidence": app_context.confidence,
+            "source": app_context.source,
+        }
+
+        if args.show_prompt:
+            result["prompt_format"] = format_context_for_prompt(app_context)
+
+        _output_json(success(result))
         return 0
 
     except Exception as e:
@@ -366,6 +611,11 @@ def cmd_analyze(args):
 
     exploitable_filter = "all" if args.exploitable_all else ("strict" if args.exploitable_only else None)
 
+    # Application context is used ONLY when the operator passes it explicitly.
+    # Auto-discovering it from the scanned repo (or stale output dirs) would let
+    # repo-supplied config silently suppress findings — an explicit act only.
+    app_context_path = args.app_context
+
     try:
         with step_context("analyze", output_dir, inputs={
             "dataset_path": os.path.abspath(args.dataset),
@@ -377,7 +627,7 @@ def cmd_analyze(args):
                 dataset_path=args.dataset,
                 output_dir=output_dir,
                 analyzer_output_path=args.analyzer_output,
-                app_context_path=args.app_context,
+                app_context_path=app_context_path,
                 repo_path=args.repo_path,
                 limit=args.limit,
                 llm_config_name=args.llm_config,
@@ -410,6 +660,7 @@ def cmd_analyze(args):
                       "Skipping verification.", file=sys.stderr)
             else:
                 from core.verifier import run_verification
+                from core.schemas import verify_step_summary
                 with step_context("verify", output_dir, inputs={
                     "results_path": result.results_path,
                     "analyzer_output_path": os.path.abspath(args.analyzer_output),
@@ -418,7 +669,7 @@ def cmd_analyze(args):
                         results_path=result.results_path,
                         output_dir=output_dir,
                         analyzer_output_path=args.analyzer_output,
-                        app_context_path=args.app_context,
+                        app_context_path=app_context_path,
                         repo_path=args.repo_path,
                         workers=args.workers,
                         backoff_seconds=args.backoff,
@@ -427,13 +678,12 @@ def cmd_analyze(args):
                         llm_config_name=args.llm_config,
                     )
 
-                    vctx.summary = {
-                        "findings_input": vresult.findings_input,
-                        "findings_verified": vresult.findings_verified,
-                        "agreed": vresult.agreed,
-                        "disagreed": vresult.disagreed,
-                        "confirmed_vulnerabilities": vresult.confirmed_vulnerabilities,
-                    }
+                    # #300: the shared seven-field construction — the
+                    # standalone path previously omitted needs_review /
+                    # error_count (the pipeline's summary had them), so the
+                    # command a user runs directly was strictly less
+                    # informative. One helper so the sites cannot drift.
+                    vctx.summary = verify_step_summary(vresult)
                     vctx.outputs = {
                         "verified_results_path": vresult.verified_results_path,
                     }
@@ -458,7 +708,7 @@ def cmd_analyze(args):
 def cmd_verify(args):
     """Run Stage 2 attacker-simulation verification on Stage 1 results."""
     from core.verifier import run_verification
-    from core.schemas import success, error
+    from core.schemas import success, error, verify_step_summary
     from core.step_report import step_context
     from core import tracking
 
@@ -466,18 +716,22 @@ def cmd_verify(args):
 
     output_dir = args.output or tempfile.mkdtemp(prefix="open_ant_verify_")
 
+    # Application context is used ONLY when the operator passes it explicitly
+    # (see the analyze command for the rationale — no silent auto-discovery).
+    app_context_path = args.app_context
+
     try:
         with step_context("verify", output_dir, inputs={
             "results_path": os.path.abspath(args.results),
             "analyzer_output_path": os.path.abspath(args.analyzer_output),
-            "app_context_path": os.path.abspath(args.app_context) if args.app_context else None,
+            "app_context_path": os.path.abspath(app_context_path) if app_context_path else None,
             "repo_path": os.path.abspath(args.repo_path) if args.repo_path else None,
         }) as ctx:
             result = run_verification(
                 results_path=args.results,
                 output_dir=output_dir,
                 analyzer_output_path=args.analyzer_output,
-                app_context_path=args.app_context,
+                app_context_path=app_context_path,
                 repo_path=args.repo_path,
                 workers=args.workers,
                 checkpoint_path=getattr(args, "checkpoint", None),
@@ -485,13 +739,10 @@ def cmd_verify(args):
                 llm_config_name=args.llm_config,
             )
 
-            ctx.summary = {
-                "findings_input": result.findings_input,
-                "findings_verified": result.findings_verified,
-                "agreed": result.agreed,
-                "disagreed": result.disagreed,
-                "confirmed_vulnerabilities": result.confirmed_vulnerabilities,
-            }
+            # #300: the shared seven-field construction (see the chained
+            # verify site above) — needs_review / error_count included, so
+            # #285's status derivation finds its required key here too.
+            ctx.summary = verify_step_summary(result)
             ctx.outputs = {
                 "verified_results_path": result.verified_results_path,
             }
@@ -507,6 +758,22 @@ def cmd_verify(args):
         _output_json(error(str(e)))
         return 2
 
+
+
+def _discovery_from_step_reports(step_reports):
+    """#600: the discovery block recorded by the parse step's summary —
+    forwarded to the standalone build-output/report pipeline-output
+    constructions (both load step reports; the block lives there, no
+    re-derivation needed). BEST-EFFORT: the parse report must sit in the
+    loaded step-reports directory (the same one the costs/durations read);
+    a parse output elsewhere drops the block (present-only downstream)."""
+    for sr in step_reports or []:
+        if isinstance(sr, dict) and sr.get("step") == "parse":
+            summary = sr.get("summary") or {}
+            block = summary.get("discovery")
+            if isinstance(block, dict) and block:
+                return block
+    return None
 
 def cmd_build_output(args):
     """Build pipeline_output.json from analysis results."""
@@ -531,9 +798,10 @@ def cmd_build_output(args):
                 repo_url=args.repo_url,
                 language=args.language,
                 commit_sha=args.commit_sha,
-                application_type=args.app_type or "web_app",
+                application_type=args.app_type or "unknown",
                 processing_level=args.processing_level,
                 step_reports=step_reports,
+                discovery=_discovery_from_step_reports(step_reports),
             )
 
             ctx.outputs = {"pipeline_output_path": path}
@@ -549,7 +817,7 @@ def cmd_build_output(args):
 def cmd_dynamic_test(args):
     """Run Docker-isolated dynamic exploit testing."""
     from core.dynamic_tester import run_tests
-    from core.schemas import success, error
+    from core.schemas import success, error, dynamic_test_step_summary
     from core.step_report import step_context
     from core import tracking
 
@@ -570,14 +838,7 @@ def cmd_dynamic_test(args):
                 llm_config_name=args.llm_config,
             )
 
-            ctx.summary = {
-                "findings_tested": result.findings_tested,
-                "confirmed": result.confirmed,
-                "not_reproduced": result.not_reproduced,
-                "blocked": result.blocked,
-                "inconclusive": result.inconclusive,
-                "errors": result.errors,
-            }
+            ctx.summary = dynamic_test_step_summary(result)
             ctx.outputs = {
                 "results_json_path": result.results_json_path,
                 "results_md_path": result.results_md_path,
@@ -758,6 +1019,7 @@ def cmd_report(args):
                     output_path=pipeline_output_path,
                     repo_name=args.repo_name,
                     step_reports=step_reports,
+                    discovery=_discovery_from_step_reports(step_reports),
                 )
 
             if fmt == "html":
@@ -827,7 +1089,6 @@ def cmd_report_data(args):
     Outputs a JSON blob with stats, chart data, findings, remediation HTML,
     and step reports — everything display-ready.
     """
-    import html as html_mod
     from core.schemas import success, error
     from core.step_report import step_context
     from utilities.llm_client import get_global_tracker
@@ -934,7 +1195,6 @@ def cmd_report_data(args):
                 verdict = str(result.get("finding") or result.get("verdict", "")).lower()
                 file_path = route_key.rsplit(":", 1)[0] if ":" in route_key else route_key
                 unit = units_by_id.get(route_key, {})
-                llm_context = unit.get("llm_context") or {}
                 verification = result.get("verification") or {}
 
                 # Justification: prefer stage2, fallback to stage1
@@ -946,6 +1206,13 @@ def cmd_report_data(args):
                 # Downgrade unverified findings to inconclusive
                 if justification.strip() == "Max iterations reached":
                     verdict = "inconclusive"
+
+                # #215: computed from the DISPLAYED verdict (the downgrade
+                # above must strip severity too — an inconclusive row with a
+                # CRITICAL badge, ranked critical in Code Scanning, is the
+                # exact non-finding leak the finding-only gate exists for).
+                _sev = _severity_for_result(result, verdict)
+                _sev_src = _severity_source_for_result(result, verdict)
 
                 verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
 
@@ -972,8 +1239,16 @@ def cmd_report_data(args):
                     "function": func_name,
                     "attack_vector": result.get("attack_vector", "") or "",
                     "analysis": justification,
+                    # #215: a rankable severity on every finding — the
+                    # stamped/model value, else the reporter's conservative
+                    # derivation, so the HTML/SARIF surfaces rank old scans
+                    # too. The sort below stays VERDICT-primary (epistemic
+                    # status); severity is display/filter metadata.
+                    "severity": _sev,
+                    "severity_source": _sev_src,
                     "dynamic_test_status": dt_status,
                     "dynamic_test_details": dt_details,
+                    "start_line": _unit_start_line(unit),
                     "number": 0,  # assigned after sort
                 })
 
@@ -1050,13 +1325,35 @@ def cmd_report_data(args):
             if not actionable:
                 remediation_html = "<p>No vulnerabilities or security concerns found. All code units are either safe or properly protected.</p>"
             else:
+                # attack_vector and analysis are untrusted Stage-1/2 LLM output.
+                # Interpolated raw they could inject prompt instructions (or a
+                # fake `### Finding` header) into the remediation prompt. Fence
+                # each with a length-adaptive run so it stays inert data. (The
+                # remediation_html sink is also an XSS vector — HTML-escaping at
+                # the sink is a separate, deferred hardening; this closes the
+                # prompt-injection half.)
+                from prompts._fence import safe_code_fence, collapse_inline
                 findings_text = ""
                 for f in actionable:
+                    _av = f['attack_vector'] or 'Not specified'
+                    _an = f['analysis'][:500]
+                    _avf = safe_code_fence(_av)
+                    _anf = safe_code_fence(_an)
+                    # file/function derive from the (poisonable) route_key; collapse
+                    # newlines so they can't forge a `### Finding` header line.
+                    _file = collapse_inline(f['file'])
+                    _func = collapse_inline(f['function'])
                     findings_text += f"""
-### Finding #{f['number']}: {f['file']}:{f['function']}
+### Finding #{f['number']}: {_file}:{_func}
 - **Verdict**: {f['verdict']}
-- **Attack Vector**: {f['attack_vector'] or 'Not specified'}
-- **Analysis**: {f['analysis'][:500]}
+- **Attack Vector**:
+{_avf}
+{_av}
+{_avf}
+- **Analysis**:
+{_anf}
+{_an}
+{_anf}
 """
                 prompt = f"""Analyze these security findings and provide:
 
@@ -1101,23 +1398,20 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
                 remediation_html = re.sub(r'#(\d+)', _linkify_finding, remediation_html)
 
             # --- Step reports ---
-            step_reports_data = []
-            for sr in _load_step_reports(results_dir):
-                duration = sr.get("duration_seconds", 0)
-                cost = sr.get("cost_usd", 0)
-                if duration >= 60:
-                    dur_str = f"{duration / 60:.1f}m"
-                else:
-                    dur_str = f"{duration:.1f}s"
-                cost_str = f"${cost:.2f}" if cost > 0 else "-"
-
-                step_reports_data.append({
-                    "step": sr.get("step", "unknown"),
-                    "duration": dur_str,
-                    "cost": cost_str,
-                    "status": sr.get("status", "unknown"),
-                    "timestamp": sr.get("timestamp", ""),
-                })
+            # #305: the projection previously copied five display fields and
+            # dropped `errors`/`error_count`/skip reasons — the degradation
+            # data the SARIF invocations block (and any honest CI gate)
+            # needs. Thread them now (the #285 vocabulary).
+            _all_steps = _load_step_reports(results_dir)
+            _skip_reasons = {}
+            _excluded_langs: list[str] = []
+            for sr in _all_steps:
+                if sr.get("step") == "scan":
+                    _summary = sr.get("summary", {})
+                    _skip_reasons = _summary.get("steps_skipped_reasons", {}) or {}
+                    _excluded_langs = _excluded_languages_for_report(_summary)
+                    break
+            step_reports_data = _step_report_rows(_all_steps, _skip_reasons)
 
             # Sort by timestamp
             step_reports_data.sort(key=lambda s: s.get("timestamp", ""))
@@ -1188,6 +1482,9 @@ Format your response as HTML (use <h3>, <p>, <ul>, <li>, <strong> tags). Do not 
                 "findings": findings,
                 "findings_by_verdict": findings_by_verdict,
                 "step_reports": step_reports_data,
+                # #305: excluded languages reach the Go consumer so the SARIF
+                # notifications can carry them.
+                "excluded_languages": _excluded_langs,
                 "categories": categories,
                 "diff": diff_block,
             }
@@ -1209,9 +1506,10 @@ def resolve_language_selection(args, counts: dict[str, int]):
     Kept as a standalone function so the flag semantics are testable without
     running a scan, and so `scan` and `parse` cannot drift apart.
 
-    `-l auto` (the default) deliberately still means "dominant language only".
-    Multi-language is opt-in via --languages / --all-languages, so no existing
-    invocation changes behaviour.
+    `-l auto` (the default) means every detected language above the size
+    threshold — not the dominant one (see ``_select_languages_for``). ``-l <lang>``
+    narrows to a single language, ``--languages`` to a named subset, and
+    ``--all-languages`` scans everything detected regardless of the threshold.
 
     Raises:
         ValueError: If an explicit `-l <lang>` is combined with a multi-language
@@ -1246,6 +1544,11 @@ def resolve_language_selection(args, counts: dict[str, int]):
         all_languages=getattr(args, "all_languages", False),
         min_files=getattr(args, "min_language_files", DEFAULT_MIN_FILES),
         min_share=getattr(args, "min_language_share", DEFAULT_MIN_SHARE),
+        # #308: the exclusion reason names the flag the user actually
+        # typed — -l on the explicit path, --languages otherwise.
+        deselected_reason=(
+            "not requested via -l" if explicit
+            else "not requested via --languages"),
     )
     # Report here rather than at each call site: this is the single point every
     # command funnels through, so a coverage gap cannot escape by way of a
@@ -1414,7 +1717,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan_p.add_argument("--no-skip-tests", action="store_true", help="Include test files in parsing (default: tests are skipped)")
     scan_p.add_argument("--library-mode", action="store_true",
                         help="Seed the exported public API as entry points (for libraries with no main/route/CLI entry point)")
-    scan_p.add_argument("--limit", type=int, help="Max units to analyze")
+    scan_p.add_argument("--limit", type=int, help="Max units to analyze and enhance (the LLM reachability pass still reviews the full codebase)")
     scan_p.add_argument(
         "--llm-config",
         default=None,
@@ -1524,6 +1827,31 @@ def build_parser() -> argparse.ArgumentParser:
     parse_p.set_defaults(func=cmd_parse)
 
     # ---------------------------------------------------------------
+    # generate-context — generate application security context
+    # ---------------------------------------------------------------
+    gc_p = subparsers.add_parser(
+        "generate-context",
+        help="Generate application security context for a repository",
+    )
+    gc_p.add_argument("repo", help="Path to repository")
+    gc_p.add_argument("--output", "-o",
+                       help="Output path (default: ./application_context.json in the "
+                            "current directory — never written into the scanned repo)")
+    gc_p.add_argument("--force", action="store_true",
+                       help="Force regeneration, ignoring OPENANT.md override files")
+    gc_p.add_argument("--show-prompt", action="store_true",
+                       help="Include formatted prompt text in output")
+    gc_p.add_argument(
+        "--llm-config",
+        default=None,
+        help=(
+            "Name of the llm-config in ~/.config/openant/config.json. "
+            "Defaults to the file's default_llm."
+        ),
+    )
+    gc_p.set_defaults(func=cmd_generate_context)
+
+    # ---------------------------------------------------------------
     # enhance — add security context to a dataset
     # ---------------------------------------------------------------
     enhance_p = subparsers.add_parser("enhance", help="Enhance a dataset with security context")
@@ -1621,7 +1949,7 @@ def build_parser() -> argparse.ArgumentParser:
     bo_p.add_argument("--repo-url", help="Repository URL")
     bo_p.add_argument("--language", help="Primary language")
     bo_p.add_argument("--commit-sha", help="Commit SHA")
-    bo_p.add_argument("--app-type", help="Application type (default: web_app)")
+    bo_p.add_argument("--app-type", help="Application type (default: unknown — no fabricated assumption)")
     bo_p.add_argument("--processing-level", help="Processing level used")
     bo_p.set_defaults(func=cmd_build_output)
 

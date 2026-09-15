@@ -18,6 +18,10 @@ class Finding:
     stage1_verdict: str
     stage2_verdict: str
     dynamic_testing: dict | bool = False
+    # #319: a non-CONFIRMED dynamic test result (ERROR / NOT_REPRODUCED /
+    # ...) — the transparency without the verification claim. Optional and
+    # NOT required: old artifacts validate.
+    dynamic_testing_attempted: Optional[dict] = None
     description: Optional[str] = None
     vulnerable_code: Optional[str] = None
     vulnerable_code_section: Optional[str] = None
@@ -25,6 +29,10 @@ class Finding:
     suggested_fix: Optional[str] = None
     steps_to_reproduce: Optional[list] = None
     rejection_reason: Optional[str] = None
+    # #215: a rankable severity + its provenance. Optional and NOT required —
+    # old artifacts (pre-#215 scans) must validate.
+    severity: Optional[str] = None
+    severity_source: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "Finding":
@@ -39,6 +47,7 @@ class Finding:
             stage1_verdict=data["stage1_verdict"],
             stage2_verdict=data["stage2_verdict"],
             dynamic_testing=data.get("dynamic_testing", False),
+            dynamic_testing_attempted=data.get("dynamic_testing_attempted"),
             description=data.get("description"),
             vulnerable_code=data.get("vulnerable_code"),
             vulnerable_code_section=data.get("vulnerable_code_section"),
@@ -46,6 +55,8 @@ class Finding:
             suggested_fix=data.get("suggested_fix"),
             steps_to_reproduce=data.get("steps_to_reproduce"),
             rejection_reason=data.get("rejection_reason"),
+            severity=data.get("severity"),
+            severity_source=data.get("severity_source"),
         )
 
 

@@ -8,6 +8,8 @@ vulnerabilities from internal-only vulnerabilities.
 
 from typing import List, Optional
 
+from prompts._fence import safe_code_fence, collapse_inline
+
 
 # Input budget for the inlined unit code.
 # primary_code was previously inlined verbatim, so a large unit overflowed the
@@ -53,16 +55,31 @@ Code that HANDLES dangerous patterns is often a SECURITY CONTROL:
 
 ## Your Analysis Process
 
-1. **Identify Dangerous Operations**
+1. **Get Static Dependencies First**
+   Call `get_static_dependencies` to see what functions this code calls and what calls it.
+   Then use `read_function` to examine key dependencies — especially service methods
+   that may contain authorization, validation, or sanitization.
+
+2. **Identify Dangerous Operations**
    Look for: eval, exec, SQL queries, file I/O, deserialization, command execution, innerHTML
 
-2. **Trace User Input Reachability**
+3. **Trace User Input Reachability (Backward)**
    If dangerous operations exist, trace BACKWARDS:
    - Who calls this function?
    - Who calls those callers?
    - Does the chain lead to an entry point (route handler, CLI parser, stdin)?
 
-3. **Apply Classification Logic**
+4. **Trace Forward Into Called Functions**
+   Check what the function CALLS — especially service/repository methods:
+   - Use `search_definitions` to find implementations of called methods
+   - Look for authorization checks (auth, permission, guard, can, allow, authorize)
+   - Look for validation/sanitization in called code
+   - A function may delegate security to its callees (e.g., service-layer auth)
+   - For `this.someService.method()` patterns, search for the method name definition
+   - A control found in a callee reduces severity ONLY if it PROVABLY guards the
+     tainted path; when unsure, keep EXPLOITABLE — never hide a reachable sink (over-seed)
+
+5. **Apply Classification Logic**
    ```
    Has dangerous sink?
    ├─ No  → NEUTRAL or SECURITY_CONTROL
@@ -71,7 +88,7 @@ Code that HANDLES dangerous patterns is often a SECURITY CONTROL:
             └─ No  → VULNERABLE_INTERNAL
    ```
 
-4. **Complete with finish tool**
+6. **Complete with finish tool**
    Provide classification, reasoning, and confidence level.
 
 ## Entry Point Examples
@@ -112,8 +129,13 @@ def get_user_prompt(
     Returns:
         Formatted prompt string
     """
-    deps_str = ", ".join(static_deps[:10]) if static_deps else "None identified"
-    callers_str = ", ".join(static_callers[:10]) if static_callers else "None identified"
+    # deps/callers/unit_id are scanned identifiers (untrusted in principle, same
+    # class as route_key). Collapse newlines for one-line inertness/consistency
+    # (defense-in-depth; an identifier with a newline is unlikely but not asserted
+    # impossible). unit_id is collapsed at its interpolation below.
+    deps_str = collapse_inline(", ".join(static_deps[:10])) if static_deps else "None identified"
+    callers_str = collapse_inline(", ".join(static_callers[:10])) if static_callers else "None identified"
+    unit_id = collapse_inline(unit_id)
 
     # Cap the inlined code so a large unit cannot overflow the model context.
     primary_code = _cap_primary_code(primary_code)
@@ -149,15 +171,16 @@ def get_user_prompt(
 """
     # else: reachable_from_entry is None, no reachability info available
 
+    code_fence = safe_code_fence(primary_code)
     return f"""## Code Unit to Analyze
 
 **ID:** `{unit_id}`
 **Type:** {unit_type}
 {reachability_section}
 ### Code (with static dependencies already included)
-```
+{code_fence}
 {primary_code}
-```
+{code_fence}
 
 ### Static Analysis Results
 **Functions this code calls:** {deps_str}
@@ -167,19 +190,26 @@ def get_user_prompt(
 
 ## Your Task
 
-1. **Analyze for dangerous operations**: eval, exec, SQL, file I/O, deserialization, etc.
+1. **Start with `get_static_dependencies`** to see resolved callees and callers.
+   Then use `read_function` to examine called service/repository methods.
 
-2. **Consider reachability**: Can user input reach any dangerous operations?
+2. **Analyze for dangerous operations**: eval, exec, SQL, file I/O, deserialization, etc.
+
+3. **Consider reachability**: Can user input reach any dangerous operations?
    - If this is an entry point or reachable from one: vulnerabilities are EXPLOITABLE
    - If not reachable: vulnerabilities are VULNERABLE_INTERNAL
 
-3. **Classify the code**:
+4. **Trace forward**: Check called functions for authorization, validation, or security controls
+   for context. A callee control reduces severity ONLY if it provably guards the tainted path;
+   when unsure, keep EXPLOITABLE — never hide a reachable sink (over-seed).
+
+5. **Classify the code**:
    - **EXPLOITABLE**: Dangerous ops + user input can reach them
    - **VULNERABLE_INTERNAL**: Dangerous ops but no user input path
    - **SECURITY_CONTROL**: Defensive code (validators, sanitizers)
    - **NEUTRAL**: No security relevance
 
-4. Call the `finish` tool with your classification and reasoning.
+6. Call the `finish` tool with your classification and reasoning.
 
 Begin your analysis."""
 

@@ -191,6 +191,17 @@ class CompletionResult:
             ``Message.content`` already enforces).
         input_tokens: From the provider's usage metadata.
         output_tokens: Ditto.
+        usage_details: Provider-supplied billing-relevant usage DETAIL
+            fields (reasoning tokens; cache read/write tokens), copied
+            VERBATIM by the adapter — present-only, absent when the
+            provider reported none. Pass-through capture for #211:
+            these fields never feed the cost formula and are never
+            summed into token totals; they exist so the accounting
+            artifacts can be reconciled against a provider bill. (The
+            cost-math question — whether ``output_tokens`` already
+            includes reasoning on a given route — is deliberately
+            unresolved; summing here would double-count on routes
+            where it does.)
         stop_reason: Normalised across providers. The pipeline's
             agentic loops branch on ``"tool_use"`` to know whether
             to execute tools and continue.
@@ -204,6 +215,9 @@ class CompletionResult:
     output_tokens: int
     stop_reason: StopReason
     raw: Any = field(default=None, repr=False)
+    # After ``raw`` so the pre-existing positional contract
+    # (content, input, output, stop_reason, raw) is unchanged.
+    usage_details: dict | None = field(default=None, repr=False)
 
     def __post_init__(self):
         # Accept list for ergonomic construction by adapters; freeze
@@ -257,7 +271,19 @@ class LLMResponseError(LLMError):
     requires (e.g. missing usage block, malformed tool_use). Distinct
     from connection errors and rate limits so the pipeline can decide
     whether to retry.
+
+    #537: carries the REJECTED reply's usage when the provider supplied it
+    (a rejected call the provider billed must not vanish from accounting).
+    Zeroes when the failure predates a usage block (a transport error or
+    a refusal raised before the response parsed) — those are never billed
+    as completions by construction.
     """
+
+    def __init__(self, message: str, *,
+                 input_tokens: int = 0, output_tokens: int = 0):
+        super().__init__(message)
+        self.input_tokens = int(input_tokens or 0)
+        self.output_tokens = int(output_tokens or 0)
 
 
 class LLMRefusalError(LLMResponseError):

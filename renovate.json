@@ -1,0 +1,80 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "#332/#476 vendored report scripts — chart.js. Versions live in the vendored file names, the go:embed list and vendorScripts names, the template literals, and the test pins in report_vendor_test.go and report_issue332_test.go (filename lists + the 'Chart.js v<version>' banner marker). RULES BOUGHT WITH INCIDENTS: (1) A CONDITIONAL packageNameTemplate is invalid config for the regex manager and halted renovate (#476) — do not reintroduce one. (2) A STATIC packageNameTemplate overrides the packageName capture group of every matchString in its manager — observed behavior, renovate CLI 37.440.7 (--dry-run=extract at 1a6fa1be); #485's single shared manager used one static template for three matchStrings, so tailwindcss-3.4.16.js and chartjs-plugin-datalabels-2.2.0.min.js extracted as chart.js@3.4.16 / chart.js@2.2.0 and spawned the invalid #487/#488 branches. THE INVARIANT: never mix a static packageNameTemplate with a matchString carrying a packageName capture group — the group is silently overridden. Every manager here uses value-only matchStrings + its own static template; DO NOT add a matchString with a packageName group to any of these managers. chart.js needs the static template because the vendored file name (chart-X.umd.min.js) carries no literal matching the npm package name chart.js; the second matchString tracks the banner marker pinned by report_issue332_test.go. vendor/SOURCES.txt (the provenance record) is deliberately NOT tracked: config:recommended's :ignoreModulesAndTests preset adds **/vendor/** to ignorePaths (verified: a no-extends config extracts it, the preset one does not), we deliberately do not override the standard ignores — provenance there is hand-maintained per the #332 recipe. These managers are NOTIFIERS, not fixers: a vendored bump always needs the manual #332 recipe (the vendored blob + the sha256 pin + the go:embed/vendorScripts names + the template literals + both test files' pins — all in one commit); the branch rewrites the name literals (including the go:embed list in report.go, which makes the branch BUILD-red, not just test-red) while the vendored blob and its sha256 pin do not move, so every branch from this surface is unmergeable as-authored by design.",
+      "fileMatch": [
+        "^apps/openant-cli/internal/report/templates/.*\\.gohtml$",
+        "^apps/openant-cli/internal/report/report_vendor_test\\.go$",
+        "^apps/openant-cli/internal/report/report_issue332_test\\.go$",
+        "^apps/openant-cli/internal/report/report\\.go$"
+      ],
+      "matchStrings": [
+        "chart-(?<currentValue>[0-9.]+)\\.umd\\.min\\.js",
+        "Chart\\.js v(?<currentValue>[0-9.]+)"
+      ],
+      "datasourceTemplate": "npm",
+      "packageNameTemplate": "chart.js"
+    },
+    {
+      "customType": "regex",
+      "description": "#332/#476 vendored report scripts — chartjs-plugin-datalabels. Same rules as the chart.js manager above (static packageNameTemplate + value-only matchStrings; never add a packageName capture group to this manager — #485's lesson; the file name matches the npm package chartjs-plugin-datalabels). Notifier-only: the vendored blob/sha do not move on a branch; see the chart.js manager entry for the full rules.",
+      "fileMatch": [
+        "^apps/openant-cli/internal/report/templates/.*\\.gohtml$",
+        "^apps/openant-cli/internal/report/report_vendor_test\\.go$",
+        "^apps/openant-cli/internal/report/report_issue332_test\\.go$",
+        "^apps/openant-cli/internal/report/report\\.go$"
+      ],
+      "matchStrings": [
+        "chartjs-plugin-datalabels-(?<currentValue>[0-9.]+)\\.min\\.js"
+      ],
+      "datasourceTemplate": "npm",
+      "packageNameTemplate": "chartjs-plugin-datalabels"
+    },
+    {
+      "customType": "regex",
+      "description": "#577 vendored ui scripts \u2014 marked. Versions live in the vendored file names, the go:embed list in ui/embed.go, the handleAsset case list in internal/server/server.go, the /assets script tags in ui/summary.html + ui/disclosure.html, and the pin table in ui/vendor_test.go. Same rules as the chart.js manager entry (static packageNameTemplate + value-only matchStrings; never a matchString carrying a packageName capture group \u2014 #485's lesson; the file name matches the npm package name marked). Notifier-only, never a fixer: a vendored bump is the manual #332-recipe commit \u2014 the blob + vendor/SOURCES.txt + the ui/vendor_test.go pin table + all reference files \u2014 in one commit; the branch rewrites the name literals (including the go:embed list, which makes the branch BUILD-red, not just test-red) while the vendored bytes and their sha pins do not move, so every branch from this surface is unmergeable as-authored by design.",
+      "fileMatch": [
+        "^apps/openant-cli/ui/embed\\.go$",
+        "^apps/openant-cli/ui/summary\\.html$",
+        "^apps/openant-cli/ui/disclosure\\.html$",
+        "^apps/openant-cli/internal/server/server\\.go$",
+        "^apps/openant-cli/ui/vendor_test\\.go$"
+      ],
+      "matchStrings": [
+        "marked-(?<currentValue>[0-9.]+)\\.min\\.js"
+      ],
+      "datasourceTemplate": "npm",
+      "packageNameTemplate": "marked"
+    },
+    {
+      "customType": "regex",
+      "description": "#577 vendored ui scripts \u2014 dompurify (the sole XSS sanitizer for the ui pages' untrusted-markdown render path \u2014 currency matters more here than anywhere else on the vendored surface). Same rules as the chart.js manager entry: static packageNameTemplate + value-only matchStrings, never a packageName capture group (#485's lesson; the file name dompurify-<version>.min.js matches the npm package name dompurify). Notifier-only, never a fixer \u2014 see the chart.js manager entry for the full rules.",
+      "fileMatch": [
+        "^apps/openant-cli/ui/embed\\.go$",
+        "^apps/openant-cli/ui/summary\\.html$",
+        "^apps/openant-cli/ui/disclosure\\.html$",
+        "^apps/openant-cli/internal/server/server\\.go$",
+        "^apps/openant-cli/ui/vendor_test\\.go$"
+      ],
+      "matchStrings": [
+        "dompurify-(?<currentValue>[0-9.]+)\\.min\\.js"
+      ],
+      "datasourceTemplate": "npm",
+      "packageNameTemplate": "dompurify"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "#540 landed the prebuilt-CSS migration: the npm CLI channel is now LIVE for tailwind v3 (a v3 security bump = a valid regen per the SOURCES.txt recipe). The cap exists only to prevent a v4 bump arriving as a config-format migration disguised as a version bump — v4 changes the config format (JS->@theme CSS) and the artifact channel; it must be a deliberate migration, not a renovate branch.",
+      "matchPackageNames": [
+        "tailwindcss"
+      ],
+      "allowedVersions": "<4"
+    }
+  ]
+}

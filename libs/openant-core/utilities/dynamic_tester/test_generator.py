@@ -10,14 +10,21 @@ import json
 import os
 
 from core.language_registry import docker_template_for, language_for_path
+from utilities.dynamic_tester.declared_runtime import _clean_version
 import re
 import sys
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utilities.llm_client import TokenTracker
-from utilities.llm import PhaseBinding, simple_text
+
+
+def _clean_declared(raw: object) -> str:
+    """Re-validate at the interpolation site (defense in depth: the value was
+    allowlist-validated at derivation; this re-checks so a future refactoring
+    of either side cannot open the executed-prompt surface)."""
+    return _clean_version(raw) or ""
+from utilities.llm import DEFAULT_MAX_TOKENS, PhaseBinding, simple_text
 
 # Map language strings to Dockerfile template names
 def resolve_docker_template(file_path: str, scan_language: str | None = None) -> str | None:
@@ -63,14 +70,29 @@ DEPENDENCY INSTALLATION:
 - For Node.js: put ALL dependencies in package.json.
 - For Go: do NOT write go.mod or go.sum yourself. Instead, the Dockerfile MUST initialize
   the module inside the container using `RUN go mod init <name> && go mod tidy`. This works
-  whether the test uses stdlib only or third-party packages. Use golang:1.25-alpine as the
-  base image to support modern k8s and cloud-native packages. Example Dockerfile for Go:
-      FROM golang:1.25-alpine
+  whether the test uses stdlib only or third-party packages. Use golang:1.27-alpine as the
+  base image (the fallback when the target's declared Go version is unknown — matches
+  docker_templates/go.Dockerfile) to support modern k8s and cloud-native packages.
+  Example Dockerfile for Go:
+      FROM golang:1.27-alpine
       WORKDIR /test
       COPY test_exploit.go .
       RUN go mod init openant-test && go mod tidy
       RUN go build -o test_exploit test_exploit.go
       CMD ["./test_exploit"]
+- BASE IMAGE RUNTIME POLICY (all languages): prefer a base image matching the
+  scanned target's DECLARED runtime — the `Declared runtime:` lines in the
+  finding prompt below (mechanically derived from the target's go.mod /
+  .python-version / pyproject requires-python / package.json engines /
+  .tool-versions), or a language-version cue stated in the finding itself.
+  A wrong runtime can hide version-dependent exploit behavior or break the
+  repro outright (the exploit may not compile/run on a different major).
+  Only when no declaration is visible, fall back to the current stable
+  release of the language. The Go example above is that fallback, not an
+  override of a declared version. If a build fails because a dependency
+  requires a newer toolchain than the declared runtime, the RETRY may use
+  the current stable release instead — and MUST state the deviation in the
+  test's output/details.
 - The Dockerfile MUST install dependencies from the requirements/package file, NOT inline in RUN commands.
 - If a package has many transitive dependencies, only install the specific sub-package you need
   (e.g., `langchain-core` instead of `langchain`).
@@ -131,30 +153,39 @@ def _build_finding_prompt(finding: dict, repo_info: dict) -> str:
     # vocabularies ("javascript" vs the "node" base image) and conflating them
     # tells the model the wrong language for the code it is writing a test
     # against. Template selection is resolve_docker_template's job.
-    loc_for_lang = finding.get("location", {})
-    finding_file = loc_for_lang.get("file", "") if isinstance(loc_for_lang, dict) else ""
+    loc_for_lang = finding.get("location")
+    _ff = loc_for_lang.get("file") if isinstance(loc_for_lang, dict) else None
+    finding_file = _ff if isinstance(_ff, str) else ""  # location.file may be non-str (JSON)
     language = language_for_path(finding_file) or repo_info.get("language") or "unknown"
 
     # Derive the staged source filename so the LLM can reference it in COPY.
     source_basename = ""
-    loc = finding.get("location", {})
-    if isinstance(loc, dict) and loc.get("file"):
+    loc = finding.get("location")
+    if isinstance(loc, dict) and isinstance(loc.get("file"), str) and loc["file"]:
         source_basename = os.path.basename(loc["file"])
+
+    # Inline label fields are model-produced free text (name, cwe_name, the two
+    # verdicts) or repo-derived (name/type). Interpolated raw on their own line, a
+    # newline in any of them forges a FINDING/instruction line — and THIS prompt's
+    # output is EXECUTED (docker build/run), so injection here is the worst case.
+    # Collapse control chars so each stays one inert line. (Multi-line body fields —
+    # vulnerable_code/description/impact/steps — are length-adaptively FENCED below.)
+    from prompts._fence import collapse_inline
 
     parts = [
         f"Generate a dynamic exploit test for the following vulnerability.",
         "",
-        f"Repository: {repo_info.get('name', 'unknown')}",
-        f"Language: {language}",
-        f"Application Type: {repo_info.get('application_type', 'unknown')}",
+        f"Repository: {collapse_inline(repo_info.get('name', 'unknown'))}",
+        f"Language: {collapse_inline(language)}",
+        f"Application Type: {collapse_inline(repo_info.get('application_type', 'unknown'))}",
         "",
         "FINDING:",
-        f"  ID: {finding.get('id', 'unknown')}",
-        f"  Name: {finding.get('name', 'unknown')}",
-        f"  CWE: {finding.get('cwe_id', 0)} - {finding.get('cwe_name', 'Unknown')}",
+        f"  ID: {collapse_inline(finding.get('id', 'unknown'))}",
+        f"  Name: {collapse_inline(finding.get('name', 'unknown'))}",
+        f"  CWE: {finding.get('cwe_id', 0)} - {collapse_inline(finding.get('cwe_name', 'Unknown'))}",
         f"  Location: {json.dumps(loc, indent=4)}",
-        f"  Stage 1 Verdict: {finding.get('stage1_verdict', 'unknown')}",
-        f"  Stage 2 Verdict: {finding.get('stage2_verdict', 'unknown')}",
+        f"  Stage 1 Verdict: {collapse_inline(finding.get('stage1_verdict', 'unknown'))}",
+        f"  Stage 2 Verdict: {collapse_inline(finding.get('stage2_verdict', 'unknown'))}",
     ]
 
     if source_basename:
@@ -164,14 +195,42 @@ def _build_finding_prompt(finding: dict, repo_info: dict) -> str:
             f"  Your Dockerfile MUST use `COPY {source_basename} .` — the file is already there.",
         ])
 
+    # #521: the declared-runtime lines — mechanically derived from the target's
+    # root manifests by declared_runtime.derive_declared_runtimes and
+    # ALLOWLIST-VALIDATED there (a strict version grammar; anything else was
+    # omitted BEFORE reaching this point). Repo-author-controlled text never
+    # interpolates raw into this EXECUTED-output prompt: these lines carry
+    # zero free-text capacity — tighter than the collapsed inline fields above.
+    declared = repo_info.get("declared_runtimes")
+    if isinstance(declared, dict) and declared:
+        parts.extend(["", "  Declared runtimes (from the target's manifests):"])
+        for lang in sorted(declared):
+            v = _clean_declared(declared.get(lang))
+            if v:
+                parts.append(f"    {lang}: {v}")
+
+    # These four fields are UNTRUSTED: `vulnerable_code` is raw Stage-1/2 LLM
+    # output or a raw scanned-source excerpt; description/impact/steps are prior
+    # LLM output. They were interpolated raw, so a finding could inject prompt
+    # instructions into the test-generation prompt — and this prompt's output is
+    # EXECUTED (docker build/run). Length-adaptive fences keep them inert here;
+    # the structural mitigation (docker build --network=none / --internal test
+    # net) is tracked separately (fencing alone is partial for executed output).
+    from prompts._fence import safe_code_fence
+
+    def _fenced(label: str, value) -> list:
+        body = value if isinstance(value, str) else str(value)
+        sf = safe_code_fence(body)
+        return ["", f"  {label}:", f"{sf}", body, f"{sf}"]
+
     if finding.get("description"):
-        parts.extend(["", f"  Description: {finding['description']}"])
+        parts.extend(_fenced("Description", finding["description"]))
     if finding.get("vulnerable_code"):
-        parts.extend(["", f"  Vulnerable Code:\n{finding['vulnerable_code']}"])
+        parts.extend(_fenced("Vulnerable Code", finding["vulnerable_code"]))
     if finding.get("impact"):
-        parts.extend(["", f"  Impact: {finding['impact']}"])
+        parts.extend(_fenced("Impact", finding["impact"]))
     if finding.get("steps_to_reproduce"):
-        parts.extend(["", f"  Steps to Reproduce: {finding['steps_to_reproduce']}"])
+        parts.extend(_fenced("Steps to Reproduce", finding["steps_to_reproduce"]))
 
     # Add CWE-specific guidance
     cwe_id = finding.get("cwe_id", 0)
@@ -253,7 +312,7 @@ def generate_test(
 
     prompt = _build_finding_prompt(finding, repo_info)
     raw = simple_text(
-        binding, prompt, max_tokens=8192, system=SYSTEM_PROMPT, tracker=tracker,
+        binding, prompt, max_tokens=DEFAULT_MAX_TOKENS, system=SYSTEM_PROMPT, tracker=tracker,
     )
 
     parsed = _parse_generation_response(raw)
@@ -264,6 +323,32 @@ def generate_test(
     required = ["dockerfile", "test_script", "test_filename"]
     if not all(k in parsed for k in required):
         return None
+    # Every staging field the executor writes or joins must be a str — a non-str
+    # (JSON allows any type) would raise in _write_test_files and abort the whole
+    # dynamic-test run. Degrade a malformed generation to the None (ERROR) path —
+    # result_collector records generation-None as status ERROR, un-retried.
+    _REQUIRED_STR_FIELDS = ("dockerfile", "test_script", "test_filename")
+    if any(k in parsed and not isinstance(parsed[k], str)
+           for k in _REQUIRED_STR_FIELDS):
+        return None
+    # The OPTIONAL fields are prompt-declared as "string | null" (the system
+    # prompt: docker_compose "null if single container"; Go tests are told NOT
+    # to write go.mod, so null requirements are the expected emission) — a
+    # model that enumerates the full schema emits null, and that complete,
+    # valid generation must NOT be discarded (#522: of 21 scored generations
+    # in the discovery run, 14 carried a null optional and were dropped this
+    # way; 4 more were truncated replies failing at the parser, not here).
+    # Coerce null to the canonical absent
+    # form "" (what result_collector's .get(k, "") and DynamicTestResult
+    # default to); keep rejecting non-str non-null values — a dict/number is
+    # still a malformed generation.
+    _OPTIONAL_STR_FIELDS = ("requirements", "requirements_filename",
+                            "docker_compose")
+    for k in _OPTIONAL_STR_FIELDS:
+        if k in parsed and parsed[k] is None:
+            parsed[k] = ""
+        if k in parsed and not isinstance(parsed[k], str):
+            return None
 
     return parsed
 
@@ -296,13 +381,26 @@ def regenerate_test(
     test_filename = previous_generation.get('test_filename', 'test_exploit.py')
     test_script = previous_generation.get('test_script', '')
 
+    # Each embed (prior LLM output + docker build/run stderr, all attacker-influenced)
+    # gets its OWN length-aware fence so a ``` line inside one cannot break out and
+    # inject prompt-level instructions into the regeneration call. Per-embed, not one
+    # global fence, since a single fence sized from one body fails to escape the others.
+    from prompts._fence import safe_code_fence
+    dockerfile_txt = previous_generation.get('dockerfile', '')
+    requirements_txt = previous_generation.get('requirements', '')
+    error_txt = error_message[:1500]
+    df_fence = safe_code_fence(dockerfile_txt)
+    req_fence = safe_code_fence(requirements_txt)
+    ts_fence = safe_code_fence(test_script)
+    err_fence = safe_code_fence(error_txt)
+
     retry_prompt = (
         f"{original_prompt}\n\n"
         f"IMPORTANT: A previous attempt to generate this test FAILED.\n\n"
-        f"Previous Dockerfile:\n```\n{previous_generation.get('dockerfile', '')}\n```\n\n"
-        f"Previous requirements:\n```\n{previous_generation.get('requirements', '')}\n```\n\n"
-        f"Previous test script ({test_filename}):\n```\n{test_script}\n```\n\n"
-        f"Error message:\n```\n{error_message[:1500]}\n```\n\n"
+        f"Previous Dockerfile:\n{df_fence}\n{dockerfile_txt}\n{df_fence}\n\n"
+        f"Previous requirements:\n{req_fence}\n{requirements_txt}\n{req_fence}\n\n"
+        f"Previous test script ({test_filename}):\n{ts_fence}\n{test_script}\n{ts_fence}\n\n"
+        f"Error message:\n{err_fence}\n{error_txt}\n{err_fence}\n\n"
         f"Fix the issue and regenerate. Common fixes:\n"
         f"- Missing directories: use `mkdir -p` before writing files\n"
         f"- Dependency conflicts: don't pin exact versions, use >= or no pin\n"
@@ -313,7 +411,7 @@ def regenerate_test(
     )
 
     raw = simple_text(
-        binding, retry_prompt, max_tokens=8192, system=SYSTEM_PROMPT, tracker=tracker,
+        binding, retry_prompt, max_tokens=DEFAULT_MAX_TOKENS, system=SYSTEM_PROMPT, tracker=tracker,
     )
 
     parsed = _parse_generation_response(raw)
@@ -323,6 +421,32 @@ def regenerate_test(
     required = ["dockerfile", "test_script", "test_filename"]
     if not all(k in parsed for k in required):
         return None
+    # Every staging field the executor writes or joins must be a str — a non-str
+    # (JSON allows any type) would raise in _write_test_files and abort the whole
+    # dynamic-test run. Degrade a malformed generation to the None (ERROR) path —
+    # result_collector records generation-None as status ERROR, un-retried.
+    _REQUIRED_STR_FIELDS = ("dockerfile", "test_script", "test_filename")
+    if any(k in parsed and not isinstance(parsed[k], str)
+           for k in _REQUIRED_STR_FIELDS):
+        return None
+    # The OPTIONAL fields are prompt-declared as "string | null" (the system
+    # prompt: docker_compose "null if single container"; Go tests are told NOT
+    # to write go.mod, so null requirements are the expected emission) — a
+    # model that enumerates the full schema emits null, and that complete,
+    # valid generation must NOT be discarded (#522: of 21 scored generations
+    # in the discovery run, 14 carried a null optional and were dropped this
+    # way; 4 more were truncated replies failing at the parser, not here).
+    # Coerce null to the canonical absent
+    # form "" (what result_collector's .get(k, "") and DynamicTestResult
+    # default to); keep rejecting non-str non-null values — a dict/number is
+    # still a malformed generation.
+    _OPTIONAL_STR_FIELDS = ("requirements", "requirements_filename",
+                            "docker_compose")
+    for k in _OPTIONAL_STR_FIELDS:
+        if k in parsed and parsed[k] is None:
+            parsed[k] = ""
+        if k in parsed and not isinstance(parsed[k], str):
+            return None
 
     return parsed
 

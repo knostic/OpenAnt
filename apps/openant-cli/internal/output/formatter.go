@@ -64,6 +64,31 @@ func PrintKeyValue(key, value string) {
 	fmt.Println(value)
 }
 
+// renderCostBlock prints the Cost line (labelled incomplete when any model
+// was unpriced) and the unpriced id list — the one home for all three
+// summary renderers. #598: an incomplete figure must never read as
+// complete, and a $0 incomplete figure must not vanish the cost line
+// entirely (the report renderer's old cost>0 gate did exactly that).
+func renderCostBlock(usage map[string]any) {
+	cost := floatFromAny(usage["total_cost_usd"])
+	incomplete, _ := usage["cost_incomplete"].(bool)
+	unpriced, _ := usage["unpriced_models"].([]any)
+	costLabel := "Cost"
+	if incomplete {
+		costLabel = "Cost (incomplete — at least one model unpriced)"
+	}
+	PrintKeyValue(costLabel, fmt.Sprintf("$%.4f", cost))
+	if len(unpriced) > 0 {
+		ids := make([]string, 0, len(unpriced))
+		for _, u := range unpriced {
+			if id, ok := u.(string); ok {
+				ids = append(ids, id)
+			}
+		}
+		PrintKeyValue("Unpriced models", strings.Join(ids, ", "))
+	}
+}
+
 // PrintScanSummary outputs a formatted summary of scan results.
 func PrintScanSummary(data map[string]any) {
 	metrics, ok := data["metrics"].(map[string]any)
@@ -108,11 +133,9 @@ func PrintScanSummary(data map[string]any) {
 	// Usage info
 	if usage, ok := data["usage"].(map[string]any); ok {
 		PrintHeader("Usage")
-		cost := floatFromAny(usage["total_cost_usd"])
 		inputTokens := intFromAny(usage["total_input_tokens"])
 		outputTokens := intFromAny(usage["total_output_tokens"])
-
-		PrintKeyValue("Cost", fmt.Sprintf("$%.4f", cost))
+		renderCostBlock(usage)
 		PrintKeyValue("Tokens", fmt.Sprintf("%d input / %d output", inputTokens, outputTokens))
 	}
 
@@ -230,10 +253,10 @@ func PrintReportSummary(data map[string]any) {
 		PrintKeyValue("Reskin", path)
 	}
 	if usage, ok := data["usage"].(map[string]any); ok {
-		cost := floatFromAny(usage["total_cost_usd"])
-		if cost > 0 {
-			PrintKeyValue("Cost", fmt.Sprintf("$%.4f", cost))
-		}
+		// #598: the report envelope's usage carries the incompleteness
+		// metadata — render it (the old cost>0 gate vanished an
+		// incomplete $0 entirely).
+		renderCostBlock(usage)
 	}
 	fmt.Println()
 }
@@ -407,6 +430,39 @@ func PrintScanSummaryV2(data map[string]any) {
 
 	PrintKeyValue("Total units analyzed", fmt.Sprintf("%d", total))
 
+	// #323: the reachability advisory, in the Scan Results section (wave r1:
+	// it landed under Output Files before — a coverage number beside the
+	// report paths, not beside the unit counts). The blackout warning
+	// previously reached only an artifact field + an LLM instruction; the
+	// terminal never said anything, so a blacked-out scan looked like a
+	// small clean run. Deterministic (printed from the envelope's block).
+	// The reduction uses the envelope's OWN float — the integer recompute
+	// truncated (wave r1: 2/3 printed 34%, the artifacts said 33.3%).
+	if reach, ok := data["reachability"].(map[string]any); ok && reach != nil {
+		reachable := intFromAny(reach["reachable_units"])
+		original := intFromAny(reach["original_units"])
+		if original > 0 {
+			// the envelope's OWN float when present (the exact figure the
+			// artifacts print); the recompute is only the fallback for a
+			// hand-built map without it.
+			pct := float64(100*original-100*reachable) / float64(original)
+			if f, ok := reach["reachability_reduction_percentage"].(float64); ok {
+				pct = f
+			}
+			PrintKeyValue("Reachability", fmt.Sprintf(
+				"%d of %d units in scope (%.1f%% reduction)", reachable, original, pct))
+		} else {
+			PrintKeyValue("Reachability", fmt.Sprintf("%d units in scope", reachable))
+		}
+		if warns, ok := reach["reachability_warnings"].([]any); ok {
+			for _, wn := range warns {
+				if s, ok := wn.(string); ok && s != "" {
+					yellow.Printf("  ⚠ %s\n", s)
+				}
+			}
+		}
+	}
+
 	combined := vulnerable + bypassable
 	if combined > 0 {
 		red.Printf("  Vulnerable: %d\n", combined)
@@ -431,11 +487,9 @@ func PrintScanSummaryV2(data map[string]any) {
 	// Usage info
 	if usage, ok := data["usage"].(map[string]any); ok {
 		PrintHeader("Usage")
-		cost := floatFromAny(usage["total_cost_usd"])
 		inputTokens := intFromAny(usage["total_input_tokens"])
 		outputTokens := intFromAny(usage["total_output_tokens"])
-
-		PrintKeyValue("Cost", fmt.Sprintf("$%.4f", cost))
+		renderCostBlock(usage)
 		PrintKeyValue("Tokens", fmt.Sprintf("%d input / %d output", inputTokens, outputTokens))
 	}
 

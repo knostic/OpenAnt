@@ -3,6 +3,163 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-14] — The errored unit's usage reaches the tracker (#616)
+
+### Fixed
+
+- **A mid-conversation adapter raise no longer vanishes the verify stage's spend.** `verify_result`'s conversation loop had no try/except around the adapter call: a raise mid-conversation lost the accumulated usage and the errored unit read $0 / 0 tokens while the provider billed both. The fix (the #537/#549 idiom, at the boundary the verifier actually uses — the loop bypasses the helpers): the accumulated conversation usage **plus the raising turn's own tokens** (only `LLMResponseError` carries them; connection/auth/limit raises billed nothing and append no turn entry) reaches the tracker *before* the re-raise, exactly once (the try stays narrow — widening it double-records on the record-then-parse exits). A turn-1 failure with nothing accumulated writes no record; KeyboardInterrupt propagates uncaught. The harvest, the checkpoint's usage, and the resume's "already spent" sum now carry the real spend — **first-resume-true**: a retried unit's checkpoint is overwritten by its retry's usage, so a resume-of-a-resume sees only the retry's spend (the pre-existing overwrite shape, now material — a named follow-up). The #598 pricing census is 17 sites (the new exception-path record passes `pricing=`).
+
+## [2026-09-14] — Silent accounting drops become loud (#605)
+
+### Fixed
+
+- **Two failure paths that silently discarded cost/token accounting now surface.** The report-phase tracker hand-off (the only route by which the report step's spend reaches the tracker) sat inside `except Exception: pass` — a binding or pricing failure there silently dropped the step's tokens, and the report step read as $0 / 0 tokens with `cost_incomplete=false`. The step-report cost snapshot substituted a complete-looking zero on any tracker exception — and a fabricated baseline corrupted the step-over-step deltas (a failed end yielded NEGATIVE deltas; a failed start charged another step's spend). Both are fixed: the hand-off failure is counted (a module-level counter — a poisoned tracker cannot count its own failure) and named on stderr; a failed snapshot is a sentinel, the delta is written as zeros WITHOUT subtracting, and the step's token_usage carries `accounting_error: true` + `cost_incomplete: true` (both markers, never one without the other). The marker OR-aggregates at the scan level. In production the counter's incrementer runs inside the report step itself — the observable effect is the **report step's own artifact** being marked (a future pre-report incrementer would mark later steps too; no such site exists today). A healthy run's artifacts are byte-identical (present-only keys). Scope limit, disclosed: the marker reaches the step reports + the scan aggregate only — `UsageInfo` has no field, so the console cost line and the typed Go usage cannot show it.
+
+## [2026-09-14] — Unknown pricing never substituted: the masquerade deleted (#598)
+
+### Fixed
+
+- **An adapter's unknown price is never silently replaced with the Anthropic catalogue rate.** `TokenTracker.record_call`'s legacy fallback (and the report generator's own `MODEL_PRICING` fallback — the same substitution in a second consumer) substituted the Anthropic-catalogue rate whenever the adapter's pricing map missed the model: a custom OpenAI-compatible endpoint configured with a Claude model id reported a plausible wrong-rate cost with `cost_incomplete=false`. Both fallbacks are deleted — a lookup miss takes the #216 loud path (a one-time warning, $0, and `cost_incomplete=true` + `unpriced_models` in the artifacts), and the CLI report's usage now carries the incompleteness metadata through (previously dropped — the report-phase masquerade would have survived the tracker fix alone). Every production call site passes the adapter's pricing (16 sites, census-pinned in the tests — the census excludes by path, not by filename); the two legacy cost-asserting tests that relied on the substitution are rewritten; the remaining omitted-pricing fixtures now exercise the loud path deliberately.
+- **The incompleteness metadata reaches the consumers that were still dropping it** (the review round): the Go `report` renderer printed cost only — and its cost>0 gate vanished an incomplete $0 entirely — it now renders the label and the unpriced ids through the same shared block as both scan renderers (pinned by Go output tests); the dynamic-test and enhance resume paths now PERSIST the per-unit unpriced ids (their resume readers were wired for keys nothing wrote — a resumed step silently read complete); the four resume forwardings and the llm-reach one are pinned.
+
+## [2026-09-14] — Dependencies: the dual http stack bumped to 2.13.0 (#632)
+
+### Dependencies
+
+- **`httpx2` 2.12.0 → 2.13.0 and its peer `httpcore2` 2.12.0 → 2.13.0,
+  together.** `httpx2` pins its `httpcore2` peer exactly, so the two bumps
+  are one atomic change — each alone fails `pip install -r requirements.txt`
+  with a dependency conflict (the peer renovate PR that bumped only
+  `httpcore2` is superseded by this pair).
+
+## [2026-09-14] — LLM-reach report gaps: the skip class + the promoted-vs-retained decomposition (#602)
+
+### Fixed
+
+- **The unknown-unit_id skip line carries its class.** A signal naming a
+  unit outside its batch used to log only the id — an `entry_point/high`
+  skip (could have promoted) was indistinguishable in the record from an
+  `external_input/low` one (could not). The line now carries
+  kind/confidence/batch, `parse_response` gains a policy-free
+  `on_signal_skip` callback, and the stage counts
+  `signals_skipped_unknown_unit` + a by-class histogram — accepted
+  responses only (a dropped/truncated batch's skips are discarded with
+  it; split-retry halves commit their own). The step report carries
+  `signals_skipped_promotable` — the skipped signals that could have
+  promoted, an upper bound (a skipped id may exist in another batch or
+  nowhere in the dataset), sized at report time from this run's own
+  promote set. A skipped signal is not a coverage failure: `error_count`
+  stays dropped+failed batches only.
+- **`entry_points_promoted` is decomposed.** The structural baseline
+  (detector + library seeds, without the LLM extras — a side computation
+  on a copy, the filter itself unchanged) gives
+  `structural_reachable_units` + `units_newly_reachable` per language,
+  lifted through the aggregation whitelist with
+  `reachability_baseline_languages` (the denominator honesty) and
+  forwarded present-only into `pipeline_output.json`. The keys stay
+  absent when unmeasurable; the synthetic-only-seeds case is disclosed
+  by the `reachability_baseline` marker (never a silent absence).
+  Telemetry only: retained unit sets are unchanged for every
+  pre-existing shape (the base-vs-head artifact differential on the
+  parse-level reachable path; the llr and keep-all paths pinned by
+  executed tests).
+
+## [2026-09-14] — Discovery counters: the excluded directories are NAMED (#600)
+
+### Fixed
+
+- **The excluded-directory count is no longer nameless.** A directory-name
+  prune now records a name-keyed histogram (`excluded_dir_names`) with up
+  to 2 entry-relative example paths per retained name (an example is
+  withheld for non-ASCII or oversized paths — the count stands) and an
+  overflow disclosure (`excluded_dir_names_overflow`) — retention reserved
+  for the scanner's effective exclusion set (the first-party names:
+  `build/`, `env/`, `migrations/` …, and the test-dir names the
+  skip-tests pipeline prunes), dynamic names bounded with the overflow
+  disclosed as an occurrence count; hostile/oversized/non-ASCII names
+  count but never key the artifact. Seven scanners instrumented (python,
+  c, php, ruby, rust, swift, zig); JS remains count-only (camelCase
+  alias) and Go's pipeline mode writes no scan-result artifact — both
+  disclosed, never zeroed. What is excluded is unchanged; only what the
+  artifacts record.
+- **The counters reach the artifacts operators read.** The discovery block
+  (per language, per field — absence ≠ zero at both granularities) now
+  reaches: the parse step report (the scan path and the standalone
+  `parse`), `pipeline_output.json` (the Step-6 bridge and the standalone
+  `build-output`/`report`, best-effort), `scan.report.json` (beside
+  coverage), and the generated summary's per-field Discovery section. A
+  failed language is disclosed and its stale artifact never read; in a
+  reused output directory the newest artifact wins by mtime when both
+  probed filenames are present, and an mtime tie is disclosed rather than
+  guessed (the parse-start recency guard — shared with the coverage
+  lane's identical pre-existing hole — is a named follow-up).
+
+## [2026-09-13] — Swift coverage counters + per-key disclosure (absence ≠ zero)
+
+### Fixed
+
+- **The Swift scanner now forwards the walker's symlink telemetry.** The
+  hand-built statistics dict copied only `directories_unreadable` while
+  rust/zig forward all three coverage keys — a Swift scan that refused
+  symlinks reported `symlinks_skipped` nowhere at all. All three keys
+  (`symlinks_skipped`, `symlink_examples`, `unreadable_examples`) are now
+  emitted, present-at-0 on a clean scan (absence remains the
+  uninstrumented signal, per the coverage contract).
+- **A partially instrumented parser can no longer produce a false
+  `symlinks_skipped: 0`.** The coverage aggregation's any-key probe passed
+  on the one key a language DID emit, then summed the absent key as 0 —
+  the exact coercion the aggregation's doctrine forbids. Each count key's
+  total now sums only the languages that reported it, and the new
+  `languages_without_symlinks_skipped_data` /
+  `languages_without_directories_unreadable_data` lists (generated from
+  the count-key tuple; supersets of `languages_without_coverage_data`)
+  disclose each total's exclusion set — a list's absence means the total is
+  complete, and for a listed language the count is unknown, not zero. The
+  generated summary's coverage line teaches the same semantics.
+
+## [2026-08-14] — Recover reasoning-only (empty-completion) analyze responses
+
+### Fixed
+
+- **A unit is no longer silently dropped when a thinking-on model spends its
+  whole token budget reasoning.** Claude-5-family models run adaptive thinking by
+  default; on a large unit the model could exhaust the 8192-token `simple_text`
+  budget on a thinking block and return no text, which errored the unit
+  permanently (a coverage loss — the unit never got a verdict). The default
+  `max_tokens` is raised to 20000 (under the non-streaming ceiling) so thinking
+  and the JSON verdict both fit, and `parse_response` now scans the response for
+  a lone verdict-bearing JSON object instead of spanning from the first prose/code
+  brace, so a verdict emitted after a prose-and-code preamble parses. When several
+  verdict objects appear (an example beside the real one) it stays an ERROR and is
+  retried rather than guessed. Complements the in-run ERROR-retry added the same
+  day: fewer units reach the retry path at all.
+
+## [2026-08-14] — Configurable Python-subprocess timeout
+
+### Fixed
+
+- **The CLI's Python-subprocess timeout is now configurable via
+  `OPENANT_INVOKE_TIMEOUT`.** It was a hardcoded 30 minutes with no override, so a
+  large repo whose `analyze`/`enhance` phase legitimately ran longer was killed
+  mid-phase — the deadline closes the subprocess stdout pipe, so the in-flight
+  read returns `file already closed` and the phase's output is discarded, which
+  then cascades to a missing-file error in downstream phases. The timeout now
+  honors `OPENANT_INVOKE_TIMEOUT` (a Go duration like `2h`, or a bare integer of
+  seconds), defaulting to `30m` when unset or invalid. Completed units are already
+  checkpointed, so a re-run resumes; the override lets a single large run finish
+  outright.
+
+## [2026-08-14] — Local web UI
+
+### Added
+
+- **`openant serve` — a local, loopback-only web UI for the scan pipeline.**
+  Submit a repository URL or local path from the browser, watch scan logs stream
+  live (SSE), and read the HTML report / markdown summary / disclosures. Binds
+  127.0.0.1 only (refuses a non-loopback `--addr`); outputs persist under
+  `~/.openant/webui/`. Original work by @sounil, reconciled onto master and
+  security-hardened. See the "Web UI" section in the README.
+
 ## [2026-07-22] — Efficacy harness rescoped to a smoke test
 
 ### Changed

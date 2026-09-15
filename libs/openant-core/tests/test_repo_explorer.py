@@ -9,7 +9,6 @@ negative controls for that trade.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
 
@@ -18,7 +17,6 @@ from context.repo_explorer import (
     ExplorationBudget,
     RepoExplorer,
 )
-from utilities.file_io import UnsafeRepoFile
 
 
 @pytest.fixture

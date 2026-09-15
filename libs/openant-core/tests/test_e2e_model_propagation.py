@@ -25,14 +25,13 @@ correctly" (which `test_llm_adapter_contract.py` covers).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import pytest
 
 from utilities.llm import (
     CompletionResult,
-    LLMAdapter,
     Message,
     PhaseBinding,
     PhaseRegistry,
@@ -288,7 +287,7 @@ class TestAnalyzeUnitPropagation:
             },
             "metadata": {"direct_calls": [], "direct_callers": []},
         }
-        result = analyze_unit(registry.get("analyze"), unit)
+        analyze_unit(registry.get("analyze"), unit)
         # The fake adapter returned `{"verdict": "SAFE"}` — analyze_unit
         # passes it through. We don't care about the verdict itself,
         # only that the call landed on the analyze adapter.

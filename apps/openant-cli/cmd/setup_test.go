@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// withScriptedStdin redirects os.Stdin to the contents of ``script`` for
+// withScriptedStdin redirects os.Stdin to the contents of “script“ for
 // the duration of the test. Each line of the script answers one prompt.
 // Lines that are blank ("\n") accept the prompt's default.
 //
@@ -77,25 +77,25 @@ func TestSetupLLMWizard_HappyPath(t *testing.T) {
 	//   3-7. verify, llm_reach, enhance, report, dynamic_test, app_context: accept provider default + model default
 	//   8. Set as default_llm: y
 	script := strings.Join([]string{
-		"my-config",          // llm-config name
-		"",                   // analyze: provider (accept default "anthropic")
-		"",                   // analyze: provider type (accept default "anthropic")
-		"sk-test",            // analyze: API key
-		"",                   // analyze: base URL (blank)
-		"",                   // analyze: model (accept Opus default)
-		"",                   // verify: provider (re-use anthropic from session)
-		"",                   // verify: model (default Opus)
-		"",                   // llm_reach: provider
-		"",                   // llm_reach: model
-		"",                   // enhance: provider
-		"",                   // enhance: model (default Sonnet)
-		"",                   // report: provider
-		"",                   // report: model
-		"",                   // dynamic_test: provider
-		"",                   // dynamic_test: model
-		"",                   // app_context: provider
-		"",                   // app_context: model
-		"y",                  // Set as default_llm?
+		"my-config", // llm-config name
+		"",          // analyze: provider (accept default "anthropic")
+		"",          // analyze: provider type (accept default "anthropic")
+		"sk-test",   // analyze: API key
+		"",          // analyze: base URL (blank)
+		"",          // analyze: model (accept Opus default)
+		"",          // verify: provider (re-use anthropic from session)
+		"",          // verify: model (default Opus)
+		"",          // llm_reach: provider
+		"",          // llm_reach: model
+		"",          // enhance: provider
+		"",          // enhance: model (default Sonnet)
+		"",          // report: provider
+		"",          // report: model
+		"",          // dynamic_test: provider
+		"",          // dynamic_test: model
+		"",          // app_context: provider
+		"",          // app_context: model
+		"y",         // Set as default_llm?
 	}, "\n") + "\n"
 
 	withScriptedStdin(t, script)
@@ -207,14 +207,14 @@ func TestSetupLLMWizard_OpenAIProvider(t *testing.T) {
 		"openai",          // provider type
 		"sk-openai-test",  // API key
 		"",                // base URL
-		"gpt-4o-mini",       // model
-		"", "gpt-4o-mini",   // llm_reach: provider (default openai) + model
-		"", "gpt-4o-mini",   // enhance
-		"", "gpt-4o",        // analyze (heavier model)
-		"", "gpt-4o",        // verify
-		"", "gpt-4o-mini",   // dynamic_test
-		"", "gpt-4o-mini",   // report
-		"y",               // default_llm
+		"gpt-4o-mini",     // model
+		"", "gpt-4o-mini", // llm_reach: provider (default openai) + model
+		"", "gpt-4o-mini", // enhance
+		"", "gpt-4o", // analyze (heavier model)
+		"", "gpt-4o", // verify
+		"", "gpt-4o-mini", // dynamic_test
+		"", "gpt-4o-mini", // report
+		"y", // default_llm
 	}, "\n") + "\n"
 
 	withScriptedStdin(t, script)
@@ -254,20 +254,20 @@ func TestSetupLLMWizard_RefusesOpenantDefaultName(t *testing.T) {
 	// a valid name. The rest of the flow is the minimum-input happy
 	// path.
 	script := strings.Join([]string{
-		"openant-default",   // rejected — reserved
-		"my-config",         // accepted
-		"",                  // analyze: provider
-		"",                  // analyze: provider type
-		"sk-test",           // analyze: API key
-		"",                  // analyze: base URL
-		"",                  // analyze: model
-		"", "",              // verify
-		"", "",              // llm_reach
-		"", "",              // enhance
-		"", "",              // report
-		"", "",              // dynamic_test
-		"", "",              // app_context
-		"",                  // default_llm (accept Y default)
+		"openant-default", // rejected — reserved
+		"my-config",       // accepted
+		"",                // analyze: provider
+		"",                // analyze: provider type
+		"sk-test",         // analyze: API key
+		"",                // analyze: base URL
+		"",                // analyze: model
+		"", "",            // verify
+		"", "", // llm_reach
+		"", "", // enhance
+		"", "", // report
+		"", "", // dynamic_test
+		"", "", // app_context
+		"", // default_llm (accept Y default)
 	}, "\n") + "\n"
 
 	withScriptedStdin(t, script)

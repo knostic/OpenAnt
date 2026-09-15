@@ -1,7 +1,6 @@
 """P6 coverage-fill tests — real behaviors flagged untested by the test-exhaustiveness
 audit (tester-expert + auditor). Each exercises the production code path, not a stub."""
 import hashlib
-import os
 import sys
 import pathlib
 

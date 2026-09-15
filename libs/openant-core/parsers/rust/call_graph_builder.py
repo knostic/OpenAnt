@@ -24,6 +24,7 @@ design notes for the actual node-type dump this was built from):
   stream of well-known formatting/assertion macros (see `_scan_macro_body`).
 """
 
+import os
 import posixpath
 import re
 from collections import defaultdict
@@ -49,10 +50,23 @@ _SCANNABLE_MACROS = {
 }
 
 # A conservative call-shaped pattern used ONLY inside macro token trees
-# (real code is parsed by the grammar and does not need this). Matches
-# `name(` and `recv.name(` / `recv.name::<T>(`.
+# (real code is parsed by the grammar and does not need this). Matches, in
+# alternation order:
+#   `A::B::c(`         scoped associated/module call -> emitted as a `scoped`
+#                      site so cross-file `Type::method`/`mod::fn` targets
+#                      resolve (the AST walk gets these for free; the macro
+#                      scanner did not, silently dropping the most common
+#                      fuzz-harness idiom `assert!(Type::method(d))`).
+#   `name(` / `recv.name(` / `recv.name::<T>(`   bare or dotted method chain.
+# Scoped is tried first so `Codec::roundtrip(` binds the qualifier rather than
+# degrading to a bare same-file-only `roundtrip`. A trailing turbofish
+# (`foo::<T>(`) is NOT an identifier after `::`, so it falls through to the
+# bare branch exactly as before (no scoped false-match).
 _MACRO_CALL_RE = re.compile(
-    r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:::<[^>]*>)?\s*\("
+    r"\b("
+    r"(?:[A-Za-z_][A-Za-z0-9_]*::)+[A-Za-z_][A-Za-z0-9_]*"       # A::B::c (scoped)
+    r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"      # bare / recv.name
+    r")\s*(?:::<[^>]*>)?\s*\("
 )
 
 # String / char literals inside a macro token tree, blanked BEFORE the call-shaped
@@ -66,6 +80,97 @@ _RUST_STR_LITERAL_RE = re.compile(
     r'|"(?:\\.|[^"\\])*"'         # normal string with escapes
     r"|'(?:\\.|[^'\\])'"          # char literal
 )
+
+
+def _blank_rust_literals(text: str) -> str:
+    """Single-pass O(n) equivalent of ``_RUST_STR_LITERAL_RE.sub(" ", text)``.
+
+    The regex form is O(n^2) on an unterminated-``r#"`` flood (its ``(?:[^"]|"(?!#))*``
+    branch restarts at every position). This hand-written forward-cursor scanner blanks
+    the SAME four literal forms — collapsing each matched span to a single space, exactly
+    like ``re.sub(" ", ...)`` — with a monotonic index, so it is linear and cannot ReDoS.
+    Running it BEFORE the length budget (rather than the reverse) also restores the calls
+    that the bound-then-strip ordering dropped when a large literal pushed a real trailing
+    call past the cap. A differential test asserts byte-identical output vs the regex on a
+    real-code corpus (any divergence is a call-graph/reachability change and must fail).
+
+    Deliberately matches the regex's EXACT (incomplete) scope — 1-hash raw strings only,
+    no ``r##``/byte-string/``br`` forms — so the extracted call set is unchanged. Extending
+    it to more literal forms would remove real phantom edges but is a call-set change; see
+    issue #288 (tracked as future work, alongside the token-tree-walk that would
+    retire this scanner entirely).
+    """
+    # An UNTERMINATED literal is left UNCHANGED, exactly like the regex: with no
+    # closing delimiter the corresponding alternative fails to match, so re.sub emits
+    # the single opening char and retries at the next position. Only a fully-terminated
+    # literal is collapsed to one space. (Getting this wrong would blank a stray trailing
+    # quote to EOF and drop real trailing calls — the divergence the differential caught.)
+    n = len(text)
+    out = []
+    i = 0
+    # Monotonic short-circuits keep the scan O(n): once we learn there is no `"#`
+    # (resp. no `"`) at/after some index, every LATER raw-string opener starts
+    # scanning even further right, so it is also unterminated -- return -1 without
+    # re-scanning to EOF. Without this, a repeated-`r#"` flood (no closing `"#`)
+    # calls find() to EOF from ~n/3 positions -> O(n^2) (a real ReDoS: measured
+    # ~1.8s at 240KB). The result is byte-identical to calling find() every time.
+    no_hashclose_from = None   # if set: no `"#` exists at/after this index
+    no_quote_from = None       # if set: no `"`  exists at/after this index
+    while i < n:
+        c = text[i]
+        # r#"..."#  (one hash, matching the regex's single-hash branch only)
+        if c == 'r' and text.startswith('r#"', i):
+            start = i + 3
+            if no_hashclose_from is not None and start >= no_hashclose_from:
+                close = -1
+            else:
+                close = text.find('"#', start)
+                if close == -1:
+                    no_hashclose_from = start
+            if close != -1:
+                out.append(' '); i = close + 2; continue
+            out.append(c); i += 1; continue                  # unterminated -> unchanged
+        # r"..."
+        if c == 'r' and text.startswith('r"', i):
+            start = i + 2
+            if no_quote_from is not None and start >= no_quote_from:
+                close = -1
+            else:
+                close = text.find('"', start)
+                if close == -1:
+                    no_quote_from = start
+            if close != -1:
+                out.append(' '); i = close + 1; continue
+            out.append(c); i += 1; continue                  # unterminated -> unchanged
+        # "..." — content is (?:\\.|[^"\\])*, where \\. is backslash + any NON-newline
+        # (re's '.' excludes '\n' without DOTALL, so \<newline> ends the group and the
+        # literal fails to match — must be replicated or the scanner over-consumes).
+        if c == '"':
+            j = i + 1
+            matched = False
+            while j < n:
+                cj = text[j]
+                if cj == '"':
+                    matched = True; break
+                if cj == '\\':
+                    if j + 1 < n and text[j + 1] != '\n':
+                        j += 2; continue
+                    break                                    # \\. fails -> group ends, no close
+                j += 1                                       # [^"\\]
+            if matched:
+                out.append(' '); i = j + 1; continue
+            out.append(c); i += 1; continue                  # unterminated -> unchanged
+        # '.' or '\.' char literal — NOT a lifetime ('a), label ('x:), or unterminated.
+        # The '\X' escape form also excludes \<newline> (same '.' rule as above).
+        if c == "'":
+            if i + 3 < n and text[i + 1] == '\\' and text[i + 2] != '\n' and text[i + 3] == "'":
+                out.append(' '); i += 4; continue            # '\X'
+            if i + 2 < n and text[i + 1] not in "'\\" and text[i + 2] == "'":
+                out.append(' '); i += 3; continue            # 'X'
+            out.append(c); i += 1; continue                  # lifetime/label/unterminated
+        out.append(c)
+        i += 1
+    return ''.join(out)
 
 RUST_BUILTINS = {
     # core::fmt / println-family macro names (recovered via token-tree scan,
@@ -131,6 +236,11 @@ class CallGraphBuilder:
 
         self.call_graph: Dict[str, List[str]] = {}
         self.reverse_call_graph: Dict[str, List[str]] = {}
+        # Machine-readable record of macro bodies whose call-scan input was truncated by
+        # the ReDoS budget (scan_budget.py). A non-empty list means the call graph for
+        # those contexts is KNOWN-INCOMPLETE — downstream reachability should over-seed
+        # rather than trust the callee list. See issue #288.
+        self.scan_truncated: List[str] = []
 
     # -- public API (parity with sibling parsers) ----------------------------
 
@@ -185,6 +295,7 @@ class CallGraphBuilder:
             "imports": self.imports,
             "call_graph": self.call_graph,
             "reverse_call_graph": self.reverse_call_graph,
+            "scan_truncated": self.scan_truncated,
             "statistics": self.get_statistics(),
         }
 
@@ -271,6 +382,18 @@ class CallGraphBuilder:
             return sites
         source = code.encode("utf-8")
 
+        # #299 (7 of 7): dispatch containers — an array literal of bare-ident
+        # function references (`static TBL: [fn(); N] = [a, b];` or a local
+        # `let t = [a, b];`) binds its name; a subscript call over a KNOWN
+        # container resolves to every referenced function (over-seed, the
+        # safe direction). Idiomatic Rust dispatches via match / dyn Fn /
+        # bound locals (all already resolving) — this completes the family
+        # shape; the umbrella measured the idiom as rare in real code, so
+        # corpus gains are expected ≈0 (pre-registered).
+        containers = dict(self._file_containers(caller_file))
+        containers.update(self._collect_local_containers(tree.root_node, source))
+        container_names = set(containers.keys())
+
         stack = [tree.root_node]
         entered_fn = False
         while stack:
@@ -288,6 +411,19 @@ class CallGraphBuilder:
                 entered_fn = True
             if node.type == "call_expression":
                 callee = node.children[0] if node.children else None
+                # #299 (7 of 7): a subscript callee TBL[i]() over a KNOWN
+                # container — one site per referenced function. Unknown bases
+                # fall through to _describe_callee (which abstains on the
+                # index_expression shape; no bare-name false edges).
+                if (callee is not None and callee.type == "index_expression"
+                        and container_names):
+                    base = self._index_expression_base(callee, source)
+                    if base is not None and base in containers:
+                        for target in sorted(containers[base]):
+                            sites.append({"kind": "bare", "name": target,
+                                          "bare_filter_name": target})
+                        stack.extend(node.children)
+                        continue
                 site = self._describe_callee(callee, source)
                 if site is not None:
                     sites.append(site)
@@ -315,6 +451,96 @@ class CallGraphBuilder:
                     or bare in repo_names):
                 filtered.append(site)
         return filtered
+
+    # ------------------------------------------------------------------
+    # #299 (7 of 7): dispatch containers
+    # ------------------------------------------------------------------
+    def _index_expression_base(self, callee: Node, source: bytes) -> Optional[str]:
+        """The base identifier text of an index_expression callee."""
+        for child in callee.children:
+            if child.type == "identifier":
+                return self._text(child, source)
+        return None
+
+    def _array_expression_targets(self, arr, source: bytes, repo_names) -> list:
+        """The bare-ident known-function names an array literal references."""
+        targets = []
+        for child in arr.children:
+            if child.type == "identifier":
+                name = self._text(child, source)
+                if name in repo_names:
+                    targets.append(name)
+        return targets
+
+    def _collect_local_containers(self, root, source: bytes) -> Dict[str, list]:
+        """let NAME: [fn(); N] = [a, b]; -> container map (this caller's body).
+        A rebound name is dropped rather than guessed."""
+        repo_names = set(self._build_name_index()) if not self.functions else {
+            fi.get("name") for fi in self.functions.values() if fi.get("name")}
+        containers: Dict[str, list] = {}
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type == "let_declaration":
+                ident = None
+                arr = None
+                for child in node.children:
+                    if child.type == "identifier" and ident is None:
+                        ident = self._text(child, source)
+                    elif child.type == "array_expression":
+                        arr = child
+                if ident is not None and arr is not None:
+                    if ident in containers:
+                        containers.pop(ident, None)
+                    else:
+                        targets = self._array_expression_targets(arr, source, repo_names)
+                        if targets:
+                            containers[ident] = targets
+            stack.extend(node.children)
+        return containers
+
+    def _file_containers(self, caller_file: str) -> Dict[str, list]:
+        """File-scope static containers (static TBL: [...] = [a, b];), parsed
+        once per file and cached. Abstains (empty) on read/parse failure."""
+        cached = getattr(self, "_file_container_cache", None)
+        if cached is None:
+            cached = {}
+            self._file_container_cache = cached
+        if caller_file in cached:
+            return cached[caller_file]
+        result: Dict[str, list] = {}
+        repo_names = {fi.get("name") for fi in self.functions.values()
+                      if fi.get("name")}
+        try:
+            full = (caller_file if os.path.isabs(caller_file)
+                    else os.path.join(self.repository, caller_file))
+            with open(full, "rb") as fh:
+                source = fh.read()
+            tree = self.parser.parse(source)
+            stack = [tree.root_node]
+            while stack:
+                node = stack.pop()
+                if node.type == "static_item":
+                    ident = None
+                    arr = None
+                    for child in node.children:
+                        if child.type == "identifier" and ident is None:
+                            ident = self._text(child, source)
+                        elif child.type == "array_expression":
+                            arr = child
+                    if ident is not None and arr is not None:
+                        if ident in result:
+                            result.pop(ident, None)
+                        else:
+                            targets = self._array_expression_targets(arr, source,
+                                                                     repo_names)
+                            if targets:
+                                result[ident] = targets
+                stack.extend(node.children)
+        except OSError:
+            result = {}
+        cached[caller_file] = result
+        return result
 
     def _describe_callee(self, callee: Optional[Node], source: bytes) -> Optional[dict]:
         if callee is None:
@@ -406,9 +632,17 @@ class CallGraphBuilder:
         invisible to the AST walk above. For a small set of well-known
         macros whose arguments are ordinary expressions (format/print/assert/
         vec/...), regex-recover call-shaped identifiers from the raw token
-        text. This can only find bare/dotted names -- it cannot see argument
-        structure -- so results feed the same bare/field resolution paths
-        with a conservative shape.
+        text. It recovers bare, dotted, and scoped (`Type::method`) call names
+        -- it cannot see argument structure -- so results feed the same
+        bare/field/scoped resolution paths as the AST walk, with a conservative
+        shape.
+
+        NOTE (2026-08-15): "opaque token tree" describes only how THIS scanner
+        treats the body, not the grammar. tree-sitter DOES lex the `token_tree`
+        into structured nodes (string_literal / identifier / nested token_tree),
+        so a node-walk could recover these calls without any regex or scan
+        budget. That rewrite is deferred (see issue #288 R1/T); the
+        regex path is retained for now with a linear literal-stripper in front.
         """
         macro_name = None
         token_tree = None
@@ -420,11 +654,36 @@ class CallGraphBuilder:
         if macro_name not in _SCANNABLE_MACROS or token_tree is None:
             return
         text = self._text(token_tree, source)
-        # Blank literals so a call-shaped substring inside a string is not scanned.
-        text = _RUST_STR_LITERAL_RE.sub(" ", text)
+        # Blank literals FIRST, via the linear _blank_rust_literals (byte-identical to
+        # _RUST_STR_LITERAL_RE.sub but O(n), so it cannot ReDoS the way the regex did on an
+        # unterminated-raw-string flood). Stripping before the budget also collapses a large
+        # string literal to one space, so a real trailing call is no longer pushed past the
+        # cap -- fixing the recall regression the earlier bound-first ordering introduced.
+        text = _blank_rust_literals(text)
+        # THEN bound the stripped text for _MACRO_CALL_RE, which is still O(n^2) on an
+        # adversarial dotted/scoped chain with no trailing '('. This residual (a call after
+        # >8KB of non-literal token soup can be truncated) is tracked in issue #288.
+        from utilities.scan_budget import bound_macro_scan_text
+        text, _truncated = bound_macro_scan_text(text, context=f"rust macro {macro_name}")
+        if _truncated:
+            self.scan_truncated.append(f"rust macro {macro_name}")
         for match in _MACRO_CALL_RE.finditer(text):
             call_name = match.group(1)
-            if "." in call_name:
+            if "::" in call_name:
+                # Scoped `A::B::c` -> a `scoped` site with the IMMEDIATE
+                # qualifier (segment just before the leaf), matching the shape
+                # `_split_scoped` produces for an AST scoped_identifier so it
+                # routes through the same `_resolve_scoped` path (associated-fn
+                # via class_name, module via mod-file). Add-only vs the prior
+                # bare capture: a `Type::method(` token that previously yielded
+                # bare `method` (same-file-only) now yields the qualified call.
+                qualifier, leaf = call_name.rsplit("::", 1)
+                immediate = qualifier.rsplit("::", 1)[-1]
+                sites.append({
+                    "kind": "scoped", "qualifier": immediate, "leaf": leaf,
+                    "bare_filter_name": None,
+                })
+            elif "." in call_name:
                 receiver_name, method = call_name.rsplit(".", 1)
                 if receiver_name == "self":
                     sites.append({
@@ -1136,7 +1395,15 @@ class CallGraphBuilder:
             return same_file
         if len(candidates) == 1:
             return candidates
-        return []
+        # The qualifier bound nothing in Steps 1-3 and the raw leaf is ambiguous.
+        # Fall back to exactly what a bare `leaf(` call resolves to (free-function
+        # filter + import/external handling) -- this is what the pre-scoped-recovery
+        # bare capture produced, so macro scoped-call recovery stays strictly
+        # ADD-ONLY and never drops an edge the bare path would have kept (e.g. a
+        # leaf shared by a free fn and a method: raw count == 2 here, but the bare
+        # resolver picks the unique FREE function). Purely additive: only reached
+        # when the raw fallback above would have returned [].
+        return self._resolve_bare(leaf, caller_file, name_to_ids)
 
     def _mod_target_files(self, mod_name: str, caller_file: str) -> Set[str]:
         """Candidate file paths a `mod <mod_name>;` declaration could map to.

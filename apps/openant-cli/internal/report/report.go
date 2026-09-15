@@ -3,6 +3,7 @@ package report
 import (
 	"embed"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"io"
 	"os"
@@ -14,6 +15,37 @@ var templateFS embed.FS
 
 //go:embed templates/report-reskin.gohtml
 var reskinFS embed.FS
+
+// #332: the report templates' third-party scripts (tailwindcss, chart.js,
+// chartjs-plugin-datalabels) are VENDORED at pinned versions — the CDN tags
+// carried no SRI, chart.js no version at all, and cdn.tailwindcss.com is a
+// mutable runtime generator. The report is served AND written to disk for
+// direct file:// opening, so the scripts are INLINED at render time (template
+// func returning template.JS): self-contained in every mode — served,
+// standalone, air-gapped — with no route coupling.
+//
+//go:embed vendor/report.css vendor/chart-4.5.1.umd.min.js vendor/chartjs-plugin-datalabels-2.2.0.min.js
+var vendorFS embed.FS
+
+// vendorScripts holds the embedded script contents. go:embed validates the
+// directive's patterns at COMPILE time (a missing vendored file fails the
+// build); a wrong name in a TEMPLATE is a render-time failure — vendorJS
+// fails loud when the literal names nothing embedded (see below), so the
+// map is built once and a stale literal cannot pass silently.
+var vendorScripts = func() map[string]template.JS {
+	m := make(map[string]template.JS, 2)
+	for _, n := range []string{
+		"chart-4.5.1.umd.min.js",
+		"chartjs-plugin-datalabels-2.2.0.min.js",
+	} {
+		b, err := vendorFS.ReadFile("vendor/" + n)
+		if err != nil {
+			panic("vendored report script missing: " + n)
+		}
+		m[n] = template.JS(b)
+	}
+	return m
+}()
 
 var (
 	overviewTmpl *template.Template
@@ -28,6 +60,30 @@ func init() {
 		},
 		"even": func(i int) bool {
 			return i%2 == 0
+		},
+		// #332: inline a vendored, pinned script by file name — the rendered
+		// report carries its own dependencies (no CDN, no SRI negotiation).
+		// Wave r1 (three axes): return an ERROR on an unknown name — a map
+		// miss returned the zero template.JS and the report rendered
+		// unstyled/chartless SILENTLY (go:embed validates the directive's
+		// patterns, not the string literal a template passes; a rename that
+		// missed one of the template call sites compiled clean). template
+		// execution now fails loud instead.
+		"vendorJS": func(name string) (template.JS, error) {
+			js, ok := vendorScripts[name]
+			if !ok {
+				return "", fmt.Errorf("report: no vendored script %q (vendor/ is missing the file, or the template's literal is stale)", name)
+			}
+			return js, nil
+		},
+		// #540: the prebuilt CSS embed — same fail-loud contract as vendorJS
+		// (an unknown name fails the render, not a silently unstyled report).
+		"vendorCSS": func(name string) (template.CSS, error) {
+			b, err := vendorFS.ReadFile("vendor/" + name)
+			if err != nil {
+				return "", fmt.Errorf("report: no vendored CSS %q (vendor/ is missing the file, or the template's literal is stale)", name)
+			}
+			return template.CSS(b), nil
 		},
 	}
 

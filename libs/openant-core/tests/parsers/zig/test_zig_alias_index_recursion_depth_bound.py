@@ -33,7 +33,6 @@ Select the module under test with env CGB_PATH (defaults to the repo file):
     CGB_PATH=/path/to/call_graph_builder.py pytest test_...depth_bound.py
 """
 
-import importlib.util
 import os
 import sys
 from pathlib import Path

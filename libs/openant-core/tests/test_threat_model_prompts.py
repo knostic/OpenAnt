@@ -12,7 +12,6 @@ wording and because changing it would silently move every existing user's
 verdicts.
 """
 
-import pytest
 
 from context.application_context import ApplicationContext
 from prompts.vulnerability_analysis import (

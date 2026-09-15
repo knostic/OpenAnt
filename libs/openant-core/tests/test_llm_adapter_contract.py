@@ -124,6 +124,12 @@ def _openrouter_factory():
     return make_adapter
 
 
+def _ollama_factory():
+    from tests._llm_factories.ollama import make_adapter
+
+    return make_adapter
+
+
 # Each row: (display_name, scenario_factory_callable)
 # Add a row when registering a new adapter.
 ADAPTERS: list[tuple[str, Callable[[str], LLMAdapter]]] = [
@@ -132,6 +138,7 @@ ADAPTERS: list[tuple[str, Callable[[str], LLMAdapter]]] = [
     ("google", _google_factory()),
     ("bedrock", _bedrock_factory()),
     ("openrouter", _openrouter_factory()),
+    ("ollama", _ollama_factory()),
 ]
 
 

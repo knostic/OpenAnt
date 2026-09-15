@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import types
 
-import pytest
 
 from context.threat_model_agent import _finalize
 from utilities.file_io import repo_path_state

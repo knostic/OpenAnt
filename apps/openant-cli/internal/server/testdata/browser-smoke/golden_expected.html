@@ -1,0 +1,51 @@
+<h1>The browser-smoke canary markdown — exercises every MD_SANITIZE class.</h1>
+<h1>Rendered by the REAL vendored marked + DOMPurify in a real browser; the</h1>
+<h1>sanitized #content innerHTML is compared against golden_expected.html</h1>
+<h1>(full equality) plus hard canary assertions the --update-golden path can</h1>
+<h1>never touch.</h1>
+<h1>Security Analysis: openant</h1>
+<p><strong>Repository:</strong> <a href="https://example.com/org/repo">https://example.com/org/repo</a>
+<strong>Language:</strong> go
+<strong>Commit:</strong> abc123</p>
+<h2>Summary</h2>
+<p>A <strong>bold</strong> claim, <em>emphasis</em>, <del>strikethrough</del>, and <code>inline code</code>.</p>
+<h3>The hostile shapes (must all be stripped by the sanitizer)</h3>
+<ul>
+<li>an image: </li>
+<li>a form: </li>
+<li>a style block: </li>
+<li>a raw script: </li>
+<li>a scheme link: <a>click</a> and <a>data</a></li>
+<li>a data attribute: <div>tagged</div></li>
+</ul>
+<h3>A code fence</h3>
+<pre><code class="language-go">func main() { fmt.Println("hello") }
+</code></pre>
+<p>Raw script inside a fence (must survive as literal text, not execute):</p>
+<pre><code>&lt;script&gt;alert("fenced")&lt;/script&gt;
+</code></pre>
+<h3>A table</h3>
+<table>
+<thead>
+<tr>
+<th>Verdict</th>
+<th>Count</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>vulnerable</td>
+<td>2</td>
+</tr>
+<tr>
+<td>not_vulnerable</td>
+<td>3</td>
+</tr>
+</tbody></table>
+<h3>A task list</h3>
+<ul>
+<li> unchecked task</li>
+<li> completed task</li>
+</ul>
+<h3>A link that must survive</h3>
+<p><a href="https://example.com/docs">safe link</a></p>
+

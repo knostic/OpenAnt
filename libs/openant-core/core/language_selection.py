@@ -73,6 +73,7 @@ def select_languages(
     all_languages: bool = False,
     min_files: int = DEFAULT_MIN_FILES,
     min_share: float = DEFAULT_MIN_SHARE,
+    deselected_reason: str = "not requested via --languages",
 ) -> LanguageSelection:
     """Choose which detected languages to parse.
 
@@ -118,7 +119,7 @@ def select_languages(
         # of `selected` — parsing a language with zero files is pure overhead.
         selected = [lang for lang, _ in ordered if lang in requested]
         excluded = {
-            lang: "not requested via --languages"
+            lang: deselected_reason
             for lang, _ in ordered
             if lang not in requested
         }
@@ -196,6 +197,8 @@ def report_exclusions(excluded: dict[str, str]) -> None:
     for language, reason in sorted(excluded.items()):
         print(f"    {language}: {reason}", file=sys.stderr)
     print(
-        "  Use --all-languages to scan everything, or --languages to name a set.",
+        # #308: --languages/--all-languages are Python-CLI-only; the Go scan/
+        # parse commands expose -l only, so the footer names both forms.
+        "  Use -l <lang> (or --languages/--all-languages) to change the scope.",
         file=sys.stderr,
     )

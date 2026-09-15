@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -33,13 +36,13 @@ func probeOpenAI(apiKey, baseURL, model string) error {
 }
 
 // openrouterAPIBase is the default OpenRouter base URL — it already includes
-// the ``/v1`` segment (matching the Python adapter's ``_DEFAULT_BASE_URL`` and
+// the “/v1“ segment (matching the Python adapter's “_DEFAULT_BASE_URL“ and
 // the openai SDK's path handling). Package var so tests can point at httptest.
 var openrouterAPIBase = "https://openrouter.ai/api/v1"
 
 // probeOpenRouter verifies an OpenRouter key+model. OpenRouter speaks the
-// OpenAI chat-completions wire API, but its base_url already carries ``/v1``,
-// so we append only ``/chat/completions`` (NOT ``/v1/chat/completions`` like
+// OpenAI chat-completions wire API, but its base_url already carries “/v1“,
+// so we append only “/chat/completions“ (NOT “/v1/chat/completions“ like
 // probeOpenAI) and default a BLANK base_url to OpenRouter — not api.openai.com,
 // which probeOpenAI would hit, failing the probe with an OpenRouter key.
 func probeOpenRouter(apiKey, baseURL, model string) error {
@@ -48,6 +51,81 @@ func probeOpenRouter(apiKey, baseURL, model string) error {
 		base = openrouterAPIBase
 	}
 	return probeChatCompletionsAt(apiKey, base+"/chat/completions", model)
+}
+
+// ollamaAPIBase is the default Ollama base URL — it already includes the
+// “/v1“ segment (matching the Python adapter's “_DEFAULT_BASE_URL“).
+// Package var so tests can point at httptest.
+var ollamaAPIBase = "http://localhost:11434/v1"
+
+// The canonical not-pulled body markers — MUST mirror the Python
+// adapter's _NOT_PULLED_MARKERS in utilities/llm/providers/ollama.py
+// (hunt r1: the two halves of the same live-verified gate had drifted).
+const (
+	notPulledMarkerA = "not found"
+	notPulledMarkerB = "try pulling it"
+)
+
+// probeClientTimeout bounds each wizard probe request — package var so the
+// timeout test can shrink it (the established openaiAPIURL pattern).
+var probeClientTimeout = 15 * time.Second
+
+// probeOllama verifies an Ollama model is pulled and serving. Ollama speaks
+// the OpenAI chat-completions wire API on its own base (already carrying
+// “/v1“, like OpenRouter) and ignores Authorization headers — stock local
+// Ollama needs no key, so a blank key probes with the same placeholder the
+// Python adapter sends. A key-checking remote gateway still works: any
+// non-blank key is forwarded verbatim.
+func probeOllama(apiKey, baseURL, model string) error {
+	base := strings.TrimRight(baseURL, "/")
+	if base == "" {
+		base = ollamaAPIBase
+	}
+	if apiKey == "" {
+		apiKey = "ollama" // placeholder; matches utilities/llm/providers/ollama.py
+	}
+	err := probeChatCompletionsAt(apiKey, base+"/chat/completions", model)
+	if err == nil {
+		return nil
+	}
+	// hunt r3 (sonnet): parity with the Python adapter — a refused
+	// connection on localhost is almost always a stopped daemon, not a
+	// network fault; layer the same "start it with `ollama serve`" hint.
+	if pe, ok := err.(*AnthropicProbeError); ok && pe.Kind == "network" {
+		pe.Message = pe.Message + " — start the server with `ollama serve` and retry"
+	}
+	// hunt r1 (sonnet): a timeout on the OLLAMA probe is most often a cold
+	// model load (15GB+ models take minutes on first inference) — layer the
+	// specific advice on the shared neutral timeout.
+	if pe, ok := err.(*AnthropicProbeError); ok && pe.Kind == "timeout" {
+		pe.Message = pe.Message + " — if the model was cold, its first load can take minutes; pre-warm it with a tiny request"
+	}
+	// Rewrite the generic 404 wording into the fixable `ollama pull` hint —
+	// GATED on the captured body (review should-fix #346): only a 404 whose
+	// body actually says the model is unpulled gets the pull advice; a
+	// marker-less 404 is almost always a base_url misconfiguration (the
+	// endpoint path is wrong — e.g. missing /v1) and gets that hint instead.
+	if pe, ok := err.(*AnthropicProbeError); ok && pe.Kind == "model_not_found" {
+		lowered := strings.ToLower(pe.Body)
+		// hunt r1 (sonnet): ONE canonical marker set, mirroring the Python
+		// adapter's _NOT_PULLED_MARKERS ("not found", "try pulling it") —
+		// two hand-copied variants of the same live-verified gate drift.
+		if strings.Contains(lowered, notPulledMarkerA) && strings.Contains(lowered, notPulledMarkerB) {
+			pe.Message = fmt.Sprintf("model %q not pulled into Ollama — run `ollama pull %s` (or `ollama list` to see what's installed)", model, model)
+		} else {
+			pe.Message = fmt.Sprintf("HTTP 404 from Ollama (body: %q) but it does not say the model is unpulled — check the base_url: Ollama's OpenAI-compatible API is at http://<host>:11434/v1 (the /v1 segment included)", truncateBody(pe.Body))
+		}
+	}
+	return err
+}
+
+// truncateBody keeps an error message readable — a 4096-byte capture is
+// diagnostic, not a wall.
+func truncateBody(b string) string {
+	if len(b) > 200 {
+		return b[:200] + "..."
+	}
+	return b
 }
 
 // probeChatCompletionsAt POSTs a minimal 1-token request to a full
@@ -74,9 +152,22 @@ func probeChatCompletionsAt(apiKey, endpoint, model string) error {
 	req.Header.Set("authorization", "Bearer "+apiKey)
 	req.Header.Set("content-type", "application/json")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: probeClientTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
+		// Review should-fix (#346): a probe TIMEOUT is not an unreachable
+		// server — a cold 15GB+ model's first load takes minutes, and the
+		// wizard said "could not reach" while Ollama was busy loading.
+		if os.IsTimeout(err) || errors.Is(err, context.DeadlineExceeded) {
+			// hunt r1 (sonnet): this probe is SHARED by the OpenAI and
+			// OpenRouter wrappers — the shared message stays provider-
+			// NEUTRAL; the Ollama wrapper layers its cold-load advice on
+			// this kind below.
+			return &AnthropicProbeError{
+				Kind:    "timeout",
+				Message: fmt.Sprintf("probe to %s timed out after %s — the provider may be slow to respond; retry, and check that %s is reachable", endpoint, probeClientTimeout, endpoint),
+			}
+		}
 		return &AnthropicProbeError{
 			Kind:    "network",
 			Message: fmt.Sprintf("could not reach %s: %s", endpoint, err),
@@ -94,9 +185,16 @@ func probeChatCompletionsAt(apiKey, endpoint, model string) error {
 			Message: fmt.Sprintf("authentication rejected (HTTP %d) — double-check the API key", resp.StatusCode),
 		}
 	case http.StatusNotFound:
+		// Review should-fix (#346): the classification stays model_not_found
+		// for the whole OpenAI-wire family (the OpenAI contract test pins it;
+		// OpenAI's own 404 bodies never carry pull markers) — but the BODY is
+		// captured into the error so a provider wrapper (probeOllama) can
+		// discriminate the genuine not-pulled shape from a base_url misconfig.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return &AnthropicProbeError{
 			Kind:    "model_not_found",
 			Status:  resp.StatusCode,
+			Body:    string(body),
 			Message: fmt.Sprintf("model %q not found at %s (HTTP 404) — check the model ID at the provider", model, endpoint),
 		}
 	default:

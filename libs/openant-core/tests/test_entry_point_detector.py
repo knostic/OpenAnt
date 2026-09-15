@@ -2,7 +2,6 @@
 produced by the JS analyzer are recognised as entry points and therefore
 survive the reachability filter.
 """
-import pytest
 
 from utilities.agentic_enhancer.entry_point_detector import (
     ENTRY_POINT_TYPES,

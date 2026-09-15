@@ -12,12 +12,10 @@ Outputs dataset.json in the same format as the JavaScript parser.
 
 import ast
 import json
-import os
-import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import write_json, open_utf8
 
 
 class PythonRouteParser:

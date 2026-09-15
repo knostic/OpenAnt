@@ -2,7 +2,10 @@
 Reachability Analyzer
 
 Determines if functions are reachable from entry points using the reverse call graph.
-This enables filtering vulnerable code based on whether user input can reach it.
+This enables filtering vulnerable code based on call-graph reachability (whether a
+recorded call path exists from any entry point) — NOT taint reachability: an edge the
+parser did not record produces the same result as dead code, and the two are
+indistinguishable in the output.
 
 A function is "reachable" if there exists a call path from any entry point to that
 function. The path is traced backwards: starting from the target function, we follow
@@ -19,7 +22,7 @@ Usage:
     analyzer = ReachabilityAnalyzer(functions, reverse_call_graph, entry_points)
 
     if analyzer.is_reachable_from_entry_point('file.py:unsafe_eval'):
-        print("Exploitable!")
+        print("Reachable in the call graph!")
         path = analyzer.get_entry_point_path('file.py:unsafe_eval')
         print(f"Path: {' -> '.join(path)}")
 """

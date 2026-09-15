@@ -15,7 +15,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import anthropic
-import httpx
+import httpx2 as httpx
 
 from utilities.llm import LLMAdapter
 from utilities.llm.providers.anthropic import AnthropicAdapter
@@ -52,7 +52,7 @@ def _response(
 
 
 def _fake_httpx_response(status_code: int, *, retry_after: str | None = None) -> httpx.Response:
-    """Build a real httpx.Response so SDK error constructors are happy.
+    """Build a real httpx2.Response so SDK error constructors are happy.
 
     The anthropic SDK's exception classes require an httpx.Response in
     their constructor; faking it with SimpleNamespace works for some

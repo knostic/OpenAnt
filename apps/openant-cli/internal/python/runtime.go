@@ -168,22 +168,33 @@ func CheckOpenantInstalled(pythonPath string) error {
 		)
 	}
 
-	// If we're not already using the managed venv, create one and use it.
-	vp := venvPython()
-	if pythonPath != vp {
-		fmt.Fprintln(os.Stderr, "Creating managed Python environment at ~/.openant/venv/...")
-		if err := createVenv(pythonPath); err != nil {
-			return fmt.Errorf(
-				"failed to create venv at %s: %w\n"+
-					"Try manually: %s -m venv %s && %s -m pip install -e %s",
-				venvDir(), err, pythonPath, venvDir(), vp, corePath,
-			)
+	// #62 (ar7casper): concurrent invocations that both detect a missing
+	// install race pip on the same venv (pip does not support concurrent
+	// writes) — and BOTH create the venv itself if it is missing. Serialize
+	// the ENTIRE create-then-install sequence on the OS-level lock
+	// (review finding: createVenv previously raced outside it), mirroring
+	// the JS bootstrap's .openant-npm-install.lock pattern.
+	venvRoot := filepath.Dir(venvDir())
+	if err := withVenvInstallLock(venvRoot, func() error {
+		// Re-check under the lock: another process may have finished
+		// creating+installing while we waited (the JS pattern's re-check).
+		if pythonPath != venvPython() {
+			fmt.Fprintln(os.Stderr, "Creating managed Python environment at ~/.openant/venv/...")
+			if err := createVenv(pythonPath); err != nil {
+				return fmt.Errorf(
+					"failed to create venv at %s: %w\n"+
+						"Try manually: %s -m venv %s && %s -m pip install -e %s",
+					venvDir(), err, pythonPath, venvDir(), venvPython(), corePath,
+				)
+			}
+			pythonPath = venvPython()
 		}
-		pythonPath = vp
-	}
-
-	fmt.Fprintf(os.Stderr, "Installing openant from %s...\n", corePath)
-	if err := installOpenant(pythonPath, corePath); err != nil {
+		fmt.Fprintf(os.Stderr, "Installing openant from %s...\n", corePath)
+		if isOpenantImportable(pythonPath) {
+			return nil
+		}
+		return installOpenant(pythonPath, corePath)
+	}); err != nil {
 		return fmt.Errorf(
 			"failed to install openant from %s:\n  %w\n"+
 				"Try manually: %s -m pip install -e %s",
@@ -227,20 +238,62 @@ func EnsureRuntime() (*RuntimeInfo, error) {
 	}
 
 	// After CheckOpenantInstalled, the venv may have been created.
-	// Re-detect to pick up the venv Python if it was just created.
-	vp := venvPython()
-	if rt.Path != vp && fileExists(vp) && isOpenantImportable(vp) {
-		if info, err := checkPython(vp); err == nil {
-			rt = info
+	// Re-detect to pick up the venv Python if it was just created —
+	// unless the active runtime IS the explicit OPENANT_PYTHON override.
+	rt = preferVenv(rt)
+
+	// Check if dependencies have changed since last install.
+	// #437 (wave r1, opus): the .deps-hash is VENV-scoped
+	// (depsHashPath -> ~/.openant/venv/.deps-hash) — an override run
+	// (rt.Path is not the venv python) must not pip-install into the
+	// user's pinned interpreter on the venv's stamp: that installed into
+	// the system Python while stamping the venv, and once the override is
+	// unset the venv silently ran the OLD dependencies forever — the exact
+	// staleness failure the #59 hash exists to prevent. The override's
+	// environment is its owner's to manage; the venv's staleness is
+	// checked on the runs that use the venv.
+	if rt.Path == venvPython() {
+		if err := CheckDepsStale(rt.Path); err != nil {
+			return nil, err
 		}
 	}
 
-	// Check if dependencies have changed since last install.
-	if err := CheckDepsStale(rt.Path); err != nil {
-		return nil, err
-	}
-
 	return rt, nil
+}
+
+// preferVenv is EnsureRuntime's post-install re-detect: after
+// CheckOpenantInstalled the managed venv may have just been created, so the
+// venv Python is picked up — EXCEPT when the active runtime is the explicit
+// OPENANT_PYTHON override. #437: with the venv present (the normal install
+// state) this block silently replaced a valid, explicitly-set override with
+// the venv interpreter, no warning — inverting the README's documented
+// precedence ("Takes precedence over the managed venv at ~/.openant/venv/ and
+// any Python on PATH") and doing exactly what DetectRuntime's own comment
+// forbids ("never silently using a different interpreter behind the
+// caller's back") for a USABLE override. The override wins.
+func preferVenv(rt *RuntimeInfo) *RuntimeInfo {
+	// #437 (wave r1, three axes): keep the override only when it is
+	// SELF-SUFFICIENT — isOpenantImportable. DetectRuntime probes --version
+	// only; a version-adequate override WITHOUT openant (the documented
+	// CI/container pin shape) is exactly what CheckOpenantInstalled just
+	// bootstrapped the managed venv FOR (its local pythonPath reassignment
+	// cannot reach the caller), and keeping the bare override returned an
+	// interpreter that failed EVERY subsequent invocation with
+	// ModuleNotFoundError — a regression the pre-fix unconditional
+	// re-detect never had. The venv was built FROM the override's
+	// interpreter, so the pin is still honoured at the base level.
+	if override := os.Getenv("OPENANT_PYTHON"); override != "" && rt.Path == override {
+		if isOpenantImportable(rt.Path) {
+			return rt
+		}
+	}
+	vp := venvPython()
+	if rt.Path != vp && fileExists(vp) && isOpenantImportable(vp) {
+		if info, err := checkPython(vp); err == nil {
+			return info
+		}
+	}
+	return rt
 }
 
 // depsHashPath returns the path to the stored dependency hash inside the venv.
@@ -294,7 +347,16 @@ func depsHash(corePath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(append([]byte(corePath+"\x00"), pyproject...))
+	// #59: the staleness key covers requirements.txt too — installOpenant
+	// now installs it (the exact CI pins), so a pin change must trigger a
+	// reinstall the same way a pyproject change does. A MISSING file is not
+	// an error (the dev-layout degrade path): hash the corePath+pyproject
+	// alone, matching the old key.
+	reqs, reqsErr := os.ReadFile(filepath.Join(corePath, "requirements.txt"))
+	if reqsErr != nil {
+		reqs = nil // degrade: the dev layout without requirements.txt
+	}
+	sum := sha256.Sum256(append(append([]byte(corePath+"\x00"), pyproject...), reqs...))
 	return hex.EncodeToString(sum[:]), nil
 }
 
@@ -342,10 +404,16 @@ func checkDepsStaleWith(pythonPath string, coreFinder func() (string, error)) er
 	}
 
 	fmt.Fprintln(os.Stderr, "Dependencies changed, updating openant installation...")
-	// Known limitation: concurrent invocations that both detect stale deps
-	// will race to pip-install into the same venv. pip does not support
-	// concurrent writes; an OS-level lock would be needed to close this gap.
-	if err := installOpenant(pythonPath, corePath); err != nil {
+	// #62 (ar7casper): the known limitation is closed — concurrent
+	// invocations serialize on the OS-level lock (mirroring the JS
+	// bootstrap), and staleness is re-checked under it.
+	venvRoot := filepath.Dir(venvDir())
+	if err := withVenvInstallLock(venvRoot, func() error {
+		if stale2, _, err2 := depsStaleness(corePath); err2 == nil && !stale2 {
+			return nil
+		}
+		return installOpenant(pythonPath, corePath)
+	}); err != nil {
 		return fmt.Errorf(
 			"failed to update openant dependencies: %w\n"+
 				"Try manually: %s -m pip install -e %s",
@@ -382,11 +450,55 @@ func isOpenantImportable(pythonPath string) bool {
 }
 
 // installOpenant runs `python -m pip install -e <corePath>`.
-func installOpenant(pythonPath, corePath string) error {
+// installOpenantCmds builds the commands installOpenant runs (the test seam).
+func installOpenantCmds(pythonPath, corePath string) []*exec.Cmd {
+	// #59 (ar7casper): end-user installs must be DETERMINISTIC — CI runs
+	// `pip install -r requirements.txt && pip install ".[dev]"`, where
+	// requirements.txt carries the EXACT pins. An end user running `openant
+	// scan` today resolves pyproject.toml's FLOOR pins (>=), pulling whatever
+	// PyPI currently serves — so a user hits anthropic==1.2.1 while CI tested
+	// ==1.2.0, and an upstream SDK change lands on users without ever being
+	// exercised in CI. Mirror CI: requirements.txt first (the exact pins),
+	// then the editable install (which must not upgrade what was pinned — pip
+	// does not downgrade pinned deps unless the pin conflicts, and
+	// pyproject's floors are compatible with the pins by construction).
+	//
+	// #428: the honest boundary of "deterministic" — the LLM-SDK chain
+	// (anthropic/openai/google-genai/pydantic/httpx and their transitive
+	// pins) is EXACTLY locked; the shared floor lines (PyYAML, requests, the
+	// eight tree-sitter grammars) and anthropic[bedrock]'s extra (boto3/
+	// botocore, unpinned — botocore releases ~daily) resolve at whatever the
+	// floor admits. The drift hazard this leaves — a pyproject floor raised
+	// ABOVE a requirements pin would silently upgrade past the pin on the
+	// editable install — is guarded by
+	// libs/openant-core/tests/test_issue428_floors_vs_pins.py.
+	reqs := filepath.Join(corePath, "requirements.txt")
+	cmds := []*exec.Cmd{}
+	if _, err := os.Stat(reqs); err == nil {
+		reqCmd := exec.Command(pythonPath, "-m", "pip", "install", "-r", reqs)
+		reqCmd.Stdout = os.Stderr // pip output goes to stderr so it doesn't pollute JSON stdout
+		reqCmd.Stderr = os.Stderr
+		cmds = append(cmds, reqCmd)
+	}
+	// A dev layout without requirements.txt degrades to the old behavior
+	// (the editable install alone) — the staleness check must not error
+	// every run.
 	cmd := exec.Command(pythonPath, "-m", "pip", "install", "-e", corePath)
 	cmd.Stdout = os.Stderr // pip output goes to stderr so it doesn't pollute JSON stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	cmds = append(cmds, cmd)
+	return cmds
+}
+
+// installOpenant mirrors CI: requirements.txt (the exact pins) first, then
+// the editable install.
+func installOpenant(pythonPath, corePath string) error {
+	for _, c := range installOpenantCmds(pythonPath, corePath) {
+		if err := c.Run(); err != nil {
+			return fmt.Errorf("pip install failed (%v): %w", c.Args, err)
+		}
+	}
+	return nil
 }
 
 // PipUninstall returns an *exec.Cmd that runs `python -m pip uninstall openant -y`.
@@ -473,4 +585,33 @@ func findOpenantCore() (string, error) {
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
+}
+
+// venvInstallLockPath returns the lockfile path guarding concurrent pip
+// installs into the managed venv. Mirrors the JS bootstrap's pattern
+// (parser_adapter.py's _file_lock over .openant-npm-install.lock): the
+// withVenvInstallLock runs fn under an exclusive lock so two concurrent
+// invocations that both detect a missing or stale install serialize
+// instead of racing pip on the same venv (pip does not support
+// concurrent writes: corrupted RECORD files, partial wheel extraction,
+// broken .dist-info metadata).
+//
+// The lock is the same cross-platform shape the JS bootstrap uses
+// (msvcrt.locking on Windows, flock elsewhere) via Go's build-tag
+// split: lock_unix.go / lock_windows.go.
+func withVenvInstallLock(venvDir string, fn func() error) error {
+	lockPath := filepath.Join(venvDir, ".deps-install.lock")
+	if err := os.MkdirAll(venvDir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := lockFileExcl(f); err != nil {
+		return err
+	}
+	defer unlockFile(f)
+	return fn()
 }

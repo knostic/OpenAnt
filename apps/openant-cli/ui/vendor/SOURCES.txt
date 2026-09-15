@@ -1,0 +1,93 @@
+# Provenance + integrity record for the vendored ui scripts (#577 — the #332
+# recipe's ui variant). The sha256s below are ENFORCED by ui/vendor_test.go
+# (the uiVendorScripts pin table). An upgrade is the full recipe, in ONE
+# commit: the vendored blob + the sha256 here + the pin table in
+# ui/vendor_test.go + the go:embed list in ui/embed.go + the handleAsset case
+# list in internal/server/server.go + the /assets script tags in summary.html
+# and disclosure.html. The #577 customManagers in renovate.json read the
+# version from those REFERENCE files (config:recommended's
+# :ignoreModulesAndTests preset adds **/vendor/** to ignorePaths; the
+# standard ignores are deliberately not overridden — provenance here is
+# hand-maintained, same as internal/report/vendor/).
+#
+# WHY NO BREAKOUT GUARD (deliberate difference from the report variant): the
+# report blobs are inlined as template.JS/template.CSS and need the
+# </script>/</style> hazard checks; these ui blobs are served as EXTERNAL
+# responses (Content-Type application/javascript + nosniff, handleAsset) —
+# the html/template escape/breakout class has no reach here. The guards that
+# DO transfer are the sha256 lock and the versioned-name invariants in
+# ui/vendor_test.go.
+#
+# SANITIZER MODEL (amended by #578 follow-up A): DOMPurify remains the
+# PRIMARY content boundary for the untrusted-markdown render path of
+# summary.html + disclosure.html (marked.parse -> DOMPurify.sanitize ->
+# innerHTML); since #578-A the server additionally ships a route-scoped
+# nonce CSP on those pages (script-src 'self' 'nonce-…'), so a sanitizer
+# bypass yielding script execution is dead — the worst residual is
+# markup-level abuse (allowlisted-tag defacement / same-origin phishing),
+# which no header can fix because the page IS the trusted origin. The CSP
+# is the backstop for the execution class; the sanitizer policy stays the
+# load-bearing boundary.
+#
+# LIMITATION (the sha lock's blind spot, #578 review round): the lock
+# detects UNCOORDINATED drift only — a single commit that moves the blob
+# AND the sha256 here AND the pin table together passes every test. The
+# one guard for a coordinated swap is the REVIEWER's out-of-band
+# cross-check: on every bump, independently re-derive the npm tarball's
+# sha512 against the registry's dist.integrity and the inner file's
+# sha256 against the committed bytes — never trust the diff's own numbers.
+#
+# marked-18.0.13.min.js (the #583 patch bump from 18.0.12; the #332 recipe)
+#   source: https://cdn.jsdelivr.net/npm/marked@18.0.13/lib/marked.umd.js
+#   npm anchor: registry.npmjs.org/marked/-/marked-18.0.13.tgz
+#   dist.integrity (of the .tgz, not of the inner file): sha512-xTxVzZsBFwunP6HDmtBkabUQEYArnP7/rMDGmPj9SlrKlQ4i8MdYVow+nJL0eOqwpUqhzBoTBRADGN6uYwPyOw==
+#   sha256: b147274a9ce27d17276587167e49483d719f6893eeca3a3667a59797661d3556
+#   verified: 2026-09-13 — the tarball sha512 was re-derived and MATCHED the
+#         registry dist.integrity at write time; the committed bytes are the
+#         tarball's lib/marked.umd.js, verbatim (the 18.x tarball ships no
+#         root .min.js since v16 — the -<semver>.min.js NAME is kept for
+#         the version-suffix + notifier conventions; the file IS
+#         upstream-minified (jsdelivr's synthesized .umd.min.js was
+#         deliberately NOT vendored: it strips the version banner and is
+#         not a registry artifact).
+#         Upstream delta 18.0.12 -> 18.0.13: SEVEN bug fixes (re-derived
+#         from the upstream release notes, not the renovate body — the
+#         #583 review round's correction): #4087 (tabs in the thematic
+#         break that ends a list item), #4090 (O(n^2) reflinkSearch —
+#         perf/DoS-relevant for attacker-authored markdown), #4077 (case
+#         fold reference link labels), #4075 (drop leading whitespace
+#         after a hard line break), #4072 (html block start conditions
+#         when ending a list item), #4066 (respect raw tokens when
+#         closing link labels), #4080 (strip a tab following spaces in
+#         an indented code block). The two-oracle render differential
+#         (raw + post-DOMPurify) ran as out-of-band verification at this
+#         version with corpus items exercising EACH of the seven fixed
+#         shapes. OBSERVED (24 items, two oracles): 22/24 identical
+#         post-sanitize; 2 NAMED deltas, both the fixes' OWN intended
+#         behavior changes — #4075 (the leading whitespace after a hard
+#         break is dropped: "backslash<br>\n   next" -> "backslash<br>next")
+#         and #4080 (a tab following spaces in an indented code block is
+#         stripped: "\tcontinue" -> "continue"). The other five fixes
+#         (#4087, #4090, #4077, #4072, #4066) showed 0 deltas on their
+#         exercised shapes. Both deltas are benign rendering changes on
+#         the untrusted-markdown path; DOMPurify's boundary and the
+#         nonce CSP are unaffected.
+#
+# dompurify-3.4.15.min.js
+#   source: https://cdn.jsdelivr.net/npm/dompurify@3.4.15/dist/purify.min.js
+#   npm anchor: registry.npmjs.org/dompurify/-/dompurify-3.4.15.tgz
+#   dist.integrity (of the .tgz, not of the inner file): sha512-EUBjM+B+lkDE41iE82DDSCfkoPGfXx8IxFxPMjNzm/Uk4xDet77rTN9wqlxlVg71kK7XGuUMv6wUxJUwwv+Xyw==
+#   sha256: f263b05369e050fa175d4ecb9c9358eb4253602d510297adfb31df48b2f1c4d5
+#   verified: 2026-09-12 — the tarball sha512 was re-derived and MATCHED the
+#         registry dist.integrity at write time; the committed bytes are the
+#         tarball's dist/purify.min.js, verbatim. Currency bump from 3.4.13
+#         (the pre-#577 blob was itself genuine — byte-identical to the
+#         3.4.13 dist, and 3.4.13 is the version that fixed the
+#         GHSA-55q2-fjhq-7xh7 advisory). 3.4.14 and 3.4.15 carry no advisory
+#         ids; upstream's notes name bypass preconditions (risky tags
+#         allow-listed; XML-content clobbering) that this app's inert
+#         MD_SANITIZE allowlist does not meet — this is a hygiene/currency
+#         bump of the sole sanitizer, not a claim that a known exploit is
+#         closed. The trailing sourceMappingURL comment references a map the
+#         /assets route never serves (allowlisted) — cosmetic, kept verbatim
+#         for byte fidelity.

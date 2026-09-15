@@ -20,9 +20,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from core.schemas import AnalyzeResult, AnalysisMetrics, UsageInfo
+from core.schemas import AnalyzeResult, AnalysisMetrics
 from core import tracking
-from core.checkpoint import StepCheckpoint
+from core.checkpoint import StepCheckpoint, analyze_result_is_error
 from core.progress import ProgressReporter
 
 # Import existing analysis machinery
@@ -36,20 +36,60 @@ from utilities.llm import (
 )
 from utilities.file_io import read_json, write_json
 from utilities.json_corrector import JSONCorrector
-from utilities.rate_limiter import get_rate_limiter, is_rate_limit_error, is_retryable_error
+from utilities.llm import DEFAULT_MAX_TOKENS
+from utilities.rate_limiter import (
+    get_rate_limiter,
+    is_budget_exhausted_error,
+    is_retryable_error,
+)
+
+# #569 (choice c): the budget-retry cap — raised above the analyze
+# default but under the Anthropic non-streaming ceiling (the SDK rejects
+# >~21,333 with "Streaming is required" — see helpers.py:29-31; the
+# adapters call non-streaming). The deterministic length-empty class gets
+# ONE retry that attacks the cause (the budget) within that envelope.
+# #569 follow-up (2b): the envelope is PER-MODEL where the registry knows
+# the ceiling (config/models.json max_output_tokens) — the review round's
+# granularity fix: a per-ADAPTER number over-raises for small-output
+# models, and a 400 on the retry would be an un-retried error, strictly
+# worse than the coin flip. Unlisted models keep this default-derived cap.
+BUDGET_RETRY_MAX_TOKENS = min(DEFAULT_MAX_TOKENS * 2, 21000)
+
+def budget_retry_cap(index: int, budget_set: set, binding=None) -> int | None:
+    """#569: the per-index retry cap — the raised cap for the budget class,
+    None (the unchanged default) for every other retryable. With a binding,
+    the cap honors the model's documented max-output ceiling
+    (model_registry.max_output_tokens): a listed model gets
+    min(2x default, ceiling); an unlisted model keeps the default-derived
+    BUDGET_RETRY_MAX_TOKENS. A ceiling that admits no raise (<= the
+    default) returns None — a same-cap retry beats a guaranteed 400."""
+    if index not in budget_set:
+        return None
+    if binding is None:
+        return BUDGET_RETRY_MAX_TOKENS
+    from core import model_registry
+    ceiling = model_registry.max_output_tokens(
+        binding.provider_name, binding.model)
+    if ceiling is None:
+        return BUDGET_RETRY_MAX_TOKENS
+    cap = min(DEFAULT_MAX_TOKENS * 2, ceiling)
+    if cap <= DEFAULT_MAX_TOKENS:
+        return None
+    return cap
+
 
 # These live in core/ because core is shipped and experiment.py is not: importing
 # them from the research harness made `import core.analyzer` fail in any installed
 # environment (ModuleNotFoundError: no module named 'experiment').
 from core.analysis_core import (
     analyze_unit,
-    parse_response,
-    _normalize_result,
 )
 
 # Import application context (optional)
 try:
-    from context.application_context import ApplicationContext, load_context
+    # ApplicationContext is the availability probe's residue — load_context
+    # alone proves the module imports (the try/except stays honest)
+    from context.application_context import load_context
     HAS_APP_CONTEXT = True
 except ImportError:
     HAS_APP_CONTEXT = False
@@ -119,7 +159,8 @@ def _apply_limit(units, limit):
     return prioritized[:limit]
 
 
-def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_context):
+def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_context,
+                  max_tokens=None):
     """Process a single unit for Stage 1 detection.
 
     Returns a dict with all result data. Does not mutate shared state.
@@ -135,6 +176,7 @@ def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_contex
             use_multifile=True,
             json_corrector=json_corrector,
             app_context=app_context,
+            max_tokens=max_tokens,
         )
 
         # Ensure unit_id is always present
@@ -220,13 +262,6 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
             print(f"[Detect] Restored {len(checkpointed)} units from checkpoints",
                   file=sys.stderr, flush=True)
 
-    progress = ProgressReporter("Detect", total, tracker=tracker, completed=len(checkpointed))
-
-    mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
-    remaining = total - len(checkpointed)
-    print(f"[Detect] Mode: {mode}, {remaining} units to process ({len(checkpointed)} already done)",
-          file=sys.stderr, flush=True)
-
     # Pre-populate results from checkpoints, but ONLY for successfully-completed
     # units. Errored units are loaded into the "units_to_process" list so they
     # get retried on resume (matches enhance's behavior).
@@ -234,10 +269,7 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
     code_by_route = {}
     units_to_process = []
 
-    def _cp_is_error(cp_data):
-        res = cp_data.get("result", {}) if cp_data else {}
-        return res.get("verdict") == "ERROR" or res.get("finding") == "error"
-
+    # Hoisted to module level (testable; mirrors checkpoint.py's predicates).
     for i, unit in enumerate(units):
         uid = unit.get("id", f"unit_{i}")
         cp_data = checkpointed.get(uid)
@@ -246,6 +278,24 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
             code_by_route[cp_data.get("route_key", uid)] = cp_data.get("code_for_route", "")
         else:
             units_to_process.append((i, unit))
+
+    # #435 (wave r1, three axes): done/remaining derive from the retry queue
+    # itself — total minus what actually runs — so the narration can never
+    # disagree with the queue by ANY input class. The round-1 fix tallied
+    # non-error rows over checkpointed.values(), but the queue's predicate is
+    # "non-error row whose id IS IN the units list": checkpoint.load()
+    # returns every file in the dir, nothing invalidates stale entries when
+    # units legitimately shrink on a resume (--limit, --exploitable, the
+    # diff filter, a re-parse), so a foreign row overcounted again — the
+    # same 3/2 shape, a different trigger. (finding_verifier.py computes the
+    # same quantity the same way: remaining = len(results_to_verify).)
+    _done = total - len(units_to_process)
+    progress = ProgressReporter("Detect", total, tracker=tracker, completed=_done)
+
+    mode = "sequential" if workers <= 1 else f"parallel ({workers} workers)"
+    remaining = len(units_to_process)
+    print(f"[Detect] Mode: {mode}, {remaining} units to process ({_done} already done)",
+          file=sys.stderr, flush=True)
 
     def _process_and_save(i, unit):
         out = _process_unit(binding, unit, i, json_corrector, app_context)
@@ -277,8 +327,16 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
                     unit_elapsed=out["elapsed"],
                 )
         except KeyboardInterrupt:
-            print("[Detect] Interrupted — progress saved to checkpoints",
-                  file=sys.stderr, flush=True)
+            print(_interrupt_report(results, total), file=sys.stderr, flush=True)
+            progress.finish()
+            # #313: stop swallowing the interrupt. The checkpoints are
+            # written (per-unit saves happen in _process_and_save) and the
+            # report is printed; swallowing it made the None placeholders
+            # reach _count_verdicts (AttributeError) and the resulting
+            # error envelope made the Go CLI record the interrupt as a
+            # FAILED scan — the interrupt short-circuit fires only on
+            # empty stdout.
+            raise
         progress.finish()
         return results, code_by_route
 
@@ -307,14 +365,86 @@ def _run_detection(units, binding: PhaseBinding, json_corrector, app_context, wo
         print("[Detect] Interrupted — cancelling pending work...",
               file=sys.stderr, flush=True)
         executor.shutdown(wait=False, cancel_futures=True)
-        print("[Detect] Progress saved to checkpoints",
-              file=sys.stderr, flush=True)
+        print(_interrupt_report(results, total), file=sys.stderr, flush=True)
+        progress.finish()
+        raise  # #313: see the sequential handler note
     else:
         executor.shutdown(wait=False)
 
     progress.finish()
 
     return results, code_by_route
+
+
+def _interrupt_report(results, total):
+    """#313: what an interrupted run actually did — N analysed, M not
+    started, checkpoints written. Both numbers derive from the results
+    list (the None placeholders are the not-started units)."""
+    analysed = sum(1 for r in results if r is not None)
+    not_started = total - analysed
+    return (
+        f"[Detect] Interrupted after {analysed}/{total} unit(s) "
+        f"({not_started} not started); progress saved to checkpoints")
+
+
+def _cp_is_error(cp_data):
+    """Is this checkpointed unit an error (must be re-analyzed, not adopted)?
+
+    Delegates to ``checkpoint.analyze_result_is_error`` — the one shared
+    predicate (load_ids / status / the summary seed below all use it; four
+    hand-copies drifted within one PR).
+    """
+    res = cp_data.get("result", {}) if cp_data else {}
+    return analyze_result_is_error(res)
+
+
+def _seed_summary(existing: dict, unit_ids: frozenset | set | None = None) -> dict:
+    """Seed the _summary.json counters from checkpointed rows.
+
+    Counts as completed ONLY the rows adoption will keep: an errored row
+    (``analyze_result_is_error``) is re-analyzed and its outcome is owned by
+    ``_summary_callback`` — seeding it here (as completed OR as an error)
+    double-counts on resume (completed + errors > total; the pre-existing
+    verdict=="ERROR" over-count, which #316/#324 was extending to the
+    neither-key shape). Usage tokens accumulate over ALL rows — the spend
+    happened regardless of the row's fate.
+
+    famD panel (sonnet): when unit_ids is given, a FOREIGN row — a stale
+    checkpoint entry whose id is not in the current units list (units can
+    legitimately shrink on a resume: --limit, --exploitable, the diff
+    filter, a re-parse) — is excluded from the completed seed, the same
+    id-membership predicate the retry queue and the narration now use; the
+    #316/#324 seed would otherwise over-count completed past total. Usage
+    excludes foreign rows too — the summary describes THIS run's units; a
+    prior run's spend on units no longer in the set is not this run's
+    spend (the test pins the consistency both ways).
+
+    Returns: completed, input_tokens, output_tokens, cost_usd,
+    unpriced_models (the #216 marker).
+    """
+    completed = 0
+    input_tokens = 0
+    output_tokens = 0
+    cost_usd = 0.0
+    unpriced: set = set()
+    for _id, _cp in existing.items():
+        if unit_ids is not None and _id not in unit_ids:
+            continue
+        if not analyze_result_is_error(_cp.get("result") or {}):
+            completed += 1
+        _usage = _cp.get("usage", {})
+        input_tokens += _usage.get("input_tokens", 0)
+        output_tokens += _usage.get("output_tokens", 0)
+        cost_usd += _usage.get("cost_usd", 0.0)
+        # #216: restore the incomplete-cost marker from per-unit records.
+        unpriced.update(_usage.get("unpriced_models") or [])
+    return {
+        "completed": completed,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": cost_usd,
+        "unpriced_models": unpriced,
+    }
 
 
 def _count_verdicts(results):
@@ -328,12 +458,121 @@ def _count_verdicts(results):
         "errors": 0,
     }
     for r in results:
-        finding = r.get("finding", r.get("verdict", "error").lower())
-        if finding in counts:
-            counts[finding] += 1
-        elif r.get("verdict") == "ERROR":
+        # #313: an interrupted run leaves None placeholders for units that
+        # never ran — skip them (an un-run unit is not a verdict; the
+        # checkpoint-resume semantics own those units).
+        if r is None:
+            continue
+        # #324/null-verdict: an INEFFECTIVE finding (absent/None/non-string/
+        # empty) falls back to the verdict, which must itself be an effective
+        # string — the eager ``.lower()`` default crashed post-LLM-spend on
+        # ``{"verdict": null}``.
+        finding = r.get("finding")
+        verdict = r.get("verdict")
+        if not isinstance(finding, str) or not finding.strip():
+            finding = verdict if isinstance(verdict, str) and verdict.strip() else None
+        if finding is None:
+            # Neither an effective finding nor an effective verdict — the
+            # malformed shape (#324; null/empty verdicts): an error, not a
+            # silent drop.
+            counts["errors"] += 1
+        elif finding.lower() in counts:
+            counts[finding.lower()] += 1
+        elif verdict == "ERROR" or finding.lower() == "error":
+            # finding=="error" without verdict=="ERROR" (a legacy
+            # half-stamped row): agree with analyze_result_is_error, which
+            # classifies it as an error.
+            counts["errors"] += 1
+        # #427: an unrecognized verdict is a malformed model reply — the
+        # error bucket (the F13 partition closes; the sink-side
+        # analyze_result_is_error agrees, so resume retries the row too).
+        else:
             counts["errors"] += 1
     return counts
+
+
+def _analyze_fingerprint(binding, ctx_sha=None) -> dict:
+    """Build the analyze-phase backend-identity fingerprint.
+
+    The static system + user-analysis templates are rendered with
+    ``app_context=None`` (mandatory: the LLM-generated threat model is
+    non-deterministic per scan and must not enter the key). An unrenderable
+    template becomes a sentinel via ``render_template_texts`` → forces re-run
+    rather than a stale adoption.
+    """
+    from core.backend_identity import fingerprint_for_binding, render_template_texts
+    from prompts.vulnerability_analysis import get_system_prompt
+    from prompts.prompt_selector import get_analysis_prompt
+    texts = render_template_texts([
+        lambda: get_system_prompt(app_context=None),
+        lambda: get_analysis_prompt(code="", language="code", app_context=None),
+    ])
+    # #546: the context's deterministic-derivation identity joins the KEY
+    # (the narration stays excluded — this is the SOURCES hash, not the
+    # text). None (no context / a pre-#546 artifact) leaves the key
+    # member absent-equivalent; a changed derivation archives the stale
+    # records and re-pays.
+    return fingerprint_for_binding(
+        binding, texts,
+        extra_key=({"ctx_sources_sha256": ctx_sha} if ctx_sha else None))
+
+
+def _archive_stale_results(output_dir: str, current_fp: str) -> None:
+    """Preserve a prior scan's report before this run overwrites it.
+
+    If ``output_dir/results.json`` exists and was produced under a DIFFERENT
+    ``analyze_fingerprint``, rename it to ``results__<short-fp>.json`` (an
+    unstamped file → ``results__legacy.json``) so a re-scan with a different
+    model/config preserves the prior analyze report. The suffix is the SAME short
+    form as ``StepCheckpoint._archive_dir`` — the last ``:``-split segment, first 8
+    hex — so the ``sha256:`` prefix's colon never lands in a filename (a colon
+    breaks ``os.replace`` on Windows: the OSError is swallowed and a later run
+    overwrites the prior results.json, defeating the preservation promise).
+
+    Scope (named residual): this preserves the Stage-1 ``results.json`` only.
+    ``results_verified.json`` (Stage-2, and the file the serve/report layer
+    prefers) is NOT fingerprint-checked or archived here — a backend-swap re-scan
+    run without ``--verify`` leaves the prior verified file in place. That is
+    pre-existing base behaviour (base overwrote ``results.json`` unconditionally);
+    extending identity/preservation to ``results_verified.json`` is a follow-up.
+
+    Collision-safe: if the target archive name already exists (an A→B→A config
+    alternation, or two unstamped reports both → ``results__legacy.json``), a
+    ``-<n>`` suffix is appended rather than overwriting — mirroring
+    ``_archive_dir`` — so no prior report is ever destroyed. Best-effort: any error
+    leaves the file in place (preserve-not-destroy; never crash the scan).
+    """
+    results_path = os.path.join(output_dir, "results.json")
+    if not os.path.exists(results_path):
+        return
+    try:
+        prior = read_json(results_path)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return
+    if not isinstance(prior, dict):
+        return
+    old_fp = prior.get("analyze_fingerprint")
+    if old_fp == current_fp:
+        return
+    # Short, filesystem-safe suffix: drop the ``sha256:`` prefix (its colon is
+    # illegal in a Windows filename) and keep the first 8 hex chars. A machine
+    # stamp is always a str; a hand-corrupted non-string stamp must NOT crash the
+    # scan (the function's contract is best-effort) — treat it as unstamped.
+    suffix = old_fp.split(":")[-1][:8] if isinstance(old_fp, str) and old_fp else "legacy"
+    # Never clobber an existing archive (distinct prior report under the same
+    # short suffix): append -<n> until the name is free, as _archive_dir does.
+    base = os.path.join(output_dir, f"results__{suffix}")
+    archive = f"{base}.json"
+    n = 1
+    while os.path.exists(archive):
+        archive = f"{base}-{n}.json"
+        n += 1
+    try:
+        os.replace(results_path, archive)
+        print(f"[Analyze] Prior scan's results.json (fingerprint {suffix}) "
+              f"preserved as {os.path.basename(archive)}.", file=sys.stderr)
+    except OSError:
+        pass
 
 
 def run_analysis(
@@ -385,6 +624,9 @@ def run_analysis(
     Returns:
         AnalyzeResult with results path, metrics, and usage.
     """
+    # #214: snapshot cumulative usage at phase start so the "Stage 1" summary
+    # below reports this phase's delta, not the prior phases' total.
+    _phase_baseline = tracking.get_usage()
     os.makedirs(output_dir, exist_ok=True)
 
     # Configure global rate limiter
@@ -412,15 +654,29 @@ def run_analysis(
     binding = registry.get("analyze")
     print(f"[Analyze] Provider: {binding.provider_name}, Model: {binding.model}", file=sys.stderr)
 
-    # JSON corrector inherits the analyze binding so correction calls
-    # route through the same provider+model.
-    json_corrector = JSONCorrector(binding)
-
-    # Load application context if provided
+    # #546: the application context loads BEFORE the I2 fingerprint — the
+    # adopt gate folds the context's deterministic-derivation identity
+    # (source_sha256), so the prior order (fingerprint-then-load) would key
+    # on None forever.
     app_context = None
     if app_context_path and HAS_APP_CONTEXT and os.path.exists(app_context_path):
         app_context = load_context(Path(app_context_path))
         print(f"[Analyze] App context: {app_context.application_type}", file=sys.stderr)
+
+    # I2 adopt gate: BEFORE loading any prior checkpoints, verify the backend
+    # identity that produced them matches the current one. A changed model /
+    # provider / adapter / static template archives the stale dir aside and
+    # forces a re-run rather than silently adopting another backend's verdicts.
+    # Run AFTER the checkpoint.dir override above.
+    analyze_fp = _analyze_fingerprint(
+        binding, ctx_sha=getattr(app_context, "source_sha256", None))
+    checkpoint.sync_identity(analyze_fp)
+    # Preserve a prior scan's final report before this run overwrites it.
+    _archive_stale_results(output_dir, analyze_fp["key_digest"])
+
+    # JSON corrector inherits the analyze binding so correction calls
+    # route through the same provider+model.
+    json_corrector = JSONCorrector(binding)
 
     # Load dataset
     print(f"[Analyze] Loading dataset: {dataset_path}", file=sys.stderr)
@@ -472,47 +728,64 @@ def run_analysis(
     # Initialize summary tracking for _summary.json
     # Count checkpointed units to seed the counters and sum existing usage
     _existing = checkpoint.load()
-    _summary_completed = 0
-    _summary_errors = 0
     _summary_error_breakdown = {}
-    _summary_input_tokens = 0
-    _summary_output_tokens = 0
-    _summary_cost_usd = 0.0
-    for _uid, _cp in _existing.items():
-        _r = _cp.get("result", {})
-        if _r.get("verdict") == "ERROR" or _r.get("finding") == "error":
-            _summary_errors += 1
-            _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
-        else:
-            _summary_completed += 1
-        _cp_usage = _cp.get("usage", {})
-        _summary_input_tokens += _cp_usage.get("input_tokens", 0)
-        _summary_output_tokens += _cp_usage.get("output_tokens", 0)
-        _summary_cost_usd += _cp_usage.get("cost_usd", 0.0)
+    # #293 adjudication: analyze has NO third state — "inconclusive" is a
+    # first-class COMPLETED verdict (verdict_taxonomy FINDING_VERDICT_ORDER;
+    # the Stage-1 prompt's own enum), not a degenerate no-verdict marker like
+    # verify's verification.incomplete or enhance's INCOMPLETE_CLASSIFICATION.
+    # The third bucket stays 0 here but is still emitted for shape consistency.
+    _summary_incomplete = 0
+    _seed = _seed_summary(_existing, {u.get("id") for u in units})
+    _summary_completed = _seed["completed"]
+    _summary_errors = 0  # errored rows are re-analyzed; _summary_callback owns them
+    _summary_input_tokens = _seed["input_tokens"]
+    _summary_output_tokens = _seed["output_tokens"]
+    _summary_cost_usd = _seed["cost_usd"]
+    _summary_unpriced: set[str] = _seed["unpriced_models"]
 
     def _usage_dict():
-        return {"input_tokens": _summary_input_tokens,
-                "output_tokens": _summary_output_tokens,
-                "cost_usd": round(_summary_cost_usd, 6)}
+        usage = {"input_tokens": _summary_input_tokens,
+                 "output_tokens": _summary_output_tokens,
+                 "cost_usd": round(_summary_cost_usd, 6)}
+        # #216: persist the unpriced set into _summary.json so a resume of
+        # a resume keeps the marker (run-cumulative semantics).
+        _all_unpriced = set(_summary_unpriced) | set(
+            get_global_tracker().get_totals().get("unpriced_models") or [])
+        if _all_unpriced:
+            usage["cost_incomplete"] = True
+            usage["unpriced_models"] = sorted(_all_unpriced)
+        return usage
 
     # Inject prior usage into tracker so step_report captures the total
-    if _summary_input_tokens or _summary_output_tokens:
+    if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
         get_global_tracker().add_prior_usage(
-            _summary_input_tokens, _summary_output_tokens, _summary_cost_usd)
+            _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
+            unpriced_models=sorted(_summary_unpriced) or None)
+        # #281: re-snapshot the phase baseline AFTER the injection — the
+        # pre-injection baseline made the "Stage 1" delta include the prior
+        # session's tokens/cost (calls exclude restored units while
+        # tokens/cost included them: an internally inconsistent line, and
+        # #214's "this phase's delta" contract broken on resumed runs).
+        # The step reports' totals still include the prior usage (the
+        # run-total contract); only the per-phase stderr line is the delta.
+        _phase_baseline = tracking.get_usage()
 
     # Write initial summary
     checkpoint.write_summary(total, _summary_completed, _summary_errors,
                              _summary_error_breakdown, phase="in_progress",
-                             usage=_usage_dict())
+                             usage=_usage_dict(), incomplete=_summary_incomplete)
 
     def _summary_callback(finding, usage=None):
         """Update summary counters after each unit. Called from main thread."""
-        nonlocal _summary_completed, _summary_errors, _summary_error_breakdown
+        nonlocal _summary_completed, _summary_incomplete, _summary_errors
+        nonlocal _summary_error_breakdown
         nonlocal _summary_input_tokens, _summary_output_tokens, _summary_cost_usd
         if finding == "error":
             _summary_errors += 1
             _summary_error_breakdown["api"] = _summary_error_breakdown.get("api", 0) + 1
         else:
+            # #293 adjudication: "inconclusive"/"insufficient_context" are
+            # completed verdicts (taxonomy), not incomplete — no third state.
             _summary_completed += 1
         if usage:
             _summary_input_tokens += usage.get("input_tokens", 0)
@@ -520,7 +793,7 @@ def run_analysis(
             _summary_cost_usd += usage.get("cost_usd", 0.0)
         checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                  _summary_error_breakdown, phase="in_progress",
-                                 usage=_usage_dict())
+                                 usage=_usage_dict(), incomplete=_summary_incomplete)
 
     # --- Stage 1: Detection ---
     results, code_by_route = _run_detection(
@@ -533,6 +806,16 @@ def run_analysis(
         i for i, r in enumerate(results)
         if r and is_retryable_error(r.get("error"))
     ]
+    # #569 (choice c): the deterministic budget-exhaustion empties (the
+    # length-stop class #561 named) retry ONCE at a RAISED cap — a same-cap
+    # re-roll of a budget exhaustion is a coin flip; the raised cap attacks
+    # the cause. Every other retryable (the filtered/malformed empties, the
+    # transient network class) keeps the #292 same-cap rationale.
+    budget_retry_indices = [
+        i for i in retryable_indices
+        if is_budget_exhausted_error(results[i].get("error"))
+    ]
+    _budget_set = set(budget_retry_indices)
     if retryable_indices:
         rate_limiter = get_rate_limiter()
         backoff = rate_limiter.time_until_ready()
@@ -541,17 +824,33 @@ def run_analysis(
                   f"(waiting {backoff:.0f}s for rate limit to clear)...", file=sys.stderr)
             rate_limiter.wait_if_needed()
         else:
-            print(f"[Analyze] Retrying {len(retryable_indices)} failed units (transient errors)...",
-                  file=sys.stderr)
+            _cap_desc = ""
+            if budget_retry_indices:
+                _caps = sorted({c for c in (budget_retry_cap(
+                    i, _budget_set, binding) for i in budget_retry_indices)
+                    if c is not None})
+                if _caps:
+                    _cap_desc = (f" ({len(budget_retry_indices)} at a raised "
+                                 f"output cap {_caps} — budget exhaustion)")
+                else:
+                    _cap_desc = (f" ({len(budget_retry_indices)} budget-"
+                                 f"exhausted; no ceiling admits a raise — "
+                                 f"same-cap retry)")
+            print(f"[Analyze] Retrying {len(retryable_indices)} failed units "
+                  f"(transient errors){_cap_desc}...", file=sys.stderr)
 
         # Retry sequentially to avoid re-triggering rate limit
         for i in retryable_indices:
             unit = units[i]
-            out = _process_unit(binding, unit, i, json_corrector, app_context)
+            _cap = budget_retry_cap(i, _budget_set, binding)
+            out = _process_unit(binding, unit, i, json_corrector, app_context,
+                                max_tokens=_cap)
             results[i] = out["result"]
             code_by_route[out["route_key"]] = out["code_for_route"]
 
-            # Update summary: retry succeeded → flip error to completed
+            # Update summary: retry produced a verdict → flip error to
+            # completed (#293 adjudication: inconclusive is a completed
+            # verdict; analyze has no third state)
             if out["finding"] != "error":
                 _summary_errors = max(0, _summary_errors - 1)
                 _summary_completed += 1
@@ -561,7 +860,7 @@ def run_analysis(
             _summary_cost_usd += retry_usage.get("cost_usd", 0.0)
             checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                      _summary_error_breakdown, phase="in_progress",
-                                     usage=_usage_dict())
+                                     usage=_usage_dict(), incomplete=_summary_incomplete)
 
             # Update checkpoint
             if checkpoint is not None:
@@ -581,9 +880,9 @@ def run_analysis(
     # Write final summary with phase="done"
     checkpoint.write_summary(total, _summary_completed, _summary_errors,
                              _summary_error_breakdown, phase="done",
-                             usage=_usage_dict())
+                             usage=_usage_dict(), incomplete=_summary_incomplete)
 
-    tracking.log_usage("Stage 1")
+    tracking.log_usage("Stage 1", _phase_baseline)
 
     # Compute verdict counts from results
     counts = _count_verdicts(results)
@@ -619,6 +918,14 @@ def run_analysis(
         },
         "results": results,
         "code_by_route": code_by_route,
+        # Stamp the analyze-phase KEY digest so (a) a later re-scan with a
+        # different config archives this report instead of overwriting it, and
+        # (b) the verify phase can fold it into its own adopt-gate KEY — an
+        # analyze-model/provider/template swap regenerates this digest and
+        # thereby invalidates any verify checkpoints produced against the old
+        # analyze run (closes the verify-overwrite corruption). Deterministic +
+        # persisted → zero re-pay.
+        "analyze_fingerprint": analyze_fp["key_digest"],
     }
 
     write_json(results_path, experiment_result)

@@ -26,12 +26,14 @@ Output (JSON):
 
 import json
 import os
+import re
 import stat
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
-from utilities.file_io import read_json, write_json, open_utf8, safe_to_read
+from utilities.file_io import open_utf8, safe_to_read
+from core.repo_walk import ExcludedDirRecorder
 
 
 class RepositoryScanner:
@@ -122,6 +124,10 @@ class RepositoryScanner:
 
         # Results
         self.files: List[Dict] = []
+        # #600: a seed so the public scan_directory() never AttributeErrors
+        # pre-scan(); scan() RESETS it (the authoritative construction).
+        self._excluded_recorder = ExcludedDirRecorder(self.exclude_patterns)
+
 
     def should_exclude_directory(self, dir_name: str) -> bool:
         """Check if a directory should be excluded."""
@@ -140,6 +146,33 @@ class RepositoryScanner:
         """Check if a file is a Python source file."""
         ext = os.path.splitext(file_name)[1].lower()
         return ext in self.source_extensions
+
+    # #312: the shebang probe needs no filesystem access here — the
+    # FIRST-LINE match lives in _is_python_shebang, and discovery calls it
+    # only for extensionless regular files (cheap: one open, one line).
+    _SHEBANG_RE = re.compile(rb"^#!.*python", re.IGNORECASE)
+
+    def _is_python_shebang(self, path) -> bool:
+        """#312: an extensionless executable whose first line is a
+        ``#!...python`` shebang IS first-party Python source. Byte-identical
+        twins of .py files were silently dropped here — and the skip was
+        uncounted, so the coverage gap left no trace in any artifact."""
+        try:
+            with open(path, "rb") as fh:
+                first = fh.readline(256)
+        except OSError:
+            return False
+        return bool(self._SHEBANG_RE.match(first))
+
+    def _note_shebang(self, path) -> None:
+        """Count a shebang-discovered file so the coverage gain stays
+        visible — the shape _note_symlink established (its own stats key
+        plus a few example paths; never folded into another counter)."""
+        self.stats['shebang_files_detected'] = \
+            self.stats.get('shebang_files_detected', 0) + 1
+        self.stats.setdefault('shebang_examples', [])
+        if len(self.stats['shebang_examples']) < 5:
+            self.stats['shebang_examples'].append(str(path))
 
     def is_test_file(self, relative_path: str) -> bool:
         """Check if a file is a test file.
@@ -290,6 +323,7 @@ class RepositoryScanner:
             if stat.S_ISDIR(mode):
                 if self.should_exclude_directory(entry.name):
                     self.stats['directories_excluded'] += 1
+                    self._excluded_recorder.note(entry.name, entry_relative)
                     continue
                 if not self._safe_to_descend(entry, repo_real, seen_dirs):
                     self._note_symlink(entry)
@@ -307,7 +341,15 @@ class RepositoryScanner:
                     self._note_symlink(entry)
                     continue
                 if not self.is_source_file(entry.name):
-                    continue
+                    # #312: extension-only discovery silently dropped
+                    # shebang'd executables — byte-identical twins of .py
+                    # files. The shebang fallback recovers them; the count
+                    # keeps the gain visible.
+                    if (os.path.splitext(entry.name)[1] == ""
+                            and self._is_python_shebang(entry)):
+                        self._note_shebang(entry)
+                    else:
+                        continue
 
                 # Skip test files if configured
                 if self.skip_tests and self.is_test_file(entry_relative):
@@ -364,6 +406,11 @@ class RepositoryScanner:
 
         # Reset state
         self.files = []
+        # #600: the excluded-dir recorder — reserved retention is the
+        # scanner's EFFECTIVE exclusion set (exclude_patterns: build/, env/,
+        # migrations/ ... the first-party names), dynamic names bounded with
+        # the overflow disclosed. Reset per scan; merged after the walk.
+        self._excluded_recorder = ExcludedDirRecorder(self.exclude_patterns)
         self.stats = {
             'total_files': 0,
             'total_size_bytes': 0,
@@ -386,6 +433,10 @@ class RepositoryScanner:
 
         # Sort files by path for consistent output
         self.files.sort(key=lambda f: f['path'])
+
+        # #600: fold the excluded-dir histogram into the statistics the
+        # artifact carries (the names reach the parse step report).
+        self._excluded_recorder.merge_into(self.stats)
 
         return {
             'repository': str(self.repo_path),

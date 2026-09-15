@@ -23,6 +23,18 @@ import (
 
 const summaryFile = "_summary.json"
 
+// fingerprintFile is the backend-identity sidecar (I2) the Python pipeline
+// writes into each checkpoint dir. Like _summary.json it is NOT a per-unit
+// result and must be excluded from the fallback count, or a resume would
+// over-count "completed" units by one.
+const fingerprintFile = "_fingerprint.json"
+
+// isSidecar reports whether a checkpoint-dir entry is a bookkeeping sidecar
+// (never a per-unit result) and so must not be counted as a completed unit.
+func isSidecar(name string) bool {
+	return name == summaryFile || name == fingerprintFile
+}
+
 // Summary represents the _summary.json written by Python pipeline steps.
 type Summary struct {
 	Step           string         `json:"step"`
@@ -30,16 +42,18 @@ type Summary struct {
 	Timestamp      string         `json:"timestamp"`
 	TotalUnits     int            `json:"total_units"`
 	Completed      int            `json:"completed"`
+	Incomplete     int            `json:"incomplete"` // #293: units that ended without a verdict
 	Errors         int            `json:"errors"`
 	ErrorBreakdown map[string]int `json:"error_breakdown"`
 }
 
 // Info describes an existing checkpoint directory.
 type Info struct {
-	Dir       string   // full path to the checkpoint dir
-	Count     int      // number of successfully completed units
-	Errors    int      // number of errored units
-	Summary   *Summary // parsed _summary.json (may have counts overridden by Python)
+	Dir        string   // full path to the checkpoint dir
+	Count      int      // number of successfully completed units
+	Incomplete int      // number of units that ended without a verdict (#293)
+	Errors     int      // number of errored units
+	Summary    *Summary // parsed _summary.json (may have counts overridden by Python)
 }
 
 // Phase returns the detected phase state as a human-readable string.
@@ -80,6 +94,7 @@ func DetectViaPython(pythonPath, scanDir, stepName string) *Info {
 	var status struct {
 		Step           string         `json:"step"`
 		Completed      int            `json:"completed"`
+		Incomplete     int            `json:"incomplete"`
 		Errors         int            `json:"errors"`
 		TotalFiles     int            `json:"total_files"`
 		TotalUnits     int            `json:"total_units"`
@@ -102,14 +117,16 @@ func DetectViaPython(pythonPath, scanDir, stepName string) *Info {
 	}
 
 	info := &Info{
-		Dir:    dir,
-		Count:  status.Completed,
-		Errors: status.Errors,
+		Dir:        dir,
+		Count:      status.Completed,
+		Incomplete: status.Incomplete,
+		Errors:     status.Errors,
 		Summary: &Summary{
 			Step:           status.Step,
 			Phase:          status.Phase,
 			TotalUnits:     status.TotalUnits,
 			Completed:      status.Completed,
+			Incomplete:     status.Incomplete,
 			Errors:         status.Errors,
 			ErrorBreakdown: status.ErrorBreakdown,
 		},
@@ -131,7 +148,7 @@ func DetectFallback(scanDir, stepName string) *Info {
 
 	count := 0
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") && e.Name() != summaryFile {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") && !isSidecar(e.Name()) {
 			count++
 		}
 	}
@@ -179,10 +196,17 @@ func PromptResume(info *Info, stepName string, quiet bool) bool {
 		// Interrupted run — show progress out of total
 		yellow.Fprintf(os.Stderr, "Previous %s run interrupted", stepName)
 		s := info.Summary
-		if info.Errors > 0 {
+		switch {
+		case info.Errors > 0 && info.Incomplete > 0:
+			fmt.Fprintf(os.Stderr, " (%d/%d completed, %d incomplete, %d errors)\n",
+				info.Count, s.TotalUnits, info.Incomplete, info.Errors)
+		case info.Errors > 0:
 			fmt.Fprintf(os.Stderr, " (%d/%d completed, %d errors)\n",
 				info.Count, s.TotalUnits, info.Errors)
-		} else {
+		case info.Incomplete > 0:
+			fmt.Fprintf(os.Stderr, " (%d/%d completed, %d incomplete)\n",
+				info.Count, s.TotalUnits, info.Incomplete)
+		default:
 			fmt.Fprintf(os.Stderr, " (%d/%d completed)\n",
 				info.Count, s.TotalUnits)
 		}

@@ -6,14 +6,13 @@ for both agentic and single-shot enhancement modes.
 
 Checkpoints are always enabled for agentic mode. Per-unit progress is saved
 to ``{output_dir}/enhance_checkpoints/`` so interrupted runs can resume
-automatically. On successful completion the checkpoint dir is removed.
+automatically. Checkpoints are preserved alongside results (see the scanner's enhance step).
 """
 
-import json
 import os
 import sys
 
-from core.schemas import EnhanceResult, UsageInfo
+from core.schemas import EnhanceResult
 from core import tracking
 from core.progress import ProgressReporter
 from utilities.rate_limiter import configure_rate_limiter
@@ -61,6 +60,12 @@ def enhance_dataset(
     Returns:
         EnhanceResult with output path, stats, and usage.
     """
+    # #214: snapshot cumulative usage at phase start so the "Enhance" summary
+    # below reports this phase's delta, not the prior phases' total.
+    # #281: MUTABLE holder — the enhance path's checkpoint-restore injects
+    # prior usage into the tracker AFTER this snapshot; the injection site
+    # refreshes the holder (see verifier's identical shape).
+    _phase_baseline = {"usage": tracking.get_usage()}
     # Configure global rate limiter
     configure_rate_limiter(backoff_seconds=float(backoff_seconds))
 
@@ -96,6 +101,18 @@ def enhance_dataset(
     print(f"[Enhance] Loading dataset: {dataset_path}", file=sys.stderr)
     dataset = read_json(dataset_path)
     units = dataset.get("units", [])
+    # #213: apply --limit to the INTENDED population, not the raw head. When
+    # diff-mode annotated the dataset (diff_selected markers), analyze's own
+    # order is filter-then-limit (analyzer.py:523-557); a raw head-slice here
+    # would slice ALPHABETICALLY first and silently drop diff-selected units
+    # outside the head — the run would enhance/analyze ~0 units and exit
+    # clean (a false-coverage regression glm-5.3 caught in review). Match
+    # analyze's population semantics EXACTLY, including its key-presence
+    # predicate (analyzer.py:523): a diff that selected ZERO units still
+    # counts as annotated — filtering to 0 beats spending the limit on
+    # unrelated units (sonnet confirm-round catch).
+    if any("diff_selected" in u for u in units if isinstance(u, dict)):
+        units = [u for u in units if isinstance(u, dict) and u.get("diff_selected")]
     if limit:
         units = units[:limit]
         dataset["units"] = units  # so the agentic/single-shot paths enhance only these
@@ -112,7 +129,10 @@ def enhance_dataset(
         )
 
     def _on_restored(count: int):
-        progress.completed = count
+        # #218: rebase BOTH the counter and the session baseline, else the
+        # restored units dilute the per-unit rate (Enhance/Verify learn the
+        # restored count here, not via the `completed=` constructor arg).
+        progress.mark_restored(count)
 
     # Run enhancement
     if mode == "agentic":
@@ -127,13 +147,19 @@ def enhance_dataset(
             progress_callback=_on_unit_done,
             restored_callback=_on_restored,
             workers=workers,
+            phase_baseline=_phase_baseline,
         )
     elif mode == "single-shot":
+        # NOTE: single-shot enhance performs NO add_prior_usage injection
+        # (no checkpoint restore on this path) — its baseline was already
+        # correct pre-#281; no holder threading needed (wave catch: threading
+        # it anyway was dead code).
         enhanced = enhancer.enhance_dataset(
             dataset,
             progress_callback=_on_unit_done,
             workers=workers,
             checkpoint_path=checkpoint_path,
+            restored_callback=_on_restored,
         )
     else:
         raise ValueError(f"Unknown enhancement mode: {mode}. Use 'agentic' or 'single-shot'.")
@@ -146,6 +172,7 @@ def enhance_dataset(
     error_summary = {}
     context_key = "agent_context" if mode == "agentic" else "llm_context"
 
+    incomplete_count = 0
     for unit in enhanced.get("units", []):
         ctx = unit.get(context_key, {})
         if ctx.get("error"):
@@ -159,6 +186,9 @@ def enhance_dataset(
             continue
         cls = ctx.get("security_classification", "unknown")
         classifications[cls] = classifications.get(cls, 0) + 1
+        # #293: the agent's degenerate exit is not a successful enhance
+        if cls == "incomplete":
+            incomplete_count += 1
 
     # Checkpoints are preserved as a permanent artifact alongside results.
     # Final summary (phase="done") is written by context_enhancer.
@@ -171,13 +201,13 @@ def enhance_dataset(
     if error_count:
         print(f"[Enhance] Errors: {error_count} ({error_summary})", file=sys.stderr)
 
-    tracking.log_usage("Enhance")
+    tracking.log_usage("Enhance", _phase_baseline["usage"])
 
     usage = tracking.get_usage()
 
     return EnhanceResult(
         enhanced_dataset_path=output_path,
-        units_enhanced=len(units) - error_count,
+        units_enhanced=len(units) - error_count - incomplete_count,
         error_count=error_count,
         error_summary=error_summary,
         classifications=classifications,

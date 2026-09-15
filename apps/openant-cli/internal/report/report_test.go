@@ -121,3 +121,35 @@ func excerpt(out, key string) string {
 	}
 	return out[start:end]
 }
+
+// #215: a severity-bearing finding renders its badge; a finding without one
+// (old artifacts) renders none.
+func TestRenderReskinSeverityBadge(t *testing.T) {
+	data := baseReportData()
+	// the reskin template iterates the GROUPED structure the report-data
+	// projection builds (cli.py: findings_by_verdict) — not .Findings.
+	data.FindingsByVerdict = []FindingGroup{{
+		Verdict: "vulnerable",
+		Findings: []Finding{{
+			Number:         1,
+			Verdict:        "vulnerable",
+			File:           "src/app.py",
+			Function:       "render",
+			Severity:       "critical",
+			SeveritySource: "model",
+		}},
+	}}
+	var buf bytes.Buffer
+	if err := RenderReskin(data, &buf); err != nil {
+		t.Fatalf("RenderReskin: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, ">critical<") {
+		t.Error("expected the severity badge to render for a severity-bearing finding")
+	}
+	// the color method backs the badge style
+	f := Finding{Severity: "critical"}
+	if f.SeverityColor() != "#721c24" {
+		t.Errorf("SeverityColor(critical) = %q, want #721c24", f.SeverityColor())
+	}
+}

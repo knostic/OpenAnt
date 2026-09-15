@@ -13,7 +13,6 @@ standardized metadata (timing, cost, inputs, outputs).
 import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any
 
 from utilities.file_io import write_json
 
@@ -62,10 +61,20 @@ class ParseResult:
     # not only visible in a stderr line that CI discards.
     excluded_languages: dict = field(default_factory=dict)
     # Which path supplied the application context: "threat_model" (a file in
-    # the scanned repo), "generated" (the built-in LLM generator), or "none".
+    # the scanned repo), "repo_manual" (an OPENANT.json/OPENANT.md committed
+    # by the scanned repo — #322: a distinct source so the provenance banner
+    # discloses it), "generated" (the built-in LLM generator), or "none".
     # Recorded because a scan run under the WRONG security model looks
     # identical to a correct one unless the source is stated.
     context_source: str = "none"
+    # #322: the manual-override exclusion volume + warnings (the R5 pattern:
+    # stderr is discarded by CI; the artifact is the receipt). Carried when
+    # context_source == "repo_manual".
+    manual_exclusions: int | None = None
+    manual_override_warnings: list = field(default_factory=list)
+    # the OVERRIDE FILE that actually matched (OPENANT.json / .openant.md /
+    # ...) — the banner names the file present in the repo, not a guess.
+    manual_override_filename: str = ""
 
     @property
     def degraded(self) -> bool:
@@ -91,6 +100,11 @@ class UsageInfo:
     total_output_tokens: int = 0
     total_tokens: int = 0
     total_cost_usd: float = 0.0
+    # #216: the cost figure is incomplete when any dispatched model had no
+    # pricing record (tokens counted, dollars $0). Deterministic advisory —
+    # flows into step reports and scan.report.json via tracking.get_usage.
+    cost_incomplete: bool = False
+    unpriced_models: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -156,6 +170,11 @@ class ScanResult:
     output_dir: str
     dataset_path: str | None = None
     enhanced_dataset_path: str | None = None
+    # #285: the scan-level status (worst per-step: error > partial > skipped
+    # > success) and the aggregate errors — carried so the envelope / webui /
+    # CLI consumers see a degraded scan without re-reading scan.report.json.
+    scan_status: str = "success"
+    scan_errors: list = field(default_factory=list)
     analyzer_output_path: str | None = None
     app_context_path: str | None = None
     results_path: str | None = None
@@ -190,10 +209,20 @@ class ScanResult:
     # not only visible in a stderr line that CI discards.
     excluded_languages: dict = field(default_factory=dict)
     # Which path supplied the application context: "threat_model" (a file in
-    # the scanned repo), "generated" (the built-in LLM generator), or "none".
+    # the scanned repo), "repo_manual" (an OPENANT.json/OPENANT.md committed
+    # by the scanned repo — #322: a distinct source so the provenance banner
+    # discloses it), "generated" (the built-in LLM generator), or "none".
     # Recorded because a scan run under the WRONG security model looks
     # identical to a correct one unless the source is stated.
     context_source: str = "none"
+    # #322: the manual-override exclusion volume + warnings (the R5 pattern:
+    # stderr is discarded by CI; the artifact is the receipt). Carried when
+    # context_source == "repo_manual".
+    manual_exclusions: int | None = None
+    manual_override_warnings: list = field(default_factory=list)
+    # the OVERRIDE FILE that actually matched (OPENANT.json / .openant.md /
+    # ...) — the banner names the file present in the repo, not a guess.
+    manual_override_filename: str = ""
     # Provenance for a repo-supplied threat model (context_source ==
     # "threat_model"). sha256 is over the raw file bytes so a scan can be tied
     # to the exact file that shaped it; None (never the empty-string hash) when
@@ -214,6 +243,8 @@ class ScanResult:
     def to_dict(self) -> dict:
         return {
             "output_dir": self.output_dir,
+            "scan_status": self.scan_status,
+            "scan_errors": self.scan_errors,
             "dataset_path": self.dataset_path,
             "enhanced_dataset_path": self.enhanced_dataset_path,
             "analyzer_output_path": self.analyzer_output_path,
@@ -239,6 +270,16 @@ class ScanResult:
             "context_source": self.context_source,
             "threat_model_sha256": self.threat_model_sha256,
             "threat_model_warnings": self.threat_model_warnings,
+            # #322 (wave r3): the manual-override receipt reaches the machine-
+            # readable JSON envelope too (the R5 pattern — the threat-model
+            # analogues above are here; the manual ones were dropped by this
+            # hand-maintained dict). Present-only: None/empty stays absent.
+            **({"manual_exclusions": self.manual_exclusions}
+               if self.manual_exclusions is not None else {}),
+            **({"manual_override_warnings": self.manual_override_warnings}
+               if self.manual_override_warnings else {}),
+            **({"manual_override_filename": self.manual_override_filename}
+               if self.manual_override_filename else {}),
             "degraded": self.degraded,
         }
 
@@ -274,6 +315,40 @@ class EnhanceResult:
 # Verify result
 # ---------------------------------------------------------------------------
 
+def verify_step_summary(result: "VerifyResult") -> dict:
+    """The verify step-report summary (issue #300; ten fields since #302).
+
+    Shared by every construction site — core/scanner.py (the pipeline),
+    openant/cli.py's chained analyze --verify, and standalone openant
+    verify — so the sites cannot drift. The reconciliation counters bound:
+    agreed + disagreed + disagreed_inconclusive + needs_review +
+    error_count accounts for every findings_input finding except the
+    disagreed-but-still-vulnerable case, which increments only
+    confirmed_vulnerabilities (see core/verifier.py
+    _count_verification_outcomes) — the counters are therefore a bound
+    (<=), not exact equality. #509: ``disagreed_inconclusive`` is the
+    disagreement arm whose corrected finding is ``inconclusive`` — the
+    verifier could NOT confirm it, so it must never fold into ``safe``.
+    """
+    return {
+        "findings_input": result.findings_input,
+        "findings_verified": result.findings_verified,
+        "agreed": result.agreed,
+        "disagreed": result.disagreed,
+        "disagreed_inconclusive": result.disagreed_inconclusive,
+        "confirmed_vulnerabilities": result.confirmed_vulnerabilities,
+        "needs_review": result.needs_review,
+        "error_count": result.error_count,
+        "units_analyzed_total": result.units_analyzed_total,
+        # downgraded/upgraded are NOT a partition of disagreed: agreed records
+        # whose finding was rewritten by the consistency pass also count
+        # direction, and a vulnerable->bypassable disagreement counts BOTH
+        # confirmed_vulnerabilities and downgraded.
+        "downgraded": result.downgraded,
+        "upgraded": result.upgraded,
+    }
+
+
 @dataclass
 class VerifyResult:
     """Result of `open-ant verify`."""
@@ -282,13 +357,32 @@ class VerifyResult:
     findings_verified: int = 0
     agreed: int = 0
     disagreed: int = 0
+    # #509: disagreements whose corrected finding is ``inconclusive`` —
+    # the verifier explicitly could NOT confirm the finding. Counted
+    # separately so the scanner threads them into ``inconclusive`` and
+    # they never fold into ``safe`` (the ->inconclusive arm of the
+    # #374/#381 family).
+    disagreed_inconclusive: int = 0
     confirmed_vulnerabilities: int = 0
     # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
     # (degenerate path or adapter error). Counted separately so the scanner
     # never folds them into ``safe``.
     needs_review: int = 0
     error_count: int = 0
+    # #302: Stage 2's SCOPE — the denominator (all analyzed units; only
+    # Stage-1 positives enter) and the direction of its changes
+    # (structurally one-way: a Stage-1 negative is never re-examined, so
+    # no upgrade path exists for it). Persisted so the artifacts state
+    # "adjudicated N of M" instead of implying whole-codebase adjudication.
+    units_analyzed_total: int = 0
+    downgraded: int = 0
+    upgraded: int = 0
     usage: UsageInfo = field(default_factory=UsageInfo)
+
+    def step_summary(self) -> dict:
+        """The verify step-report summary (issue #300): the shared
+        construction every site uses (ten fields since #302)."""
+        return verify_step_summary(self)
 
     def to_dict(self) -> dict:
         return {
@@ -300,6 +394,9 @@ class VerifyResult:
             "confirmed_vulnerabilities": self.confirmed_vulnerabilities,
             "needs_review": self.needs_review,
             "error_count": self.error_count,
+            "units_analyzed_total": self.units_analyzed_total,
+            "downgraded": self.downgraded,
+            "upgraded": self.upgraded,
             "usage": self.usage.to_dict(),
         }
 
@@ -323,6 +420,38 @@ class DynamicTestStepResult:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def step_summary(self) -> dict:
+        return dynamic_test_step_summary(self)
+
+
+def dynamic_test_step_summary(result: "DynamicTestStepResult") -> dict:
+    """The dynamic-test step-report summary (#533; the #300 verify pattern).
+
+    Shared by every construction site — core/scanner.py (the pipeline) and
+    openant/cli.py's standalone ``openant dynamic-test`` — so the sites
+    cannot drift. ``error_count`` is the #285/#376 partial-status contract's
+    well-typed int (``step_report.py`` derives ``partial`` from it and from
+    the ctx error list, never from ``summary["errors"]``); the ``errors``
+    key is retained as the persisted display contract (an int count here —
+    do NOT widen the status contract to read it: the same word is a list of
+    strings one level up on StepReport itself).
+
+    Reconciliation bound (the verify precedent): ``confirmed + not_reproduced
+    + blocked + inconclusive + errors <= findings_tested`` — the gap is the
+    language-SKIPPED rows (and any restored row whose persisted status falls
+    outside the five counted words); restored checkpoints ARE counted into
+    their buckets, and SKIPPED rows are deliberately not counted as errors.
+    """
+    return {
+        "findings_tested": result.findings_tested,
+        "confirmed": result.confirmed,
+        "not_reproduced": result.not_reproduced,
+        "blocked": result.blocked,
+        "inconclusive": result.inconclusive,
+        "errors": result.errors,
+        "error_count": result.errors,
+    }
 
 
 # ---------------------------------------------------------------------------

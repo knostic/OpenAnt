@@ -5,7 +5,6 @@ Runs Docker-isolated exploit tests against confirmed vulnerabilities.
 Wraps ``utilities.dynamic_tester.run_dynamic_tests()``.
 """
 
-import json
 import os
 import shutil
 import sys
@@ -43,6 +42,22 @@ def run_tests(
         RuntimeError: If Docker is not available.
         FileNotFoundError: If pipeline_output_path doesn't exist.
     """
+    # #214: snapshot cumulative usage at phase start so the "Dynamic Test"
+    # summary below reports this phase's delta, not the prior phases' total.
+    _phase_baseline = tracking.get_usage()
+    # #333 (wave r1 opus): the #281 cross-phase console contract, applied to
+    # the dynamic-test step — the pre-injection snapshot below captured the
+    # checkpoint injection's restored tokens/cost while excluding their
+    # calls, so a resumed run's console line double-counted the restored
+    # spend (10 checkpoints at $0.60 + one $0.03 retry printed $0.63). The
+    # mutable holder is refreshed AT the injection site
+    # (utilities/dynamic_tester), so the phase line reports only the NEW
+    # retry spend — the same contract analyze/verify/enhance carry.
+    _baseline_holder = {
+        "cost_usd": _phase_baseline.total_cost_usd,
+        "tokens": _phase_baseline.total_tokens,
+        "calls": _phase_baseline.total_calls,
+    }
     # Check Docker availability
     if not shutil.which("docker"):
         raise RuntimeError(
@@ -95,6 +110,16 @@ def run_tests(
         repo_path=repo_path,
         registry=registry,
         llm_config_name=llm_config_name,
+        usage_baseline=_baseline_holder,
+    )
+    # #333 (wave r1): rebuild the baseline from the refreshed holder — the
+    # phase line now EXCLUDES the restored checkpoints' spend (it was
+    # reported by their original run's line; including it again
+    # double-counts across a resume).
+    _phase_baseline = UsageInfo(
+        total_calls=_baseline_holder["calls"],
+        total_tokens=_baseline_holder["tokens"],
+        total_cost_usd=_baseline_holder["cost_usd"],
     )
 
     # Count outcomes
@@ -124,7 +149,7 @@ def run_tests(
     if not os.path.exists(results_md_path):
         results_md_path = None
 
-    tracking.log_usage("Dynamic Test")
+    tracking.log_usage("Dynamic Test", _phase_baseline)
 
     print(f"\n[Dynamic Test] Results: {confirmed} confirmed, "
           f"{not_reproduced} not reproduced, {blocked} blocked, "

@@ -48,13 +48,14 @@ var setupLLMPhases = []phaseSpec{
 	{name: "report", short: "Disclosure + summary + remediation generation."},
 }
 
-// Provider adapter types the wizard offers in the picker. All three
-// ship with a Python adapter (anthropic, openai, google) — see
+// Provider adapter types the wizard offers in the picker. All of them
+// ship with a Python adapter (anthropic, openai, google, bedrock,
+// openrouter, ollama) — see
 // “libs/openant-core/utilities/llm/providers/__init__.py“ — so a
 // completed wizard config runs without further changes. The wizard
 // probes each provider+model pair against the real provider API
 // before saving, so a typo'd key or model ID surfaces immediately.
-var supportedProviderTypes = []string{"anthropic", "openai", "google", "bedrock", "openrouter"}
+var supportedProviderTypes = []string{"anthropic", "openai", "google", "bedrock", "openrouter", "ollama"}
 
 // apiKeyHints maps a provider type to a one-line reminder shown right
 // before the wizard asks for the API key. Used to head off the common
@@ -68,6 +69,7 @@ var apiKeyHints = map[string]string{
 	"openai":     "Note: ChatGPT/Codex subscriptions do NOT include API access — get an API key at platform.openai.com (separate billing).",
 	"bedrock":    "Note: Bedrock uses the AWS credential chain, not an API key — leave the key BLANK and export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (+ AWS_REGION).",
 	"openrouter": "Note: create an OpenRouter API key at openrouter.ai/keys; the base URL defaults to https://openrouter.ai/api/v1.",
+	"ollama":     "Note: Ollama runs locally and needs NO API key — leave the key BLANK (a placeholder is used automatically). Base URL defaults to http://localhost:11434/v1; models must be pulled first (`ollama pull <model>`).",
 }
 
 type phaseSpec struct {
@@ -508,12 +510,14 @@ func probeAllPhases(
 			return fmt.Errorf("internal: provider %q referenced by phase %q but not collected", ref.Provider, phase)
 		}
 		fmt.Fprintf(os.Stderr, "  %s/%s ... ", ref.Provider, ref.Model)
-		if prov.APIKey == "" {
+		if prov.APIKey == "" && prov.Type != "ollama" {
 			// Blank key means "read from the environment" (the wizard
 			// offers this and WriteLLMConfig persists the env-read shape).
 			// The Go probe can't read the provider's env var, so skip it;
 			// Python's registry.validate() surfaces a missing/blank env
-			// key at scan start instead.
+			// key at scan start instead. Ollama is exempt: it needs no
+			// key at all (the adapter sends a placeholder), so its probe
+			// always runs.
 			fmt.Fprintln(os.Stderr, "SKIPPED (key from environment)")
 			continue
 		}
@@ -537,6 +541,10 @@ func probeAllPhases(
 			// probeOpenRouter defaults a blank base_url to openrouter.ai/api/v1
 			// (NOT api.openai.com) and appends /chat/completions correctly.
 			probeErr = probeOpenRouter(prov.APIKey, prov.BaseURL, ref.Model)
+		case "ollama":
+			// Ollama speaks the OpenAI wire API on localhost:11434/v1 and does
+			// not check keys — probe with the same placeholder the adapter uses.
+			probeErr = probeOllama(prov.APIKey, prov.BaseURL, ref.Model)
 		default:
 			fmt.Fprintln(os.Stderr, "SKIPPED")
 			return fmt.Errorf("provider type %q has no probe implementation yet", prov.Type)

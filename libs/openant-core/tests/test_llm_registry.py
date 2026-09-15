@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -12,11 +12,8 @@ from utilities.llm import (
     PHASES,
     ConfigError,
     ConfigFile,
-    LLMAdapter,
     LLMAuthError,
     LLMConfig,
-    LLMNotFoundError,
-    PhaseBinding,
     PhaseRef,
     PhaseRegistry,
     ProviderConfig,
@@ -24,7 +21,6 @@ from utilities.llm import (
     empty_config,
     get_builtin_default,
     load_config_file,
-    parse_config,
     resolve_llm_config,
     resolve_provider,
     with_llm_config,
@@ -170,7 +166,7 @@ class TestBuildPhaseRegistry:
         # All six phases share the same provider → one adapter,
         # reused across phases. Not six adapters.
         llm_config = LLMConfig(name="foo", phases=_all_phases_ref("anthropic", "m"))
-        registry = self._build(llm_config)
+        self._build(llm_config)
         assert len(_FakeAdapter.instances) == 1
 
     def test_two_providers_yield_two_adapter_instances(self):
@@ -187,7 +183,7 @@ class TestBuildPhaseRegistry:
             "app_context": PhaseRef(provider="openrouter", model="qwen/qwen-3-coder-480b"),
         }
         llm_config = LLMConfig(name="foo", phases=phases)
-        registry = self._build(llm_config, cf)
+        self._build(llm_config, cf)
         # Two distinct provider entries → two adapter instances.
         assert len(_FakeAdapter.instances) == 2
 

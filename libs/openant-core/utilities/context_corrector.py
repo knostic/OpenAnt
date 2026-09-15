@@ -12,9 +12,9 @@ Uses LLM-based semantic search instead of keyword matching.
 
 import json
 import os
-import subprocess
 import sys
-from pathlib import Path
+
+from core.verdict_taxonomy import STAGE1_VERDICTS
 from typing import Optional
 
 from .llm_client import TokenTracker, get_global_tracker
@@ -61,10 +61,16 @@ def _canonical_skip_dirs() -> set[str]:
     """
     skip = set(_FALLBACK_SKIP_DIRS)
     try:
-        # utilities/context_corrector.py -> utilities -> openant-core -> libs -> repo root
-        cfg = Path(__file__).resolve().parent.parent.parent.parent / "config" / "languages.json"
-        with open(cfg, 'r', encoding='utf-8') as fh:
-            skip |= set(json.load(fh).get("skip_dirs", ()))
+        # #273: resolve through the registry's own locator. The previous
+        # fixed four-.parent walk matched only the CHECKOUT depth — in a
+        # wheel install the config sits two parents up, the walk missed,
+        # and every pip install silently degraded to this frozen fallback.
+        from core.language_registry import find_languages_config
+
+        cfg = find_languages_config()
+        if cfg is not None:
+            with open(cfg, 'r', encoding='utf-8') as fh:
+                skip |= set(json.load(fh).get("skip_dirs", ()))
     except Exception:
         pass
     return skip
@@ -518,6 +524,19 @@ class ContextCorrector:
                 new_result["prompt_length"] = len(prompt)
                 new_result["response_length"] = len(response)
 
+                if new_result.get("verdict") == "ERROR":
+                    # #316 (mirror): the re-analysis recovered no
+                    # recognizable verdict — a FAILED correction, not
+                    # "Correction successful! New verdict: ERROR". Stamp the
+                    # failure on the returned original (every other break in
+                    # this loop does; experiment.py reads correction_status)
+                    # and preserve the garbage reply for manual review.
+                    current_result["correction_attempted"] = True
+                    current_result["correction_status"] = "reanalysis_unrecognized_verdict"
+                    if new_result.get("raw_finding") is not None:
+                        current_result["raw_finding"] = new_result["raw_finding"]
+                    print(f"      Correction failed: re-analysis produced no recognizable verdict", file=sys.stderr)
+                    break
                 if new_result.get("verdict") != "INSUFFICIENT_CONTEXT":
                     # Correction successful
                     new_result["correction_status"] = "success"
@@ -578,6 +597,12 @@ class ContextCorrector:
                     corrected = self._normalize_result(corrected)
                     if corrected.get("verdict") not in ("ERROR", None):
                         corrected["json_corrected"] = True
+                        # #215 mirror of analyze_unit: only a MODEL-supplied
+                        # severity value becomes "corrected" (the extraction
+                        # prompt can fabricate the field); a derived stamp
+                        # stays derived.
+                        if corrected.get("severity_source") == "model":
+                            corrected["severity_source"] = "corrected"
                         return corrected
                 except Exception:
                     pass
@@ -592,8 +617,44 @@ class ContextCorrector:
 
     @staticmethod
     def _normalize_result(result: dict) -> dict:
-        """Normalize finding -> verdict and ensure uppercase."""
-        if "verdict" not in result and "finding" in result:
+        """Normalize finding -> verdict and ensure uppercase.
+
+        #316/#324 mirror of ``core.analysis_core._normalize_result``: an
+        unrecognized, non-string, or absent finding/verdict routes to the
+        one error shape (verdict=ERROR, finding="error", raw preserved) —
+        never a synthesized verdict. (Both-keys-disagreement rows are not
+        reconciled here — same as the core function, a present effective
+        verdict short-circuits the finding branch; that family is the
+        documented F13 residual.)
+        """
+        verdict = result.get("verdict")
+        has_verdict = isinstance(verdict, str) and verdict.strip() != ""
+        # #427 (wave r1, opus+fable): the unrecognized-VERDICT branch,
+        # mirrored — the twin's passthrough adopted a garbage verdict as
+        # "Correction successful! New verdict: SAY WHAT" and returned it to
+        # experiment.py as the analysis result. The finding-kept redesign
+        # applies here too: the garbage verdict is discarded (raw
+        # preserved); a usable canonical finding is KEPT; only an
+        # absent/unusable finding routes to the error shape.
+        if has_verdict and verdict.strip().upper() not in STAGE1_VERDICTS:
+            result["raw_verdict"] = verdict
+            _finding = result.get("finding")
+            from core.verdict_taxonomy import FINDING_VERDICT_ORDER as _FVO
+            _canonical = frozenset(_FVO) | {"error"}
+            if not (isinstance(_finding, str)
+                    and _finding.strip().lower() in _canonical):
+                if _finding is not None and (
+                        not isinstance(_finding, str) or _finding.strip()):
+                    result["raw_finding"] = _finding
+                result["verdict"] = "ERROR"
+                result["finding"] = "error"
+            else:
+                # famBCR panel (sonnet): the KEPT verdict must be normalized
+                # to match the kept finding — the severity stamping keys on
+                # `verdict`, and the garbage "SAY WHAT" left in place
+                # silently dropped severity for exactly these rows.
+                result["verdict"] = _finding.strip().upper()
+        if not has_verdict and "finding" in result:
             finding = result["finding"]
             mapping = {
                 "vulnerable": "VULNERABLE", "safe": "SAFE",
@@ -601,9 +662,38 @@ class ContextCorrector:
                 "inconclusive": "INCONCLUSIVE",
                 "insufficient_context": "INSUFFICIENT_CONTEXT",
             }
-            result["verdict"] = mapping.get(finding.lower(), finding.upper())
+            if not isinstance(finding, str):
+                result["raw_finding"] = finding
+                result["finding"] = "error"
+                result["verdict"] = "ERROR"
+            else:
+                v = mapping.get(finding.lower(), "ERROR")
+                if v == "ERROR" and finding.lower() != "error":
+                    result["raw_finding"] = finding
+                    result["finding"] = "error"
+                result["verdict"] = v
+        elif not has_verdict:
+            result["verdict"] = "ERROR"
+            result["finding"] = "error"
         if "verdict" in result and isinstance(result["verdict"], str):
-            result["verdict"] = result["verdict"].upper()
+            result["verdict"] = result["verdict"].strip().upper()
+        # #215 mirror: the finding-gated severity stamp, AFTER the uppercase
+        # fold (core's order — stamping before it lost a model severity on a
+        # lowercase-verdict reply, wave round-2). The shared enum comes from
+        # verdict_taxonomy so the twin cannot drift.
+        from core.verdict_taxonomy import SEVERITIES as _SEVS
+        if result.get("verdict") in ("VULNERABLE", "BYPASSABLE"):  # SEVERITY_FINDING_VERDICTS, uppercased
+            sev = result.get("severity")
+            if isinstance(sev, str) and sev.strip().lower() in _SEVS:
+                result["severity"] = sev.strip().lower()
+                result["severity_source"] = "model"
+            else:
+                result["severity"] = ("high" if result["verdict"] == "VULNERABLE"
+                                      else "medium")
+                result["severity_source"] = "derived"
+        else:
+            result.pop("severity", None)
+            result.pop("severity_source", None)
         return result
 
 

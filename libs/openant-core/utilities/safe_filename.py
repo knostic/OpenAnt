@@ -3,6 +3,13 @@
 import hashlib
 
 
+# #317 (panel round-3): the truncation threshold, EXPORTED so the checkpoint
+# disambiguator's injectivity early-out imports the same constant instead of
+# duplicating the literal (drift in one silently broke the other's
+# "by construction" claim).
+SAFE_FILENAME_MAX_LEN = 255 - 5 - 17  # leave room for .json (5) and _ + 16 hex (17) = 233
+
+
 def safe_filename(unit_id: str) -> str:
     """Convert a unit ID to a safe filename.
 
@@ -16,7 +23,7 @@ def safe_filename(unit_id: str) -> str:
             .replace(" ", "_"))
 
     # Leave room for .json extension (5 chars) and hash suffix (17 chars: _ + 16 hex)
-    max_len = 255 - 5 - 17  # = 233
+    max_len = SAFE_FILENAME_MAX_LEN
 
     if len(safe) > max_len:
         h = hashlib.sha256(unit_id.encode()).hexdigest()[:16]

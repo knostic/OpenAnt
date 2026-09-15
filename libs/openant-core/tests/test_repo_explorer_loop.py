@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from context.repo_explorer import explore_repository, MAX_TURNS
-from utilities.llm.adapter import Message, TextBlock, ToolDef, ToolResultBlock, ToolUseBlock
+from utilities.llm.adapter import TextBlock, ToolDef, ToolResultBlock, ToolUseBlock
 
 
 class _Resp:

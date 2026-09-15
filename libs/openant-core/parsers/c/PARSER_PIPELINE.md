@@ -117,7 +117,16 @@ Generates `dataset.json` and `analyzer_output.json` with identical schema to Pyt
 
 ### Limitations
 
-- Cannot resolve function pointer dispatch (LLM compensates)
+- Function-pointer dispatch through STATIC containers resolves as of #298 (a
+  braced initialiser of function references — ops struct designated
+  initialisers, function-pointer arrays, struct-array command tables — plus a
+  subscript or member call through the container name records edges to every
+  function the initialisers reference; over-seed is the safe direction).
+  REMAINING unmitigated on a default scan: dispatch through pointers assigned
+  at RUNTIME (indirect calls via variables holding function addresses with no
+  static initialiser table), which the opt-in `--llm-reachability` stage
+  (off by default; reads the first 1,500 bytes per unit) only partially
+  compensates for.
 - Cannot resolve complex macro expansions (tree-sitter sees the macro call, not the expansion)
 - Does not track struct field access patterns
 - C++ template instantiation is not tracked

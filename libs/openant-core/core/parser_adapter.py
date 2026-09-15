@@ -11,7 +11,6 @@ sys.path hacks in the original code.
 
 import contextlib
 import functools
-import json
 import os
 import shutil
 import subprocess
@@ -29,6 +28,7 @@ from core.language_registry import (
     supported_languages,
 )
 from core.schemas import ParseResult
+from utilities.child_interp import child_interpreter_env
 from utilities.file_io import open_utf8, read_json, write_json
 from utilities.prune_telemetry import compute_prune_telemetry
 
@@ -473,8 +473,12 @@ def apply_reachability_filter(
 
     For ``codeql`` and ``exploitable`` levels the reachability filter is
     still applied (it is a prerequisite), but the additional CodeQL /
-    LLM-classification filters are not yet wired into the Python path
-    and a warning is printed.
+    LLM-classification filters are not yet wired into the Python path.
+    The fallback is fail-safe (the skipped filters are narrowing), and is
+    RECORDED, not just printed: the filter metadata carries
+    ``level_fallback_warning``, ``requested_processing_level`` and
+    ``effective_processing_level`` so the emitted artifact never silently
+    claims the requested level (#328).
 
     Args:
         dataset: The full, unfiltered dataset dict (mutated in place).
@@ -502,6 +506,7 @@ def apply_reachability_filter(
     EntryPointDetector = _epd.EntryPointDetector
     blackout_warning = _epd.blackout_warning
     library_seed_ids = _epd.library_seed_ids
+    real_entry_point_ids = _epd.real_entry_point_ids
     ReachabilityAnalyzer = _ra.ReachabilityAnalyzer
 
     call_graph_path = os.path.join(output_dir, "call_graph.json")
@@ -523,6 +528,36 @@ def apply_reachability_filter(
     # Detect entry points structurally, then seed with any extras (e.g. LLM-promoted).
     detector = EntryPointDetector(functions, call_graph)
     entry_points = detector.detect_entry_points()
+    # #602: the STRUCTURAL baseline (detector + library seeds, WITHOUT the
+    # LLM-promoted extras) is a SIDE COMPUTATION on a copy, inserted before
+    # the union — the union below is unchanged, and the seed unions are set
+    # operations ((D ∪ X) ∪ B = (D ∪ B) ∪ X; the BFS closure is
+    # seed-order-independent), so the main filter's inputs and outputs are
+    # identical for every pre-existing shape. The side computation gives
+    # the counterfactual: what the structural pass alone retains.
+    # The baseline counts DATASET units (not graph ids — the analyzer's
+    # reachable set can include ids absent from the dataset).
+    _baseline_seed = set(entry_points)
+    if library_mode:
+        _baseline_seed |= library_seed_ids(functions)
+    _baseline_ids = None
+    _baseline_unmeasurable = None
+    if extra_entry_points:
+        if real_entry_point_ids(_baseline_seed, functions):
+            _baseline_analyzer = ReachabilityAnalyzer(
+                functions=functions,
+                reverse_call_graph=reverse_call_graph,
+                entry_points=_baseline_seed,
+            )
+            _baseline_ids = _baseline_analyzer.get_all_reachable()
+        else:
+            # #602: the decomposition's most-informative case — the LLM
+            # extras are the ONLY real seeds; synthetic-harness seeds are
+            # not real entry points, so there is no structural baseline to
+            # measure against (the structural-only run would have kept ALL
+            # units — the extras can only narrow, and by an unmeasurable
+            # amount). Disclosed, never silently absent.
+            _baseline_unmeasurable = "no_real_structural_seeds"
     if extra_entry_points:
         entry_points = entry_points | extra_entry_points
     # Library-mode (opt-in): the public API is the entry surface. Union-only —
@@ -542,21 +577,45 @@ def apply_reachability_filter(
     # pass-through (keep all units, unfiltered) and record a loud warning so the
     # degraded result is never silent. Higher-level callers may still seed
     # ``extra_entry_points`` to get real filtering.
-    if not entry_points and original_count > 0:
+    real_eps = real_entry_point_ids(entry_points, functions)
+    if not real_eps and original_count > 0:
+        why = ("Only synthetic fuzz-harness entry points detected"
+               if entry_points else "No entry points detected")
         warning = (
-            "No entry points detected — reachability cannot seed a frontier. "
+            f"{why} — reachability cannot seed a real frontier. "
             "Returning all units unfiltered to avoid a silent blackout; "
-            f"'{processing_level}' filtering was NOT applied."
+            f"'{processing_level}' filtering was NOT applied. "
+            "Use --library-mode to seed the exported public API surface."
         )
         print(f"  [Warning] {warning}", file=sys.stderr)
-        dataset.setdefault("metadata", {})["reachability_filter"] = {
+        _rec = {
             "original_units": original_count,
-            "entry_points": 0,
+            "entry_points": len(entry_points),
             "reachable_units": original_count,
             "filtered_out": 0,
             "reduction_percentage": 0,
             "warning": warning,
         }
+        # #520: the seed-class counts on BOTH branches — the keep-all record
+        # must not read as "no signal" when synthetic-only seeding was the cause.
+        _rec["structural_entry_points"], _rec["incidental_entry_points"] = (
+            _epd.classify_seeds(detector.entry_point_details))
+        # #602: the decomposition's most-informative case lands HERE — the
+        # LLM extras were the only seeds and the structural baseline could
+        # not run. The marker (never silent absence — absence reads as
+        # "no LLM extras").
+        if _baseline_unmeasurable is not None:
+            _rec["reachability_baseline"] = _baseline_unmeasurable
+        # #328 (wave r1, opus+fable): the effective level on the pass-through
+        # path is "all" — nothing was pruned — and this is the case where
+        # recording it matters MOST: without it the record looks identical to
+        # "no fallback happened". The request is recorded beside it; the
+        # blackout warning prose already carries the "NOT applied" message, so
+        # no redundant level_fallback_warning key rides this branch.
+        _rec["effective_processing_level"] = "all"
+        if processing_level in ("codeql", "exploitable"):
+            _rec["requested_processing_level"] = processing_level
+        dataset.setdefault("metadata", {})["reachability_filter"] = _rec
         return dataset
 
     # Compute reachable set (BFS forward from entry points)
@@ -587,13 +646,37 @@ def apply_reachability_filter(
         if original_count > 0
         else 0
     )
-    dataset.setdefault("metadata", {})["reachability_filter"] = {
+    _structural_eps, _incidental_eps = _epd.classify_seeds(
+        detector.entry_point_details)
+    _filter_rec = {
         "original_units": original_count,
         "entry_points": len(entry_points),
+        "structural_entry_points": _structural_eps,
+        "incidental_entry_points": _incidental_eps,
         "reachable_units": len(filtered_units),
         "filtered_out": original_count - len(filtered_units),
         "reduction_percentage": reduction_pct,
     }
+    # #602: the decomposition — units_newly_reachable is derived from the
+    # counterfactual baseline (the DATASET units the combined seeds retain
+    # that the structural-only closure does NOT), making the promoted-vs-
+    # retained relationship self-explaining. The key is ABSENT when the
+    # baseline is unmeasurable (no LLM extras: nothing to decompose; the
+    # keep-all path: retained units are NOT proven reachable — reporting
+    # them as LLM gains would be a fabrication).
+    if _baseline_ids is not None:
+        _filter_rec["structural_reachable_units"] = sum(
+            1 for u in units if u.get("id", "") in _baseline_ids)
+        _filter_rec["units_newly_reachable"] = sum(
+            1 for u in filtered_units
+            if u.get("id", "") not in _baseline_ids)
+    elif _baseline_unmeasurable is not None:
+        # The synthetic-only case — the most-informative decomposition:
+        # the LLM extras were the ONLY real seeds. The keys stay absent;
+        # the marker explains WHY (never silent absence — absence alone
+        # reads as "no LLM extras").
+        _filter_rec["reachability_baseline"] = _baseline_unmeasurable
+    dataset.setdefault("metadata", {})["reachability_filter"] = _filter_rec
 
     print(f"  Entry points detected: {len(entry_points)}", file=sys.stderr)
     print(
@@ -602,11 +685,24 @@ def apply_reachability_filter(
         file=sys.stderr,
     )
 
-    _blackout = blackout_warning(detector.entry_point_details, original_count,
-                                 len(filtered_units), library_mode=library_mode)
+    # #520 (the fable+astra fold): the seed-quality advisory rides its OWN
+    # key — following the orphan_advisory pattern — so it can never displace
+    # the forward-asymmetry invariant from the reserved ``warning`` slot (the
+    # correctness voice outranks the seed-quality voice at ANY reduction).
+    # extra_seed_count = the ACCEPTED-EFFECTIVE caller-supplied seeds
+    # (deduplicated, resolved to graph nodes) — named in the wording, never
+    # classified.
+    _extra_seeds_effective = sum(
+        1 for s in (extra_entry_points or [])
+        if s in reachable_ids or s in {u.get("id") for u in units}
+    )
+    _blackout = blackout_warning(
+        detector.entry_point_details, original_count,
+        len(filtered_units), library_mode=library_mode,
+        extra_seed_count=_extra_seeds_effective)
     if _blackout:
-        dataset["metadata"]["reachability_filter"]["warning"] = _blackout
-        print(f"  [Warning] {_blackout}", file=sys.stderr)
+        dataset["metadata"]["reachability_filter"]["blackout_advisory"] = _blackout
+        print(f"  [Advisory] {_blackout}", file=sys.stderr)
 
     # Per-unit prune telemetry (ADDITIVE, all-language; advisory — must never crash
     # the filter). Merges classification keys + the pruned_units.json sidecar; a
@@ -614,26 +710,45 @@ def apply_reachability_filter(
     # already claim the slot. call_graph/reverse_call_graph are the UN-pruned graphs.
     _rf = dataset["metadata"]["reachability_filter"]
     _pruned_ids = [u.get("id", "") for u in units if u.get("id", "") not in reachable_ids]
-    _extra, _asym_warning = compute_prune_telemetry(
+    _extra, _asym_warning, _orphan_advisory = compute_prune_telemetry(
         reachable_ids, sorted(_pruned_ids), call_graph, reverse_call_graph, output_dir)
     _rf.update(_extra)
+    # #520 (the fable+astra fold): with the advisory on its own key, the
+    # reserved ``warning`` slot belongs to the correctness signals — the
+    # forward-asymmetry invariant lands whenever it fires, no longer crowded
+    # out by the seed-quality advisory.
     if _asym_warning and "warning" not in _rf:
         _rf["warning"] = _asym_warning
         print(f"  [Warning] {_asym_warning}", file=sys.stderr)
+    # #301: the orphan-rate advisory — its own key, NEVER the reserved
+    # ``warning`` slot, and it reaches the scan summary on stderr.
+    if _orphan_advisory:
+        _rf["orphan_advisory"] = _orphan_advisory
+        print(f"  [Advisory] {_orphan_advisory}", file=sys.stderr)
 
-    # Warn about unimplemented higher-level filters
-    if processing_level == "codeql":
-        print(
-            "  [Warning] CodeQL filter not yet wired into the Python parser path. "
-            "Returning reachable units only.",
-            file=sys.stderr,
-        )
-    elif processing_level == "exploitable":
-        print(
-            "  [Warning] Exploitable filter (CodeQL + LLM classification) not yet "
-            "wired into the Python parser path. Returning reachable units only.",
-            file=sys.stderr,
-        )
+    # Record the level that actually ran, so the artifact answers "what
+    # filtering was applied?" even when no fallback happened (#328).
+    _rf["effective_processing_level"] = "reachable"
+
+    # Warn about unimplemented higher-level filters (#328: the warning now
+    # reaches the RESULT STRUCTURE the way the asymmetry warning above does,
+    # in its OWN key — the reserved ``warning`` slot may already hold the
+    # blackout text, and dropping the fallback note there would be the same
+    # silent drop this fixes — and the request is recorded beside it. The
+    # fallback itself is fail-safe (the unapplied filters are narrowing:
+    # more units analysed than the label implies, none dropped); the defect
+    # being fixed is the artifact silently claiming the requested level.)
+    if processing_level in ("codeql", "exploitable"):
+        if processing_level == "codeql":
+            _fb = ("CodeQL filter not yet wired into the core reachability "
+                   "filter path. Returning reachable units only.")
+        else:
+            _fb = ("Exploitable filter (CodeQL + LLM classification) not yet "
+                   "wired into the core reachability filter path. Returning "
+                   "reachable units only.")
+        _rf["level_fallback_warning"] = _fb
+        _rf["requested_processing_level"] = processing_level
+        print(f"  [Warning] {_fb}", file=sys.stderr)
 
     return dataset
 
@@ -713,6 +828,12 @@ def _js_deps_installed() -> bool:
     return (_JS_PARSER_DIR / "node_modules" / ".package-lock.json").is_file()
 
 
+# #325: the npm-install bootstrap bound — the parse-step convention (PR
+# #135's timeout=1800). Module-level so a test can inject a small bound and
+# EXECUTE the diagnosis path instead of grepping the source for it.
+_NPM_INSTALL_TIMEOUT_S = 1800
+
+
 def _ensure_js_parser_dependencies() -> None:
     """Install the JS parser's Node dependencies on first use.
 
@@ -742,7 +863,11 @@ def _ensure_js_parser_dependencies() -> None:
     # Serialize concurrent bootstraps. The lockfile lives next to package.json so
     # it's always on the same filesystem as the install target.
     lock_path = _JS_PARSER_DIR / ".openant-npm-install.lock"
-    with _file_lock(lock_path):
+    # the wait budget outlasts a legitimate install (the bounded npm install
+    # inside the lock holds it for up to 30 minutes): the install bound + 5
+    # minutes of slack.
+    with _file_lock(lock_path, what="the npm-install bootstrap",
+                    wait_seconds=1800 + 300):
         # Re-check under the lock: another process may have finished while we waited.
         if _js_deps_installed():
             return
@@ -751,40 +876,98 @@ def _ensure_js_parser_dependencies() -> None:
             "[Parser] Installing JS parser dependencies (first run, this may take a minute)...",
             file=sys.stderr,
         )
-        result = subprocess.run(
+        # #325: PR #135 bounded the parse subprocesses and named this call
+        # as a deferred follow-up ("a separate unbounded subprocess... a
+        # tracked follow-up, out of scope here") — the follow-up. A stalled
+        # npm (a blocking postinstall script, a registry stall outlasting
+        # npm's own retry budget) hung its process indefinitely AND every
+        # concurrent parse behind the lock it holds. The parse steps use
+        # timeout=1800; the bootstrap gets the same convention.
+        # Wave r1 (three axes): the named diagnosis is IMPLEMENTED, not
+        # asserted — and the timeout kills npm's whole PROCESS GROUP: a
+        # killed npm leaves its postinstall grandchild writing node_modules
+        # while the lock releases and the next waiter starts a CONCURRENT
+        # install into the same tree — exactly the corruption the lock
+        # exists to prevent. start_new_session puts npm in its own group
+        # so the kill can reach the grandchildren.
+        _npm_proc = subprocess.Popen(
             [npm, "install"],
             cwd=str(_JS_PARSER_DIR),
             stdout=sys.stderr,
             stderr=sys.stderr,
+            start_new_session=(os.name != "nt"),
         )
-        if result.returncode != 0:
+        try:
+            _rc = _npm_proc.wait(timeout=_NPM_INSTALL_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            if os.name != "nt":
+                try:
+                    os.killpg(os.getpgid(_npm_proc.pid), 9)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            _npm_proc.kill()
+            _npm_proc.wait()
+            raise RuntimeError(
+                f"`npm install` (from {_JS_PARSER_DIR}) exceeded the "
+                f"{_NPM_INSTALL_TIMEOUT_S}s install bound and was killed "
+                "with its process group. Re-run the command; if it persists, "
+                "inspect the npm output above for the stalled postinstall step."
+            ) from None
+        if _rc != 0:
             raise RuntimeError(
                 f"`npm install` failed in {_JS_PARSER_DIR} with exit code "
-                f"{result.returncode}. See npm output above for details; you can "
+                f"{_rc}. See npm output above for details; you can "
                 f"reproduce with: npm install (from {_JS_PARSER_DIR})"
             )
 
 
 @contextlib.contextmanager
-def _file_lock(lock_path: Path):
+def _file_lock(lock_path: Path, *, what: str, wait_seconds: float):
     """Cross-platform exclusive file lock as a context manager.
 
-    Uses ``msvcrt`` on Windows and ``fcntl`` elsewhere. Blocks until the lock is
-    acquired, releases on exit. The lockfile itself is left in place; only the
-    OS-level lock matters for mutual exclusion.
+    Uses ``msvcrt`` on Windows and ``fcntl`` elsewhere. Acquires within
+    ``wait_seconds`` and releases on exit. The lockfile itself is left in
+    place; only the OS-level lock matters for mutual exclusion.
+
+    #325 (wave r1, three axes): BOTH platforms take the SAME bounded,
+    # retry-loop wait — the deadline and the caller's ``what`` are
+    # parameters, not baked into this helper (a generic lock must not
+    # carry npm's timeout and message). The POS POSIX branch catches ONLY
+    # BlockingIOError (contention — EAGAIN/EWOULDBLOCK): every other errno
+    # is a hard failure (ENOLCK, EINVAL, EOPNOTSUPP on some container
+    # volume mounts) and re-raises immediately — a blanket ``except
+    # OSError`` turned a fast, accurately-classified os_error into a
+    # 35-minute spin with a false "wedged" diagnosis. The timeout message
+    # states the OBSERVED FACT (lock not acquired within the budget) — it
+    # cannot know WHY (a legitimate fresh install can hold the section
+    # for its own full bound; N waiters can chain N generations).
     """
+    import time
+
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     # "w" (not "a+") so the file pointer is at byte 0 — msvcrt.locking locks a
     # range starting at the *current* file position, so different positions
     # would mean non-overlapping (i.e. non-exclusive) locks.
     f = open_utf8(lock_path, "w")
+    deadline = time.monotonic() + wait_seconds
     try:
         if os.name == "nt":
             import msvcrt
 
-            f.seek(0)
-            # LK_LOCK blocks (with retries) until the byte range is exclusive.
-            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+            while True:
+                try:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"{what}: the lock at {lock_path} was not "
+                            f"acquired within {wait_seconds:.0f}s — another "
+                            "process holds it (a first-run install can hold "
+                            "it for its own full bound)."
+                        ) from None
+                    time.sleep(1.0)
             try:
                 yield
             finally:
@@ -793,7 +976,19 @@ def _file_lock(lock_path: Path):
         else:
             import fcntl
 
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"{what}: the lock at {lock_path} was not "
+                            f"acquired within {wait_seconds:.0f}s — another "
+                            "process holds it (a first-run install can hold "
+                            "it for its own full bound)."
+                        ) from None
+                    time.sleep(1.0)
             try:
                 yield
             finally:
@@ -857,6 +1052,19 @@ def _parse_via_subprocess(
         print(f"[Parser] Running {language} parser...", file=sys.stderr)
 
     parser_script = parser_script_path(language)
+    if parser_script is None:
+        # #273: the guard rejected the config's parser.script (absolute
+        # path, .. escape, or symlink escape out of the engine root) or the
+        # language has no script. Say THAT — a bare str(None) spawn would
+        # fail with a misleading generic RuntimeError exactly in the
+        # hostile-config scenario this guard exists for.
+        raise RuntimeError(
+            f"No runnable parser script for language {language!r}: the "
+            "registry entry has no parser.script, or its value was "
+            "rejected by the engine-root containment guard "
+            "(config/languages.json may come from an untrusted source — "
+            "see parser_script_path)"
+        )
 
     cmd = [
         sys.executable, str(parser_script),
@@ -878,6 +1086,10 @@ def _parse_via_subprocess(
         stderr=sys.stderr,
         cwd=str(_CORE_ROOT),
         timeout=1800,  # 30 min — large repos, tree-sitter/Node/Go toolchains
+        # #303: the child resolves THIS checkout by construction — the shared
+        # venv's editable .pth (re-pointable mid-scan by a concurrent session)
+        # cannot win over an explicit PYTHONPATH entry.
+        env=child_interpreter_env(),
     )
 
     if result.returncode != 0:

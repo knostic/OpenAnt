@@ -30,8 +30,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
-from utilities.file_io import read_json, write_json, open_utf8
-from core.repo_walk import walk_repository
+from utilities.file_io import open_utf8
+from core.repo_walk import ExcludedDirRecorder, walk_repository
 
 
 class RepositoryScanner:
@@ -113,6 +113,10 @@ class RepositoryScanner:
         # into, so a symlink loop back to an ancestor does not cause infinite
         # recursion / duplicate scanning.
         self._visited_dirs: Set = set()
+        # #600: a seed so the public scan_directory() never AttributeErrors
+        # pre-scan(); scan() RESETS it (the authoritative construction).
+        self._excluded_recorder = ExcludedDirRecorder(self.exclude_patterns)
+
 
     def should_exclude_directory(self, dir_name: str) -> bool:
         """Check if a directory should be excluded."""
@@ -176,6 +180,7 @@ class RepositoryScanner:
             should_exclude_directory=self.should_exclude_directory,
             on_file=_on_file,
             stats=self.stats,
+            note_excluded=self._excluded_recorder.note,
         )
 
     def scan(self) -> Dict:
@@ -197,7 +202,12 @@ class RepositoryScanner:
             'directories_read_failed': 0,
         }
 
+        # #600: the recorder resets WITH the stats (a second scan() on one
+        # instance must not double the histogram).
+        self._excluded_recorder = ExcludedDirRecorder(self.exclude_patterns)
+
         self.scan_directory(self.repo_path)
+        self._excluded_recorder.merge_into(self.stats)
 
         # Sort files by path for consistent output
         self.files.sort(key=lambda f: f['path'])

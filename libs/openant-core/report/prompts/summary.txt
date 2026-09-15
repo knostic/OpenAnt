@@ -12,72 +12,20 @@ OUTPUT FORMAT:
 **Commit:** {repository.commit_sha or "Not available"}
 **Scan Mode:** {scan_mode_line}
 **Analysis Date:** {date}
-**Application Type:** {app_type}
+**Application Type:** {app_type} — if `context_source` is "none" AND the app_type value is itself "unknown", render "unknown (not determined — no application context was generated)". An EXPLICIT operator-supplied app_type (e.g. from --app-type) must be rendered as given: an explicit assertion is never overridden by the absent-context rule.
 **Processing Level:** {pipeline_stats.processing_level or "Not available"}
 
-## Results
+## Coverage
 
-| Verdict | Count |
-|---------|-------|
-| Vulnerable | {n} |
-| Safe | {n} |
-| Protected | {n} |
-| Inconclusive | {n} |
-| Error | {n} |
+- If a top-level `discovery` key exists, add a Discovery section naming what did NOT enter the pipeline: per language (from discovery.per_language) render the figures the language DID report — the excluded-directories count (directories_excluded), the named exclusions (excluded_dir_names with counts and one example path each), the overflow (excluded_dir_names_overflow — the occurrence count of unretained prunes: hostile/oversized/non-ASCII names and dynamic names beyond the bound), and the shebang-detected count (sources ADMITTED despite extensionless names — a discovery, not an exclusion). For each MISSING field in discovery.fields_missing_by_language qualify THAT FIELD alone as unknown (not zero) — the language's other reported figures stand; a retained name with no example entry has no disclosable example — say so, never invent one; a language in discovery.languages_without_discovery_data has no discovery data at all; discovery.failed_languages' parses failed (their figures do not exist). If `discovery` is absent, add no Discovery section.
+- If a top-level `coverage` key exists, add a Coverage line: test files skipped (per language from coverage.test_files_skipped), symlinks refused, directories unreadable; also note the top-level per_language, parse_errors, excluded_languages, and degraded keys if present — a reader must see what did NOT enter the pipeline. (These are TOP-LEVEL keys beside application_type, NOT nested under pipeline_stats.) Each count sums only the languages that reported it, and is complete only when its OWN exclusion list is absent: the symlinks-refused count is qualified by `languages_without_symlinks_skipped_data`, the directories-unreadable count by `languages_without_directories_unreadable_data` — a listed language's count is unknown, not zero, and the line must say so. The other `languages_without_*` lists (e.g. `languages_without_test_skip_data`, `languages_without_coverage_data`) describe SEPARATE counters and do not qualify the symlink/unreadable totals. If `coverage` is absent, add no Coverage section at all.
 
-## Pipeline Statistics
-
-- Parsed: {n} functions from {n} files
-- Total units: {pipeline_stats.total_units}
-- Reachable units: {pipeline_stats.reachable_units}
-- After CodeQL filter: {n} units
-- Analyzed in Stage 1: {n} units
-- Verified in Stage 2: {n} findings
-
-## Per-Step Costs
-
-[Build from pipeline_stats.costs. Each key is a step name, with estimated, actual, units_requested, units_processed.]
-
-| Step | Estimated (USD) | Actual (USD) | Units |
-|------|-----------------|--------------|-------|
-| {step} | ${estimated} | ${actual} | {units_processed}/{units_requested} |
-| **Total** | **${sum_estimated}** | **${sum_actual}** | |
-
-## Per-Step Durations
-
-[Build from pipeline_stats.durations. Each key is a step name, value is seconds. Format as Xm Ys.]
-
-| Step | Duration |
-|------|----------|
-| {step} | {formatted_duration} |
-| **Total** | **{formatted_total}** |
+The Pipeline Statistics, Results, Per-Step Durations, Per-Step Costs, Confirmed Vulnerabilities, and Not Confirmed sections are rendered automatically by the server — do NOT duplicate them; write only the sections you are asked for here.
 
 ## Skipped Steps
 
 [Build from pipeline_stats.skipped_steps. Each entry has step and reason.]
-[If no steps were skipped, write: "No steps were skipped."]
-
-| Step | Reason |
-|------|--------|
-| {step} | {reason} |
-
-## Confirmed Vulnerabilities
-
-[For each VULNERABLE finding where stage2_verdict is "confirmed" or "agreed", one row.]
-[If no vulnerabilities were confirmed, write: "No vulnerabilities were confirmed."]
-
-| # | Vulnerability | Location | CWE | Verified |
-|---|--------------|----------|-----|----------|
-| 1 | {short_name} | {file:function} | CWE-{n} | {static|verified|dynamic} |
-
-## False Positives Eliminated
-
-[For each finding that Stage 2 rejected.]
-[If no false positives, write: "No false positives to report."]
-
-| Finding | Stage 1 | Stage 2 | Reason |
-|---------|---------|---------|--------|
-| {name} | {verdict} | {verdict} | {one_sentence_reason} |
+[If no steps were skipped, write: "No steps were skipped." Do NOT emit the table header or any placeholder row when the list is empty.]
 
 ## Methodology
 
@@ -93,9 +41,11 @@ INSTRUCTIONS:
 - Fill in all {placeholders} from the input data
 - If a count is zero, still show "0" in the table
 - Keep "Reason" column under 15 words
-- "Verified" column: "dynamic" if dynamic_testing exists for that finding, "verified" if stage2_verdict is "confirmed" or "agreed" (Stage 2 attacker simulation passed), else "static"
+- "Verified" column, in priority order: "dynamic" if dynamic_testing exists for that finding (a CONFIRMED Docker test); "dynamic test failed (<status>)" if dynamic_testing_attempted exists (the test ran but did not confirm — NEVER render this as verified); "verified" if stage2_verdict is "confirmed" or "agreed" (Stage 2 attacker simulation passed); else "static"
+- "Severity" column: the finding's `severity` field from the input data (critical / high / medium / low); if absent, write the empty cell
 - Language comes from repository.language
 - Commit SHA comes from repository.commit_sha; if null or missing, write "Not available"
+- Repository link comes from repository.url; if missing, write "Not available"
 - Scan Mode is derived from the top-level `diff` field on the input data:
   - If `diff` is missing or `diff.mode != "incremental"`, write: `Full`
   - If `diff.mode == "incremental"`, write:
@@ -103,8 +53,7 @@ INSTRUCTIONS:
   - When the scan was incremental, ALSO add a paragraph immediately after the metadata block:
     `> This is an incremental scan. Only the {diff.units_in_diff}/{diff.units_total_parsed} unit(s) overlapping changes between {diff.base_sha[:8]} and {diff.head_sha[:8]} were analyzed. Findings on unchanged units inherit the most recent prior verdict and are not re-examined here.`
 - Processing Level comes from pipeline_stats.processing_level; if null or missing, write "Not available"
-- Reachable units comes from pipeline_stats.reachable_units; total units from pipeline_stats.total_units
-- Per-Step Costs: iterate pipeline_stats.costs; compute totals by summing estimated and actual
-- Per-Step Durations: iterate pipeline_stats.durations; format seconds as "Xm Ys" (e.g., "2m 31s"); the "total" key is the overall duration
+- Reachable units comes from pipeline_stats.reachable_units; total units from pipeline_stats.total_units. When pipeline_stats.reachability_filter_applied is true, append " ({pipeline_stats.reachable_units} of {pipeline_stats.original_units} parsed, {pipeline_stats.reachability_reduction_percentage}% pruned by the reachability filter)" to the Reachable units line so the pruning is visible; when false, append " (reachability filtering not applied/recorded)"
+- Reachability warnings: iterate pipeline_stats.reachability_warnings; if non-empty, render each entry as its own bullet under the Reachable units line; if empty, OMIT the "Reachability warnings" line entirely
 - Skipped Steps: iterate pipeline_stats.skipped_steps; if the array is empty, write "No steps were skipped."
 - Do not add commentary or explanations outside the template

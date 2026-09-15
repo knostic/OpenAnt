@@ -22,6 +22,9 @@ from pathlib import Path
 from core.schemas import ReportResult
 from core.language_registry import fence_for_path
 from core.verdict_taxonomy import DISCLOSURE_ELIGIBLE
+from core.verdict_taxonomy import (SEVERITIES, SEVERITY_FINDING_VERDICTS,
+                                   severity_display_verdict)
+from utilities.child_interp import child_interpreter_env
 from utilities.file_io import normalize_results, open_utf8, read_json, write_json
 
 # Root of openant-core
@@ -202,6 +205,97 @@ def _dedup_caller_callee(
 # Pipeline output builder
 # ---------------------------------------------------------------------------
 
+def finding_identity_key(file_path: str, function: str, cwe_id: int) -> str:
+    """#314: a run-stable identity for a finding — a short hash over the
+    stable triple (location file, function, CWE).
+
+    VULN-NNN is assigned by list position: drop or add one finding
+    anywhere but the end and every later ID shifts, so the positional ID
+    is not a durable join key across artifacts (a stale
+    dynamic_test_results.json merges one finding's result into a
+    DIFFERENT finding). The identity key is derived from the finding's
+    identity, not its position. Short + hex so it stays human-auditable
+    alongside the display ID."""
+    import hashlib
+    try:
+        cwe_val = int(cwe_id or 0)
+    except (TypeError, ValueError):
+        cwe_val = 0
+    payload = f"{file_path}|{function}|{cwe_val}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _load_reachability_metadata(scan_dir: str) -> dict | None:
+    """Return the reachability-filter record for this scan, if one exists.
+
+    The parse step (``core/parser_adapter.apply_reachability_filter``) stamps
+    the true kept-unit count onto ``<scan_dir>/dataset.json`` under
+    ``metadata.reachability_filter``. The reporter reads it so
+    ``pipeline_stats.reachable_units`` reflects reality instead of assuming
+    every analyzed unit is reachable. Returns ``None`` when the dataset or the
+    record is absent/unreadable (an unfiltered scan, or a parser that recorded
+    none). NOTE: on a multi-language scan the merged ``dataset.json`` currently
+    carries only the first-parsed language's record (see ``dataset_merge`` /
+    BUG-2b); this reader surfaces that record and warns — full per-language
+    accounting is deferred to a follow-up.
+    """
+    dataset_path = os.path.join(scan_dir, "dataset.json")
+    if not os.path.exists(dataset_path):
+        return None
+    try:
+        dataset = read_json(dataset_path)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(dataset, dict):
+        return None
+    metadata = dataset.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    rf = metadata.get("reachability_filter")
+    return rf if isinstance(rf, dict) else None
+
+
+def _severity_fields(finding: dict) -> dict:
+    """#215: the severity + severity_source record fields for one finding.
+
+    FINDING-ONLY: rows whose final verdict is not vulnerable/bypassable
+    carry NO severity (a "low" on a safe unit defeats the triage filter the
+    reporter asked for). A model-supplied value threads present-only; a
+    DERIVED value is RE-DERIVED from the FINAL verdict — Stage 2 reclassifies
+    (finding_verifier rewrites `finding` in three places), and a stale
+    Stage-1 stamp must not outrank the final verdict. Old artifacts that
+    carry no severity at all land in the same derivation.
+    """
+    # Panel round-3: gates on the SHARED displayed verdict — a "Max
+    # iterations reached" verification downgrades the row to inconclusive
+    # (stripping its severity) exactly as report-data does, so pipeline
+    # findings, CSV, and HTML/SARIF emit one rank for one row.
+    verdict = severity_display_verdict(finding)
+    if verdict not in SEVERITY_FINDING_VERDICTS:
+        return {}
+    sev = finding.get("severity")
+    source = finding.get("severity_source")
+    # ONLY a model-supplied value keeps its rank: a corrected value rides a
+    # JSON repair whose extraction prompt may have fabricated it
+    # (conservative-default), and a derived value went stale when Stage 2
+    # reclassified the row — both re-derive from the FINAL verdict, with
+    # their provenance labels preserved.
+    if sev in SEVERITIES and source == "model":
+        # Why "model" is exempt from re-derivation and derived/corrected
+        # are not (panel doc item): "model" is the analysis-time LLM's own
+        # impact assessment — exactly what the field records, so it cannot
+        # go stale by a later verdict change the way a DERIVED stamp (a
+        # verdict-mapped fallback the reclassification invalidated) or a
+        # CORRECTED stamp (the repair prompt may have fabricated the
+        # field) can. The "stale Stage-1 stamp" wording above names the
+        # derived/corrected paths only, by design.
+        return {"severity": sev, "severity_source": "model"}
+    derived = "high" if verdict == "vulnerable" else "medium"
+    return {"severity": derived,
+            "severity_source": (source if source in ("corrected", "derived")
+                               else "derived")}
+
+
 def build_pipeline_output(
     results_path: str,
     output_path: str,
@@ -209,12 +303,32 @@ def build_pipeline_output(
     repo_url: str | None = None,
     language: str | None = None,
     commit_sha: str | None = None,
-    application_type: str = "web_app",
+    application_type: str = "unknown",
     processing_level: str | None = None,
     step_reports: list[dict] | None = None,
     context_source: str = "none",
     threat_model_sha256: str | None = None,
     threat_model_warnings: list | None = None,
+    # #322: the manual-override receipt fields (the R5 pattern — stderr is
+    # discarded by CI; the artifact is the receipt). Present-only.
+    manual_exclusions: int | None = None,
+    manual_override_warnings: list | None = None,
+    manual_override_filename: str = "",
+    skipped_steps: list | None = None,
+    skipped_step_reasons: dict | None = None,
+    # #307: the multi-language coverage fields the CHANGELOG (2026-07-22)
+    # says pipeline_output.json carries — it did not, and this producer had
+    # no parameter for them. Present-only: None (absent upstream) stays
+    # absent in the artifact; degraded=None means unknown, degraded=False
+    # is a deliberate clean assertion.
+    per_language: dict | None = None,
+    parse_errors: list | None = None,
+    excluded_languages: dict | None = None,
+    degraded: bool | None = None,
+    coverage: dict | None = None,
+    # #600: the discovery block (the excluded dirs NAMED, per language) —
+    # present-only beside coverage.
+    discovery: dict | None = None,
 ) -> tuple[str, int]:
     """Build ``pipeline_output.json`` from analysis results.
 
@@ -229,8 +343,12 @@ def build_pipeline_output(
         repo_url: Repository URL.
         language: Primary language.
         commit_sha: Commit SHA being analyzed.
-        application_type: App type for context (default ``"web_app"``).
-        processing_level: Processing level used (``"reachable"``, etc.).
+        application_type: App type for context (default ``"unknown"`` —
+            #304: a caller that omits it gets the honest unknown, never a
+            fabricated web_app).
+        processing_level: The level REQUESTED on the CLI (``"reachable"``, etc.);
+            ``pipeline_stats.effective_processing_level`` carries the level that
+            actually ran when the Python-path fallback recorded one (#328).
         step_reports: Optional list of step report dicts for duration/cost info.
         context_source: Which path supplied the security model —
             ``"threat_model"`` (a file in the scanned repo), ``"generated"``
@@ -296,7 +414,27 @@ def build_pipeline_output(
     call_graph_path = os.path.join(
         os.path.dirname(os.path.abspath(results_path)), "call_graph.json"
     )
+    # #423: the pre-dedup count is over the SAME population `vulnerable`
+    # counts (the confirmed findings list) — NOT the analyze-stage metrics.
+    # Stage-2 adjudication can retain/create vulnerabilities Stage-1
+    # detection did not flag (a live run: detect 0 vulnerable, verify 2 that
+    # stayed), so the metrics population and the findings population diverge
+    # and the #289/#381 reconciliation contract (before >= after) broke,
+    # emitting `"deduplicated": -2` — a count that can never be explained as
+    # deduplication. Deriving both from one list makes the delta a TRUE
+    # dedup delta.
+    confirmed_before_dedup = len(confirmed)
     confirmed = _dedup_caller_callee(confirmed, all_results, call_graph_path)
+    # #423 (wave r1): the disclosure/metrics overlap, split by the recount's
+    # own predicates (verifier.py:497-513) — the confirmed rows the recount
+    # ALSO buckets into errors / needs_review, counted once (in vulnerable,
+    # via the findings list) and subtracted from those buckets.
+    _k_overlap_error = sum(1 for c in confirmed if c.get("error"))
+    _k_overlap_needs = sum(
+        1 for c in confirmed
+        if not c.get("error")
+        and isinstance(c.get("verification"), dict)
+        and c["verification"].get("incomplete"))
 
     # Build findings in PipelineOutput schema
     findings_data = []
@@ -362,8 +500,17 @@ def build_pipeline_output(
                 else:
                     flow_str = _coerce_to_str(data_flow)
                 parts.append("Data flow: " + flow_str)
-            if finding.get("verification_explanation"):
-                parts.append("Verification: " + _coerce_to_str(finding["verification_explanation"]))
+            # #534: read Stage 2's explanation from where the verify stage
+            # actually writes it (finding["verification"]["explanation"]),
+            # with the legacy top-level key as fallback — the old read was a
+            # hook to a key NO PRODUCER wrote (the disclosure body could
+            # assert what Stage 2 refuted).
+            _v = finding.get("verification")
+            if not isinstance(_v, dict):
+                _v = {}
+            _v_expl = _v.get("explanation") or finding.get("verification_explanation")
+            if _v_expl:
+                parts.append("Verification: " + _coerce_to_str(_v_expl))
             steps_to_reproduce = "\n\n".join(parts) if parts else None
 
         # Determine stage2 verdict.
@@ -390,12 +537,30 @@ def build_pipeline_output(
         elif verification.get("incomplete"):
             stage2_verdict = "unverified"
         elif verification:
-            stage2_verdict = "rejected"
+            # #283: agree=False + COMPLETE does not mean "not a finding".
+            # finding_verifier writes the corrected verdict onto
+            # r["finding"] as its authoritative call; a disagreement that
+            # reclassifies vulnerable -> bypassable (still real) must stay
+            # DISCLOSURE_ELIGIBLE — the "final verdict, not the agree flag"
+            # rule the stats side already uses (verifier.py:321,
+            # _write_verified_results). Only a corrected verdict that is
+            # ITSELF disclosure-dropped maps to "rejected".
+            corrected = str(finding.get("finding") or finding.get("verdict", "")).lower()
+            if corrected in ("vulnerable", "bypassable"):
+                stage2_verdict = corrected
+            else:
+                stage2_verdict = "rejected"
         else:
             stage2_verdict = finding.get("finding", "vulnerable")
 
+        _file = route_key.split(":")[0] if ":" in route_key else "unknown"
+        _func = route_key.split(":", 1)[1] if ":" in route_key else route_key
+        _cwe = vuln.get("cwe_id") or finding.get("cwe_id") or full_result.get("cwe_id", 0)
         findings_data.append({
             "id": f"VULN-{i+1:03d}",
+            # #314: the run-stable join key (see finding_identity_key);
+            # VULN-NNN stays as the display ID.
+            "identity_key": finding_identity_key(_file, _func, _cwe),
             "name": vuln.get("name", finding.get("finding", "Unknown Vulnerability")),
             "short_name": vuln.get("short_name", finding.get("verdict", "vuln")),
             "location": {
@@ -411,6 +576,48 @@ def build_pipeline_output(
             "cwe_name": vuln.get("cwe_name") or finding.get("cwe_name") or full_result.get("cwe_name", "Unknown"),
             "stage1_verdict": finding.get("verdict", finding.get("finding", "vulnerable")),
             "stage2_verdict": stage2_verdict,
+            # #534: Stage 2's text reaches the disclosure prompt as OWN
+            # record keys. Fresh-wins precedence (the verify dict is the
+            # authoritative Stage-2 record — the same precedence as the
+            # steps-rebuild path); coerced (dict-shaped explanations are a
+            # real model-output class); the note is the TOP-LEVEL
+            # verification_note the verifier actually writes; present-only.
+            **({"verification_explanation":
+                    _coerce_to_str(verification.get("explanation")
+                                  or finding.get("verification_explanation"))}
+               if (isinstance(verification, dict) and verification.get("explanation"))
+               or finding.get("verification_explanation") else {}),
+            **({"verification_note": finding["verification_note"]}
+               if finding.get("verification_note") else {}),
+            # #534 gate fold (fable+astra): the consistency pass rewrites
+            # the verdict WITHOUT touching verification["explanation"] — the
+            # banner can stamp an updated status beside the explanation that
+            # argued for the original one. Carry the update present-only so
+            # the banner can attribute the pre-update explanation correctly.
+            **({"consistency_update": finding["consistency_update"]}
+               if isinstance(finding.get("consistency_update"), dict) else {}),
+            # #215 (partial repair): the two FINDING-SEMANTIC transit
+            # fields — confidence (float 0.0-1.0 per the verdict schema,
+            # json_corrector.py:32; NOT analysis_core.py:181's error-shape
+            # default) and json_corrected (provenance: the finding's JSON
+            # was model-repaired, json_corrector.py:278) — populated
+            # upstream, surviving into results_verified.json, previously
+            # DROPPED by this fixed-key record. Present-only: absent
+            # upstream stays absent (never a fabricated 0/False — a REAL
+            # falsy value threads through). elapsed_seconds/prompt_length
+            # stay OUT (per-unit step telemetry, not finding metadata).
+            **({"confidence": finding["confidence"]}
+               if finding.get("confidence") is not None else {}),
+            **({"json_corrected": finding["json_corrected"]}
+               if finding.get("json_corrected") is not None else {}),
+            # #215: a rankable severity on EVERY finding. Present-only for a
+            # model/stamped value. Two coverage paths, distinct (panel doc
+            # item): OLD results_verified.json artifacts are covered by the
+            # READ-TIME derivation above for free; resumed PRE-PR checkpoint
+            # rows are NOT — they are covered upstream by the prompt-template
+            # fingerprint invalidation (the analysis prompt changed, so the
+            # rows are re-analyzed, not adopted), not by this read-time path.
+            **_severity_fields(finding),
             "description": description,
             "vulnerable_code": vulnerable_code,
             "vulnerable_code_section": vulnerable_code_section,
@@ -422,16 +629,177 @@ def build_pipeline_output(
     # Compute costs and durations from step reports
     costs = {}
     durations = {}
-    skipped_steps = []
+    # #302: Stage 2's SCOPE from the verify step report — the denominator
+    # (adjudicated N of M analyzed units; the rest were not re-examined) and
+    # the direction of its changes, so the summary generator's single input
+    # can state them. Present-only: absent when no verify step ran.
+    _verify_scope: dict = {}
+    for sr in (step_reports or []):
+        if sr.get("step") == "verify":
+            _vs = sr.get("summary", {})
+            if isinstance(_vs, dict):
+                for _k in ("findings_input", "units_analyzed_total",
+                           "downgraded", "upgraded"):
+                    if isinstance(_vs.get(_k), int) and not isinstance(
+                            _vs.get(_k), bool):
+                        _verify_scope[_k] = _vs[_k]
+                if _vs.get("same_model_verification") is not None:
+                    _verify_scope["same_model_verification"] = bool(
+                        _vs["same_model_verification"])
+            break
+
+    # #535: re-source the Stage-1 population facts from the step reports
+    # (the same pattern as _verify_scope). units_analyzed's old formula
+    # (total_units - metrics.errors) is exact on the analyze-only path but
+    # contaminated whenever verify ran: results_verified's recount buckets a
+    # Stage-2 verify ERROR on an already-analyzed unit into `errors`, so a
+    # 120-analyzed run with one verify error reported 119 analyzed. The
+    # analyze step report's own `analyzed` is the authoritative Stage-1
+    # count. parsed_units: the parse stage's total (the pre-filter
+    # population — original_units is NOT a reliable parse count; it falls
+    # back to total_units when no reachability record exists).
+    _stage1_stats: dict = {}
+    for sr in (step_reports or []):
+        _ss = sr.get("summary")
+        if not isinstance(_ss, dict):
+            continue
+        if sr.get("step") == "parse":
+            if isinstance(_ss.get("total_units"), int) and not isinstance(
+                    _ss.get("total_units"), bool):
+                _stage1_stats["parsed_units"] = _ss["total_units"]
+        elif sr.get("step") == "analyze":
+            # #535: analyzed is flat; the error count lives under
+            # error_count (the #285 key) with verdicts.errors nested —
+            # the flat `errors` key has no producer here.
+            if isinstance(_ss.get("analyzed"), int) and not isinstance(
+                    _ss.get("analyzed"), bool):
+                _stage1_stats["units_analyzed"] = _ss["analyzed"]
+            _err = _ss.get("error_count")
+            if not isinstance(_err, int) or isinstance(_err, bool):
+                _v = _ss.get("verdicts")
+                _err = _v.get("errors") if isinstance(_v, dict) else None
+            if isinstance(_err, int) and not isinstance(_err, bool):
+                _stage1_stats["stage1_errors"] = _err
+
     if step_reports:
         for sr in step_reports:
             step = sr.get("step", "unknown")
-            if sr.get("cost_usd"):
+            # #535: `is not None` — a $0 or <0.5s step is a REAL step
+            # (parse), not an absence; truthiness dropped it from the tables.
+            if sr.get("cost_usd") is not None:
                 costs[step] = {"actual": sr["cost_usd"]}
-            if sr.get("duration_seconds"):
+            if sr.get("duration_seconds") is not None:
                 durations[step] = sr["duration_seconds"]
 
+    # Populate skipped_steps from the authoritative ScanResult skip data. The
+    # reporter is otherwise blind to skips (it reads only cost/duration above),
+    # so pipeline_stats.skipped_steps was always [] — a crashed/skipped step
+    # (most importantly a non-aborting Stage-2 verify failure) then rendered in
+    # the human summary as "No steps were skipped", indistinguishable from a
+    # clean fully-verified scan. Report-fidelity only: per-finding disclosure is
+    # unchanged (unverified findings stay included, labeled stage2_verdict
+    # 'vulnerable' vs 'confirmed'); this does NOT gate disclosure.
+    _skip_reasons = skipped_step_reasons or {}
+    skipped_steps_detail = [
+        {"step": s, "reason": _skip_reasons.get(s, "")}
+        for s in (skipped_steps or [])
+    ]
+
     total_units = metrics.get("total", len(all_results))
+
+    # F1: report the TRUE reachable count from the reachability filter's record
+    # (persisted to <scan_dir>/dataset.json by the parse step) instead of
+    # fabricating reachable_units = total_units. Surfacing original_units +
+    # the reduction makes the pruning visible (a report that showed only the
+    # kept count gave no hint units were pruned — the neqo misdiagnosis vector).
+    # When no record exists but a filtering level was requested, warn rather
+    # than silently assert full reachability (the free-function-parser /
+    # not-recorded blind spot); also surface any blackout warning the filter
+    # recorded (previously written to metadata only, with no report consumer).
+    _reach = _load_reachability_metadata(
+        os.path.dirname(os.path.abspath(results_path))
+    )
+    reachability_warnings: list[str] = []
+    _reach_telemetry: dict = {}
+    reachability_filter_applied = _reach is not None
+    reachable_units = total_units
+    original_units = total_units
+    reachability_reduction_percentage = None
+    if _reach is not None:
+        if isinstance(_reach.get("reachable_units"), int):
+            reachable_units = _reach["reachable_units"]
+        if isinstance(_reach.get("original_units"), int):
+            original_units = _reach["original_units"]
+        if isinstance(_reach.get("reduction_percentage"), (int, float)):
+            reachability_reduction_percentage = _reach["reduction_percentage"]
+        _rf_warning = _reach.get("warning")
+        if isinstance(_rf_warning, str) and _rf_warning:
+            reachability_warnings.append(_rf_warning)
+        # #520 (the fable+astra fold): the seed-quality advisory forwards on
+        # the same human + envelope channel as the reserved warning — its own
+        # key at the producer, delivered here so it can never be silently
+        # dropped for lack of a forwarding path.
+        _rf_blackout = _reach.get("blackout_advisory")
+        if isinstance(_rf_blackout, str) and _rf_blackout:
+            reachability_warnings.append(_rf_blackout)
+        # #328: the Python-path level fallback (codeql/exploitable accepted,
+        # reachability-only run) reaches the artifact instead of dying on
+        # stderr. Present-only forward — records without the key (non-Python
+        # paths, plain reachable) are untouched, so the forward never
+        # fabricates a fallback.
+        _fb_warning = _reach.get("level_fallback_warning")
+        if isinstance(_fb_warning, str) and _fb_warning:
+            reachability_warnings.append(_fb_warning)
+        # The level that actually ran, when the record says one (the Python
+        # path always writes it; per-language records don't, and stay as-is).
+        _eff = _reach.get("effective_processing_level")
+        if isinstance(_eff, str) and _eff:
+            _reach_telemetry["effective_processing_level"] = _eff
+        # #301: the prune classification (orphan = missing-edge ROOT
+        # candidate; dead_cluster = downstream shadow) previously reached no
+        # consumer — forward it present-only so pipeline_output carries the
+        # signal that distinguishes genuinely-dead code from missing edges.
+        for _tk in ("pruned_orphan_count", "pruned_in_dead_cluster_count",
+                    "pruned_forward_called_by_reachable_count",
+                    # #602: the promoted-vs-retained decomposition — the
+                    # counterfactual structural baseline and the units the
+                    # LLM extras added beyond it (present-only: a language
+                    # that could not measure the baseline contributes
+                    # nothing, never a fabricated 0).
+                    "structural_reachable_units", "units_newly_reachable",
+                    "reachability_baseline_languages"):
+            _tv = _reach.get(_tk)
+            if isinstance(_tv, int):
+                _reach_telemetry[_tk] = _tv
+        _bf = _reach.get("pruned_by_file")
+        if isinstance(_bf, dict):
+            _reach_telemetry["pruned_by_file"] = _bf
+        # #602: the synthetic-only baseline marker (a str) — forwarded
+        # like the advisory below, not summed.
+        _bl = _reach.get("reachability_baseline")
+        if isinstance(_bl, str) and _bl:
+            _reach_telemetry["reachability_baseline"] = _bl
+        _oa = _reach.get("orphan_advisory")
+        if isinstance(_oa, str) and _oa:
+            _reach_telemetry["orphan_advisory"] = _oa
+    elif total_units > 0 and (processing_level or "").lower() not in ("", "all", "none"):
+        reachability_warnings.append(
+            f"Reachability filtering was requested (level={processing_level!r}) "
+            "but no reachability_filter record was found; reachable_units falls "
+            "back to total_units and may overstate reachability."
+        )
+
+    # reachable_units is a parse-stage count (units the filter kept); total_units
+    # is the analyze-stage total (which --limit / subset runs can truncate below
+    # the kept set). Guard the cross-stage case so the report never silently
+    # shows reachable_units > total_units without explanation.
+    if isinstance(reachable_units, int) and reachable_units > total_units:
+        reachability_warnings.append(
+            f"reachable_units ({reachable_units}) exceeds analyzed total_units "
+            f"({total_units}): analysis covered a subset of the reachable units "
+            "(e.g. --limit). reachable_units is the reachability filter's kept "
+            "count; units_analyzed reflects what was actually analyzed."
+        )
 
     pipeline_output = {
         "repository": {
@@ -442,6 +810,14 @@ def build_pipeline_output(
         },
         "analysis_date": datetime.now(timezone.utc).isoformat(),
         "application_type": application_type,
+        # #307: the CHANGELOG-claimed coverage fields, present-only.
+        **({"per_language": per_language} if per_language is not None else {}),
+        **({"parse_errors": parse_errors} if parse_errors is not None else {}),
+        **({"excluded_languages": excluded_languages}
+           if excluded_languages is not None else {}),
+        **({"degraded": degraded} if degraded is not None else {}),
+        **({"coverage": coverage} if coverage is not None else {}),
+        **({"discovery": discovery} if discovery is not None else {}),
         # Which path supplied the security model (Plan DoD #9). Additive key;
         # Go consumers use comma-ok access so it is safe to add.
         "context_source": context_source,
@@ -453,19 +829,80 @@ def build_pipeline_output(
         # Over-permissive-model warnings (previously stderr-only). Emitted as a
         # list so the report header can render them; empty list when none.
         "threat_model_warnings": list(threat_model_warnings or []),
+        **({"manual_exclusions": manual_exclusions}
+           if manual_exclusions is not None else {}),
+        **({"manual_override_warnings": list(manual_override_warnings or [])}
+           if manual_override_warnings else {}),
+        **({"manual_override_filename": manual_override_filename}
+           if manual_override_filename else {}),
         "pipeline_stats": {
             "total_units": total_units,
-            "reachable_units": total_units,
-            "units_analyzed": total_units - metrics.get("errors", 0),
+            "reachable_units": reachable_units,
+            # Additive reachability provenance (all tolerated by the untyped
+            # pipeline_stats dict in report/schema.py):
+            "original_units": original_units,
+            "reachability_filter_applied": reachability_filter_applied,
+            "reachability_reduction_percentage": reachability_reduction_percentage,
+            "reachability_warnings": reachability_warnings,
+            **_reach_telemetry,
+
+            **_verify_scope,
+            # #535: units_analyzed re-sourced from the analyze step report
+            # (see _stage1_stats above). Fallback: with no analyze report and
+            # no verify report, the analyze-only formula is exact; with
+            # verify having run, the subtraction is contaminated — omit
+            # (present-only) rather than emit a wrong integer. The rest of
+            # _stage1_stats (parsed_units, stage1_errors) ALWAYS spreads.
+            **_stage1_stats,
+            **({"units_analyzed":
+                    total_units - metrics.get("errors", 0)}
+               if "units_analyzed" not in _stage1_stats
+               and not _verify_scope else {}),
             "processing_level": processing_level,
             "costs": costs,
             "durations": durations,
-            "skipped_steps": skipped_steps,
+            "skipped_steps": skipped_steps_detail,
         },
         "results": {
-            "vulnerable": metrics.get("vulnerable", 0) + metrics.get("bypassable", 0),
-            "safe": metrics.get("safe", 0) + metrics.get("protected", 0),
+            # #289: re-derive from the DEDUPED findings list, not from
+            # metrics (the pre-dedup count) — the same file must never
+            # report 183 in results.vulnerable alongside 175 entries in
+            # findings. The pre-dedup count and the dedup delta are
+            # explicit so the difference is explainable, not contradictory.
+            # #423: before_dedup counts the SAME list's PRE-dedup length
+            # (captured above _dedup_caller_callee), so the delta is a true
+            # dedup delta — never negative (the analyze-metrics population
+            # diverges from the findings population when Stage-2 retains
+            # vulnerabilities Stage-1 did not flag).
+            "vulnerable": len(findings_data),
+            "vulnerable_before_dedup": confirmed_before_dedup,
+            "deduplicated": confirmed_before_dedup - len(findings_data),
+            # #289: protected is its OWN key — the lossy safe-fold destroyed
+            # a verdict the pipeline computes and the template has a row for.
+            "safe": metrics.get("safe", 0),
+            "protected": metrics.get("protected", 0),
             "inconclusive": metrics.get("inconclusive", 0),
+            # #423 (wave r1, three axes — the F13 partition): the metrics
+            # recount and the disclosure list are TWO populations that
+            # deliberately overlap (verifier.py's #284 note keeps
+            # errored/incomplete rows whose Stage-1 finding is vulnerable in
+            # confirmed_findings; the recount buckets those same rows into
+            # errors/needs_review first). With `vulnerable` counting the
+            # disclosure list, the overlap rows are counted ONCE here and
+            # their metrics-bucket entries are subtracted below — otherwise
+            # the partition over-sums total by exactly the overlap (the
+            # pre-round fix traded the negative `deduplicated` for this
+            # silent +k on the live run's own shape).
+            # F13: errored units are part of `total` (see units_analyzed
+            # above), so the results buckets must include them or they
+            # cannot reconcile to `total` — MINUS the overlap already
+            # counted in `vulnerable`.
+            "errors": max(0, metrics.get("errors", 0) - _k_overlap_error),
+            # #284 (wave catch): incomplete verifications are ALSO part of
+            # total — the partition must carry needs_review or the buckets
+            # cannot reconcile (the F13 invariant, extended) — minus the
+            # same overlap.
+            "needs_review": max(0, metrics.get("needs_review", 0) - _k_overlap_needs),
             "total": total_units,
         },
         "findings": findings_data,
@@ -531,7 +968,19 @@ def generate_html_report(
     # No cwd=_CORE_ROOT: these are now `-m` package invocations resolved through
     # the installed distribution, not source-tree-relative scripts. Depending on
     # cwd is what made them unrunnable from an installed wheel.
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    # #303: the child resolves THIS checkout by construction (PYTHONPATH
+    # precedes site-packages, so the re-pointable shared-venv .pth cannot
+    # win). -P keeps the untrusted CWD off sys.path; the env keeps the
+    # venv's .pth off the resolution.
+    # #325 (wave r1 correction): the last two unbounded subprocess.run sites
+    # IN CORE/ (the issue's item 3; parsers/<lang>/test_pipeline.py and the
+    # file_io.run_utf8 pass-throughs remain unbounded on their DIRECT CLI
+    # invocations, capped only through _parse_via_subprocess's 1800s):
+    # the timeout convention PR #135 established for parse steps was never
+    # extended to the other call sites). 30 min matches the parse bound; the
+    # named diagnosis on expiry, not a bare TimeoutExpired traceback.
+    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr,
+                            env=child_interpreter_env(), timeout=1800)
 
     if result.returncode != 0:
         raise RuntimeError(f"HTML report generation failed (exit code {result.returncode})")
@@ -566,7 +1015,10 @@ def generate_csv_report(
     # No cwd=_CORE_ROOT: these are now `-m` package invocations resolved through
     # the installed distribution, not source-tree-relative scripts. Depending on
     # cwd is what made them unrunnable from an installed wheel.
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    # #303: same as the HTML path above — explicit resolution for the child.
+    # #325: the CSV twin of the HTML bound above.
+    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr,
+                            env=child_interpreter_env(), timeout=1800)
 
     if result.returncode != 0:
         raise RuntimeError(f"CSV export failed (exit code {result.returncode})")
@@ -594,7 +1046,6 @@ def generate_summary_report(
     Returns:
         ReportResult with the output path and usage info.
     """
-    import json
     from report.generator import generate_summary_report as _generate_summary, merge_dynamic_results
     from report.schema import validate_pipeline_output, ValidationError
     from utilities.llm import (
@@ -687,7 +1138,6 @@ def generate_disclosure_docs(
     Returns:
         ReportResult with the output directory path and usage info.
     """
-    import json
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from report.generator import generate_disclosure as _generate_disclosure, _merge_usage, merge_dynamic_results
     from report.schema import validate_pipeline_output, ValidationError
@@ -804,13 +1254,37 @@ def _record_usage_in_tracker(usage: dict, binding):
                 input_tokens=usage["input_tokens"],
                 output_tokens=usage["output_tokens"],
                 pricing=lookup_pricing(binding),
+                # #211 pass-through capture: verbatim when the generator's
+                # usage dict carries it; never in the cost math.
+                usage_details=usage.get("usage_details"),
             )
-    except Exception:
-        pass  # Best effort — don't break report generation
+    except Exception as exc:
+        # #605: the drop is COUNTED and NAMED, never silent — the report
+        # generation continues (the artifact is already written), but the
+        # accounting failure surfaces in the step/scan artifacts (the
+        # module-level counter) and on stderr with the exception class.
+        # The counter import is GUARDED separately: the swallowed exception
+        # may itself have been the import failure inside the try — the
+        # fallback never re-raises out of this handler (the pristine `pass`
+        # never raised; the fix must not either).
+        try:
+            from utilities.llm_client import record_accounting_error
+            record_accounting_error()
+        except Exception:
+            # The counting mechanism is unavailable: the stderr line below
+            # is the only remaining signal — still never silent.
+            print("[report] accounting hand-off failed AND the counter "
+                  "is unavailable", file=sys.stderr)
+        print(f"[report] accounting hand-off failed "
+              f"({type(exc).__name__}): {exc}", file=sys.stderr)
 
 
 def _usage_to_info(usage: dict):
-    """Convert a usage dict to a UsageInfo dataclass."""
+    """Convert a usage dict to a UsageInfo dataclass.
+
+    #598: the incompleteness metadata flows through — the CLI report's
+    usage must never claim a complete cost the pipeline did not have
+    (the same #216 contract the tracker path enforces)."""
     from core.schemas import UsageInfo
     return UsageInfo(
         total_calls=1,
@@ -818,4 +1292,6 @@ def _usage_to_info(usage: dict):
         total_output_tokens=usage.get("output_tokens", 0),
         total_tokens=usage.get("total_tokens", 0),
         total_cost_usd=usage.get("cost_usd", 0.0),
+        cost_incomplete=bool(usage.get("cost_incomplete", False)),
+        unpriced_models=list(usage.get("unpriced_models") or []),
     )

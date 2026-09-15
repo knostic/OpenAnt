@@ -62,7 +62,7 @@ from .registry import (
     resolve_llm_config,
     resolve_provider,
 )
-from .helpers import lookup_pricing, simple_text
+from .helpers import DEFAULT_MAX_TOKENS, lookup_pricing, simple_completion, simple_text
 
 __all__ = [
     # adapter
@@ -109,5 +109,7 @@ __all__ = [
     "resolve_provider",
     # helpers
     "lookup_pricing",
+    "DEFAULT_MAX_TOKENS",
+    "simple_completion",
     "simple_text",
 ]

@@ -34,15 +34,14 @@ Output (JSON):
 """
 
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional
 
 import tree_sitter_php as ts_php
 from tree_sitter import Language, Parser
-from utilities.file_io import read_json, write_json, open_utf8
+from utilities.file_io import read_json, open_utf8
 
 
 PHP_LANGUAGE = Language(ts_php.language_php())

@@ -1,0 +1,128 @@
+package python
+
+import (
+	"io"
+	"os"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+// Round-3 panel findings, locked by execution:
+//
+// 1. Stderr-drain bound. The #433 rework bounded the READ-ERROR path's
+// stderr drain via Wait-first, but the NORMAL path's <-stderrDone was
+// bounded only by the deadline: a descendant holding ONLY the stderr
+// write-end kept the streamer blocked until ctx.Done() fired the
+// watchdog. Executed probe (pre-fix binary, 15s budget): a child that
+// printed a complete envelope and exited in 0.1s hung the invocation
+// 15.77s and returned under a spurious "deadline fired ... recovered"
+// note. The stderrDrainGrace close bounds the drain by the CHILD's exit
+// (+grace), not the deadline.
+//
+// 2. Kill-artifact exit code. In the recovered-envelope branch the child's
+// exit code under a fired deadline is the KILL's artifact — Unix a negative
+// signal code (normalizeExit maps to the conservative 2), Windows
+// TerminateProcess's exit 1, which is indistinguishable from a legitimate
+// vulnerabilities-found exit, so a killed Windows run surfaced exit 1 for a
+// recovered envelope. exitErrIsKillArtifact now routes every platform to the
+// conservative 2. (Unix-only test — the Windows branch needs a Windows
+// runner; the mapping is the same statement of code.)
+
+// A complete envelope is in hand and the child has exited, but a descendant
+// holds ONLY the stderr write-end: the invocation must return promptly
+// (bounded by the child's exit + WaitDelay, NOT the deadline), with no
+// deadline ever firing. #431 (wave r1 sonnet): the old stderrDrainGrace
+// mutation was stale — the variable's only production call site was removed
+// by the managed-writers refactor; the test now rides (and pins) the
+// WaitDelay bound itself.
+func TestInvoke_StderrOnlyDescendantDoesNotHang(t *testing.T) {
+	t.Setenv("OPENANT_INVOKE_TIMEOUT", "30s")
+	s := writeScript(t, `printf '{"status":"success","errors":[]}'
+sleep 60 >&2 &
+exit 0
+`)
+	start := time.Now()
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("envelope must be returned despite the stderr descendant: %v", err)
+	}
+	if res.Envelope.Status != "success" {
+		t.Fatalf("envelope status = %q, want success", res.Envelope.Status)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("exit code = %d, want 0", res.ExitCode)
+	}
+	if elapsed > 15*time.Second {
+		t.Fatalf("the drain must be bounded by the child's exit (+grace), not the deadline: took %v", elapsed)
+	}
+}
+
+// A child that wrote a complete envelope and was then KILLED by the deadline
+// (signal death) surfaces the conservative exit 2 with the envelope's own
+// status preserved — never the kill artifact's code through the 0/1/2
+// contract. Unix-only (signal death); Windows maps the same statement via
+// exitErrIsKillArtifact's TerminateProcess branch.
+func TestInvoke_KillArtifactExitCodeIsConservative(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("signal-death artifact is Unix; Windows takes the same mapping via exitErrIsKillArtifact")
+	}
+	// #585: the deadline is the fast-phase margin — the envelope printf
+	// must land before the deadline fires. The 2s this replaced carried
+	// the same load-spawn race as the invoke_ctx trio. This child STAYS
+	// ALIVE (exec sleep 60) — no WaitDelay ceiling — so the budget
+	// follows the envelope family's incident-bought rule (see
+	// invoke_envelope_test.go:30-37): 30s, the stalled-child-beatable
+	// shape.
+	t.Setenv("OPENANT_INVOKE_TIMEOUT", "30s")
+	s := writeScript(t, `printf '{"status":"success","errors":[]}'
+exec sleep 60
+`)
+	r, w, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = w
+	res, err := Invoke(s, []string{"analyze", "."}, "", false, "", nil)
+	os.Stderr = old
+	w.Close()
+	b, _ := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("a complete envelope must win over the deadline kill: %v", err)
+	}
+	if res.Envelope.Status != "success" {
+		t.Fatalf("envelope status = %q, want success", res.Envelope.Status)
+	}
+	if res.ExitCode != 2 {
+		t.Fatalf("exit code = %d, want the conservative 2 — the kill artifact must never surface as clean/vulns-found", res.ExitCode)
+	}
+	if !strings.Contains(string(b), envelopeRecoveredMarker) {
+		t.Fatalf("the recovery notice must be visible on stderr when not quiet; got: %q", string(b))
+	}
+}
+
+// #431 (wave r1 sonnet): the ENVELOPE path's exit-code extraction missed
+// exec.ErrWaitDelay (the managed-writers shape when a descendant holds a
+// write-end) — a scan that legitimately exits 1 ("vulnerabilities found")
+// beside a held pipe was silently reported as exit 0. ProcessState carries
+// the real code.
+func TestInvoke_Exit1WithHeldPipeKeepsExit1(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script children (the package convention)")
+	}
+	t.Setenv("OPENANT_INVOKE_TIMEOUT", "30s")
+	s := writeScript(t, `printf '{"status":"success","errors":[]}'
+sleep 60 &
+exit 1
+`)
+	res, err := Invoke(s, []string{"analyze", "."}, "", true, "", nil)
+	if err != nil {
+		t.Fatalf("the envelope must win over the held write-end: %v", err)
+	}
+	if res.Envelope.Status != "success" {
+		t.Fatalf("envelope status = %q, want success", res.Envelope.Status)
+	}
+	if res.ExitCode != 1 {
+		t.Fatalf("exit code = %d, want 1 (the vulnerabilities-found exit was silently dropped to 0 by the ErrWaitDelay miss)", res.ExitCode)
+	}
+}

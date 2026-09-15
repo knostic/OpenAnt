@@ -25,7 +25,6 @@ import json
 import types
 from pathlib import Path
 
-import pytest
 
 import report.html_report as generate_report
 import report.csv_export as export_csv

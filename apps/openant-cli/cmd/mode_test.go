@@ -30,6 +30,12 @@ func TestValidateModeFlags(t *testing.T) {
 		{name: "incremental + diffBase", opts: modeOpts{incremental: true, diffBase: "x"}, wantErr: "mutually exclusive"},
 		{name: "incremental + pr", opts: modeOpts{incremental: true, pr: 1}, wantErr: "mutually exclusive"},
 
+		{name: "staged alone", opts: modeOpts{staged: true}, wantErr: ""},
+		{name: "staged + diffBase", opts: modeOpts{staged: true, diffBase: "x"}, wantErr: "mutually exclusive"},
+		{name: "staged + pr", opts: modeOpts{staged: true, pr: 1}, wantErr: "mutually exclusive"},
+		{name: "staged + incremental", opts: modeOpts{staged: true, incremental: true}, wantErr: "mutually exclusive"},
+		{name: "full + staged", opts: modeOpts{full: true, staged: true}, wantErr: "cannot be combined"},
+
 		{name: "invalid scope", opts: modeOpts{scope: "everything"}, wantErr: "invalid --diff-scope"},
 		{name: "valid scope", opts: modeOpts{scope: "callers"}, wantErr: ""},
 	}
@@ -99,6 +105,26 @@ func TestSelectModeIncrementalUsesLatestSuccess(t *testing.T) {
 	}
 	if got.Base != "fullsha" {
 		t.Errorf("expected base=fullsha, got %s", got.Base)
+	}
+}
+
+func TestSelectModeStagedSetsStagedFlag(t *testing.T) {
+	withTempHome(t)
+	got, err := selectMode(modeOpts{staged: true, projectName: "p"})
+	if err != nil {
+		t.Fatalf("selectMode: %v", err)
+	}
+	if got.Kind != config.ScanKindDiff {
+		t.Errorf("expected diff, got %s", got.Kind)
+	}
+	if !got.Staged {
+		t.Error("expected Staged=true")
+	}
+	if got.Base != "" {
+		t.Errorf("staged decision should leave Base empty, got %q", got.Base)
+	}
+	if got.Scope == "" {
+		t.Error("expected default scope to be applied")
 	}
 }
 

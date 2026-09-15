@@ -5,7 +5,6 @@ both are silent: the scan exits 0 and reports success while producing wrong or
 missing results.
 """
 
-import json
 
 import pytest
 

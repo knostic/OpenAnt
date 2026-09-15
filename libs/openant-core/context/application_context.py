@@ -33,7 +33,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from utilities.file_io import open_utf8, read_json, read_repo_file, write_json
-from utilities.llm import PhaseBinding, simple_text
+from utilities.llm import PhaseBinding, simple_completion
 
 load_dotenv()
 
@@ -129,6 +129,14 @@ class ApplicationContext:
     confidence: float = 0.0
     evidence: list[str] = field(default_factory=list)
     source: str = "llm"  # "llm", "manual", "merged", or "threat_model"
+    # #322 (wave r1): the manual-override receipt rides the context itself —
+    # stderr is discarded by CI; the field IS the receipt. Set by
+    # _application_context_from_override (the warnings it printed) so the
+    # scanner can carry them onto the result and the deliverable.
+    override_warnings: list = field(default_factory=list)
+    # the OVERRIDE FILE that matched (e.g. ".openant.json") — the banner
+    # names the file actually present in the repo, not a generic guess.
+    override_filename: str = ""
 
     # --- Custom threat-model extension (schema v1, see context/threat_model.py) ---
     #
@@ -143,8 +151,13 @@ class ApplicationContext:
     # file is handed to the pipeline — the precondition for comparing them.
     # Provenance of a repo-supplied threat model, for scan-artifact visibility.
     # Both are additive/defaulted so save_context(asdict)/load_context(**data)
-    # round-trip unchanged. sha256 is over the raw file bytes; permissive_warnings
-    # is warn_permissive_threat_model's output, which was previously discarded.
+    # round-trip unchanged. #546 generalizes source_sha256 to the
+    # DETERMINISTIC-DERIVATION identity of whichever arm produced the
+    # context: the threat-model file's raw bytes (that arm), the override
+    # file's content (the manual arm), or the gathered CONTEXT sources'
+    # digest (the LLM arm) — the checkpoint family's resume keys fold it;
+    # permissive_warnings is warn_permissive_threat_model's output, which
+    # was previously discarded.
     source_sha256: str | None = None
     permissive_warnings: list = None
     threat_model_version: int | None = None
@@ -254,6 +267,20 @@ MANUAL_OVERRIDE_FILES = [
     ".openant.json",
 ]
 
+# #322: the manual-override path (authored by the SCANNED repository — the
+# trust boundary the source itself documents) had no bound on
+# not_a_vulnerability, unlike the threat-model path (which caps file bytes
+# and warns on the criteria ratio). Every entry splices into the Stage-1
+# prompt under "Do NOT flag as vulnerable" — an unbounded list silently
+# narrows what the analyser will report. Cap it and WARN (never silently
+# truncate without a receipt).
+MAX_MANUAL_EXCLUSIONS = 50
+
+# The count-keyed permissive warning (this path has no criteria for a ratio,
+# so count-keyed). The threshold is well under the cap so a hostile-but-
+# plausible list still warns even when it fits.
+MANUAL_EXCLUSIONS_WARN_THRESHOLD = 25
+
 # Priority files to read for context generation
 CONTEXT_FILES = [
     "README.md",
@@ -303,6 +330,8 @@ def gather_context_sources(repo_path: Path) -> dict[str, str]:
         Dictionary mapping filename to content.
     """
     sources = {}
+    skipped: list[str] = []
+    truncated: list[str] = []
 
     # Read priority files
     for filename in CONTEXT_FILES:
@@ -311,15 +340,46 @@ def gather_context_sources(repo_path: Path) -> dict[str, str]:
             # Guarded, and bounded at the syscall rather than after the fact: the
             # old form read the whole file and *then* truncated to 10 000 chars, so
             # a README symlinked to /dev/zero or a multi-GB file was fully resident
-            # before the cap ever applied.
-            content = read_repo_file(filepath, max_bytes=10_000)
+            # before the cap ever applied. ``oversize="truncate"`` is the intended
+            # semantics here (#217 — exploration reads take the bounded prefix,
+            # per read_repo_file's own caller guidance); the default "raise" made
+            # every doc above the ceiling vanish while the truncation handler
+            # below was dead code.
+            # Read one char PAST the cap: len > 10_000 is the only precise
+            # truncation signal (chars are what the model consumes; a
+            # byte-based stat check false-positives on multi-byte files
+            # whose whole char count fits, and a bare >= misfires at the
+            # exact boundary — confirm-round catches on both sides).
+            content = read_repo_file(filepath, max_bytes=10_001,
+                                     oversize="truncate")
             if content is None:
                 continue
-            if len(content) >= 10_000:
-                content = content + "\n\n[... truncated ...]"
+            if len(content) > 10_000:
+                content = content[:10_000] + "\n\n[... truncated ...]"
+                truncated.append(filename)
             sources[filename] = content
         except Exception as e:  # noqa: BLE001 - context gathering is best-effort
             print(f"Warning: Could not read {filename}: {e}", file=sys.stderr)
+            skipped.append(filename)
+
+    # #217: the degradation must be VISIBLE to the context generator (and so
+    # to the artifact) — the generator prices the gap into its confidence via
+    # its existing "based on how much information was available" instruction;
+    # no post-hoc arithmetic on the model's number.
+    if skipped:
+        # String-valued (the sources dict is dict[str, str] and every prompt
+        # builder does text assembly on its values — a list here crashed both
+        # builders the moment the bookkeeping first fired; 4-seat wave catch).
+        sources["[skipped_sources]"] = (
+            "Documentation files that could NOT be read and were excluded "
+            "from the sources below: " + ", ".join(skipped)
+        )
+    if truncated:
+        sources["[truncated_sources]"] = (
+            "Documentation files read only as a bounded 10 000-character "
+            "prefix (content may continue past the truncation marker): "
+            + ", ".join(truncated)
+        )
 
     # Get directory structure (top 2 levels)
     dir_structure = get_directory_structure(repo_path, max_depth=2)
@@ -332,6 +392,27 @@ def gather_context_sources(repo_path: Path) -> dict[str, str]:
         sources["[detected_patterns]"] = entry_points
 
     return sources
+
+
+def context_sources_digest(sources: dict[str, str]) -> str:
+    """#546: the deterministic-derivation identity over the gathered
+    CONTEXT sources — the fingerprint the checkpoint family folds into its
+    resume keys (via the artifact's source_sha256).
+
+    Hashes ONLY the repo-derived CONTEXT_FILES entries and the two
+    degradation markers — NOT ``[directory_structure]`` (it lists the
+    in-repo output dir, so hashing it would self-invalidate on every
+    resume that writes a new artifact) and NOT ``[detected_patterns]``
+    (an rglob-order, cap-windowed list — not canonical). Those two stay a
+    named residual: a rename that flips the LLM's classification without
+    touching the hashed sources does not invalidate.
+    """
+    import hashlib
+    entries = {k: v for k, v in sources.items()
+               if not k.startswith("[directory_structure]")
+               and not k.startswith("[detected_patterns]")}
+    payload = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def get_directory_structure(repo_path: Path, max_depth: int = 2) -> str:
@@ -469,7 +550,94 @@ def _application_context_from_override(data: Any, filename: str) -> ApplicationC
     """
     if not isinstance(data, dict):
         raise ValueError(f"manual override is not a mapping (got {type(data).__name__})")
+    # #322 (wave r1 #2): the cap was keyed on isinstance(nav, list) — a repo
+    # committing a bare STRING skipped both the cap and the warning, and the
+    # splice site then iterated the string PER CHARACTER (one "Do NOT flag"
+    # bullet per character). Coerce/validate at the boundary: a str is a
+    # common one-entry mistake (coerce + warn); any other non-list is
+    # dropped with a warning (never a silent per-character splice).
+    nav = data.get("not_a_vulnerability")
+    override_warnings: list = []
+    if isinstance(nav, str):
+        override_warnings.append(
+            f"not_a_vulnerability was a bare string — coerced to a "
+            f"one-entry list (the splice emits one bullet per item; a bare "
+            f"string would otherwise become one bullet per CHARACTER)")
+        print(f"Warning: {filename} {override_warnings[-1]}", file=sys.stderr)
+        data["not_a_vulnerability"] = [nav]
+        nav = data["not_a_vulnerability"]
+    elif nav is not None and not isinstance(nav, list):
+        override_warnings.append(
+            f"not_a_vulnerability had type {type(nav).__name__} (expected a "
+            f"list) — ignored; it would otherwise be spliced per item/character")
+        print(f"Warning: {filename} {override_warnings[-1]}", file=sys.stderr)
+        data["not_a_vulnerability"] = []
+        nav = data["not_a_vulnerability"]
     data = {**data, "source": "manual"}
+    # #322: bound the repo-supplied exclusion list. The splice site
+    # (build_application_context_prompt) emits every entry as a
+    # "Do NOT flag as vulnerable" bullet — an arbitrarily long list from the
+    # SCANNED repo (the attacker-authored path per the block comment above)
+    # silently narrows the analyzer's scope. Truncate to the cap and WARN
+    # with the original count — AND collect the warning onto the context
+    # (wave r1 #1: stderr-only warnings never reach the receipt).
+    if isinstance(nav, list) and len(nav) > MAX_MANUAL_EXCLUSIONS:
+        override_warnings.append(
+            f"not_a_vulnerability had {len(nav)} entries (the cap is "
+            f"{MAX_MANUAL_EXCLUSIONS}) — truncated to the cap; a scanned "
+            f"repo authored this list")
+        print(
+            f"Warning: {filename} not_a_vulnerability has {len(nav)} entries "
+            f"(the cap is {MAX_MANUAL_EXCLUSIONS}) — a scanned repo is "
+            f"authoring this list; truncating to the cap. Raise the cap "
+            f"deliberately if more are genuinely needed.",
+            file=sys.stderr,
+        )
+        data["not_a_vulnerability"] = nav[:MAX_MANUAL_EXCLUSIONS]
+    elif isinstance(nav, list) and len(nav) > MANUAL_EXCLUSIONS_WARN_THRESHOLD:
+        override_warnings.append(
+            f"not_a_vulnerability has {len(nav)} entries — a permissive "
+            f"exclusion list authored by the scanned repo")
+        print(
+            f"Warning: {filename} not_a_vulnerability has {len(nav)} entries "
+            f"— a permissive exclusion list authored by the scanned repo; "
+            f"treat the findings' scope as only as trustworthy as that file.",
+            file=sys.stderr,
+        )
+    data["override_warnings"] = override_warnings
+    data["override_filename"] = filename
+    # #546: the override arm's deterministic input IS the override file —
+    # sha over the RE-SERIALIZED PARSE of its data (a stable function of
+    # the file's content; not the raw bytes — key ORDER and whitespace
+    # changes do not re-key, semantic changes do).
+    # UNCONDITIONAL: the override data is repo-supplied; a supplied
+    # source_sha256 must never pin the resume identity (#546's review
+    # round — the identity is derived, never adopted).
+    import hashlib as _h
+    try:
+        # #546 follow-up (3c): default=str — a YAML override with a
+        # non-JSON-serializable scalar (an unquoted date becomes a
+        # datetime.date) used to land source_sha256=None here, silently
+        # skipping the invalidation fold for that run (stale adoption after
+        # an override edit). str() keeps the identity DERIVED; the
+        # documented residual: str() on a type whose repr embeds an address
+        # or other unstable text would make the key never-stable (always
+        # re-pay) — accepted for YAML's date/bytes shapes, which str()
+        # renders deterministically. A SECOND residual: json.dumps raises
+        # BEFORE default is consulted for non-str/mixed-type MAPPING KEYS
+        # (e.g. a YAML `1: x` alongside `a: y` trips sort_keys) — that
+        # lands None (the fail-open direction; warned below, never silent).
+        _raw = json.dumps(data, sort_keys=True, separators=(",", ":"),
+                          default=str)
+        data["source_sha256"] = _h.sha256(
+            _raw.encode("utf-8")).hexdigest()
+    except (TypeError, ValueError) as exc:
+        # Never silent: the None path skips the invalidation fold for this
+        # run (stale adoption) — surface it so an operator sees why.
+        print(f"Warning: override identity could not be derived ({exc}); "
+              f"checkpoint invalidation is skipped for this run — fix the "
+              f"override file's non-serializable keys", file=sys.stderr)
+        data["source_sha256"] = None
     known = {f.name for f in fields(ApplicationContext)}
     unknown = [k for k in data if k not in known]
     if unknown:
@@ -660,10 +828,17 @@ def generate_application_context(
     if not sources:
         raise ValueError(f"No context sources found in {repo_path}")
 
-    # Format sources for prompt
+    # Format sources for prompt. `content` is a repo file (README, package
+    # manifest, ...) read from the SCANNED repo — untrusted. A bare ``` fence is
+    # escapable: a source file containing its own ``` line would break out and
+    # the remainder would be read as prompt-level instructions, steering the
+    # generated app-context (which then seeds every Stage-1 analysis prompt).
+    # Use a length-adaptive fence per source so the content stays inert data.
+    from prompts._fence import safe_code_fence
     sources_text = ""
     for name, content in sources.items():
-        sources_text += f"\n### {name}\n```\n{content}\n```\n"
+        _sf = safe_code_fence(content)
+        sources_text += f"\n### {name}\n{_sf}\n{content}\n{_sf}\n"
 
     # Call LLM via the adapter — provider+model are dictated by the
     # llm-config's ``app_context`` phase, not hardcoded here.
@@ -671,10 +846,21 @@ def generate_application_context(
         f"Generating context with {binding.provider_name}/{binding.model}...",
         file=sys.stderr,
     )
-    response_text = simple_text(
+    # #512: the typed-result sibling (simple_completion) so the parse-
+    # failure error can NAME the truncation when that is the cause; and
+    # the private 2000 cap is dropped (DEFAULT_MAX_TOKENS — the cap was
+    # never protecting cost where it mattered: the OpenAI Responses path
+    # floors output to 16000 anyway, and Stage-1's per-unit calls already
+    # run at this default. A 2000 cap on a reasoning model spends the
+    # whole budget on hidden reasoning and returns a fence fragment —
+    # exactly the failure the parse error below then mislabels).
+    _result = simple_completion(
         binding,
         CONTEXT_GENERATION_PROMPT.format(sources=sources_text),
-        max_tokens=2000,
+    )
+    response_text = "\n".join(
+        block.text for block in _result.content
+        if hasattr(block, "text")
     )
 
     # Extract JSON from response
@@ -694,9 +880,26 @@ def generate_application_context(
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse LLM response as JSON: {e}\nResponse: {response_text}")
+        # #512: name the truncation when that is the cause — a bare
+        # "could not parse" on a max_tokens reply hid the real failure
+        # (the budget went to hidden reasoning, not the answer).
+        trunc_note = ""
+        if _result.stop_reason == "max_tokens":
+            trunc_note = ("; the reply was TRUNCATED at max_tokens — the "
+                          "budget was spent on hidden reasoning, not the answer")
+        raise ValueError(
+            f"Failed to parse LLM response as JSON: {e}\n"
+            f"(stop_reason={_result.stop_reason}{trunc_note})\n"
+            f"Response: {response_text}")
 
     data['source'] = 'llm'
+    # #546: stamp the deterministic-derivation identity — the checkpoint
+    # family's resume keys fold this (via the artifact), so a repo edit
+    # that changes the context derivation invalidates the stale records
+    # while the LLM's own re-narration does not re-pay. UNCONDITIONAL:
+    # model output is untrusted — a supplied source_sha256 (steered by
+    # the scanned repo's sources text) must never pin the identity.
+    data['source_sha256'] = context_sources_digest(sources)
 
     # Allowlist-filter to dataclass fields: the LLM can hallucinate unknown/extra
     # keys, and a raw ApplicationContext(**data) would raise an uncaught TypeError
@@ -777,37 +980,51 @@ def format_context_for_prompt(context: ApplicationContext) -> str:
     Returns:
         Formatted string for prompt injection.
     """
+    # The free-text fields below (purpose, intended_behaviors, not_a_vulnerability,
+    # security_model, trust_boundaries) are attacker-authored: a scanned repo can
+    # commit OPENANT.json / OPENANT.THREATMODEL.md, which is auto-loaded on every
+    # default scan. Each is spliced onto its own prompt line, so an embedded newline
+    # would forge a NEW instruction line (a fake "## SYSTEM DIRECTIVE" / extra
+    # "Do NOT flag" bullet) that steers this tool's own analyzer/verifier LLM into
+    # false negatives. Collapse every such value to a single inert line — the same
+    # discipline safe_code_fence/neutralize_boundaries already apply to source and
+    # file-boundary markers. application_type is collapsed too: __post_init__ skips the
+    # ApplicationType enum check when source=="manual" (a repo-committed OPENANT.json
+    # override), so it is attacker-controllable despite looking validated. type_info comes
+    # from the built-in registry (a dict lookup on application_type), so it is left raw.
+    from prompts._fence import collapse_inline
+
     type_info = context.get_type_info()
 
     lines = [
         "## Application Context",
         "",
-        f"**Application Type:** {context.application_type}",
+        f"**Application Type:** {collapse_inline(context.application_type)}",
     ]
 
     if type_info:
         lines.append(f"**Type Description:** {type_info.get('description', '')}")
         lines.append(f"**Attack Model:** {type_info.get('attack_model', '')}")
 
-    lines.append(f"**Purpose:** {context.purpose}")
+    lines.append(f"**Purpose:** {collapse_inline(context.purpose)}")
     lines.append("")
 
     if context.intended_behaviors:
         lines.append("**Intended Behaviors (these are FEATURES, not vulnerabilities):**")
         for behavior in context.intended_behaviors:
-            lines.append(f"- {behavior}")
+            lines.append(f"- {collapse_inline(behavior)}")
         lines.append("")
 
     if context.trust_boundaries:
         lines.append("**Trust Boundaries:**")
         for source, level in context.trust_boundaries.items():
-            lines.append(f"- {source}: {level}")
+            lines.append(f"- {collapse_inline(source)}: {collapse_inline(level)}")
         lines.append("")
 
     if context.not_a_vulnerability:
         lines.append("**Do NOT flag as vulnerable:**")
         for item in context.not_a_vulnerability:
-            lines.append(f"- {item}")
+            lines.append(f"- {collapse_inline(item)}")
         lines.append("")
 
     if context.suppress_local_only():
@@ -816,7 +1033,7 @@ def format_context_for_prompt(context: ApplicationContext) -> str:
         lines.append("")
 
     if context.security_model:
-        lines.append(f"**Security Model:** {context.security_model}")
+        lines.append(f"**Security Model:** {collapse_inline(context.security_model)}")
         lines.append("")
 
     return "\n".join(lines)

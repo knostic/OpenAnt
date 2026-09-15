@@ -1033,51 +1033,176 @@ class TypeScriptAnalyzer {
   }
 
   /**
-   * Emit a synthetic unit when a file's top-level statements are dominated by
-   * a bare side-effect call (e.g. an Electron preload script that only calls
-   * contextBridge.exposeInMainWorld({...})). Without this, such files yield
-   * zero units even though they carry analysable behaviour.
+   * #330: emit ONE synthetic `<file>:module` unit per file holding the module
+   * top-level code — IIFEs, callbacks passed to top-level calls, bare driver
+   * calls, initialiser calls — which belongs to no emitted unit. The call
+   * graph scans only emitted units' code, so in any file with >=1 real unit
+   * those calls (including calls to sinks) never became edges: a sink
+   * reachable through bootstrap code alone got no incoming edge from it
+   * (the false-negative direction). The previous capture fired only on
+   * files with ZERO units.
+   *
+   * The residual is masked by EMITTED UNIT LINE RANGES — the Python
+   * extractor's :__module__ precedent, which wrote down why: exclusion by
+   * whole-STATEMENT containment drops the class/object-literal boundary and
+   * leaks member bodies in, attributing their calls to module load, which is
+   * not when they run (with module_level entry-point seeding, fabricated
+   * reachability). Emitted only when the residual contains a call. This
+   * subsumes the old empty-file fallback, whose receiver-naming also
+   * fabricated callee labels (`x.js:[1].forEach`).
    */
   _extractTopLevelSideEffects(sourceFile, relativePath) {
-    // Only synthesise when the regular extractors produced nothing for this
-    // file — otherwise we'd duplicate real functions/methods.
+    const functionId = `${relativePath}:module`;
+    // A real unit named `module` wins — never clobber it.
+    if (this.functions[functionId]) return;
+
     const filePrefix = `${relativePath}:`;
-    const hasAny = Object.keys(this.functions).some((id) =>
-      id.startsWith(filePrefix),
-    );
-    if (hasAny) return;
-
-    for (const statement of sourceFile.getStatements()) {
-      if (statement.getKindName() !== "ExpressionStatement") continue;
-      const expr = statement.getExpression();
-      if (!expr || expr.getKindName() !== "CallExpression") continue;
-
-      const callee = expr.getExpression();
-      let label = "module";
-      if (callee && callee.getKindName() === "PropertyAccessExpression") {
-        const obj = callee.getExpression
-          ? callee.getExpression().getText()
-          : "";
-        const member = callee.getName ? callee.getName() : "";
-        label = member ? `${obj}.${member}` : obj || "module";
-      } else if (callee && callee.getKindName() === "Identifier") {
-        label = callee.getText();
+    const covered = new Set();
+    for (const [id, fd] of Object.entries(this.functions)) {
+      if (!id.startsWith(filePrefix)) continue;
+      const s = fd.startLine;
+      const e = fd.endLine;
+      if (Number.isInteger(s) && Number.isInteger(e)) {
+        for (let ln = s; ln <= e; ln++) covered.add(ln);
       }
-
-      const functionId = `${relativePath}:${label}`;
-      if (this.functions[functionId]) continue;
-      const code = statement.getFullText();
-      this.functions[functionId] = {
-        name: label,
-        code: code,
-        isExported: false,
-        unitType: "module_level",
-        startLine: statement.getStartLineNumber(),
-        endLine: statement.getEndLineNumber(),
-      };
-      // One synthetic unit per file is enough to make the file analysable.
-      return;
     }
+    // #330 (wave r1 opus): CLASS DECLARATION RANGES are masked whole — the
+    // Python :__module__ precedent covers ast.ClassDef bodies, and class
+    // field initializers (`private repo = new Repo();`, `cache =
+    // buildCache();`) are on NO unit's line range, so they leaked into the
+    // residual and their calls were attributed to module load — fabricated
+    // reachability from a synthetic root, the exact defect the b.js guard
+    // asserts against, one class field away.
+    for (const cls of sourceFile.getDescendantsOfKind(
+        ts.SyntaxKind.ClassDeclaration)) {
+      for (let ln = cls.getStartLineNumber(); ln <= cls.getEndLineNumber(); ln++) {
+        covered.add(ln);
+      }
+    }
+
+    const lines = sourceFile.getFullText().split("\n");
+    const residual = [];
+    let first = null;
+    let last = null;
+    // #330 (wave r1 sonnet): track multi-line /* ... */ blocks — an interior
+    // line without a leading * is still comment content, and commented-out
+    // code must not fabricate module-load edges (the resolver extracts the
+    // module unit's edges from this text with plain regexes).
+    let inBlockComment = false;
+    for (let i = 0; i < lines.length; i++) {
+      const ln = i + 1;
+      if (covered.has(ln)) continue;
+      const stripped = lines[i].trim();
+      if (inBlockComment) {
+        if (stripped.endsWith("*/")) inBlockComment = false;
+        continue;
+      }
+      if (stripped.startsWith("/*")) {
+        if (!stripped.endsWith("*/")) inBlockComment = true;
+        continue;
+      }
+      if (
+        !stripped ||
+        stripped.startsWith("//") ||
+        stripped.startsWith("*")
+      ) {
+        continue;
+      }
+      residual.push(lines[i]);
+      if (first === null) first = ln;
+      last = ln;
+    }
+    if (first === null || !residual.length) return;
+
+    const code = residual.join("\n");
+    if (!this._residualContainsCall(code)) return;
+
+    this.functions[functionId] = {
+      name: "module",
+      code: code,
+      isExported: false,
+      unitType: "module_level",
+      startLine: first,
+      endLine: last,
+    };
+
+    // #330 (wave r1 opus, the headline): the Pattern-A companion — every
+    // other synthetic emit pairs the unit with real callGraph edges, and the
+    // analyzer's callGraph is what call_graph.json (and therefore the
+    // reachability pipeline) consumes. Without this, the module unit existed
+    // with [] edges in the graph that gates reachability: the issue's false
+    // negative survived behind the resolver's second graph (which only
+    // bundles the dataset).
+    this.callGraph[functionId] = this._moduleUnitEdges(
+      sourceFile, covered, relativePath);
+  }
+
+  /**
+   * The module unit's outgoing edges: the CallExpression/NewExpression
+   * descendants that start on UNCOVERED lines (the residual's own calls —
+   * the same shape extractCallsFromFunction derives from a function node,
+   * filtered to the lines the unit actually carries).
+   */
+  _moduleUnitEdges(sourceFile, covered, relativePath) {
+    const calls = [];
+    const seen = new Set();
+    const pushName = (name, dynamic, member = false) => {
+      const key = `${name} ${dynamic ? 1 : 0}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      calls.push({ resolved: false, name: name, dynamic: dynamic, member: member });
+    };
+    const callExprs = sourceFile.getDescendantsOfKind(
+      ts.SyntaxKind.CallExpression,
+    );
+    for (const callExpr of callExprs) {
+      if (covered.has(callExpr.getStartLineNumber())) continue;
+      const callee = callExpr.getExpression();
+      const normalized = this._normalizeCallName(callee);
+      if (normalized) {
+        pushName(normalized, false,
+                 !!callee && callee.getKindName() === "PropertyAccessExpression");
+      } else {
+        const raw = callee ? callee.getText().replace(/\s+/g, " ").trim() : "";
+        pushName(raw, true);
+      }
+      for (const arg of callExpr.getArguments()) {
+        if (arg.getKindName() === "Identifier") {
+          pushName(arg.getText(), false);
+        }
+      }
+    }
+    const newExprs = sourceFile.getDescendantsOfKind(
+      ts.SyntaxKind.NewExpression,
+    );
+    for (const newExpr of newExprs) {
+      if (covered.has(newExpr.getStartLineNumber())) continue;
+      pushName(newExpr.getExpression().getText(), false);
+    }
+    return calls;
+  }
+
+  /**
+   * True when text contains a function call — `foo(..)`, `obj.method(..)`,
+   * `new C(..)` — excluding keyword openers (if/for/while/switch/catch/
+   * function), which are not calls. #330's emit gate: a file whose residual is
+   * imports and assignments only yields no module unit.
+   */
+  _residualContainsCall(text) {
+    // #330 (wave r1 opus): `require(...)`/`import(...)` are module-system
+    // plumbing, not bootstrap behaviour — the Python precedent skips
+    // import lines before deciding to emit, and a plain CJS header
+    // (`const fs = require('fs');`) otherwise emitted a zero-edge module
+    // unit for nearly every file in a corpus.
+    const KEYWORDS = new Set([
+      "if", "for", "while", "switch", "catch", "function", "require", "import",
+    ]);
+    const re = /([A-Za-z_$][\w$]*)\s*\(/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      if (!KEYWORDS.has(m[1])) return true;
+    }
+    return false;
   }
 
   /**
@@ -1726,6 +1851,115 @@ class TypeScriptAnalyzer {
     return null;
   }
 
+  // ------------------------------------------------------------------
+  // #299 (6 of 7): dispatch containers (object/array literals of handlers)
+  // ------------------------------------------------------------------
+
+  /**
+   * Map variable/const names -> handler-function names referenced by an
+   * object/array literal initializer, from one node's descendants.
+   * Rebound names are dropped (ambiguous) rather than guessed.
+   */
+  _collectContainersFrom(node) {
+    const containers = {};
+    const dropped = {};
+    if (!node) return containers;
+    const ts = require("ts-morph");
+    // getDescendantsOfKind is the reliable descent (a manual getChildren()
+    // walk stops at the SyntaxList wrapper). For the FILE map this includes
+    // declarations inside function bodies — safe by design (over-seed): a
+    // container referenced by name dispatches to its handlers regardless of
+    // which scope declared it, and the name gate still requires the literal
+    // to reference known handler names.
+    for (const decl of node.getDescendantsOfKind(
+      ts.SyntaxKind.VariableDeclaration,
+    )) {
+      const nameNode = decl.getNameNode ? decl.getNameNode() : null;
+      const init = decl.getInitializer ? decl.getInitializer() : null;
+      if (!nameNode || !init) continue;
+      const name = nameNode.getText();
+      if (dropped[name]) continue;
+      const kind = init.getKindName();
+      if (
+        kind !== "ObjectLiteralExpression" &&
+        kind !== "ArrayLiteralExpression"
+      ) {
+        continue;
+      }
+      if (Object.prototype.hasOwnProperty.call(containers, name)) {
+        // second declaration of the same name -> ambiguous, drop
+        delete containers[name];
+        dropped[name] = true;
+        continue;
+      }
+      const targets = this._containerElementNames(init);
+      if (targets.length > 0) containers[name] = targets;
+    }
+    return containers;
+  }
+
+  /**
+   * The bare-identifier handler names an object/array literal references.
+   * Object literals contribute property VALUES; array literals their
+   * elements. Non-identifier elements contribute nothing (the name gate at
+   * resolution abstains).
+   */
+  _containerElementNames(literal) {
+    const names = [];
+    const kind = literal.getKindName();
+    if (kind === "ObjectLiteralExpression") {
+      for (const prop of literal.getProperties()) {
+        const init = prop.getInitializer ? prop.getInitializer() : null;
+        if (init && init.getKindName() === "Identifier") {
+          names.push(init.getText());
+        }
+      }
+    } else if (kind === "ArrayLiteralExpression") {
+      for (const el of literal.getElements()) {
+        if (el.getKindName() === "Identifier") names.push(el.getText());
+      }
+    }
+    return names;
+  }
+
+  /**
+   * Resolve an ElementAccessExpression callee over a KNOWN container to the
+   * container's handler names, or null when the base is not a known
+   * container (abstain — no invented edges). Merges the enclosing
+   * function's local containers with the file-scope map (cached per file).
+   */
+  _containerTargetsForCallee(callee, funcNode) {
+    const base = callee.getExpression();
+    if (!base || base.getKindName() !== "Identifier") return null;
+    const name = base.getText();
+    // file-scope containers, cached per relative path
+    if (!this._fileContainersCache) this._fileContainersCache = {};
+    const rel =
+      (funcNode.getSourceFile &&
+        funcNode.getSourceFile().getFilePath()) ||
+      "";
+    let fileMap = this._fileContainersCache[rel];
+    if (fileMap === undefined) {
+      try {
+        fileMap = this._collectContainersFrom(funcNode.getSourceFile());
+      } catch (e) {
+        fileMap = {};
+      }
+      this._fileContainersCache[rel] = fileMap;
+    }
+    // NOTE: the file map is collected from the SOURCE FILE root, which
+    // includes function bodies — a function-local table is ALSO visible
+    // there. That is safe for dispatch (over-seed direction), matching the
+    // sibling parsers' file-scope merge; the name gate still requires the
+    // literal to reference known handler names.
+    const localMap = this._collectContainersFrom(funcNode);
+    const targets =
+      (localMap && Object.prototype.hasOwnProperty.call(localMap, name) && localMap[name]) ||
+      (Object.prototype.hasOwnProperty.call(fileMap, name) && fileMap[name]) ||
+      null;
+    return targets || null;
+  }
+
   /**
    * Extract function calls from within a function body.
    *
@@ -1762,6 +1996,24 @@ class TypeScriptAnalyzer {
         const isMember =
           !!callee && callee.getKindName() === "PropertyAccessExpression";
         pushName(normalized, false, isMember);
+      } else if (
+        // #299 (6 of 7): a container dispatch — `handlers[k]()` /
+        // `tbl[0]()` — an ElementAccessExpression whose BASE identifier names
+        // a known container of handler references. Resolve to EVERY
+        // referenced function (over-seed, the safe direction). The container
+        // map merges this function's local const/var declarations with the
+        // file-scope ones (the common placement).
+        callee &&
+        callee.getKindName() === "ElementAccessExpression" &&
+        this._containerTargetsForCallee
+      ) {
+        const targets = this._containerTargetsForCallee(callee, funcNode);
+        if (targets !== null) {
+          for (const target of targets) pushName(target, false);
+        } else {
+          const raw = callee.getText().replace(/\s+/g, " ").trim();
+          pushName(raw, true);
+        }
       } else {
         // Dynamic / element-access callee — record the raw span trimmed to a
         // single line so node names never become multiline blobs.
@@ -1872,6 +2124,16 @@ class TypeScriptAnalyzer {
         } else if (!target) {
           // Unresolvable static name — bucket as indirect so it isn't lost.
           if (!indirect.includes(name)) indirect.push(name);
+          // #299 (6 of 7): CONSUMER — an indirect entry that resolves when
+          // the member restriction is dropped becomes a REFERENCE edge (a
+          // receiver call `x.foo()` whose same-named free function exists:
+          // over-seed, the reachability-safe direction). This is the
+          // plumbing the umbrella asks for: the detection already worked,
+          // only the graph never consumed it.
+          const ref = resolveName(name, callerFile, false);
+          if (ref && ref !== callerId && !resolvedTargets.includes(ref)) {
+            resolvedTargets.push(ref);
+          }
         }
       }
 

@@ -21,3 +21,4 @@ reports/
 # tracing/replay tooling) or any test file for it -- those are real,
 # versioned development capabilities, not local scratch.
 local/
+/bughunt-repros/

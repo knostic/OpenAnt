@@ -32,18 +32,14 @@ from typing import Optional
 import pytest
 
 from utilities.llm import (
-    CompletionResult,
     LLMAuthError,
     LLMConnectionError,
-    LLMError,
     LLMNotFoundError,
     PhaseBinding,
     PhaseRegistry,
-    TextBlock,
     lookup_pricing,
     probe_registry_or_raise,
 )
-from utilities.llm_client import TokenTracker
 
 
 # ---------------------------------------------------------------------------

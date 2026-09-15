@@ -23,11 +23,8 @@ list-of-dict ``data_flow``, or dict-shaped ``verification_explanation``.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from pathlib import Path
 
-import pytest
 
 from core.reporter import _coerce_to_str, build_pipeline_output
 from utilities.file_io import write_json

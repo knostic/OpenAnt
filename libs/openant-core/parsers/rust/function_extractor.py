@@ -307,6 +307,22 @@ class FunctionExtractor:
                     pending_attrs = []
                     continue
 
+                if t == "extern_crate_declaration":
+                    # `#[macro_use] extern crate afl;` (classic afl.rs form)
+                    # brings the crate's macros into bare scope. Record the crate
+                    # only when #[macro_use] is present (plain `extern crate` does
+                    # NOT scope the macros).
+                    if any("macro_use" in a for a in pending_attrs):
+                        cname = next((_text(c, source) for c in child.children
+                                      if c.type == "identifier"), None)
+                        if cname:
+                            imports_local.append({
+                                "kind": "extern_macro_use", "crate": cname,
+                                "leaf": None, "alias": None,
+                            })
+                    pending_attrs = []
+                    continue
+
                 if t == "mod_item":
                     self._handle_mod(
                         child, source, file_path, functions, classes,
@@ -343,6 +359,19 @@ class FunctionExtractor:
                     self._handle_function(
                         child, source, file_path, functions, cur_ctx,
                         pending_attrs, worklist,
+                    )
+                    pending_attrs = []
+                    continue
+
+                # libFuzzer harness: `fuzz_target!(|data| { .. })`. The closure
+                # body is the real program entry point but sits inside an opaque
+                # macro token_tree, so no function_item is emitted and its calls
+                # (e.g. `Frame::decode`) never reach the call graph. Emit a
+                # synthetic entry-point unit carrying the body as ordinary Rust.
+                if t == "macro_invocation" and self._is_fuzz_target_macro(child, source, imports_local):
+                    self._handle_fuzz_target(
+                        child, source, file_path, functions, classes,
+                        imports_local, cur_ctx, pending_attrs,
                     )
                     pending_attrs = []
                     continue
@@ -640,6 +669,198 @@ class FunctionExtractor:
             }
             worklist.append((block, new_ctx))
 
+    _FUZZ_MACRO_NAMES = ("fuzz_target",)
+    _AFL_FUZZ = ("afl", "fuzz")  # AFL's generic `fuzz!` — gated on the afl crate
+
+    def _resolve_macro_origin(self, name: str, imports_local: List[dict]):
+        """Resolve a bare macro name through the file's `use` imports to its
+        ``(crate, real_macro_name)`` origin. Returns ``(None, name)`` when the
+        name is not imported (locally defined or prelude)."""
+        for imp in imports_local:
+            if imp.get("kind") != "use":
+                continue
+            local = imp.get("alias") or imp.get("leaf")
+            if local == name:
+                path = imp.get("path") or ""
+                crate = path.split("::")[0] if path else None
+                return crate, imp.get("leaf")
+        return None, name
+
+    def _is_fuzz_target_macro(self, node: Node, source: bytes,
+                              imports_local: List[dict]) -> bool:
+        """True if `node` is a fuzz-harness macro invocation.
+
+        Recognizes libFuzzer `fuzz_target!` (bare, path-qualified, or
+        import-aliased `use libfuzzer_sys::fuzz_target as ft; ft!(..)`) and AFL's
+        `fuzz!` (path-qualified `afl::fuzz!` or `use afl::fuzz; fuzz!(..)`). A
+        bare name is resolved THROUGH the file's `use` imports to its origin
+        crate + real macro name, so an alias to an unrelated macro
+        (`use evil::thing as fuzz_target`) and a bare `fuzz!` with no afl import
+        are NOT matched (path-resolution is the over-match guard). `fuzz_target`
+        is accepted from any crate (a distinctive libFuzzer name); the generic
+        `fuzz` is accepted only from the `afl` crate. macro_rules!-wrapped
+        harnesses are out of scope (a deliberate deferral: recognizing them
+        needs macro-definition scanning + expansion-shape handling)."""
+        ref = next((c for c in node.children
+                    if c.type in ("identifier", "scoped_identifier")), None)
+        if ref is None:
+            return False
+        text = _text(ref, source)
+        if "::" in text:
+            segs = text.split("::")
+            crate, macro_name = segs[0], segs[-1]
+        else:
+            crate, macro_name = self._resolve_macro_origin(text, imports_local)
+        if macro_name in self._FUZZ_MACRO_NAMES:
+            return True
+        if (crate, macro_name) == self._AFL_FUZZ:
+            return True
+        # AFL brought into bare macro scope via `#[macro_use] extern crate afl`
+        # or `use afl::*`: an otherwise-unresolved bare `fuzz!` is then afl's
+        # harness macro. Gated on afl provenance so a generic `fuzz!` in a file
+        # that doesn't scope afl's macros is NOT matched.
+        if (crate is None and macro_name == "fuzz"
+                and self._afl_in_macro_scope(imports_local)):
+            return True
+        return False
+
+    def _afl_in_macro_scope(self, imports_local: List[dict]) -> bool:
+        """True if the file brings AFL's macros into bare scope, via
+        ``#[macro_use] extern crate afl`` or a ``use afl::*`` glob."""
+        for imp in imports_local:
+            kind = imp.get("kind")
+            if kind == "extern_macro_use" and imp.get("crate") == "afl":
+                return True
+            if kind == "use_glob" and (imp.get("path") or "").split("::")[0] == "afl":
+                return True
+        return False
+
+    def _handle_fuzz_target(
+        self, node: Node, source: bytes, file_path: str,
+        functions: Dict[str, Any], classes: Dict[str, Any],
+        imports_local: List[dict], ctx: dict, attrs: List[str],
+    ) -> None:
+        """Synthesize an entry-point unit from a `fuzz_target!(|d| { .. })` body.
+
+        libFuzzer's `fuzz_target!` expands to the program `main`; its closure
+        body is the actual fuzzed code path but lives inside an opaque macro
+        token_tree that emits no `function_item`, so the calls it makes never
+        enter the call graph. We lift the body out as `fn <name>() { .. }` and
+        run the ORDINARY extractor walk over it, so any nested `fn`/`impl`/
+        `struct` in the body becomes its own same-file unit. This preserves the
+        call-graph builder's nested-fn invariant (a nested fn is its own unit, so
+        its edges are not lost and a bare call to it binds to the local unit, not
+        a same-named global) — a flat single-unit lift violates it, dropping the
+        nested fn's edges AND mis-binding its bare calls. The harness unit is
+        forced to ``unit_type="main"`` so it seeds reachability, and tagged
+        ``synthetic_harness`` so downstream stages can special-case it.
+        """
+        # Test-gated harness (`#[cfg(test)] fuzz_target!` or inside a test scope)
+        # is skipped like a normal test function when tests are excluded.
+        is_test_attr = any(_TEST_ATTR_RE.match(a) for a in attrs)
+        if (is_test_attr or ctx.get("in_test_scope")) and self.skip_tests:
+            return
+
+        # Locate the closure body via tree-sitter token_tree nodes (string/comment
+        # -safe, unlike a raw brace scan). Macro args are `( |params| BODY )`.
+        outer = next((c for c in node.children if c.type == "token_tree"), None)
+        if outer is None:
+            return
+        kids = outer.children
+        # The closure is `|params| body`. Everything after the SECOND top-level
+        # `|` is the body; a `{`-delimited token_tree BEFORE it is a param
+        # destructure (`|Wrap { inner }: Wrap| ..`), never the body. Restrict the
+        # body-brace search to after the params so an expr-form harness whose
+        # only brace IS the param destructure is not mis-lifted.
+        pipes = [i for i, c in enumerate(kids) if c.type == "|"]
+        after = pipes[1] if len(pipes) >= 2 else -1
+        block_tts = [
+            c for i, c in enumerate(kids)
+            if i > after and c.type == "token_tree"
+            and _text(c, source).lstrip().startswith("{")
+        ]
+        if block_tts:
+            # Block form `|params| { .. }`: the body is the last such brace.
+            body = _text(block_tts[-1], source)
+            base_line = block_tts[-1].start_point[0]  # 0-based line of body `{`
+        elif len(pipes) >= 2:
+            # Expr form `|params| expr` (no block): lift the expression after the
+            # second top-level `|`, up to the closing `)`, into a statement body.
+            expr = source[kids[pipes[1]].end_byte:kids[-1].start_byte].decode(
+                "utf-8", "replace"
+            ).strip()
+            if not expr:
+                return
+            # Terminate on a fresh line so a trailing `//` line comment on the
+            # expr does not swallow the appended `;}` (which would make the lifted
+            # fn unparseable and silently drop the harness).
+            body = "{\n" + expr + "\n; }"
+            base_line = node.start_point[0]
+        else:
+            return
+
+        # Unique harness fn name per file (multiple `fuzz_target!` in one file).
+        name = "fuzz_target"
+        n = 2
+        while f"{file_path}:{name}" in functions:
+            name = f"fuzz_target__{n}"
+            n += 1
+
+        # Run the lifted body through the ordinary walk so nested items become
+        # their own units. Use a fresh functions slice to post-process (retype the
+        # harness to `main`, offset lines) before merging; classes/imports go to
+        # the real tables since a nested struct/impl/use IS a same-file item.
+        synth = f"fn {name}() {body}".encode("utf-8")
+        synth_funcs: Dict[str, Any] = {}
+        # Throwaway classes table: the synth walk records nested `struct`/`enum`
+        # with synth-relative coordinates, and a harness that re-declares a real
+        # crate type's name would otherwise clobber the real entry (classes are
+        # bare-name keyed). Merge below with offset lines, never overwriting a
+        # real type.
+        synth_classes: Dict[str, Any] = {}
+        walk_ctx = {
+            "qual_prefix": "",
+            "class_name": None,
+            "module_path": ctx.get("module_path", ()),
+            "in_test_scope": ctx.get("in_test_scope", False),
+        }
+        try:
+            self._walk(
+                self.parser.parse(synth).root_node, synth, file_path,
+                synth_funcs, synth_classes, imports_local, walk_ctx,
+            )
+        except Exception:
+            return
+
+        harness_id = f"{file_path}:{name}"
+        if harness_id not in synth_funcs:
+            return  # body didn't parse to a fn; nothing to seed
+
+        def _offset(info):
+            for k in ("start_line", "end_line"):
+                if isinstance(info.get(k), int):
+                    info[k] = info[k] + base_line
+
+        for fid, info in synth_funcs.items():
+            # Offset the synthetic line numbers back onto the real harness body.
+            _offset(info)
+            if fid == harness_id:
+                # The walk classified the lifted `fn` as a plain function; retype
+                # it to a structural entry point and tag it synthetic.
+                info["unit_type"] = "main"
+                info["is_exported"] = False
+                info["synthetic_harness"] = True
+            if fid not in functions:
+                functions[fid] = info
+
+        # Nested harness-local types: record with offset lines, but never clobber
+        # a real same-named crate type (a real definition always wins).
+        for cid, cinfo in synth_classes.items():
+            if cid in classes:
+                continue
+            _offset(cinfo)
+            classes[cid] = cinfo
+
     def _classify(
         self, name: str, class_name: Optional[str], has_self: bool,
         attrs: List[str], is_test_attr: bool, in_test_scope: bool,
@@ -696,7 +917,18 @@ class FunctionExtractor:
         if target is None:
             return
         for path_segs, leaf, alias in self._flatten_use_node(target, source, ()):
-            if leaf == "*" or not leaf:
+            if not leaf:
+                continue
+            if leaf == "*":
+                # A glob `use crate::*` is not resolvable to a specific symbol,
+                # but it DOES bring the crate's macros into bare scope — recorded
+                # (kind=use_glob) so fuzz-harness recognition can see `use afl::*`.
+                imports_local.append({
+                    "kind": "use_glob",
+                    "path": "::".join(path_segs),
+                    "leaf": None,
+                    "alias": None,
+                })
                 continue
             imports_local.append({
                 "kind": "use",
@@ -757,6 +989,20 @@ class FunctionExtractor:
                     results.extend(self._flatten_use_node(child, source, prefix))
             return results
         if t == "use_wildcard":
+            # `path::*` — recover the path prefix from the wildcard's own path
+            # child (e.g. `use afl::*` -> prefix ('afl',)) so a glob import records
+            # its crate. Previously the prefix was dropped (wildcards were skipped
+            # by the caller, so it never mattered).
+            path_child = next(
+                (c for c in node.children
+                 if c.type in ("identifier", "scoped_identifier",
+                               "crate", "self", "super")),
+                None,
+            )
+            if path_child is not None:
+                sub = self._flatten_use_node(path_child, source, prefix)
+                base = sub[0][0] if sub else prefix
+                return [(base, "*", None)]
             return [(prefix, "*", None)]
         return []
 

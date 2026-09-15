@@ -8,7 +8,8 @@ CSV file suitable for filtering, sorting, and analysis in Excel or Google Sheets
 Output Columns:
     - file: Source file path
     - unit_id: Unique identifier (file:function)
-    - unit_description: What the code does (from LLM context)
+    - unit_description: The LLM's analysis explanation (agentic
+      classification_reasoning / single-shot reasoning)
     - unit_code: Complete source code
     - stage2_verdict: Final verdict after Stage 2 verification
     - stage2_justification: Stage 2 explanation
@@ -28,8 +29,41 @@ import argparse
 import csv
 import json
 import os
-import sys
 from utilities.file_io import normalize_results, read_json
+
+from core.verdict_taxonomy import (SEVERITIES as _SEVERITIES, SEVERITY_FINDING_VERDICTS,
+                                  severity_display_verdict)
+
+
+def _severity_source_for(result: dict) -> str:
+    """The provenance matching _severity_for ("" when no severity)."""
+    if _severity_for(result) == "":
+        return ""
+    src = result.get("severity_source")
+    if result.get("severity") in _SEVERITIES and src == "model":
+        return "model"
+    return src if src in ("corrected", "derived") else "derived"
+
+
+def _severity_for(result: dict) -> str:
+    """#215: the severity for one CSV row — FINDING-ONLY (empty for
+    non-findings, so severity=low does not return safe/ERROR units); a
+    model value keeps; a derived value RE-DERIVES from the final verdict
+    (Stage 2 reclassifies; a stale derived/corrected stamp must not
+    outrank it). Gates on the SHARED displayed verdict (panel round-3):
+    a "Max iterations reached" verification downgrades the row to
+    inconclusive and strips its severity, matching report-data and the
+    reporter — one row, one rank, every surface."""
+    verdict = severity_display_verdict(result)
+    if verdict not in SEVERITY_FINDING_VERDICTS:
+        return ""
+    sev = result.get("severity")
+    src = result.get("severity_source")
+    # ONLY a model value keeps its rank (corrected rides a possibly-
+    # fabricated repair; derived went stale under Stage-2 reclassification).
+    if sev in _SEVERITIES and src == "model":
+        return sev
+    return "high" if verdict == "vulnerable" else "medium"
 
 # Characters that make a spreadsheet treat a cell as a formula on open (CSV / formula
 # injection, CWE-1236 / OWASP). Cells written from scanned source or LLM text must be
@@ -157,8 +191,35 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
         else:
             unit_code = str(code_field) if code_field else ''
 
-        # Get LLM context from dataset (may be None)
-        llm_context = unit.get('llm_context') or {}
+        # #326: read BOTH context keys — agentic mode (the default on both
+        # entry points) writes agent_context, single-shot writes llm_context;
+        # this exporter read llm_context only, so unit_description was empty
+        # for every unit of an agentically enhanced dataset, and the enhancer's
+        # own "error" classification marker (written to agent_context "so the
+        # CSV shows honestly") never reached the CSV it was written for. The
+        # analyzer's precedence: agent_context first, llm_context fallback.
+        # Wave r1 (fable): a non-dict agent_context (hand-edited / foreign
+        # dataset) degrades to a blank description, never an AttributeError
+        # (the analyzer's guard convention).
+        agent_context = unit.get('agent_context')
+        if not isinstance(agent_context, dict):
+            agent_context = {}
+        llm_context = unit.get('llm_context')
+        if not isinstance(llm_context, dict):
+            llm_context = {}
+        # The key names differ: agentic's context text is
+        # classification_reasoning, single-shot's is reasoning. Map both —
+        # a naive two-key fallback would leave the column empty in agentic mode.
+        unit_description = (
+            agent_context.get('classification_reasoning')
+            or llm_context.get('reasoning')
+            or '')
+        if len(unit_description) > 500:
+            unit_description = unit_description[:500]
+        agentic_classification = (
+            agent_context.get('security_classification')
+            or llm_context.get('security_classification')
+            or '')
 
         # Get verification data from experiment result
         verification = result.get('verification') or {}
@@ -174,14 +235,19 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
         row = {
             'file': extract_file(route_key),
             'unit_id': route_key,
-            'unit_description': llm_context.get('reasoning', '')[:500] if llm_context.get('reasoning') else '',
+            'unit_description': unit_description,
             'unit_code': unit_code,
+            # #215: the rankable severity — the stamped/model value, or the
+            # same conservative derivation the reporter applies (so an old
+            # scan's CSV still ranks).
+            'severity': _severity_for(result),
+            'severity_source': _severity_source_for(result),
             'stage2_verdict': stage2_verdict,
             'stage2_justification': verification.get('explanation', ''),
             'stage1_verdict': stage1_verdict,
             'stage1_justification': result.get('reasoning', ''),
             'stage1_confidence': result.get('confidence', ''),
-            'agentic_classification': llm_context.get('security_classification', '')
+            'agentic_classification': agentic_classification
         }
         # Neutralize CSV / formula injection on every cell before writing.
         rows.append({k: _csv_safe(v) for k, v in row.items()})
@@ -192,6 +258,8 @@ def export_csv(experiment_path: str, dataset_path: str, output_path: str):
         'unit_id',
         'unit_description',
         'unit_code',
+        'severity',
+        'severity_source',
         'stage2_verdict',
         'stage2_justification',
         'stage1_verdict',

@@ -92,6 +92,9 @@ def test_the_guard_actually_matches_the_bad_pattern():
     assert _MACHINE_PATH.search('X = "/private/tmp/claude-501/scratch/impl-core"')
     assert not _MACHINE_PATH.search('ROOT = Path(__file__).parent.parent')
     assert not _MACHINE_PATH.search('p = tmp_path / "dataset.json"')
+    # JS-flavored: a quoted personal path must match; a // comment example must not.
+    assert _MACHINE_PATH.search("const R = '/Users/nahumkorda/code/dvna';")
+    assert not _MACHINE_PATH.search("// example: /Users/someone/repo".split("//", 1)[0])
 
 
 
@@ -109,6 +112,23 @@ def _shipped_sources():
 
 
 _SHIPPED = _shipped_sources()
+
+
+def _shipped_js_sources():
+    # The shipped-source sweep was .py-only, which let personal paths ride into
+    # parsers/javascript/*.js unnoticed (dataset_enhancer.js, generate_report.js).
+    out = []
+    for pkg in _SHIPPED_PKGS:
+        out.extend((_SRC_ROOT / pkg).rglob("*.js"))
+        out.extend((_SRC_ROOT / pkg).rglob("*.ts"))
+    return [
+        p for p in out
+        if "node_modules" not in p.parts
+        and not p.name.endswith((".min.js", ".bundle.js", ".chunk.js"))
+    ]
+
+
+_SHIPPED_JS = _shipped_js_sources()
 
 
 def test_the_source_sweep_is_not_vacuous():
@@ -131,5 +151,26 @@ def test_no_machine_specific_absolute_paths_in_shipped_source(src):
     """
     for i, line in enumerate(src.read_text(errors="replace").splitlines(), 1):
         code = line.split("#", 1)[0]
+        m = _MACHINE_PATH.search(code)
+        assert not m, f"{src.relative_to(_SRC_ROOT)}:{i}: machine path {m.group(0)}"
+
+
+def test_the_js_source_sweep_is_not_vacuous():
+    """Same floor as the Python sweep: a broken .js glob must not pass silently."""
+    assert len(_SHIPPED_JS) >= 3, (
+        f"only {len(_SHIPPED_JS)} shipped JS sources found; the glob has stopped matching"
+    )
+
+
+@pytest.mark.parametrize("src", _SHIPPED_JS, ids=lambda p: str(p.relative_to(_SRC_ROOT)))
+def test_no_machine_specific_absolute_paths_in_shipped_js(src):
+    """No /Users/<name> or /home/<name> literal in shipped JavaScript/TypeScript.
+
+    Two dead scripts (dataset_enhancer.js, generate_report.js) shipped personal
+    paths because this sweep was .py-only; extending it here closes that gap. JS
+    line comments use // (not #), so an example path in a // comment is fine.
+    """
+    for i, line in enumerate(src.read_text(errors="replace").splitlines(), 1):
+        code = line.split("//", 1)[0]
         m = _MACHINE_PATH.search(code)
         assert not m, f"{src.relative_to(_SRC_ROOT)}:{i}: machine path {m.group(0)}"

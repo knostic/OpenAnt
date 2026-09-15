@@ -40,6 +40,24 @@ from utilities.llm.providers.bedrock import BedrockAdapter
 from utilities.rate_limiter import get_rate_limiter, reset_rate_limiter
 
 
+def test_no_region_maps_to_typed_auth_error(monkeypatch):
+    """anthropic>=1.0 removed the warned us-east-1 fallback: constructing
+    AnthropicBedrock with no resolvable region raises the SDK's bare
+    ValueError. The adapter must surface that as a typed, actionable
+    LLMAuthError — not crash adapter construction. Constructs the REAL
+    SDK class (no injected fake) so this path is exercised where the
+    mocked-client contract suite is structurally blind."""
+    for var in ("AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    # Point the AWS config file nowhere so a developer machine's own
+    # ~/.aws/config cannot silently satisfy the region lookup. (Do NOT
+    # set a bogus AWS_PROFILE: the SDK then raises botocore's
+    # ProfileNotFound, a different failure mode.)
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/nonexistent-openant-test-aws-config")
+    with pytest.raises(LLMAuthError, match="region"):
+        BedrockAdapter()
+
+
 @pytest.fixture(autouse=True)
 def _reset_state():
     reset_rate_limiter()
@@ -246,6 +264,35 @@ class TestErrorMapping:
         adapter, _ = _stub_adapter(respond)
         with pytest.raises(LLMAuthError):
             adapter.validate(model="us.anthropic.claude-sonnet-4-6")
+
+    def test_typed_credentials_error_maps_to_auth_error(self):
+        """1.5.0 narrowed the identity-token/auth-profile raises to the typed
+        CredentialsError (an AnthropicError subclass the APIStatusError arm
+        never sees); it must surface typed like the bare-RuntimeError marker.
+        The except is getattr-guarded — on SDKs older than 1.5.0 the arm
+        matches nothing (the helper returns a never-raised class)."""
+        cls = getattr(anthropic, "CredentialsError", None)
+        if cls is None:
+            pytest.skip("the pinned anthropic predates CredentialsError (>=1.5.0)")
+
+        # The message deliberately does NOT carry _NO_CREDENTIALS_MARKER —
+        # a marker-carrying message would pass via the RuntimeError arm if
+        # the class ever subclassed RuntimeError, and this test must prove
+        # the TYPED arm did the mapping.
+        def respond(**kw):
+            raise cls("identity token file is not readable")
+
+        adapter, _ = _stub_adapter(respond)
+        with pytest.raises(LLMAuthError) as exc_info:
+            _complete(adapter)
+        assert "AWS_ACCESS_KEY_ID" in str(exc_info.value)
+
+        # The startup probe takes the same typed path (validate() is the
+        # first call a scan makes; the probe catches only LLMError).
+        adapter, _ = _stub_adapter(respond)
+        with pytest.raises(LLMAuthError) as exc_info:
+            adapter.validate(model="us.anthropic.claude-sonnet-4-6")
+        assert "AWS_ACCESS_KEY_ID" in str(exc_info.value)
 
     def test_unrelated_runtime_error_propagates(self):
         """Only the SDK's no-credentials RuntimeError is auth-shaped;

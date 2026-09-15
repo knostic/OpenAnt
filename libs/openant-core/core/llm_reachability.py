@@ -15,8 +15,10 @@ Pipeline ordering (managed by ``core/scanner.py``):
 
 1. Parse with ``processing_level="all"`` so every unit is available.
 2. ``analyze_reachability`` reviews all units and returns signals.
-3. ``apply_signals`` promotes high-confidence ``entry_point`` signals by
-   setting ``is_entry_point=True`` on the target unit.
+3. ``apply_signals`` promotes ``entry_point`` signals whose confidence is
+   in the promote set (``OPENANT_PROMOTE_ENTRY_POINT_AT``, default
+   ``{high}`` — #345: configurable per run) by setting
+   ``is_entry_point=True`` on the target unit.
 4. The structural reachability filter re-runs with LLM-promoted entry
    points added as extra BFS seeds, yielding a dataset filtered to the
    user's requested ``processing_level`` but expanded by LLM findings.
@@ -29,8 +31,9 @@ Output:
 - ``analyze_reachability(...)`` returns a list of ``ReachabilitySignal``
   dicts.
 - ``apply_signals(dataset, signals)`` mutates the dataset in place so each
-  unit gains an ``llm_reachability_signals`` field, and high-confidence
-  ``entry_point`` signals set ``is_entry_point = True`` on the target unit.
+  unit gains an ``llm_reachability_signals`` field, and ``entry_point``
+  signals in the promote set set ``is_entry_point = True`` on the target unit
+  (the set is configurable — see OPENANT_PROMOTE_ENTRY_POINT_AT).
 
 Usage:
     from core.llm_reachability import analyze_reachability, apply_signals
@@ -42,13 +45,16 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, asdict
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Union, Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from utilities.llm import PhaseBinding
+    from context.application_context import ApplicationContext  # noqa: F401
+from utilities.rate_limiter import is_budget_exhausted_error
 
 
 # Maximum number of units to send in a single LLM call. Larger batches save
@@ -207,6 +213,44 @@ _VALID_KINDS = {"entry_point", "external_input", "cross_process"}
 _VALID_CONFIDENCES = {"high", "medium", "low"}
 
 
+def _strip_fence(text: str) -> str:
+    """Strip a leading ```json ... ``` (or bare ``` ... ```) fence."""
+    fence = re.match(
+        r"^```(?:json)?\s*(?P<body>.*?)\s*```\s*$",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if fence:
+        return fence.group("body").strip()
+    return text
+
+
+def _classify_malformed(response_text: str) -> str:
+    """#294: name the failure SHAPE.
+
+    Six materially different failures — a bare array (the model answered,
+    wrong shape), a truncation (budget/transport), a prose refusal (policy),
+    an empty completion (adapter empty-content), fenced variants, and valid
+    JSON of a non-object type — previously produced one byte-identical log
+    line, so a completed run could not be diagnosed even in principle.
+    """
+    if not response_text or not response_text.strip():
+        return "empty response (no content)"
+    cleaned = _strip_fence(response_text.strip())
+    try:
+        value = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Heuristic with a known blind spot (wave catch): prose that merely
+        # MENTIONS a brace ("I can't return `{}` for this") lands here as
+        # "truncated" — a diagnostic label only, never behavior-affecting.
+        if "{" in cleaned or "[" in cleaned:
+            return "truncated or unbalanced JSON"
+        return "non-JSON text (prose/refusal)"
+    if isinstance(value, list):
+        return "valid JSON array, expected an object"
+    return f"valid JSON of wrong type {type(value).__name__}, expected an object"
+
+
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     """Best-effort JSON extraction from a model response.
 
@@ -215,16 +259,7 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     """
     if not text:
         return None
-    cleaned = text.strip()
-
-    # Strip ```json ... ``` or ``` ... ``` fences.
-    fence = re.match(
-        r"^```(?:json)?\s*(?P<body>.*?)\s*```\s*$",
-        cleaned,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if fence:
-        cleaned = fence.group("body").strip()
+    cleaned = _strip_fence(text.strip())
 
     try:
         return json.loads(cleaned)
@@ -247,23 +282,58 @@ def parse_response(
     response_text: str,
     valid_unit_ids: Optional[set] = None,
     on_error: Optional[Callable[[str], None]] = None,
+    batch_label: Optional[str] = None,
+    on_batch_drop: Optional[Callable[[], None]] = None,
+    stop_reason: Optional[str] = None,
+    on_signal_skip: Optional[Callable[..., None]] = None,
 ) -> List[ReachabilitySignal]:
+    # on_signal_skip (#602): called with reason/kind/confidence kwargs
     """Parse a single LLM response into validated ``ReachabilitySignal``s.
 
     Malformed entries are skipped (not raised); the optional ``on_error``
     callback receives a one-line description per skipped item, useful for
     logging.
+    #602: ``on_signal_skip`` receives ``reason="unknown_unit_id"``,
+    ``kind``, ``confidence`` for cross-batch signal skips — POLICY-FREE
+    kwargs (the promotable subset is derived at report time from the
+    promote_set, never here). The caller collects ATTEMPT-LOCALLY and
+    folds only accepted responses into its stage totals (the diagnostic
+    log fires for discarded attempts too — the counter is the accepted
+    metric, the log line may out-total it by design).
+
+    #294: a batch-level drop names its failure SHAPE (see
+    :func:`_classify_malformed`), carries the caller-supplied
+    ``batch_label`` and a truncated raw snippet (the evidence — the raw
+    response was previously discarded entirely), and fires ``on_batch_drop``
+    once so the caller can count the loss.
     """
     log = on_error or (lambda msg: print(f"[LLMReach] {msg}", file=sys.stderr))
+    label = f" [{batch_label}]" if batch_label else ""
+    # None-safe: the docstring promises malformed entries are skipped, not
+    # raised — a None response_text must classify, not crash (wave catch).
+    snippet = f" raw[:200]={(response_text or '')[:200]!r}"
 
     data = _extract_json(response_text)
     if not isinstance(data, dict):
-        log("malformed response: not a JSON object — skipping batch")
+        shape = _classify_malformed(response_text)
+        # #538: the stop reason upgrades the brace heuristic to evidence —
+        # "truncated at max_tokens" (the model hit the cap) vs "unbalanced
+        # JSON (not truncated)" (end_turn + broken braces = a shape error).
+        truncated = (stop_reason == "max_tokens" and
+                     shape == "truncated or unbalanced JSON")
+        if truncated:
+            shape = "truncated at max_tokens"
+        log(f"malformed response: {shape} — skipping batch{label};{snippet}")
+        if on_batch_drop is not None:
+            on_batch_drop(truncated=truncated)
         return []
 
     raw_signals = data.get("signals")
     if not isinstance(raw_signals, list):
-        log("malformed response: 'signals' missing or not a list — skipping batch")
+        log(f"malformed response: 'signals' missing or not a list "
+            f"(got {type(raw_signals).__name__}) — skipping batch{label};{snippet}")
+        if on_batch_drop is not None:
+            on_batch_drop(truncated=False)
         return []
 
     out: List[ReachabilitySignal] = []
@@ -286,7 +356,19 @@ def parse_response(
             log(f"signal #{idx}: invalid confidence {confidence!r} — skipped")
             continue
         if valid_unit_ids is not None and unit_id not in valid_unit_ids:
-            log(f"signal #{idx}: unknown unit_id {unit_id!r} — skipped")
+            # #602: the skip carries the signal's kind and confidence — an
+            # entry_point/high skip (could have promoted) is now
+            # distinguishable in the record from an external_input/low skip
+            # (could not). The old PREFIX is preserved (no in-repo consumer
+            # matches the full old line).
+            _where = f" in {batch_label}" if batch_label else ""
+            log(f"signal #{idx}: unknown unit_id {unit_id!r} "
+                f"(kind={kind!r}, confidence={confidence!r}) — skipped{_where}")
+            if on_signal_skip is not None:
+                # Policy-free kwargs; the caller decides what to count (the
+                # promotable subset needs promote_set, not this module).
+                on_signal_skip(reason="unknown_unit_id", kind=kind,
+                               confidence=confidence)
             continue
 
         out.append(
@@ -318,12 +400,15 @@ def _chunk(items: List[Any], size: int) -> List[List[Any]]:
 
 def analyze_reachability(
     dataset: Dict[str, Any],
-    app_context: Optional[Dict[str, Any]] = None,
+    app_context: Optional[Union[Dict[str, Any], "ApplicationContext"]] = None,
     binding: Optional["PhaseBinding"] = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_code_bytes: int = DEFAULT_MAX_CODE_BYTES,
     max_units: Optional[int] = None,
     on_error: Optional[Callable[[str], None]] = None,
+    stats: Optional[Dict[str, Any]] = None,
+    checkpoint_path: Optional[str] = None,
+    tracker: Optional[Any] = None,
 ) -> List[ReachabilitySignal]:
     """Run the LLM reachability review stage over a parsed dataset.
 
@@ -376,37 +461,511 @@ def analyze_reachability(
         probe_registry_or_raise(registry)
         binding = registry.get("llm_reach")
 
-    valid_ids = {u.get("id") for u in units if u.get("id")}
-
     # Lazy import so this module stays usable when callers explicitly
     # provide a binding and never want the registry fallback above.
-    from utilities.llm import LLMAuthError, simple_text
+    from utilities.llm import (LLMAuthError, TextBlock, simple_completion,
+                            DEFAULT_MAX_TOKENS)
+
+    # #532 (review-wave fix): the usage machinery must be live in PRODUCTION —
+    # resolve the global tracker when the caller doesn't pass one (the family
+    # pattern; without this, records persist zero usage and the restored-cost
+    # contract is dead outside tests).
+    if tracker is None:
+        from utilities.llm_client import get_global_tracker
+        tracker = get_global_tracker()
 
     signals: List[ReachabilitySignal] = []
-    batches = _chunk(units, batch_size)
-    for i, batch in enumerate(batches):
+    # #294: count parse-level batch drops and the units they carried —
+    # a dropped batch is a coverage gap in the most consequential direction
+    # (this stage decides which units are analyzed at all), and previously
+    # nothing counted it: the step report said units_reviewed=N for a run
+    # in which some units were never reviewed.
+    dropped_batches = 0
+    units_not_reviewed = 0
+    batches_truncated = 0
+    batches_failed = 0
+    # #602: the skip-class counters — accepted-response occurrences only
+    # (see _attempt's commit point); policy-free (the promotable subset is
+    # derived at report time from promote_set, never here).
+    signals_skipped_unknown_unit = 0
+    signals_skipped_by_class: Dict[str, int] = {}
+    # #599: the artifact-failure counter — summary-write failures are
+    # diagnostics, NOT coverage gaps (the pass succeeded; the persisted
+    # artifact is degraded). Like its sibling counters, it is bypassed by
+    # the empty-units early return (zero units means zero write attempts
+    # — absence is honest; the scanner defaults to 0).
+    checkpoint_summary_write_failures = 0
+    # #558: the split-and-retry provenance counters (direction 4 — the
+    # recovery never silently overwrites the coverage counts).
+    batches_split_recovered = 0
+    batches_split_lost = 0
+
+    # ------------------------------------------------------------------
+    # #532: resume/adopt machinery — the checkpoint family's own pattern
+    # (analyzer.py's StepCheckpoint + backend-identity gate).
+    #   * per-unit records {"signals", "projection_sha", "usage"} — a
+    #     "reviewed, no signal" outcome IS a record (the majority case);
+    #   * the KEY is backend-identity only (model/provider/adapter/base_url/
+    #     static template rendered with app_context=None) — app-context
+    #     CONTENT is deliberately excluded (it regenerates non-determinis-
+    #     tically every scan; content-keying = a guaranteed re-pay — the
+    #     backend_identity ~17k-token lesson at LLR prices);
+    #   * projection_sha = unit_type + trimmed code: a body edit under the
+    #     same id re-runs (closes the family's path-only residual for the
+    #     phase where it is most FN-severe);
+    #   * dropped/exception batches leave NO records — absence IS the retry
+    #     marker (no frozen coverage gaps, no error records the #311
+    #     summary-vs-status drift class would miscount);
+    #   * adopted SIGNALS (not promotion outcomes) — apply_signals still
+    #     runs over them under the CURRENT promotion policy.
+    # ------------------------------------------------------------------
+    checkpoint = None
+    adopted: Dict[str, dict] = {}
+    units_to_run = units
+    if checkpoint_path is not None:
+        import hashlib
+        import os as _os
+
+        from core.backend_identity import (
+            fingerprint_for_binding,
+            render_template_texts,
+        )
+        from core.checkpoint import StepCheckpoint
+
+        def _projection_sha(unit: dict) -> str:
+            # Hash EXACTLY the bytes the prompt sends: the same
+            # _unit_for_prompt projection build_prompt uses (golden
+            # invariant by construction). is_entry_point / reachable are
+            # excluded because they are CONSTANT at this stage's input in
+            # the scanner path — parse runs at level "all" under
+            # --llm-reachability (parser_adapter.py:688-690 skips the
+            # filter), so the flags arrive False/None every run; the
+            # re-parsed dataset overwrites any mutation before the next
+            # pass reads it (scanner.py:391-399). A parser that stamped
+            # the flags itself would carry them across a flip — named
+            # residual. Null/non-str fields coerce to "" — a malformed
+            # unit must cost this hash one line, never the whole stage
+            # (deep-refute 2026-09-08: TypeError here skipped LLR).
+            p = _unit_for_prompt(unit, max_code_bytes=max_code_bytes)
+            body = str(p.get("unit_type") or "") + "\n" + str(p.get("code") or "")
+            return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+
+        try:
+            checkpoint = StepCheckpoint("llm_reach", _os.path.dirname(checkpoint_path))
+            checkpoint.dir = checkpoint_path
+            # I2 adopt gate: BEFORE loading prior checkpoints, verify the backend
+            # identity that produced them matches (a changed model/provider/
+            # adapter/template archives the stale dir and forces a re-run).
+            # #546 follow-up (3b): accept BOTH shapes — the scanner passes
+            # the artifact dict; a direct caller may pass an ApplicationContext
+            # (the type asymmetry the #546 review named: a dataclass-carrying
+            # caller silently folded nothing).
+            _ctx_sha = None
+            if app_context is not None:
+                if isinstance(app_context, dict):
+                    _ctx_sha = app_context.get("source_sha256")
+                else:
+                    _ctx_sha = getattr(app_context, "source_sha256", None)
+            llr_fp = fingerprint_for_binding(
+                binding,
+                render_template_texts([
+                    lambda: PROMPT_TEMPLATE.format(
+                        app_context_block=_build_app_context_block(None),
+                        units_block="",
+                    )
+                ]),
+                # #546: the context's deterministic-derivation identity —
+                # the per-prompt app-context block stays excluded (the
+                # narration non-determinism trap); the SOURCES hash
+                # invalidates the stale records when the derivation changes.
+                extra_key=({"ctx_sources_sha256": _ctx_sha}
+                          if _ctx_sha else None),
+            )
+            checkpoint.sync_identity(llr_fp)
+            prior_records = checkpoint.load()
+        except OSError as exc:
+            # The save doctrine applies to the whole persistence block: an
+            # unwritable/absent checkpoint dir costs persistence, never the
+            # pass — run this stage without checkpointing rather than skip it.
+            if on_error:
+                on_error(f"llm_reach checkpoint init failed, running unpersisted: {exc}")
+            else:
+                print(f"[LLMReach] checkpoint init failed, running unpersisted: {exc}",
+                      file=sys.stderr)
+            checkpoint = None
+            prior_records = {}
+        if checkpoint is not None:
+            current_sha = {u.get("id"): _projection_sha(u) for u in units}
+            for uid, rec in prior_records.items():
+                if (uid not in current_sha or not isinstance(rec, dict)
+                        or rec.get("projection_sha") != current_sha[uid]):
+                    continue
+                try:
+                    rec_sigs = [ReachabilitySignal(**s)
+                                for s in (rec.get("signals") or [])]
+                except TypeError:
+                    # Malformed prior record — never adopt it; the unit re-runs.
+                    continue
+                adopted[uid] = rec
+                signals.extend(rec_sigs)
+            units_to_run = [u for u in units if u.get("id") not in adopted]
+            if stats is not None:
+                stats["units_adopted"] = len(adopted)
+            # Family lifecycle (deep-refute 2026-09-08): an in_progress
+            # summary at PASS START, exactly as analyzer.py:719-722 does —
+            # a run killed mid-loop after a prior completed pass must NOT
+            # leave a stale phase="done" summary behind (the Go resume
+            # sweep reads it and would suppress the fresh/resume prompt
+            # entirely, checkpoint.go:115-116).
+            try:
+                checkpoint.write_summary(
+                    total_units=len(units),
+                    completed=len(adopted),
+                    errors=0,
+                    error_breakdown={},
+                    phase="in_progress",
+                    usage=None,
+                    incomplete=max(0, len(units) - len(adopted)),
+                )
+            except OSError as exc:
+                # #599: this write is load-bearing for the resume sweep
+                # (a stale phase=done suppresses the fresh prompt) — its
+                # failure must be LOUD like the init/save siblings, never
+                # `pass` (which was silent even WITH an on_error), and
+                # counted so the report carries it without any callback.
+                if on_error:
+                    on_error(
+                        "llm_reach pass-start summary write failed "
+                        "(resume sweep may read a stale or absent phase): "
+                        f"{exc}")
+                else:
+                    print(
+                        "[LLMReach] pass-start summary write failed "
+                        "(resume sweep may read a stale or absent phase): "
+                        f"{exc}", file=sys.stderr)
+                checkpoint_summary_write_failures += 1
+            # Restored cost lands as PRIOR usage — never zero, never this run's
+            # new spend (the #26/#26b kill-vs-complete asymmetry lessons).
+            if adopted and tracker is not None:
+                tot_in = sum(int((r.get("usage") or {}).get("input_tokens", 0) or 0)
+                             for r in adopted.values())
+                tot_out = sum(int((r.get("usage") or {}).get("output_tokens", 0) or 0)
+                              for r in adopted.values())
+                tot_cost = sum(float((r.get("usage") or {}).get("cost_usd", 0) or 0)
+                               for r in adopted.values())
+                unpriced: set = set()
+                for r in adopted.values():
+                    unpriced.update(
+                        (r.get("usage") or {}).get("unpriced_models") or [])
+                try:
+                    tracker.add_prior_usage(
+                        tot_in, tot_out, tot_cost,
+                        unpriced_models=sorted(unpriced) or None)
+                except Exception:  # noqa: BLE001 — accounting must never kill the pass
+                    pass
+
+    batches = _chunk(units_to_run, batch_size)
+    persisted = 0
+
+    # #558: one call+parse attempt for a (sub-)batch. Returns
+    # (signals, outcome) where outcome ∈ {"ok", "failed", "dropped",
+    # "truncated"}; the counters are mutated here so the split-and-retry
+    # below can revise them (a recovered original subtracts what its
+    # drop counted; the halves count their own outcomes).
+    def _attempt(sub_batch, label) -> tuple:
+        """Returns (signals, outcome, deltas) — deltas are THIS attempt's
+        applied counter changes ({dropped, units, truncated}), so the
+        split-and-retry subtracts exactly what was applied (never an
+        inferred shape — the refutation's negative-counter catch)."""
+        nonlocal dropped_batches, units_not_reviewed, batches_truncated, \
+            batches_failed, signals_skipped_unknown_unit, signals_skipped_by_class
         prompt = build_prompt(
-            batch, app_context=app_context, max_code_bytes=max_code_bytes
+            sub_batch, app_context=app_context, max_code_bytes=max_code_bytes
         )
         try:
-            text = simple_text(binding, prompt, max_tokens=4096)
+            result = simple_completion(binding, prompt,
+                                       max_tokens=DEFAULT_MAX_TOKENS,
+                                       tracker=tracker)
+            text = "\n".join(
+                b.text for b in result.content
+                if isinstance(b, TextBlock))
         except LLMAuthError:
             # Auth failures are fatal and recur on every batch — surface
             # them instead of burying them as a per-batch "failed" line,
             # so the caller can stop and tell the user the key is bad.
             raise
         except Exception as exc:  # noqa: BLE001 — advisory stage; never crash pipeline
-            msg = f"batch {i + 1}/{len(batches)} failed: {exc}"
+            # #569 x #558 composition (the review follow-up): a DETERMINISTIC
+            # budget-exhausted empty surfaces HERE as an exception — the
+            # adapter raises on empty content before LLR's parse-path
+            # truncation gate ever sees a stop_reason — and under the #541
+            # classification it became batches_failed -> a same-cap resume
+            # re-roll: the exact billed coin flip #569 exists to kill, in the
+            # phase that decides what gets analyzed at all. Classify it as
+            # the TRUNCATED class with FULL deltas so #558's split-and-retry
+            # covers it: the counters + deltas match the parse-path
+            # truncated arm exactly, the split's subtraction stays exact,
+            # and the halves' own outcomes flow through the same arms. The
+            # split halves are smaller outputs (less likely to exhaust) AND
+            # a fresh roll — the #558 rationale, same-cap by design (LLR
+            # passes no raised cap; the raised-cap path is analyze-phase
+            # only, per #569).
+            if is_budget_exhausted_error(str(exc)):
+                dropped_batches += 1
+                batches_truncated += 1
+                units_not_reviewed += len(sub_batch)
+                msg = f"{label} truncated (budget exhausted: the model spent "
+                f"the output cap before emitting content): {exc}"
+                if on_error:
+                    on_error(msg)
+                else:
+                    print(f"[LLMReach] {msg}", file=sys.stderr)
+                return [], "truncated", {
+                    "dropped": 1, "units": len(sub_batch), "truncated": 1}
+            # #541: a provider-exception batch is counted in the coverage
+            # truth. A distinct counter (different failure class, different
+            # remediation) + the same units_not_reviewed.
+            msg = f"{label} failed: {exc}"
             if on_error:
                 on_error(msg)
             else:
                 print(f"[LLMReach] {msg}", file=sys.stderr)
-            continue
+            batches_failed += 1
+            units_not_reviewed += len(sub_batch)
+            return [], "failed", {"dropped": 0, "units": 0, "truncated": 0}
+
+        batch_ids = {u.get("id") for u in sub_batch if u.get("id")}
+        first = sub_batch[0].get("id", "?") if sub_batch else "?"
+        last = sub_batch[-1].get("id", "?") if sub_batch else "?"
+        dropped = []
+        _delta = {"dropped": 0, "units": 0, "truncated": 0}
+
+        def _count_drop(sb=sub_batch, truncated=False):
+            nonlocal dropped_batches, units_not_reviewed, batches_truncated
+            dropped_batches += 1
+            units_not_reviewed += len(sb)
+            _delta["dropped"] += 1
+            _delta["units"] += len(sb)
+            if truncated:
+                batches_truncated += 1
+                _delta["truncated"] += 1
+            dropped.append(True)
+
+        # #602: attempt-LOCAL skip collection — the parent's skips are
+        # counted into the STAGE totals only when the batch COMMITS ("ok"):
+        # a max_tokens drop discards them with the batch, and a split-
+        # retry's halves contribute their own. No subtraction is ever
+        # needed (nothing un-counted).
+        _attempt_skips: list = []
+
+        def _count_skip(**kw):
+            _attempt_skips.append(kw)
 
         parsed = parse_response(
-            text, valid_unit_ids=valid_ids, on_error=on_error
+            text, valid_unit_ids=batch_ids, on_error=on_error,
+            batch_label=f"{label}, units {first}..{last}",
+            on_batch_drop=_count_drop,
+            stop_reason=result.stop_reason,
+            on_signal_skip=_count_skip,
         )
+        # #538 gate fold: a max_tokens reply drops the batch WHOLE (the
+        # applied==adopted invariant; the salvage prefix discarded) —
+        # independently of the parse outcome (the callback may not fire).
+        if result.stop_reason == "max_tokens":
+            if not dropped:
+                batches_truncated += 1
+                dropped_batches += 1
+                units_not_reviewed += len(sub_batch)
+                _delta["truncated"] += 1
+                _delta["dropped"] += 1
+                _delta["units"] += len(sub_batch)
+            return [], "truncated", _delta
+        if dropped:
+            return [], "dropped", _delta
+        # The commit point: only ACCEPTED responses' skips enter the totals
+        # (the metric is unknown-ID signal occurrences in accepted
+        # responses — the diagnostic log may carry discarded attempts').
+        for kw in _attempt_skips:
+            signals_skipped_unknown_unit += 1
+            _key = f"{kw.get('kind', 'unknown')}/{kw.get('confidence', 'unknown')}"
+            signals_skipped_by_class[_key] = \
+                signals_skipped_by_class.get(_key, 0) + 1
+        return parsed, "ok", _delta
+
+    for i, batch in enumerate(batches):
+        # #558 (the refutation's usage fix): the tracking window spans the
+        # ORIGINAL batch AND its split halves — started once here, never
+        # inside _attempt, so the per-unit records carry the whole
+        # recovery's true cost (a lost half's spend shared over the
+        # recovered units — the conservative choice, else it vanishes).
+        if tracker is not None:
+            try:
+                tracker.start_unit_tracking()
+            except Exception:  # noqa: BLE001
+                pass
+        parsed, outcome, deltas = _attempt(
+            batch, f"batch {i + 1}/{len(batches)}")
+        record_units: list = batch if outcome == "ok" else []
+
+        # #558: SPLIT-AND-RETRY (never the JSON corrector — it cannot
+        # recover signals the model never emitted, and on the truncation
+        # class it would freeze partial batches as reviewed). A dropped
+        # or truncated batch of >= 2 units is re-issued once as two
+        # halves: the halves are smaller outputs (less likely to exhaust
+        # a cap or break mid-structure) AND a fresh roll (the model's
+        # own broken-JSON finishes — the measured residual class at the
+        # lifted cap — recover on re-generation; the #292 rationale).
+        # Bounded: ONE split level, no recursion — a half that still
+        # drops stays dropped (its units re-run on the next resume via
+        # absence-as-retry). The ORIGINAL drop's counters are revised
+        # (subtracted) so the halves count their own outcomes: the
+        # coverage truth is never double-counted, and the recovery has
+        # its own provenance counters (#558's direction 4).
+        if outcome in ("dropped", "truncated") and len(batch) >= 2:
+            # Subtract EXACTLY this attempt's applied deltas (the
+            # refutation's negative-counter catch: a max_tokens reply
+            # with a no-brace shape incremented dropped but NOT truncated
+            # — inferring the shape drove batches_truncated to -1).
+            dropped_batches -= deltas["dropped"]
+            units_not_reviewed -= deltas["units"]
+            batches_truncated -= deltas["truncated"]
+            halves = []
+            mid = (len(batch) + 1) // 2
+            for j, half in enumerate((batch[:mid], batch[mid:])):
+                if not half:
+                    continue
+                p2, o2, _d2 = _attempt(
+                    half, f"batch {i + 1}/{len(batches)} half {j + 1}/2")
+                if o2 == "ok":
+                    halves.extend(p2)
+                    record_units.extend(half)
+            if halves or record_units:
+                batches_split_recovered += 1
+            else:
+                batches_split_lost += 1
+            print(f"[LLMReach] batch {i + 1}/{len(batches)} split-retry: "
+                  f"{sum(1 for u in record_units)} units recovered via "
+                  f"halves", file=sys.stderr)
+            parsed = halves
+            outcome = "recovered" if record_units else outcome
+
+        # NOTE: a "failed" (provider-exception) batch is deliberately NOT
+        # split — the exception class (empty completions, transport) is
+        # not output-size-shaped; the #541 counters + the resume own it.
+        if outcome == "failed" or (outcome in ("dropped", "truncated")
+                                   and not record_units):
+            continue
         signals.extend(parsed)
+
+        # Persist per-unit records for the OK units — dropped halves leave
+        # no records (absence = the retry marker on the next resume). Save
+        # failures cost persistence, not the pass (the advisory doctrine).
+        if checkpoint is not None and record_units:
+            batch_usage = {}
+            if tracker is not None:
+                try:
+                    batch_usage = tracker.get_unit_usage() or {}
+                except Exception:  # noqa: BLE001
+                    batch_usage = {}
+            n_units = max(len(record_units), 1)
+
+            def _share(units_in_batch: int) -> dict:
+                share = {
+                    "input_tokens": int(batch_usage.get("input_tokens", 0) or 0) // units_in_batch,
+                    "output_tokens": int(batch_usage.get("output_tokens", 0) or 0) // units_in_batch,
+                    "cost_usd": round(float(batch_usage.get("cost_usd", 0.0) or 0.0) / units_in_batch, 6),
+                }
+                if batch_usage.get("unpriced_models"):
+                    share["cost_incomplete"] = True
+                    share["unpriced_models"] = sorted(
+                        set(batch_usage["unpriced_models"]))
+                return share
+
+            sig_by_unit: Dict[str, List[dict]] = {}
+            for sig in parsed:
+                sig_by_unit.setdefault(sig.unit_id, []).append({
+                    "unit_id": sig.unit_id, "kind": sig.kind,
+                    "confidence": sig.confidence, "reason": sig.reason,
+                })
+            for u in record_units:
+                uid = u.get("id")
+                if not uid:
+                    continue
+                try:
+                    checkpoint.save(uid, {
+                        "signals": sig_by_unit.get(uid, []),
+                        "projection_sha": current_sha[uid],
+                        "usage": _share(n_units),
+                    })
+                    persisted += 1
+                except OSError as exc:
+                    if on_error:
+                        on_error(f"llm_reach checkpoint save failed for {uid}: {exc}")
+                    else:
+                        print(f"[LLMReach] checkpoint save failed for {uid}: {exc}",
+                              file=sys.stderr)
+
+    if checkpoint is not None:
+        try:
+            completed = len(adopted) + persisted
+            # #293 three-state invariant: completed + incomplete + errors ==
+            # total_units. Un-reviewed units (dropped/exception batches —
+            # absence IS their retry marker) are the `incomplete` bucket,
+            # NOT summary errors (#311 drift class); the phase stays
+            # "in_progress" until every unit has a record.
+            incomplete = max(0, len(units) - completed)
+            checkpoint.write_summary(
+                total_units=len(units),
+                completed=completed,
+                errors=0,
+                error_breakdown={},
+                phase="done" if completed == len(units) else "in_progress",
+                usage=None,
+                incomplete=incomplete,
+            )
+        except OSError as exc:
+            # #599: the final write previously surfaced ONLY through
+            # on_error — and the scanner passes none, so in scans this
+            # failure class never appeared anywhere. Loud like the
+            # siblings, counted into the stats the report carries.
+            if on_error:
+                on_error(
+                    "llm_reach final summary write failed "
+                    "(summary left at its pre-final state; the resume sweep "
+                    "may offer a needless resume): "
+                    f"{exc}")
+            else:
+                print(
+                    "[LLMReach] final summary write failed "
+                    "(summary left at pass-start state; the resume sweep "
+                    "may offer a needless resume): "
+                    f"{exc}", file=sys.stderr)
+            checkpoint_summary_write_failures += 1
+
+    if stats is not None:
+        stats["batches_dropped"] = dropped_batches
+        stats["units_not_reviewed"] = units_not_reviewed
+        # #602: the skip-class telemetry — a skipped signal is NOT a
+        # coverage failure (the same doctrine as the write-failure counter:
+        # error_count stays dropped+failed batches only).
+        stats["signals_skipped_unknown_unit"] = signals_skipped_unknown_unit
+        stats["signals_skipped_unknown_unit_by_class"] = \
+            dict(signals_skipped_by_class)
+        # #538: the truncation subclass — the recurrence's diagnosis lever.
+        stats["batches_truncated"] = batches_truncated
+        # #541: the provider-exception class — distinct from the parse
+        # drops, same coverage-truth denominator.
+        stats["batches_failed"] = batches_failed
+        # #558: the split-and-retry provenance.
+        stats["batches_split_recovered"] = batches_split_recovered
+        stats["batches_split_lost"] = batches_split_lost
+        # #599: the summary-write diagnostic — an ARTIFACT failure, not a
+        # coverage gap. Must NOT fold into error_count (a failed write
+        # does not mean an incomplete review: the pass succeeded and the
+        # per-unit records persist; the persisted summary alone is
+        # degraded). Folding it would flip #541's partial contract wrongly.
+        stats["checkpoint_summary_write_failures"] = \
+            checkpoint_summary_write_failures
 
     return signals
 
@@ -416,9 +975,64 @@ def analyze_reachability(
 # ---------------------------------------------------------------------------
 
 
-# Confidences at or above this threshold promote ``entry_point`` signals to
-# ``is_entry_point = True`` on the target unit.
-_PROMOTE_ENTRY_POINT_AT = {"high"}
+# The confidence tiers that promote an ``entry_point`` signal to
+# ``is_entry_point = True`` on the target unit. This is a SET-MEMBERSHIP
+# test, not an "at or above" ordering — no ordering over high/medium/low
+# exists in this module, and the earlier "at or above" comment described
+# semantics the code never implemented (it worked only because the set
+# had one element) — #345.
+#
+# Configurable per run (#345): an operator can trade recall for cost —
+# promotion is promote-only and never demotes, so a wrong promotion costs
+# analysis budget while a missing one silently drops a unit and everything
+# reachable only through it. OPENANT_PROMOTE_ENTRY_POINT_AT is a
+# comma-separated subset of high/medium/low, read at apply time; invalid or
+# empty content falls back to the shipped default WITH a stderr warning —
+# a calibration knob must never crash the scan.
+#
+# The DEFAULT is the deliberate PR #50 calibration, pinned by
+# test_medium_confidence_does_not_promote: medium measured 48% precision
+# on the one audit #345 reports (n=25, 95% CI [30,67], an internal run the
+# issue flags as not reproducible from this repository — widen only after
+# the second-corpus reproduction it names), and low 0.0%.
+_PROMOTE_ENTRY_POINT_AT_DEFAULT = frozenset({"high"})
+# the tier vocabulary _VALID_CONFIDENCES already declares (parse validates
+# incoming signals against it) — a second hand-rolled copy would drift: a
+# tier added there but not here makes an operator's whole list discard
+# (wave r1 opus), narrowing promotion to the default: the under-seeding
+# direction.
+_PROMOTE_TIERS = frozenset(_VALID_CONFIDENCES)
+_ENV_PROMOTE_ENTRY_POINT_AT = "OPENANT_PROMOTE_ENTRY_POINT_AT"
+
+
+def _promote_entry_point_at() -> frozenset:
+    """The tiers that promote, after resolving the env override (#345)."""
+    raw = os.environ.get(_ENV_PROMOTE_ENTRY_POINT_AT)
+    if raw is None or raw == "":
+        # blank-but-SET (OPENANT_PROMOTE_ENTRY_POINT_AT= — the CI-template
+        # shape, `=$WIDEN` with WIDEN unset) WARNED, not silent: the operator
+        # believes the widening is live while promotion silently narrows to
+        # the default — units dropped from analysis with zero signal (wave
+        # r1, sonnet+opus).
+        if raw == "":
+            print(
+                f"[LLMReach] {_ENV_PROMOTE_ENTRY_POINT_AT} is set but empty; "
+                f"falling back to the shipped default "
+                f"{sorted(_PROMOTE_ENTRY_POINT_AT_DEFAULT)}",
+                file=sys.stderr,
+            )
+        return _PROMOTE_ENTRY_POINT_AT_DEFAULT
+    wanted = {t.strip().lower() for t in raw.split(",") if t.strip()}
+    if not wanted or (wanted - _PROMOTE_TIERS):
+        print(
+            f"[LLMReach] {_ENV_PROMOTE_ENTRY_POINT_AT}={raw!r}: expected "
+            f"comma-separated tiers from {sorted(_PROMOTE_TIERS)}; falling "
+            "back to the shipped default "
+            f"{sorted(_PROMOTE_ENTRY_POINT_AT_DEFAULT)}",
+            file=sys.stderr,
+        )
+        return _PROMOTE_ENTRY_POINT_AT_DEFAULT
+    return frozenset(wanted)
 
 
 def apply_signals(
@@ -429,9 +1043,11 @@ def apply_signals(
 
     For each unit referenced by a signal:
       - The signal is appended to a per-unit ``llm_reachability_signals`` list.
-      - If the signal kind is ``entry_point`` AND its confidence is in
-        :data:`_PROMOTE_ENTRY_POINT_AT`, the unit's ``is_entry_point`` field
-        is set to ``True`` (never set back to ``False``).
+      - If the signal kind is ``entry_point`` AND its confidence is in the
+        promote set (:func:`_promote_entry_point_at` — the shipped default
+        ``{high}``, configurable via OPENANT_PROMOTE_ENTRY_POINT_AT), the
+        unit's ``is_entry_point`` field is set to ``True`` (never set back
+        to ``False``).
 
     Crucially, this never DEMOTES a unit. ``is_entry_point=True`` set by the
     structural pass remains true regardless of what the LLM said.
@@ -446,6 +1062,7 @@ def apply_signals(
     """
     units = dataset.get("units") or []
     by_id = {u.get("id"): u for u in units if u.get("id")}
+    promote_at = _promote_entry_point_at()
 
     promoted = 0
     touched: set = set()
@@ -463,7 +1080,7 @@ def apply_signals(
 
         if (
             sig.kind == "entry_point"
-            and sig.confidence in _PROMOTE_ENTRY_POINT_AT
+            and sig.confidence in promote_at
             and not unit.get("is_entry_point", False)
         ):
             unit["is_entry_point"] = True
@@ -474,6 +1091,10 @@ def apply_signals(
         "signals_applied": applied,
         "entry_points_promoted": promoted,
         "units_touched": len(touched),
+        # #345 (wave r1 opus): the resolved set is part of the run's
+        # provenance — two scans under different sets produce different
+        # promotions with byte-identical step reports otherwise.
+        "promote_set": sorted(promote_at),
     }
 
 

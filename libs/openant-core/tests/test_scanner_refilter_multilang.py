@@ -12,7 +12,6 @@ persist one is no longer skipped just because it isn't the primary.
 
 import json
 
-import pytest
 
 from core.scanner import partition_units_by_language, resolve_call_graph_dirs
 

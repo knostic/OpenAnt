@@ -227,13 +227,18 @@ Unsupported types (desktop apps, mobile apps, games, embedded systems) are rejec
 
 **Usage:**
 ```bash
+# Generate context via CLI (recommended)
+openant generate-context /path/to/repo
+
+# Generate context via Python module
+python -m context.generate_context /path/to/repo
+
 # List supported types
 python -m context.generate_context --list-types
 
-# Generate context for a repository
-python -m context.generate_context /path/to/repo
-
-# Context is saved to application_context.json in the dataset directory
+# Context is saved to application_context.json in the current directory
+# Under a project, the Go CLI auto-fills --app-context from the project scan dir
+# (operator-owned, never the scanned repo); otherwise pass --app-context explicitly
 ```
 
 **Generated Context Structure:**

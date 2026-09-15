@@ -52,13 +52,19 @@ def test_retries_install_when_node_modules_partially_installed(fake_parser_dir, 
     class _Ok:
         returncode = 0
 
-    def _fake_run(cmd, **kwargs):
+    def _fake_popen(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        # Simulate npm completing the install by writing the sentinel.
-        _mark_installed(fake_parser_dir)
-        return _Ok()
 
-    monkeypatch.setattr(parser_adapter.subprocess, "run", _fake_run)
+        class _P:
+            pid = 123
+            def wait(self, timeout=None):
+                _mark_installed(fake_parser_dir)  # npm wrote the sentinel
+                return 0
+            def kill(self):
+                pass
+        return _P()
+
+    monkeypatch.setattr(parser_adapter.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(parser_adapter.shutil, "which", lambda name: "/usr/bin/npm")
 
     parser_adapter._ensure_js_parser_dependencies()
@@ -69,14 +75,19 @@ def test_retries_install_when_node_modules_partially_installed(fake_parser_dir, 
 def test_runs_npm_install_when_node_modules_missing(fake_parser_dir, monkeypatch):
     calls = []
 
-    class _Ok:
-        returncode = 0
-
-    def _fake_run(cmd, **kwargs):
+    def _fake_popen(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        return _Ok()
 
-    monkeypatch.setattr(parser_adapter.subprocess, "run", _fake_run)
+        class _P:
+            pid = 123
+            def wait(self, timeout=None):
+                _mark_installed(fake_parser_dir)  # npm wrote the sentinel
+                return 0
+            def kill(self):
+                pass
+        return _P()
+
+    monkeypatch.setattr(parser_adapter.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(parser_adapter.shutil, "which", lambda name: "/usr/bin/npm")
 
     parser_adapter._ensure_js_parser_dependencies()
@@ -106,10 +117,16 @@ def test_raises_when_package_json_missing(fake_parser_dir, monkeypatch):
 
 
 def test_raises_when_npm_install_fails(fake_parser_dir, monkeypatch):
-    class _Fail:
-        returncode = 1
+    def _fail_popen(cmd, **kwargs):
+        class _P:
+            pid = 123
+            def wait(self, timeout=None):
+                return 1
+            def kill(self):
+                pass
+        return _P()
 
-    monkeypatch.setattr(parser_adapter.subprocess, "run", lambda *a, **kw: _Fail())
+    monkeypatch.setattr(parser_adapter.subprocess, "Popen", _fail_popen)
     monkeypatch.setattr(parser_adapter.shutil, "which", lambda name: "/usr/bin/npm")
 
     with pytest.raises(RuntimeError, match="npm install.*exit code 1"):
@@ -119,10 +136,16 @@ def test_raises_when_npm_install_fails(fake_parser_dir, monkeypatch):
 def test_install_failure_message_includes_repro_command(fake_parser_dir, monkeypatch):
     """The error message must tell the user how to reproduce the install
     locally so they can read npm's diagnostics."""
-    class _Fail:
-        returncode = 1
+    def _fail_popen(cmd, **kwargs):
+        class _P:
+            pid = 123
+            def wait(self, timeout=None):
+                return 1
+            def kill(self):
+                pass
+        return _P()
 
-    monkeypatch.setattr(parser_adapter.subprocess, "run", lambda *a, **kw: _Fail())
+    monkeypatch.setattr(parser_adapter.subprocess, "Popen", _fail_popen)
     monkeypatch.setattr(parser_adapter.shutil, "which", lambda name: "/usr/bin/npm")
 
     with pytest.raises(RuntimeError) as exc_info:
@@ -159,16 +182,20 @@ def test_concurrent_bootstrap_serialized_by_lock(fake_parser_dir, monkeypatch):
     the first, must observe the sentinel on entry and skip its own install."""
     install_count = 0
 
-    class _Ok:
-        returncode = 0
-
-    def _fake_run(cmd, **kwargs):
+    def _fake_popen(cmd, **kwargs):
         nonlocal install_count
         install_count += 1
-        _mark_installed(fake_parser_dir)
-        return _Ok()
 
-    monkeypatch.setattr(parser_adapter.subprocess, "run", _fake_run)
+        class _P:
+            pid = 123
+            def wait(self, timeout=None):
+                _mark_installed(fake_parser_dir)  # npm wrote the sentinel
+                return 0
+            def kill(self):
+                pass
+        return _P()
+
+    monkeypatch.setattr(parser_adapter.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(parser_adapter.shutil, "which", lambda name: "/usr/bin/npm")
 
     # Two sequential calls in the same process: first installs and writes the

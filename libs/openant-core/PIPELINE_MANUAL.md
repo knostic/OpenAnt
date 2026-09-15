@@ -49,7 +49,7 @@ OpenAnt is a vulnerability analysis tool using Claude. The name "two-stage" refe
 ### Required Software
 
 ```bash
-# Python 3.10+
+# Python 3.11+
 python3 --version
 
 # Node.js (for JavaScript parser)
@@ -348,9 +348,11 @@ Entry Point: handle_request()
 Intermediate: process_data()
     │
     ▼
-Target: unsafe_eval()  ← REACHABLE (exploitable)
+Target: unsafe_eval()  ← REACHABLE in the static call graph
 
-Isolated: helper_function()  ← NOT REACHABLE (not exploitable)
+Isolated: helper_function()  ← NOT REACHABLE in the static call graph (no recorded call path
+from any entry point — which is a claim about the parsed call graph, not a proof of
+unexploitability: an edge the parser did not record produces the same result as dead code)
 ```
 
 **Entry points** are functions that directly receive external input:
@@ -503,7 +505,7 @@ if reachability.is_reachable_from_entry_point(func_id):
     print(f"REACHABLE from {entry}")
     print(f"Path: {' → '.join(path)}")
 else:
-    print("NOT REACHABLE - cannot be exploited externally")
+    print("NOT REACHABLE in the static call graph - no recorded call path from any entry point")
 ```
 
 ### Statistics
@@ -534,14 +536,25 @@ For typical web applications, entry-point filtering achieves 60-95% reduction.
 
 Classifies the repository type to reduce false positives.
 
-**Location:** `context/generate_context.py`
+**Location:** `context/application_context.py`, `openant/cli.py`
 
-**Command:**
+**Command (via CLI):**
+```bash
+openant generate-context                           # Uses active project
+openant generate-context /path/to/repo             # Explicit repo path
+openant generate-context /path/to/repo -o ctx.json # Custom output path
+openant generate-context --force                   # Skip OPENANT.md override
+openant generate-context --show-prompt             # Include prompt format in output
+```
+
+**Command (via Python module):**
 ```bash
 python -m context.generate_context /path/to/repo
 python -m context.generate_context /path/to/repo -o application_context.json
 python -m context.generate_context --list-types  # Show supported types
 ```
+
+When using a project (`openant init`), the output defaults to the project scan directory and is automatically discovered by `analyze` and `verify` — no need to pass `--app-context`.
 
 **Supported Application Types:**
 
@@ -885,7 +898,7 @@ python parsers/python/parse_repository.py /path/to/flask-app \
 python validate_dataset_schema.py datasets/flask-app/dataset.json
 
 # 3. Generate application context
-python -m context.generate_context /path/to/flask-app
+openant generate-context /path/to/flask-app
 
 # 4. Run Stage 1 + Stage 2 on first 20 units
 python experiment.py --dataset flask-app --verify --limit 20
@@ -907,7 +920,7 @@ python parsers/javascript/test_pipeline.py /path/to/node-app \
 python validate_dataset_schema.py datasets/node-app/dataset.json
 
 # 3. Generate application context
-python -m context.generate_context /path/to/node-app
+openant generate-context /path/to/node-app
 
 # 4. Run full analysis
 python experiment.py --dataset node-app --verify
@@ -953,7 +966,7 @@ python parsers/python/parse_repository.py /repo --output datasets/name/dataset.j
 python parsers/javascript/test_pipeline.py /repo --analyzer-path /analyzer.js --output datasets/name --processing-level codeql
 
 # Generate app context
-python -m context.generate_context /repo
+openant generate-context /repo
 
 # Run Stage 1
 python experiment.py --dataset name

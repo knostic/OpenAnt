@@ -3,6 +3,7 @@ package cmd
 import (
 	"os"
 
+	"github.com/knostic/open-ant-cli/internal/git"
 	"github.com/knostic/open-ant-cli/internal/output"
 	"github.com/knostic/open-ant-cli/internal/python"
 	"github.com/spf13/cobra"
@@ -38,7 +39,7 @@ func init() {
 	buildOutputCmd.Flags().StringVar(&buildOutputRepoURL, "repo-url", "", "Repository URL")
 	buildOutputCmd.Flags().StringVar(&buildOutputLanguage, "language", "", "Primary language")
 	buildOutputCmd.Flags().StringVar(&buildOutputCommitSHA, "commit-sha", "", "Commit SHA")
-	buildOutputCmd.Flags().StringVar(&buildOutputAppType, "app-type", "", "Application type (default: web_app)")
+	buildOutputCmd.Flags().StringVar(&buildOutputAppType, "app-type", "", "Application type (default: unknown — no fabricated assumption)")
 	buildOutputCmd.Flags().StringVar(&buildOutputProcessingLevel, "processing-level", "", "Processing level used")
 }
 
@@ -80,10 +81,19 @@ func runBuildOutput(cmd *cobra.Command, args []string) {
 
 	pyArgs := []string{"build-output", resultsPath, "--output", buildOutputPath}
 	if buildOutputRepoName != "" {
-		pyArgs = append(pyArgs, "--repo-name", buildOutputRepoName)
+		// The "=" form: a name starting with "-" must never parse as a
+		// flag element (argparse treats "--repo-name -x" as a flag).
+		pyArgs = append(pyArgs, "--repo-name="+buildOutputRepoName)
 	}
 	if buildOutputRepoURL != "" {
-		pyArgs = append(pyArgs, "--repo-url", buildOutputRepoURL)
+		// #562: normalize defensively (an init-recorded scp-form or
+		// credential-bearing remote must never reach the report permalinks
+		// or the SARIF repositoryUri verbatim — the same tier fix as the
+		// scan path's resolveRepoMetadata).
+		normalized := git.NormalizeRemote(buildOutputRepoURL)
+		if normalized != "" {
+			pyArgs = append(pyArgs, "--repo-url", normalized)
+		}
 	}
 	if buildOutputLanguage != "" {
 		pyArgs = append(pyArgs, "--language", buildOutputLanguage)

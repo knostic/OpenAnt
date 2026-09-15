@@ -1,0 +1,30 @@
+{
+  "comment": "#540: the single source of truth for the report palette — consumed by BOTH tailwind.config.js (the build) and the Go coverage test (the config->CSS drift check). Changed here = regenerate + update the report.css sha.",
+  "colors": {
+    "navy": {
+      "900": "#1a1a2e",
+      "800": "#16213e",
+      "700": "#0f3460"
+    },
+    "accent": "#e94560",
+    "knostic": {
+      "purple": "#6861FF",
+      "purple-hover": "#7D77FF",
+      "purple-light": "#F0EDFF",
+      "purple-glow": "rgba(104, 97, 255, 0.08)",
+      "navy": "#1F1E45",
+      "navy-deep": "#1F0451",
+      "body": "#727272",
+      "muted": "#87909E",
+      "border": "#B3BEFB",
+      "border-light": "#E8ECF4",
+      "card-bg": "#F5F7FB"
+    }
+  },
+  "fontFamily": {
+    "knostic-sans": ["system-ui", "sans-serif"]
+  },
+  "borderRadius": {
+    "card": "20px"
+  }
+}

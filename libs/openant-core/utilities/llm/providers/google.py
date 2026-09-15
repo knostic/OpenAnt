@@ -58,6 +58,7 @@ import sys
 import threading
 from typing import Any, Optional
 
+import httpcore
 import httpx
 from google import genai
 from google.genai import errors as genai_errors
@@ -99,7 +100,8 @@ _GEMINI_FINISH_REASONS: dict[str, StopReason] = {
 # ``LLMRefusalError`` so a security scan doesn't read a safety-blocked
 # candidate as a clean, finding-free pass.
 #
-# We verified against the pinned google-genai SDK (v2.4.0) that
+# We verified (and tests/test_llm_sdk_contract_floor.py re-derives against the
+# INSTALLED SDK) that
 # ``types.FinishReason`` exposes SAFETY / RECITATION / BLOCKLIST /
 # PROHIBITED_CONTENT / SPII (among others). We build the comparison set
 # from the enum when importable so the names stay in sync with the SDK,
@@ -144,6 +146,40 @@ def reset_warnings() -> None:
         _warned_finish_reasons.clear()
 
 
+def _gemini_output_tokens(usage: Any) -> int:
+    """Gemini's output-token billing rule, as the single source of truth.
+
+    Gemini bills output as candidates + thoughts (thinking models like
+    gemini-2.5-* emit ``thoughts_token_count``); count both so the cost
+    isn't undercounted. ``tests/test_llm_sdk_contract_floor.py`` drives
+    this against the INSTALLED SDK's ``usage_metadata`` type — a field
+    rename in a future google-genai turns that floor RED.
+    """
+    return (getattr(usage, "candidates_token_count", 0) or 0) + (
+        getattr(usage, "thoughts_token_count", 0) or 0
+    )
+
+
+def _extract_usage_details(usage: Any) -> Optional[dict]:
+    """Pass-through capture (#211): Gemini usage detail fields.
+
+    Copies ``thoughts_token_count`` / ``cached_content_token_count``
+    VERBATIM when present; ``None`` otherwise (absent ≠ 0). Never feeds
+    the cost formula — note ``thoughts_token_count`` is ALREADY summed
+    into ``output_tokens`` above (Gemini bills candidates + thoughts as
+    output), so these captured fields are informational for bill
+    reconciliation, not additional billed tokens.
+    """
+    if usage is None:
+        return None
+    details: dict = {}
+    for field_name in ("thoughts_token_count", "cached_content_token_count"):
+        value = getattr(usage, field_name, None)
+        if value is not None:
+            details[field_name] = value
+    return details or None
+
+
 class GoogleAdapter:
     """:class:`LLMAdapter` implementation backed by ``google.genai.Client``."""
 
@@ -177,8 +213,11 @@ class GoogleAdapter:
             max_retries: Forwarded to the SDK as
                 ``HttpOptions(retry_options=HttpRetryOptions(attempts=...))``.
                 The google-genai SDK DOES expose retry configuration this
-                way (verified against the pinned v2.4.0:
-                ``HttpRetryOptions.attempts``); on top of the SDK's own
+                way (``HttpRetryOptions.attempts`` is a declared field of
+                the installed SDK — tests/test_llm_sdk_contract_floor.py
+                re-derives the field's existence on every run; the attempt-
+                COUNTING semantics below are documented, not machine-checked);
+                on top of the SDK's own
                 retry, our rate limiter coordinates 429 backoff across
                 workers — same division of labour as the other adapters.
             _client: Injected SDK instance for testing.
@@ -202,7 +241,9 @@ class GoogleAdapter:
         if max_retries is not None:
             # F3 (round-5): the SDK's ``attempts`` field is the "Maximum
             # number of attempts, INCLUDING the original request" (verified
-            # against pinned google-genai v2.4.0: "If 0 or 1, it means no
+            # against the installed google-genai (the FIELD is re-derived by
+            # tests/test_llm_sdk_contract_floor.py; this counting SEMANTICS is
+            # documented, not machine-checked): "If 0 or 1, it means no
             # retries"). OpenAI/Anthropic ``max_retries`` instead counts
             # retries BEYOND the first request. So forwarding
             # ``attempts=max_retries`` was off-by-one — ``max_retries=5``
@@ -263,7 +304,23 @@ class GoogleAdapter:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.APIError as exc:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, httpx.TimeoutException) as exc:
+        # 4b (the real-transport guard's catch): the previous clause named
+        # six httpx classes individually and MISSED ReadError /
+        # RemoteProtocolError (a mid-connection reset escaped untyped —
+        # proven live by the accept-then-close guard test).
+        # httpx.TransportError is the single base of every transport error
+        # in the httpx family (connect, read, write, pool, remote-protocol,
+        # the timeout family) — strictly wider than the old list, never
+        # narrower. The httpcore bases are BELT-AND-BRACES for a raw
+        # httpcore exception arriving un-wrapped (httpx maps httpcore into
+        # its OWN hierarchy — httpx.ReadError is NOT httpcore.ReadError;
+        # the families chain via `raise ... from`, neither inherits the
+        # other). httpcore's roots are NetworkError / ProtocolError /
+        # TimeoutException (there is no httpcore.TransportError); all three
+        # are caught. A transport-backend flip (the httpx2 direction the
+        # anthropic/openai SDKs already took) changes which family arrives;
+        # this clause and the guard tests keep the mapping honest.
+        except (httpx.TransportError, httpcore.NetworkError, httpcore.ProtocolError, httpcore.TimeoutException) as exc:
             raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
         return _response_to_unified(response)
@@ -292,7 +349,8 @@ class GoogleAdapter:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.APIError as exc:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, httpx.TimeoutException) as exc:
+        # The same transport clause as complete()'s (see its comment).
+        except (httpx.TransportError, httpcore.NetworkError, httpcore.ProtocolError, httpcore.TimeoutException) as exc:
             raise LLMConnectionError(redact_secrets(str(exc))) from redacted_cause_from(exc)
 
 
@@ -412,30 +470,41 @@ def _response_to_unified(response: Any) -> CompletionResult:
         # that would mask a refusal as a non-finding.
         feedback = getattr(response, "prompt_feedback", None)
         block_reason = getattr(feedback, "block_reason", None) if feedback else None
+        # #212: a prompt-level policy block IS a refusal (the same
+        # deterministic-refusal family as a candidate-level SAFETY finish)
+        # — typed accordingly and marker-aligned so the verify phase's
+        # print-time refused count derives for this family too. Only when
+        # the provider actually SUPPLIED a block reason: an empty-candidates
+        # response with no prompt_feedback evidence stays a plain response
+        # error (retryable shape upstream), never an evidence-free refusal
+        # claim (fable D2 — the fix's own no-assertion-beyond-evidence rule).
+        if block_reason:
+            raise LLMRefusalError(
+                f"Gemini refused the request "
+                f"(prompt blocked: {block_reason})"
+            )
         raise LLMResponseError(
-            f"Gemini returned no candidates "
-            f"(prompt blocked: {block_reason or 'unknown reason'})"
+            f"Gemini returned no candidates (empty response; no prompt "
+            "block reason supplied)"
         )
 
     # Usage metadata lives on response.usage_metadata for the new SDK.
     usage = getattr(response, "usage_metadata", None)
     if usage is not None:
         input_tokens = getattr(usage, "prompt_token_count", 0) or 0
-        # Gemini bills output as candidates + thoughts (thinking models
-        # like gemini-2.5-* emit thoughts_token_count); count both so the
-        # cost isn't undercounted.
-        output_tokens = (
-            (getattr(usage, "candidates_token_count", 0) or 0)
-            + (getattr(usage, "thoughts_token_count", 0) or 0)
-        )
+        output_tokens = _gemini_output_tokens(usage)
+    usage_details = _extract_usage_details(usage)
 
     # R4-2: a safety/blocked candidate finish reason is the more
     # specific signal — raise it regardless of whether the candidate
     # carried partial text or a function_call. Gemini reports these as
     # SAFETY / RECITATION / BLOCKLIST / PROHIBITED_CONTENT / SPII.
     if raw_finish in _GEMINI_REFUSAL_FINISH_REASONS:
+        # #212: message aligned with the cross-adapter refusal marker
+        # ("refused the request") so the verify phase's print-time refused
+        # count derives correctly for every provider family.
         raise LLMRefusalError(
-            f"Gemini blocked the response (finish_reason={raw_finish!r}); "
+            f"Gemini refused the request (finish_reason={raw_finish!r}); "
             "the candidate was withheld for safety or policy reasons"
         )
 
@@ -449,11 +518,19 @@ def _response_to_unified(response: Any) -> CompletionResult:
     # VALID and not caught here because content_blocks is non-empty. Refusal is
     # the more specific signal and already raised above.
     if not content_blocks:
+        # #569: the budget wording is DETERMINISTIC-CLASS-ONLY — a
+        # MAX_TOKENS stop is the thinking-budget exhaustion (the raised-cap
+        # retry class); every other empty candidate (filtered/malformed)
+        # keeps the #292 same-cap rationale and must NOT carry the marker.
+        if raw_finish in ("MAX_TOKENS", "FinishReason.MAX_TOKENS"):
+            raise LLMResponseError(
+                "Gemini returned a candidate with no usable content (empty "
+                "completion); the response was truncated — a thinking "
+                "model consumed the token budget before emitting output"
+            )
         raise LLMResponseError(
             "Gemini returned a candidate with no usable content (empty "
-            "completion); the response may have been truncated (a thinking "
-            "model consumed the token budget before emitting output) or "
-            "filtered/malformed"
+            "completion); the response may have been filtered or malformed"
         )
 
     stop_reason: StopReason
@@ -499,6 +576,7 @@ def _response_to_unified(response: Any) -> CompletionResult:
         content=content_blocks,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        usage_details=usage_details,
         stop_reason=stop_reason,
         raw=response,
     )

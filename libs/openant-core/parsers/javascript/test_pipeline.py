@@ -40,7 +40,7 @@ import sys
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Set, Tuple
+from typing import Set
 
 # Add parent directories to path so utilities can be found when run as a subprocess
 _parser_dir = Path(__file__).parent
@@ -679,7 +679,7 @@ class PipelineTest:
                                          len(filtered_units),
                                          library_mode=getattr(self, "library_mode", False))
             if _blackout:
-                dataset["metadata"]["reachability_filter"]["warning"] = _blackout
+                dataset["metadata"]["reachability_filter"]["blackout_advisory"] = _blackout
                 print(f"  [Warning] {_blackout}", file=sys.stderr)
 
             # Write filtered dataset

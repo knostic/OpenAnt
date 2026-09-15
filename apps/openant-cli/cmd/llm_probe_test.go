@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -285,5 +286,141 @@ func TestProbeOpenAI_ReasoningModelsUseMaxCompletionTokens(t *testing.T) {
 				t.Errorf("model %q: max_tokens present=%v, want %v (body=%s)", tc.model, hasPlainMaxTok, tc.wantPlainMaxTok, gotBody)
 			}
 		})
+	}
+}
+
+func TestProbeOllama_BlankKeyUsesPlaceholderAndDefaultsToLocalhost(t *testing.T) {
+	var gotPath, gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// A blank key must probe with the same placeholder the Python adapter
+	// sends (stock Ollama ignores it); a blank base_url must default to the
+	// local Ollama endpoint (overridden to the test server here), appending
+	// /chat/completions to the /v1 base — no double /v1.
+	orig := ollamaAPIBase
+	defer func() { ollamaAPIBase = orig }()
+	ollamaAPIBase = server.URL + "/v1"
+
+	if err := probeOllama("", "", "qwen3.8:27b"); err != nil {
+		t.Fatalf("expected nil error for 200, got: %v", err)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Errorf("path = %q, want '/v1/chat/completions'", gotPath)
+	}
+	if gotAuth != "Bearer ollama" {
+		t.Errorf("authorization = %q, want 'Bearer ollama' (placeholder)", gotAuth)
+	}
+
+	// A non-blank key (key-checking remote gateway) is forwarded verbatim.
+	if err := probeOllama("gateway-secret", server.URL+"/v1", "qwen3.8:27b"); err != nil {
+		t.Fatalf("expected nil error for 200, got: %v", err)
+	}
+	if gotAuth != "Bearer gateway-secret" {
+		t.Errorf("authorization = %q, want 'Bearer gateway-secret'", gotAuth)
+	}
+}
+
+func TestProbeOllama_UnpulledModel404GetsPullHint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"message":"model 'ghost' not found, try pulling it first"}}`))
+	}))
+	defer server.Close()
+
+	err := probeOllama("ollama", server.URL+"/v1", "ghost")
+	if err == nil {
+		t.Fatal("expected an error for 404, got nil")
+	}
+	if pe, ok := err.(*AnthropicProbeError); !ok || pe.Kind != "model_not_found" {
+		t.Fatalf("kind = %v, want model_not_found; err = %v", err, err)
+	} else if !strings.Contains(pe.Message, "ollama pull") {
+		t.Errorf("message = %q, want an `ollama pull` hint", pe.Message)
+	}
+}
+
+// Review fixes (#346): the Ollama 404 gate discriminates the genuine
+// not-pulled body from a base_url misconfiguration, and a probe timeout
+// is a cold-load hint, not "could not reach".
+func TestProbeOllama_GatesPullHintOnBody(t *testing.T) {
+	// genuine not-pulled: Ollama's live body shape
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"message":"model 'x' not found, try pulling it first"}}`))
+	}))
+	defer server.Close()
+	err := probeOllama("", server.URL, "x")
+	pe, ok := asProbeError(err)
+	if !ok {
+		t.Fatalf("expected AnthropicProbeError, got %T", err)
+	}
+	if !strings.Contains(pe.Message, "ollama pull") {
+		t.Errorf("genuine not-pulled 404 must keep the pull hint, got: %s", pe.Message)
+	}
+
+	// marker-less 404 (a base_url misconfig: wrong path, empty/foreign body)
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`404 page not found`))
+	}))
+	defer server2.Close()
+	err2 := probeOllama("", server2.URL, "x")
+	pe2, ok2 := asProbeError(err2)
+	if !ok2 {
+		t.Fatalf("expected AnthropicProbeError, got %T", err2)
+	}
+	if !strings.Contains(pe2.Message, "check the base_url") {
+		t.Errorf("a marker-less 404 is a base_url misconfig, not a pull case, got: %s", pe2.Message)
+	}
+}
+
+func TestProbeChatCompletionsAt_TimeoutIsItsOwnKind(t *testing.T) {
+	// A server that never answers: the probe's 15s client timeout is long,
+	// so bind a shorter one by making the handler sleep past a reduced
+	// client timeout — reuse the package var if the timeout is exported
+	// elsewhere; here we assert the classification on a hanging endpoint
+	// with the client's own deadline overridden via the context path used
+	// by the wizard probe. Simplest: hang the handler longer than the probe
+	// budget is not feasible at 15s in a unit test; assert the KIND mapping
+	// via the http.Client error shape instead.
+	orig := probeClientTimeout
+	defer func() { probeClientTimeout = orig }()
+	probeClientTimeout = 100 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+	}))
+	defer server.Close()
+	err := probeChatCompletionsAt("k", server.URL, "m")
+	pe, ok := asProbeError(err)
+	if !ok {
+		t.Fatalf("expected AnthropicProbeError, got %T", err)
+	}
+	if pe.Kind != "timeout" {
+		t.Errorf("a probe timeout must be its own kind (cold-load hint), got %q", pe.Kind)
+	}
+}
+
+// hunt r4 (sonnet): the round-3 network-kind layering — a refused connection
+// must carry the "ollama serve" hint (parity with the Python adapter).
+func TestProbeOllama_NetworkErrorGetsServeHint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("never reached — the connection is refused below")
+	}))
+	url := server.URL
+	server.Close() // refuse connections
+	err := probeOllama("", url, "x")
+	pe, ok := asProbeError(err)
+	if !ok {
+		t.Fatalf("expected AnthropicProbeError, got %T", err)
+	}
+	if pe.Kind != "network" {
+		t.Errorf("expected network kind, got %q", pe.Kind)
+	}
+	if !strings.Contains(pe.Message, "ollama serve") {
+		t.Errorf("a refused connection must carry the serve hint, got: %s", pe.Message)
 	}
 }

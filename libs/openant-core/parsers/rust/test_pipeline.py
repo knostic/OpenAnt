@@ -200,7 +200,7 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
     the Zig/PHP/Ruby/C parser pipelines for the identical shape).
     """
     try:
-        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector, blackout_warning, library_seed_ids
+        from utilities.agentic_enhancer.entry_point_detector import EntryPointDetector, blackout_warning, classify_seeds, library_seed_ids, real_entry_point_ids
         from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
     except ImportError:
         print(
@@ -226,9 +226,21 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
     )
     reachable = analyzer.get_all_reachable()
 
-    if not entry_points and functions:
-        print("  [Warning] No entry points detected — keeping all units unfiltered "
-              "to avoid a silent blackout.", file=sys.stderr)
+    # A synthesized fuzz harness seeds the BFS but is NOT a real structural entry
+    # point (main/route/CLI). If the ONLY seeds are synthetic harnesses — a pure-
+    # library-with-fuzz target whose real public API is often macro-hidden from
+    # the call graph (e.g. httparse's `complete!`-wrapped internals) — keep the
+    # blackout safety net instead of trusting a harness-only reachable set, which
+    # would silently drop the un-reached public API. Hybrid targets that also ship
+    # a real bin/route still have real seeds, so they filter normally. `--library-
+    # mode` (which adds non-synthetic public-API seeds) also defeats the fallback.
+    real_entry_points = real_entry_point_ids(entry_points, functions)
+    if not real_entry_points and functions:
+        why = ("Only synthetic fuzz-harness entry points detected"
+               if entry_points else "No entry points detected")
+        print(f"  [Warning] {why} — keeping all units unfiltered to avoid a silent "
+              "blackout. Use --library-mode to seed the exported public API.",
+              file=sys.stderr)
         reachable = set(functions.keys())
 
     filtered_functions = {
@@ -251,8 +263,14 @@ def apply_reachability_filter(call_graph_output: dict, repo_path: str,
 
     _blackout = blackout_warning(detector.entry_point_details, len(functions),
                                  len(filtered_functions), library_mode=library_mode)
+    # #520: the seed-class counts ride the result dict (this pipeline's
+    # surface is the return value — stderr-only delivery, like zig's; the
+    # counts have no downstream reader today and are informational).
+    _struct, _inc = classify_seeds(detector.entry_point_details)
+    result["_seed_class_counts"] = {
+        "structural_entry_points": _struct, "incidental_entry_points": _inc}
     if _blackout:
-        print(f"  [Warning] {_blackout}", file=sys.stderr)
+        print(f"  [Advisory] {_blackout}", file=sys.stderr)
 
     return result
 

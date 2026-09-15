@@ -19,15 +19,20 @@ On completion, a final ``scan.report.json`` aggregates all step reports.
 import json
 import os
 import shutil
+from typing import Any, Dict
 import sys
 from pathlib import Path
 
 from core.schemas import (
-    ScanResult, AnalysisMetrics, UsageInfo, StepReport,
+    ScanResult, AnalysisMetrics, StepReport, verify_step_summary,
+    dynamic_test_step_summary,
 )
 from core.step_report import step_context
 from core import tracking
+from utilities.llm_client import get_global_tracker
+from utilities.child_interp import resolved_core_path
 from utilities.file_io import read_json, write_json
+from utilities.llm.adapter import LLMAuthError
 
 # Import app context generator (optional)
 try:
@@ -110,6 +115,136 @@ def partition_units_by_language(units: list[dict]) -> dict[str | None, list[dict
     return parts
 
 
+def _relativize_home(path_str: str) -> str:
+    """Strip the user's home prefix (~) from an absolute path (leak hygiene)."""
+    home = os.path.expanduser("~")
+    if path_str.startswith(home):
+        return "~" + path_str[len(home):]
+    return path_str
+
+
+def _promotable_skip_count(by_class: dict, promote_set) -> int:
+    """#602: the skipped signals that COULD have promoted — an UPPER
+    BOUND: entry_point skips whose confidence is in THIS run's promote
+    set (the promote gate at apply_signals). Upper bound because the
+    skipped signal's target is outside its batch by construction — the
+    count cannot know whether the id exists in another batch (a real
+    lost promotion candidate) or nowhere in the dataset (a hallucinated
+    id, promotable by no gate), nor whether the target was already an
+    entry point. Factored for testability: the guard tolerates malformed
+    keys (never a report-assembly crash)."""
+    total = 0
+    for k, v in (by_class or {}).items():
+        if (not isinstance(k, str) or not isinstance(v, int)
+                or "/" not in k):
+            continue
+        kind, confidence = k.split("/", 1)
+        if kind == "entry_point" and confidence in (promote_set or []):
+            total += v
+    return total
+
+
+def aggregate_reachability_telemetry(per_lang: dict) -> dict:
+    """#301: sum the per-language prune telemetry into the top-level record.
+
+    The merged-run shape keeps the orphan/dead-cluster counts per language
+    (under ``reachability_filter.per_language``) while the reporter reads only
+    the top level — so on a multi-language scan the classification the
+    reporter now forwards would otherwise exist but never reach it. Counts sum
+    exactly; ``pruned_by_file`` merges per-file and re-caps at the module's
+    top-20 (each language capped its own top-20, so a cross-language sum can
+    miss a file outside its own language's cap — an advisory pointer, noted).
+    Present-only: a record set without telemetry contributes nothing, and
+    the result is empty when no language ran the classification.
+    """
+    agg: Dict[str, int] = {}
+    by_file: Dict[str, int] = {}
+    asym = 0
+    # #602: the reachability-decomposition keys join the per-language sum —
+    # a new per-language key is silently DROPPED by this whitelist (the
+    # #328 class). Present-only per record: a language whose filter could
+    # not measure the baseline (keep-all/none) contributes nothing —
+    # never a fabricated 0.
+    _measured_languages = 0
+    for record in per_lang.values():
+        if not isinstance(record, dict):
+            continue
+        for key in ("pruned_orphan_count", "pruned_in_dead_cluster_count",
+                    "structural_reachable_units", "units_newly_reachable"):
+            v = record.get(key)
+            if isinstance(v, int):
+                agg[key] = agg.get(key, 0) + v
+                if key == "units_newly_reachable":
+                    _measured_languages += 1
+        v = record.get("pruned_forward_called_by_reachable_count")
+        if isinstance(v, int):
+            asym += v
+        bf = record.get("pruned_by_file")
+        if isinstance(bf, dict):
+            for f, c in bf.items():
+                if isinstance(c, int):
+                    by_file[f] = by_file.get(f, 0) + c
+    out: dict = {}
+    out.update(agg)
+    # #602: how many languages actually MEASURED the baseline — the
+    # decomposition's denominator honesty (the rest could not: no LLM
+    # extras / unfilterable / synthetic-only).
+    if _measured_languages:
+        out["reachability_baseline_languages"] = _measured_languages
+    # #602 guard: the asym key's presence is keyed on the PRUNE telemetry
+    # specifically — NOT on agg's truthiness (the decomposition keys make
+    # agg truthy; a record with only structural/newly-reachable telemetry
+    # must not fabricate a pruned_forward_called_by_reachable_count of 0 —
+    # the exact #328-class trap this function's callers hit before).
+    if asym or any(k in agg for k in
+                   ("pruned_orphan_count", "pruned_in_dead_cluster_count")):
+        # the hard invariant is always present when the classification ran —
+        # a measured 0 is the healthy signal, not a fabricated one
+        out["pruned_forward_called_by_reachable_count"] = asym
+    if by_file:
+        top = sorted(by_file.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
+        out["pruned_by_file"] = dict(top)
+    # #602: the synthetic-only baseline marker lifts language-prefixed
+    # (a string cannot sum) — the same shape as the warning lift above,
+    # SORTED like its sibling so the joined string is deterministic.
+    _bl = [f"{lang}: {r['reachability_baseline']}"
+           for lang, r in sorted(per_lang.items())
+           if isinstance(r, dict) and r.get("reachability_baseline")]
+    if _bl:
+        out["reachability_baseline"] = "; ".join(_bl)
+    # per-language orphan advisories lift to the top level (the same shape
+    # as the warning lift; its own key, never the reserved warning slot).
+    advisories = [
+        f"{lang}: {record['orphan_advisory']}"
+        for lang, record in sorted(per_lang.items())
+        if isinstance(record, dict) and record.get("orphan_advisory")
+    ]
+    if advisories:
+        out["orphan_advisory"] = "; ".join(advisories)
+    return out
+
+def same_model_verification_note(analyze_binding, verify_binding) -> str | None:
+    """#302: a note when analyze and verify resolve to the same model.
+
+    A legitimate configuration, but Stage 2 is then not an independent
+    instrument — the adjudication shares the model's blind spots, and a
+    high disagreement rate does not establish independence. The note makes
+    that visible in the scan banner and the step summary.
+    """
+    if analyze_binding is None or verify_binding is None:
+        return None
+    if (getattr(analyze_binding, "model", None) == getattr(verify_binding, "model", None)
+            and getattr(analyze_binding, "provider_name", None)
+            == getattr(verify_binding, "provider_name", None)):
+        return (
+            f"analyze and verify use the same model "
+            f"({analyze_binding.provider_name}/{analyze_binding.model}); "
+            "Stage 2 is not an independent instrument — adjudication shares "
+            "the model's blind spots, so the disagreement rate does not "
+            "establish independence")
+    return None
+
+
 def scan_repository(
     repo_path: str,
     output_dir: str,
@@ -166,7 +301,8 @@ def scan_repository(
         generate_context: If True, generate application context (reduces FP).
         generate_report: If True, generate summary + disclosure reports.
         skip_tests: If True, exclude test files from parsing (default: True).
-        limit: Max number of units to analyze.
+        limit: Max number of units to analyze and enhance (the LLM
+            reachability pass still reviews the full codebase).
         enhance: If True, run agentic/single-shot context enhancement.
         enhance_mode: ``"agentic"`` (thorough) or ``"single-shot"`` (fast).
         dynamic_test: If True, run Docker-isolated dynamic testing (requires Docker).
@@ -213,6 +349,12 @@ def scan_repository(
 
     def _step_label(name: str) -> str:
         nonlocal step_num
+        # #219: a "Skipping ..." notice is not a performed step; the denominator
+        # (_count_steps) counts only steps that RUN, so numbering skips too
+        # pushed the numerator past the total (e.g. the report step printed as
+        # [8/7]). Render skips without a step number.
+        if name.startswith("Skipping"):
+            return f"  - {name}"
         step_num += 1
         return f"[{step_num}/{total_steps}] {name}"
 
@@ -311,6 +453,15 @@ def scan_repository(
             "language": parse_result.language,
             "processing_level": parse_result.processing_level,
         }
+        # #600: the discovery block (outcomes — the excluded dirs NAMED;
+        # skip_tests stays in the inputs: it is config, not a result). The
+        # per-language spec is read via getattr BEFORE ScanResult
+        # population (duck-typed stub ParseResults carry per_language=None).
+        _pl = getattr(parse_result, "per_language", None) or {}
+        _probe = ScanResult(output_dir=output_dir,
+                            language=parse_result.language or "unknown")
+        _probe.per_language = _pl
+        ctx.summary["discovery"] = _collect_discovery(_probe)
         # If the parse step generated a diff_stats report, attach it.
         _diff_report = os.path.join(output_dir, "diff_filter.report.json")
         if os.path.exists(_diff_report):
@@ -396,10 +547,31 @@ def scan_repository(
                     )
                     save_context(context, Path(app_context_path))
                     result.app_context_path = app_context_path
-                    result.context_source = "generated"
+                    # #322: the manual-override branch (OPENANT.json /
+                    # OPENANT.md authored by the SCANNED repo) is a distinct
+                    # source — recording "generated" suppressed the
+                    # deterministic provenance banner, which exists precisely
+                    # to disclose a repo-controlled security model in a way
+                    # a hostile file cannot steer. Carry the exclusion
+                    # volume + warnings onto the result (the R5 pattern).
+                    if getattr(context, "source", "") == "manual":
+                        result.context_source = "repo_manual"
+                        result.manual_exclusions = len(
+                            context.not_a_vulnerability or [])
+                        result.manual_override_warnings = list(
+                            context.override_warnings or [])
+                        result.manual_override_filename = (
+                            context.override_filename or "")
+                        print(
+                            "  Using repo-committed override "
+                            f"({result.manual_exclusions} exclusion(s))",
+                            file=sys.stderr,
+                        )
+                    else:
+                        result.context_source = "generated"
                     ctx.summary = {
                         "application_type": context.application_type,
-                        "context_source": "generated",
+                        "context_source": result.context_source,
                     }
                     ctx.outputs = {"app_context_path": app_context_path}
                     print(f"  App type: {context.application_type}", file=sys.stderr)
@@ -407,7 +579,14 @@ def scan_repository(
                     print(f"  WARNING: App context generation failed: {e}",
                           file=sys.stderr)
                     print("  Continuing without app context.", file=sys.stderr)
+                    ctx.status = "skipped"
                     ctx.summary = {"skipped": True, "reason": str(e)}
+                    # Record the crash like the enhance/verify/dynamic-test
+                    # handlers do — otherwise the degraded scan (default threat
+                    # model) is absent from result.skipped_steps / scan.report.json
+                    # / pipeline_output.json and the summary claims "No steps were
+                    # skipped" (only the per-step report + stderr carried it).
+                    _record_skip(result, "app-context", "failed")
 
         collected_step_reports.append(_load_step_report(output_dir, "app-context"))
     elif generate_context:
@@ -459,147 +638,419 @@ def scan_repository(
         }) as ctx:
             try:
                 dataset = read_json(active_dataset_path)
-            except (OSError, json.JSONDecodeError) as exc:
+            except Exception as exc:
+                # Broaden beyond (OSError, json.JSONDecodeError): read_json opens
+                # strict UTF-8, so a bad-encoding dataset raises UnicodeDecodeError
+                # (a ValueError). NOTE: this inner guard predates the whole-body
+                # wrap below (#268) and stays for its precise skip reason; the
+                # body wrap catches everything else (corrupt call_graph.json in
+                # the re-filter, failed writes) and degrades the same way.
                 print(f"  WARNING: failed to load dataset: {exc}", file=sys.stderr)
+                ctx.status = "skipped"
                 ctx.summary = {"skipped": True, "reason": str(exc)}
+                # Record the crash so the degraded reachability pass (no
+                # LLM-promoted entry points -> potential missed vulns) is
+                # visible in the artifacts, not only on CI-discarded stderr.
+                _record_skip(result, "llm-reachability", "failed")
                 dataset = None
 
-            if dataset is not None:
-                app_ctx_payload = None
-                if app_context_path and os.path.exists(app_context_path):
-                    try:
-                        app_ctx_payload = read_json(app_context_path)
-                    except (OSError, json.JSONDecodeError):
-                        app_ctx_payload = None
-
-                # --limit governs the analyze stage, not how many units the
-                # LLM reachability pass reviews — it must see the full
-                # codebase to find missed entry points.
-                signals = analyze_reachability(
-                    dataset=dataset,
-                    app_context=app_ctx_payload,
-                    binding=llm_reach_binding,
-                    max_code_bytes=llm_reachability_max_code_bytes,
-                )
-                summary = apply_signals(dataset, signals)
-
-                signals_path = os.path.join(output_dir, "llm_reachability.json")
-                write_json(signals_path, {"signals": signals_to_json(signals)}, indent=2)
-
-                pre_filter_count = len(dataset.get("units", []))
-                post_filter_count = pre_filter_count
-                refilter_supported = False
-
-                # Re-apply the structural reachability filter using
-                # LLM-promoted entry points as additional BFS seeds.
-                # Only possible when the parser persisted call_graph.json.
-                # Which parsers do so is determined by PROBING THE FILESYSTEM
-                # below, not by a hardcoded language list — an earlier comment
-                # here claimed only Python and Zig persist it, which is wrong
-                # (JavaScript writes a fully-formed call_graph.json too). Keep
-                # this probe-based: parsers gain and lose the behaviour over
-                # time, and a stale list here would silently skip re-filtering
-                # for a language that actually supports it.
-                if processing_level != "all":
-                    cg_dirs = resolve_call_graph_dirs(output_dir)
-                    if cg_dirs:
-                        from core.parser_adapter import apply_reachability_filter
-
-                        llm_promoted_ids = {
-                            u["id"] for u in dataset.get("units", [])
-                            if u.get("is_entry_point") and u.get("id")
-                        }
-                        partitions = partition_units_by_language(
-                            dataset.get("units", [])
-                        )
-                        kept: list[dict] = []
-                        unfilterable: dict[str, int] = {}
-
-                        for lang, lang_units in partitions.items():
-                            lang_dir = cg_dirs.get(lang)
-                            if lang_dir is None and None in cg_dirs:
-                                # Legacy flat layout: one graph covers everything.
-                                lang_dir = cg_dirs[None]
-                            if lang_dir is None:
-                                # This language's parser persisted no call graph,
-                                # so its units pass through unfiltered — the
-                                # pre-existing behaviour, now scoped per language
-                                # instead of disabling the filter for the whole
-                                # scan just because the primary lacked a graph.
-                                unfilterable[lang or "unknown"] = len(lang_units)
-                                kept.extend(lang_units)
-                                continue
-
-                            # Deep-copy metadata: the shallow {**dataset} copy
-                            # shares the nested metadata dict across every
-                            # per-language call, so each filter's stats
-                            # overwrote the previous language's.
-                            lang_dataset = {
-                                **dataset,
-                                "units": lang_units,
-                                "metadata": dict(dataset.get("metadata") or {}),
-                            }
-                            filtered = apply_reachability_filter(
-                                lang_dataset,
-                                lang_dir,
-                                processing_level,
-                                extra_entry_points=scope_entry_points_to_units(
-                                    llm_promoted_ids, lang_units
-                                ),
-                            )
-                            kept.extend(filtered.get("units", []))
-
-                        dataset = {**dataset, "units": kept}
-                        post_filter_count = len(kept)
-                        result.units_count = post_filter_count
-                        refilter_supported = True
-
-                        for lang, count in unfilterable.items():
+            # #268: guard the WHOLE stage body (the pattern enhance/verify
+            # use), not just the dataset read — a non-LLM failure below
+            # (corrupt call_graph.json in the re-filter at parser_adapter,
+            # a failed write_json) previously aborted the whole scan via
+            # step_context re-raise instead of degrading to a recorded skip.
+            # Provider errors are NOT at issue: analyze_reachability already
+            # skips failed batches, re-raising only LLMAuthError by design —
+            # and that one MUST still abort (bad credentials must not be
+            # silently skipped into a "successful" degraded scan).
+            pre_llmreach_units_count = result.units_count
+            # #516: whether the re-filtered dataset reached disk. write_json
+            # is ATOMIC (temp + fsync + os.replace) — after it returns, the
+            # disk IS the post-filter dataset and downstream consumes the
+            # DISK (enhance/analyze read active_dataset_path, never this
+            # local). A post-write bookkeeping failure must therefore leave
+            # units_count describing the post-filter state, not restore the
+            # pre-stage count over a persisted dataset.
+            dataset_persisted = False
+            try:
+                if dataset is not None:
+                    app_ctx_payload = None
+                    if app_context_path and os.path.exists(app_context_path):
+                        try:
+                            app_ctx_payload = read_json(app_context_path)
+                        except Exception as exc:
+                            # Broad like the dataset load above: this optional
+                            # app-context read must never abort the scan. read_json
+                            # opens strict UTF-8, so a bad-encoding self-written file
+                            # raises UnicodeDecodeError (not OSError/JSONDecodeError);
+                            # a missing payload just means the reachability prompt
+                            # runs without the extra app-context hint. Warn (like the
+                            # dataset-load sibling) so this recall-affecting
+                            # degradation is visible, not silent.
                             print(
-                                f"\n  WARNING: {lang} persisted no call_graph.json; "
-                                f"{count} unit(s) skip post-LLM re-filtering and "
-                                f"flow to downstream stages unfiltered.",
+                                f"  WARNING: could not read app context for "
+                                f"reachability ({exc}); continuing without the "
+                                f"app-context hint.",
                                 file=sys.stderr,
                             )
-                    else:
-                        # Parser doesn't persist call_graph.json — the full
-                        # unfiltered dataset will flow to downstream stages.
-                        # Warn loudly so the cost impact is visible.
-                        print(
-                            f"\n  WARNING: --llm-reachability with "
-                            f"--level {processing_level}: "
-                            f"{parse_result.language} does not yet support "
-                            f"post-LLM re-filtering (call_graph.json not found). "
-                            f"Downstream stages will process all "
-                            f"{pre_filter_count} units instead of the filtered "
-                            f"subset — this may significantly increase cost.",
-                            file=sys.stderr,
-                        )
+                            app_ctx_payload = None
 
-                # Persist final dataset so downstream stages see promoted
-                # entry points, per-unit signals, and the applied filter.
-                write_json(active_dataset_path, dataset, indent=2)
+                    # --limit governs the analyze AND enhance stages, not how many units the
+                    # LLM reachability pass reviews — it must see the full
+                    # codebase to find missed entry points.
+                    # #294: collect parse-level batch-drop stats so the
+                    # step report's units_reviewed stops implying full
+                    # coverage when batches were dropped.
+                    reach_stats: Dict[str, Any] = {}
+                    signals = analyze_reachability(
+                        dataset=dataset,
+                        app_context=app_ctx_payload,
+                        binding=llm_reach_binding,
+                        max_code_bytes=llm_reachability_max_code_bytes,
+                        stats=reach_stats,
+                        # #532: resume parity with the checkpointed stages —
+                        # per-unit records under the family's backend-identity
+                        # gate; a relaunch adopts matching units instead of
+                        # re-paying the whole pass.
+                        checkpoint_path=os.path.join(
+                            output_dir, "llm_reach_checkpoints"),
+                        tracker=get_global_tracker(),
+                    )
+                    summary = apply_signals(dataset, signals)
 
-                ctx.summary = {
-                    "units_reviewed": pre_filter_count,
-                    "signals_added": summary["signals_applied"],
-                    "entry_points_promoted": summary["entry_points_promoted"],
-                    "units_touched": summary["units_touched"],
-                    "post_filter_units": post_filter_count,
-                    "refilter_supported": refilter_supported,
-                }
-                ctx.outputs = {"signals_path": signals_path}
+                    signals_path = os.path.join(output_dir, "llm_reachability.json")
+                    write_json(signals_path, {"signals": signals_to_json(signals)}, indent=2)
 
-                print(
-                    f"  LLM reachability: {summary['signals_applied']} signals, "
-                    f"{summary['entry_points_promoted']} new entry points",
-                    file=sys.stderr,
-                )
-                if processing_level != "all" and refilter_supported:
+                    pre_filter_count = len(dataset.get("units", []))
+                    post_filter_count = pre_filter_count
+                    refilter_supported = False
+
+                    # Re-apply the structural reachability filter using
+                    # LLM-promoted entry points as additional BFS seeds.
+                    # Only possible when the parser persisted call_graph.json.
+                    # Which parsers do so is determined by PROBING THE FILESYSTEM
+                    # below, not by a hardcoded language list — an earlier comment
+                    # here claimed only Python and Zig persist it, which is wrong
+                    # (JavaScript writes a fully-formed call_graph.json too). Keep
+                    # this probe-based: parsers gain and lose the behaviour over
+                    # time, and a stale list here would silently skip re-filtering
+                    # for a language that actually supports it.
+                    if processing_level != "all":
+                        cg_dirs = resolve_call_graph_dirs(output_dir)
+                        if cg_dirs:
+                            from core.parser_adapter import apply_reachability_filter
+
+                            llm_promoted_ids = {
+                                u["id"] for u in dataset.get("units", [])
+                                if u.get("is_entry_point") and u.get("id")
+                            }
+                            partitions = partition_units_by_language(
+                                dataset.get("units", [])
+                            )
+                            kept: list[dict] = []
+                            unfilterable: dict[str, int] = {}
+                            # Per-language reachability_filter stats, aggregated back
+                            # onto the rebuilt dataset below. Without this the rebuild
+                            # at `dataset = {**dataset, "units": kept}` carried the
+                            # ORIGINAL (pre-LLM) metadata, so the reporter rendered
+                            # "reachability filtering not applied" on a scan that DID
+                            # prune via the LLM-seeded re-filter.
+                            refilter_by_language: dict[str, dict] = {}
+
+                            for lang, lang_units in partitions.items():
+                                lang_dir = cg_dirs.get(lang)
+                                if lang_dir is None and None in cg_dirs:
+                                    # Legacy flat layout: one graph covers everything.
+                                    lang_dir = cg_dirs[None]
+                                if lang_dir is None:
+                                    # This language's parser persisted no call graph,
+                                    # so its units pass through unfiltered — the
+                                    # pre-existing behaviour, now scoped per language
+                                    # instead of disabling the filter for the whole
+                                    # scan just because the primary lacked a graph.
+                                    unfilterable[lang or "unknown"] = len(lang_units)
+                                    kept.extend(lang_units)
+                                    continue
+
+                                # Deep-copy metadata: the shallow {**dataset} copy
+                                # shares the nested metadata dict across every
+                                # per-language call, so each filter's stats
+                                # overwrote the previous language's.
+                                lang_dataset = {
+                                    **dataset,
+                                    "units": lang_units,
+                                    "metadata": dict(dataset.get("metadata") or {}),
+                                }
+                                filtered = apply_reachability_filter(
+                                    lang_dataset,
+                                    lang_dir,
+                                    processing_level,
+                                    extra_entry_points=scope_entry_points_to_units(
+                                        llm_promoted_ids, lang_units
+                                    ),
+                                    library_mode=library_mode,
+                                )
+                                kept.extend(filtered.get("units", []))
+                                _rf = (filtered.get("metadata") or {}).get(
+                                    "reachability_filter"
+                                )
+                                if _rf:
+                                    refilter_by_language[lang or "unknown"] = _rf
+
+                            # Rebuild the dataset, aggregating the per-language filter
+                            # stats into metadata so the reporter reads a real record
+                            # instead of the stale pre-LLM one. Unfilterable languages
+                            # (no call graph) are folded in as pass-throughs so the
+                            # aggregate reconciles with len(kept).
+                            _new_md = dict(dataset.get("metadata") or {})
+                            # Only stamp a record when a real per-language filter ran.
+                            # If every language was unfilterable (no call graph), the
+                            # units passed through untouched, so leaving no record —
+                            # the honest "not applied" signal — is correct; a "0%
+                            # reduction" record would falsely claim filtering happened.
+                            if refilter_by_language:
+                                _per_lang = dict(refilter_by_language)
+                                _unfiltered = 0
+                                for _lang, _cnt in unfilterable.items():
+                                    _unfiltered += _cnt
+                                    _per_lang[_lang] = {
+                                        "original_units": _cnt,
+                                        "entry_points": 0,
+                                        "reachable_units": _cnt,
+                                        "filtered_out": 0,
+                                        "reduction_percentage": 0,
+                                        "unfilterable": True,
+                                    }
+                                _orig = sum(
+                                    r.get("original_units", 0) for r in _per_lang.values()
+                                )
+                                _reach = sum(
+                                    r.get("reachable_units", 0) for r in _per_lang.values()
+                                )
+                                _agg = {
+                                    **aggregate_reachability_telemetry(_per_lang),
+                                    "original_units": _orig,
+                                    "entry_points": sum(
+                                        r.get("entry_points", 0) for r in _per_lang.values()
+                                    ),
+                                    "reachable_units": _reach,
+                                    "filtered_out": _orig - _reach,
+                                    # Units that flowed through unfiltered (no call
+                                    # graph for their language) — folded into the
+                                    # totals above but surfaced explicitly so the
+                                    # record never silently claims they were filtered.
+                                    "unfiltered_units": _unfiltered,
+                                    "reduction_percentage": (
+                                        round((1 - _reach / _orig) * 100, 1)
+                                        if _orig
+                                        else 0
+                                    ),
+                                    "per_language": _per_lang,
+                                }
+                                # Lift any per-language advisory (e.g. an empty-seed
+                                # blackout — a language that flowed through unfiltered
+                                # because it had no real entry points) to the top
+                                # level, where the reporter reads it (reporter.py:505).
+                                # Without this the record reads "filter applied, N%
+                                # reduction" while hiding that a language blacked out —
+                                # the exact fidelity gap this record exists to close.
+                                _warnings = [
+                                    f"{_lang}: {_r['warning']}"
+                                    for _lang, _r in _per_lang.items()
+                                    if _r.get("warning")
+                                ]
+                                if _warnings:
+                                    _agg["warning"] = "; ".join(_warnings)
+                                # #328 (wave r1, three axes): the fixed
+                                # whitelist above dropped the three new level
+                                # keys — the issue's exact defect survived on
+                                # the --llm-reachability path (the record the
+                                # reporter reads is rebuilt from this _agg,
+                                # and the per-language copies never surface).
+                                # Lift the fallback warnings language-prefixed
+                                # (the same shape as the warning lift); the
+                                # LEVEL fields only when every per-language
+                                # record that has one AGREES (a multi-language
+                                # scan with mixed levels claims nothing).
+                                _fb = [
+                                    f"{_lang}: {_r['level_fallback_warning']}"
+                                    for _lang, _r in _per_lang.items()
+                                    if _r.get("level_fallback_warning")
+                                ]
+                                if _fb:
+                                    _agg["level_fallback_warning"] = "; ".join(_fb)
+                                for _lk in ("requested_processing_level",
+                                            "effective_processing_level"):
+                                    _vals = {
+                                        _r.get(_lk)
+                                        for _r in _per_lang.values()
+                                        if isinstance(_r, dict)
+                                        and isinstance(_r.get(_lk), str) and _r.get(_lk)
+                                    }
+                                    if len(_vals) == 1:
+                                        _agg[_lk] = next(iter(_vals))
+
+                                _new_md["reachability_filter"] = _agg
+                            else:
+                                # No real filter ran (every language unfilterable):
+                                # honour the "not applied" contract by clearing any
+                                # record inherited from an upstream merge, so a stale
+                                # record can never misdescribe the passed-through units.
+                                _new_md.pop("reachability_filter", None)
+                            dataset = {**dataset, "units": kept, "metadata": _new_md}
+                            post_filter_count = len(kept)
+                            result.units_count = post_filter_count
+                            refilter_supported = True
+
+                            for lang, count in unfilterable.items():
+                                print(
+                                    f"\n  WARNING: {lang} persisted no call_graph.json; "
+                                    f"{count} unit(s) skip post-LLM re-filtering and "
+                                    f"flow to downstream stages unfiltered.",
+                                    file=sys.stderr,
+                                )
+                        else:
+                            # Parser doesn't persist call_graph.json — the full
+                            # unfiltered dataset will flow to downstream stages.
+                            # Warn loudly so the cost impact is visible.
+                            print(
+                                f"  WARNING: --llm-reachability with "
+                                f"--level {processing_level}: "
+                                f"{parse_result.language} does not yet support "
+                                f"post-LLM re-filtering (call_graph.json not found). "
+                                f"Downstream stages will process all "
+                                f"{pre_filter_count} units instead of the filtered "
+                                f"subset — this may significantly increase cost.",
+                                file=sys.stderr,
+                            )
+
+                    # Persist final dataset so downstream stages see promoted
+                    # entry points, per-unit signals, and the applied filter.
+                    write_json(active_dataset_path, dataset, indent=2)
+                    dataset_persisted = True
+
+                    ctx.summary = {
+                        # Coverage semantics (#386 + #532): every unit whose
+                        # review state is ACCOUNTED this pass — adopted-
+                        # restored (see units_adopted) plus newly sent. For
+                        # "sent this run" only, subtract units_adopted.
+                        "units_reviewed": pre_filter_count,
+                        "signals_added": summary["signals_applied"],
+                        "entry_points_promoted": summary["entry_points_promoted"],
+                        "units_touched": summary["units_touched"],
+                        # #345 (wave r1 opus): the resolved promote set is
+                        # the run's provenance — two scans under different
+                        # sets differ in promotions with byte-identical
+                        # step reports otherwise.
+                        "promote_set": summary.get("promote_set", []),
+                        # #532: adopted units are restored, not re-reviewed —
+                        # the resume provenance (they were reviewed; their
+                        # signals replay under THIS run's promote set).
+                        "units_adopted": reach_stats.get("units_adopted", 0),
+                        "post_filter_units": post_filter_count,
+                        "refilter_supported": refilter_supported,
+                        # #294: the honest coverage numbers — units_reviewed
+                        # counts what was SENT for review, not what was
+                        # actually reviewed.
+                        "batches_dropped": reach_stats.get("batches_dropped", 0),
+                        # #538: the truncation subclass — the diagnosis
+                        # lever for the deferred-recovery tracker.
+                        "batches_truncated": reach_stats.get("batches_truncated", 0),
+                        # #541: the provider-exception class — the coverage
+                        # truth the parse-path-only counters missed.
+                        "batches_failed": reach_stats.get("batches_failed", 0),
+                        # #558: the split-and-retry provenance — the recovery
+                        # never silently overwrites the coverage counts.
+                        "batches_split_recovered": reach_stats.get(
+                            "batches_split_recovered", 0),
+                        "batches_split_lost": reach_stats.get(
+                            "batches_split_lost", 0),
+                        "units_not_reviewed": reach_stats.get("units_not_reviewed", 0),
+                        # #599: the summary-write diagnostic. An ARTIFACT
+                        # failure, not a coverage gap — must stay OUT of
+                        # error_count below: a failed write does not mean
+                        # an incomplete review (the pass succeeded, the
+                        # per-unit records persist; the persisted summary
+                        # alone is degraded). Folding it in would flip the
+                        # step to partial wrongly.
+                        "checkpoint_summary_write_failures": reach_stats.get(
+                            "checkpoint_summary_write_failures", 0),
+                        # #602: the skip-class telemetry — unknown-ID signal
+                        # occurrences in ACCEPTED responses (the diagnostic
+                        # log may carry discarded attempts; the counter is
+                        # the accepted-response metric). A skipped signal is
+                        # NOT a coverage failure: error_count stays
+                        # dropped+failed batches only. Two known exclusions:
+                        # adopted units bypass parse on resume (their skips
+                        # were never persisted); a SPLIT batch narrows
+                        # valid_unit_ids per half, so a cross-half reference
+                        # reads as a skip — the metric is not batch-geometry-
+                        # invariant, and split-recovered runs read higher.
+                        "signals_skipped_unknown_unit": reach_stats.get(
+                            "signals_skipped_unknown_unit", 0),
+                        "signals_skipped_unknown_unit_by_class": reach_stats.get(
+                            "signals_skipped_unknown_unit_by_class", {}),
+                        # #602: the promotable subset — sized at REPORT
+                        # time from this run's own promote_set (the promote
+                        # gate: kind=entry_point, confidence in promote_set),
+                        # never by parse_response (which must stay
+                        # policy-free). An UPPER BOUND: the skipped id is
+                        # outside its batch by construction — it may exist
+                        # in another batch or nowhere in the dataset.
+                        "signals_skipped_promotable":
+                            _promotable_skip_count(
+                                reach_stats.get(
+                                    "signals_skipped_unknown_unit_by_class",
+                                    {}) or {},
+                                summary.get("promote_set") or []),
+                        # #541 (the refute round): the #285/#376 partial-
+                        # status contract — dropped + failed batches make
+                        # the STEP read partial, never success/0/0.
+                        "error_count": (reach_stats.get("batches_dropped", 0)
+                                        + reach_stats.get("batches_failed", 0)),
+                    }
+                    ctx.outputs = {"signals_path": signals_path}
+
                     print(
-                        f"  After reachability filter: {post_filter_count} units",
+                        f"  LLM reachability: {summary['signals_applied']} signals, "
+                        f"{summary['entry_points_promoted']} new entry points",
                         file=sys.stderr,
                     )
+                    if processing_level != "all" and refilter_supported:
+                        print(
+                            f"  After reachability filter: {post_filter_count} units",
+                            file=sys.stderr,
+                        )
+            except LLMAuthError:
+                # The designed abort: bad credentials surface loudly, never
+                # degrade into a skip (a silently-skipped reachability pass
+                # reads as a clean run to a credential-less user).
+                raise
+            except Exception as exc:
+                # #268 (wave catch): the body mutates result.units_count
+                # mid-flow (post-re-filter) BEFORE the dataset persist; a
+                # failure in that window left the count describing a dataset
+                # that never reached disk. Restore the pre-stage count so the
+                # result matches what downstream actually consumes.
+                # #516: that restore is correct ONLY when the persist never
+                # happened. write_json is atomic, so a persisted dataset IS
+                # the post-filter one downstream consumes — restoring the
+                # pre count there would describe a dataset that no longer
+                # exists on disk. Gate on the persist; record which state
+                # won so the step report never reads "no effects" while
+                # downstream consumes the re-filtered dataset.
+                if not dataset_persisted:
+                    result.units_count = pre_llmreach_units_count
+                print(
+                    f"  WARNING: LLM reachability stage failed: {exc}",
+                    file=sys.stderr,
+                )
+                ctx.status = "skipped"
+                ctx.summary = {"skipped": True, "reason": str(exc),
+                               "dataset_persisted": dataset_persisted}
+                # Record the crash so the degraded reachability pass is
+                # visible in the artifacts, matching the dataset-read guard.
+                _record_skip(result, "llm-reachability", "failed")
 
         collected_step_reports.append(
             _load_step_report(output_dir, "llm-reachability")
@@ -638,6 +1089,17 @@ def scan_repository(
                     workers=workers,
                     backoff_seconds=backoff_seconds,
                     # checkpoint_path auto-derived from output_path
+                    # #213: --limit bounds the enhance phase too — the
+                    # scan's cheapest-mode flag must bound the run's spend,
+                    # and enhance is a high-volume per-unit LLM phase. NOTE
+                    # the ordering trade-off (deliberate, per the issue's
+                    # ruling): a limited run selects units BEFORE the
+                    # enhancer writes security_classification, so analyze's
+                    # classification-priority re-sort no-ops on the
+                    # pre-limited set — bounded runs choose cost-bound over
+                    # classification-priority coverage. (LLM reachability
+                    # stays unbounded: it needs the full corpus.)
+                    limit=limit,
                 )
 
                 ctx.summary = {
@@ -662,6 +1124,7 @@ def scan_repository(
             except Exception as e:
                 print(f"  WARNING: Enhancement failed: {e}", file=sys.stderr)
                 print("  Continuing with the un-enhanced dataset.", file=sys.stderr)
+                ctx.status = "skipped"
                 ctx.summary = {"skipped": True, "reason": str(e)}
                 _record_skip(result, "enhance", "failed")
 
@@ -700,6 +1163,11 @@ def scan_repository(
         ctx.summary = {
             "total_units": analyze_result.metrics.total,
             "analyzed": analyze_result.metrics.total - analyze_result.metrics.errors,
+            # #285 (wave catch): the flat error_count the step-status
+            # derivation reads — analyze counts per-unit failures here, not
+            # in ctx.errors, so without this key every-unit-errors stayed
+            # status="success" (the same false-green shape verify had).
+            "error_count": analyze_result.metrics.errors,
             "verdicts": {
                 "vulnerable": analyze_result.metrics.vulnerable,
                 "bypassable": analyze_result.metrics.bypassable,
@@ -750,15 +1218,16 @@ def scan_repository(
                     registry=registry,
                 )
 
-                ctx.summary = {
-                    "findings_input": verify_result.findings_input,
-                    "findings_verified": verify_result.findings_verified,
-                    "agreed": verify_result.agreed,
-                    "disagreed": verify_result.disagreed,
-                    "confirmed_vulnerabilities": verify_result.confirmed_vulnerabilities,
-                    "needs_review": verify_result.needs_review,
-                    "error_count": verify_result.error_count,
-                }
+                # #300: the shared seven-field construction (the standalone
+                # and chained-verify sites in cli.py build the same dict
+                # through the same helper, so the three cannot drift).
+                ctx.summary = verify_step_summary(verify_result)
+                # #302: the same-model note — banner + step summary
+                _same_model = same_model_verification_note(
+                    registry.get("analyze"), registry.get("verify"))
+                if _same_model:
+                    ctx.summary["same_model_verification"] = True
+                    print(f"  [Note] {_same_model}", file=sys.stderr)
                 ctx.outputs = {
                     "verified_results_path": verify_result.verified_results_path,
                 }
@@ -783,7 +1252,13 @@ def scan_repository(
                     total=analyze_result.metrics.total,
                     vulnerable=verify_result.confirmed_vulnerabilities,
                     bypassable=0,
-                    inconclusive=analyze_result.metrics.inconclusive,
+                    # #509: a Stage-2 disagreement corrected to
+                    # ``inconclusive`` is an explicitly-unconfirmable finding —
+                    # it threads into inconclusive, NEVER into safe (the
+                    # plain-disagreement fold above covers only genuine
+                    # downgrades to safe).
+                    inconclusive=analyze_result.metrics.inconclusive
+                    + verify_result.disagreed_inconclusive,
                     protected=analyze_result.metrics.protected,
                     safe=analyze_result.metrics.safe + verify_result.disagreed,
                     errors=analyze_result.metrics.errors + verify_result.error_count,
@@ -795,6 +1270,7 @@ def scan_repository(
             except Exception as e:
                 print(f"  WARNING: Verification failed: {e}", file=sys.stderr)
                 print("  Continuing with unverified Stage 1 results.", file=sys.stderr)
+                ctx.status = "skipped"
                 ctx.summary = {"skipped": True, "reason": str(e)}
                 _record_skip(result, "verify", "failed")
 
@@ -830,12 +1306,41 @@ def scan_repository(
             language=result.language,
             application_type=(
                 app_context_path and _read_app_type(app_context_path)
-            ) or "web_app",
+            ) or "unknown",
+            # #304: an absent context is UNKNOWN, not a fabricated web_app —
+            # the deliverable must never present a guess as an observation
+            # (context_source: "none" carries the real state one field away;
+            # the summary template now joins the two for the reader).
             processing_level=processing_level,
             step_reports=collected_step_reports,
             context_source=result.context_source,
             threat_model_sha256=result.threat_model_sha256,
             threat_model_warnings=result.threat_model_warnings,
+            # #322: the manual-override receipt fields reach the deliverable.
+            manual_exclusions=getattr(result, "manual_exclusions", None),
+            manual_override_warnings=list(
+                getattr(result, "manual_override_warnings", []) or []),
+            manual_override_filename=getattr(
+                result, "manual_override_filename", "") or "",
+            # #307: the CHANGELOG-claimed coverage fields reach the
+            # deliverable (the report generator and dynamic tester read
+            # only this file).
+            per_language=result.per_language,
+            parse_errors=result.parse_errors,
+            excluded_languages=result.excluded_languages,
+            degraded=result.degraded,
+            coverage=_collect_coverage(result),
+            # #600: the discovery block for the deliverable — re-derived
+            # from the same on-disk scan artifacts (idempotent; the parse
+            # step computed the same block into its own summary).
+            discovery=_collect_discovery(_probe_from_result(result)),
+            # Authoritative skip data so pipeline_output.json reflects real
+            # pipeline status (esp. a non-aborting verify failure) instead of
+            # always reporting "nothing skipped". At this point (Step 6) all
+            # pre-build skips incl. verify are already recorded; dynamic-test/
+            # report skips are recorded later and remain in scan.report.json.
+            skipped_steps=list(result.skipped_steps),
+            skipped_step_reasons=dict(result.skipped_step_reasons),
         )
 
         ctx.outputs = {"pipeline_output_path": pipeline_output_path}
@@ -867,16 +1372,14 @@ def scan_repository(
                         pipeline_output_path=pipeline_output_path,
                         output_dir=output_dir,
                         registry=registry,
+                        # #521: the declared-runtime channel — the scanned
+                        # repo's root, so the derivation reads the TARGET's
+                        # manifests (the dead-input fix; the scan entry
+                        # previously omitted it).
+                        repo_path=repo_path,
                     )
 
-                    ctx.summary = {
-                        "findings_tested": dt_result.findings_tested,
-                        "confirmed": dt_result.confirmed,
-                        "not_reproduced": dt_result.not_reproduced,
-                        "blocked": dt_result.blocked,
-                        "inconclusive": dt_result.inconclusive,
-                        "errors": dt_result.errors,
-                    }
+                    ctx.summary = dynamic_test_step_summary(dt_result)
                     ctx.outputs = {
                         "results_json_path": dt_result.results_json_path,
                         "results_md_path": dt_result.results_md_path,
@@ -889,6 +1392,7 @@ def scan_repository(
                 except Exception as e:
                     print(f"  WARNING: Dynamic test failed: {e}", file=sys.stderr)
                     print("  Continuing without dynamic-test results.", file=sys.stderr)
+                    ctx.status = "skipped"
                     ctx.summary = {"skipped": True, "reason": str(e)}
                     _record_skip(result, "dynamic-test", "failed")
 
@@ -959,7 +1463,8 @@ def scan_repository(
     result.usage = tracking.get_usage()
     result.step_reports = collected_step_reports
 
-    _write_scan_report(output_dir, result, collected_step_reports)
+    _write_scan_report(output_dir, result, collected_step_reports,
+                       repo_path=repo_path)
     _print_summary(result)
 
     return result
@@ -1032,10 +1537,30 @@ def _read_app_type(app_context_path: str) -> str | None:
 # that a scan skipped part of the tree; without them a partially-covered scan of
 # a hostile repo looks identical to a clean one. Aggregated here, at report time.
 _COVERAGE_COUNT_KEYS = ("symlinks_skipped", "directories_unreadable")
+# #307: the DOMINANT exclusion — test files set aside by --skip-tests (on
+# by default; 1,346 files on the filing run, larger than every language-
+# or threshold-based exclusion combined) — aggregated per language.
+_TEST_FILES_SKIPPED_KEY = "test_files_skipped"
+# JavaScript's scanner still writes camelCase testFilesSkipped (the same
+# naming drift the 2026-08 CHANGELOG fixed for symlinks_skipped) — read it
+# as an alias until the parser is renamed.
+_TEST_FILES_SKIPPED_ALIASES = (_TEST_FILES_SKIPPED_KEY, "testFilesSkipped")
 _COVERAGE_EXAMPLE_KEYS = ("symlink_examples", "unreadable_examples")
 # Parsers disagree on the filename: the in-process Python parser writes
 # scan_result.json (singular); the subprocess parsers write scan_results.json.
 _SCAN_RESULT_FILENAMES = ("scan_result.json", "scan_results.json")
+# #600: the discovery-stage fields. Counters are flat; the histogram and
+# its examples are per-name MAPPINGS (never coerced through the numeric
+# reducer). The JS scanner writes the camelCase count alias.
+_DISCOVERY_COUNT_KEYS = ("directories_excluded",)
+# shebang_files_detected is PYTHON-ONLY — deliberately NOT in the universal
+# set, or every other language reads permanently "missing" (noise that
+# dilutes the real gaps); it forwards when present (the read is field-wise).
+_DISCOVERY_OPTIONAL_KEYS = ("shebang_files_detected",)
+_DISCOVERY_MAP_KEYS = ("excluded_dir_names", "excluded_dir_examples")
+_DISCOVERY_OVERFLOW_KEY = "excluded_dir_names_overflow"
+_DISCOVERY_ALL_FIELDS = (*_DISCOVERY_COUNT_KEYS, *_DISCOVERY_MAP_KEYS,
+                        _DISCOVERY_OVERFLOW_KEY, *_DISCOVERY_OPTIONAL_KEYS)
 
 
 def _read_coverage_stats(dir_path: str) -> dict:
@@ -1059,10 +1584,50 @@ def _read_coverage_stats(dir_path: str) -> dict:
             return {}
         return {
             k: stats[k]
-            for k in (*_COVERAGE_COUNT_KEYS, *_COVERAGE_EXAMPLE_KEYS)
+            for k in (*_COVERAGE_COUNT_KEYS, *_COVERAGE_EXAMPLE_KEYS,
+                      *_TEST_FILES_SKIPPED_ALIASES)
             if k in stats
         }
     return {}
+
+
+def _read_stats_fields(dir_path: str, keys) -> dict:
+    """Read the GIVEN statistics fields (present ones only) from a
+    directory's scan-result file — the #600 discovery reader (the sibling
+    of _read_coverage_stats above; the coverage reader KEEPS its own
+    filename-order loop — routing it through this freshness logic would
+    change the coverage lane's behavior and is a named follow-up, not
+    folded silently here).
+
+    #600 freshness: a REUSED output directory can carry a prior language's
+    artifact beside the current one (the singular and plural filenames
+    differ by parser); prefer the NEWEST by mtime so a stale file is never
+    misattributed to the current language — and an mtime TIE between the
+    two is disclosed (read neither) rather than guessed by filename order.
+    (The arbitration runs when both filenames are present; a language whose
+    parser writes NO scan artifact into a reused directory has no
+    current-run file to prefer — the parse-start recency guard is the
+    named follow-up, shared with the coverage lane's identical hole.)"""
+    candidates = [os.path.join(dir_path, n) for n in _SCAN_RESULT_FILENAMES]
+    candidates = [c for c in candidates if os.path.isfile(c)]
+    if not candidates:
+        return {}
+    try:
+        mtimes = {os.path.getmtime(c) for c in candidates}
+        if len(mtimes) == 1 and len(candidates) > 1:
+            # Both artifacts carry the SAME mtime (a reused dir written within
+            # one coarse-granularity tick): genuinely ambiguous which language
+            # produced which — disclose (read NEITHER) rather than guess by
+            # filename order.
+            return {}
+        newest = max(candidates, key=os.path.getmtime)
+        stats = read_json(newest).get("statistics", {}) or {}
+        return {k: stats[k] for k in keys if k in stats}
+    except (OSError, TypeError, ValueError, AttributeError):
+        # #600 review: a candidate vanishing between isfile and getmtime,
+        # or a non-dict statistics value — telemetry must never abort a
+        # successful parse step; disclose (no data) instead of guessing.
+        return {}
 
 
 def _language_scan_dirs(result: ScanResult) -> list[tuple[str, str]]:
@@ -1085,46 +1650,227 @@ def _language_scan_dirs(result: ScanResult) -> list[tuple[str, str]]:
 def _collect_coverage(result: ScanResult) -> dict:
     """Aggregate skipped-symlink / unreadable-dir figures across languages.
 
-    A language is "instrumented" iff its scan-result ``statistics`` carries at
-    least one coverage COUNT key. This is a presence PROBE, deliberately not a
-    hardcoded per-language allowlist: the parser set gains and loses coverage
-    instrumentation over time, and a stale allowlist would fail dangerously —
-    silently summing a de-instrumented language's absent keys as 0, i.e. a false
-    "nothing skipped". The probe fails safe instead: an uninstrumented language
-    is disclosed in ``languages_without_coverage_data`` rather than counted as 0,
-    so a ``symlinks_skipped: 0`` aggregate is trustworthy ONLY when that list is
-    empty. (JavaScript and Go do not yet instrument coverage; they appear in the
-    list until their parsers emit the snake_case keys.)
+    A language is "instrumented" iff its scan-result ``statistics`` carries
+    at least one coverage COUNT key. This is a presence PROBE, deliberately
+    not a hardcoded per-language allowlist: the parser set gains and loses
+    coverage instrumentation over time, and a stale allowlist would fail
+    dangerously — silently summing a de-instrumented language's absent keys
+    as 0, i.e. a false "nothing skipped". The probe fails safe instead: an
+    uninstrumented language is disclosed in ``languages_without_coverage_data``
+    rather than counted as 0.
+
+    #606: the probe guards the ANY-key-absent case; the PARTIALLY
+    instrumented case (a language emitting one coverage key and not
+    another) is disclosed PER KEY: each count key's total sums only the
+    languages that reported it, and the ``languages_without_{key}_data``
+    lists are that total's exclusion set — supersets of
+    ``languages_without_coverage_data`` (a fully uninstrumented language is
+    missing every key), emitted present-only (a list's ABSENCE means the
+    total is complete). The example keys stay merge-only — the absence of
+    examples is not a false-zero count. A dangling symlink lands in the
+    unreadable path (the stat-OSError branch), not the symlink count.
     """
     counts = {k: 0 for k in _COVERAGE_COUNT_KEYS}
     examples: dict[str, list] = {k: [] for k in _COVERAGE_EXAMPLE_KEYS}
     without_data: list[str] = []
+    without_key: dict[str, list[str]] = {k: [] for k in _COVERAGE_COUNT_KEYS}
+    test_files: dict[str, int] = {}
+    # #307 (review finding): a language may be coverage-instrumented (so it
+    # passes the presence probe above) yet skip test files WITHOUT counting
+    # them — go/rust/swift/zig today. Counting those as an absent entry
+    # would read as "zero skipped"; disclosing them keeps absence ≠ zero.
+    no_test_skip_data: list[str] = []
     for lang, d in _language_scan_dirs(result):
         stats = _read_coverage_stats(d)
+        # #606: per-key presence disclosure, recorded BEFORE the any-key
+        # probe — a language missing ONE key must not be summed as a false
+        # zero for it (the any-key probe passes on the keys it DID emit).
+        for k in _COVERAGE_COUNT_KEYS:
+            if k not in stats:
+                without_key[k].append(lang or "unknown")
         if not any(k in stats for k in _COVERAGE_COUNT_KEYS):
             without_data.append(lang or "unknown")
             continue
+        # #606: the totals are known-language subtotals — only the
+        # languages that REPORTED the key enter the sum.
         for k in _COVERAGE_COUNT_KEYS:
-            counts[k] += int(stats.get(k, 0) or 0)
+            if k in stats:
+                counts[k] += int(stats[k] or 0)
         for k in _COVERAGE_EXAMPLE_KEYS:
             for ex in stats.get(k, []) or []:
                 if len(examples[k]) < 5 and ex not in examples[k]:
                     examples[k].append(ex)
+        # #307: the test-file exclusion, per language. snake_case first,
+        # then the JS camelCase alias; a language that skips test files but
+        # reports NO count of them (go/rust/swift/zig today) is DISCLOSED
+        # below, never silently counted as zero.
+        skipped = None
+        for key in _TEST_FILES_SKIPPED_ALIASES:
+            v = stats.get(key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                skipped = v
+                break
+        if skipped is not None:
+            test_files[lang or "unknown"] = skipped
+        else:
+            no_test_skip_data.append(lang or "unknown")
     return {
         **counts,
         **examples,
+        # #307: the dominant exclusion, per-language attributed
+        **({_TEST_FILES_SKIPPED_KEY: test_files} if test_files else {}),
         "languages_without_coverage_data": sorted(set(without_data)),
+        # #307 (review finding): the languages whose test-file exclusion is
+        # UNCOUNTERED — the reader must see that "no entry" means unknown,
+        # not zero (the same absence-vs-zero doctrine as the list above).
+        **({"languages_without_test_skip_data": sorted(set(no_test_skip_data))}
+           if no_test_skip_data else {}),
+        # #606: per-key presence disclosure — each count key's total sums
+        # only the languages that reported it; these lists are that total's
+        # exclusion set, supersets of languages_without_coverage_data.
+        # Present-only (the same regime as the #307 test-skip list — NOT
+        # the always-present languages_without_coverage_data above): a
+        # list's absence means the total is complete. Names are GENERATED
+        # from the tuple — do not hand-add siblings here; a tuple entry
+        # literally named `coverage` or `test_skip` would collide with the
+        # hand-written keys above, and one named like an example key would
+        # be shadowed by the **examples merge (both guarded in test_issue606).
+        **(
+            {f"languages_without_{k}_data": sorted(set(without_key[k]))
+             for k in _COVERAGE_COUNT_KEYS if without_key[k]}
+        ),
     }
 
+
+def _fold_camel_alias(stats: dict) -> None:
+    """#600: the JS scanner's camelCase count alias supplies the canonical
+    spelling only when the canonical is absent; the alias is ALWAYS removed
+    (a both-spellings artifact must not leak two keys for one figure).
+    Shared by the per-language branch and the single-language passthrough —
+    one home, so the two cannot drift."""
+    if "directoriesExcluded" in stats:
+        if "directories_excluded" not in stats:
+            stats["directories_excluded"] = stats["directoriesExcluded"]
+        del stats["directoriesExcluded"]
+
+
+def _probe_from_result(result: ScanResult) -> ScanResult:
+    """#600: a probe carrying the result's per-language map for the
+    discovery aggregator (the report step reuses the parse step's
+    output dirs; no re-derivation of the statistics)."""
+    probe = ScanResult(output_dir=result.output_dir,
+                       language=result.language or "unknown")
+    probe.per_language = result.per_language or {}
+    return probe
+
+
+def _collect_discovery(result: ScanResult) -> dict:
+    """#600: the discovery-stage exclusion counters, per language.
+
+    The excluded directories are NAMED, not a bare count: each language
+    carries the fields its scanner instruments (the flat counts, the
+    name-keyed histogram with entry-relative examples, the overflow
+    disclosure, the shebang count) — and the absence doctrine holds at
+    TWO granularities: a language with NO discovery field is listed in
+    ``languages_without_discovery_data`` (uninstrumented), and a language
+    with SOME fields is listed in ``fields_missing_by_language`` for each
+    field it lacks (a language carrying the flat count but not the
+    histogram is partially instrumented — never summed as if complete).
+
+    Language attribution: the histogram is per language BY CONSTRUCTION —
+    the cross-language "total" of the flat count measures prune
+    observations, not unique excluded directories, and is only forwarded
+    as the per-language flat counts. A FAILED language (``ok`` false or
+    a parse error) is disclosed in ``failed_languages`` — its stale
+    scan-result file, if any, is never read (a failed parse's artifact
+    is not this run's data) and NEVER falls back to another language's.
+    """
+    per_lang: dict[str, dict] = {}
+    without_data: list[str] = []
+    missing_fields: dict[str, list[str]] = {}
+    failed: list[str] = []
+    for lang, spec in (result.per_language or {}).items():
+        out = spec.get("output_dir") if isinstance(spec, dict) else None
+        ok = spec.get("ok", True) if isinstance(spec, dict) else True
+        if not ok:
+            # The outcome's own record says the parse failed: disclose,
+            # never read its possibly-stale artifact. NOTE the asymmetry:
+            # _collect_coverage (above) still reads failed languages' dirs
+            # (pre-existing behavior, #606-era); this block deliberately does
+            # not — the discovery disclosure is the newer contract, pinned
+            # by test. Aligning coverage is its own follow-up, not folded
+            # silently here.
+            failed.append(lang or "unknown")
+            continue
+        stats = _read_stats_fields(out or result.output_dir,
+                                   _DISCOVERY_ALL_FIELDS +
+                                   ("directoriesExcluded",))
+        if not stats:
+            without_data.append(lang or "unknown")
+            continue
+        # The camelCase alias (JS) supplies the count only; the histogram
+        # stays unknown for that language (disclosed, not zero).
+        _fold_camel_alias(stats)
+        per_lang[lang or "unknown"] = stats
+        absent = [f for f in _DISCOVERY_ALL_FIELDS
+                   if f not in stats and f not in _DISCOVERY_OPTIONAL_KEYS]
+        if absent:
+            missing_fields[lang or "unknown"] = absent
+    if not result.per_language:
+        # The single-language passthrough (the standalone parse and the
+        # single-language scan) writes straight into result.output_dir.
+        stats = _read_stats_fields(result.output_dir,
+                                   _DISCOVERY_ALL_FIELDS +
+                                   ("directoriesExcluded",))
+        _fold_camel_alias(stats)
+        lang = result.language or "unknown"
+        if not stats:
+            without_data.append(lang)
+        else:
+            per_lang[lang] = stats
+            absent = [f for f in _DISCOVERY_ALL_FIELDS
+                       if f not in stats and f not in _DISCOVERY_OPTIONAL_KEYS]
+            if absent:
+                missing_fields[lang] = absent
+    block: dict = {"per_language": per_lang}
+    if without_data:
+        block["languages_without_discovery_data"] = sorted(set(without_data))
+    if missing_fields:
+        block["fields_missing_by_language"] = missing_fields
+    if failed:
+        block["failed_languages"] = sorted(set(failed))
+    return block
 
 def _write_scan_report(
     output_dir: str,
     result: ScanResult,
     step_reports: list[dict],
+    *,
+    repo_path: str,
 ) -> str:
-    """Write ``scan.report.json`` — the aggregate report for the full pipeline."""
+    """Write ``scan.report.json`` — the aggregate report for the full pipeline.
+
+    ``repo_path`` is the scan target, threaded by the caller (absolutized
+    once at the top of ``scan_repository``) and written verbatim under
+    ``inputs.repo_path`` — never re-``abspath``'d or relativized — matching
+    the per-step reports that carry the key (the parse step's, the
+    app-context step's, the enhance step's).
+    """
     total_cost = sum(sr.get("cost_usd", 0) for sr in step_reports)
     total_duration = sum(sr.get("duration_seconds", 0) for sr in step_reports)
+    # #285: aggregate the per-step status and errors — the scan report must
+    # be at least as informative as the per-step files it summarises.
+    # #420 (wave r1, fable+opus): "interrupted" ranks with the failure
+    # class — the .get(..., 0) default silently ranked it as success, and
+    # the aggregate scan status fed to the envelope stayed green.
+    _STATUS_RANK = {"success": 0, "skipped": 1, "partial": 2, "error": 3,
+                    "interrupted": 4}
+    _worst_status = "success"
+    for sr in step_reports:
+        _st = str(sr.get("status", "success") or "success").lower()
+        if _STATUS_RANK.get(_st, 0) > _STATUS_RANK.get(_worst_status, 0):
+            _worst_status = _st
+    _all_errors = [e for sr in step_reports for e in sr.get("errors", [])]
     total_input = sum(
         sr.get("token_usage", {}).get("input_tokens", 0) for sr in step_reports
     )
@@ -1132,8 +1878,14 @@ def _write_scan_report(
         sr.get("token_usage", {}).get("output_tokens", 0) for sr in step_reports
     )
 
+    # #285: carry the derived status/errors onto the ScanResult so the
+    # envelope and downstream consumers see the degraded scan.
+    result.scan_status = _worst_status
+    result.scan_errors = _all_errors
     scan_report = StepReport(
         step="scan",
+        status=_worst_status,
+        errors=_all_errors,
         summary={
             "units_count": result.units_count,
             "language": result.language,
@@ -1153,6 +1905,19 @@ def _write_scan_report(
             "excluded_languages": result.excluded_languages,
             "degraded": result.degraded,
             "context_source": result.context_source,
+            # #303: WHICH checkout produced this scan — the parent's resolved
+            # openant-core root. The shared venv's editable .pth is
+            # re-pointable by a concurrent session mid-scan; the children
+            # now resolve explicitly (utilities/child_interp.py), and this
+            # record makes any residual skew detectable after the fact.
+            # RELATIVIZED when under the user's home: this key is the tool's
+            # INSTALL path (incidental disclosure, typically under home) — a
+            # different contract from inputs.repo_path (#613), which is the
+            # scan's primary INPUT and is recorded raw absolute exactly like
+            # every per-step report. Relativizing here limits incidental
+            # install-path disclosure; it does not make the report share-safe
+            # (the outputs block carries raw artifact paths too).
+            "openant_core_path": _relativize_home(str(resolved_core_path())),
             # R5: provenance of a repo-supplied threat model. sha is absent (key
             # omitted) when no threat model was loaded — never the empty hash.
             **(
@@ -1161,11 +1926,39 @@ def _write_scan_report(
                 else {}
             ),
             "threat_model_warnings": result.threat_model_warnings,
+            # #322 (wave r3): the manual-override receipt in scan.report.json
+            # too (the R5 pattern; the threat-model analogues are here).
+            # Present-only: None/empty stays absent.
+            **(
+                {"manual_exclusions": result.manual_exclusions}
+                if result.manual_exclusions is not None
+                else {}
+            ),
+            **(
+                {"manual_override_warnings": list(result.manual_override_warnings or [])}
+                if result.manual_override_warnings
+                else {}
+            ),
+            **(
+                {"manual_override_filename": result.manual_override_filename}
+                if result.manual_override_filename
+                else {}
+            ),
             # Aggregate of what the walker refused (symlinks) or could not read
             # (directories), summed across languages from each scan-result file.
             "coverage": _collect_coverage(result),
+            # #600: the discovery block beside coverage — the serialization
+            # contract names scan.report.json one of the operator's two
+            # artifacts; idempotent re-derivation from the same on-disk scan
+            # artifacts (the Step-6 bridge reads them too).
+            "discovery": _collect_discovery(_probe_from_result(result)),
         },
-        inputs={"repo_path": result.output_dir.replace(os.path.abspath("."), ".")},
+        # #613: the actual scan target — the caller-threaded, caller-absolutized
+        # repo path, written verbatim like every per-step inputs.repo_path (the
+        # parse report carries the same value in this directory). NOT the
+        # output directory: the old line fabricated the input from the output
+        # state, and its cwd-substring "relativizer" corrupted values outright.
+        inputs={"repo_path": repo_path},
         outputs={
             "dataset_path": result.dataset_path,
             "enhanced_dataset_path": result.enhanced_dataset_path,
@@ -1181,6 +1974,22 @@ def _write_scan_report(
             "input_tokens": total_input,
             "output_tokens": total_output,
             "total_tokens": total_input + total_output,
+            # #216: the aggregate rebuilds token_usage from the step
+            # reports — OR-aggregate the incomplete-cost marker across them
+            # (a rebuild must not drop the advisory).
+            **({
+                "cost_incomplete": True,
+                "unpriced_models": sorted({m for sr in step_reports
+                                           for m in (sr.get("token_usage", {})
+                                                     .get("unpriced_models") or [])}),
+            } if any(sr.get("token_usage", {}).get("cost_incomplete")
+                     for sr in step_reports) else {}),
+            # #605: the accounting-drop marker OR-aggregates across the step
+            # reports the same way — a silently-dropped accounting failure
+            # must not vanish at the scan level either.
+            **({"accounting_error": True}
+               if any(sr.get("token_usage", {}).get("accounting_error")
+                      for sr in step_reports) else {}),
         },
     )
 
