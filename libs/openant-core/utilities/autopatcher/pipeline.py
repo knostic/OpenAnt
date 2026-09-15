@@ -760,6 +760,58 @@ _VALIDATION_GAP_RE = re.compile(
     r"|requires?\s+(testing|validation)|unable\s+to\s+(verify|confirm))\b",
     re.IGNORECASE,
 )
+
+# Evidence-supply validation gap -- a SIBLING idiom to _VALIDATION_GAP_RE's
+# testing-coverage phrasing ("cannot verify/confirm/test", "unverified",
+# "untested"): the Challenger instead says evidence NEEDED to establish
+# whether the remediation mechanism works was not supplied to it at all
+# ("not shown", "omitted", "not traced", "not established"), rather than
+# saying it could not run a verification step. Both represent the same
+# underlying epistemic category (a self-reported inability to confirm
+# something) -- see _classify_finding's own "Validation gap" step, which
+# checks this alongside _VALIDATION_GAP_RE, never as a separate category.
+#
+# Deliberately a COMBINATION of two independent signals, never a single
+# broad "not shown"/"omitted"/"not included" keyword alone -- mirrors
+# _has_behavioral_defect_signal's own two-signal design, for the same
+# reason: an absence marker alone is equally at home describing an
+# optional/non-blocking detail ("an optional alternative implementation
+# was not shown" must NOT become a validation gap), and a necessity marker
+# alone says nothing about missing evidence. Both must be present:
+#   1. a NECESSITY marker -- this finding is about something the
+#      remediation mechanism's correctness is required by/relies on/
+#      depends on/is consistent with -- not merely optional, hypothetical,
+#      or a testing/hardening nice-to-have.
+#   2. an EVIDENCE-ABSENCE marker -- that same thing's own supporting
+#      evidence was not shown/traced/included/established.
+# Checked over the WHOLE finding text, not clause-scoped (contrast
+# _has_behavioral_defect_signal, which requires same-clause co-occurrence):
+# the natural phrasing here routinely links the two markers across a
+# "but"/"so" connective ("...was asserted BUT not traced from evidence
+# shown"), which a clause split would sever.
+_EVIDENCE_GAP_NECESSITY_RE = re.compile(
+    r"\brequire[sd]?\b|\bconsistency\b|\brelies?\s+on\b|\bdepends?\s+on\b"
+    r"|\bneeded?\s+to\s+(establish|verify|confirm)\b|\bnecessary\s+(for|to)\b|\bmust\s+be\b",
+    re.IGNORECASE,
+)
+_EVIDENCE_ABSENCE_RE = re.compile(
+    r"\bnot\s+shown\b|\bomitted\b|\bnot\s+traced\b|\bnot\s+included\b"
+    r"|(?:not|cannot\s+be)\s+established\b",
+    re.IGNORECASE,
+)
+
+
+def _has_evidence_gap_signal(text: str) -> bool:
+    """True when `text` states BOTH that something is required for/relied
+    on by/depended on by the remediation mechanism's correctness AND that
+    the evidence needed to confirm it was not supplied -- see
+    _EVIDENCE_GAP_NECESSITY_RE/_EVIDENCE_ABSENCE_RE's own comment for why
+    both are required together, never either alone."""
+    if not text:
+        return False
+    return bool(_EVIDENCE_GAP_NECESSITY_RE.search(text) and _EVIDENCE_ABSENCE_RE.search(text))
+
+
 _GENERIC_RE = re.compile(
     r"\b(tests?\s+should|consider\s+(adding|using)|recommend|performance\s+impact"
     r"|documentation|changelog|code\s+style|best\s+practice)\b",
@@ -869,7 +921,15 @@ def _classify_finding(text: str) -> str:
        concern merely because the same finding also happens to use
        behavioral-sounding wording (run-4 evidence never showed this
        collision, but the ordering makes it impossible regardless).
-    5. Validation gap patterns → validation_gap.
+    5. Validation gap patterns → validation_gap. Two independent idioms,
+       either sufficient on its own: the existing testing-coverage phrasing
+       (_VALIDATION_GAP_RE: "cannot verify/confirm/test", "unverified",
+       "untested"...), OR the evidence-supply idiom (_has_evidence_gap_signal:
+       something the mechanism's correctness is required by/relies on/
+       depends on, WHOSE OWN evidence was not shown/traced/included/
+       established) -- never merely a bare "not shown"/"omitted" on its
+       own, which is equally at home describing an optional/non-blocking
+       detail.
     6. Generic observation patterns → generic.
     7. Default → plausible_risk (conservative).
     """
@@ -886,8 +946,8 @@ def _classify_finding(text: str) -> str:
     # Step 3: concrete behavioral-defect language (run-4 Architecture B).
     if _has_behavioral_defect_signal(text):
         return "behavioral_defect"
-    # Step 4: validation gap.
-    if _VALIDATION_GAP_RE.search(text):
+    # Step 4: validation gap — testing-coverage idiom OR evidence-supply idiom.
+    if _VALIDATION_GAP_RE.search(text) or _has_evidence_gap_signal(text):
         return "validation_gap"
     # Step 5: generic observation.
     if _GENERIC_RE.search(text):
@@ -896,7 +956,13 @@ def _classify_finding(text: str) -> str:
 
 
 def _classify_challenger(challenger: dict) -> dict:
-    """Return an augmented challenger dict with per-finding classifications and counts."""
+    """Return an augmented challenger dict with per-finding classifications and counts.
+
+    `result = dict(challenger)` is a full shallow copy, so `verification_status`
+    (patch_challenger.challenge_patch's authoritative tri-state signal, added
+    alongside the pre-existing `still_vulnerable` projection) rides through
+    into the returned dict unchanged, with no dedicated handling needed here.
+    """
     result = dict(challenger) if challenger else {}
 
     classified_edge: list[dict] = []
@@ -923,6 +989,43 @@ def _classify_challenger(challenger: dict) -> dict:
     # narrowed plausible_risk_count's population without changing what
     # plausible_risk itself means for findings that still land there.
     result["behavioral_defect_count"] = sum(1 for f in all_classified if f["category"] == "behavioral_defect")
+
+    # Consistency reconciliation (demonstrated regression: a raw Challenger
+    # response asserted verification_status="VERIFIED_FIXED" while ALSO
+    # reporting a finding classified validation_gap -- i.e. the model itself
+    # said some required verification could not be established from the
+    # supplied evidence, in the same response). VERIFIED_FIXED is a claim
+    # that the supplied evidence affirmatively supports the mechanism; an unresolved
+    # validation_gap is structurally incompatible with that claim BY
+    # DEFINITION (validation_gap = "cannot verify/confirm/test/validate...",
+    # see _classify_finding), regardless of any specific wording -- so this
+    # never inspects finding text itself, only the already-computed count.
+    #
+    # Deliberately reduces certainty ONLY (VERIFIED_FIXED ->
+    # INSUFFICIENT_EVIDENCE), never RESIDUAL_VULNERABILITY: an unresolved
+    # validation gap is an absence of sufficient verification, not
+    # affirmative evidence the vulnerability remains -- inferring the
+    # latter would itself communicate stronger certainty than this evidence
+    # supports, in the opposite direction.
+    #
+    # Deliberately excludes confirmed_defect_count/behavioral_defect_count:
+    # both already have deterministic blocking behavior via the existing
+    # Misaligned path in _build_recommendation_v1 (aln_val="Misaligned" is
+    # set whenever confirmed_defect_count > 0, checked before any
+    # still_vulnerable-based branch) -- reconciling verification_status for
+    # those too is a signal-level-only concern, not the demonstrated bug
+    # this reconciliation exists to fix, and is intentionally left for a
+    # separate change if a concrete need is shown.
+    #
+    # Deliberately excludes plausible_risk_count: that category is the
+    # classifier's broad, catch-all default (see _classify_finding's own
+    # "Default -> plausible_risk (conservative)" step) and also covers
+    # entirely benign observations -- including it here would make
+    # VERIFIED_FIXED practically unreachable, not merely more conservative.
+    if result.get("verification_status") == "VERIFIED_FIXED" and result["validation_gap_count"] > 0:
+        result["verification_status"] = "INSUFFICIENT_EVIDENCE"
+        result["still_vulnerable"] = True
+
     return result
 
 
@@ -1644,6 +1747,13 @@ def _compute_trust_signals(
     risk_count = classified_challenger.get("plausible_risk_count", 0)
     gap_count = classified_challenger.get("validation_gap_count", 0)
     still_vulnerable = bool((classified_challenger or {}).get("still_vulnerable"))
+    # Authoritative tri-state signal (patch_challenger.VERIFICATION_STATUSES),
+    # or None for a pre-existing/legacy/unclassified challenger dict -- used
+    # ONLY to pick accurate notes text below (never int_val/imp_val/aln_val,
+    # and never any I1-I6-tagged branch condition), so a dict that predates
+    # this field, or one where the model's answer couldn't be classified,
+    # renders EXACTLY the same notes text as before this field existed.
+    verification_status = (classified_challenger or {}).get("verification_status")
 
     # --- Patch Integrity ---
     _unavailable_reason = _applicability_unavailable_reason(applicability)
@@ -1683,7 +1793,12 @@ def _compute_trust_signals(
     elif still_vulnerable and risk_count == 0:
         # still_vulnerable=True but only due to validation gaps, not high-confidence findings
         imp_val = "High"
-        imp_notes = f"No high-confidence heuristic risk identified · {gap_count} verification gap(s)"
+        if verification_status == "RESIDUAL_VULNERABILITY":
+            imp_notes = "Adversarial review identified a concrete residual vulnerability; not corroborated by a separately confirmed defect"
+        elif verification_status == "INSUFFICIENT_EVIDENCE":
+            imp_notes = "Available evidence is insufficient to verify the fix; no residual vulnerability has been demonstrated"
+        else:  # None (pre-existing/legacy/unclassified) -- exact pre-change text
+            imp_notes = f"No high-confidence heuristic risk identified · {gap_count} verification gap(s)"
     else:
         imp_val = "Medium"
         total = risk_count + gap_count
@@ -1698,7 +1813,12 @@ def _compute_trust_signals(
         aln_notes = "Adversarial review confirms fix approach"
     elif still_vulnerable and risk_count == 0:
         aln_val = "Likely Aligned"
-        aln_notes = "Correct mechanism · runtime verification pending"
+        if verification_status == "RESIDUAL_VULNERABILITY":
+            aln_notes = "Adversarial review identified a concrete residual vulnerability; not corroborated by a separately confirmed defect"
+        elif verification_status == "INSUFFICIENT_EVIDENCE":
+            aln_notes = "Available evidence is insufficient to verify the fix; no residual vulnerability has been demonstrated"
+        else:  # None (pre-existing/legacy/unclassified) -- exact pre-change text
+            aln_notes = "Correct mechanism · runtime verification pending"
     else:
         aln_val = "Partial"
         aln_notes = f"still_vulnerable flag set · {risk_count} plausible risk(s)"
@@ -1858,6 +1978,7 @@ def _build_recommendation_v1(
     signals: dict,
     still_vulnerable: bool = False,
     defect_count: int = 0,
+    verification_status: "str | None" = None,
 ) -> dict:
     """Produce a Trust Package recommendation from the six trust signals.
 
@@ -1882,6 +2003,18 @@ def _build_recommendation_v1(
            claim as verified-clean).
       I5 → everything else (including Unknown/Not Verified on either axis)
            falls through to Manual Review Required.
+
+    `verification_status` (patch_challenger.VERIFICATION_STATUSES, or None)
+    is read ONLY inside the I5 `still_vulnerable and defect_count == 0`
+    branch, to make that branch's `reason`/`why` text name which of two
+    materially different situations occurred — an affirmative residual-
+    vulnerability finding, or evidence that was merely insufficient to
+    verify the fix — WITHOUT changing the `decision` value itself (still
+    always "Manual Review Required" here) or any other branch's condition.
+    Omitting it (the default, `None`) preserves the exact behavior of every
+    pre-existing caller: it renders identically to the "unknown/unclassified"
+    wording, since a caller that has no richer signal to offer must not be
+    read as implying one.
 
     Release-polish (report explainability): every branch's `reason` may
     append one sentence naming the specific Trust Signal(s) that gated it —
@@ -1927,17 +2060,31 @@ def _build_recommendation_v1(
             why += f" ({notes})"
         return {"decision": "Manual Review Required", "reason": reason, "why": why}
     if still_vulnerable and defect_count == 0:  # I5
-        reason = (
-            "Challenger flagged unverified risks but found no confirmed exploit path; "
-            "see Review Results below before deploying."
-        )
+        if verification_status == "RESIDUAL_VULNERABILITY":
+            reason = (
+                "Adversarial review found affirmative evidence the vulnerability may remain "
+                "exploitable (a concrete bypass or ineffective mechanism); see Review Results "
+                "below before deploying."
+            )
+            why = "affirmative evidence indicates the vulnerability may still be present"
+        elif verification_status == "INSUFFICIENT_EVIDENCE":
+            reason = (
+                "The available evidence was insufficient to verify the fix is effective; "
+                "see Review Results below before deploying."
+            )
+            why = "the fix could not be sufficiently verified from the available evidence"
+        else:  # None — unknown/legacy/malformed; never treated as either real state
+            reason = (
+                "The Challenger's verification status is unavailable or unclassified for this "
+                "patch; stronger confidence is not justified. See Review Results below before "
+                "deploying."
+            )
+            why = "the Challenger's verification status could not be established for this patch"
         notes = (signals["remediation_alignment"].get("notes") or "").strip().rstrip(".")
         if notes:
             reason += f" Remediation alignment: {notes}."
-        why = (
-            "the patch's effectiveness against the vulnerability has not been confirmed — "
-            "adversarial review flagged risks that remain unverified"
-        )
+        if notes:
+            why += f" ({notes})"
         return {"decision": "Manual Review Required", "reason": reason, "why": why}
     if (
         integrity in _POSITIVE_INTEGRITY
@@ -3331,6 +3478,7 @@ def _build_report(result: PipelineResult) -> str:
         signals,
         still_vulnerable=classified_challenger.get("still_vulnerable", False),
         defect_count=calibrated_defect_count,
+        verification_status=classified_challenger.get("verification_status"),
     )
     # Demo polish: surface the already-computed decision on stdout the moment
     # it's known. Reuses the existing decision->emoji mapping (Hero Banner) —

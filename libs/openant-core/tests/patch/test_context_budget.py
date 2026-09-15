@@ -566,6 +566,264 @@ class TestPostPatchRecoveryExtension:
 
 
 # ---------------------------------------------------------------------------
+# Slice 4 -- the confirmed "nonzero but insufficient" budget-extension bug.
+#
+# Reproduces the ffmpegdotjs/CVE-2021-23376 shape at the unit level:
+# `_extend_post_patch_budget` previously only asked ContextBudgetController
+# for another window when a pool had reached EXACTLY zero (`<= 0`), never
+# when it merely had less headroom than the content that was just resolved
+# actually needs. A small-but-nonzero remainder (as in the real trace:
+# "remaining_chars": 54) silently never requested an extension at all, even
+# under policy="always" with unused windows still available.
+# ---------------------------------------------------------------------------
+
+class TestPostPatchRecoveryPartialShortfall:
+    def test_nonzero_but_insufficient_budget_requests_extension(self, tmp_path, monkeypatch):
+        """The core regression: `available` (10) is > 0 -- never hits the
+        old `<= 0` gate -- but is still smaller than the resolved window
+        (80 chars for this fixture). Before the fix this attempt fails
+        closed with zero extension_requests ever recorded, identical to
+        the observed ffmpegdotjs telemetry (`extension_requests: []`,
+        `remaining_chars: 54`). After the fix, exactly one window is
+        requested and approved, and the target is recovered."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.context_budget import ContextBudgetController
+
+        (tmp_path / "mod.py").write_text("CONST_B = 42\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        conformance = _make_conformance(edited_files=["mod.py"], unexpected_files=["mod.py"])
+        patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_B = 42\n+CONST_B = 43\n"
+        monkeypatch.setattr(rp, "MAX_POST_PATCH_SOURCE_CHARS", 50)
+        controller = ContextBudgetController(policy="always", interactive=False)
+
+        result = rp.recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+            budget_controller=controller,
+        )
+
+        trace = controller.to_trace_dict()["stages"]
+        assert trace["post_patch_recovery"]["extension_requests"], (
+            "no extension was ever REQUESTED -- the bug this test exists to catch"
+        )
+        assert trace["post_patch_recovery"]["approved_windows"] == 1
+        assert result.attempts[0].success is True
+        assert result.ready_for_regeneration is True
+
+    def test_sufficient_budget_never_requests_extension(self, tmp_path):
+        """Case 1/2: plenty of room -- no extension should ever be asked
+        for, even with policy="always"."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.context_budget import ContextBudgetController
+
+        (tmp_path / "mod.py").write_text("CONST_B = 42\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        conformance = _make_conformance(edited_files=["mod.py"], unexpected_files=["mod.py"])
+        patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_B = 42\n+CONST_B = 43\n"
+        controller = ContextBudgetController(policy="always", interactive=False)
+
+        result = rp.recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+            budget_controller=controller,
+        )
+
+        assert result.attempts[0].success is True
+        trace = controller.to_trace_dict()["stages"]
+        assert trace.get("post_patch_recovery", {}).get("extension_requests", []) == []
+        assert trace.get("final_target_slice", {}).get("extension_requests", []) == []
+
+    def test_policy_never_still_refuses_on_partial_shortfall(self, tmp_path, monkeypatch):
+        """Case 3: the exact same nonzero-but-insufficient shape as the
+        core regression, but policy="never" -- must still fail closed."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.context_budget import ContextBudgetController
+
+        (tmp_path / "mod.py").write_text("CONST_B = 42\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        conformance = _make_conformance(edited_files=["mod.py"], unexpected_files=["mod.py"])
+        patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_B = 42\n+CONST_B = 43\n"
+        monkeypatch.setattr(rp, "MAX_POST_PATCH_SOURCE_CHARS", 50)
+        controller = ContextBudgetController(policy="never", interactive=False)
+
+        result = rp.recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+            budget_controller=controller,
+        )
+
+        assert result.attempts[0].success is False
+        assert result.attempts[0].failure_reason == "target_budget_exhausted"
+        trace = controller.to_trace_dict()["stages"]
+        assert trace["post_patch_recovery"]["extension_requests"][0]["decision_source"] == "policy_never"
+
+    def test_max_windows_still_refuses_on_partial_shortfall(self, tmp_path, monkeypatch):
+        """Case 4: same shape again, but the hard window cap is already
+        at its configured maximum -- must still fail closed even under
+        policy="always"."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.context_budget import ContextBudgetController
+
+        (tmp_path / "mod.py").write_text("CONST_B = 42\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        conformance = _make_conformance(edited_files=["mod.py"], unexpected_files=["mod.py"])
+        patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_B = 42\n+CONST_B = 43\n"
+        monkeypatch.setattr(rp, "MAX_POST_PATCH_SOURCE_CHARS", 50)
+        controller = ContextBudgetController(policy="always", max_windows=1, interactive=False)
+
+        result = rp.recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+            budget_controller=controller,
+        )
+
+        assert result.attempts[0].success is False
+        assert result.attempts[0].failure_reason == "target_budget_exhausted"
+        trace = controller.to_trace_dict()["stages"]
+        assert trace["post_patch_recovery"]["extension_requests"][0]["decision_source"] == (
+            "hard_budget_window_limit_reached"
+        )
+
+    def test_precheck_behavior_unchanged_and_does_not_extend_the_other_pool(self, tmp_path):
+        """Case 5: the PRE-EXISTING line-5525 pre-check shape (the shared
+        `final_target_slice` ceiling is already fully exhausted by prior
+        content, `available <= 0` before any window is even built) must
+        keep behaving exactly as before -- AND, now that the helper
+        compares against a real need instead of a hardcoded zero, must
+        NOT also request an extension of the untouched, still-plentiful
+        `post_patch_recovery` pool. This is the scenario the previous
+        (rejected) "just remove both checks unconditionally" design would
+        have broken."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.context_budget import ContextBudgetController
+
+        (tmp_path / "mod.py").write_text("CONST_B = 42\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        conformance = _make_conformance(edited_files=["mod.py"], unexpected_files=["mod.py"])
+        patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_B = 42\n+CONST_B = 43\n"
+        initial_slice = _make_slice_result(rendered="x" * rp.FINAL_TARGET_SLICE_MAX_CHARS)
+        controller = ContextBudgetController(policy="always", interactive=False)
+
+        result = rp.recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, initial_slice, conformance, patch,
+            budget_controller=controller,
+        )
+
+        assert result.attempts[0].success is True
+        assert result.ready_for_regeneration is True
+        assert "x" * 100 in result.slice_result.rendered
+        trace = controller.to_trace_dict()["stages"]
+        assert trace["final_target_slice"]["approved_windows"] == 1
+        # The untouched pool must never have been asked for an extension.
+        assert "post_patch_recovery" not in trace
+
+    def test_tier5_probe_confirmed_fallback_requests_extension(self, tmp_path, monkeypatch):
+        """Case 6: the Tier-5 full-file-fallback path (no identifier
+        resolves via categories 1-4, forcing `_build_post_patch_window`
+        to return None) hits the exact same nonzero-but-insufficient
+        shape and must also now request -- and receive -- an extension."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.context_budget import ContextBudgetController
+
+        (tmp_path / "mod.py").write_text("SOME_VALUE = 123\n", encoding="utf-8")
+        # No functions/constants registered at all -- categories 1-4 (and
+        # the old-side anchor tier, itself gated to "uncovered_target"
+        # only) all miss, forcing the Tier-5 full-file fallback.
+        context = _make_context(repo_path=tmp_path)
+        conformance = _make_conformance(edited_files=["mod.py"], unexpected_files=["mod.py"])
+        patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-SOME_VALUE = 123\n+SOME_VALUE = 456\n"
+        monkeypatch.setattr(rp, "MAX_POST_PATCH_SOURCE_CHARS", 60)
+        controller = ContextBudgetController(policy="always", interactive=False)
+
+        result = rp.recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+            budget_controller=controller,
+        )
+
+        trace = controller.to_trace_dict()["stages"]
+        assert trace["post_patch_recovery"]["extension_requests"], (
+            "Tier-5's own probe-confirmed retry never requested an extension"
+        )
+        assert trace["post_patch_recovery"]["approved_windows"] == 1
+        assert result.attempts[0].success is True
+
+
+# ---------------------------------------------------------------------------
+# A successful, budget-extended recovery must never be mistaken for a
+# shortcut past Patch Target Conformance / the Recommendation Policy --
+# extension only ever supplies MORE EVIDENCE for those gates to evaluate.
+# ---------------------------------------------------------------------------
+
+class TestBudgetExtensionDoesNotBypassConformance:
+    def test_check_patch_target_conformance_source_never_mentions_budget_terms(self):
+        """Structural guarantee: the acceptance gate this fix's recovery
+        path feeds evidence into has zero coupling to budget/extension
+        state -- a successful extension can only ever supply more
+        evidence, never a shortcut past this check."""
+        import inspect
+        from utilities.autopatcher.remediation_planner import check_patch_target_conformance
+        source = inspect.getsource(check_patch_target_conformance)
+        for term in ("budget_controller", "context_budget", "ContextBudgetController", "_extend_post_patch_budget"):
+            assert term not in source
+
+    def test_budget_extended_recovery_does_not_make_an_out_of_scope_regenerated_patch_conformant(
+        self, tmp_path, monkeypatch,
+    ):
+        """Behavioral proof: recover_post_patch_source succeeds (via the
+        fix's budget extension) for the approved target, but a separately
+        "regenerated" patch that instead touches a file outside the
+        approved ready_edits is still correctly flagged non-conformant --
+        exactly mirroring the pipeline.py-level `_regen_conformance` /
+        `_regen_ok` re-check (pipeline.py ~4957-4970) that runs on every
+        regenerated patch regardless of how its evidence was gathered."""
+        from utilities.autopatcher import remediation_planner as rp
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import (
+            IntendedEdit, ReadyEdit, check_patch_target_conformance,
+        )
+
+        (tmp_path / "mod.py").write_text("CONST_B = 42\n", encoding="utf-8")
+        (tmp_path / "other.py").write_text("X = 1\n", encoding="utf-8")
+        context = _make_context(constants={"mod.py": {
+            "CONST_B": {"qualified_name": "CONST_B", "class_name": None, "name": "CONST_B", "line": 1, "end_line": 1},
+        }}, repo_path=tmp_path)
+        conformance = _make_conformance(edited_files=["mod.py"], unexpected_files=["mod.py"])
+        patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-CONST_B = 42\n+CONST_B = 43\n"
+        monkeypatch.setattr(rp, "MAX_POST_PATCH_SOURCE_CHARS", 50)
+        controller = ContextBudgetController(policy="always", interactive=False)
+
+        result = rp.recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+            budget_controller=controller,
+        )
+        assert result.attempts[0].success is True  # the fix worked: evidence was recovered
+        assert controller.to_trace_dict()["stages"]["post_patch_recovery"]["approved_windows"] == 1
+
+        # The approved scope is only "mod.py:CONST_B" -- a "regenerated"
+        # patch touching a different, unapproved file must still fail
+        # conformance, regardless of the successful extension above.
+        ready_edits = [ReadyEdit(
+            edit=IntendedEdit(file="mod.py", symbol="mod.py:CONST_B"),
+            role="edit_target", file="mod.py", symbol="mod.py:CONST_B",
+        )]
+        out_of_scope_patch = "--- a/other.py\n+++ b/other.py\n@@ -1,1 +1,1 @@\n-X = 1\n+X = 2\n"
+        out_of_scope_patch, meta = repair_hunk_headers(out_of_scope_patch, repo_root=tmp_path)
+
+        report = check_patch_target_conformance(
+            out_of_scope_patch, meta.relocations, ready_edits, result.slice_result,
+        )
+        assert report.all_conformant is False
+        assert report.unexpected_files == ["other.py"]
+
+
+# ---------------------------------------------------------------------------
 # Structured trace
 # ---------------------------------------------------------------------------
 

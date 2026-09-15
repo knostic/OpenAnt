@@ -1774,10 +1774,25 @@ def _extract_identifiers_from_text(text: "str | None") -> "list[str]":
     capitalized word, e.g. a sentence-initial "Extend" or a bare class
     name, is deliberately excluded as too generic on its own; a bare
     class name of interest reaches this extraction some other way, e.g.
-    as a verified target symbol's own class qualifier). A shorter token
-    that is only a substring of an already-captured longer token (e.g.
-    "ALLOWED_VALUES" inside "Policy.ALLOWED_VALUES") is skipped -- it adds
-    no new search target. Order-preserving, first-occurrence-deduplicated.
+    as a verified target symbol's own class qualifier). Order-preserving,
+    first-occurrence-deduplicated.
+
+    A shorter token that is only a substring of an already-captured longer
+    token is skipped as redundant ONLY when that longer token is itself
+    plain (undotted) -- e.g. a genuinely-contained shorter SCREAMING_SNAKE_CASE
+    or CamelCase token inside a longer one of the same flat shape adds no
+    new search target. It is NEVER skipped merely for being contained in an
+    already-captured DOTTED token: `object.attribute` (a qualified reference,
+    typically occurring at a consumer/read site) and the bare `attribute`
+    (typically occurring at its own definition/assignment/normalization/
+    constructor site: `self.attribute = ...`, a bare parameter name, etc.)
+    routinely name two DIFFERENT repository locations for the same
+    underlying attribute -- demonstrated directly by a real evidence-
+    acquisition gap where a constructor's own normalization of an attribute
+    was never searched for because the only extracted term was a caller-
+    qualified reference to that same attribute, which never occurs inside
+    the constructor's own source. Both forms are therefore always kept as
+    independent search targets when independently extractable.
     """
     if not text:
         return []
@@ -1793,7 +1808,7 @@ def _extract_identifiers_from_text(text: "str | None") -> "list[str]":
             tok = m.group(0)
             if tok in seen:
                 continue
-            if any(tok != longer and tok in longer for longer in found):
+            if any(tok != longer and "." not in longer and tok in longer for longer in found):
                 continue
             seen.add(tok)
             found.append(tok)
@@ -1829,6 +1844,51 @@ def _extract_strategy_identifiers(strategy: RemediationStrategyResult) -> "list[
             _add(tok)
 
     return ordered
+
+
+def _mechanism_derived_terms(strategy: RemediationStrategyResult) -> "set[str]":
+    """The subset of `_extract_strategy_identifiers(strategy)`'s own output
+    that is independently derivable from `extended_mechanism`/
+    `required_edits` alone -- recomputed via the same pure, already-existing
+    `_extract_identifiers_from_text`, ignoring `target_symbols` entirely.
+    Provenance-based, never shape-based: a term's SOURCE decides this, not
+    whether it happens to be dotted, snake_case, or CamelCase -- a bare,
+    mechanism-derived CamelCase identifier (e.g. a Go-style exported
+    function name mentioned in the mechanism text) belongs here exactly
+    like a mechanism-derived snake_case one; a target-symbol-only bare
+    CamelCase class name does not, purely because of where it came from.
+
+    Read-only relative to `_extract_strategy_identifiers`: this never
+    changes that function's own output, `RemediationStrategyResult`'s
+    schema, or category 2's iteration -- it exists solely so category 3a's
+    own usage scan (the only caller) can locally reorder its iteration."""
+    terms: "set[str]" = set(_extract_identifiers_from_text(strategy.extended_mechanism))
+    for edit in strategy.required_edits:
+        terms.update(_extract_identifiers_from_text(edit))
+    return terms
+
+
+def _mechanism_terms_first(strategy_terms: "list[str]", strategy: RemediationStrategyResult) -> "list[str]":
+    """Stable partition of an already-extracted, already-deduplicated
+    `strategy_terms` list: every term independently derivable from the
+    mechanism text first (original relative order preserved), then every
+    remaining term whose only origin is a coarse, unconditionally-added
+    verified target symbol (original relative order preserved).
+
+    A term that happens to be BOTH a verified target symbol AND
+    independently derivable from the mechanism text is classified by the
+    latter -- `_extract_strategy_identifiers`'s own cross-source dedup
+    already guarantees it appears in `strategy_terms` exactly once; this
+    only decides which group that one occurrence lands in, never
+    duplicates it.
+
+    For category 3a's own usage-discovery loop only -- never used to
+    reorder `strategy_terms` itself, category 2's iteration, or anything
+    else that reads `strategy_terms` directly."""
+    mechanism = _mechanism_derived_terms(strategy)
+    specific = [t for t in strategy_terms if t in mechanism]
+    coarse = [t for t in strategy_terms if t not in mechanism]
+    return specific + coarse
 
 
 def _merge_line_windows(windows: "list[tuple[int, int]]") -> "list[tuple[int, int]]":
@@ -2659,13 +2719,21 @@ def _build_final_target_slice_inner(
     # class-only/file-only targets' discovered consumers (SUPPORTING
     # role: raw_symbol stays None). Offsets from EVERY matching strategy
     # term are accumulated PER FUNCTION first (never rendered per-term) so
-    # two different terms landing in the same function (e.g. both
-    # "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" and "remove_headers_on_redirect"
-    # inside the same __init__) merge into one window set and render once,
-    # in first-encountered function order.
+    # two different terms landing in the same function merge into one
+    # window set and render once, in first-encountered function order --
+    # where "first-encountered" is over _mechanism_terms_first's own
+    # reordering of strategy_terms (mechanism-derived terms before
+    # coarse, target-symbol-only ones; each group's own relative order
+    # otherwise unchanged), not strategy_terms' own original order. This
+    # is a LOCAL reordering for this scan only -- strategy_terms itself,
+    # category 2 (above), and category 3b (below) are unaffected. Without
+    # it, a single coarse, unconditionally-first target-symbol term with
+    # several coincidental matches could consume this shared budget ahead
+    # of a term that actually names the mechanism, discovered only later
+    # in strategy_terms' own order.
     per_function_hits: "dict[tuple[str, str], dict]" = {}
     function_order: "list[tuple[str, str]]" = []
-    for term in strategy_terms:
+    for term in _mechanism_terms_first(strategy_terms, strategy):
         for (f, label, fn_start, fn_end, offsets) in _lookup_identifier_usages(term, preferred_files, context):
             fkey = (f, label)
             if fkey not in per_function_hits:
@@ -5397,25 +5465,35 @@ def recover_post_patch_source(
     attempts: "list[RecoveryTargetAttempt]" = []
     budget_remaining = MAX_POST_PATCH_SOURCE_CHARS
 
-    def _extend_post_patch_budget(affected_file: str) -> bool:
+    def _extend_post_patch_budget(affected_file: str, needed_chars: int = 1) -> bool:
         """Try, in order, to extend whichever pool(s) are actually
         binding for the CURRENT target -- this round's own
         "post_patch_recovery" pool first (the narrower one in practice),
         then the shared "final_target_slice" ceiling -- returning True
         if at least one extension was approved (the caller recomputes
         `available` immediately afterward). A no-op, always returning
-        False, when `budget_controller` is None."""
+        False, when `budget_controller` is None.
+
+        `needed_chars` is the amount the CALLER has already determined
+        it's short by (e.g. a just-built window's own rendered length,
+        or an unbounded probe's rendered length) -- a pool is extended
+        only when it is insufficient for that amount, never merely when
+        it has reached exactly zero. The default, `1`, reproduces the
+        original "pool is at/below zero" test exactly (`x < 1` iff
+        `x <= 0` for the non-negative values used here) for the one
+        caller (the pre-check above, before any window has been built)
+        that has no more specific need to report yet."""
         nonlocal budget_remaining
         if budget_controller is None:
             return False
         extended = False
-        if budget_remaining <= 0 and budget_controller.request_extension(
+        if budget_remaining < needed_chars and budget_controller.request_extension(
             "post_patch_recovery", MAX_POST_PATCH_SOURCE_CHARS,
             reason="target_budget_exhausted", affected_targets=[affected_file],
         ):
             budget_remaining += MAX_POST_PATCH_SOURCE_CHARS
             extended = True
-        if (_effective_final_target_max(budget_controller) - len(current_slice.rendered)) <= 0 and (
+        if (_effective_final_target_max(budget_controller) - len(current_slice.rendered)) < needed_chars and (
             budget_controller.request_extension(
                 "final_target_slice", FINAL_TARGET_SLICE_MAX_CHARS,
                 reason="target_budget_exhausted", affected_targets=[affected_file],
@@ -5544,7 +5622,7 @@ def recover_post_patch_source(
         if window is not None:
             rendered_text = _render_definition_block(window.file, window.label, window.start, window.end, window.source)
             if len(rendered_text) > available:
-                if _extend_post_patch_budget(file):
+                if _extend_post_patch_budget(file, needed_chars=len(rendered_text)):
                     total_remaining = _effective_final_target_max(budget_controller) - len(current_slice.rendered)
                     available = min(budget_remaining, total_remaining)
                 if len(rendered_text) > available:
@@ -5623,7 +5701,7 @@ def recover_post_patch_source(
                     verified_file in probe.identifier_definition_covered
                     or verified_file in probe.full_file_fallback_covered
                 )
-                if probe_would_cover and _extend_post_patch_budget(file):
+                if probe_would_cover and _extend_post_patch_budget(file, needed_chars=len(probe.rendered)):
                     # Budget was confirmed to be the sole blocker AND an
                     # extension was approved -- retry the REAL build
                     # (never just the discarded probe) against the

@@ -3777,10 +3777,15 @@ class TestStrategyIdentifierExtraction:
         assert "DEFAULT_REMOVE_HEADERS_ON_REDIRECT" in found
         assert "Retry" in found  # class qualifier of a VERIFIED symbol is trusted, unlike bare prose
 
-    def test_substring_of_dotted_identifier_not_duplicated(self):
+    def test_bare_attribute_retained_alongside_dotted_form(self):
+        """A qualified reference (`object.attribute`, typically a consumer/
+        read site) and its bare attribute component (typically the
+        definition/assignment/normalization site, e.g. `self.attribute = ...`)
+        name two DIFFERENT repository locations and must both be kept as
+        independent search targets -- neither is redundant with the other."""
         from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
         found = _extract_identifiers_from_text("Policy.ALLOWED_VALUES is the mechanism.")
-        assert found.count("ALLOWED_VALUES") == 0  # only the dotted form is kept
+        assert found.count("ALLOWED_VALUES") == 1
         assert found.count("Policy.ALLOWED_VALUES") == 1
 
     def test_order_preserving_deduplication(self):
@@ -3791,6 +3796,338 @@ class TestStrategyIdentifierExtraction:
         )
         found = _extract_strategy_identifiers(strategy)
         assert found.count("Policy.ALLOWED_VALUES") == 1
+
+
+class TestBareIdentifierRetainedAlongsideDottedForm:
+    """A qualified reference (`object.attribute`) and its bare attribute
+    component name two potentially DIFFERENT repository locations -- a
+    consumer/read site vs. a definition/assignment/normalization/constructor
+    site (`self.attribute = ...`, a bare parameter name, etc.) -- so the
+    bare form must never be discarded merely for being a substring of an
+    already-captured dotted form. Generic examples only; no repository- or
+    CVE-specific identifiers."""
+
+    def test_dotted_and_bare_attribute_both_retained(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        found = _extract_identifiers_from_text(
+            "The client reads client.security_policy; security_policy is normalized at construction."
+        )
+        assert "client.security_policy" in found
+        assert "security_policy" in found
+
+    def test_exact_duplicate_dotted_identifier_still_deduplicated(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        found = _extract_identifiers_from_text(
+            "client.security_policy is read here. Later, client.security_policy is read again."
+        )
+        assert found.count("client.security_policy") == 1
+
+    def test_ordering_remains_deterministic(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        text = "First mention: server.timeout_seconds. Then MAX_RETRY_COUNT constant."
+        first_run = _extract_identifiers_from_text(text)
+        second_run = _extract_identifiers_from_text(text)
+        assert first_run == second_run
+        assert first_run == ["server.timeout_seconds", "timeout_seconds", "MAX_RETRY_COUNT"]
+
+    def test_multiple_dotted_references_share_one_bare_identifier(self):
+        """Two different qualified references to the same underlying
+        attribute must not create duplicate bare-identifier entries."""
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        found = _extract_identifiers_from_text(
+            "client.security_policy and server.security_policy both read "
+            "security_policy, which is defined once."
+        )
+        assert found.count("client.security_policy") == 1
+        assert found.count("server.security_policy") == 1
+        assert found.count("security_policy") == 1
+
+    def test_snake_case_only_extraction_unchanged(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        assert _extract_identifiers_from_text("The MAX_RETRY_COUNT constant controls retries.") == ["MAX_RETRY_COUNT"]
+
+    def test_camelcase_only_extraction_unchanged(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        assert _extract_identifiers_from_text("The RequestHistory class stores metadata.") == ["RequestHistory"]
+
+    def test_dotted_only_extraction_unchanged(self):
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        assert _extract_identifiers_from_text("See obj.attribute for details.") == ["obj.attribute"]
+
+    def test_duplicate_identical_token_represented_once(self):
+        """A genuinely repeated identical token (no dotted form involved at
+        all) remains represented exactly once -- untouched by this change."""
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        found = _extract_identifiers_from_text(
+            "MAX_RETRY_COUNT governs retries. MAX_RETRY_COUNT is read at startup."
+        )
+        assert found.count("MAX_RETRY_COUNT") == 1
+
+    def test_non_dotted_containment_still_deduplicated(self):
+        """A shorter token that is a substring of an already-captured
+        PLAIN (non-dotted) longer token is still treated as redundant --
+        this change narrows the dedup rule to dotted-vs-bare only, it does
+        not disable dedup broadly."""
+        from utilities.autopatcher.remediation_planner import _extract_identifiers_from_text
+        found = _extract_identifiers_from_text(
+            "PolicyAllowedValues is the source of truth. AllowedValues is a shorter alias."
+        )
+        assert found.count("PolicyAllowedValues") == 1
+        assert found.count("AllowedValues") == 0
+
+
+class TestBareIdentifierEnablesConsumerDiscovery:
+    """Composition test: category-3a's consumer-usage scan can only search
+    for terms _extract_strategy_identifiers actually produced. This proves
+    the retained bare identifier makes a definition/constructor -- which
+    only ever uses the bare, self-qualified form -- newly discoverable,
+    using an entirely synthetic, generic scenario (no repository- or
+    CVE-specific names)."""
+
+    def test_definition_only_reachable_via_retained_bare_identifier(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            _extract_strategy_identifiers, build_final_target_slice,
+        )
+
+        (tmp_path / "widget.py").write_text(
+            "class Widget:\n"
+            "    def __init__(self, allowed_hosts=None):\n"
+            "        self.allowed_hosts = frozenset(h.lower() for h in (allowed_hosts or []))\n"
+            "\n"
+            "    def other_method(self):\n"
+            "        return None\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={
+                "widget.py:Widget.__init__": {
+                    "name": "__init__", "className": "Widget", "startLine": 2, "endLine": 3,
+                    "code": (
+                        "    def __init__(self, allowed_hosts=None):\n"
+                        "        self.allowed_hosts = frozenset(h.lower() for h in (allowed_hosts or []))\n"
+                    ),
+                },
+                "widget.py:Widget.other_method": {
+                    "name": "other_method", "className": "Widget", "startLine": 5, "endLine": 6,
+                    "code": "    def other_method(self):\n        return None\n",
+                },
+            },
+            repo_path=tmp_path,
+        )
+        # The strategy text -- like the real demonstrated case -- only ever
+        # names the QUALIFIED, consumer-side reference; it never mentions
+        # the bare attribute name on its own.
+        strategy = _make_strategy(
+            target_files=["widget.py"], target_symbols=[],
+            extended_mechanism=(
+                "The consumer reads widget.allowed_hosts to decide whether to allow the host."
+            ),
+        )
+
+        terms = _extract_strategy_identifiers(strategy)
+        assert "widget.allowed_hosts" in terms
+        assert "allowed_hosts" in terms  # retained thanks to this fix -- not discarded as redundant
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "Discovered consumer" in result.rendered
+        assert "Widget.__init__" in result.rendered
+        assert "self.allowed_hosts = frozenset" in result.rendered
+        assert "other_method" not in result.rendered
+
+
+class TestMechanismTermsPrioritizedOverTargetSymbol:
+    """Design 2 (provenance-based) category-3a prioritization:
+    _mechanism_terms_first partitions an already-extracted strategy_terms
+    list into mechanism-derived terms (independently derivable from
+    extended_mechanism/required_edits) first, then coarse terms whose only
+    origin is a verified target symbol -- by SOURCE, never by identifier
+    shape. Generic/synthetic names only."""
+
+    def _strategy(self, target_symbols, extended_mechanism, required_edits=None):
+        return _make_strategy(
+            target_files=["widget.py"], target_symbols=target_symbols,
+            extended_mechanism=extended_mechanism, required_edits=required_edits or [],
+        )
+
+    def test_mechanism_derived_terms_placed_before_target_symbol_only(self):
+        from utilities.autopatcher.remediation_planner import (
+            _extract_strategy_identifiers, _mechanism_terms_first,
+        )
+        strategy = self._strategy(
+            target_symbols=["Client"],
+            extended_mechanism=(
+                "RequestPolicy.validate_request reads request.allowed_hosts; "
+                "allowed_hosts is normalized before use. NewTransport also applies it."
+            ),
+        )
+        strategy_terms = _extract_strategy_identifiers(strategy)
+        assert strategy_terms[0] == "Client"  # coarse target symbol is unconditionally first, as always
+
+        reordered = _mechanism_terms_first(strategy_terms, strategy)
+
+        assert reordered[-1] == "Client"  # the only target-symbol-only term ends up last
+        for term in ("RequestPolicy.validate_request", "request.allowed_hosts", "allowed_hosts", "NewTransport"):
+            assert term in reordered
+            assert reordered.index(term) < reordered.index("Client")
+
+    def test_cross_language_shape_protection_camelcase_mechanism_term(self):
+        """A mechanism-derived CamelCase/PascalCase identifier (e.g. a
+        Go-style exported function name) must stay ahead of a
+        target-symbol-only CamelCase name -- proving classification is by
+        SOURCE, not by shape. A shape-based rule would incorrectly lump
+        both together as "coarse"."""
+        from utilities.autopatcher.remediation_planner import (
+            _extract_strategy_identifiers, _mechanism_terms_first,
+        )
+        strategy = self._strategy(
+            target_symbols=["Client"],
+            extended_mechanism="NewTransport already applies the required normalization.",
+        )
+        strategy_terms = _extract_strategy_identifiers(strategy)
+        reordered = _mechanism_terms_first(strategy_terms, strategy)
+
+        assert reordered.index("NewTransport") < reordered.index("Client")
+
+    def test_duplicate_provenance_single_occurrence_in_mechanism_group(self):
+        """A term appearing both as a target symbol AND independently in
+        the mechanism text must appear exactly once, in the higher-priority
+        (mechanism) group -- never duplicated, never left behind in the
+        coarse group. Contrasted against a second, genuinely
+        target-symbol-only term so the reordering is non-trivial."""
+        from utilities.autopatcher.remediation_planner import (
+            _extract_strategy_identifiers, _mechanism_terms_first,
+        )
+        strategy = self._strategy(
+            target_symbols=["NewTransport", "Client"],
+            extended_mechanism="NewTransport already applies the required normalization.",
+        )
+        strategy_terms = _extract_strategy_identifiers(strategy)
+        assert strategy_terms.count("NewTransport") == 1  # already guaranteed by _extract_strategy_identifiers
+
+        reordered = _mechanism_terms_first(strategy_terms, strategy)
+        assert reordered.count("NewTransport") == 1  # still exactly once -- not duplicated
+        # "NewTransport" is both a target symbol AND mechanism-derived --
+        # it must land ahead of "Client", which is target-symbol-only.
+        assert reordered.index("NewTransport") < reordered.index("Client")
+        assert reordered[-1] == "Client"
+
+    def test_stable_ordering_repeated_calls_identical(self):
+        from utilities.autopatcher.remediation_planner import (
+            _extract_strategy_identifiers, _mechanism_terms_first,
+        )
+        strategy = self._strategy(
+            target_symbols=["Client", "Session"],
+            extended_mechanism="RequestPolicy.validate_request reads request.allowed_hosts.",
+            required_edits=["Extend allowed_hosts to include the new value."],
+        )
+        strategy_terms = _extract_strategy_identifiers(strategy)
+        first = _mechanism_terms_first(strategy_terms, strategy)
+        second = _mechanism_terms_first(strategy_terms, strategy)
+        assert first == second
+        # Relative order within each group preserved: both coarse terms
+        # keep their original mutual order at the tail.
+        assert [t for t in first if t in ("Client", "Session")] == ["Client", "Session"]
+
+    def test_category_2_unaffected(self, tmp_path):
+        """Reuses TestClassOnlyTargetDiscovery's own fixture and assertions
+        verbatim -- category 2's constant-lookup behavior/output must be
+        byte-for-byte unchanged by a category-3a-only reordering."""
+        fixture = TestClassOnlyTargetDiscovery()
+        context = fixture._context_with_policy_and_consumer(tmp_path)
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        strategy = _make_strategy(
+            target_files=["policy.py"], target_symbols=[],
+            extended_mechanism="Policy.ALLOWED_VALUES",
+            required_edits=["Add 'b' to Policy.ALLOWED_VALUES."],
+        )
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+        assert "policy.py" in result.covered_target_files
+        assert (
+            "Related definition (context only, not an approved edit target): "
+            "`policy.py:Policy.ALLOWED_VALUES`" in result.rendered
+        )
+        assert "Target definition: `policy.py:Policy.ALLOWED_VALUES`" not in result.rendered
+
+    def test_coarse_term_starvation_prevented_under_tight_budget(self, tmp_path):
+        """Composition test: a coarse, target-symbol-only term ("Widget")
+        matches two consumer functions; a mechanism-derived term
+        ("max_retry_count", from extended_mechanism) matches a third,
+        necessary-to-understand-remediation function. Under a tight
+        budget, the mechanism candidate must never be starved by the
+        coarse term's own matches -- and coarse candidates must still
+        render once enough budget remains. No budget constant is changed;
+        `max_chars` is passed explicitly per-call, exactly as
+        build_final_target_slice's own public signature already allows."""
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+
+        src = (
+            "class Widget:\n"
+            "    def method_a(self):\n"
+            "        return \"Widget helper A with some padding text to make this block reasonably sized for testing purposes here\"\n"
+            "\n"
+            "    def method_b(self):\n"
+            "        return \"Widget helper B with some padding text to make this block reasonably sized for testing purposes here\"\n"
+            "\n"
+            "    def configure(self, max_retry_count=None):\n"
+            "        self.max_retry_count = int(max_retry_count or 0)\n"
+        )
+        (tmp_path / "widget.py").write_text(src, encoding="utf-8")
+        lines = src.splitlines(keepends=True)
+
+        def code_for(start, end):
+            return "".join(lines[start - 1:end])
+
+        context = _make_context(
+            functions={
+                "widget.py:Widget.method_a": {
+                    "name": "method_a", "className": "Widget", "startLine": 2, "endLine": 3,
+                    "code": code_for(2, 3),
+                },
+                "widget.py:Widget.method_b": {
+                    "name": "method_b", "className": "Widget", "startLine": 5, "endLine": 6,
+                    "code": code_for(5, 6),
+                },
+                "widget.py:Widget.configure": {
+                    "name": "configure", "className": "Widget", "startLine": 8, "endLine": 9,
+                    "code": code_for(8, 9),
+                },
+            },
+            repo_path=tmp_path,
+        )
+        strategy = _make_strategy(
+            target_files=["widget.py"], target_symbols=["Widget"],
+            extended_mechanism="The client reads config.max_retry_count to decide retry behavior.",
+        )
+
+        # Tight budget: only the mechanism-derived candidate (plus whatever
+        # the primary edit-target definition itself always contributes)
+        # fits -- neither coarse consumer does.
+        tight = build_final_target_slice(strategy, str(tmp_path), context, max_chars=900)
+        assert "Discovered consumer: `widget.py:Widget.configure`" in tight.rendered
+        assert "Discovered consumer: `widget.py:Widget.method_a`" not in tight.rendered
+        assert "Discovered consumer: `widget.py:Widget.method_b`" not in tight.rendered
+        # Whole-block-or-omit: the coarse consumer windows are either
+        # rendered as complete "Discovered consumer" blocks (checked above)
+        # or entirely absent -- never partially included. (The primary
+        # edit-target's own full-class definition block legitimately
+        # contains all method bodies verbatim regardless of budget, so
+        # method source text alone is not itself a signal here.)
+
+        # Generous budget: the mechanism candidate AND both coarse
+        # consumers all render -- the fix never excludes coarse evidence,
+        # only deprioritizes its commit order when budget is genuinely tight.
+        loose = build_final_target_slice(strategy, str(tmp_path), context)
+        assert "Discovered consumer: `widget.py:Widget.configure`" in loose.rendered
+        assert "Discovered consumer: `widget.py:Widget.method_a`" in loose.rendered
+        assert "Discovered consumer: `widget.py:Widget.method_b`" in loose.rendered
+
+    def test_no_repository_specific_strings_in_provenance_reordering(self):
+        import inspect
+        from utilities.autopatcher.remediation_planner import _mechanism_derived_terms, _mechanism_terms_first
+        source = inspect.getsource(_mechanism_derived_terms) + inspect.getsource(_mechanism_terms_first)
+        for needle in ("urllib3", "Cookie", "Retry", "remove_headers_on_redirect", "PoolManager", "CVE-"):
+            assert needle not in source
 
 
 class TestClassOnlyTargetDiscovery:

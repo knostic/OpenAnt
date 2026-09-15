@@ -82,6 +82,67 @@ class TestClassifyFinding:
 
 
 # ---------------------------------------------------------------------------
+# _classify_finding — evidence-supply validation gap (sibling idiom to the
+# testing-coverage phrasing above): the Challenger says evidence NEEDED to
+# establish whether the remediation mechanism works was not supplied at all
+# ("not shown"/"omitted"/"not traced"/"not established"), rather than saying
+# it could not run a verification step. Requires a NECESSITY marker
+# (required/consistency/relies on/depends on/...) co-occurring with an
+# EVIDENCE-ABSENCE marker (not shown/omitted/not traced/not established) —
+# neither alone is sufficient, so a bare "not shown"/"omitted" describing an
+# optional or unrelated detail must not become validation_gap.
+# ---------------------------------------------------------------------------
+
+class TestClassifyFindingEvidenceSupplyGap:
+    def test_required_consuming_behavior_not_shown(self):
+        assert _classify_finding(
+            "Required consuming behavior was not shown in the supplied evidence."
+        ) == "validation_gap"
+
+    def test_correctness_depends_on_unshown_transformation(self):
+        assert _classify_finding(
+            "Correctness depends on a transformation whose implementation was not "
+            "shown in the verified evidence."
+        ) == "validation_gap"
+
+    def test_consistency_asserted_but_not_traced(self):
+        assert _classify_finding(
+            "Consistency with another required execution path was asserted but "
+            "not traced from the supplied evidence."
+        ) == "validation_gap"
+
+    def test_required_evidence_omitted_cannot_establish_correctness(self):
+        assert _classify_finding(
+            "Required implementation evidence was omitted, so the remediation "
+            "behavior cannot be established from the evidence shown."
+        ) == "validation_gap"
+
+    def test_no_new_regression_test_shown_is_not_a_validation_gap(self):
+        """A bare testing/hardening observation, with no necessity marker
+        tying it to the remediation mechanism's own correctness, must not
+        become validation_gap merely because it says something was "shown"."""
+        assert _classify_finding("No new regression test was shown.") != "validation_gap"
+
+    def test_optional_alternative_not_shown_is_not_a_validation_gap(self):
+        """An absence marker ("not shown") alone, describing an explicitly
+        optional/non-blocking detail, must not become validation_gap."""
+        assert _classify_finding(
+            "An optional alternative implementation was not shown."
+        ) != "validation_gap"
+
+    def test_benign_edge_case_stays_plausible_risk(self):
+        assert _classify_finding(
+            "Same-origin redirects still forward the session header (intended, preserved)."
+        ) == "plausible_risk"
+
+    def test_generic_hypothetical_risk_stays_plausible_risk(self):
+        assert _classify_finding(
+            "A user who supplies a custom configuration omitting the new entry "
+            "would not get protection."
+        ) == "plausible_risk"
+
+
+# ---------------------------------------------------------------------------
 # behavioral_defect (run-4 Architecture B)
 #
 # A generic, repository/language-agnostic category for a candidate patch

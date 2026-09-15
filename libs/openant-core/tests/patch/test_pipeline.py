@@ -2344,6 +2344,410 @@ class TestMediumHygieneRecommendation:
 
 
 # ---------------------------------------------------------------------------
+# Challenger verification_status tri-state -- reaching _compute_trust_signals
+# and _build_recommendation_v1 as structured signal, never as parsed prose.
+# ---------------------------------------------------------------------------
+
+class TestVerificationStatusRecommendation:
+    """RESIDUAL_VULNERABILITY and INSUFFICIENT_EVIDENCE both still project
+    still_vulnerable=True (same conservative decision as before this field
+    existed), but the deterministic reason/notes text must now name which
+    of the two actually occurred -- and UNKNOWN/legacy-unclassified must
+    never be described as an affirmative residual-vulnerability finding."""
+
+    @staticmethod
+    def _classified_challenger(verification_status, still_vulnerable):
+        return {
+            "confirmed_defect_count": 0,
+            "plausible_risk_count": 0,
+            "validation_gap_count": 1,
+            "still_vulnerable": still_vulnerable,
+            "verification_status": verification_status,
+        }
+
+    def test_residual_and_insufficient_share_decision_but_differ_in_reason(self):
+        """Both currently land on the same conservative recommendation
+        level, but with materially different deterministic explanations."""
+        from utilities.autopatcher.pipeline import _build_recommendation_v1, _compute_trust_signals
+
+        residual_signals = _compute_trust_signals(
+            [], {"applicable": True},
+            self._classified_challenger("RESIDUAL_VULNERABILITY", True), "Good", "low",
+        )
+        insufficient_signals = _compute_trust_signals(
+            [], {"applicable": True},
+            self._classified_challenger("INSUFFICIENT_EVIDENCE", True), "Good", "low",
+        )
+
+        residual_rec = _build_recommendation_v1(
+            residual_signals, still_vulnerable=True, defect_count=0,
+            verification_status="RESIDUAL_VULNERABILITY",
+        )
+        insufficient_rec = _build_recommendation_v1(
+            insufficient_signals, still_vulnerable=True, defect_count=0,
+            verification_status="INSUFFICIENT_EVIDENCE",
+        )
+
+        # Same conservative decision level -- this change must not make
+        # either case more (or less) permissive than the other.
+        assert residual_rec["decision"] == "Manual Review Required"
+        assert insufficient_rec["decision"] == "Manual Review Required"
+
+        # But their deterministic explanations must be semantically distinct.
+        assert residual_rec["reason"] != insufficient_rec["reason"]
+        assert residual_rec["why"] != insufficient_rec["why"]
+        assert "affirmative evidence" in residual_rec["why"]
+        assert "could not be sufficiently verified" in insufficient_rec["why"]
+
+    def test_unknown_reason_distinct_from_residual_vulnerability(self):
+        """UNKNOWN (verification_status=None -- legacy/unclassified/
+        malformed) must never read as an affirmative residual-vulnerability
+        claim: its reason/why must differ from RESIDUAL_VULNERABILITY's."""
+        from utilities.autopatcher.pipeline import _build_recommendation_v1, _compute_trust_signals
+
+        unknown_signals = _compute_trust_signals(
+            [], {"applicable": True},
+            self._classified_challenger(None, True), "Good", "low",
+        )
+        residual_signals = _compute_trust_signals(
+            [], {"applicable": True},
+            self._classified_challenger("RESIDUAL_VULNERABILITY", True), "Good", "low",
+        )
+
+        unknown_rec = _build_recommendation_v1(
+            unknown_signals, still_vulnerable=True, defect_count=0, verification_status=None,
+        )
+        residual_rec = _build_recommendation_v1(
+            residual_signals, still_vulnerable=True, defect_count=0,
+            verification_status="RESIDUAL_VULNERABILITY",
+        )
+
+        assert unknown_rec["decision"] == "Manual Review Required"
+        assert unknown_rec["reason"] != residual_rec["reason"]
+        assert unknown_rec["why"] != residual_rec["why"]
+        assert "affirmative evidence" not in unknown_rec["why"]
+        assert "unavailable or unclassified" in unknown_rec["reason"]
+
+    def test_omitting_verification_status_preserves_prior_default_wording(self):
+        """A caller that doesn't pass verification_status at all (every
+        pre-existing direct caller of this function) gets the same
+        "unknown" wording as an explicit None -- never silently implying a
+        richer signal it wasn't given."""
+        from utilities.autopatcher.pipeline import _build_recommendation_v1, _compute_trust_signals
+
+        signals = _compute_trust_signals(
+            [], {"applicable": True},
+            {"confirmed_defect_count": 0, "plausible_risk_count": 0,
+             "validation_gap_count": 1, "still_vulnerable": True},
+            "Good", "low",
+        )
+        no_kwarg_rec = _build_recommendation_v1(signals, still_vulnerable=True, defect_count=0)
+        explicit_none_rec = _build_recommendation_v1(
+            signals, still_vulnerable=True, defect_count=0, verification_status=None,
+        )
+        assert no_kwarg_rec == explicit_none_rec
+        assert no_kwarg_rec["decision"] == "Manual Review Required"
+
+    def test_build_recommendation_reads_structured_status_not_prose(self):
+        """_build_recommendation_v1 must distinguish the three states from
+        the `verification_status` parameter alone -- never by parsing the
+        `signals` notes/reason prose. Same `signals` dict, three different
+        `verification_status` values, three distinct reasons."""
+        from utilities.autopatcher.pipeline import _build_recommendation_v1, _compute_trust_signals
+
+        # verification_status is deliberately omitted from this dict --
+        # _build_recommendation_v1 must still distinguish the three cases
+        # via its own `verification_status` parameter, not by reading it
+        # back out of `signals` (which never carries it at all).
+        signals = _compute_trust_signals(
+            [], {"applicable": True},
+            {"confirmed_defect_count": 0, "plausible_risk_count": 0,
+             "validation_gap_count": 1, "still_vulnerable": True},
+            "Good", "low",
+        )
+        reasons = {
+            status: _build_recommendation_v1(
+                signals, still_vulnerable=True, defect_count=0, verification_status=status,
+            )["reason"]
+            for status in ("RESIDUAL_VULNERABILITY", "INSUFFICIENT_EVIDENCE", None)
+        }
+        assert len(set(reasons.values())) == 3  # all three pairwise distinct
+
+    def test_compute_trust_signals_does_not_overclaim_for_insufficient_evidence(self):
+        """_compute_trust_signals' notes for INSUFFICIENT_EVIDENCE must not
+        contain the affirmative claim phrasing reserved for
+        RESIDUAL_VULNERABILITY -- it must not describe a demonstrated
+        residual vulnerability that was never actually found."""
+        from utilities.autopatcher.pipeline import _compute_trust_signals
+
+        insufficient_signals = _compute_trust_signals(
+            [], {"applicable": True},
+            self._classified_challenger("INSUFFICIENT_EVIDENCE", True), "Good", "low",
+        )
+        residual_signals = _compute_trust_signals(
+            [], {"applicable": True},
+            self._classified_challenger("RESIDUAL_VULNERABILITY", True), "Good", "low",
+        )
+
+        insufficient_notes = insufficient_signals["remediation_alignment"]["notes"]
+        residual_notes = residual_signals["remediation_alignment"]["notes"]
+        assert insufficient_notes != residual_notes
+        assert "identified a concrete residual vulnerability" not in insufficient_notes
+        assert "identified a concrete residual vulnerability" in residual_notes
+
+    def test_legacy_and_pre_existing_dicts_unaffected(self):
+        """A classified_challenger dict with no `verification_status` key at
+        all (every pre-existing test fixture / persisted execution artifact)
+        renders IDENTICAL notes text to before this field existed."""
+        from utilities.autopatcher.pipeline import _compute_trust_signals
+
+        legacy_dict = {
+            "confirmed_defect_count": 0, "plausible_risk_count": 0,
+            "validation_gap_count": 1, "still_vulnerable": True,
+        }
+        signals = _compute_trust_signals([], {"applicable": True}, legacy_dict, "Good", "low")
+        assert signals["remediation_alignment"]["notes"] == "Correct mechanism · runtime verification pending"
+        assert signals["security_improvement"]["notes"] == "No high-confidence heuristic risk identified · 1 verification gap(s)"
+
+
+# ---------------------------------------------------------------------------
+# _classify_challenger: VERIFIED_FIXED + validation_gap consistency
+# reconciliation (demonstrated urllib3/CVE-2023-43804 regression: a raw
+# Challenger response asserted verification_status=VERIFIED_FIXED while ALSO
+# reporting a finding classified validation_gap -- i.e. the model itself said
+# some required verification could not be established from the supplied
+# evidence, in the same response). Scope is deliberately narrow: only this
+# exact (VERIFIED_FIXED, validation_gap_count > 0) combination reconciles;
+# confirmed_defect/behavioral_defect (already blocked via the Misaligned
+# path) and plausible_risk (the classifier's broad catch-all default) are
+# untouched.
+# ---------------------------------------------------------------------------
+
+class TestVerifiedFixedValidationGapReconciliation:
+    @staticmethod
+    def _challenger(verification_status, still_vulnerable, edge_cases=None, potential_issues=None):
+        return {
+            "verification_status": verification_status,
+            "still_vulnerable": still_vulnerable,
+            "edge_cases": edge_cases or [],
+            "potential_issues": potential_issues or [],
+            "summary": "",
+        }
+
+    def test_verified_fixed_with_validation_gap_becomes_insufficient_evidence(self):
+        """Case 1: a generic, non-repository-specific validation-gap-shaped
+        finding ("cannot verify ...") alongside VERIFIED_FIXED must
+        reconcile to INSUFFICIENT_EVIDENCE, still_vulnerable=True -- never
+        RESIDUAL_VULNERABILITY (absence of verification is not affirmative
+        evidence of a remaining vulnerability)."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger(
+            "VERIFIED_FIXED", False,
+            potential_issues=["Cannot verify whether the consuming code normalizes this value as shown"],
+        )
+        result = _classify_challenger(challenger)
+
+        assert result["validation_gap_count"] > 0
+        assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert result["still_vulnerable"] is True
+
+    def test_verified_fixed_with_only_plausible_risk_is_unaffected(self):
+        """Case 2: a plausible_risk-only finding (no validation_gap, no
+        defect) must NOT downgrade VERIFIED_FIXED -- that bucket is
+        intentionally broad/catch-all and must not automatically invalidate
+        an affirmative verdict."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger(
+            "VERIFIED_FIXED", False,
+            edge_cases=["Some minor edge case that is not a defect or a verification gap"],
+        )
+        result = _classify_challenger(challenger)
+
+        assert result["confirmed_defect_count"] == 0
+        assert result["behavioral_defect_count"] == 0
+        assert result["validation_gap_count"] == 0
+        assert result["verification_status"] == "VERIFIED_FIXED"
+        assert result["still_vulnerable"] is False
+
+    def test_verified_fixed_with_no_findings_is_unaffected(self):
+        """Case 3: VERIFIED_FIXED with no edge_cases/potential_issues at all
+        remains VERIFIED_FIXED."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger("VERIFIED_FIXED", False)
+        result = _classify_challenger(challenger)
+
+        assert result["validation_gap_count"] == 0
+        assert result["verification_status"] == "VERIFIED_FIXED"
+        assert result["still_vulnerable"] is False
+
+    def test_residual_vulnerability_with_validation_gap_is_unaffected(self):
+        """Case 4: the reconciliation only ever touches VERIFIED_FIXED --
+        RESIDUAL_VULNERABILITY must pass through unchanged regardless of
+        validation_gap_count."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger(
+            "RESIDUAL_VULNERABILITY", True,
+            potential_issues=["Cannot verify whether the consuming code normalizes this value as shown"],
+        )
+        result = _classify_challenger(challenger)
+
+        assert result["validation_gap_count"] > 0
+        assert result["verification_status"] == "RESIDUAL_VULNERABILITY"
+        assert result["still_vulnerable"] is True
+
+    def test_insufficient_evidence_with_validation_gap_is_unaffected(self):
+        """Case 5: already INSUFFICIENT_EVIDENCE stays INSUFFICIENT_EVIDENCE
+        regardless of validation_gap_count -- no double-reconciliation."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger(
+            "INSUFFICIENT_EVIDENCE", True,
+            potential_issues=["Cannot verify whether the consuming code normalizes this value as shown"],
+        )
+        result = _classify_challenger(challenger)
+
+        assert result["validation_gap_count"] > 0
+        assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert result["still_vulnerable"] is True
+
+    def test_unknown_legacy_unclassified_remains_conservative_and_unchanged(self):
+        """Case 6: verification_status=None (UNKNOWN/legacy/malformed) is
+        left exactly as-is by this reconciliation -- it is already
+        conservative (still_vulnerable reflects legacy Yes/No or the
+        fail-closed default) and this change must not touch it."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        legacy_no = self._challenger(None, False)  # e.g. legacy "Still vulnerable: No"
+        legacy_yes = self._challenger(
+            None, True,
+            potential_issues=["Cannot verify whether the consuming code normalizes this value as shown"],
+        )
+
+        result_no = _classify_challenger(legacy_no)
+        result_yes = _classify_challenger(legacy_yes)
+
+        assert result_no["verification_status"] is None
+        assert result_no["still_vulnerable"] is False
+        assert result_yes["verification_status"] is None
+        assert result_yes["still_vulnerable"] is True
+
+    def test_end_to_end_verified_fixed_with_validation_gap_does_not_deploy(self, tmp_path):
+        """Case 7: end-to-end through _build_report -- VERIFIED_FIXED plus a
+        generic validation-gap finding must NOT produce Deploy After
+        Validation."""
+        from utilities.autopatcher.pipeline import PipelineResult, _build_report
+
+        kwargs = TestWhyManualReview()._base_kwargs(
+            tmp_path,
+            challenger={
+                "verification_status": "VERIFIED_FIXED",
+                "still_vulnerable": False,
+                "edge_cases": [],
+                "potential_issues": ["Cannot verify whether the consuming code normalizes this value as shown"],
+                "summary": "",
+            },
+        )
+        report = _build_report(PipelineResult(**kwargs))
+
+        assert "Deploy After Validation" not in report
+        assert "Manual Review Required" in report
+
+    def test_confirmed_defect_recommendation_behavior_unchanged(self):
+        """Case 8: a confirmed_defect finding still drives Misaligned ->
+        Manual Review Required exactly as before this reconciliation, via
+        the pre-existing, untouched path -- this reconciliation only adds
+        the new VERIFIED_FIXED + validation_gap branch."""
+        from utilities.autopatcher.pipeline import (
+            _build_recommendation_v1, _classify_challenger, _compute_trust_signals,
+        )
+
+        challenger = self._challenger(
+            "VERIFIED_FIXED", False,
+            potential_issues=["The patch is still vulnerable to the same attack vector"],
+        )
+        classified = _classify_challenger(challenger)
+        assert classified["confirmed_defect_count"] == 1
+        # A confirmed defect must never be silently reconciled away by this
+        # change -- it is intentionally excluded from the new condition.
+        assert classified["verification_status"] == "VERIFIED_FIXED"
+
+        signals = _compute_trust_signals([], {"applicable": True}, classified, "Good", "low")
+        rec = _build_recommendation_v1(
+            signals,
+            still_vulnerable=classified["still_vulnerable"],
+            defect_count=classified["confirmed_defect_count"],
+            verification_status=classified["verification_status"],
+        )
+        assert rec["decision"] == "Manual Review Required"
+
+    def test_no_repository_specific_strings_in_reconciliation(self):
+        """Case 9: the reconciliation added to _classify_challenger must
+        contain no repository- or CVE-specific production logic."""
+        import inspect
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        source = inspect.getsource(_classify_challenger)
+        for needle in ("urllib3", "Cookie", "GHSA", "CVE-", "retry.py", "poolmanager"):
+            assert needle not in source
+
+    def test_verified_fixed_with_newly_recognized_evidence_supply_gap_becomes_insufficient_evidence(
+        self, tmp_path,
+    ):
+        """Composition test: a finding that is recognized as validation_gap
+        ONLY via the new evidence-supply idiom (_has_evidence_gap_signal --
+        not the pre-existing testing-coverage _VALIDATION_GAP_RE) must still
+        flow through the unmodified reconciliation end-to-end: VERIFIED_FIXED
+        -> INSUFFICIENT_EVIDENCE -> still_vulnerable=True -> no Deploy After
+        Validation."""
+        from utilities.autopatcher.pipeline import PipelineResult, _build_report, _classify_challenger
+
+        evidence_supply_gap_finding = (
+            "Correctness depends on a transformation whose implementation was "
+            "not shown in the verified evidence."
+        )
+        # Confirm this finding is NOT matched by the pre-existing
+        # testing-coverage regex -- it only qualifies via the new idiom.
+        from utilities.autopatcher.pipeline import _VALIDATION_GAP_RE
+        assert not _VALIDATION_GAP_RE.search(evidence_supply_gap_finding)
+
+        challenger = self._challenger("VERIFIED_FIXED", False, potential_issues=[evidence_supply_gap_finding])
+        classified = _classify_challenger(challenger)
+        assert classified["validation_gap_count"] > 0
+        assert classified["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert classified["still_vulnerable"] is True
+
+        kwargs = TestWhyManualReview()._base_kwargs(tmp_path, challenger=challenger)
+        report = _build_report(PipelineResult(**kwargs))
+        assert "Deploy After Validation" not in report
+        assert "Manual Review Required" in report
+
+    def test_verified_fixed_with_only_plausible_risk_stays_verified_fixed_end_to_end(self, tmp_path):
+        """Composition test: findings that stay plausible_risk under the
+        broadened classifier (a benign edge case and a bare, non-necessity
+        "not shown" detail) must leave VERIFIED_FIXED completely untouched,
+        end to end through _build_report."""
+        from utilities.autopatcher.pipeline import PipelineResult, _build_report, _classify_challenger
+
+        challenger = self._challenger(
+            "VERIFIED_FIXED", False,
+            edge_cases=["Same-origin redirects still forward the session header (intended, preserved)."],
+            potential_issues=["An optional alternative implementation was not shown."],
+        )
+        classified = _classify_challenger(challenger)
+        assert classified["validation_gap_count"] == 0
+        assert classified["verification_status"] == "VERIFIED_FIXED"
+        assert classified["still_vulnerable"] is False
+
+        kwargs = TestWhyManualReview()._base_kwargs(tmp_path, challenger=challenger)
+        report = _build_report(PipelineResult(**kwargs))
+        assert "Deploy After Validation" in report
+
+
+# ---------------------------------------------------------------------------
 # Vulnerability Sources (GHSA/CVE/Advisory URL — no upstream remediation links)
 # ---------------------------------------------------------------------------
 
@@ -3494,7 +3898,11 @@ class TestWhyManualReview:
         """node-semver-representative: the patch's effectiveness against the
         vulnerability remains uncertain (still_vulnerable, no confirmed
         defect). Decision must land on the existing still_vulnerable/
-        defect_count==0 branch, unchanged by this batch."""
+        defect_count==0 branch, unchanged by this batch. This fixture's
+        challenger dict predates `verification_status` (no such key), so
+        it renders as the UNKNOWN/unclassified case -- never claiming
+        stronger certainty (residual vulnerability or verified-fixed) than
+        this old-shaped dict actually supports."""
         from utilities.autopatcher.pipeline import _build_report, PipelineResult
         kwargs = self._base_kwargs(
             tmp_path,
@@ -3511,7 +3919,7 @@ class TestWhyManualReview:
 
         assert "**Manual Review Required**" in rec_block
         assert "**Why manual review:**" in rec_block
-        assert "effectiveness" in rec_block.lower() or "has not been confirmed" in rec_block.lower()
+        assert "unavailable or unclassified" in rec_block.lower()
 
     def test_green_recommendation_has_no_why_manual_review_text(self, tmp_path):
         from utilities.autopatcher.pipeline import _build_report, PipelineResult
@@ -4552,4 +4960,4 @@ class TestSecurityInvariantTopAction:
 
         assert "**Manual Review Required**" in report
         assert "**Why manual review:**" in report
-        assert "has not been confirmed" in report
+        assert "could not be established" in report
