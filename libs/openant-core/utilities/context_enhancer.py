@@ -798,16 +798,26 @@ class ContextEnhancer:
                           unit_id=unit_id,
                           error=error_info.get("message", str(e)),
                           error_type=error_info.get("type", "unknown"))
-                unit["agent_context"] = {
-                    "error": error_info,
-                    # An errored unit has NO verdict. Tagging it "neutral" made the
-                    # exploitable-filter / CSV read the failure as a genuine benign
-                    # result (same masquerade as the agent-degenerate exit); "error"
-                    # is a non-verdict marker the filter never keeps and the CSV
-                    # shows honestly.
-                    "security_classification": "error",
-                    "confidence": 0.0
-                }
+                # #614: a POST-RESULT assembly failure (agent.py's preserve
+                # path marks assembly_error inside the completed context)
+                # must NOT destroy the paid classification — a bare error
+                # dict replaced it (the 12-raise-class data loss). The
+                # exception raised INSIDE agent.run() (an LLM/parse failure)
+                # still takes the error dict (no completed context exists).
+                _preserved = unit.get("agent_context") or {}
+                if _preserved.get("assembly_error"):
+                    unit["agent_context"] = _preserved
+                else:
+                    unit["agent_context"] = {
+                        "error": error_info,
+                        # An errored unit has NO verdict. Tagging it "neutral" made the
+                        # exploitable-filter / CSV read the failure as a genuine benign
+                        # result (same masquerade as the agent-degenerate exit); "error"
+                        # is a non-verdict marker the filter never keeps and the CSV
+                        # shows honestly.
+                        "security_classification": "error",
+                        "confidence": 0.0
+                    }
 
             unit_elapsed = time.monotonic() - unit_start
             worker = threading.current_thread().name
