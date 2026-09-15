@@ -399,6 +399,38 @@ def build_parser() -> argparse.ArgumentParser:
             "`openant patch --compare-existing-tests`."
         ),
     )
+
+    # --- presentation flags -- identical semantics/precedence to
+    # `openant patch`'s own --verbose/--quiet (see
+    # utilities/autopatcher/progress.py); --json is specific to this
+    # script (openant patch's machine-readable path is its stdout JSON
+    # envelope, unaffected by any of these three).
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Show detailed progress: the repository parser's full "
+            "Phase 1-4 report and per-stage diagnostic telemetry. "
+            "Identical semantics to `openant patch --verbose`."
+        ),
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress human-readable progress narration on stderr.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Print the final summary as one raw JSON object on stdout "
+            "(vulnerability_path, trust_report_path, trace_dir, "
+            "trace_manifest, llm_calls, usage) instead of the default "
+            "human-readable summary -- the machine-readable path for "
+            "scripts/tests. Implies --quiet (no human progress on stderr "
+            "either, for a genuinely clean machine-readable run)."
+        ),
+    )
     return parser
 
 
@@ -430,6 +462,14 @@ def _new_debug_artifacts(debug_dir: Path, since: float) -> list[str]:
 
 def main(argv: "list[str] | None" = None) -> int:
     args = build_parser().parse_args(argv)
+
+    from utilities.autopatcher import progress
+
+    # --json wins over --verbose/--quiet for progress purposes (a genuinely
+    # clean machine-readable run never has human narration mixed into its
+    # stdout/stderr) -- see progress.configure()'s own quiet-over-verbose
+    # precedence, reused here rather than reimplemented.
+    progress.configure(verbose=args.verbose, quiet=(args.quiet or args.json))
 
     finding_id = args.finding_id
     cve = args.cve
@@ -583,15 +623,39 @@ def main(argv: "list[str] | None" = None) -> int:
     from core import tracking
 
     usage = tracking.get_usage()
+    usage_dict = usage.to_dict()
 
-    print(json.dumps({
-        "vulnerability_path": result.vulnerability_path,
-        "trust_report_path": result.trust_report_path,
-        "trace_dir": str(trace_dir),
-        "trace_manifest": str(manifest_path),
-        "llm_calls": len(tracer.calls),
-        "usage": usage.to_dict(),
-    }, indent=2))
+    if args.json:
+        # Machine-readable path -- byte-for-byte the same shape this
+        # script has always printed here; preserved for scripts/tests that
+        # parse it (see e.g. test_run_traced_wrapper.py).
+        print(json.dumps({
+            "vulnerability_path": result.vulnerability_path,
+            "trust_report_path": result.trust_report_path,
+            "trace_dir": str(trace_dir),
+            "trace_manifest": str(manifest_path),
+            "llm_calls": len(tracer.calls),
+            "usage": usage_dict,
+        }, indent=2))
+    else:
+        # Human path (default): the pipeline's own progress stream already
+        # printed the run header/stage progress/Recommendation banner to
+        # stderr (run_patch/run_patch_cve -> core.patch -> pipeline.run(),
+        # the exact same call graph `openant patch` uses) -- this adds only
+        # the trace-specific facts nothing else in that stream knows about.
+        # Trust Report content itself is never parsed/summarized here (see
+        # core/patch.py's module docstring: it's an opaque artifact).
+        progress.header(
+            "Trace Summary",
+            [
+                ("Vulnerability", result.vulnerability_path),
+                ("Trust Report", result.trust_report_path),
+                ("Trace", str(trace_dir)),
+                ("LLM calls", str(len(tracer.calls))),
+                ("Tokens", f"{usage_dict['total_tokens']:,}"),
+                ("Cost", f"${usage_dict['total_cost_usd']:.2f}"),
+            ],
+        )
     return 0
 
 

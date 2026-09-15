@@ -599,7 +599,21 @@ def cmd_patch(args):
     from core.patch import run_patch, run_patch_cve
     from core.schemas import success, error
     from core.step_report import step_context
+    from utilities.autopatcher import progress
     from utilities.autopatcher.context_budget import ContextBudgetController
+
+    # Presentation only -- configured once, at the very top, before any
+    # pipeline work: --quiet wins over --verbose (see progress.configure's
+    # own docstring), matching the Go CLI's own --quiet/--verbose
+    # precedence. Read by pipeline.py/llm_client.py/the repository parser
+    # as module-global state for the rest of this process -- see
+    # utilities/autopatcher/progress.py's module docstring for why a
+    # global, not a threaded parameter, is the smallest correct design
+    # here.
+    progress.configure(
+        verbose=bool(getattr(args, "verbose", False)),
+        quiet=bool(getattr(args, "quiet", False)),
+    )
 
     finding_id = getattr(args, "finding_id", None)
     cve = getattr(args, "cve", None)
@@ -1694,6 +1708,29 @@ def build_parser() -> argparse.ArgumentParser:
             "reports Not Verified. Adds a new, observability-only Trust "
             "Signal and report section -- does not change the "
             "Recommendation."
+        ),
+    )
+    patch_p.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Show detailed progress: the repository parser's full "
+            "Phase 1-4 report, per-stage diagnostic telemetry (hunk "
+            "repair, relocation, applicability retries, evidence "
+            "acquisition rounds, etc.), and any fatal error's full "
+            "traceback. Default output is a concise, structured summary; "
+            "this adds the underlying detail without changing anything "
+            "that gets decided."
+        ),
+    )
+    patch_p.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress this run's human-readable progress narration on "
+            "stderr entirely (the JSON envelope on stdout is unaffected). "
+            "Set automatically by the Go CLI when its own --quiet or "
+            "--json flag is used; can also be passed directly here."
         ),
     )
     patch_p.set_defaults(func=cmd_patch)

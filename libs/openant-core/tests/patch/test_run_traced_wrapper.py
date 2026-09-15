@@ -245,14 +245,20 @@ class TestTraceHooksHermetic:
         assert manifest["input_type"] == "cve"
 
     def test_final_summary_includes_canonical_usage(self, run_traced, tmp_path, monkeypatch, capsys):
-        """run_traced.py's final JSON summary must surface OpenAnt's
+        """run_traced.py's --json final summary must surface OpenAnt's
         canonical core.tracking.get_usage() -- the same shared TokenTracker
         every other OpenAnt command already reads -- not a fabricated or
         Auto-Patcher-specific number. This only tests that the already-
         correct total is serialized here; recording (call_llm() ->
         get_global_tracker().record_call()) is covered by
         test_llm_client.py's own usage/cost propagation tests, not
-        re-tested here."""
+        re-tested here.
+
+        --json is required here (the machine-readable path -- see
+        progress.py/the terminal-output cleanup): the DEFAULT summary is
+        now a clean human-readable block, not raw JSON on stdout; that
+        default is covered separately by
+        test_default_summary_is_human_readable_not_json below."""
         from utilities.llm_client import get_global_tracker
 
         monkeypatch.setenv("LLM_PROVIDER", "mock")
@@ -265,7 +271,10 @@ class TestTraceHooksHermetic:
         repo_root.mkdir()
         output_dir = tmp_path / "out"
 
-        argv = ["--cve", "CVE-2021-12345", "--repo-root", str(repo_root), "--output", str(output_dir)]
+        argv = [
+            "--cve", "CVE-2021-12345", "--repo-root", str(repo_root), "--output", str(output_dir),
+            "--json",
+        ]
         with _mock_fetch_cve_at_source():
             exit_code = run_traced.main(argv)
 
@@ -280,6 +289,65 @@ class TestTraceHooksHermetic:
                 (1000 / 1_000_000) * 15.0 + (500 / 1_000_000) * 75.0
             ),
         }
+
+    def test_default_summary_is_human_readable_not_json(self, run_traced, tmp_path, monkeypatch, capsys):
+        """Default (no --json): the pipeline's whole human progress stream,
+        including this script's own trace-specific "Trace Summary" close,
+        goes to stderr (same convention as `openant patch` -- progress
+        stays off stdout throughout); stdout stays empty. The raw JSON dict
+        is only ever printed (to stdout) under --json now -- see
+        test_final_summary_includes_canonical_usage."""
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        output_dir = tmp_path / "out"
+
+        argv = ["--cve", "CVE-2021-12345", "--repo-root", str(repo_root), "--output", str(output_dir)]
+        with _mock_fetch_cve_at_source():
+            exit_code = run_traced.main(argv)
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(captured.err)
+        assert "Trace Summary" in captured.err
+        assert "LLM calls" in captured.err
+        assert "Cost" in captured.err
+
+    def test_json_mode_has_no_human_progress_on_stderr(self, run_traced, tmp_path, monkeypatch, capsys):
+        """--json implies quiet (see progress.configure()'s own
+        quiet-over-verbose precedence, and run_traced.py's main(), which
+        passes quiet=(args.quiet or args.json)): a genuinely
+        machine-readable run must produce exactly one JSON object on
+        stdout and NOTHING on stderr -- no run header, no stage progress,
+        no "[pipeline] LLM mode:" line, no Recommendation banner. This is
+        the in-process (run_traced.py) equivalent of `openant patch --json`
+        forwarding --quiet to the Python subprocess (apps/openant-cli/
+        cmd/patch.go's appendPresentationArgs)."""
+        from utilities.autopatcher import progress
+
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        output_dir = tmp_path / "out"
+
+        argv = [
+            "--cve", "CVE-2021-12345", "--repo-root", str(repo_root), "--output", str(output_dir),
+            "--json",
+        ]
+        try:
+            with _mock_fetch_cve_at_source():
+                exit_code = run_traced.main(argv)
+        finally:
+            progress.reset_for_tests()
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        summary = json.loads(captured.out)
+        assert "usage" in summary
+        assert "trust_report_path" in summary
 
 
 class TestDebugArtifactManifest:

@@ -30,6 +30,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def _default_to_mock_and_isolated_config(monkeypatch):
     import utilities.autopatcher.llm_client as llm_client
+    from utilities.autopatcher import progress
     from utilities.llm import empty_config
 
     monkeypatch.setenv("LLM_PROVIDER", "mock")
@@ -39,3 +40,9 @@ def _default_to_mock_and_isolated_config(monkeypatch):
     monkeypatch.setattr(llm_client, "_cached_adapters", {})
     monkeypatch.setattr(llm_client, "_call_metadata", {})
     monkeypatch.setattr(llm_client, "_call_history", {})
+    # progress.py's verbosity/model-announcement state is process-global by
+    # design (mirrors llm_client's own _cached_provider/_cached_model
+    # pattern) -- reset it per test too, or a test that ran earlier in this
+    # same pytest process could leave a later test's "Model" announcement
+    # (or a non-default verbosity level) silently suppressed/altered.
+    progress.reset_for_tests()

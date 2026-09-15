@@ -290,6 +290,86 @@ func TestCveIDPatternRejectsInvalidIDs(t *testing.T) {
 	}
 }
 
+// withPresentationFlags sets the package-level flag vars appendPresentationArgs
+// reads (patchVerbose, quiet, jsonOutput), running fn with them, then
+// restores the prior values -- these are cobra-bound globals shared across
+// the whole cmd package's tests, so tests must not leak them.
+func withPresentationFlags(t *testing.T, verbose, q, j bool, fn func()) {
+	t.Helper()
+	prevVerbose, prevQuiet, prevJSON := patchVerbose, quiet, jsonOutput
+	patchVerbose, quiet, jsonOutput = verbose, q, j
+	t.Cleanup(func() { patchVerbose, quiet, jsonOutput = prevVerbose, prevQuiet, prevJSON })
+	fn()
+}
+
+func TestAppendPresentationArgs_Default(t *testing.T) {
+	withPresentationFlags(t, false, false, false, func() {
+		got := appendPresentationArgs([]string{"patch"})
+		want := []string{"patch"}
+		if len(got) != len(want) || got[0] != want[0] {
+			t.Errorf("argv = %v, want %v (no presentation flags set)", got, want)
+		}
+	})
+}
+
+func TestAppendPresentationArgs_Verbose(t *testing.T) {
+	withPresentationFlags(t, true, false, false, func() {
+		got := appendPresentationArgs([]string{"patch"})
+		want := []string{"patch", "--verbose"}
+		if len(got) != len(want) || got[1] != want[1] {
+			t.Errorf("argv = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestAppendPresentationArgs_QuietForwardsQuiet(t *testing.T) {
+	withPresentationFlags(t, false, true, false, func() {
+		got := appendPresentationArgs([]string{"patch"})
+		want := []string{"patch", "--quiet"}
+		if len(got) != len(want) || got[1] != want[1] {
+			t.Errorf("argv = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestAppendPresentationArgs_JSONImpliesQuiet(t *testing.T) {
+	withPresentationFlags(t, false, false, true, func() {
+		got := appendPresentationArgs([]string{"patch"})
+		want := []string{"patch", "--quiet"}
+		if len(got) != len(want) || got[1] != want[1] {
+			t.Errorf("argv = %v, want %v (--json alone must still forward --quiet)", got, want)
+		}
+	})
+}
+
+func TestAppendPresentationArgs_VerboseAndJSONBothForward(t *testing.T) {
+	// Go never resolves the --verbose/--json precedence itself (Python's
+	// progress.configure() does -- quiet wins there); Go's only job is to
+	// forward both flags whenever both were requested.
+	withPresentationFlags(t, true, false, true, func() {
+		got := appendPresentationArgs([]string{"patch"})
+		want := []string{"patch", "--verbose", "--quiet"}
+		if len(got) != len(want) {
+			t.Fatalf("argv = %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("argv[%d] = %q, want %q (full=%v)", i, got[i], want[i], got)
+			}
+		}
+	})
+}
+
+func TestPatchCmdHasVerboseFlag(t *testing.T) {
+	flag := patchCmd.Flags().Lookup("verbose")
+	if flag == nil {
+		t.Fatal("patchCmd is missing the --verbose flag")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--verbose default should be false, got %q", flag.DefValue)
+	}
+}
+
 func TestPatchCmdHasCVEFlag(t *testing.T) {
 	flag := patchCmd.Flags().Lookup("cve")
 	if flag == nil {

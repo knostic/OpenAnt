@@ -35,6 +35,52 @@ from utilities.prune_telemetry import compute_prune_telemetry
 # Root of openant-core (where parsers/ lives)
 _CORE_ROOT = Path(__file__).parent.parent
 
+# AUTOPATCHER_PARSER_QUIET (additive, opt-in env var -- see
+# parsers/python/parse_repository.py's own module docstring on it) is set
+# only by Auto Patcher (utilities.autopatcher, via core/patch.py), and only
+# outside its own --verbose mode. `openant parse`/`analyze` and standalone
+# CLI use never set it, so their console output is completely unaffected by
+# the checks below -- this module's wrapper-level "[Parser] Running..."/
+# "Auto-detected language:"/"...complete: N units" lines only go quiet for
+# Auto Patcher's own default/quiet runs.
+def _verbose_parser_output() -> bool:
+    return not bool(os.environ.get("AUTOPATCHER_PARSER_QUIET"))
+
+
+# Presentation-only, additive: while active, a parse_repository() call
+# skips its own human-facing "repository analyzed" summary line entirely
+# (currently: the Python path's compact summary -- see
+# parsers/python/parse_repository.py) instead of repeating it. Used by
+# Auto Patcher's Post-Patch Investigation (utilities.autopatcher.
+# pipeline.py), which re-parses an isolated, patched copy of the repository
+# as an internal implementation detail of its own stage -- not a second
+# "repository analyzed" event the terminal should announce. Never affects
+# parsing itself, verbose output (AUTOPATCHER_PARSER_QUIET unset already
+# shows the complete report for every call, suppressed or not), or any
+# return value. A depth counter (not a bool) so nested/re-entrant calls
+# degrade safely rather than one inner call's exit clearing an outer one's
+# suppression.
+_suppress_summary_depth = 0
+
+
+@contextlib.contextmanager
+def suppress_summary_announcement():
+    """See module-level comment above. Usage::
+
+        with suppress_summary_announcement():
+            parse_repository(repo_path, output_dir)
+    """
+    global _suppress_summary_depth
+    _suppress_summary_depth += 1
+    try:
+        yield
+    finally:
+        _suppress_summary_depth -= 1
+
+
+def _summary_announcement_suppressed() -> bool:
+    return _suppress_summary_depth > 0
+
 # JS parser directory (holds its own package.json / node_modules)
 _JS_PARSER_DIR = _CORE_ROOT / "parsers" / "javascript"
 
@@ -158,7 +204,8 @@ def parse_repository(
     # Detect language if auto
     if language == "auto":
         language = detect_language(repo_path)
-        print(f"  Auto-detected language: {language}", file=sys.stderr)
+        if _verbose_parser_output():
+            print(f"  Auto-detected language: {language}", file=sys.stderr)
 
     # Dispatch to the right parser via the registry.
     try:
@@ -605,7 +652,8 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
     The Python parser has a clean `parse_repository()` function that we can
     call directly (it's the best-structured of the three).
     """
-    print("[Parser] Running Python parser...", file=sys.stderr)
+    if _verbose_parser_output():
+        print("[Parser] Running Python parser...", file=sys.stderr)
 
     # Import and call directly — the Python parser is well-structured
     parser_dir = str(_CORE_ROOT / "parsers" / "python")
@@ -621,6 +669,10 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
         "dataset_name": name or Path(repo_path).name,
         "output_dir": output_dir,  # For intermediate files
         "skip_tests": skip_tests,
+        # Presentation-only passthrough -- see suppress_summary_announcement()
+        # above. Never read for anything other than parse_repository.py's
+        # own compact "Repository analyzed" summary line.
+        "suppress_summary": _summary_announcement_suppressed(),
     }
 
     dataset, analyzer_output = _py_parse(repo_path, options)
@@ -634,7 +686,8 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
     write_json(dataset_path, dataset)
     write_json(analyzer_output_path, analyzer_output)
     units_count = len(dataset.get("units", []))
-    print(f"  Python parser complete: {units_count} units", file=sys.stderr)
+    if _verbose_parser_output():
+        print(f"  Python parser complete: {units_count} units", file=sys.stderr)
 
     return ParseResult(
         dataset_path=dataset_path,
@@ -800,7 +853,8 @@ def _parse_via_subprocess(
     if spec.bootstrap == "npm":
         _ensure_js_parser_dependencies()
 
-    print(f"[Parser] Running {language} parser...", file=sys.stderr)
+    if _verbose_parser_output():
+        print(f"[Parser] Running {language} parser...", file=sys.stderr)
 
     parser_script = parser_script_path(language)
 
@@ -838,7 +892,8 @@ def _parse_via_subprocess(
         data = read_json(dataset_path)
         units_count = len(data.get("units", []))
 
-    print(f"  {language} parser complete: {units_count} units", file=sys.stderr)
+    if _verbose_parser_output():
+        print(f"  {language} parser complete: {units_count} units", file=sys.stderr)
 
     return ParseResult(
         dataset_path=dataset_path,

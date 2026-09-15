@@ -94,12 +94,21 @@ class TestPipelineLLMModeLog:
     as a single final JSON envelope (internal/python.Invoke()), so any
     engine progress print()s ported from the standalone Auto Patcher
     project were redirected to stderr during the merge -- see
-    utilities/autopatcher/pipeline.py and llm_client.py."""
+    utilities/autopatcher/pipeline.py and llm_client.py.
+
+    Presentation cleanup, round 2: this line no longer bypasses progress.py
+    -- it's a verbose-only diagnostic now (the run header's own "Model"
+    line, built by core/patch.py from the same resolved provider/model
+    state, is what a human sees by default). Every test below explicitly
+    configures verbose mode; a companion test confirms default/quiet never
+    show it."""
 
     def test_mock_mode_log(self, monkeypatch, capsys):
         import utilities.autopatcher.llm_client as llm_client
+        from utilities.autopatcher import progress
         monkeypatch.setenv("LLM_PROVIDER", "mock")
         monkeypatch.setattr(llm_client, "_cached_provider", None)
+        progress.configure(verbose=True)
         from utilities.autopatcher.pipeline import run
         run("XSS in login form")
         captured = capsys.readouterr()
@@ -108,6 +117,7 @@ class TestPipelineLLMModeLog:
     def test_live_mode_log_has_no_model_name(self, monkeypatch, capsys):
         # With Anthropic configured, the early log should say LIVE with no model.
         import utilities.autopatcher.llm_client as llm_client
+        from utilities.autopatcher import progress
         from utilities.llm import CompletionResult, TextBlock
 
         monkeypatch.setattr(llm_client, "load_config_file", lambda: _anthropic_config("claude-test-model"))
@@ -116,6 +126,7 @@ class TestPipelineLLMModeLog:
         monkeypatch.setattr(llm_client, "_cached_model", {})
         monkeypatch.setattr(llm_client, "_cached_adapters", {})
         monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+        progress.configure(verbose=True)
 
         # Stub out the shared adapter (not the raw SDK) so the test stays
         # offline -- llm_client.py no longer constructs anthropic.Anthropic
@@ -146,6 +157,25 @@ class TestPipelineLLMModeLog:
         # Must not include a specific model name in the early log.
         assert "gpt-4o" not in captured.err.split("[pipeline] LLM mode:")[1].split("\n")[0]
         assert "claude" not in captured.err.split("[pipeline] LLM mode:")[1].split("\n")[0].lower()
+
+    def test_default_mode_never_shows_llm_mode_line(self, monkeypatch, capsys):
+        """Companion to the two verbose-mode tests above: default (and
+        quiet) must never show this diagnostic -- it moved behind
+        progress.verbose(), it wasn't just duplicated."""
+        import utilities.autopatcher.llm_client as llm_client
+        from utilities.autopatcher import progress
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        monkeypatch.setattr(llm_client, "_cached_provider", None)
+        progress.configure()  # default
+        from utilities.autopatcher.pipeline import run
+        run("XSS in login form")
+        assert "[pipeline] LLM mode:" not in capsys.readouterr().err
+
+    @pytest.fixture(autouse=True)
+    def _reset_progress(self):
+        from utilities.autopatcher import progress
+        yield
+        progress.reset_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -3012,15 +3042,20 @@ class TestNoPatchProducedOutcome:
         Recommendation Policy's own "Manual Review Required" catch-all
         (see test_no_manual_review_or_deploy_bottom_line) -- exactly the
         real-world shape of the reported bug. stderr must show
-        NO PATCH PRODUCED instead, never that decision string."""
+        NO PATCH PRODUCED instead, never that decision string.
+
+        Presentation cleanup, round 2: the legacy "[pipeline]
+        Recommendation:" prefix is gone from the default banner (see
+        TestRecommendationBannerHasNoLegacyPrefix below) -- this test now
+        checks only the decision-precedence semantics, not that prefix."""
         from utilities.autopatcher.pipeline import _build_report, PipelineResult
         result = PipelineResult(**self._base_kwargs(tmp_path, patch=""))
         report = _build_report(result)
 
         captured = capsys.readouterr()
-        assert "[pipeline] Recommendation:" in captured.err
         assert "⚫ NO PATCH PRODUCED" in captured.err
         assert "Manual Review Required" not in captured.err
+        assert "MANUAL REVIEW REQUIRED" not in captured.err
         assert "NO PATCH PRODUCED" in report
 
     def test_stderr_precedence_independent_of_recommendation_value(self, tmp_path, monkeypatch, capsys):
@@ -3038,15 +3073,20 @@ class TestNoPatchProducedOutcome:
         report = pl._build_report(result)
 
         captured = capsys.readouterr()
-        assert "[pipeline] Recommendation:" in captured.err
         assert "⚫ NO PATCH PRODUCED" in captured.err
         assert "Do Not Apply" not in captured.err
+        assert "DO NOT APPLY" not in captured.err
         assert "NO PATCH PRODUCED" in report
 
     def test_stderr_normal_patch_recommendation_unchanged(self, tmp_path, capsys):
         """Regression: a real, non-empty patch must still print the normal
         Recommendation Policy decision to stderr, exactly as before this
-        fix -- the fix must only change the no-patch case."""
+        fix -- the fix must only change the no-patch case.
+
+        The default banner uppercases the decision text (a formatting
+        choice -- see pipeline.py's own comment at the banner call site);
+        the underlying decision value itself is unchanged, so this checks
+        for the uppercased form."""
         from utilities.autopatcher.pipeline import _build_report, PipelineResult
         patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 2\n"
         kwargs = self._base_kwargs(tmp_path, patch=patch)
@@ -3057,13 +3097,37 @@ class TestNoPatchProducedOutcome:
         report = _build_report(result)
 
         captured = capsys.readouterr()
-        assert "[pipeline] Recommendation:" in captured.err
         assert "NO PATCH PRODUCED" not in captured.err
         assert "NO PATCH PRODUCED" not in report
         assert any(
             decision in captured.err
-            for decision in ("Deploy After Validation", "Deploy With Caution", "Manual Review Required", "Do Not Apply")
+            for decision in (
+                "DEPLOY AFTER VALIDATION", "DEPLOY WITH CAUTION",
+                "MANUAL REVIEW REQUIRED", "DO NOT APPLY",
+            )
         )
+
+    def test_default_banner_has_no_legacy_prefix_verbose_keeps_it(self, tmp_path, capsys):
+        """The legacy "[pipeline] Recommendation:" prefix is intentionally
+        gone from the default human banner; verbose mode keeps it as
+        historical diagnostic context (see pipeline.py's own comment at
+        the banner call site)."""
+        from utilities.autopatcher import progress
+        from utilities.autopatcher.pipeline import _build_report, PipelineResult
+
+        result = PipelineResult(**self._base_kwargs(tmp_path, patch=""))
+
+        progress.configure()
+        _build_report(result)
+        default_err = capsys.readouterr().err
+        assert "[pipeline] Recommendation:" not in default_err
+        assert "⚫ NO PATCH PRODUCED" in default_err
+
+        progress.configure(verbose=True)
+        _build_report(result)
+        verbose_err = capsys.readouterr().err
+        assert "[pipeline] Recommendation:" in verbose_err
+        progress.reset_for_tests()
 
 
 # ---------------------------------------------------------------------------

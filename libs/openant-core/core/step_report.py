@@ -52,8 +52,23 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
     except Exception as exc:
         report.status = "error"
         report.errors.append(str(exc))
-        print(f"[{step}] ERROR: {exc}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
+        if step == "patch":
+            # Auto Patcher only (this context manager is shared by every
+            # step-based command -- parse/analyze/scan/etc. below keep
+            # their exact prior unconditional-traceback behavior
+            # unchanged): a concise, human-readable failure line by
+            # default, full traceback only under --verbose. The JSON
+            # envelope's `errors` (report.errors, above) is untouched
+            # either way -- this only changes what a human watching the
+            # terminal sees, never core.schemas.error()'s machine-readable
+            # content.
+            from utilities.autopatcher import progress
+            progress.fatal(f"Run failed: {exc}")
+            if progress.is_verbose():
+                traceback.print_exc(file=sys.stderr)
+        else:
+            print(f"[{step}] ERROR: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
         raise
     finally:
         report.duration_seconds = round(time.monotonic() - start, 2)

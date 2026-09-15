@@ -4705,7 +4705,9 @@ class TestPipelineContextOrderingWithSlice:
 
         assert not mock_gen.called
         captured = capsys.readouterr()
-        assert "[pipeline] Recommendation:" in captured.err
+        # Legacy "[pipeline] Recommendation:" prefix is intentionally gone
+        # from the default banner (presentation cleanup, round 2) -- only
+        # the decision-precedence semantics are checked here.
         assert "⚫ NO PATCH PRODUCED" in captured.err
         assert "Manual Review Required" not in captured.err
         assert "NO PATCH PRODUCED" in report

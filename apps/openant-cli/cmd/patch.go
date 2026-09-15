@@ -49,6 +49,7 @@ var (
 	patchOutput                  string
 	patchContextBudgetPolicy     string
 	patchMaxContextBudgetWindows int
+	patchVerbose                 bool
 )
 
 func init() {
@@ -65,6 +66,33 @@ func init() {
 		"Context-budget extension policy: ask, always, or never (default: Python's own -- ask if interactive, else never)")
 	patchCmd.Flags().IntVar(&patchMaxContextBudgetWindows, "max-context-budget-windows", 0,
 		"Hard cap on total context-budget windows per acquisition stage (default: Python's own, 10)")
+	// Forwarded to Python as a bare --verbose flag (see appendPresentationArgs
+	// below) -- Python (utilities.autopatcher.progress) is the sole authority
+	// on what verbose mode actually shows.
+	patchCmd.Flags().BoolVar(&patchVerbose, "verbose", false,
+		"Show detailed progress: the repository parser's full report, per-stage diagnostic telemetry, and full error detail on failure")
+}
+
+// appendPresentationArgs forwards this run's presentation flags to the
+// Python `patch` CLI, which owns all actual formatting decisions (see
+// utilities/autopatcher/progress.py) -- Go decides only WHETHER to ask for
+// verbose/quiet, never HOW they're rendered. The root `--quiet`/`-q` flag
+// already suppresses Go's own live echo of Python's stderr
+// (internal/python.Invoke's streamStderr); forwarding `--quiet` here
+// additionally asks Python itself to suppress its own progress output --
+// belt-and-suspenders, and the only way `run_traced.py`-style direct
+// Python callers or a future non-Go caller would get the same behavior.
+// `--json` implies the same Python-side quiet: a genuinely clean
+// machine-readable run must never mix human progress into the subprocess's
+// output, even on a stream Go itself isn't rendering to the terminal.
+func appendPresentationArgs(pyArgs []string) []string {
+	if patchVerbose {
+		pyArgs = append(pyArgs, "--verbose")
+	}
+	if quiet || jsonOutput {
+		pyArgs = append(pyArgs, "--quiet")
+	}
+	return pyArgs
 }
 
 // contextBudgetFlags carries the raw --context-budget-policy /
@@ -174,7 +202,7 @@ func runPatchFinding(args []string, budget contextBudgetFlags) {
 		os.Exit(2)
 	}
 
-	pyArgs := buildPatchPyArgs(pipelineOutputPath, patchFindingID, repoRoot, outputDir, budget)
+	pyArgs := appendPresentationArgs(buildPatchPyArgs(pipelineOutputPath, patchFindingID, repoRoot, outputDir, budget))
 
 	// LLM provider/model selection and credential resolution are entirely
 	// OpenAnt's canonical LLM configuration, resolved by the Python Auto
@@ -232,7 +260,7 @@ func runPatchCVE(args []string, budget contextBudgetFlags) {
 		os.Exit(2)
 	}
 
-	pyArgs := buildPatchCVEPyArgs(patchCVE, repoRoot, outputDir, budget)
+	pyArgs := appendPresentationArgs(buildPatchCVEPyArgs(patchCVE, repoRoot, outputDir, budget))
 
 	// Same deliberate omission as Finding mode -- see runPatchFinding's
 	// matching comment: no Go-side LLM preflight, no extra env forwarded.

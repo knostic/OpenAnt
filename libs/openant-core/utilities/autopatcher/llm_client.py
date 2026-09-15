@@ -49,6 +49,7 @@ import re
 import sys
 from typing import Optional
 
+from . import progress
 from ..model_config import GPT_4O_MINI
 from ..llm_client import get_global_tracker
 from ..llm import (
@@ -102,6 +103,15 @@ _call_history: dict = {}
 # Display names for user-facing messages. Internal `provider` strings stay
 # lowercase ("anthropic", "openai") to match canonical config's convention.
 _DISPLAY_NAME = {"anthropic": "Anthropic", "openai": "OpenAI", "google": "Google"}
+
+
+def display_provider_name(provider: str) -> str:
+    """Human-facing name for a canonical provider key (e.g. "anthropic" ->
+    "Anthropic"). Pure formatting -- reuses the same _DISPLAY_NAME mapping
+    call_llm() itself already used for its per-call announcement; adds no
+    new provider-resolution logic. Used by core/patch.py to build the run
+    header's "Model" line from the already-resolved _cached_provider."""
+    return _DISPLAY_NAME.get(provider, provider)
 
 
 class ModelUnavailableError(RuntimeError):
@@ -648,7 +658,8 @@ def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> s
     provider = _resolve_active_provider()
 
     if provider == "mock":
-        print("Using mock LLM", file=sys.stderr)
+        if progress.claim_model_announcement("mock", "mock"):
+            progress.info(f"Model  {progress.format_provider_model('mock', 'mock')}")
         record = {
             "provider": "mock",
             "model": "mock",
@@ -663,7 +674,19 @@ def call_llm(prompt: str, model: str = GPT_4O_MINI, stage: str = "unknown") -> s
     adapter = _get_or_build_adapter(provider)
     resolved_max_tokens = _resolve_max_tokens()
 
-    print(f"Using {_DISPLAY_NAME.get(provider, provider)} (model: {model_to_use})", file=sys.stderr)
+    # Announce provider/model once per run, not once per call: normal
+    # production runs already announce this in the run header
+    # (core/patch.py, built from this same _cached_provider/_cached_model
+    # state right after _require_llm_provider() resolves it, before
+    # pipeline.run() ever calls here) -- claim_model_announcement() is a
+    # no-op there. A caller that skips the header (tests, replay calling
+    # pipeline.run()/call_llm() directly) still gets exactly one
+    # announcement, on its first real call. No provider fallback/switching
+    # exists in this module (see the "never silently substitute" module
+    # docstring), so this fires once in practice.
+    _display_provider = display_provider_name(provider)
+    if progress.claim_model_announcement(_display_provider, model_to_use):
+        progress.info(f"Model  {progress.format_provider_model(_display_provider, model_to_use)}")
 
     # Preserve Auto Patcher's existing effective prompt exactly: LLMClient.
     # complete() already concatenated system_prompt + user_message into one

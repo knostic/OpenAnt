@@ -44,6 +44,7 @@ See Also:
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -138,85 +139,142 @@ def parse_repository(repo_path: str, options: dict = None) -> tuple:
     skip_tests = options.get('skip_tests', False)
     output_dir = options.get('output_dir')
 
-    print(f"=" * 60, file=sys.stderr)
-    print(f"PYTHON REPOSITORY PARSER", file=sys.stderr)
-    print(f"Repository: {repo_path}", file=sys.stderr)
-    print(f"=" * 60, file=sys.stderr)
+    # AUTOPATCHER_PARSER_QUIET is an opt-in, additive env var -- unset (the
+    # default) preserves this function's full Phase 1-4 console report
+    # byte-for-byte, exactly as every existing caller (openant parse/
+    # analyze, standalone CLI use) already sees it. It is set only by Auto
+    # Patcher (utilities.autopatcher, via core/patch.py), and only outside
+    # its own --verbose mode, to replace this report with one compact
+    # summary line; see core/patch.py's own comment at the call site for
+    # why an env var rather than a new parameter here.
+    _verbose_report = not bool(os.environ.get('AUTOPATCHER_PARSER_QUIET'))
+    # Presentation-only, additive: set by core/parser_adapter.py's
+    # _parse_python() from its own suppress_summary_announcement() context
+    # manager -- when True, even the compact one-line summary below is
+    # skipped (used for Auto Patcher's Post-Patch Investigation, an
+    # internal second parse of an isolated patched copy that should not
+    # re-announce "repository analyzed" to a human watching the terminal).
+    # Never affects the verbose report above, which already shows the
+    # complete output for every call regardless of this flag.
+    _suppress_summary = bool(options.get('suppress_summary'))
+
+    if _verbose_report:
+        print(f"=" * 60, file=sys.stderr)
+        print(f"PYTHON REPOSITORY PARSER", file=sys.stderr)
+        print(f"Repository: {repo_path}", file=sys.stderr)
+        print(f"=" * 60, file=sys.stderr)
 
     # Phase 1: Scan repository
-    print(f"\n[Phase 1] Scanning repository for Python files...", file=sys.stderr)
+    if _verbose_report:
+        print(f"\n[Phase 1] Scanning repository for Python files...", file=sys.stderr)
     scanner = RepositoryScanner(repo_path, {'skip_tests': skip_tests})
     scan_result = scanner.scan()
-    print(f"  Found {scan_result['statistics']['total_files']} Python files", file=sys.stderr)
-    print(f"  Total size: {scan_result['statistics']['total_size_bytes']:,} bytes", file=sys.stderr)
+    if _verbose_report:
+        print(f"  Found {scan_result['statistics']['total_files']} Python files", file=sys.stderr)
+        print(f"  Total size: {scan_result['statistics']['total_size_bytes']:,} bytes", file=sys.stderr)
 
     if output_dir:
         scan_file = Path(output_dir) / 'scan_result.json'
         write_json(scan_file, scan_result)
-        print(f"  Saved: {scan_file}", file=sys.stderr)
+        if _verbose_report:
+            print(f"  Saved: {scan_file}", file=sys.stderr)
 
     # Phase 2: Extract functions
-    print(f"\n[Phase 2] Extracting functions and classes...", file=sys.stderr)
+    if _verbose_report:
+        print(f"\n[Phase 2] Extracting functions and classes...", file=sys.stderr)
     extractor = FunctionExtractor(repo_path)
     extractor_result = extractor.extract_from_scan(scan_result)
-    print(f"  Total functions: {extractor_result['statistics']['total_functions']}", file=sys.stderr)
-    print(f"    Standalone: {extractor_result['statistics']['standalone_functions']}", file=sys.stderr)
-    print(f"    Methods: {extractor_result['statistics']['total_methods']}", file=sys.stderr)
-    print(f"    Module-level: {extractor_result['statistics']['module_level_units']}", file=sys.stderr)
-    print(f"  Total classes: {extractor_result['statistics']['total_classes']}", file=sys.stderr)
+    if _verbose_report:
+        print(f"  Total functions: {extractor_result['statistics']['total_functions']}", file=sys.stderr)
+        print(f"    Standalone: {extractor_result['statistics']['standalone_functions']}", file=sys.stderr)
+        print(f"    Methods: {extractor_result['statistics']['total_methods']}", file=sys.stderr)
+        print(f"    Module-level: {extractor_result['statistics']['module_level_units']}", file=sys.stderr)
+        print(f"  Total classes: {extractor_result['statistics']['total_classes']}", file=sys.stderr)
 
     if output_dir:
         extract_file = Path(output_dir) / 'functions.json'
         write_json(extract_file, extractor_result)
-        print(f"  Saved: {extract_file}", file=sys.stderr)
+        if _verbose_report:
+            print(f"  Saved: {extract_file}", file=sys.stderr)
 
     # Phase 3: Build call graph
-    print(f"\n[Phase 3] Building call graph...", file=sys.stderr)
+    if _verbose_report:
+        print(f"\n[Phase 3] Building call graph...", file=sys.stderr)
     builder = CallGraphBuilder(extractor_result, {'max_depth': max_depth})
     builder.build_call_graph()
     call_graph_result = builder.export()
     stats = call_graph_result['statistics']
-    print(f"  Total edges: {stats['total_edges']}", file=sys.stderr)
-    print(f"  Avg out-degree: {stats['avg_out_degree']}", file=sys.stderr)
-    print(f"  Max out-degree: {stats['max_out_degree']}", file=sys.stderr)
-    print(f"  Isolated functions: {stats['isolated_functions']}", file=sys.stderr)
+    if _verbose_report:
+        print(f"  Total edges: {stats['total_edges']}", file=sys.stderr)
+        print(f"  Avg out-degree: {stats['avg_out_degree']}", file=sys.stderr)
+        print(f"  Max out-degree: {stats['max_out_degree']}", file=sys.stderr)
+        print(f"  Isolated functions: {stats['isolated_functions']}", file=sys.stderr)
 
     if output_dir:
         graph_file = Path(output_dir) / 'call_graph.json'
         write_json(graph_file, call_graph_result)
-        print(f"  Saved: {graph_file}", file=sys.stderr)
+        if _verbose_report:
+            print(f"  Saved: {graph_file}", file=sys.stderr)
 
     # Phase 4: Generate units
-    print(f"\n[Phase 4] Generating analysis units...", file=sys.stderr)
+    if _verbose_report:
+        print(f"\n[Phase 4] Generating analysis units...", file=sys.stderr)
     generator = UnitGenerator(call_graph_result, {
         'max_depth': max_depth,
         'dataset_name': dataset_name,
     })
     dataset = generator.generate_units()
     stats = dataset['statistics']
-    print(f"  Total units: {stats['total_units']}", file=sys.stderr)
-    print(f"  Enhanced units: {stats['units_enhanced']}", file=sys.stderr)
-    print(f"  With upstream deps: {stats['units_with_upstream']}", file=sys.stderr)
-    print(f"  With downstream callers: {stats['units_with_downstream']}", file=sys.stderr)
+    if _verbose_report:
+        print(f"  Total units: {stats['total_units']}", file=sys.stderr)
+        print(f"  Enhanced units: {stats['units_enhanced']}", file=sys.stderr)
+        print(f"  With upstream deps: {stats['units_with_upstream']}", file=sys.stderr)
+        print(f"  With downstream callers: {stats['units_with_downstream']}", file=sys.stderr)
 
-    # Summary by type
-    print(f"\n  By type:", file=sys.stderr)
-    for unit_type, count in sorted(stats['by_type'].items()):
-        print(f"    {unit_type}: {count}", file=sys.stderr)
+        # Summary by type
+        print(f"\n  By type:", file=sys.stderr)
+        for unit_type, count in sorted(stats['by_type'].items()):
+            print(f"    {unit_type}: {count}", file=sys.stderr)
 
     # Generate analyzer output for Stage 2 verification (pass the call graph so the output
     # surfaces top-level callGraph / reverseCallGraph, matching the analyzer_output schema).
     analyzer_output = generate_analyzer_output(extractor_result, call_graph_result)
-    print(f"\n[Stage 2 Support] Generated analyzer output: {len(analyzer_output['functions'])} functions", file=sys.stderr)
+    if _verbose_report:
+        print(f"\n[Stage 2 Support] Generated analyzer output: {len(analyzer_output['functions'])} functions", file=sys.stderr)
 
     if output_dir:
         analyzer_file = Path(output_dir) / 'analyzer_output.json'
         write_json(analyzer_file, analyzer_output)
-        print(f"  Saved: {analyzer_file}", file=sys.stderr)
+        if _verbose_report:
+            print(f"  Saved: {analyzer_file}", file=sys.stderr)
 
-    print(f"\n" + "=" * 60, file=sys.stderr)
-    print(f"PARSING COMPLETE", file=sys.stderr)
-    print(f"=" * 60, file=sys.stderr)
+    if _verbose_report:
+        print(f"\n" + "=" * 60, file=sys.stderr)
+        print(f"PARSING COMPLETE", file=sys.stderr)
+        print(f"=" * 60, file=sys.stderr)
+    elif not _suppress_summary:
+        # Compact replacement for the Phase 1-4 report above -- the exact
+        # counts already computed by Phases 1/2 (language/files/functions/
+        # classes), no new computation. Caller (core/patch.py, via
+        # pipeline.py's Analyze stage) treats this as the one line it
+        # needs; the full report is one --verbose flag away. Language is
+        # hardcoded "Python" rather than threaded in from a caller: this
+        # module IS the Python parser, so it's always correct here with no
+        # new data flow.
+        print(
+            "  ✓ Repository analyzed",
+            file=sys.stderr,
+        )
+        print(
+            f"      Python · {scan_result['statistics']['total_files']} files · "
+            f"{extractor_result['statistics']['total_functions']} functions · "
+            f"{extractor_result['statistics']['total_classes']} classes",
+            file=sys.stderr,
+        )
+    # else: an internal, presentation-suppressed call (e.g. Auto Patcher's
+    # Post-Patch Investigation re-parsing an isolated patched copy) --
+    # nothing is printed at all in default mode; verbose is unaffected
+    # (see _verbose_report branch above).
 
     return dataset, analyzer_output
 

@@ -300,6 +300,37 @@ def _run_engine_and_write_artifacts(
     """
     _require_llm_provider()
 
+    # Run header -- printed once, here, rather than announced per-LLM-call
+    # (see llm_client.call_llm's own "announce once" fallback for callers
+    # that reach it without going through this header first). Provider/
+    # model are already authoritatively resolved by _require_llm_provider()
+    # above (utilities.autopatcher.llm_client._cached_provider/_cached_model)
+    # -- reused here, never re-resolved. Presentation only: no new
+    # provider-resolution logic, no effect on which provider/model is used.
+    from utilities.autopatcher import llm_client as _llm
+    from utilities.autopatcher import progress as _progress
+
+    _header_provider = _llm._cached_provider or "unknown"
+    if _header_provider == "mock":
+        _header_model = "mock"
+    else:
+        _header_model = _llm._cached_model.get(_header_provider, "unknown")
+    _header_provider_display = (
+        "mock" if _header_provider == "mock" else _llm.display_provider_name(_header_provider)
+    )
+    # Claimed here (return value unused) so llm_client's own first live
+    # call -- which checks the same claim -- becomes a no-op; the header
+    # below is this run's one and only announcement in production.
+    _progress.claim_model_announcement(_header_provider_display, _header_model)
+    _progress.header(
+        "OpenAnt Auto Patcher",
+        [
+            ("CVE" if input_type == "cve" else "Finding", artifact_label),
+            ("Repository", repo_root or "-"),
+            ("Model", _progress.format_provider_model(_header_provider_display, _header_model)),
+        ],
+    )
+
     patch_dir = os.path.join(output_dir, "patch")
     os.makedirs(patch_dir, exist_ok=True)
 
@@ -317,7 +348,6 @@ def _run_engine_and_write_artifacts(
     with open(vulnerability_path, "w", encoding="utf-8") as f:
         f.write(vulnerability_text)
 
-    from utilities.autopatcher import llm_client as _llm
     from utilities.autopatcher import run_metadata as _rm
     from utilities.autopatcher.pipeline import run as _run_pipeline
 
@@ -341,15 +371,34 @@ def _run_engine_and_write_artifacts(
         os.makedirs(investigation_dir, exist_ok=True)
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
-    report_body = _run_pipeline(
-        vulnerability_text=vulnerability_text,
-        api_key=api_key,
-        repo_root=repo_root,
-        investigation_output_dir=investigation_dir,
-        budget_controller=budget_controller,
-        compare_existing_tests=compare_existing_tests,
-        execution_recorder=execution_recorder,
-    )
+
+    # Presentation only: outside verbose mode, ask the repository parser
+    # (parsers/python/parse_repository.py) to skip its own multi-line
+    # "PYTHON REPOSITORY PARSER" / "[Phase 1-4]" console report and print a
+    # one-line summary instead. An env var, not a parameter, so this stays
+    # entirely opt-in from the Auto Patcher side -- `openant parse`/
+    # `analyze` (which also call into this same parser) never set it and
+    # are completely unaffected; saved/restored exactly like run_traced.py
+    # already does for AUTOPATCHER_DEBUG, so a caller's own environment is
+    # never permanently mutated.
+    _prev_parser_quiet = os.environ.get("AUTOPATCHER_PARSER_QUIET")
+    if not _progress.is_verbose():
+        os.environ["AUTOPATCHER_PARSER_QUIET"] = "1"
+    try:
+        report_body = _run_pipeline(
+            vulnerability_text=vulnerability_text,
+            api_key=api_key,
+            repo_root=repo_root,
+            investigation_output_dir=investigation_dir,
+            budget_controller=budget_controller,
+            compare_existing_tests=compare_existing_tests,
+            execution_recorder=execution_recorder,
+        )
+    finally:
+        if _prev_parser_quiet is None:
+            os.environ.pop("AUTOPATCHER_PARSER_QUIET", None)
+        else:
+            os.environ["AUTOPATCHER_PARSER_QUIET"] = _prev_parser_quiet
 
     # The provider is already authoritatively resolved by this point --
     # _require_llm_provider() (above) ran the canonical resolver before any

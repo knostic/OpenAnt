@@ -13,6 +13,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import progress
 from .confidence_scorer import score_confidence
 from .finding_calibration import calibrate_findings
 from .llm_client import LLMClient, ModelUnavailableError
@@ -3293,6 +3294,7 @@ def _build_report(result: PipelineResult) -> str:
     # count alone.
     known_findings = _build_known_findings(classified_challenger, result.finding_calibration)
     calibrated_defect_count = len(known_findings["potential_remaining_risks"])
+    progress.stage(5, 5, "Decide")
     signals = _compute_trust_signals(
         result.hygiene,
         result.applicability,
@@ -3324,6 +3326,7 @@ def _build_report(result: PipelineResult) -> str:
     signals["existing_test_comparison"] = classify_existing_test_comparison_signal(
         result.existing_test_comparison
     )
+    progress.success("Trust signals evaluated")
     trust_rec = _build_recommendation_v1(
         signals,
         still_vulnerable=classified_challenger.get("still_vulnerable", False),
@@ -3338,10 +3341,26 @@ def _build_report(result: PipelineResult) -> str:
     # Review Required / Deploy / Do Not Apply bottom line for a run that
     # produced no final candidate patch, matching what the report itself
     # already renders in that case.
+    #
+    # Presentation (release polish, round 2): the legacy "[pipeline]
+    # Recommendation:" prefix is intentionally gone from the default
+    # human-facing banner -- a bare bordered decision line is the whole
+    # point of the closing block, not a debug-log-style prefix. Decision
+    # text itself is unchanged (still `trust_rec['decision']`/"NO PATCH
+    # PRODUCED" verbatim, just uppercased for the banner -- a formatting
+    # choice, not a new value); the emoji->decision mapping is untouched.
+    # The old two-line "[pipeline] Recommendation:\n{emoji} {decision}"
+    # form still exists, verbose-only, for anyone grepping historical
+    # scripts/logs.
     if no_patch:
-        print("[pipeline] Recommendation:\n⚫ NO PATCH PRODUCED", file=sys.stderr)
+        _decision_line = "⚫ NO PATCH PRODUCED"
     else:
-        print(f"[pipeline] Recommendation:\n{_DECISION_CARD_EMOJI.get(trust_rec['decision'], '⚪')} {trust_rec['decision']}", file=sys.stderr)
+        _decision_line = f"{_DECISION_CARD_EMOJI.get(trust_rec['decision'], '⚪')} {trust_rec['decision'].upper()}"
+    progress.banner([_decision_line])
+    progress.verbose(
+        f"[pipeline] Recommendation:\n"
+        f"{'⚫ NO PATCH PRODUCED' if no_patch else _DECISION_CARD_EMOJI.get(trust_rec['decision'], '⚪') + ' ' + trust_rec['decision']}"
+    )
     security_gain = _extract_security_gain(review_sections.get("explanation", ""))
     # known_findings already computed above (calibration-aware, feeds signals/trust_rec).
     # Gate the Trust Signals table's forward pointer on the same finding
@@ -4115,10 +4134,9 @@ def _run_planner_claim_verification(
         llm,
         mode=mode,
     )
-    print(
+    progress.verbose(
         f"[pipeline] Planner Claim Verifier (v1, mode={mode}): status={verifier_v1.status} "
-        f"failure_kind={verifier_v1.failure_kind}",
-        file=sys.stderr,
+        f"failure_kind={verifier_v1.failure_kind}"
     )
 
     result = {
@@ -4187,7 +4205,7 @@ def _run_planner_claim_verification(
         except ModelUnavailableError:
             raise
         except Exception as exc:
-            print(f"[pipeline] Planner revision unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+            progress.verbose(f"[pipeline] Planner revision unavailable: {type(exc).__name__}: {exc}")
             revised_plan_result = None
 
         if revised_plan_result is None or not revised_plan_result.rendered:
@@ -4235,7 +4253,7 @@ def _run_planner_claim_verification(
                 revised_plan_result, repo_root, vulnerability_text, investigation_context,
             )
         except Exception as exc:
-            print(f"[pipeline] Revised Planner evidence unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+            progress.verbose(f"[pipeline] Revised Planner evidence unavailable: {type(exc).__name__}: {exc}")
             revised_evidence_ctx = ""
         result["revised_planner_evidence_ctx"] = revised_evidence_ctx
 
@@ -4250,10 +4268,9 @@ def _run_planner_claim_verification(
             mode=_v2_mode,
             stage=_PLAN_REVERIFICATION_STAGE,
         )
-        print(
+        progress.verbose(
             f"[pipeline] Planner Claim Verifier (v2, post-revision, mode={_v2_mode}): "
-            f"status={verifier_v2.status} failure_kind={verifier_v2.failure_kind}",
-            file=sys.stderr,
+            f"status={verifier_v2.status} failure_kind={verifier_v2.failure_kind}"
         )
         result["verifier_v2"] = verifier_v2
 
@@ -4289,11 +4306,8 @@ def _run_planner_claim_verification(
         # contradiction is already established, and it must not be cleared
         # by accident. No second attempt of anything -- this returns
         # immediately, it does not retry the revision or the verification.
-        print(
-            f"[pipeline] Planner Claim Verifier: internal failure while attempting to "
-            f"clear an already-established contradiction: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
+        progress.verbose(f"[pipeline] Planner Claim Verifier: internal failure while attempting to "
+            f"clear an already-established contradiction: {type(exc).__name__}: {exc}")
         result["authoritative"] = "none"
         result["forced_skip"] = True
         result["skip_reason"] = (
@@ -4586,12 +4600,9 @@ def _generate_patch_with_contract_check(
     if result.status != "contract_violation":
         return result.diff, result.status, 1
 
-    print(
-        f"[pipeline] Patch Generator response violated the output contract "
+    progress.verbose(f"[pipeline] Patch Generator response violated the output contract "
         f"({result.block_count} candidate diff block(s) and/or surrounding prose) "
-        "— retrying once with an explicit contract reminder …",
-        file=sys.stderr,
-    )
+        "— retrying once with an explicit contract reminder …")
     combined_hint = (retry_hint + "\n\n" if retry_hint else "") + _CONTRACT_VIOLATION_RETRY_HINT
     retry_raw = generate_patch_raw(
         vulnerability_text, llm, code_context=code_context, retry_hint=combined_hint,
@@ -4599,7 +4610,7 @@ def _generate_patch_with_contract_check(
     )
     retry_result = classify_patch_response(retry_raw)
     if retry_result.status == "valid":
-        print("[pipeline] Contract-violation retry succeeded — single valid diff produced.", file=sys.stderr)
+        progress.verbose("[pipeline] Contract-violation retry succeeded — single valid diff produced.")
         return retry_result.diff, retry_result.status, 2
 
     # Anything other than "valid" after the one bounded retry fails closed
@@ -4610,11 +4621,8 @@ def _generate_patch_with_contract_check(
     # original"/"skip validation" partly by checking `patch` truthiness,
     # not only `final_status` — so `diff` must actually BE "" here, not
     # merely be labelled non-"valid").
-    print(
-        f"[pipeline] Contract-violation retry still invalid (status={retry_result.status}) "
-        "— failing closed.",
-        file=sys.stderr,
-    )
+    progress.verbose(f"[pipeline] Contract-violation retry still invalid (status={retry_result.status}) "
+        "— failing closed.")
     return "", retry_result.status, 2
 
 
@@ -4640,7 +4648,7 @@ def _load_experiment_plan(vulnerability_text: str) -> str:
         return ""
     try:
         text = plan_path.read_text(encoding="utf-8")
-        print(f"[pipeline] Phase E plan loaded for {m.group(0)} ({len(text)} chars).", file=sys.stderr)
+        progress.verbose(f"[pipeline] Phase E plan loaded for {m.group(0)} ({len(text)} chars).")
         return text
     except Exception:
         return ""
@@ -4737,13 +4745,13 @@ def _run_patch_generation_and_investigation(
     """
     _patch_validation_skip_reason: str | None = None
     _patch_generation_status: str | None = None  # set only when generation actually ran
+    progress.stage(3, 5, "Generate")
     if _skip_patch_generation:
         _skip_reason_text = _skip_patch_generation_reason or "no verified final-target source"
-        print(f"[pipeline] Step 1/4 – Patch Generation skipped ({_skip_reason_text}).", file=sys.stderr)
+        progress.skipped("Patch generation skipped", reason=_skip_reason_text)
         patch = ""
         _patch_validation_skip_reason = _skip_reason_text
     else:
-        print("[pipeline] Step 1/4 – Generating patch …", file=sys.stderr)
         patch, _patch_generation_status, _patch_generation_llm_calls = _generate_patch_with_contract_check(
             vulnerability_text, llm, code_context=code_context,
         )
@@ -4760,11 +4768,10 @@ def _run_patch_generation_and_investigation(
                 f"Patch Generator response invalid (status={_patch_generation_status}) "
                 f"after bounded contract regeneration ({_patch_generation_llm_calls} call(s))"
             )
-            print(
-                f"[pipeline] Step 1/4 – {_patch_validation_skip_reason} — "
-                "treating as no patch produced; skipping hunk repair/hygiene/applicability.",
-                file=sys.stderr,
-            )
+            progress.warning("Patch generation failed validation")
+            progress.verbose(f"[pipeline] Step 1/4 – {_patch_validation_skip_reason}")
+        else:
+            progress.success("Patch generated")
 
     # Hunk header repair — recompute @@ counts from body, and (with repo_root)
     # relocate a drifted old-side line number by content; never blocks the pipeline
@@ -4782,12 +4789,10 @@ def _run_patch_generation_and_investigation(
             patch, _repair_meta = repair_hunk_headers(patch, repo_root=repo_root)
             _final_repair_meta = _repair_meta
             if _repair_meta.normalization_applied:
-                print(
-                    f"[pipeline] Hunk headers repaired: "
+                progress.verbose(f"[pipeline] Hunk headers repaired: "
                     f"{_repair_meta.hunks_rewritten} hunk(s) in "
                     f"{_repair_meta.files_rewritten} file(s)"
-                    f" ({_repair_meta.hunks_relocated} relocated by content)"
-                , file=sys.stderr)
+                    f" ({_repair_meta.hunks_relocated} relocated by content)")
         except Exception:
             pass
 
@@ -4802,7 +4807,7 @@ def _run_patch_generation_and_investigation(
     try:
         from .relocation_telemetry import build_relocation_telemetry, summarize as _summarize_relocation
         _relocation_telemetry = build_relocation_telemetry(_raw_patch_for_telemetry, repo_root)
-        print(f"[pipeline] Relocation telemetry: {_summarize_relocation(_relocation_telemetry)}", file=sys.stderr)
+        progress.verbose(f"[pipeline] Relocation telemetry: {_summarize_relocation(_relocation_telemetry)}")
         if os.environ.get("AUTOPATCHER_DEBUG") and _relocation_telemetry is not None:
             import datetime as _dt
             import json as _json
@@ -4813,7 +4818,7 @@ def _run_patch_generation_and_investigation(
                 _json.dumps(_relocation_telemetry.to_dict(), indent=2), encoding="utf-8"
             )
     except Exception as exc:
-        print(f"[pipeline] Relocation telemetry unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+        progress.verbose(f"[pipeline] Relocation telemetry unavailable: {type(exc).__name__}: {exc}")
 
     # Slice 4 -- Patch Target Conformance Gate + Post-Patch Recovery: the
     # final deterministic gate, catching a generated patch that edits a
@@ -4857,12 +4862,14 @@ def _run_patch_generation_and_investigation(
                 _edit_readiness.ready_edits, _slice_result,
             )
             _recovery_reasons = post_patch_recovery_trigger_reasons(_patch_target_conformance)
-            print(
-                f"[pipeline] Patch Target Conformance: all_conformant={_patch_target_conformance.all_conformant}, "
+            progress.verbose(f"[pipeline] Patch Target Conformance: all_conformant={_patch_target_conformance.all_conformant}, "
                 f"edited files={_patch_target_conformance.edited_files}"
-                + (f", trigger_reasons={_recovery_reasons}" if _recovery_reasons else ""),
-                file=sys.stderr,
-            )
+                + (f", trigger_reasons={_recovery_reasons}" if _recovery_reasons else ""))
+            if not _recovery_reasons:
+                progress.success(
+                    "Target conformance passed",
+                    detail=f"Files changed: {', '.join(_patch_target_conformance.edited_files)}",
+                )
 
             if _recovery_reasons:
                 _post_patch_recovery = recover_post_patch_source(
@@ -4871,16 +4878,13 @@ def _run_patch_generation_and_investigation(
                     recovery_targets=_recovery_targets,
                     budget_controller=budget_controller,
                 )
-                print(
-                    f"[pipeline] Post-Patch Recovery: targets={[t.file for t in _post_patch_recovery.recovery_targets]}, "
+                progress.verbose(f"[pipeline] Post-Patch Recovery: targets={[t.file for t in _post_patch_recovery.recovery_targets]}, "
                     f"ready_for_regeneration={_post_patch_recovery.ready_for_regeneration}"
                     + (f", failure_reason={_post_patch_recovery.failure_reason}"
-                       if _post_patch_recovery.failure_reason else ""),
-                    file=sys.stderr,
-                )
+                       if _post_patch_recovery.failure_reason else ""))
 
                 if not _post_patch_recovery.ready_for_regeneration:
-                    print("[pipeline] Post-Patch Recovery: insufficient recovered evidence — failing closed.", file=sys.stderr)
+                    progress.warning("Evidence recovery insufficient — patch withdrawn")
                     patch = ""
                 else:
                     _recovery_hint = build_post_patch_recovery_hint(_patch_target_conformance, _post_patch_recovery, patch)
@@ -4910,10 +4914,7 @@ def _run_patch_generation_and_investigation(
                         _regenerated_raw = ""
 
                     if not _regenerated_raw or not _regenerated_raw.strip():
-                        print(
-                            "[pipeline] Post-Patch Recovery: regeneration produced an empty/malformed "
-                            "patch — failing closed.", file=sys.stderr,
-                        )
+                        progress.warning("Patch regeneration produced no usable patch")
                         patch = ""
                     else:
                         from .diff_hunk_repair import repair_hunk_headers as _repair_regenerated
@@ -4959,25 +4960,20 @@ def _run_patch_generation_and_investigation(
                         )
                         _regenerated_patch_target_conformance = _regen_conformance
                         _regen_ok = _regen_conformance.all_conformant and not _regen_conformance.unexpected_files
-                        print(
-                            f"[pipeline] Post-Patch Recovery: regeneration_performed=True, "
+                        progress.verbose(f"[pipeline] Post-Patch Recovery: regeneration_performed=True, "
                             f"regenerated all_conformant={_regen_conformance.all_conformant}, "
-                            f"accepted={_regen_ok}",
-                            file=sys.stderr,
-                        )
+                            f"accepted={_regen_ok}")
                         if _regen_ok:
                             patch = _regenerated_patch
                             _final_repair_meta = _regen_meta
                             _slice_result = _post_patch_recovery.slice_result
                             _patch_target_conformance = _regen_conformance
+                            progress.recovery("Patch regenerated to match approved target")
                         else:
-                            print(
-                                "[pipeline] Post-Patch Recovery: regenerated patch still fails target "
-                                "conformance — failing closed.", file=sys.stderr,
-                            )
+                            progress.warning("Regenerated patch still fails target conformance")
                             patch = ""
         except Exception as exc:
-            print(f"[pipeline] Patch Target Conformance unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+            progress.verbose(f"[pipeline] Patch Target Conformance unavailable: {type(exc).__name__}: {exc}")
 
     if os.environ.get("AUTOPATCHER_DEBUG"):
         try:
@@ -5096,27 +5092,23 @@ def _run_patch_generation_and_investigation(
         applicability_result = _processed.applicability_result
         _context_expansion = _processed.context_expansion
         if _processed.empty_hunks_removed:
-            print(
-                f"[pipeline] Deterministic repair removed {_processed.empty_hunks_removed} "
-                f"zero-change hunk(s) — applicable={applicability_result.get('applicable')}",
-                file=sys.stderr,
-            )
+            progress.verbose(f"[pipeline] Deterministic repair removed {_processed.empty_hunks_removed} "
+                f"zero-change hunk(s) — applicable={applicability_result.get('applicable')}")
         if _context_expansion is not None:
             if _context_expansion.succeeded:
-                print(
+                progress.recovery("Patch context reconstructed")
+                progress.verbose(
                     f"[pipeline] Deterministic context reconstruction succeeded: "
                     f"{_context_expansion.hunks_expanded} hunk(s) expanded, "
                     f"{_context_expansion.hunks_unchanged} already sufficient "
-                    f"— applicable={applicability_result.get('applicable')}",
-                    file=sys.stderr,
+                    f"— applicable={applicability_result.get('applicable')}"
                 )
             else:
-                print(
-                    f"[pipeline] Deterministic context reconstruction did not apply "
+                progress.verbose(f"[pipeline] Deterministic context reconstruction did not apply "
                     f"(reason={_context_expansion.skipped_reason}) — "
-                    f"falling through to applicability-aware retry.",
-                    file=sys.stderr,
-                )
+                    f"falling through to applicability-aware retry.")
+        if applicability_result.get("applicable") is True:
+            progress.success("Patch applicable")
 
     # Applicability-aware retry — triggered only on applicable=False with a known repo_root
     original_patch = patch
@@ -5136,7 +5128,8 @@ def _run_patch_generation_and_investigation(
 
         if failed_files:
             failed_file = failed_files[0]
-            print(f"[pipeline] Applicability failed — `{failed_file}` did not apply; attempting retry …", file=sys.stderr)
+            progress.recovery("Patch did not apply — attempting recovery")
+            progress.verbose(f"[pipeline] Applicability failed — `{failed_file}` did not apply; attempting retry …")
             retry_failed_file = failed_file
             retry_error_before = stderr
             try:
@@ -5169,12 +5162,9 @@ def _run_patch_generation_and_investigation(
                         omitted_files.append(f)
 
                 if not included_real_content:
-                    print(
-                        f"[pipeline] Retry skipped — no real content for the failed "
+                    progress.verbose(f"[pipeline] Retry skipped — no real content for the failed "
                         f"file(s) ({', '.join(failed_files)}) could be included "
-                        f"(missing, unreadable, or over the {_RETRY_CONTENT_LIMIT}-character budget).",
-                        file=sys.stderr,
-                    )
+                        f"(missing, unreadable, or over the {_RETRY_CONTENT_LIMIT}-character budget).")
                 else:
                     actual_content = "\n".join(blocks)
                     if omitted_files:
@@ -5204,13 +5194,10 @@ def _run_patch_generation_and_investigation(
                     )
                     if not r_patch_raw or not r_patch_raw.strip():
                         if r_status in ("malformed_fence", "contract_violation"):
-                            print(
-                                f"[pipeline] Retry's Patch Generator response was invalid "
-                                f"(status={r_status}, {r_llm_calls} call(s)) — keeping original.",
-                                file=sys.stderr,
-                            )
+                            progress.verbose(f"[pipeline] Retry's Patch Generator response was invalid "
+                                f"(status={r_status}, {r_llm_calls} call(s)) — keeping original.")
                         else:
-                            print("[pipeline] Retry produced an empty patch; keeping original.", file=sys.stderr)
+                            progress.warning("Applicability retry produced no usable patch")
                     else:
                         # Shared generated-diff mechanics (repair_hunk_headers ->
                         # check_patch -> check_applicability) -- see
@@ -5247,20 +5234,15 @@ def _run_patch_generation_and_investigation(
                                 applicability_result = r_app
                                 if _r_repair_meta is not None:
                                     _final_repair_meta = _r_repair_meta
-                                print("[pipeline] Retry succeeded — patch applies cleanly.", file=sys.stderr)
+                                progress.success("Patch applicable")
                             else:
-                                print(
-                                    "[pipeline] Retry applied but changed semantic edits in a "
-                                    "file it was not asked to repair — rejecting, keeping "
-                                    "original patch.",
-                                    file=sys.stderr,
-                                )
+                                progress.warning("Applicability retry rejected — modified unrelated file")
                         else:
-                            print("[pipeline] Retry did not apply; keeping original patch.", file=sys.stderr)
+                            progress.warning("Patch does not apply to target file")
             except Exception as exc:
-                print(f"[pipeline] Retry failed unexpectedly: {exc}", file=sys.stderr)
+                progress.verbose(f"[pipeline] Retry failed unexpectedly: {exc}")
         else:
-            print("[pipeline] Applicability failed — target file not identified; retry skipped.", file=sys.stderr)
+            progress.verbose("[pipeline] Applicability failed — target file not identified; retry skipped.")
 
     # Post-Patch Vulnerability Investigation: re-evaluate the pre-patch
     # Anchors against an isolated, patched copy of repo_root. Runs once,
@@ -5287,6 +5269,7 @@ def _run_patch_generation_and_investigation(
             from .patch_applicability import apply_patch
             from .candidate_enrichment import build_investigation_context
             from .post_patch_evaluation import compute_coverage, derive_patch_touched_anchors, evaluate_anchors
+            from core.parser_adapter import suppress_summary_announcement
 
             _investigated_patch = patch
             _resolved_repo_root = Path(repo_root).resolve()
@@ -5307,7 +5290,15 @@ def _run_patch_generation_and_investigation(
                 _post_patch_context = None
                 if _apply_result.applied:
                     _investigation_output_dir = _workspace_root.parent / "investigation"
-                    _post_patch_context = build_investigation_context(_workspace_root, _investigation_output_dir)
+                    # Presentation only: this is an internal re-parse of an
+                    # isolated patched copy, not a second user-facing
+                    # "repository analyzed" event -- see
+                    # core/parser_adapter.suppress_summary_announcement's
+                    # own docstring. Never affects parsing, evidence, or
+                    # what gets investigated -- only whether the parser
+                    # re-announces itself in default-mode terminal output.
+                    with suppress_summary_announcement():
+                        _post_patch_context = build_investigation_context(_workspace_root, _investigation_output_dir)
                 _post_patch_observations = evaluate_anchors(_all_anchors, _post_patch_context)
                 # Coverage Analysis reuses the PRE-patch InvestigationContext (the
                 # diff's context/removed lines describe that state) and the same
@@ -5320,16 +5311,16 @@ def _run_patch_generation_and_investigation(
                 )
                 _post_patch_ctx = render_post_patch_investigation(_post_patch_observations, _post_patch_coverage)
             if _post_patch_ctx:
-                print(
+                progress.success("Post-patch analysis completed")
+                progress.verbose(
                     f"[pipeline] Post-Patch Investigation rendered "
-                    f"({len(_post_patch_ctx)} chars).",
-                    file=sys.stderr,
+                    f"({len(_post_patch_ctx)} chars)."
                 )
         except Exception as exc:
-            print(
+            progress.warning("Post-patch analysis unavailable")
+            progress.verbose(
                 f"[pipeline] Post-Patch Investigation unavailable: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
+                f"{type(exc).__name__}: {exc}"
             )
             _post_patch_observations = None
             _post_patch_coverage = None
@@ -5438,7 +5429,8 @@ def _run_patch_repair_and_calibration(
                 code_context=(challenger_context if _post_patch_evidence_current_v1 else code_context),
             )
         except Exception as _exc:
-            print(f"[pipeline] Finding calibration (v1) failed (non-fatal): {_exc}", file=sys.stderr)
+            progress.warning("Finding calibration unavailable")
+            progress.verbose(f"[pipeline] Finding calibration (v1) failed (non-fatal): {_exc}")
         _known_findings_v1 = _build_known_findings(_repair_classified, _calibration_v1)
         # This IS the final calibration unless repair is both authorized
         # and later accepted below (see accept_repair branch, which
@@ -5462,11 +5454,9 @@ def _run_patch_repair_and_calibration(
                     )
                     if f["category"] in _REPAIR_ELIGIBLE_CATEGORIES
                 ]
-                print(
-                    f"[pipeline] Repair loop – should_auto_repair authorized on "
+                progress.verbose(f"[pipeline] Repair loop – should_auto_repair authorized on "
                     f"{len(_confirmed_texts)} raw repair-eligible finding(s) "
-                    "(confirmed_defect and/or behavioral_defect); attempting one repair …"
-                , file=sys.stderr)
+                    "(confirmed_defect and/or behavioral_defect); attempting one repair …")
                 _r_hint = _build_repair_hint(_confirmed_texts)
                 _r_raw = generate_patch(
                     vulnerability_text, llm,
@@ -5519,7 +5509,8 @@ def _run_patch_repair_and_calibration(
                                 code_context=code_context,
                             )
                     except Exception as _exc:
-                        print(f"[pipeline] Finding calibration (v2) failed (non-fatal): {_exc}", file=sys.stderr)
+                        progress.warning("Finding calibration unavailable")
+                        progress.verbose(f"[pipeline] Finding calibration (v2) failed (non-fatal): {_exc}")
                     _known_findings_v2 = _build_known_findings(_r_classified, _calibration_v2)
 
                     if accept_repair(
@@ -5534,29 +5525,33 @@ def _run_patch_repair_and_calibration(
                         finding_calibration = _calibration_v2
                         if _repair_loop_meta is not None:
                             _final_repair_meta = _repair_loop_meta
-                        print(
+                        progress.recovery("Patch repaired and re-verified")
+                        progress.verbose(
                             "[pipeline] Repair succeeded – 0 calibration-confirmed "
-                            "issue(s) after re-challenge.", file=sys.stderr
+                            "issue(s) after re-challenge."
                         )
                     elif _r_classified.get("still_vulnerable") and not (
                         _repair_classified.get("still_vulnerable") is True
                     ):
-                        print(
+                        progress.warning("Patch repair rejected — introduced new risk")
+                        progress.verbose(
                             "[pipeline] Repair rejected – original Challenger reported "
                             "still_vulnerable=False, repair Challenger reports "
-                            "still_vulnerable=True; keeping original.", file=sys.stderr,
+                            "still_vulnerable=True; keeping original."
                         )
                     else:
-                        print(
+                        progress.warning("Patch repair rejected — issues remain")
+                        progress.verbose(
                             f"[pipeline] Repair rejected – "
                             f"{len(_known_findings_v2['potential_remaining_risks'])} calibration-confirmed "
                             f"confirmed_defect(s) and/or a calibrated-observed behavioral_defect "
                             "remain; keeping original."
-                        , file=sys.stderr)
+                        )
                 else:
-                    print("[pipeline] Repair patch does not apply; keeping original.", file=sys.stderr)
+                    progress.warning("Patch repair did not apply — keeping original")
             except Exception as exc:
-                print(f"[pipeline] Repair loop failed unexpectedly: {exc}", file=sys.stderr)
+                progress.warning("Patch repair failed unexpectedly")
+                progress.verbose(f"[pipeline] Repair loop failed unexpectedly: {exc}")
 
     # Batch B3: moved here from further below (originally after Existing
     # Test Comparison/deterministic signals) so ALL Stage-6-owned
@@ -5627,7 +5622,8 @@ def _run_patch_repair_and_calibration(
                 )
                 _finding_calibration_source = "fallback"
             except Exception as _exc:
-                print(f"[pipeline] Finding calibration failed (non-fatal): {_exc}", file=sys.stderr)
+                progress.warning("Finding calibration unavailable")
+                progress.verbose(f"[pipeline] Finding calibration failed (non-fatal): {_exc}")
     return locals()
 
 
@@ -5714,9 +5710,9 @@ def _run_repository_analysis_and_remediation_planning(
         _grounding = ground_repository(vulnerability_text, Path(repo_root))
         _repo_code = _grounding.rendered_context
         if _repo_code:
-            print(f"[pipeline] Code context found ({len(_repo_code)} chars); injecting into patch prompt.", file=sys.stderr)
+            progress.verbose(f"[pipeline] Code context found ({len(_repo_code)} chars); injecting into patch prompt.")
         else:
-            print("[pipeline] No code context found in repo; patch will be best-effort.", file=sys.stderr)
+            progress.warning("No repository context found — patch will be best-effort")
 
     # Phase C.5: inject vulnerability class guidance (canonical patterns + sink coverage).
     # Pass _repo_code (not the accumulated context) so sink detection scans only source code.
@@ -5727,7 +5723,7 @@ def _run_repository_analysis_and_remediation_planning(
             vulnerability_text, _repo_code, Path(repo_root) if repo_root else None
         )
         if _pattern_ctx:
-            print(f"[pipeline] Vulnerability class guidance injected ({len(_pattern_ctx)} chars).", file=sys.stderr)
+            progress.verbose(f"[pipeline] Vulnerability class guidance injected ({len(_pattern_ctx)} chars).")
     except Exception:
         pass
 
@@ -5764,19 +5760,29 @@ def _run_repository_analysis_and_remediation_planning(
                 )
                 _repository_understanding_ctx = render_repository_understanding(_repository_understanding)
                 if _repository_understanding_ctx:
-                    print(
+                    if _investigation_context is None:
+                        # No parser ran (no investigation_output_dir was
+                        # given, e.g. a direct library caller) -- this is
+                        # the one positive signal available in that case.
+                        # When the parser DID run, it already printed its
+                        # own richer "Repository analyzed" line (with
+                        # file/function/class counts) from inside
+                        # build_investigation_context() above -- printing
+                        # a second, plainer one here would just duplicate
+                        # it.
+                        progress.success("Repository analyzed")
+                    progress.verbose(
                         f"[pipeline] Repository Understanding rendered "
-                        f"({len(_repository_understanding_ctx)} chars).",
-                        file=sys.stderr,
+                        f"({len(_repository_understanding_ctx)} chars)."
                     )
 
                 from .post_patch_investigation import derive_pre_patch_anchors
                 _pre_patch_anchors = derive_pre_patch_anchors(_repository_understanding)
         except Exception as exc:
-            print(
+            progress.warning("Repository analysis unavailable")
+            progress.verbose(
                 f"[pipeline] Repository Understanding unavailable: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
+                f"{type(exc).__name__}: {exc}"
             )
 
     # Experimental: Remediation Planner. One bounded LLM call that asks the
@@ -5826,7 +5832,8 @@ def _run_repository_analysis_and_remediation_planning(
             _plan_result = generate_remediation_plan(vulnerability_text, llm, code_context=_evidence_so_far)
             _plan_ctx = _plan_result.rendered
             if _plan_ctx:
-                print(f"[pipeline] Remediation plan generated ({len(_plan_ctx)} chars).", file=sys.stderr)
+                progress.success("Remediation plan generated")
+                progress.verbose(f"[pipeline] Remediation plan generated ({len(_plan_ctx)} chars).")
 
             # Deterministic bridge: verify the Planner's proposed files/symbols
             # against the real repository, then run only what verifies through
@@ -5840,13 +5847,10 @@ def _run_repository_analysis_and_remediation_planning(
                     _plan_result, repo_root, vulnerability_text, _investigation_context
                 )
                 if _planner_evidence_ctx:
-                    print(
-                        f"[pipeline] Planner-proposed candidate evidence rendered "
-                        f"({len(_planner_evidence_ctx)} chars).",
-                        file=sys.stderr,
-                    )
+                    progress.verbose(f"[pipeline] Planner-proposed candidate evidence rendered "
+                        f"({len(_planner_evidence_ctx)} chars).")
             except Exception as exc:
-                print(f"[pipeline] Planner candidate evidence unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+                progress.verbose(f"[pipeline] Planner candidate evidence unavailable: {type(exc).__name__}: {exc}")
 
             # Planner Claim Verifier: sits between this Planner call and S2
             # (Remediation Strategy), still owned by this same canonical
@@ -5919,10 +5923,27 @@ def _run_repository_analysis_and_remediation_planning(
                         # result that vouches for it.
                         _active_verifier_result = _verifier_v1
                         _plan_authority_version = "v1"
+
+                    # Presentation only -- reads the SAME `authoritative`/
+                    # `verifier_v1.status` this block already computed above;
+                    # never a second judgment. Default-visible: this is the
+                    # one line a user needs to know whether the Planner's
+                    # claim was independently verified, without the raw
+                    # status=/failure_kind= diagnostic (see progress.verbose
+                    # calls at the verifier call sites for that detail).
+                    if _verification["authoritative"] == "v2":
+                        progress.recovery("Plan revised and re-verified")
+                    elif _verification["authoritative"] == "none":
+                        progress.warning("Plan verification unresolved")
+                    elif _verifier_v1.status == "SUPPORTED":
+                        progress.success("Plan verified")
+                    else:
+                        progress.warning("Plan verification unresolved")
                 except ModelUnavailableError:
                     raise
                 except Exception as exc:
-                    print(f"[pipeline] Planner Claim Verifier unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+                    progress.warning("Plan verification failed unexpectedly")
+                    progress.verbose(f"[pipeline] Planner Claim Verifier unavailable: {type(exc).__name__}: {exc}")
         except ModelUnavailableError:
             # An explicit execution/configuration decision (non-interactive
             # rejection, or a declined/cancelled interactive reselection),
@@ -5930,7 +5951,8 @@ def _run_repository_analysis_and_remediation_planning(
             # run, not degrade to "no plan" like every other failure here.
             raise
         except Exception as exc:
-            print(f"[pipeline] Remediation planning unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+            progress.warning("Remediation planning unavailable")
+            progress.verbose(f"[pipeline] Remediation planning unavailable: {type(exc).__name__}: {exc}")
     return locals()
 
 
@@ -5993,18 +6015,14 @@ def _run_guided_context_acquisition(
             _slice_ctx = _slice_result.rendered
             _coverage_warning_ctx = _slice_result.warning_text
             if _slice_ctx:
-                print(
-                    f"[pipeline] Final-Target Remediation Slice built "
+                progress.verbose(f"[pipeline] Final-Target Remediation Slice built "
                     f"({len(_slice_ctx)} chars); covered files={_slice_result.covered_target_files}, "
-                    f"covered symbols={_slice_result.covered_target_symbols}.",
-                    file=sys.stderr,
-                )
+                    f"covered symbols={_slice_result.covered_target_symbols}.")
             if not _slice_result.coverage_complete:
-                print(
+                progress.verbose(
                     f"[pipeline] Final-target source coverage incomplete -- "
                     f"uncovered files={_slice_result.uncovered_target_files}, "
-                    f"uncovered symbols={_slice_result.uncovered_target_symbols}.",
-                    file=sys.stderr,
+                    f"uncovered symbols={_slice_result.uncovered_target_symbols}."
                 )
 
             # Edit Readiness Gate (Slice 1) -- replaces the coarse
@@ -6015,15 +6033,12 @@ def _run_guided_context_acquisition(
             from .remediation_planner import build_intended_edits, check_edit_readiness
             _intended_edits = build_intended_edits(_strategy_result, _slice_result)
             _initial_edit_readiness = check_edit_readiness(_intended_edits, _slice_result)
-            print(
-                f"[pipeline] Edit Readiness Gate: strategy_ready={_initial_edit_readiness.strategy_ready}, "
+            progress.verbose(f"[pipeline] Edit Readiness Gate: strategy_ready={_initial_edit_readiness.strategy_ready}, "
                 f"edit_source_ready={_initial_edit_readiness.edit_source_ready}, "
                 f"{len(_initial_edit_readiness.ready_edits)}/{len(_initial_edit_readiness.intended_edits)} "
                 f"intended edit(s) ready"
                 + (f", failure_reasons={_initial_edit_readiness.failure_reasons}"
-                   if _initial_edit_readiness.unready_edits else ""),
-                file=sys.stderr,
-            )
+                   if _initial_edit_readiness.unready_edits else ""))
 
             # Slice 2 -- Deterministic Pre-Patch Retrieval: attempt
             # additional verified repository source for whatever is still
@@ -6046,23 +6061,17 @@ def _run_guided_context_acquisition(
                         _slice_ctx = _slice_result.rendered
                         _coverage_warning_ctx = _slice_result.warning_text
                         _edit_readiness = check_edit_readiness(_intended_edits, _slice_result)
-                        print(
-                            f"[pipeline] Deterministic Pre-Patch Retrieval: "
+                        progress.verbose(f"[pipeline] Deterministic Pre-Patch Retrieval: "
                             f"{_edit_acquisition.rounds_used} round(s), "
                             f"{len(_edit_acquisition.attempts)} attempt(s); "
                             f"edit_source_ready now={_edit_readiness.edit_source_ready} "
                             f"({len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)} "
                             f"intended edit(s) ready)"
                             + (f", failure_reasons={_edit_readiness.failure_reasons}"
-                               if _edit_readiness.unready_edits else ""),
-                            file=sys.stderr,
-                        )
+                               if _edit_readiness.unready_edits else ""))
                 except Exception as exc:
-                    print(
-                        f"[pipeline] Deterministic Pre-Patch Retrieval unavailable: "
-                        f"{type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
+                    progress.verbose(f"[pipeline] Deterministic Pre-Patch Retrieval unavailable: "
+                        f"{type(exc).__name__}: {exc}")
 
             # Snapshot for the debug artifact's own "readiness_after_
             # deterministic_acquisition" key -- BEFORE Slice 3 (below) can
@@ -6091,17 +6100,14 @@ def _run_guided_context_acquisition(
                         _slice_ctx = _slice_result.rendered
                         _coverage_warning_ctx = _slice_result.warning_text
                         _edit_readiness = _guided_acquisition.readiness
-                        print(
-                            f"[pipeline] Guided Context Retrieval: "
+                        progress.verbose(f"[pipeline] Guided Context Retrieval: "
                             f"{_guided_acquisition.rounds_used} round(s), "
                             f"{len(_guided_acquisition.attempts)} request(s); "
                             f"edit_source_ready now={_edit_readiness.edit_source_ready} "
                             f"({len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)} "
                             f"intended edit(s) ready)"
                             + (f", failure_reasons={_edit_readiness.failure_reasons}"
-                               if _edit_readiness.unready_edits else ""),
-                            file=sys.stderr,
-                        )
+                               if _edit_readiness.unready_edits else ""))
                 except ModelUnavailableError:
                     # See the matching guard around generate_remediation_plan
                     # above -- run_guided_acquisition calls
@@ -6110,11 +6116,8 @@ def _run_guided_context_acquisition(
                     # swallow it.
                     raise
                 except Exception as exc:
-                    print(
-                        f"[pipeline] Guided Context Retrieval unavailable: "
-                        f"{type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
+                    progress.verbose(f"[pipeline] Guided Context Retrieval unavailable: "
+                        f"{type(exc).__name__}: {exc}")
 
             # Bounded target-file fallback: a known-verified Final Strategy
             # target file whose specific symbol never resolved (through
@@ -6141,12 +6144,12 @@ def _run_guided_context_acquisition(
                 )
                 if _fallback_readiness.edit_source_ready:
                     _target_file_fallback_used = True
-                    print(
+                    progress.recovery("Target file fallback used")
+                    progress.verbose(
                         "[pipeline] Target-file source fallback: symbol-level acquisition never "
                         "resolved, but the Final Strategy's own verified target file(s) "
                         f"{sorted(_slice_result.full_file_fallback_covered)} were already rendered "
-                        "in full -- Patch Generation will proceed using that source.",
-                        file=sys.stderr,
+                        "in full -- Patch Generation will proceed using that source."
                     )
                 _edit_readiness = _fallback_readiness
 
@@ -6260,16 +6263,37 @@ def _run_guided_context_acquisition(
                 except Exception:
                     pass
 
+            # Presentation only -- one summary line for the whole readiness
+            # gate (Slice 1 alone, or Slices 2/3/target-file-fallback above
+            # having filled the gap, or none of them managing to). Reads
+            # values this block already computed; decides nothing new.
+            if _edit_readiness.edit_source_ready:
+                # Target file(s)/symbol(s) are already resolved on each
+                # ReadyEdit (remediation_planner.ReadyEdit.file/.symbol) --
+                # no new lookup, just formatting for display.
+                _target_summary = ", ".join(
+                    f"{e.file} · {e.symbol}" if e.symbol else e.file
+                    for e in _edit_readiness.ready_edits
+                )
+                _readiness_detail = (
+                    (f"{_target_summary}\n      " if _target_summary else "")
+                    + f"Edits ready: {len(_edit_readiness.ready_edits)}/{len(_edit_readiness.intended_edits)}"
+                )
+                if _initial_edit_readiness.edit_source_ready:
+                    progress.success("Target context ready", detail=_readiness_detail)
+                else:
+                    progress.recovery("Additional evidence collected", detail=_readiness_detail)
             if not _edit_readiness.edit_source_ready:
                 _skip_patch_generation = True
-                print(
+                progress.warning("Evidence gap could not be resolved")
+                progress.verbose(
                     "[pipeline] Not every intended edit has verified, patch-ready repository "
                     f"source -- skipping Patch Generation for this run. "
-                    f"failure_reasons={_edit_readiness.failure_reasons}",
-                    file=sys.stderr,
+                    f"failure_reasons={_edit_readiness.failure_reasons}"
                 )
         except Exception as exc:
-            print(f"[pipeline] Final-Target Remediation Slice unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+            progress.warning("Target context unavailable")
+            progress.verbose(f"[pipeline] Final-Target Remediation Slice unavailable: {type(exc).__name__}: {exc}")
     elif _strategy_result is not None and _strategy_result.evaluated:
         # Final Strategy actually ran (a real, successfully-parsed response
         # -- see RemediationStrategyResult.evaluated) and named ZERO
@@ -6286,11 +6310,11 @@ def _run_guided_context_acquisition(
         # -- and deliberately does NOT read `rendered` (presentation
         # output) for this decision either.
         _skip_patch_generation = True
-        print(
+        progress.warning("No evidence-backed target identified")
+        progress.verbose(
             "[pipeline] Final Remediation Strategy ran but selected no evidence-backed "
             f"target -- skipping Patch Generation for this run. "
-            f"insufficient_evidence={_strategy_result.insufficient_evidence}",
-            file=sys.stderr,
+            f"insufficient_evidence={_strategy_result.insufficient_evidence}"
         )
     return locals()
 
@@ -6421,7 +6445,14 @@ def run(
 
     llm = LLMClient(api_key=api_key)
     mode = "MOCK" if llm.is_mock else "LIVE"
-    print(f"[pipeline] LLM mode: {mode}", file=sys.stderr)
+    # Presentation (release polish, round 2): this raw diagnostic no longer
+    # bypasses progress.py -- default/quiet no longer show it (the run
+    # header's own "Model" line, from core/patch.py, already tells a human
+    # which provider/mode is in effect); verbose still shows it verbatim,
+    # unchanged text, never a model name (see the two tests in
+    # test_llm_client.py::TestPipelineLLMModeLog this line still satisfies).
+    progress.verbose(f"[pipeline] LLM mode: {mode}")
+    progress.stage(1, 5, "Analyze")
 
     # Batch B2: begin recording ONE real StageExecution for canonical Stage 1
     # (repository_analysis_and_remediation_planning) -- covers everything
@@ -6600,22 +6631,23 @@ def run(
             )
             _strategy_ctx = _strategy_result.rendered
             if _strategy_ctx:
-                print(
+                progress.success("Final strategy generated")
+                progress.verbose(
                     f"[pipeline] Final remediation strategy generated "
-                    f"({len(_strategy_ctx)} chars).",
-                    file=sys.stderr,
+                    f"({len(_strategy_ctx)} chars)."
                 )
             if _strategy_result.warnings:
-                print(
+                progress.warning("Final strategy dropped unverified item(s)")
+                progress.verbose(
                     f"[pipeline] Final strategy dropped unverified item(s): "
-                    f"{_strategy_result.warnings}",
-                    file=sys.stderr,
+                    f"{_strategy_result.warnings}"
                 )
         except ModelUnavailableError:
             # See the matching guard around generate_remediation_plan above.
             raise
         except Exception as exc:
-            print(f"[pipeline] Final remediation strategy unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+            progress.warning("Final strategy unavailable")
+            progress.verbose(f"[pipeline] Final remediation strategy unavailable: {type(exc).__name__}: {exc}")
 
     # Evidence-Gap Strategy Fallback: Final Strategy #1 evaluated a real
     # response, named zero authoritative targets, and explicitly reported
@@ -6653,13 +6685,10 @@ def run(
             repository_understanding_ctx=_repository_understanding_ctx,
             discovery_plan_ctx=_plan_ctx,
         )
-        print(
-            f"[pipeline] Evidence-gap Strategy fallback: evidence_acquired="
+        progress.verbose(f"[pipeline] Evidence-gap Strategy fallback: evidence_acquired="
             f"{_evidence_gap_fallback['evidence_acquired']} rerun_performed="
             f"{_evidence_gap_fallback['rerun_performed']} skip_reason="
-            f"{_evidence_gap_fallback['skip_reason']}",
-            file=sys.stderr,
-        )
+            f"{_evidence_gap_fallback['skip_reason']}")
         if _evidence_gap_fallback["rerun_performed"]:
             # Strategy #2 is now the ONLY authoritative Strategy result --
             # every downstream reader (Final-Target Remediation Slice,
@@ -6669,17 +6698,17 @@ def run(
             _strategy_ctx = _strategy_result.rendered if _strategy_result is not None else ""
             _planner_evidence_ctx = _evidence_gap_fallback["enriched_planner_evidence_ctx"]
             if _strategy_result is not None and (_strategy_result.target_files or _strategy_result.target_symbols):
-                print(
+                progress.recovery("Additional evidence collected")
+                progress.verbose(
                     "[pipeline] Evidence-gap Strategy fallback recovered authoritative "
                     f"target(s): target_files={_strategy_result.target_files} "
-                    f"target_symbols={_strategy_result.target_symbols}",
-                    file=sys.stderr,
+                    f"target_symbols={_strategy_result.target_symbols}"
                 )
             else:
-                print(
+                progress.warning("Evidence gap could not be resolved")
+                progress.verbose(
                     "[pipeline] Evidence-gap Strategy fallback: Strategy #2 still selected "
-                    "no evidence-backed target -- no further retry this run.",
-                    file=sys.stderr,
+                    "no evidence-backed target -- no further retry this run."
                 )
 
     # Batch B2: finish S2. artifact is the real RemediationStrategyResult
@@ -6772,6 +6801,7 @@ def run(
     # Batch B8: S3 body now lives in _run_guided_context_acquisition
     # (reusable executor shared with replay_engine.py) -- extracted verbatim,
     # called here with run()'s own inputs, unpacking only what downstream code needs.
+    progress.stage(2, 5, "Prepare")
     _s3_result = _run_guided_context_acquisition(
         vulnerability_text=vulnerability_text,
         llm=llm,
@@ -6999,14 +7029,12 @@ def run(
             _S_CHALLENGER, consumed=[_s4_rec] if _s4_rec is not None else [],
         )
 
+    progress.stage(4, 5, "Validate")
     if patch and patch.strip():
-        print("[pipeline] Step 2/4 – Challenging patch …", file=sys.stderr)
         challenger = challenge_patch(vulnerability_text, patch, llm, code_context=challenger_context)
+        progress.success("Patch evaluated")
     else:
-        print(
-            "[pipeline] Step 2/4 – Challenging patch skipped (no candidate patch was produced).",
-            file=sys.stderr,
-        )
+        progress.skipped("Challenger skipped", reason="no candidate patch was produced")
         challenger = {}
 
     # Batch B2: finish S5. Persist the raw Challenger output plus the
@@ -7321,10 +7349,7 @@ def run(
                 # (matches the ORIGINAL fused function's exact behavior:
                 # discovery failing short-circuits everything below it).
                 _existing_test_comparison = _discovery_early_result
-                print(
-                    f"[pipeline] Existing Test Comparison: {_existing_test_comparison.status}",
-                    file=sys.stderr,
-                )
+                progress.info(f"Existing Test Comparison: {_existing_test_comparison.status}")
                 if execution_recorder is not None:
                     _s11_rec = execution_recorder.finish(
                         _s11_handle, outcome="skipped_no_plan",
@@ -7361,21 +7386,11 @@ def run(
                         # CONFIDENCE_SCORING] for the provenance edit this
                         # new data flow required.
                         patch = _amendment_outcome.patch
-                        print(
-                            "[pipeline] Existing Test Amendment: accepted -- "
-                            "amended patch is now the authoritative candidate.",
-                            file=sys.stderr,
-                        )
+                        progress.recovery("Existing test amendment accepted")
                     elif _amendment_outcome.amendment.status != "not_attempted":
-                        print(
-                            f"[pipeline] Existing Test Amendment: {_amendment_outcome.amendment.status} "
-                            f"({_amendment_outcome.amendment.reason}) -- original patch kept.",
-                            file=sys.stderr,
-                        )
-                    print(
-                        f"[pipeline] Existing Test Comparison: {_existing_test_comparison.status}",
-                        file=sys.stderr,
-                    )
+                        progress.verbose(f"[pipeline] Existing Test Amendment: {_amendment_outcome.amendment.status} "
+                            f"({_amendment_outcome.amendment.reason}) -- original patch kept.")
+                    progress.info(f"Existing Test Comparison: {_existing_test_comparison.status}")
                     if execution_recorder is not None:
                         _s11_artifact = to_jsonable(_existing_test_comparison)
                         # Additive-only fields -- ExistingTestComparisonResult's
@@ -7398,7 +7413,8 @@ def run(
                         }
                         _s11_rec = execution_recorder.finish(_s11_handle, outcome="settled", artifact=_s11_artifact)
                 except Exception as exc:
-                    print(f"[pipeline] Existing Test Comparison failed unexpectedly: {exc}", file=sys.stderr)
+                    progress.warning("Existing Test Comparison failed unexpectedly")
+                    progress.verbose(f"[pipeline] Existing Test Comparison failed unexpectedly: {exc}")
                     _existing_test_comparison = _existing_test_comparison_execution_error(
                         f"comparison failed unexpectedly: {type(exc).__name__}: {exc}"
                     )
@@ -7415,11 +7431,11 @@ def run(
         try:
             _c_signals = _run_constraint_signals(patch, _Path(repo_root))
         except Exception as _exc:
-            print(f"[pipeline] Constraint signals failed (non-fatal): {_exc}", file=sys.stderr)
+            progress.verbose(f"[pipeline] Constraint signals failed (non-fatal): {_exc}")
         try:
             _r_signals = _run_remediation_signals(patch, _Path(repo_root))
         except Exception as _exc:
-            print(f"[pipeline] Remediation signals failed (non-fatal): {_exc}", file=sys.stderr)
+            progress.verbose(f"[pipeline] Remediation signals failed (non-fatal): {_exc}")
 
     # (Batch B3: the final-calibration fallback that used to live here now
     # runs immediately after the repair loop, above -- see that comment --
@@ -7448,8 +7464,8 @@ def run(
     # that does not exist.
     _s7_rec = None
     if patch and patch.strip():
-        print("[pipeline] Step 3/4 – Reviewing patch …", file=sys.stderr)
         review = review_patch(vulnerability_text, patch, llm, finding_calibration=finding_calibration)
+        progress.success("Review completed")
         if execution_recorder is not None:
             _s7_rec = execution_recorder.finish(_s7_handle, outcome="settled", artifact={"review": review})
             # Batch B4: begin recording S8 (confidence_scoring), right after
@@ -7463,20 +7479,22 @@ def run(
                 _s8_consumed.append(_s11_rec)
             _s8_handle = execution_recorder.start(_S_CONFIDENCE_SCORING, consumed=_s8_consumed)
 
-        print("[pipeline] Step 4/4 – Evaluating Trust Signals…", file=sys.stderr)
+        # Presentation note: this is confidence_scorer (canonical S8), NOT
+        # Trust Signals (S12, computed later in _build_report). Its score
+        # is deterministic-adjusted and then discarded -- never read by
+        # Trust Signals/the Recommendation Policy, never rendered in the
+        # report (see auto-patcher-architecture.md's S8 entry) -- so it
+        # never earns a default-visible line implying it's authoritative.
+        progress.verbose("[pipeline] Step 4/4 – Evaluating confidence score (informational only)…")
         score_text = score_confidence(
             vulnerability_text, patch, review, llm,
             code_context=(challenger_context if _post_patch_evidence_current else code_context),
             finding_calibration=finding_calibration,
         )
     else:
-        print(
-            "[pipeline] Step 3/4 – Reviewing patch skipped (no candidate patch was produced).",
-            file=sys.stderr,
-        )
-        print(
-            "[pipeline] Step 4/4 – Evaluating Trust Signals skipped (no candidate patch was produced).",
-            file=sys.stderr,
+        progress.skipped("Review skipped", reason="no candidate patch was produced")
+        progress.verbose(
+            "[pipeline] Step 4/4 – Evaluating Trust Signals skipped (no candidate patch was produced)."
         )
         review = ""
         score_text = ""
