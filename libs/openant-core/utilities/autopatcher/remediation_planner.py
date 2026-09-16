@@ -4790,14 +4790,18 @@ def _removed_line_span(relocated_start: "int | None", hunk_lines: "list[str]") -
     return (first, last)
 
 
-def _insertion_only_boundary_span(relocated_start: "int | None", hunk_lines: "list[str]") -> "tuple[int, int] | None":
-    """The real (1-indexed) repository line span bounding every maximal
-    contiguous '+' run in a hunk that has NO removed ('-') lines at all
-    -- the pure-insertion counterpart to _removed_line_span, used ONLY
-    by check_patch_target_conformance's own insertion-only branch (see
-    its docstring). Caller-restricted to zero-removed-line hunks; this
-    function does not re-check that itself, exactly as _removed_line_span
-    does not re-check "is this hunk a removal" either.
+def _insertion_only_covers_target(
+    relocated_start: "int | None", hunk_lines: "list[str]", target_ranges: "list[tuple[int, int]]",
+) -> bool:
+    """True iff every maximal '+' run in a hunk that has NO removed ('-')
+    lines at all (a pure insertion) is covered by the SAME single approved
+    range in `target_ranges` -- used ONLY by check_patch_target_
+    conformance's own insertion-only branch (see its docstring), for a
+    hunk whose old side is already independently, uniquely verified
+    against the real repository file (`relocated_start` is only ever
+    passed non-None for such a hunk). Caller-restricted to zero-removed-
+    line hunks; this function does not re-check that itself, exactly as
+    _removed_line_span does not re-check "is this hunk a removal" either.
 
     For each '+' run, `before`/`after` are the real-file positions of the
     nearest surrounding ' ' (context) line within the hunk (searching
@@ -4806,22 +4810,42 @@ def _insertion_only_boundary_span(relocated_start: "int | None", hunk_lines: "li
     whose own old-side sequence was already uniquely, verbatim matched
     against the real file, consecutive old-side lines are -- by
     construction of that match, not by assumption here -- consecutive
-    real file lines; a run missing one side's neighbor (it starts/ends at
-    the hunk's own boundary) has that side derived as the other side +/-
-    1, never guessed independently. A run with NEITHER neighbor (the
-    entire hunk is '+' lines with no old-side line at all) makes this
-    return None -- fails closed rather than inventing a position; see
-    check_patch_target_conformance's own gating, which never reaches
-    this function without a verified `relocated_start` in hand anyway.
+    real file lines. A run missing one side's neighbor (it starts/ends at
+    the hunk's own boundary) is judged using ONLY the side that IS real --
+    never a synthesized guess about the unknown side (see `_run_covered`
+    below): a run whose only real neighbor is far from every approved
+    range must never be treated as "covered" merely because its unknown
+    side would arithmetically land nearby. A run with NEITHER neighbor
+    (the entire hunk is '+' lines with no old-side line at all) makes this
+    return False -- fails closed rather than inventing a position; see
+    check_patch_target_conformance's own gating, which never reaches this
+    function without a verified `relocated_start` in hand anyway.
 
-    Multiple separate runs are combined into ONE (min(before), max(after))
-    span, exactly mirroring _removed_line_span's own single-span
-    reduction -- this is at least as strict as checking each run
-    individually (the combined span's containment in a range implies
-    every individual run's own containment), and requires every run in
-    the hunk to belong to the SAME approved range, never a mix."""
-    if relocated_start is None:
-        return None
+    A run is covered by one candidate range `(start, end)` when its real
+    position is either strictly inside `(start, end)`, or in one of the
+    two unit-width gaps immediately touching that range's own edges --
+    immediately before `start`, or immediately after `end` (PIP-BOUNDARY-
+    01: a helper inserted immediately adjacent to an already-approved
+    function is, by construction, still an edit AT that approved
+    location, not an unrelated one). No tolerance beyond that exact
+    boundary is ever granted: a run whose nearest real neighbor lands one
+    line further out is not covered by this range.
+
+    EVERY run in the hunk must be covered by ONE SAME range, checked per
+    range, per run -- never a combined multi-run span, exactly so that one
+    run's own legitimate boundary touch can never let a second, unrelated
+    run elsewhere in the same hunk ride along on it (a hazard the
+    predecessor combined-span check was structurally immune to only by
+    being strict everywhere, including at a target's own boundary -- see
+    this module's own PIP-BOUNDARY-01 regression tests for the exact
+    multi-run scenario this per-run check guards against).
+
+    Never consults target_source or any concatenated/rendered text --
+    position against `target_ranges` only, exactly preserving TARGET-01:
+    a rendered-block concatenation artifact has no bearing on this
+    check."""
+    if relocated_start is None or not target_ranges:
+        return False
     offset = 0
     positions: "list[int | None]" = []
     for line in hunk_lines:
@@ -4831,8 +4855,7 @@ def _insertion_only_boundary_span(relocated_start: "int | None", hunk_lines: "li
         else:
             positions.append(None)
 
-    overall_before: "int | None" = None
-    overall_after: "int | None" = None
+    runs: "list[tuple[int | None, int | None]]" = []
     n = len(hunk_lines)
     i = 0
     while i < n:
@@ -4847,20 +4870,23 @@ def _insertion_only_boundary_span(relocated_start: "int | None", hunk_lines: "li
         before = next((positions[j] for j in range(run_start - 1, -1, -1) if positions[j] is not None), None)
         after = next((positions[j] for j in range(run_end + 1, n) if positions[j] is not None), None)
         if before is None and after is None:
-            return None
-        if before is None:
-            before = after - 1
-        if after is None:
-            after = before + 1
+            return False
+        runs.append((before, after))
 
-        if overall_before is None or before < overall_before:
-            overall_before = before
-        if overall_after is None or after > overall_after:
-            overall_after = after
+    if not runs:
+        return False
 
-    if overall_before is None or overall_after is None:
-        return None
-    return (overall_before, overall_after)
+    def _run_covered(before: "int | None", after: "int | None", start: int, end: int) -> bool:
+        if before is not None:
+            return start - 1 <= before <= end
+        # before is None here, so the earlier "both None" check guarantees
+        # after is real -- never a synthesized before is compared instead.
+        return start <= after <= end + 1
+
+    return any(
+        all(_run_covered(before, after, start, end) for before, after in runs)
+        for start, end in target_ranges
+    )
 
 
 def check_patch_target_conformance(
@@ -4933,10 +4959,11 @@ def check_patch_target_conformance(
     verified against the real repository file (old_side_status ==
     "old_side_verified") and at least one approved target range exists
     for its file, target_coverage is decided ENTIRELY by position (see
-    _insertion_only_boundary_span): its real, verified insertion
-    boundary must fall entirely inside one approved target's own
-    rendered line range, exactly the same range the removed-line
-    fallback above already uses -- never a text search. When no target
+    _insertion_only_covers_target): every run's real, verified insertion
+    position must fall inside, or immediately adjacent to the boundary
+    of, one approved target's own rendered line range, exactly the same
+    range the removed-line fallback above already uses -- never a text
+    search. When no target
     range exists for the file (the file's only rendered source is a
     "Full file (last resort)" block -- see _edit_target_line_ranges_
     for_file's own docstring for why that case has no ranges to check
@@ -5016,13 +5043,9 @@ def check_patch_target_conformance(
                     # at least one approved target range for this file:
                     # position -- never the flat text search -- decides
                     # coverage (see this function's own docstring and
-                    # _insertion_only_boundary_span).
-                    insertion_span = _insertion_only_boundary_span(
-                        getattr(record, "relocated_hunk_start", None), hunk.lines,
-                    )
-                    matched = insertion_span is not None and any(
-                        start <= insertion_span[0] and insertion_span[1] <= end
-                        for (start, end) in target_ranges
+                    # _insertion_only_covers_target).
+                    matched = _insertion_only_covers_target(
+                        getattr(record, "relocated_hunk_start", None), hunk.lines, target_ranges,
                     )
                 target_coverage = "approved_target" if matched else "uncovered_target"
 

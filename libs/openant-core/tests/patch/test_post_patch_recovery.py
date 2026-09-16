@@ -632,6 +632,181 @@ class TestInsertionOnlyHunkBoundaryArtifact:
 
 
 # ---------------------------------------------------------------------------
+# PIP-BOUNDARY-01 -- a pure-insertion hunk immediately adjacent to an
+# approved function-kind target's own leading or trailing boundary (zero
+# real lines of gap) was, until this fix, always uncovered_target: the
+# insertion-only positional check required strict containment inside the
+# target's own rendered range, with no tolerance for the two unit-width
+# gaps that immediately touch that range's own edges. A helper function
+# inserted directly above (or below) an already-approved function is, by
+# construction, still an edit AT that approved location -- not an
+# unrelated one -- so it must be approved without widening the target's
+# own rendered range or consulting any concatenated text (see TARGET-01,
+# above, which this fix must not weaken).
+# ---------------------------------------------------------------------------
+
+class TestInsertionOnlyBoundaryAdjacency:
+    def _build_function_slice(self, tmp_path):
+        """A synthetic file with one verified FUNCTION target, target_func,
+        spanning real lines 20-22 -- deliberately function-kind (resolved
+        via get_function_code, never padded by _DEFINITION_CONTEXT_LINES,
+        unlike a constant) so its own rendered range is exactly (20, 22),
+        matching the real pip case's own unpadded function excerpt."""
+        lines = [f"FILLER_{i:03d} = 0\n" for i in range(1, 60)]
+        lines[19] = "def target_func(x):\n"
+        lines[20] = "    y = x + 1\n"
+        lines[21] = "    return y\n"
+        (tmp_path / "mod.py").write_text("".join(lines), encoding="utf-8")
+
+        func_code = "def target_func(x):\n    y = x + 1\n    return y\n"
+        context = _make_context(functions={
+            "mod.py:target_func": {"name": "target_func", "startLine": 20, "endLine": 22, "code": func_code},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:target_func"])
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        return build_final_target_slice(strategy, str(tmp_path), context)
+
+    def test_insertion_immediately_before_function_target_start_is_approved(self, tmp_path):
+        """A: pure insertion immediately before the target's own first
+        line (20), anchored ONLY on the target's own opening lines -- no
+        leading context, no rendered padding. Must be approved_target: the
+        insertion is at the target's own leading boundary, not outside it."""
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import check_patch_target_conformance
+
+        slice_result = self._build_function_slice(tmp_path)
+        ready_edits = [_make_ready_edit("mod.py", "mod.py:target_func")]
+
+        patch = (
+            "--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -20,2 +20,6 @@\n"
+            "+def helper():\n"
+            "+    return 1\n"
+            "+\n"
+            "+\n"
+            " def target_func(x):\n"
+            "     y = x + 1\n"
+        )
+        patch, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+
+        assert meta.relocations[0].relocation_reason == "unique_match"
+        assert meta.relocations[0].relocated_hunk_start == 20
+
+        report = check_patch_target_conformance(patch, meta.relocations, ready_edits, slice_result)
+        assert report.results[0].old_side_status == "old_side_verified"
+        assert report.results[0].target_coverage == "approved_target", (
+            "a pure insertion immediately before an approved function target's own "
+            "first line is at that target's leading boundary, not outside it "
+            "(PIP-BOUNDARY-01)"
+        )
+        assert report.all_conformant is True
+
+    def test_insertion_immediately_after_function_target_end_is_approved(self, tmp_path):
+        """B: pure insertion immediately after the target's own last line
+        (22), anchored ONLY on the target's own closing lines. Must be
+        approved_target -- the mirror image of A, on the trailing edge."""
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import check_patch_target_conformance
+
+        slice_result = self._build_function_slice(tmp_path)
+        ready_edits = [_make_ready_edit("mod.py", "mod.py:target_func")]
+
+        patch = (
+            "--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -22,1 +22,4 @@\n"
+            "     return y\n"
+            "+def helper():\n"
+            "+    return 1\n"
+            "+\n"
+        )
+        patch, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+
+        assert meta.relocations[0].relocation_reason == "unique_match"
+        assert meta.relocations[0].relocated_hunk_start == 22
+
+        report = check_patch_target_conformance(patch, meta.relocations, ready_edits, slice_result)
+        assert report.results[0].old_side_status == "old_side_verified"
+        assert report.results[0].target_coverage == "approved_target", (
+            "a pure insertion immediately after an approved function target's own "
+            "last line is at that target's trailing boundary, not outside it "
+            "(PIP-BOUNDARY-01)"
+        )
+        assert report.all_conformant is True
+
+    def test_insertion_two_lines_before_function_target_remains_uncovered(self, tmp_path):
+        """C: control -- an insertion anchored two real lines farther from
+        the target's own boundary (both sides real, neither equal to the
+        target's own edge) must remain uncovered_target. This is NOT the
+        boundary-adjacent case A/B fix authorizes; there is one whole real
+        line (FILLER_019) genuinely between this insertion and the target."""
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import check_patch_target_conformance
+
+        slice_result = self._build_function_slice(tmp_path)
+        ready_edits = [_make_ready_edit("mod.py", "mod.py:target_func")]
+
+        patch = (
+            "--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -18,2 +18,4 @@\n"
+            " FILLER_018 = 0\n"
+            "+def helper():\n"
+            "+    return 1\n"
+            " FILLER_019 = 0\n"
+        )
+        patch, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+
+        assert meta.relocations[0].relocation_reason == "unique_match"
+
+        report = check_patch_target_conformance(patch, meta.relocations, ready_edits, slice_result)
+        assert report.results[0].old_side_status == "old_side_verified"
+        assert report.results[0].target_coverage == "uncovered_target", (
+            "an insertion genuinely one line farther outside the target's own "
+            "boundary must remain rejected -- no tolerance beyond the exact "
+            "boundary is granted"
+        )
+        assert report.all_conformant is False
+
+    def test_insertion_multi_run_unrelated_run_does_not_ride_along(self, tmp_path):
+        """E: one insertion run legitimately touches the target's trailing
+        boundary; a SECOND, separate insertion run in the SAME hunk sits
+        two real lines further away with no relationship to any approved
+        target. The whole hunk must remain uncovered/non-conformant -- the
+        first run's own legitimate boundary touch must never let the
+        second, unrelated run ride along (this is the failure mode a naive
+        'just widen the containment check' fix would reintroduce)."""
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import check_patch_target_conformance
+
+        slice_result = self._build_function_slice(tmp_path)
+        ready_edits = [_make_ready_edit("mod.py", "mod.py:target_func")]
+
+        patch = (
+            "--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -22,4 +22,8 @@\n"
+            "     return y\n"
+            "+def helper():\n"
+            "+    return 1\n"
+            "+\n"
+            " FILLER_023 = 0\n"
+            " FILLER_024 = 0\n"
+            "+UNRELATED_LINE = 999\n"
+            " FILLER_025 = 0\n"
+        )
+        patch, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+
+        assert meta.relocations[0].relocation_reason == "unique_match"
+
+        report = check_patch_target_conformance(patch, meta.relocations, ready_edits, slice_result)
+        assert report.results[0].old_side_status == "old_side_verified"
+        assert report.results[0].target_coverage == "uncovered_target", (
+            "the first insertion run's own legitimate boundary touch must never "
+            "authorize a second, unrelated insertion run elsewhere in the same "
+            "hunk (multi-run safety, PIP-BOUNDARY-01)"
+        )
+        assert report.all_conformant is False
+
+
+# ---------------------------------------------------------------------------
 # _recovered_ready_edit -- promoting a Post-Patch Recovery attempt into the
 # reconciled ReadyEdit set used only by the SECOND (post-regeneration) Patch
 # Target Conformance check. Promotion must use ONLY deterministically
