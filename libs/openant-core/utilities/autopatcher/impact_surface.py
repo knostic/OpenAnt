@@ -347,7 +347,22 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
 
             changed_positions = [start_idx + i for i, is_changed in enumerate(changed_flags) if is_changed]
             if not changed_positions:
-                changed_positions = [start_idx + i for i in range(len(anchors))]
+                # A hunk with anchors (context/removed lines) but no removed
+                # line at all is a pure insertion: there is no individual
+                # anchor position that IS the edit, so unlike the branch
+                # below we must not collapse to the whole anchor span --
+                # that would attribute whichever indexed symbol happens to
+                # sit at either end of the hunk's context window, even when
+                # it is merely unmodified context next to the inserted
+                # line(s) (see module docstring's LOGGER/urllib3-style
+                # incidents). Resolve each insertion run only against the
+                # anchor immediately adjacent to it on each side, and
+                # attribute a symbol only when both sides exist and agree --
+                # otherwise abstain for that run.
+                for resolved in self._resolve_insertion_run_symbols(hunk.lines, anchors, start_idx, symbol_index):
+                    symbols.append(resolved)
+                continue
+
             true_start = min(changed_positions) + 1  # 1-indexed
             true_end = max(changed_positions) + 1
 
@@ -358,6 +373,44 @@ class LightweightImpactAnalyzer(ImpactAnalyzer):
                 symbols.append(resolved)
 
         return symbols
+
+    def _resolve_insertion_run_symbols(
+        self,
+        hunk_lines: List[str],
+        anchors: List[str],
+        start_idx: int,
+        symbol_index: List[Tuple[int, int, str, str]],
+    ) -> List[Tuple[str, str]]:
+        """For a pure-insertion hunk (no removed lines), resolve each maximal
+        run of added ('+') lines against only the anchor immediately before
+        and immediately after that specific run -- never the hunk's overall
+        span -- and attribute a symbol only when both sides exist and
+        resolve to the identical (name, kind). A run at the very start/end
+        of the hunk (missing one side) or whose two sides disagree
+        contributes nothing: abstaining is preferred over guessing."""
+        resolved_symbols: List[Tuple[str, str]] = []
+        anchor_idx = -1  # index into `anchors` of the last anchor line seen
+        i = 0
+        n = len(hunk_lines)
+        while i < n:
+            marker = hunk_lines[i][:1]
+            if marker in (" ", "-"):
+                anchor_idx += 1
+                i += 1
+                continue
+            # marker == "+": a run of one or more inserted lines
+            j = i
+            while j < n and hunk_lines[j][:1] == "+":
+                j += 1
+            preceding = anchor_idx if anchor_idx >= 0 else None
+            following = anchor_idx + 1 if j < n and hunk_lines[j][:1] in (" ", "-") else None
+            if preceding is not None and following is not None:
+                before = self._resolve_symbol_at_line(symbol_index, start_idx + preceding + 1)
+                after = self._resolve_symbol_at_line(symbol_index, start_idx + following + 1)
+                if before is not None and before == after:
+                    resolved_symbols.append(before)
+            i = j
+        return resolved_symbols
 
     def _search_usages(self, symbols: List[str], repo_context=None) -> List[UsageMatch]:
         """Greedy repo scan for symbol usage. Returns UsageMatch list.

@@ -486,6 +486,68 @@ class TestFunctionChanges:
         assert report.changed_symbols == ["new"]
 
 
+class TestInsertionOnlyHunkAttribution:
+    """IMPACT-01: a hunk with surrounding context but zero removed lines
+    (a pure insertion) must not attribute an unrelated, unmodified
+    neighboring symbol as changed merely because that symbol's line
+    happens to be part of the hunk's context."""
+
+    def test_module_level_insertion_does_not_attribute_unrelated_neighbor(self, tmp_path):
+        """A new module-level line inserted next to an unrelated, unchanged
+        assignment must not cause that assignment to be reported as changed."""
+        repo = tmp_path / "repo_insertion_only"
+        repo.mkdir()
+        write_file(repo / "config.py", "import os\nMAX_RETRIES = 3\n")
+
+        diff = (
+            "--- a/config.py\n+++ b/config.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " import os\n"
+            "+import sys\n"
+            " MAX_RETRIES = 3\n"
+        )
+
+        report = LightweightImpactAnalyzer().analyze(diff, repo_context=TargetRepoContext(repo))
+
+        assert "MAX_RETRIES" not in report.changed_symbols, (
+            "an unrelated, unmodified neighboring symbol must not be attributed "
+            f"as changed; got changed_symbols={report.changed_symbols!r}"
+        )
+
+    def test_insertion_inside_function_still_attributes_containing_function(self, tmp_path):
+        """Control: a new line inserted genuinely inside a function body
+        (still zero removed lines) must still attribute the containing
+        function — the fix must not overcorrect into abstaining here."""
+        repo = tmp_path / "repo_insertion_in_function"
+        repo.mkdir()
+        write_file(
+            repo / "processor.py",
+            "\n".join([
+                "def process(items):",
+                "    total = 0",
+                "    total += len(items)",
+                "    return total",
+            ]) + "\n",
+        )
+
+        diff = (
+            "--- a/processor.py\n+++ b/processor.py\n"
+            "@@ -1,4 +1,5 @@\n"
+            " def process(items):\n"
+            "     total = 0\n"
+            "+    total += 1\n"
+            "     total += len(items)\n"
+            "     return total\n"
+        )
+
+        report = LightweightImpactAnalyzer().analyze(diff, repo_context=TargetRepoContext(repo))
+
+        assert "process" in report.changed_symbols, (
+            "an insertion genuinely inside a function must still attribute "
+            f"that function; got changed_symbols={report.changed_symbols!r}"
+        )
+
+
 class TestMultipleHunks:
     def test_two_hunks_in_same_file_resolve_two_distinct_symbols(self, tmp_path):
         repo = _write_retry_repo(tmp_path)
