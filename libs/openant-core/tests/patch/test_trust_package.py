@@ -141,6 +141,30 @@ class TestClassifyFindingEvidenceSupplyGap:
             "would not get protection."
         ) == "plausible_risk"
 
+    def test_necessity_marker_alone_is_not_a_validation_gap(self):
+        """A necessity marker ("relies on") with no evidence-absence marker
+        anywhere in the text must not become validation_gap on its own --
+        the evidence-supply idiom requires BOTH signals together (see
+        _has_evidence_gap_signal's own docstring), never necessity alone."""
+        assert _classify_finding(
+            "The remediation's correctness relies on a transformation "
+            "performed elsewhere in the module."
+        ) != "validation_gap"
+
+    def test_absence_marker_before_necessity_marker_still_validation_gap(self):
+        """The two markers in reversed order relative to every positive
+        example above (the absence marker "not shown" first, the necessity
+        marker "depends on" second) -- both _EVIDENCE_GAP_NECESSITY_RE and
+        _EVIDENCE_ABSENCE_RE are independent whole-text searches, so order
+        must not matter."""
+        from utilities.autopatcher.pipeline import _VALIDATION_GAP_RE
+        text = (
+            "This behavior was not shown in the supplied evidence, even "
+            "though the remediation's correctness depends on it."
+        )
+        assert not _VALIDATION_GAP_RE.search(text)  # qualifies only via the new idiom
+        assert _classify_finding(text) == "validation_gap"
+
 
 # ---------------------------------------------------------------------------
 # behavioral_defect (run-4 Architecture B)

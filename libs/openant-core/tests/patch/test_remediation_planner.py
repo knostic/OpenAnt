@@ -4049,6 +4049,102 @@ class TestMechanismTermsPrioritizedOverTargetSymbol:
         )
         assert "Target definition: `policy.py:Policy.ALLOWED_VALUES`" not in result.rendered
 
+    def test_category_3b_unaffected(self, tmp_path):
+        """Category-3b regression test, analogous in purpose to
+        test_category_2_unaffected above: category 3a's mechanism-derived
+        reordering must not alter category 3b's own edit-target window
+        selection or commit order.
+
+        Structural guard: 3b's own code (its per-target strategy-term scan
+        AND its outer symbol_matches commit loop, both inside the "3b."
+        section of _build_final_target_slice_inner) never references
+        _mechanism_terms_first -- only category 3a's separate usage scan
+        does.
+
+        Behavioral guard: two verified FUNCTION targets are both 3b
+        candidates. The mechanism text prominently names "method_a" (in
+        addition to "allowed_hosts", found only inside method_a's own
+        body) -- so "method_a" is independently mechanism-derived, while
+        "method_b" (found only via its own target-symbol name, inside its
+        own body's comment) is purely coarse. This is exactly the shape
+        that would rank method_a's own symbol ahead of method_b's under a
+        (hypothetical, incorrect) reuse of category 3a's reordering for
+        3b's own outer commit loop. Category 3b's commit order must still
+        follow strategy.target_symbols' own order (method_b, listed
+        first, before method_a), and each target's own window content
+        must be exactly what its own body's strategy-term occurrences
+        produce -- neither is affected by 3a's local reordering."""
+        import inspect
+        from utilities.autopatcher.remediation_planner import (
+            _build_final_target_slice_inner, build_final_target_slice,
+        )
+
+        source = inspect.getsource(_build_final_target_slice_inner)
+        start = source.index("# 3b. Inside a directly-resolved FUNCTION target itself")
+        end = source.index("# --- Category 4 (EDIT-TARGET role):")
+        assert start < end
+        assert "_mechanism_terms_first" not in source[start:end]
+
+        (tmp_path / "widget.py").write_text(
+            "class Widget:\n"
+            "    def method_b(self):\n"
+            "        # method_b sets the retry budget\n"
+            "        self.retry_budget = 3\n"
+            "        return self.retry_budget\n"
+            "\n"
+            "    def method_a(self):\n"
+            "        # method_a sets the allowed hosts\n"
+            "        self.allowed_hosts = frozenset()\n"
+            "        return self.allowed_hosts\n",
+            encoding="utf-8",
+        )
+        context = _make_context(
+            functions={
+                "widget.py:Widget.method_b": {
+                    "name": "method_b", "className": "Widget", "startLine": 2, "endLine": 5,
+                    "code": (
+                        "    def method_b(self):\n"
+                        "        # method_b sets the retry budget\n"
+                        "        self.retry_budget = 3\n"
+                        "        return self.retry_budget\n"
+                    ),
+                },
+                "widget.py:Widget.method_a": {
+                    "name": "method_a", "className": "Widget", "startLine": 7, "endLine": 10,
+                    "code": (
+                        "    def method_a(self):\n"
+                        "        # method_a sets the allowed hosts\n"
+                        "        self.allowed_hosts = frozenset()\n"
+                        "        return self.allowed_hosts\n"
+                    ),
+                },
+            },
+            repo_path=tmp_path,
+        )
+        # target_symbols lists method_b FIRST. "method_a" and
+        # "allowed_hosts" both appear in the mechanism text -- both
+        # independently mechanism-derived -- while "method_b" is purely
+        # coarse (target-symbol-derived only, never mentioned in the
+        # mechanism text at all).
+        strategy = _make_strategy(
+            target_files=["widget.py"],
+            target_symbols=["widget.py:Widget.method_b", "widget.py:Widget.method_a"],
+            extended_mechanism="The client reads config.allowed_hosts to decide access; method_a validates it.",
+        )
+
+        result = build_final_target_slice(strategy, str(tmp_path), context)
+
+        assert "self.retry_budget = 3" in result.rendered
+        assert "self.allowed_hosts = frozenset()" in result.rendered
+        assert {"widget.py:Widget.method_b", "widget.py:Widget.method_a"} <= set(result.covered_target_symbols)
+        # Ordering: method_b's own block (first in target_symbols) must
+        # commit before method_a's own block (second) -- even though
+        # method_a's own symbol name is the one independently reinforced
+        # by the mechanism text.
+        assert result.rendered.index("self.retry_budget = 3") < result.rendered.index(
+            "self.allowed_hosts = frozenset()"
+        )
+
     def test_coarse_term_starvation_prevented_under_tight_budget(self, tmp_path):
         """Composition test: a coarse, target-symbol-only term ("Widget")
         matches two consumer functions; a mechanism-derived term

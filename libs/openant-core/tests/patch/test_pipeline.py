@@ -2746,6 +2746,62 @@ class TestVerifiedFixedValidationGapReconciliation:
         report = _build_report(PipelineResult(**kwargs))
         assert "Deploy After Validation" in report
 
+    def test_verified_fixed_with_confirmed_defect_and_validation_gap_stays_misaligned(self):
+        """Coverage-audit follow-up: a response containing BOTH a
+        confirmed_defect finding AND a validation_gap finding, with
+        verification_status=VERIFIED_FIXED. This reconciliation's own
+        condition checks only verification_status/validation_gap_count --
+        by design, per this function's own docstring, it does not also
+        gate on confirmed_defect_count, because the pre-existing
+        Misaligned path (confirmed_defect_count > 0) already independently
+        produces Manual Review Required with its own defect-specific
+        reason in _build_recommendation_v1, checked BEFORE that function
+        ever reads verification_status (that read is gated behind
+        `defect_count == 0`, reached only in the I5 branch AFTER the
+        Misaligned check). So the reconciliation still relabels
+        verification_status itself (asserted below, matching documented
+        intent) -- but this must never surface as a downgrade of the
+        recommendation: the confirmed defect must keep its own stronger
+        Misaligned reason/why text, never the weaker "insufficient
+        evidence" or "residual vulnerability" wording."""
+        from utilities.autopatcher.pipeline import (
+            _build_recommendation_v1, _classify_challenger, _compute_trust_signals,
+        )
+
+        challenger = self._challenger(
+            "VERIFIED_FIXED", False,
+            potential_issues=[
+                "The patch is still vulnerable to the same attack vector",
+                "Cannot verify whether the consuming code normalizes this value as shown",
+            ],
+        )
+        classified = _classify_challenger(challenger)
+        assert classified["confirmed_defect_count"] == 1
+        assert classified["validation_gap_count"] == 1
+        # Documented, deliberate side effect of this reconciliation's
+        # narrow condition -- inert for the recommendation below, since
+        # defect_count > 0 always routes through the independent
+        # Misaligned gate first.
+        assert classified["verification_status"] == "INSUFFICIENT_EVIDENCE"
+
+        signals = _compute_trust_signals([], {"applicable": True}, classified, "Good", "low")
+        rec = _build_recommendation_v1(
+            signals,
+            still_vulnerable=classified["still_vulnerable"],
+            defect_count=classified["confirmed_defect_count"],
+            verification_status=classified["verification_status"],
+        )
+
+        assert rec["decision"] == "Manual Review Required"
+        # Must land on the Misaligned/confirmed-defect reason -- never the
+        # weaker INSUFFICIENT_EVIDENCE/RESIDUAL_VULNERABILITY wording that
+        # a naive read of the (irrelevant here) reconciled
+        # verification_status would otherwise produce.
+        assert "high-confidence risk indicators" in rec["reason"]
+        assert rec["why"].startswith("adversarial review flagged high-confidence risk indicators")
+        assert "insufficient" not in rec["reason"].lower()
+        assert "could not be sufficiently verified" not in rec["why"]
+
 
 # ---------------------------------------------------------------------------
 # Vulnerability Sources (GHSA/CVE/Advisory URL — no upstream remediation links)
