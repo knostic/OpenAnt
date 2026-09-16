@@ -521,11 +521,18 @@ _FALLBACK_MAX_BLOCK_SCAN = 400
 forward counting brace depth -- bounds the cost of a pathological or
 unbalanced input; the fixed-window fallback below takes over past this."""
 
+_FALLBACK_VARIABLE_DECL_RE_PART = r"^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+{name}\b"
+"""Isolated separately (rather than inlined only in
+_FALLBACK_DECLARATION_RE_PARTS below) so _deterministic_identifier_fallback
+can re-test a chosen hit against this ONE shape specifically -- see its own
+`class_qualifier` handling: a plain variable declaration is never a valid
+match for a class-qualified request, no matter how it was found."""
+
 _FALLBACK_DECLARATION_RE_PARTS = (
     r"^[ \t]*(?:export[ \t]+)?function[ \t]+{name}[ \t]*\(",
     r"^[ \t]*def[ \t]+{name}[ \t]*\(",
     r"^[ \t]*class[ \t]+{name}\b",
-    r"^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+{name}\b",
+    _FALLBACK_VARIABLE_DECL_RE_PART,
 )
 """A small, fixed set of already-common declaration shapes -- deliberately
 not a language grammar. Matched literally against real file text, never
@@ -616,6 +623,7 @@ def _declaration_is_brace_scoped(lines: "list[str]", decl_line0: int) -> bool:
 
 def _deterministic_identifier_fallback(
     name: str, candidate_files: "list[str]", repo_root: Path,
+    class_qualifier: "str | None" = None,
 ) -> "_SymbolMatch | None":
     """Deterministic, file-scoped recovery for a target identifier whose
     exact name is known but the structured lookups in
@@ -632,6 +640,28 @@ def _deterministic_identifier_fallback(
          weaker, so it never runs when a real declaration was found).
     More than one match at whichever tier is checked -- or none at all --
     fails closed (returns None); this never picks an arbitrary first hit.
+
+    `class_qualifier` is _resolve_symbol_details' own already-computed
+    signal that the caller proposed this identifier in qualified form
+    ("ClassName.member") -- i.e. it is asking for a class member, never a
+    plain module/function-local variable, and never a bare, unowned token
+    reference. When given (not None):
+      - A would-be tier-1 declaration match is rejected -- fails closed
+        (returns None) -- if that match is ITSELF shaped like a plain
+        variable declaration (_FALLBACK_VARIABLE_DECL_RE_PART): a
+        same-named `const`/`let`/`var` in some unrelated function is not
+        the requested class member, no matter how unambiguous its own
+        match was.
+      - Tier 2 (the token-only fallback) is never used at all: it has no
+        declaration shape and therefore no way to establish that a bare
+        token belongs to the requested class member rather than some
+        unrelated reference, so it can never be the sole basis for
+        satisfying a class-qualified request.
+    In both cases this fails closed rather than presenting misleading
+    source under the member's label. `class_qualifier=None` (the default,
+    and every existing caller before this fix) preserves the exact prior
+    behavior for a bare, unqualified name -- neither check runs for one,
+    since a bare request carries no such signal to check against.
 
     Returns a bounded source window (the balanced-brace block itself when
     one can be found, otherwise a fixed-size padded window around the
@@ -673,10 +703,20 @@ def _deterministic_identifier_fallback(
         return None  # ambiguous declaration -- fail closed, never guess
     if declaration_hits:
         chosen = declaration_hits[0]
-    elif len(token_hits) == 1:
+        if class_qualifier is not None:
+            chosen_file, chosen_line0 = chosen
+            chosen_line_text = file_texts[chosen_file].splitlines()[chosen_line0]
+            variable_only_pattern = re.compile(_FALLBACK_VARIABLE_DECL_RE_PART.format(name=escaped))
+            if variable_only_pattern.match(chosen_line_text):
+                return None  # a plain variable can't satisfy a class-qualified request
+    elif len(token_hits) == 1 and class_qualifier is None:
         chosen = token_hits[0]
     else:
-        return None  # zero or ambiguous token occurrences -- fail closed
+        return None  # zero/ambiguous token occurrences, or a class-qualified
+        # request with no declaration match at all -- Tier 2 has no
+        # declaration or ownership information capable of establishing that
+        # a bare token belongs to the requested class member, so it must
+        # never be the sole basis for satisfying one; fail closed.
 
     file, line0 = chosen
     text = file_texts[file]
@@ -784,7 +824,9 @@ def _resolve_symbol_details(
     # run at all when the caller didn't independently verify anything.
     fallback_files = [verified_file] if verified_file else list(verified_files or ())
     if fallback_files:
-        return _deterministic_identifier_fallback(bare_name, fallback_files, repo_root)
+        return _deterministic_identifier_fallback(
+            bare_name, fallback_files, repo_root, class_qualifier=class_qualifier,
+        )
 
     return None
 

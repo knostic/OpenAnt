@@ -1162,6 +1162,57 @@ class TestDeterministicIdentifierFallback:
         match = _resolve_symbol_details("setKey", tmp_path, context, verified_files=["index.js"])
         assert match is not None  # succeeds with no LLM involved anywhere
 
+    def test_class_qualified_request_rejects_unrelated_variable_of_same_bare_name(self, tmp_path):
+        # FALLBACK-01: the requested member ("Widget.target") is a
+        # class-qualified proposal -- neither structured lookup resolves it
+        # (not indexed), so this reaches the fallback. The only text in the
+        # verified file that matches one of _FALLBACK_DECLARATION_RE_PARTS is
+        # an UNRELATED top-level `var target = ...` in a different function --
+        # a plain variable declaration, not a class member. Accepting it would
+        # present that variable's source as if it were Widget.target's own
+        # definition. The fallback must abstain instead.
+        (tmp_path / "index.js").write_text(
+            "class Widget {\n"
+            "  target(x) {\n"
+            "    return x;\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "function helper() {\n"
+            "  var target = 1;\n"
+            "  return target;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("Widget.target", tmp_path, context, verified_files=["index.js"])
+        assert match is None
+
+    def test_class_qualified_request_rejects_tier_2_token_only_match(self, tmp_path):
+        # FALLBACK-01 (Tier 2 bypass): the requested member ("Widget.target")
+        # is class-qualified -- neither structured lookup resolves it (not
+        # indexed). The verified file has NO declaration-shaped text for
+        # `target` at all (no _FALLBACK_DECLARATION_RE_PARTS match), only a
+        # single unrelated bare-token occurrence (a property access inside an
+        # unrelated function) -- a shape only Tier 2's token search can see.
+        # Tier 2 has no declaration or ownership information capable of
+        # establishing that this token belongs to Widget.target, so a
+        # class-qualified request must fail closed here too, exactly as the
+        # Tier 1 case above already does.
+        (tmp_path / "index.js").write_text(
+            "function helper(order) {\n"
+            "  return order.target;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        context = _make_context(repo_path=tmp_path)
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        match = _resolve_symbol_details("Widget.target", tmp_path, context, verified_files=["index.js"])
+        assert match is None
+
 
 # ---------------------------------------------------------------------------
 # _declaration_is_brace_scoped() -- the small syntactic pre-check that
