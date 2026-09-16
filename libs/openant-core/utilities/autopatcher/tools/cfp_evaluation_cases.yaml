@@ -1,0 +1,81 @@
+# CFP evaluation set
+#
+# Purpose:
+# Small, pre-selected evaluation set for measuring Auto Patcher's
+# evidence-driven recommendation behavior against an independent
+# vulnerability-repair benchmark.
+#
+# Selection was fixed before observing Auto Patcher outcomes.
+# Cases were selected for diversity across languages, repositories,
+# and vulnerability classes rather than expected Auto Patcher success.
+#
+# For each case we will preserve:
+# - full Auto Patcher trace
+# - generated candidate patch, if any
+# - deterministic recommendation and supporting evidence
+# - independent PatchEval-Verified result, where applicable
+#
+
+cases:
+
+  - id: jupyter-notebook-cve-2020-26215
+    display_name: Jupyter Notebook
+    repo: https://github.com/jupyter/notebook.git
+    cve: CVE-2020-26215
+    language: Python
+    sha: d8308e13803ba1c6e92f129381e615af6c6e00d3
+    selection_reason: >
+      Open-redirect case where a small-looking patch depends on preserving
+      intended URL behavior; useful for evaluating semantic evidence beyond
+      mechanical applicability.
+
+  - id: ffmpegdotjs-cve-2021-23376
+    display_name: ffmpegdotjs
+    repo: https://github.com/TRomesh/ffmpegdotjs.git
+    cve: CVE-2021-23376
+    language: JavaScript
+    sha: b7395daf0bdcb81218340427eb7073cdd28462af
+    selection_reason: >
+      Command-injection case involving security-sensitive API behavior;
+      useful for evaluating root-cause reasoning and adversarial review.
+
+  - id: gogs-cve-2022-1986
+    display_name: Gogs
+    repo: https://github.com/gogs/gogs.git
+    cve: CVE-2022-1986
+    language: Go
+    sha: 69827490e0f0e68b34e082321b4e328df7847d66
+    selection_reason: >
+      Adds Go coverage and exercises command/path handling where repository
+      and platform semantics may matter to patch correctness.
+
+  - id: helm-cve-2024-25620
+    display_name: Helm
+    repo: https://github.com/helm/helm.git
+    cve: CVE-2024-25620
+    language: Go
+    sha: e81f6140ddb22bc99a08f7409522a8dbe5338ee3
+    selection_reason: >
+      Path-traversal case in a large mature repository; useful for evaluating
+      repository grounding, impact, and compatibility with established code.
+
+  - id: totaljs-cve-2020-28494
+    display_name: Total.js
+    repo: https://github.com/totaljs/framework.git
+    cve: CVE-2020-28494
+    language: JavaScript
+    sha: 79e84ada0a4455a2fe2383bed6436f231290276a
+    selection_reason: >
+      Command-injection/input-handling case where fixing the vulnerability
+      must also preserve intended application behavior.
+
+  - id: fate-cve-2020-25459
+    display_name: FATE
+    repo: https://github.com/FederatedAI/FATE.git
+    cve: CVE-2020-25459
+    language: Python
+    sha: 67708d5d327e736d80e2f6726968cf02a926310e
+    selection_reason: >
+      Sensitive-information-exposure case chosen to diversify the evaluation
+      beyond injection and path-validation vulnerabilities and exercise
+      reasoning about intended data flow.
