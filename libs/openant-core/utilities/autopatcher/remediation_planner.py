@@ -4790,6 +4790,79 @@ def _removed_line_span(relocated_start: "int | None", hunk_lines: "list[str]") -
     return (first, last)
 
 
+def _insertion_only_boundary_span(relocated_start: "int | None", hunk_lines: "list[str]") -> "tuple[int, int] | None":
+    """The real (1-indexed) repository line span bounding every maximal
+    contiguous '+' run in a hunk that has NO removed ('-') lines at all
+    -- the pure-insertion counterpart to _removed_line_span, used ONLY
+    by check_patch_target_conformance's own insertion-only branch (see
+    its docstring). Caller-restricted to zero-removed-line hunks; this
+    function does not re-check that itself, exactly as _removed_line_span
+    does not re-check "is this hunk a removal" either.
+
+    For each '+' run, `before`/`after` are the real-file positions of the
+    nearest surrounding ' ' (context) line within the hunk (searching
+    outward past any adjacent run, never assumed to be the immediate
+    neighbor). Because `relocated_start` is only ever non-None for a hunk
+    whose own old-side sequence was already uniquely, verbatim matched
+    against the real file, consecutive old-side lines are -- by
+    construction of that match, not by assumption here -- consecutive
+    real file lines; a run missing one side's neighbor (it starts/ends at
+    the hunk's own boundary) has that side derived as the other side +/-
+    1, never guessed independently. A run with NEITHER neighbor (the
+    entire hunk is '+' lines with no old-side line at all) makes this
+    return None -- fails closed rather than inventing a position; see
+    check_patch_target_conformance's own gating, which never reaches
+    this function without a verified `relocated_start` in hand anyway.
+
+    Multiple separate runs are combined into ONE (min(before), max(after))
+    span, exactly mirroring _removed_line_span's own single-span
+    reduction -- this is at least as strict as checking each run
+    individually (the combined span's containment in a range implies
+    every individual run's own containment), and requires every run in
+    the hunk to belong to the SAME approved range, never a mix."""
+    if relocated_start is None:
+        return None
+    offset = 0
+    positions: "list[int | None]" = []
+    for line in hunk_lines:
+        if line[:1] == " ":
+            positions.append(relocated_start + offset)
+            offset += 1
+        else:
+            positions.append(None)
+
+    overall_before: "int | None" = None
+    overall_after: "int | None" = None
+    n = len(hunk_lines)
+    i = 0
+    while i < n:
+        if hunk_lines[i][:1] != "+":
+            i += 1
+            continue
+        run_start = i
+        while i < n and hunk_lines[i][:1] == "+":
+            i += 1
+        run_end = i - 1
+
+        before = next((positions[j] for j in range(run_start - 1, -1, -1) if positions[j] is not None), None)
+        after = next((positions[j] for j in range(run_end + 1, n) if positions[j] is not None), None)
+        if before is None and after is None:
+            return None
+        if before is None:
+            before = after - 1
+        if after is None:
+            after = before + 1
+
+        if overall_before is None or before < overall_before:
+            overall_before = before
+        if overall_after is None or after > overall_after:
+            overall_after = after
+
+    if overall_before is None or overall_after is None:
+        return None
+    return (overall_before, overall_after)
+
+
 def check_patch_target_conformance(
     patch: str,
     relocations: "list",
@@ -4841,6 +4914,36 @@ def check_patch_target_conformance(
     for having none; it is "new_file", and conformant whenever its own
     file is an approved target.
 
+    A hunk with NO removed ('-') lines at all (a pure insertion) never
+    reaches the verbatim-text-anywhere-in-target_source primary check
+    above: that check is blind to WHICH rendered block it matched inside
+    of, so it can be satisfied by an artifact spanning the tail of one
+    rendered block immediately followed by the head of an unrelated
+    adjacent one (target_source is built by literally joining every
+    block's own code with "\n") -- text that exists nowhere contiguously
+    in the real repository file except, possibly, at some unrelated
+    third location the hunk actually touches. A removed line's own real
+    position is always evidence of an actual, singular change; a pure
+    insertion has no such old-side content of its own, only surrounding
+    context, which is exactly the kind of wide/incidental text the
+    verbatim search was never meant to authorize on its own (see
+    _removed_line_span's own docstring for why context, unlike removed
+    content, is deliberately excluded from that fallback's position
+    check). So, whenever such a hunk is already independently, uniquely
+    verified against the real repository file (old_side_status ==
+    "old_side_verified") and at least one approved target range exists
+    for its file, target_coverage is decided ENTIRELY by position (see
+    _insertion_only_boundary_span): its real, verified insertion
+    boundary must fall entirely inside one approved target's own
+    rendered line range, exactly the same range the removed-line
+    fallback above already uses -- never a text search. When no target
+    range exists for the file (the file's only rendered source is a
+    "Full file (last resort)" block -- see _edit_target_line_ranges_
+    for_file's own docstring for why that case has no ranges to check
+    against), or when old_side_status isn't "old_side_verified", this
+    hunk falls through to the same verbatim-text path every other hunk
+    uses -- unchanged.
+
     Never raises: an unparseable/empty patch, or missing relocation data,
     degrades to an empty, non-conformant report rather than crashing.
     """
@@ -4886,26 +4989,41 @@ def check_patch_target_conformance(
                 # an already-approved file scope is covered by construction.
                 target_coverage = "approved_target"
             else:
-                anchors = old_side_anchors(hunk.lines)
-                matched = bool(anchors) and bool(target_source) and (
-                    find_unique_occurrence(anchors, target_source.splitlines()) is not None
-                )
-                if not matched and old_side_status == "old_side_verified" and target_ranges:
-                    # Fallback ONLY for a hunk already independently,
-                    # uniquely verified against the real repository file
-                    # (see this function's own docstring): its own
-                    # verbatim old-side text simply didn't fit inside the
-                    # rendered capsule's fixed padding, but its REMOVED
-                    # lines' real position still lands entirely inside
-                    # one of the approved target's own rendered ranges.
-                    removed_span = _removed_line_span(
+                has_removed_line = any(line[:1] == "-" for line in hunk.lines)
+                if has_removed_line or old_side_status != "old_side_verified" or not target_ranges:
+                    anchors = old_side_anchors(hunk.lines)
+                    matched = bool(anchors) and bool(target_source) and (
+                        find_unique_occurrence(anchors, target_source.splitlines()) is not None
+                    )
+                    if not matched and old_side_status == "old_side_verified" and target_ranges:
+                        # Fallback ONLY for a hunk already independently,
+                        # uniquely verified against the real repository file
+                        # (see this function's own docstring): its own
+                        # verbatim old-side text simply didn't fit inside the
+                        # rendered capsule's fixed padding, but its REMOVED
+                        # lines' real position still lands entirely inside
+                        # one of the approved target's own rendered ranges.
+                        removed_span = _removed_line_span(
+                            getattr(record, "relocated_hunk_start", None), hunk.lines,
+                        )
+                        if removed_span is not None:
+                            matched = any(
+                                start <= removed_span[0] and removed_span[1] <= end
+                                for (start, end) in target_ranges
+                            )
+                else:
+                    # Pure-insertion hunk, already old_side_verified, with
+                    # at least one approved target range for this file:
+                    # position -- never the flat text search -- decides
+                    # coverage (see this function's own docstring and
+                    # _insertion_only_boundary_span).
+                    insertion_span = _insertion_only_boundary_span(
                         getattr(record, "relocated_hunk_start", None), hunk.lines,
                     )
-                    if removed_span is not None:
-                        matched = any(
-                            start <= removed_span[0] and removed_span[1] <= end
-                            for (start, end) in target_ranges
-                        )
+                    matched = insertion_span is not None and any(
+                        start <= insertion_span[0] and insertion_span[1] <= end
+                        for (start, end) in target_ranges
+                    )
                 target_coverage = "approved_target" if matched else "uncovered_target"
 
             conformant = (

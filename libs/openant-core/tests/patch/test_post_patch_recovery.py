@@ -449,6 +449,189 @@ class TestWideContextHunkConformance:
 
 
 # ---------------------------------------------------------------------------
+# TARGET-01 -- insertion-only hunks currently have NO positional check at
+# all: `_removed_line_span` returns None whenever a hunk has zero removed
+# lines, so the removal-hunk position fallback never runs for a pure
+# addition, and target_coverage is decided solely by whether the hunk's
+# unchanged context lines appear, verbatim, ANYWHERE in the file's flat
+# concatenated edit-target-role text (`target_source` -- every rendered
+# block for the file joined by "\n", see _edit_target_source_for_file).
+#
+# That flat search is blind to block boundaries: `target_source` is built
+# by literally joining each rendered block's own code with "\n", so an
+# insertion's context can match an artifact spanning the TAIL of one
+# rendered block immediately followed by the HEAD of the next one -- text
+# that never exists contiguously anywhere in the real repository file
+# except, coincidentally, at some unrelated third location the diff
+# actually touches. `old_side_status` can independently, genuinely be
+# "old_side_verified" for that third location (it's a real, uniquely
+# occurring line sequence there) while that location sits outside every
+# approved target's own rendered line range.
+#
+# This fixture reproduces exactly that: two verified constants (REF, REF2)
+# in one file, rendered adjacently so REF's own tail line is immediately
+# followed (only inside the concatenated `target_source`) by REF2's own
+# head line -- a sequence that exists nowhere contiguously in the real
+# file except at a third, deliberately unrelated location, outside both
+# constants' own rendered ranges.
+# ---------------------------------------------------------------------------
+
+def _write_boundary_artifact_fixture(tmp_path):
+    """A synthetic file with two verified constants, REF (line 10) and
+    REF2 (line 40), far enough apart that their own _DEFINITION_CONTEXT_
+    LINES-padded rendered ranges (7-13 and 37-43) never overlap each
+    other or the unrelated "elsewhere" location (70-72) used below.
+
+    Returns (lines, REF_LINE, REF2_LINE) -- `lines` is 1-indexed via
+    lines[n-1], mirroring test_remediation_planner.py's own
+    _write_class_with_many_attrs helper.
+    """
+    REF_LINE = 10
+    REF2_LINE = 40
+    ELSEWHERE_TAIL_LINE = 70    # verbatim copy of REF's own last padded line
+    ELSEWHERE_BLANK_LINE = 71   # verbatim copy of the blank line the "\n".join
+                                 # of two rendered blocks inserts between them
+    ELSEWHERE_HEAD_LINE = 72    # verbatim copy of REF2's own first padded line
+    TOTAL_LINES = 80
+
+    lines = [f"FILLER_L{i:03d} = 0\n" for i in range(1, TOTAL_LINES + 1)]
+    lines[REF_LINE - 1] = "REF = 1\n"
+    lines[REF_LINE - 1 + 3] = "REF_TAIL_MARKER = 111\n"      # padded end = REF_LINE+3 = 13
+    lines[REF2_LINE - 1 - 3] = "REF2_HEAD_MARKER = 222\n"     # padded start = REF2_LINE-3 = 37
+    lines[REF2_LINE - 1] = "REF2 = 2\n"
+    lines[ELSEWHERE_TAIL_LINE - 1] = "REF_TAIL_MARKER = 111\n"
+    lines[ELSEWHERE_BLANK_LINE - 1] = "\n"
+    lines[ELSEWHERE_HEAD_LINE - 1] = "REF2_HEAD_MARKER = 222\n"
+
+    (tmp_path / "mod.py").write_text("".join(lines), encoding="utf-8")
+    return lines, REF_LINE, REF2_LINE
+
+
+class TestInsertionOnlyHunkBoundaryArtifact:
+    def _build_slice(self, tmp_path):
+        REF_LINE, REF2_LINE = 10, 40
+        context = _make_context(constants={"mod.py": {
+            "REF": {"qualified_name": "REF", "class_name": None, "name": "REF",
+                     "line": REF_LINE, "end_line": REF_LINE},
+            "REF2": {"qualified_name": "REF2", "class_name": None, "name": "REF2",
+                      "line": REF2_LINE, "end_line": REF2_LINE},
+        }}, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:REF", "mod.py:REF2"])
+        from utilities.autopatcher.remediation_planner import build_final_target_slice
+        slice_result = build_final_target_slice(strategy, str(tmp_path), context)
+        return slice_result
+
+    def test_insertion_across_rendered_block_boundary_is_falsely_approved_today(self, tmp_path):
+        """RED: a pure-insertion hunk (zero removed lines) whose context is
+        the REF/REF2 rendered-block-boundary artifact, but whose real,
+        uniquely-verified position (70-72) is outside BOTH REF's (7-13)
+        and REF2's (37-43) own rendered ranges, must be uncovered_target /
+        non-conformant. Today's production code has no positional check
+        for insertion-only hunks at all, so it incorrectly approves this
+        hunk purely because the artifact text is found somewhere in the
+        flattened target_source."""
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import (
+            _edit_target_line_ranges_for_file, _edit_target_source_for_file,
+            check_patch_target_conformance,
+        )
+
+        _write_boundary_artifact_fixture(tmp_path)
+        slice_result = self._build_slice(tmp_path)
+        ready_edits = [_make_ready_edit("mod.py", "mod.py:REF")]
+
+        # --- Fixture-sanity evidence (proves this is the described
+        # boundary artifact, not an unrelated fixture bug) --------------
+        assert "mod.py:REF" in slice_result.covered_target_symbols
+        assert "mod.py:REF2" in slice_result.covered_target_symbols
+        # target_source is exactly what check_patch_target_conformance's
+        # primary text-match searches -- the CODE-only concatenation of
+        # every rendered block for the file, joined by "\n" (see
+        # _edit_target_source_for_file). Joining REF's own rendered block
+        # immediately followed by REF2's own rendered block produces
+        # exactly this artifact text -- present nowhere contiguously in
+        # the real file except at the unrelated "elsewhere" location
+        # (70-72) used by the hunk below.
+        target_source = _edit_target_source_for_file(slice_result.rendered, "mod.py")
+        assert "REF_TAIL_MARKER = 111\n\nREF2_HEAD_MARKER = 222" in target_source
+        target_ranges = _edit_target_line_ranges_for_file(slice_result.rendered, "mod.py")
+        assert (7, 13) in target_ranges
+        assert (37, 43) in target_ranges
+
+        # Pure-insertion hunk (zero '-' lines): context = the boundary
+        # artifact text, verified against the REAL file at lines 70-72 --
+        # nowhere near either target's own (7,13)/(37,43) range.
+        patch = (
+            "--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -70,3 +70,4 @@\n"
+            " REF_TAIL_MARKER = 111\n"
+            " \n"
+            "+NEW_SUPPORTING_LINE = 999\n"
+            " REF2_HEAD_MARKER = 222\n"
+        )
+        patch, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+
+        # --- Evidence: relocation genuinely, uniquely verified this
+        # hunk against the real file (not an unrelated no-match/ambiguous
+        # artifact) ------------------------------------------------------
+        assert len(meta.relocations) == 1
+        assert meta.relocations[0].relocation_reason == "unique_match"
+        assert meta.relocations[0].relocated_hunk_start == 70
+
+        report = check_patch_target_conformance(patch, meta.relocations, ready_edits, slice_result)
+        assert report.results[0].old_side_status == "old_side_verified"
+
+        # This is the bug under test: current production code has no
+        # positional check for insertion-only hunks, so it approves this
+        # hunk purely via the flat text match against the boundary
+        # artifact. After the TARGET-01 fix this must be uncovered_target
+        # / non-conformant, since real position 70-72 is outside every
+        # approved target's own rendered range.
+        assert report.results[0].target_coverage == "uncovered_target", (
+            "expected uncovered_target once insertion-only hunks are positionally "
+            f"validated; got {report.results[0].target_coverage!r} -- this hunk's real, "
+            "verified position (70-72) is outside every approved target range "
+            f"{target_ranges}, and its context only matches target_source via the "
+            "REF/REF2 rendered-block-concatenation boundary, not any real content "
+            "at its own position (see TARGET-01)."
+        )
+        assert report.all_conformant is False
+
+    def test_insertion_genuinely_inside_approved_target_range_is_approved(self, tmp_path):
+        """Paired control: a pure-insertion hunk whose context is
+        genuinely, entirely inside REF's own rendered range (no block
+        boundary involved) must remain approved_target / conformant --
+        both today and after the TARGET-01 fix. Protects the case the
+        fix must not collaterally break."""
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import check_patch_target_conformance
+
+        _write_boundary_artifact_fixture(tmp_path)
+        slice_result = self._build_slice(tmp_path)
+        ready_edits = [_make_ready_edit("mod.py", "mod.py:REF")]
+
+        # Insert a new line between REF's own line (10) and the very next
+        # padded context line (11) -- entirely inside REF's own (7,13)
+        # rendered range, no cross-block artifact involved.
+        patch = (
+            "--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -10,2 +10,3 @@\n"
+            " REF = 1\n"
+            "+SUPPORTING_LINE = 5\n"
+            " FILLER_L011 = 0\n"
+        )
+        patch, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+
+        assert meta.relocations[0].relocation_reason == "unique_match"
+        assert meta.relocations[0].relocated_hunk_start == 10
+
+        report = check_patch_target_conformance(patch, meta.relocations, ready_edits, slice_result)
+        assert report.results[0].old_side_status == "old_side_verified"
+        assert report.results[0].target_coverage == "approved_target"
+        assert report.all_conformant is True
+
+
+# ---------------------------------------------------------------------------
 # _recovered_ready_edit -- promoting a Post-Patch Recovery attempt into the
 # reconciled ReadyEdit set used only by the SECOND (post-regeneration) Patch
 # Target Conformance check. Promotion must use ONLY deterministically
