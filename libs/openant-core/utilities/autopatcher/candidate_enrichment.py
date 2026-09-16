@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -261,6 +262,127 @@ def _collect_repo_constants(repo_root: Path, index: RepositoryIndex) -> dict:
     return constants
 
 
+_CLASS_DECLARATION_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?(?:abstract[ \t]+)?class[ \t]+([A-Za-z_$][\w$]*)")
+"""Matches the same minimal, language-agnostic ``class`` declaration shape
+already used by remediation_planner.py's own
+``_FALLBACK_DECLARATION_RE_PARTS`` (kept independent, not imported from
+there, so this module's enrichment never depends on remediation_planner.py
+internals) -- used ONLY as a sanity gate on an already-read source range in
+``_merge_class_records``, never as a discovery mechanism of its own."""
+
+
+def _merge_class_records(index: RepositoryIndex, analyzer_output_path: str, repo_root: Path) -> None:
+    """Best-effort enrichment: merge usable class records from the sibling
+    ``functions.json`` (written by the same parse that produced
+    ``analyzer_output_path`` -- every parser writes both into the same
+    output directory, see ``core.parser_adapter.parse_repository_multi``'s
+    own documented convention) into an already-built ``index``, so a bare
+    class name (e.g. a Planner-proposed ``file.py:Retry``) can resolve to
+    its real class body via ``remediation_planner.py``'s existing,
+    UNCHANGED ``_resolve_symbol_details`` -- which already handles any
+    ``by_name`` entry generically, regardless of whether it represents a
+    function, method, or class. Without this, ``analyzer_output.json``'s
+    own ``functions`` dict never contains a class-level entry at all (only
+    its individual methods, each tagged ``className``) -- ``RepositoryIndex``
+    has no defect here; the data simply never reaches it, even though it is
+    already written to disk as a free byproduct of the same parse.
+
+    Mutates ``index`` in place -- never returns a new index, never rebuilds
+    it, never touches an entry ``load_index_from_file`` already populated.
+    Every new entry is APPENDED to ``index.by_name``/``index.by_file``
+    lists, never inserted at the front, and a ``class_id`` already present
+    in ``index.functions`` is never overwritten -- so any bare name that
+    already resolved to something before this call resolves to the EXACT
+    SAME thing after it (``RepositoryIndex.search_by_name``'s exact-match
+    branch preserves list order, and ``_resolve_symbol_details`` returns on
+    the FIRST qualifying hit): this function can only ever ADD what was
+    previously unresolvable, never change what already worked.
+
+    Never raises: any failure -- missing/unreadable/malformed
+    ``functions.json``, a class record missing required fields, an
+    unreadable source range, or a source range that doesn't actually start
+    with that class's own declaration -- is isolated to that ONE class
+    record (or to the whole file, for a functions.json-level failure) and
+    skipped. This degrades to exactly today's behavior for that symbol
+    (falling through to remediation_planner.py's existing deterministic
+    identifier fallback), never aborts the merge for other classes, and is
+    never surfaced as an investigation failure.
+
+    Ambiguity rule (fail-closed, never guesses): a class record is only
+    ever merged when it is the UNIQUE eligible class for that
+    ``(file_path, bare_name)`` pair -- two classes sharing a bare name in
+    the same file (nested, or otherwise structurally distinct) are BOTH
+    excluded, never arbitrarily resolved to one of them. The same bare name
+    in a DIFFERENT file is not ambiguous at all: uniqueness is checked per
+    ``(file_path, name)`` pair, never repo-wide, mirroring
+    ``_resolve_symbol_details``'s own file-scoped verification.
+
+    Excluded outright, regardless of uniqueness: function-local classes
+    (``function_local`` truthy) -- a Planner-proposed bare-class target is
+    never meant to reach an ephemeral, function-scoped definition."""
+    functions_json_path = os.path.join(os.path.dirname(analyzer_output_path), "functions.json")
+    try:
+        if not os.path.exists(functions_json_path):
+            return
+        data = read_json(functions_json_path)
+    except Exception:
+        return
+
+    classes = data.get("classes") if isinstance(data, dict) else None
+    if not isinstance(classes, dict) or not classes:
+        return
+
+    # Group eligible records by (file_path, bare name); a group is merged
+    # only when it has exactly one member -- see this function's own
+    # docstring for why ambiguous groups are excluded entirely rather than
+    # arbitrarily resolved to one member.
+    groups: "dict[tuple[str, str], list[tuple[str, dict]]]" = {}
+    for class_id, record in classes.items():
+        if not isinstance(record, dict) or record.get("function_local"):
+            continue
+        name = record.get("name")
+        file_path = record.get("file_path")
+        start_line = record.get("start_line")
+        end_line = record.get("end_line")
+        if not isinstance(name, str) or not name:
+            continue
+        if not isinstance(file_path, str) or not file_path:
+            continue
+        if not isinstance(start_line, int) or not isinstance(end_line, int):
+            continue
+        if start_line <= 0 or start_line > end_line:
+            continue
+        groups.setdefault((file_path, name), []).append((class_id, record))
+
+    for (file_path, name), members in groups.items():
+        if len(members) != 1:
+            continue  # ambiguous same-(file, name) group -- fail closed
+        class_id, record = members[0]
+        start_line, end_line = record["start_line"], record["end_line"]
+
+        try:
+            code = index.read_file_section(file_path, start_line, end_line)
+        except Exception:
+            code = None
+        if not code:
+            continue
+
+        first_line = next((line for line in code.splitlines() if line.strip()), "")
+        match = _CLASS_DECLARATION_RE.match(first_line)
+        if not match or match.group(1) != name:
+            continue  # recorded range doesn't actually start with this class's own declaration
+
+        if class_id in index.functions:
+            continue  # never overwrite an existing entry under this id
+
+        index.functions[class_id] = {
+            "name": name, "startLine": start_line, "endLine": end_line,
+            "code": code, "unitType": "class", "className": None,
+        }
+        index.by_name.setdefault(name, []).append(class_id)
+        index.by_file.setdefault(file_path, []).append(class_id)
+
+
 def build_investigation_context(repo_root: Path, output_dir: Path) -> "InvestigationContext | None":
     """Parse the repository once and assemble the shared artifacts every
     candidate's enrichment reuses.
@@ -311,6 +433,10 @@ def build_investigation_context(repo_root: Path, output_dir: Path) -> "Investiga
 
     try:
         index = load_index_from_file(parse_result.analyzer_output_path, str(repo_root))
+        try:
+            _merge_class_records(index, parse_result.analyzer_output_path, repo_root)
+        except Exception:
+            pass  # best-effort class-record enrichment; never aborts the investigation
         call_graph_data = read_json(call_graph_path)
         functions = call_graph_data.get("functions", {})
         call_graph = call_graph_data.get("call_graph", {})

@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 
 from utilities.agentic_enhancer.reachability_analyzer import ReachabilityAnalyzer
 from utilities.agentic_enhancer.repository_index import RepositoryIndex
 from utilities.autopatcher.candidate_enrichment import (
     InvestigationContext,
+    _merge_class_records,
     _resolve_containing_function,
     build_investigation_context,
     enrich_candidates,
@@ -684,3 +686,196 @@ class TestRealIntegration:
         assert enriched.resolved_function is not None
         assert enriched.resolved_function["name"] == "authenticate_user"
         assert any("check_password" in callee for callee in enriched.callees)
+
+    def test_bare_class_resolves_beyond_the_deterministic_fallback_window(self, tmp_path):
+        """A: real parser/investigation-context regression. A class whose
+        docstring alone runs well past the deterministic identifier
+        fallback's fixed +/-40-line window (remediation_planner.py's
+        _FALLBACK_FIXED_WINDOW_LINES) must still resolve, via the REAL
+        parser and the REAL InvestigationContext.index this test builds
+        with no mocking, to its own true class range -- reaching a method
+        placed after the long docstring, not truncated mid-docstring."""
+        from utilities.autopatcher.remediation_planner import _resolve_symbol_details
+
+        docstring_body = "".join(f"    Line {i} of a long docstring.\n" for i in range(1, 60))
+        src = (
+            "class Widget:\n"
+            '    """\n'
+            f"{docstring_body}"
+            '    """\n'
+            "\n"
+            "    def real_method(self):\n"
+            "        return 1\n"
+        )
+        (tmp_path / "widget.py").write_text(src, encoding="utf-8")
+        real_method_line = src.splitlines().index("    def real_method(self):") + 1
+
+        context = build_investigation_context(tmp_path, tmp_path / "_investigation")
+        assert context is not None, "a real Python file must produce a usable investigation context"
+
+        match = _resolve_symbol_details("Widget", tmp_path, context, verified_files=["widget.py"])
+        assert match is not None
+        assert match.end_line >= real_method_line, (
+            f"expected the real class range to reach real_method at line {real_method_line}, "
+            f"got end_line={match.end_line} -- the class was truncated at the old fixed window"
+        )
+
+
+class TestClassRecordEnrichment:
+    """_merge_class_records -- the sibling-functions.json class-record
+    enrichment step. Exercised directly against synthetic, hand-built
+    functions.json content and a real on-disk source file (read_file_section
+    needs real bytes to read), never against a real repo/CVE -- these are
+    generic invariants, not case-specific regressions."""
+
+    @staticmethod
+    def _write_functions_json(output_dir, classes: dict) -> str:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "functions.json").write_text(json.dumps({"classes": classes}), encoding="utf-8")
+        # _merge_class_records only ever reads os.path.dirname(analyzer_output_path)
+        # -- this file need not exist itself.
+        return str(output_dir / "analyzer_output.json")
+
+    def test_ambiguous_same_bare_name_in_one_file_merges_neither(self, tmp_path):
+        """B: a top-level class and a same-bare-named nested class in the
+        SAME file are structurally distinct records sharing one (file,
+        name) pair -- ambiguous, so NEITHER is merged."""
+        (tmp_path / "mod.py").write_text(
+            "class Retry:\n"
+            "    def top(self):\n"
+            "        return 1\n"
+            "\n"
+            "class Outer:\n"
+            "    class Retry:\n"
+            "        def nested(self):\n"
+            "            return 2\n",
+            encoding="utf-8",
+        )
+        analyzer_output_path = self._write_functions_json(tmp_path / "_out", {
+            "mod.py:Retry": {"name": "Retry", "file_path": "mod.py", "start_line": 1, "end_line": 3, "function_local": False},
+            "mod.py:Outer.Retry": {"name": "Retry", "file_path": "mod.py", "start_line": 6, "end_line": 8, "function_local": False},
+        })
+        index = RepositoryIndex({"functions": {}}, repo_path=str(tmp_path))
+
+        _merge_class_records(index, analyzer_output_path, tmp_path)
+
+        assert "Retry" not in index.by_name
+        assert "mod.py:Retry" not in index.functions
+        assert "mod.py:Outer.Retry" not in index.functions
+
+    def test_function_local_class_is_not_merged(self, tmp_path):
+        """C: a class defined inside a function body (function_local=True)
+        is excluded outright, regardless of uniqueness."""
+        (tmp_path / "mod.py").write_text(
+            "def make():\n    class Local:\n        pass\n    return Local\n",
+            encoding="utf-8",
+        )
+        analyzer_output_path = self._write_functions_json(tmp_path / "_out", {
+            "mod.py:make.Local": {"name": "Local", "file_path": "mod.py", "start_line": 2, "end_line": 3, "function_local": True},
+        })
+        index = RepositoryIndex({"functions": {}}, repo_path=str(tmp_path))
+
+        _merge_class_records(index, analyzer_output_path, tmp_path)
+
+        assert "Local" not in index.by_name
+
+    def test_malformed_class_record_is_not_merged(self, tmp_path):
+        """D: a class record missing a required field (end_line) is
+        skipped -- same behavior as if the class were entirely absent from
+        functions.json."""
+        (tmp_path / "mod.py").write_text(
+            "class Widget:\n    def m(self):\n        pass\n", encoding="utf-8",
+        )
+        analyzer_output_path = self._write_functions_json(tmp_path / "_out", {
+            "mod.py:Widget": {"name": "Widget", "file_path": "mod.py", "start_line": 1},  # no end_line
+        })
+        index = RepositoryIndex({"functions": {}}, repo_path=str(tmp_path))
+
+        _merge_class_records(index, analyzer_output_path, tmp_path)
+
+        assert "Widget" not in index.by_name
+
+    def test_missing_functions_json_degrades_to_no_op(self, tmp_path):
+        """D (continued): no functions.json at all (or an unreadable one)
+        must degrade to exactly today's behavior -- no merge, no error."""
+        index = RepositoryIndex({"functions": {}}, repo_path=str(tmp_path))
+
+        _merge_class_records(index, str(tmp_path / "_out" / "analyzer_output.json"), tmp_path)
+
+        assert index.functions == {}
+        assert index.by_name == {}
+
+    def test_source_range_not_matching_declaration_is_rejected(self, tmp_path):
+        """E: the recorded start/end line does not actually begin with
+        this class's own declaration (simulating a corrupted/garbled
+        range, e.g. from a merged conditional redeclaration) -- rejected,
+        never trusted blindly."""
+        (tmp_path / "mod.py").write_text(
+            "x = 1\ny = 2\nclass Ledger:\n    def m(self):\n        pass\n", encoding="utf-8",
+        )
+        analyzer_output_path = self._write_functions_json(tmp_path / "_out", {
+            "mod.py:Ledger": {"name": "Ledger", "file_path": "mod.py", "start_line": 1, "end_line": 2, "function_local": False},
+        })
+        index = RepositoryIndex({"functions": {}}, repo_path=str(tmp_path))
+
+        _merge_class_records(index, analyzer_output_path, tmp_path)
+
+        assert "Ledger" not in index.by_name
+
+    def test_unreadable_source_range_is_rejected(self, tmp_path):
+        """E (continued): a class record pointing at a file that doesn't
+        exist on disk -- read_file_section returns None, rejected."""
+        analyzer_output_path = self._write_functions_json(tmp_path / "_out", {
+            "missing.py:Ghost": {"name": "Ghost", "file_path": "missing.py", "start_line": 1, "end_line": 5, "function_local": False},
+        })
+        index = RepositoryIndex({"functions": {}}, repo_path=str(tmp_path))
+
+        _merge_class_records(index, analyzer_output_path, tmp_path)
+
+        assert "Ghost" not in index.by_name
+
+    def test_existing_method_resolution_is_unchanged_by_class_enrichment(self, tmp_path):
+        """F: non-interference. A pre-existing METHOD entry (Foo.Handler,
+        className='Foo') shares its bare name "Handler" with a newly
+        eligible top-level class (mod.py:Handler) -- a genuinely different
+        key, so the class DOES get merged (appended), but a bare,
+        unqualified lookup for "Handler" must still resolve to the
+        pre-existing method, unchanged, because it was already first in
+        by_name["Handler"] before enrichment ran and new entries are only
+        ever appended, never reordered or inserted ahead of it."""
+        (tmp_path / "mod.py").write_text(
+            "class Foo:\n"
+            "    def Handler(self):\n"
+            "        return 1\n"
+            "\n"
+            "\n"
+            "class Handler:\n"
+            "    def run(self):\n"
+            "        return 2\n",
+            encoding="utf-8",
+        )
+        analyzer_output_path = self._write_functions_json(tmp_path / "_out", {
+            "mod.py:Handler": {"name": "Handler", "file_path": "mod.py", "start_line": 6, "end_line": 8, "function_local": False},
+        })
+        pre_existing = {
+            "mod.py:Foo.Handler": {
+                "name": "Handler", "startLine": 2, "endLine": 3,
+                "code": "    def Handler(self):\n        return 1\n",
+                "unitType": "method", "className": "Foo",
+            },
+        }
+        index = RepositoryIndex({"functions": pre_existing}, repo_path=str(tmp_path))
+        before = list(index.by_name["Handler"])
+
+        _merge_class_records(index, analyzer_output_path, tmp_path)
+
+        # The class WAS merged (proving the mechanism ran, not that it
+        # silently no-opped) ...
+        assert len(index.by_name["Handler"]) == len(before) + 1
+        assert "mod.py:Handler" in index.functions
+        # ... but the pre-existing method still wins a bare lookup, and the
+        # original entries are an unchanged, un-reordered prefix.
+        results = index.search_by_name("Handler", exact=True)
+        assert results[0]["id"] == "mod.py:Foo.Handler"
+        assert results[0]["unitType"] == "method"
+        assert index.by_name["Handler"][: len(before)] == before
