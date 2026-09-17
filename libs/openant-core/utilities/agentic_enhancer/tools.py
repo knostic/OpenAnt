@@ -379,6 +379,14 @@ class ToolExecutor:
                 return {
                     "error": f"include_functions entries must be objects, "
                     f"got {type(item).__name__}: {item!r}"[:200]}
+            # #614: the schema's `id: string` — an unhashable/absent id
+            # reaches the index lookup and raises (swallowed by the
+            # preserve wrap, but the model should self-correct instead)
+            if not isinstance(item.get("id"), str):
+                return {
+                    "error": f"include_functions entries must carry a "
+                    f"string id, got {type(item.get('id')).__name__}"
+                    f"{'' if item.get('id') is None else ': ' + repr(item.get('id'))[:60]}"}
 
         return {
             "status": "complete",

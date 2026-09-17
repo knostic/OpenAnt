@@ -801,12 +801,21 @@ class ContextEnhancer:
                 # #614: a POST-RESULT assembly failure (agent.py's preserve
                 # path marks assembly_error inside the completed context)
                 # must NOT destroy the paid classification — a bare error
-                # dict replaced it (the 12-raise-class data loss). The
-                # exception raised INSIDE agent.run() (an LLM/parse failure)
-                # still takes the error dict (no completed context exists).
+                # dict replaced it (the 12-raise-class data loss). NOTE the
+                # reachability: agent.py's assembly catch does NOT
+                # re-raise, so this branch is defense-in-depth for a
+                # FUTURE raise-after-store (a print failure in the catch,
+                # or a regression that re-raises) — today the preservation
+                # itself is delivered by agent.py's marker alone. When it
+                # does fire, the classification must be re-read from the
+                # PRESERVED context (the summary/stats keying depends on
+                # it — a stale "error" classification against a completed
+                # context breaks the identity).
                 _preserved = unit.get("agent_context") or {}
                 if _preserved.get("assembly_error"):
                     unit["agent_context"] = _preserved
+                    classification = _preserved.get(
+                        "security_classification", classification)
                 else:
                     unit["agent_context"] = {
                         "error": error_info,
@@ -1139,7 +1148,12 @@ class ContextEnhancer:
                 stats["error_summary"][err_type] = stats["error_summary"].get(err_type, 0) + 1
                 continue
             stats["units_processed"] += 1
-            if agent_ctx.get("include_functions"):
+            # #614: an assembly_error context is a COMPLETED analysis whose
+            # code was not inlined — the include_functions were requested
+            # but NOT delivered; counting them as units_with_context /
+            # functions_added claims delivery that failed.
+            _assembly_failed = bool(agent_ctx.get("assembly_error"))
+            if agent_ctx.get("include_functions") and not _assembly_failed:
                 stats["units_with_context"] += 1
                 stats["functions_added"] += len(agent_ctx["include_functions"])
             classification = agent_ctx.get("security_classification", "neutral")

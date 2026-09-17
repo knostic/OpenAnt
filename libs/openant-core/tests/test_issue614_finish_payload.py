@@ -21,9 +21,9 @@ Three fixes:
    shapes — an assembly_error-marked context is PRESERVED (the
    completed verdict exists); a genuine agent.run() failure (an
    LLM/parse raise with no completed context) still takes the error
-   dict. Fix 3 also groups error_summary by the recorded
-   exception_class when type == "unknown" (the capture was fine; the
-   bucketing was coarse).
+   dict. (Reachability, disclosed: agent.py's assembly catch does NOT
+   re-raise, so the handler's preserve branch is defense-in-depth for
+   a future raise-after-store; the preservation itself is layer 2's.)
 """
 
 import sys
@@ -33,7 +33,6 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tests.test_agent_degenerate_exit import _agent, _run  # noqa: E402
 from utilities.agentic_enhancer.tools import ToolExecutor  # noqa: E402
 from utilities.llm.adapter import (  # noqa: E402
     CompletionResult,
@@ -103,7 +102,7 @@ def test_the_assembly_failure_preserves_the_classification():
     completed classification + reasoning + usage SURVIVE with the
     assembly_error marker beside them (never an error dict)."""
     class _PoisonIndex:
-        adapter = None  # the agent's constructor reads index.adapter
+        # (the constructor reads binding.adapter — index.adapter is unused)
 
         def get_function(self, _id):
             raise RuntimeError("index exploded")
@@ -132,16 +131,49 @@ def test_the_assembly_failure_preserves_the_classification():
 
 
 
-def test_a_healthy_assembly_is_unchanged():
-    """The control: a valid finish with a resolvable id inlines the code
-    and carries NO assembly_error."""
-    result = _run(_agent([
-        CompletionResult(
-            content=[_finish_block("neutral", [{"id": "a.py:f"}])],
-            input_tokens=5, output_tokens=2, stop_reason="tool_use",
-            usage_details=None)]))
-    assert result.security_classification == "neutral"
-    assert "assembly_error" not in (result.to_dict())
+def test_a_validator_regression_still_preserves_the_classification():
+    """DEFENSE-IN-DEPTH, driven: monkeypatch _finish to accept the
+    historical bare-string payload (the validator regressed) and drive
+    the REAL enhance_unit_with_agent — the assembly wrap still catches
+    at the historical site (func_info.get on a str) and the completed
+    classification survives (the handler never fires: the wrap does not
+    re-raise)."""
+    from utilities.agentic_enhancer.tools import ToolExecutor
+    from tests.test_agent_degenerate_exit import _FakeAdapter, _FakeBinding
+    from tests.test_agent_degenerate_exit import _FakeTracker, _StubIndex
+    from utilities.agentic_enhancer.agent import enhance_unit_with_agent
+    from utilities.llm.adapter import ToolUseBlock
+
+    def _regressed_finish(self, input):
+        return {"status": "complete", "result": input}
+
+    # the historical malformed payload: a BARE STRING element
+    _bare = ToolUseBlock(id="t1", name="finish", input={
+        "include_functions": ["a.py:f"], "usage_context": "ctx",
+        "security_classification": "neutral",
+        "classification_reasoning": "r", "confidence": 0.5,
+    })
+    unit = {"id": "a.py:f", "unit_type": "function",
+            "language": "python",
+            "code": {"primary_code": "def f(): pass"},
+            "route": {"file": "a.py", "name": "f"}}
+    orig = ToolExecutor._finish
+    ToolExecutor._finish = _regressed_finish
+    try:
+        enhance_unit_with_agent(
+            unit, _StubIndex(),
+            _FakeBinding(_FakeAdapter([
+                CompletionResult(content=[_bare],
+                                 input_tokens=5, output_tokens=2,
+                                 stop_reason="tool_use",
+                                 usage_details=None)])),
+            tracker=_FakeTracker())
+    finally:
+        ToolExecutor._finish = orig
+    ctx = unit["agent_context"]
+    # the completed, paid classification SURVIVES the assembly raise
+    assert ctx["security_classification"] == "neutral"
+    assert ctx["assembly_error"]["exception_class"] == "AttributeError"
 
 
 # ---------------------------------------------------------------------------
