@@ -16,8 +16,10 @@ CLI report consumer (``_usage_to_info`` previously dropped it — the
 report-phase masquerade would have survived the tracker fix alone).
 
 The census pin (source-level): every production ``record_call``/
-``_extract_usage`` call passes ``pricing=`` — the 14+2+1 receipts (the
-+1 is #616's verifier exception-path record).
+``_extract_usage`` call passes ``pricing=`` — the 14+2+2 receipts (the
+first +1 is #616's verifier exception-path record; the second is #609's
+agent exception-path record — the enhance loop records its failed
+attempts the same way).
 """
 
 import ast
@@ -180,7 +182,7 @@ def test_every_production_call_site_passes_pricing():
                 if not any(k.arg == "pricing" for k in node.keywords):
                     offenders.append(f"{rel}:{node.lineno}")
                 checked += 1
-    assert checked == 17, f"the census changed: {checked} sites (was 17)"
+    assert checked == 18, f"the census changed: {checked} sites (was 18)"
     assert not offenders, f"unthreaded production callers: {offenders}"
 
 
