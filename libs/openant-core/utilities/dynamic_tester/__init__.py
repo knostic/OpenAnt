@@ -239,6 +239,19 @@ def run_dynamic_tests(
     # still reading the cumulative (#280 fixed the console lines only).
     _baseline_cost_usd = tracker.total_cost_usd
 
+    # #608: the summary's stage-local usage — the DELTA from the pre-stage
+    # baseline (the stage's OWN spend: the restored attempts' prior usage
+    # [the injection] + this run's fresh calls, EXCLUDING the earlier
+    # phases). The baseline snapshot follows the #333 refresh (the injection
+    # updates it) so the published figure is the same stage-local number
+    # the console lines and the markdown report show — the "total cost
+    # across runs" contract.
+    _summary_baseline: dict = {}
+    try:
+        _summary_baseline = dict(tracker.get_totals())
+    except Exception:  # noqa: BLE001
+        _summary_baseline = {}
+
     # Inject prior usage from ALL existing checkpoints (both successful and
     # errored) so the report shows total cost across runs. The errored
     # entries will be retried — their initial attempt cost is preserved,
@@ -264,6 +277,13 @@ def run_dynamic_tests(
         # their ORIGINAL run's console line, and a pre-injection snapshot
         # double-counted it here (the #281 cross-phase contract, extended to
         # the dynamic-test step).
+        if _summary_baseline:
+            _sb = tracker.get_totals()
+            _summary_baseline.update({
+                "total_input_tokens": _sb.get("total_input_tokens", 0),
+                "total_output_tokens": _sb.get("total_output_tokens", 0),
+                "total_cost_usd": _sb.get("total_cost_usd", 0.0),
+            })
         if usage_baseline is not None:
             _tot = tracker.get_totals()
             usage_baseline["cost_usd"] = _tot.get("total_cost_usd",
@@ -272,6 +292,27 @@ def run_dynamic_tests(
                                                 usage_baseline["tokens"])
             usage_baseline["calls"] = _tot.get("total_calls",
                                                usage_baseline["calls"])
+
+    def _summary_usage():
+        try:
+            t = tracker.get_totals()
+            u = {
+                "input_tokens": t.get("total_input_tokens", 0)
+                - _summary_baseline.get("total_input_tokens", 0),
+                "output_tokens": t.get("total_output_tokens", 0)
+                - _summary_baseline.get("total_output_tokens", 0),
+                "cost_usd": round(t.get("total_cost_usd", 0.0)
+                                  - _summary_baseline.get("total_cost_usd", 0.0), 6),
+            }
+            # #216: the incomplete-cost markers survive; #605: the counter.
+            if t.get("cost_incomplete"):
+                u["cost_incomplete"] = True
+                u["unpriced_models"] = t.get("unpriced_models") or []
+            if t.get("accounting_errors"):
+                u["accounting_errors"] = t.get("accounting_errors")
+            return u
+        except Exception:  # noqa: BLE001 — a usage read must never kill the stage
+            return None
 
     results: list[DynamicTestResult] = []
 
@@ -287,7 +328,7 @@ def run_dynamic_tests(
     _completed = _counts["completed"]
     _errors = _counts["errors"]
     checkpoint.ensure_dir()
-    checkpoint.write_summary(total, _completed, _errors, _counts["error_breakdown"], phase="in_progress")
+    checkpoint.write_summary(total, _completed, _errors, _counts["error_breakdown"], phase="in_progress", usage=_summary_usage())
 
     print(f"Dynamic testing {total} findings from {repo_info['name']} "
           f"({restored} already done, {remaining} remaining)",
@@ -404,7 +445,8 @@ def run_dynamic_tests(
                 _completed = _counts["completed"]
                 _errors = _counts["errors"]
                 checkpoint.write_summary(total, _completed, _errors, _counts["error_breakdown"],
-                                         phase="in_progress")
+                                         phase="in_progress",
+                                         usage=_summary_usage())
             continue
 
         print(f"  Generated (${generation_cost:.4f}). Running in Docker...",
@@ -493,7 +535,7 @@ def run_dynamic_tests(
             _counts = _summary_counts_from_checkpoints(checkpoint.load())
             _completed = _counts["completed"]
             _errors = _counts["errors"]
-            checkpoint.write_summary(total, _completed, _errors, _counts["error_breakdown"], phase="in_progress")
+            checkpoint.write_summary(total, _completed, _errors, _counts["error_breakdown"], phase="in_progress", usage=_summary_usage())
 
         print(f"  Result: {result.status} ({result.elapsed_seconds:.1f}s)",
               file=sys.stderr)
@@ -539,6 +581,7 @@ def run_dynamic_tests(
         # authoritative record, structurally identical to status().
         _counts = _summary_counts_from_checkpoints(checkpoint.load())
         checkpoint.write_summary(total, _counts["completed"],
-                                 _counts["errors"], _counts["error_breakdown"], phase="done")
+                                 _counts["errors"], _counts["error_breakdown"], phase="done",
+                                 usage=_summary_usage())
 
     return results
