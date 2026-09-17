@@ -8,10 +8,14 @@ missing key. A summary-reading consumer saw $0 for the whole stage.
 
 The fix adds ``usage=`` to the four existing write sites with the same
 accounting requirements as the llr sibling: the DELTA from the pre-stage
-baseline (the stage's OWN spend: the restored attempts' prior usage [the
-injection] + this run's fresh calls — the ``#333`` "total cost across
-runs" contract), the ``#216`` markers and the ``#605`` counter preserved,
-exception-safe (a usage read must never kill the stage).
+baseline (the stage's OWN spend ACROSS RUNS: the restored attempts' prior
+usage [the #333 injection — INCLUDED, the _summary.json family contract:
+enhance/analyze/verify/llr all publish prior+fresh] + this run's fresh
+calls; the earlier phases' spend EXCLUDED), the #216 markers and the #605
+counter preserved, exception-safe (a failed baseline snapshot publishes
+usage=None, never a cumulative misread). The CONSOLE baseline refreshes
+separately at the #333 site (the restored spend's original console line
+already printed it) — two channels, two figures, both correct.
 """
 
 import re
@@ -87,3 +91,179 @@ def test_the_helper_is_exception_safe():
     src = (PROJECT_ROOT / "utilities" / "dynamic_tester" / "__init__.py").read_text()
     assert "a usage read must never kill the stage" in src  # ASCII-only pin
     assert "except Exception" in src
+
+
+def test_the_resumed_pass_start_carries_the_restored_spend(tmp_path,
+                                                            monkeypatch):
+    """THE FAMILY-CONTRACT RECEIPT (the decisive branch, driven): a resumed
+    run whose checkpoint carries prior spend (1000 in / 500 out / $0.60)
+    publishes that spend in the pass-start write's usage — prior+fresh,
+    the same _summary.json contract as enhance/analyze/verify/llr. The
+    baseline is NOT refreshed at the injection (the CONSOLE baseline is —
+    two channels, two figures, both correct). A regression that refreshes
+    the summary baseline after the injection reads 0 here."""
+    import json as _json
+    import core.dynamic_tester as cd
+    import utilities.dynamic_tester as dt
+    from utilities.llm_client import reset_global_tracker, get_global_tracker
+    from tests.test_issue333_dyn_test_cost_delta import _NoopAdapter
+    from utilities.llm import PhaseBinding
+
+    reset_global_tracker()
+    tracker = get_global_tracker()
+    # an EARLIER phase's spend on the shared tracker (the exclusion half)
+    tracker.add_prior_usage(5000, 5000, 2.5)
+
+    pipeline = tmp_path / "pipeline_output.json"
+    pipeline.write_text(_json.dumps({
+        "repository": {"name": "t", "language": "python"},
+        "application_type": "unknown",
+        "findings": [{
+            "id": "f1", "name": "X", "short_name": "x",
+            "location": "a.py:1", "cwe_id": 79,
+            "stage2_verdict": "confirmed", "vulnerable_code": "eval(x)",
+            "attack_vector": "a", "steps_to_reproduce": "s",
+            "impact": "i", "suggested_fix": "f",
+        }],
+    }))
+    out = tmp_path / "out"
+    out.mkdir()
+    cp = out / "dynamic_test_checkpoints"
+    cp.mkdir()
+    # the RESTORED attempt's prior spend — injected by the #333 loop
+    (cp / "f1.json").write_text(_json.dumps({
+        "id": "f1", "status": "ERROR",
+        "generation_cost_usd": 0.60,
+        "generation_input_tokens": 1000, "generation_output_tokens": 500,
+    }))
+    (cp / "_summary.json").write_text(_json.dumps(
+        {"total_units": 1, "completed": 0, "errors": 1}))
+
+    class _FakeRegistry:
+        def get(self, phase):
+            return PhaseBinding(phase=phase, adapter=_NoopAdapter(),
+                                model="m", provider_name="anthropic")
+
+    # capture every write
+    from core.checkpoint import StepCheckpoint
+    writes = []
+    real_write = StepCheckpoint.write_summary
+
+    _POS = ("total_units", "completed", "errors", "error_breakdown")
+
+    def capture(self, *args, **kw):
+        rec = dict(zip(_POS, args))
+        rec.update(kw)
+        writes.append(rec)
+        return real_write(self, *args, **kw)
+
+    def gen(*a, **k):
+        tracker.record_call("retry/model", 100, 50,
+                            pricing={"input": 3.0, "output": 15.0})
+        return None
+
+    monkeypatch.setattr(dt, "generate_test", gen)
+    monkeypatch.setattr(StepCheckpoint, "write_summary", capture)
+    monkeypatch.setattr(cd.shutil, "which",
+                        lambda n: "/usr/bin/docker" if n == "docker"
+                        else None)
+    try:
+        cd.run_tests(pipeline_output_path=str(pipeline), output_dir=str(out),
+                     registry=_FakeRegistry())
+    finally:
+        StepCheckpoint.write_summary = real_write
+
+    # the pass-start write: completed=0 (nothing yet) but the usage carries
+    # the RESTORED prior (1000 in) — NEVER completed=N at usage=0
+    start = writes[0]
+    assert start["phase"] == "in_progress"
+    assert start["usage"]["input_tokens"] == 1000
+    assert start["usage"]["output_tokens"] == 500
+    assert abs(start["usage"]["cost_usd"] - 0.6) < 1e-9
+    # the terminal write: prior (1000) + the retry's fresh 100 — the
+    # earlier phase's 5000 EXCLUDED throughout
+    done = writes[-1]
+    assert done["usage"]["input_tokens"] == 1100
+    assert done["usage"]["output_tokens"] == 550
+    assert abs(done["usage"]["cost_usd"] - (0.6 + 0.00105)) < 1e-6
+
+
+def test_a_failed_baseline_snapshot_publishes_none(tmp_path, monkeypatch):
+    """The degraded path, DRIVEN: a tracker whose get_totals raises at entry
+    publishes usage=None (the honest absence — the llr sibling's shape),
+    never the raw run-cumulative misread as a stage delta."""
+    import json as _json
+    import core.dynamic_tester as cd
+    import utilities.dynamic_tester as dt
+    from utilities.llm_client import reset_global_tracker, get_global_tracker
+    from tests.test_issue333_dyn_test_cost_delta import _NoopAdapter
+    from utilities.llm import PhaseBinding
+
+    reset_global_tracker()
+    get_global_tracker().add_prior_usage(5000, 5000, 2.5)  # earlier phases
+
+    pipeline = tmp_path / "pipeline_output.json"
+    pipeline.write_text(_json.dumps({
+        "repository": {"name": "t", "language": "python"},
+        "application_type": "unknown",
+        "findings": [{
+            "id": "f1", "name": "X", "short_name": "x",
+            "location": "a.py:1", "cwe_id": 79,
+            "stage2_verdict": "confirmed", "vulnerable_code": "eval(x)",
+            "attack_vector": "a", "steps_to_reproduce": "s",
+            "impact": "i", "suggested_fix": "f",
+        }],
+    }))
+
+    class _PoisonedTotals:
+        def __getattr__(self, name):
+            if name == "get_totals":
+                raise RuntimeError("tracker exploded")
+            raise AttributeError(name)
+
+    class _FakeRegistry:
+        def get(self, phase):
+            return PhaseBinding(phase=phase, adapter=_NoopAdapter(),
+                                model="m", provider_name="anthropic")
+
+    from core.checkpoint import StepCheckpoint
+    writes = []
+    real_write = StepCheckpoint.write_summary
+
+    _POS = ("total_units", "completed", "errors", "error_breakdown")
+
+    def capture(self, *args, **kw):
+        rec = dict(zip(_POS, args))
+        rec.update(kw)
+        writes.append(rec)
+        return real_write(self, *args, **kw)
+
+    monkeypatch.setattr(dt, "generate_test", lambda *a, **k: None)
+    monkeypatch.setattr(StepCheckpoint, "write_summary", capture)
+    monkeypatch.setattr(cd.shutil, "which",
+                        lambda n: "/usr/bin/docker" if n == "docker"
+                        else None)
+    # poison the GLOBAL tracker's get_totals — a TRANSIENT mid-stage failure:
+    # the first call (the step wrapper's entry snapshot, core/dynamic_tester.py:47)
+    # succeeds; every later read raises. The summary baseline then reads None
+    # and publishes usage=None (never a cumulative misread as a delta).
+    _real_get_totals = type(dt.get_global_tracker()).get_totals
+    _calls = {"n": 0}
+
+    def _flaky_get_totals(self):
+        _calls["n"] += 1
+        if _calls["n"] == 1:
+            return _real_get_totals(self)
+        raise RuntimeError("tracker exploded mid-stage")
+
+    monkeypatch.setattr(type(dt.get_global_tracker()), "get_totals",
+                        _flaky_get_totals)
+    try:
+        dt.run_dynamic_tests(pipeline_output_path=str(pipeline),
+                             output_dir=str(tmp_path / "out"),
+                             registry=_FakeRegistry())
+    finally:
+        StepCheckpoint.write_summary = real_write
+    # every write carries usage=None — never a cumulative misread as delta
+    assert writes
+    assert all(w["usage"] is None for w in writes), writes

@@ -3,6 +3,13 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-15] — The dynamic-test checkpoint summaries publish the stage-local usage (#608)
+
+### Fixed
+
+- **The dynamic-test checkpoint summaries were usage-blind at every write site** — including the terminal `phase="done"` one. A summary-reading consumer saw $0 for the whole stage mid-run. The four existing write sites (pass start, generation failures, per-outcome, termination) now carry `usage=`: the **delta from the pre-stage baseline** — the stage's own spend **across runs** (the restored attempts' prior usage [the #333 injection — **included**, the `_summary.json` family contract: enhance/analyze/verify/llr all publish prior+fresh] plus this run's fresh calls; the earlier phases' spend on the shared tracker excluded). The #216 markers and the #605 accounting-error counter survive the publication; a failed baseline snapshot publishes `usage=None` (the honest absence — never the run-cumulative misread as a delta). The console baseline refreshes separately at the #333 site (the restored spend's original console line already printed it) — two channels, two figures, both correct; the resumed pass-start snapshot carries the restored units' spend, never `completed=N` at `usage=0`.
+
+## [2026-09-15] — The llr checkpoint summaries publish the stage-local running usage (#603)
 ## [2026-09-15] — The llr checkpoint summaries publish the stage-local running usage (#603)
 
 ### Fixed

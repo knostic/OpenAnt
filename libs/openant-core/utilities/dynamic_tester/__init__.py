@@ -240,17 +240,24 @@ def run_dynamic_tests(
     _baseline_cost_usd = tracker.total_cost_usd
 
     # #608: the summary's stage-local usage — the DELTA from the pre-stage
-    # baseline (the stage's OWN spend: the restored attempts' prior usage
-    # [the injection] + this run's fresh calls, EXCLUDING the earlier
-    # phases). The baseline snapshot follows the #333 refresh (the injection
-    # updates it) so the published figure is the same stage-local number
-    # the console lines and the markdown report show — the "total cost
-    # across runs" contract.
-    _summary_baseline: dict = {}
+    # baseline: the stage's OWN spend across runs (the restored attempts'
+    # prior usage [the #333 injection] + this run's fresh calls), EXCLUDING
+    # the earlier phases' spend on the shared tracker. The baseline snapshot
+    # PRECEDES the injection (NOT refreshed after it — the family contract:
+    # every _summary.json writer — enhance, analyze, verify, llm — publishes
+    # prior+fresh; the CONSOLE line refreshes its baseline separately at
+    # the #333 block so its delta excludes the restored spend that the
+    # original run's console line already printed — two channels, two
+    # figures, both correct). On a resumed run the pass-start snapshot
+    # therefore carries the restored units' spend — never completed=N at
+    # usage=0 (the "$0 for the whole stage" shape this issue exists to
+    # remove).
+    _summary_baseline: dict | None = None
     try:
         _summary_baseline = dict(tracker.get_totals())
-    except Exception:  # noqa: BLE001
-        _summary_baseline = {}
+    except Exception:  # noqa: BLE001 — None publishes usage=None (the honest
+        # absence, matching the llr sibling), never a cumulative-as-delta
+        _summary_baseline = None
 
     # Inject prior usage from ALL existing checkpoints (both successful and
     # errored) so the report shows total cost across runs. The errored
@@ -276,14 +283,10 @@ def run_dynamic_tests(
         # the injection — the restored checkpoints' spend was reported by
         # their ORIGINAL run's console line, and a pre-injection snapshot
         # double-counted it here (the #281 cross-phase contract, extended to
-        # the dynamic-test step).
-        if _summary_baseline:
-            _sb = tracker.get_totals()
-            _summary_baseline.update({
-                "total_input_tokens": _sb.get("total_input_tokens", 0),
-                "total_output_tokens": _sb.get("total_output_tokens", 0),
-                "total_cost_usd": _sb.get("total_cost_usd", 0.0),
-            })
+        # the dynamic-test step). NOTE: ONLY the console baseline refreshes
+        # — the _summary.json baseline above stays pre-injection (the family
+        # contract: the summary publishes prior+fresh; the console excludes
+        # the restored spend).
         if usage_baseline is not None:
             _tot = tracker.get_totals()
             usage_baseline["cost_usd"] = _tot.get("total_cost_usd",
@@ -294,6 +297,11 @@ def run_dynamic_tests(
                                                usage_baseline["calls"])
 
     def _summary_usage():
+        # #608: a baseline that could not be snapshotted publishes usage=None
+        # (the honest absence — the llr sibling's degraded path), never the
+        # raw run-cumulative misread as a stage delta.
+        if _summary_baseline is None:
+            return None
         try:
             t = tracker.get_totals()
             u = {
