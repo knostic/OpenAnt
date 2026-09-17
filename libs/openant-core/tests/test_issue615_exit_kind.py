@@ -123,10 +123,25 @@ def test_the_enhance_result_carries_the_histogram():
 
 
 def test_the_step_summary_threads_the_histogram():
-    """Source pin: the scanner's enhance summary forwards the histogram
-    (the artifact visibility — no stderr mining)."""
-    src = (PROJECT_ROOT / "core" / "scanner.py").read_text()
-    assert '"incomplete_summary"' in src
+    """Source pin: BOTH summary writers forward the histogram FLAT —
+    a sibling of the error_summary gate, never nested inside it (the
+    nesting bug the pipeline round caught: a zero-error run with
+    incompletes dropped the histogram from the standalone enhance step
+    report)."""
+    scanner = (PROJECT_ROOT / "core" / "scanner.py").read_text()
+    cli = (PROJECT_ROOT / "openant" / "cli.py").read_text()
+    # the flat shape in BOTH writers: the error_summary block closes
+    # BEFORE the histogram gate
+    assert ('if enhance_result.error_summary:\n'
+            '                    ctx.summary["error_summary"]'
+            in scanner)
+    assert ('if getattr(enhance_result, "incomplete_summary", None):\n'
+            '                    ctx.summary["incomplete_summary"]'
+            in scanner)
+    assert ('if result.error_summary:\n'
+            '                ctx.summary["error_summary"]' in cli)
+    assert ('if getattr(result, "incomplete_summary", None):\n'
+            '                ctx.summary["incomplete_summary"]' in cli)
 
 
 def test_the_enhancer_source_counts_the_kinds():
@@ -143,8 +158,9 @@ def test_the_enhancer_source_counts_the_kinds():
 
 def test_the_real_exits_stamp_their_kinds():
     """Drive the real agent loop (the test_agent_degenerate_exit harness
-    pattern) for the two cheaply-simulable exits and assert the stamp on
-    the REAL AgentResult — not a hand-constructed one."""
+    pattern) for all FOUR exits and assert the stamp on the REAL
+    AgentResult — not a hand-constructed one (the harness already drives
+    the no-tool-calls and max-iterations shapes)."""
     from tests.test_agent_degenerate_exit import _agent, _run
     from utilities.llm.adapter import CompletionResult, TextBlock
 
@@ -168,3 +184,25 @@ def test_the_real_exits_stamp_their_kinds():
     ]))
     assert result2.security_classification == "incomplete"
     assert result2.exit_kind == "finish_truncated"  # the real stamp
+
+    # THE no-tool-calls exit (the harness's sibling shape)
+    result3 = _run(_agent([
+        CompletionResult(
+            content=[TextBlock("hmm")],
+            input_tokens=1, output_tokens=1, stop_reason="tool_use",
+        )
+    ]))
+    assert result3.security_classification == "incomplete"
+    assert result3.exit_kind == "no_tool_calls"  # the real stamp
+
+    # THE max-iterations exit (every iteration a non-finish tool)
+    from utilities.llm.adapter import ToolUseBlock
+    looping = CompletionResult(
+        content=[ToolUseBlock(id="t", name="search_usages", input={})],
+        input_tokens=1, output_tokens=1, stop_reason="tool_use",
+    )
+    agent = _agent([looping])
+    agent.tool_executor.execute = lambda name, inp: {"status": "ok", "result": {}}
+    result4 = _run(agent)
+    assert result4.security_classification == "incomplete"
+    assert result4.exit_kind == "max_iterations"  # the real stamp

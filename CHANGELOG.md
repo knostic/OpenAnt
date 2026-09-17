@@ -3,6 +3,12 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-14] — The degenerate exits get their own diagnostic channel (#615)
+
+### Fixed
+
+- **The four degenerate enhance exits are distinguishable in the artifacts.** Three cheap model-behavior exits (end-turn-without-finish, finish truncated at max_tokens, no tool calls) and the budget-exhaustion exit (MAX_ITERATIONS) were conflated under one `classification: "incomplete"` — a consumer reading only the classification could not split the 41-vs-4. `exit_kind` now stamps each `AgentResult` (a completed analysis carries no key — the completed-record byte-identity), and the `incomplete_summary` histogram aggregates the kinds beside `error_summary`, carried by `EnhanceResult` (present-only) and threaded by BOTH step-report writers — the scanner's pipeline summary and the standalone CLI's enhance summary, FLAT siblings of the error_summary gate (a zero-error run with incompletes carries the histogram too). Legacy unstamped rows fall back to `"unstamped"`. The classification and every existing `== "incomplete"` consumer are unchanged.
+
 ## [2026-09-14] — The enhance non-verdicts: the sentinel contract (#611)
 
 ### Fixed
