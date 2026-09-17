@@ -520,6 +520,49 @@ def analyze_reachability(
     #     runs over them under the CURRENT promotion policy.
     # ------------------------------------------------------------------
     checkpoint = None
+    # #603: the stage-local running usage — the DELTA from this function's
+    # entry (the step_context semantics: a snapshot of the global
+    # tracker's totals at entry, and every publication reports
+    # current-minus-baseline). The global tracker is cumulative (prior
+    # phases' spend included), so a naive totals read would double-count
+    # with the step report and the earlier phases' summaries. The
+    # terminal summary equals the step report's delta while the windows
+    # between the two snapshots (step_context's start vs this entry)
+    # stay spend-free — they are co-located, not one shared boundary
+    # (a future LLM call between them would need a pin; none exists
+    # today).
+    _usage_baseline = None
+    if tracker is not None:
+        try:
+            _usage_baseline = tracker.get_totals()
+        except Exception:  # noqa: BLE001
+            _usage_baseline = None
+
+    def _summary_usage():
+        if tracker is None or _usage_baseline is None:
+            return None
+        try:
+            t = tracker.get_totals()
+            u = {
+                "input_tokens": t.get("total_input_tokens", 0)
+                - _usage_baseline.get("total_input_tokens", 0),
+                "output_tokens": t.get("total_output_tokens", 0)
+                - _usage_baseline.get("total_output_tokens", 0),
+                "cost_usd": round(t.get("total_cost_usd", 0.0)
+                                  - _usage_baseline.get("total_cost_usd", 0.0), 6),
+            }
+            # #216: the incomplete-cost markers survive the publication;
+            # #605: the accounting-error counter too. Run-cumulative (the
+            # accepted trade in step_report.py:147-163).
+            if t.get("cost_incomplete"):
+                u["cost_incomplete"] = True
+                u["unpriced_models"] = t.get("unpriced_models") or []
+            if t.get("accounting_errors"):
+                u["accounting_errors"] = t.get("accounting_errors")
+            return u
+        except Exception:  # noqa: BLE001 — a usage read must never kill the pass
+            return None
+
     adopted: Dict[str, dict] = {}
     units_to_run = units
     if checkpoint_path is not None:
@@ -594,6 +637,7 @@ def analyze_reachability(
                       file=sys.stderr)
             checkpoint = None
             prior_records = {}
+
         if checkpoint is not None:
             current_sha = {u.get("id"): _projection_sha(u) for u in units}
             for uid, rec in prior_records.items():
@@ -611,39 +655,6 @@ def analyze_reachability(
             units_to_run = [u for u in units if u.get("id") not in adopted]
             if stats is not None:
                 stats["units_adopted"] = len(adopted)
-            # Family lifecycle (deep-refute 2026-09-08): an in_progress
-            # summary at PASS START, exactly as analyzer.py:719-722 does —
-            # a run killed mid-loop after a prior completed pass must NOT
-            # leave a stale phase="done" summary behind (the Go resume
-            # sweep reads it and would suppress the fresh/resume prompt
-            # entirely, checkpoint.go:115-116).
-            try:
-                checkpoint.write_summary(
-                    total_units=len(units),
-                    completed=len(adopted),
-                    errors=0,
-                    error_breakdown={},
-                    phase="in_progress",
-                    usage=None,
-                    incomplete=max(0, len(units) - len(adopted)),
-                )
-            except OSError as exc:
-                # #599: this write is load-bearing for the resume sweep
-                # (a stale phase=done suppresses the fresh prompt) — its
-                # failure must be LOUD like the init/save siblings, never
-                # `pass` (which was silent even WITH an on_error), and
-                # counted so the report carries it without any callback.
-                if on_error:
-                    on_error(
-                        "llm_reach pass-start summary write failed "
-                        "(resume sweep may read a stale or absent phase): "
-                        f"{exc}")
-                else:
-                    print(
-                        "[LLMReach] pass-start summary write failed "
-                        "(resume sweep may read a stale or absent phase): "
-                        f"{exc}", file=sys.stderr)
-                checkpoint_summary_write_failures += 1
             # Restored cost lands as PRIOR usage — never zero, never this run's
             # new spend (the #26/#26b kill-vs-complete asymmetry lessons).
             if adopted and tracker is not None:
@@ -664,6 +675,42 @@ def analyze_reachability(
                 except Exception:  # noqa: BLE001 — accounting must never kill the pass
                     pass
 
+            # Family lifecycle (deep-refute 2026-09-08): an in_progress
+            # summary at PASS START, exactly as analyzer.py:719-722 does —
+            # a run killed mid-loop after a prior completed pass must NOT
+            # leave a stale phase="done" summary behind (the Go resume
+            # sweep reads it and would suppress the fresh/resume prompt
+            # entirely, checkpoint.go:115-116).
+            try:
+                checkpoint.write_summary(
+                    total_units=len(units),
+                    completed=len(adopted),
+                    errors=0,
+                    error_breakdown={},
+                    phase="in_progress",
+                    # #603: the pass-start snapshot carries the adopted/
+                    # prior baseline — the stage's true starting position
+                    # (the usage-less summary was invisible to consumers).
+                    usage=_summary_usage(),
+                    incomplete=max(0, len(units) - len(adopted)),
+                )
+            except OSError as exc:
+                # #599: this write is load-bearing for the resume sweep
+                # (a stale phase=done suppresses the fresh prompt) — its
+                # failure must be LOUD like the init/save siblings, never
+                # `pass` (which was silent even WITH an on_error), and
+                # counted so the report carries it without any callback.
+                if on_error:
+                    on_error(
+                        "llm_reach pass-start summary write failed "
+                        "(resume sweep may read a stale or absent phase): "
+                        f"{exc}")
+                else:
+                    print(
+                        "[LLMReach] pass-start summary write failed "
+                        "(resume sweep may read a stale or absent phase): "
+                        f"{exc}", file=sys.stderr)
+                checkpoint_summary_write_failures += 1
     batches = _chunk(units_to_run, batch_size)
     persisted = 0
 
@@ -854,6 +901,27 @@ def analyze_reachability(
         # not output-size-shaped; the #541 counters + the resume own it.
         if outcome == "failed" or (outcome in ("dropped", "truncated")
                                    and not record_units):
+            # #603: the failed/unrecovered batches are the billed-but-empty
+            # cases whose spend the live summary exists to show — the
+            # publication fires BEFORE the continue. DELIBERATELY
+            # UNCOUNTED on failure (the #599 counters cover the
+            # pass-start/final writes only — the persistent-failure
+            # case; a transient mid-loop write failure is invisible BY
+            # DESIGN: a per-batch counter would fire N times for one
+            # disk-full episode and drown the loud signal).
+            if checkpoint is not None:
+                try:
+                    checkpoint.write_summary(
+                        total_units=len(units),
+                        completed=len(adopted) + persisted,
+                        errors=0, error_breakdown={},
+                        phase="in_progress",
+                        usage=_summary_usage(),
+                        incomplete=max(
+                            0, len(units) - (len(adopted) + persisted)),
+                    )
+                except OSError:
+                    pass
             continue
         signals.extend(parsed)
 
@@ -905,6 +973,29 @@ def analyze_reachability(
                         print(f"[LLMReach] checkpoint save failed for {uid}: {exc}",
                               file=sys.stderr)
 
+        # #603: the per-batch publication — after EVERY attempted batch
+        # (the dropped/failed outcomes included; this tail runs for each)
+        # so the running summary tracks the live spend. Exception-safe: a
+        # publication failure must never mask the pass. DELIBERATELY
+        # UNCOUNTED on failure (the same policy as the pre-continue
+        # site — the #599 counters cover the pass-start/final writes,
+        # the persistent-failure case; a transient mid-loop failure is
+        # invisible by design).
+        if checkpoint is not None:
+            try:
+                checkpoint.write_summary(
+                    total_units=len(units),
+                    completed=len(adopted) + persisted,
+                    errors=0,
+                    error_breakdown={},
+                    phase="in_progress",
+                    usage=_summary_usage(),
+                    incomplete=max(
+                        0, len(units) - (len(adopted) + persisted)),
+                )
+            except OSError:
+                pass  # the #599 counters carry the signal
+
     if checkpoint is not None:
         try:
             completed = len(adopted) + persisted
@@ -920,7 +1011,9 @@ def analyze_reachability(
                 errors=0,
                 error_breakdown={},
                 phase="done" if completed == len(units) else "in_progress",
-                usage=None,
+                # #603: the terminal snapshot carries the full tracked usage
+                # — the same figure the step report will show.
+                usage=_summary_usage(),
                 incomplete=incomplete,
             )
         except OSError as exc:
@@ -937,8 +1030,8 @@ def analyze_reachability(
             else:
                 print(
                     "[LLMReach] final summary write failed "
-                    "(summary left at pass-start state; the resume sweep "
-                    "may offer a needless resume): "
+                    "(summary left at its last per-batch state; the resume "
+                    "sweep may offer a needless resume): "
                     f"{exc}", file=sys.stderr)
             checkpoint_summary_write_failures += 1
 

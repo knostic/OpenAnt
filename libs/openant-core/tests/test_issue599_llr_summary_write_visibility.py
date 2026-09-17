@@ -12,10 +12,14 @@ The fix mirrors the siblings' if/else idiom at both sites with PHASE-NAMED
 messages, and counts the failures into ``checkpoint_summary_write_failures``
 (the step-report stats) — visible in the artifact without any callback.
 
-The write-failure tests use a DELEGATING fake keyed on call order: llr
-makes exactly two ``write_summary`` calls per pass (pass-start, final),
-and the recorded phase sequence is asserted BEFORE the raise keying, so
-call-order drift cannot silently retarget the injection.
+The write-failure tests use a DELEGATING fake keyed on the recorded
+phase sequence: since #603 the pass writes the summary at pass start,
+after every attempted batch (deliberately uncounted best-effort), and at
+termination — the failure injection keys on ``phase`` (the final write
+is the ``phase == "done"`` call), so call-count drift cannot silently
+retarget the injection. The #599 counters cover the pass-start/final
+writes only; the per-batch refreshes are the silent best-effort class
+by design.
 
 Fully offline ($0).
 """
@@ -121,13 +125,22 @@ def test_final_write_failure_is_loud_and_leaves_the_stale_phase(
     the pass-start's phase=in_progress (the stale-state consequence the
     issue names), the counter reads 1, the distinct final-phase message
     surfaces."""
-    patched, calls = _failing_write_summary(2)
-    monkeypatch.setattr(StepCheckpoint, "write_summary", patched)
+    # #603: the write sequence is [pass-start, per-batch x N, final] —
+    # the final write is the LAST call; fail on it (the per-batch
+    # publications before it succeed and leave in_progress on disk).
+    calls = []
+    def _fail_last(self, *args, **kwargs):
+        calls.append(kwargs.get("phase"))
+        if kwargs.get("phase") == "done":
+            raise OSError("disk full")
+        return _real_write_summary(self, *args, **kwargs)
+    _real_write_summary = StepCheckpoint.write_summary
+    monkeypatch.setattr(StepCheckpoint, "write_summary", _fail_last)
     errors = []
     signals, cp = _run(tmp_path, on_error=errors.append)
 
     assert [s.unit_id for s in signals] == ["a:f1"]
-    assert calls == ["in_progress", "done"]  # the sequence assert
+    assert calls[0] == "in_progress" and calls[-1] == "done"
     assert StepCheckpoint.read_summary(cp)["phase"] == "in_progress"
     assert any("final summary write failed" in e for e in errors)
     assert any("needless resume" in e for e in errors)
@@ -147,7 +160,7 @@ def test_both_writes_fail_counts_two(monkeypatch, tmp_path):
         {"units": [_make_unit("a:f1")]},
         binding=_binding(FakeAdapter([_canned(_sig("a:f1"))])),
         checkpoint_path=cp, tracker=FakeTracker(), stats=stats)
-    assert calls == ["in_progress", "done"]  # the sequence pin
+    assert calls[0] == "in_progress" and calls[-1] == "done"  # #603: the sequence pin (per-batch publications in between)
     assert stats["checkpoint_summary_write_failures"] == 2
 
 
@@ -204,9 +217,19 @@ def test_no_callback_prints_to_stderr(monkeypatch, tmp_path, capfd):
         "final": "needless resume",            # the final hazard's direction
     }
     for i, (fail_on, phase_name) in enumerate(
-            ((1, "pass-start"), (2, "final")), start=1):
-        patched, calls = _failing_write_summary(fail_on)
-        monkeypatch.setattr(StepCheckpoint, "write_summary", patched)
+            ((1, "pass-start"), ("done", "final")), start=1):
+        # #603: the final write is the LAST call (phase=="done"), not the
+        # 2nd — the per-batch publications sit between.
+        if fail_on == "done":
+            _real = StepCheckpoint.write_summary
+            def _fail_done(self, *args, **kwargs):
+                if kwargs.get("phase") == "done":
+                    raise OSError("disk full")
+                return _real(self, *args, **kwargs)
+            monkeypatch.setattr(StepCheckpoint, "write_summary", _fail_done)
+        else:
+            patched, calls = _failing_write_summary(fail_on)
+            monkeypatch.setattr(StepCheckpoint, "write_summary", patched)
         # a FRESH dir per iteration: a shared dir would make iteration 2
         # an adopt-all pass (its shape differs from the one under test).
         _run(tmp_path / f"cp-{i}")  # no on_error
