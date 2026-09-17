@@ -378,6 +378,127 @@ class TestGenericTokensIgnored:
         assert "validate_session" in symbols
 
 
+class TestSymbolProvenance:
+    """GROUNDING-01: ordinary (unquoted) snake_case/PascalCase symbol
+    hypotheses must come only from the converter-authored narrative --
+    not from structured advisory metadata, affected-package/product
+    metadata, or references -- even when those sections contain tokens
+    that are syntactically shaped like code identifiers. Backtick-quoted
+    terms remain eligible regardless of section.
+
+    All identifiers below are fabricated placeholders, not real
+    vendor/package/CVE names.
+    """
+
+    def test_symbol_hypotheses_respect_narrative_provenance(self):
+        from utilities.autopatcher.repo_locator import _extract_symbols
+
+        text = (
+            "# A generic vulnerability summary\n"
+            "\n"
+            "## Vulnerability description\n"
+            "\n"
+            "**Advisory:** ADVISORY-0001\n"
+            "**Severity:** HIGH (CVSS: 7.5)\n"
+            "**Type:** CWE-22 (Path Traversal)\n"
+            "\n"
+            "The `resolve_target_path` function does not canonicalize input "
+            "before use, and validate_request_path fails to reject traversal "
+            "sequences.\n"
+            "\n"
+            "## Affected packages\n"
+            "\n"
+            "- registry_alpha/vendor_product_component 1.0.0 (patched: 1.0.1)\n"
+            "- also see `LegacyBridgeHandler` in the tracker\n"
+            "\n"
+            "## References\n"
+            "\n"
+            "- Reported via ReferenceSourceOrg advisory feed\n"
+        )
+
+        symbols = _extract_symbols(text)
+
+        # Plain (unquoted) identifier in the narrative paragraph is eligible.
+        assert "validate_request_path" in symbols
+        # Backticked identifier in the narrative is eligible.
+        assert "resolve_target_path" in symbols
+        # Backticked identifier outside the narrative is still eligible --
+        # an explicit code marker is not subject to section provenance.
+        assert "LegacyBridgeHandler" in symbols
+        # Plain snake_case-shaped package/ecosystem metadata is not eligible.
+        assert "vendor_product_component" not in symbols
+        # Plain PascalCase-shaped reference/metadata text is not eligible.
+        assert "ReferenceSourceOrg" not in symbols
+
+
+class TestUnquotedSymbolsExcludedFromGeneralGrep:
+    """GROUNDING-01 v2 retrospective: an unquoted (non-backtick) PascalCase/
+    snake_case token drawn from advisory narrative must never independently
+    drive Pass 3 / GENERAL_GREP grounding -- not even when the repository
+    happens to contain a genuine, unrelated code identifier with the exact
+    same lexical spelling. A real regression showed a repository can define
+    a real identifier (e.g. an internal enum-style constant) that shares its
+    literal name with an entity/platform word the advisory mentions only
+    incidentally -- same spelling, unrelated concept. No syntactic or
+    repository-lexical corroboration can distinguish the two, so unquoted
+    tokens are no longer used for Pass 3 at all; they remain eligible only
+    for Pass 2's deterministic class/def definition lookup.
+
+    All identifiers are fabricated placeholders, not real vendor/CVE names.
+    """
+
+    def test_unrelated_real_identifier_cannot_ground_via_general_grep(self, tmp_path):
+        from utilities.autopatcher.repo_locator import find_code_context
+
+        # A genuine, unrelated Python identifier that happens to share its
+        # literal spelling with the advisory's entity token below. It is a
+        # real repository symbol (a login-provider-type constant), accessed
+        # via member access -- exactly the shape the removed v2 heuristic
+        # used to accept as "corroboration" -- but it denotes a completely
+        # different concept than the advisory's incidental mention.
+        write(
+            tmp_path / "noise.py",
+            "class LoginProviderType:\n"
+            "    OrbitalStack = \"orbital_stack_provider\"\n"
+            "\n"
+            "\n"
+            "def is_orbital_login(provider_type):\n"
+            "    return provider_type == LoginProviderType.OrbitalStack\n",
+        )
+        # The genuine advisory-named symbol, with an actual definition Pass 2
+        # can find deterministically.
+        write(
+            tmp_path / "handler.py",
+            "def normalize_request_target(path):\n"
+            "    return path\n",
+        )
+
+        vuln_text = (
+            "# Improper Authentication in OrbitalStack repository org/project "
+            "prior to 4.0.0.\n"
+            "\n"
+            "## Vulnerability description\n"
+            "\n"
+            "**Type:** CWE-287\n"
+            "\n"
+            "Improper Authentication in OrbitalStack repository org/project "
+            "prior to 4.0.0. The normalize_request_target function does not "
+            "validate the caller's session before use.\n"
+        )
+
+        ctx = find_code_context(vuln_text, tmp_path)
+
+        assert "noise.py" not in ctx, (
+            "an unquoted prose/entity token must not drive GENERAL_GREP "
+            "grounding even when the repository genuinely defines an "
+            "unrelated identifier with the same lexical spelling"
+        )
+        assert "handler.py" in ctx, (
+            "a genuine unquoted symbol named in narrative must still ground "
+            "its defining file via Pass 2's deterministic definition lookup"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Change 1: ranking by total occurrence count
 # ---------------------------------------------------------------------------

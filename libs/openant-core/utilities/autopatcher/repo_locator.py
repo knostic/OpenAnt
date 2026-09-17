@@ -16,12 +16,16 @@ by occurrence count alone. This reuses the same candidate-creation / merge /
 ranking / dedup / rendering pipeline as every other pass — no separate
 rendering path, budget, or injection mechanism.
 
-Pass 3 combines two extractors:
-  - Unfiltered backtick terms: ``Cookie``, ``Authorization``, etc. — advisory
-    authors use backticks to highlight specific technical terms; these are
-    meaningful grep signals even when the raw word looks generic.
-  - Filtered symbols: snake_case / PascalCase identifiers that survive the
-    generic-token filter.
+Pass 3 signals are backtick-quoted terms only: ``Cookie``, ``Authorization``,
+etc. — advisory authors use backticks to highlight specific technical terms;
+these are meaningful grep signals even when the raw word looks generic.
+Unquoted snake_case/PascalCase tokens (``_extract_symbols``) are deliberately
+NOT merged into Pass 3: their syntactic shape alone never establishes that
+the advisory's use of the word denotes the same repository concept a raw
+grep match would find (see GROUNDING-01 v2 retrospective — a real regression
+showed a repository can legitimately define an unrelated identifier sharing
+the advisory's incidental wording). Those tokens remain useful only via Pass
+2's deterministic definition lookup, immediately above.
 
 Candidates are collected across all passes, deduped by path, and ranked.
 Returns a code context string (≤ 4 000 chars) ready to inject into the
@@ -426,10 +430,23 @@ def find_code_context(
             "hit_line_0indexed": hit_line,
         })
 
-    # Pass 3: symbol name grep — unfiltered backtick terms merged with filtered symbols
+    # Pass 3: symbol name grep — explicit backtick terms only (see
+    # GROUNDING-01 v2 retrospective). Unquoted snake_case/PascalCase tokens
+    # extracted from narrative (`symbols`) are NOT merged here: their
+    # syntactic shape alone never establishes that the advisory's use of the
+    # word denotes the *same* repository concept a lexical/code-usage-shape
+    # match would find — a real Gogs regression showed the repository can
+    # legitimately define an unrelated identifier with the same literal name
+    # (see grounding evidence: `auth.GitHub`, Gogs' own OAuth login-source
+    # type, versus the advisory's incidental "GitHub" hosting-platform
+    # mention). Unquoted tokens remain useful only via Pass 2's deterministic
+    # definition lookup (_find_symbol_definitions, below) — evidence of an
+    # actual definition, not evidence of relevance to the advisory's use.
+    # `symbols` itself is still computed and kept unfiltered so
+    # _debug_signals below keeps showing every raw extracted candidate.
     backtick_terms = _extract_backtick_terms(vulnerability_text)
     symbols = _extract_symbols(vulnerability_text)
-    all_signals = list(dict.fromkeys(backtick_terms + symbols))[:15]
+    all_signals = list(dict.fromkeys(backtick_terms))[:15]
     if all_signals:
         for p, content, hit_line in _grep_repo(
             repo_root, all_signals,
@@ -729,13 +746,68 @@ def _extract_file_paths(text: str) -> list[str]:
     return list(dict.fromkeys(m.group(1) for m in pattern.finditer(text)))
 
 
+_H1_TITLE_RE = re.compile(r'(?m)^#[ \t]+.*$')
+_H2_HEADING_RE = re.compile(r'(?m)^##[ \t]+.*$')
+_BOLD_LABEL_LINE_RE = re.compile(r'(?m)^[ \t]*\*\*[^*\n:]+:\*\*.*$')
+
+
+def _narrative_window(text: str) -> str:
+    """Return the substring of `text` eligible for ordinary (unquoted)
+    snake_case/PascalCase symbol-hypothesis extraction (see GROUNDING-01).
+
+    Converter-generated advisory text (cve_to_vuln_text / ghsa_to_vuln_text)
+    interleaves free-text narrative with structured metadata -- advisory
+    id/severity/CWE-type lines, affected-package/product metadata,
+    references, boilerplate notes -- in one flattened Markdown string.
+    Identifiers drawn from those metadata/reference sections can be
+    syntactically indistinguishable from real repository symbols even
+    though they never denote code, so ordinary symbol extraction is
+    narrowed to the converter-authored narrative: the H1 title (if any)
+    plus the first H2-headed section, with bold-labeled metadata lines
+    (``**Label:** ...`` -- the same convention `cwe_name_tokens` already
+    relies on for the **Type:** line) stripped out.
+
+    Text with no H2 heading at all (freeform/non-templated input) has no
+    such structure to narrow against and is returned unchanged, so callers
+    outside the converter template keep today's whole-text behavior.
+
+    This is a purely structural (markdown-syntax) rule -- it does not
+    reference any vendor, package, ecosystem, or CVE-specific token, so it
+    needs no maintenance as new advisories are seen.
+
+    Backtick-quoted terms are handled separately by the caller against the
+    original, full text: an explicit code marker is eligible regardless of
+    which section it appears in.
+    """
+    h2_matches = list(_H2_HEADING_RE.finditer(text))
+    if not h2_matches:
+        return text
+
+    first_h2 = h2_matches[0]
+    section_end = h2_matches[1].start() if len(h2_matches) > 1 else len(text)
+    section = text[first_h2.start():section_end]
+
+    h1_match = _H1_TITLE_RE.search(text, 0, first_h2.start())
+    title = h1_match.group(0) if h1_match else ""
+
+    window = title + "\n" + section
+    return _BOLD_LABEL_LINE_RE.sub("", window)
+
+
 def _extract_symbols(text: str) -> list[str]:
     """Extract specific function/class symbol names from vulnerability text.
 
     Priority:
-      1. Backtick-quoted identifiers  (`authenticate`, `UserManager`)
+      1. Backtick-quoted identifiers  (`authenticate`, `UserManager`) --
+         eligible anywhere in `text`, regardless of section (see
+         _narrative_window).
       2. snake_case tokens with at least one underscore
       3. PascalCase class names
+
+    (2) and (3) are unquoted, syntax-only heuristics, so they are applied
+    only within `_narrative_window(text)` -- see GROUNDING-01: without this,
+    advisory metadata/reference identifiers that merely look like code
+    symbols become false repository-symbol hypotheses.
     """
     seen: dict[str, None] = {}
 
@@ -743,16 +815,19 @@ def _extract_symbols(text: str) -> list[str]:
         if len(token) >= 4 and token.lower() not in _GENERIC_TOKENS:
             seen.setdefault(token, None)
 
-    # Backtick-quoted — most specific
+    # Backtick-quoted — most specific; explicit code marker, so it scans
+    # the full text rather than the narrowed narrative window.
     for m in re.finditer(r'`([A-Za-z_][A-Za-z0-9_]*)\s*\(?', text):
         _add(m.group(1))
 
+    narrative = _narrative_window(text)
+
     # snake_case with at least one underscore
-    for m in re.finditer(r'\b([a-z][a-z0-9]+(?:_[a-z][a-z0-9]+)+)\b', text):
+    for m in re.finditer(r'\b([a-z][a-z0-9]+(?:_[a-z][a-z0-9]+)+)\b', narrative):
         _add(m.group(1))
 
     # PascalCase (class names)
-    for m in re.finditer(r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b', text):
+    for m in re.finditer(r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b', narrative):
         _add(m.group(1))
 
     return list(seen)[:10]
