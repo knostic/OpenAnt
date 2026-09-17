@@ -145,10 +145,16 @@ def test_the_step_summary_threads_the_histogram():
 
 
 def test_the_enhancer_source_counts_the_kinds():
-    """Source pin: the counting loop reads exit_kind with the unstamped
-    fallback (the legacy rows before this fix)."""
+    """Source pin: the histogram line sits INSIDE the cls == "incomplete"
+    branch beside the increment (the placement-blind grep the deep-refute
+    caught: the line outside the branch would count every unit's kind)."""
     src = (PROJECT_ROOT / "core" / "enhancer.py").read_text()
-    assert 'ctx.get("exit_kind") or "unstamped"' in src
+    assert 'if cls == "incomplete":' in src
+    assert 'kind = ctx.get("exit_kind") or "unstamped"' in src
+    # the adjacency: the increment and the kind line in ONE branch
+    branch = ('if cls == "incomplete":\n'
+              '            incomplete_count += 1')
+    assert branch in src
 
 
 # ---------------------------------------------------------------------------
