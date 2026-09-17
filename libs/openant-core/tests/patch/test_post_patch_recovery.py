@@ -1258,6 +1258,60 @@ class TestHunkLevelRecoveryCoverage:
         assert result.attempts[1].covered_hunk_indices == [0]
         assert result.ready_for_regeneration is True
 
+    def test_approved_hunk_listed_first_does_not_steal_old_side_anchor_from_failing_hunk(self, tmp_path):
+        """Required regression 4: one file with TWO hunks -- hunk 0 is
+        already approved_target/conformant, hunk 1 is the genuine
+        uncovered_target that triggered recovery. Both hunks' own old-side
+        lines are uniquely present in the real file, but far enough apart
+        (line 2 vs line 43) that POST_PATCH_WINDOW_CONTEXT_LINES (10) padding
+        around one can never reach the other.
+
+        Source Priority 1 (_locate_old_side_in_file) must consider ONLY
+        hunk 1 -- the hunk conformance actually flagged -- not merely
+        whichever hunk happens to appear first in the patch body. Before the
+        fix, hunk 0 (already approved, listed first) satisfies the
+        unfiltered first-match scan and the window is built around line 43,
+        never covering hunk 1's own line-2 content."""
+        from utilities.autopatcher.remediation_planner import (
+            PatchConformanceReport, PatchTargetConformanceResult, recover_post_patch_source,
+        )
+
+        lines = (
+            "def helper():\n"
+            "    return HELPER_VALUE\n"
+            + "".join(f"# filler {i}\n" for i in range(1, 40))
+            + "def do_thing():\n"
+            "    return DO_VALUE\n"
+        )
+        (tmp_path / "mod.py").write_text(lines, encoding="utf-8")
+        context = _make_context(repo_path=tmp_path)
+
+        # Hunk 0 (do_thing, line 43, already approved) is listed BEFORE
+        # hunk 1 (helper, line 2, the actual uncovered_target) -- the exact
+        # out-of-line-order shape a real, structurally unusual model
+        # response can produce.
+        patch = (
+            "--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -43,1 +43,1 @@\n-    return DO_VALUE\n+    return DO_VALUE_FIXED\n"
+            "@@ -2,1 +2,1 @@\n-    return HELPER_VALUE\n+    return HELPER_VALUE_FIXED\n"
+        )
+        conformance = PatchConformanceReport(
+            results=[
+                PatchTargetConformanceResult(file="mod.py", hunk_index=0, target_coverage="approved_target", old_side_status="old_side_verified", conformant=True),
+                PatchTargetConformanceResult(file="mod.py", hunk_index=1, target_coverage="uncovered_target", old_side_status="old_side_verified", conformant=False),
+            ],
+            all_conformant=False, edited_files=["mod.py"],
+            unexpected_files=[], uncovered_files=["mod.py"], no_match_files=[],
+        )
+
+        result = recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+        )
+        assert result.attempts[0].target_start_line == 2
+        assert result.attempts[0].target_end_line == 2
+        assert result.attempts[0].covered_hunk_indices == [1]
+        assert result.ready_for_regeneration is True
+
 
 # ---------------------------------------------------------------------------
 # Recovery eligibility -- RecoveryTarget/build_recovery_targets. Recovery

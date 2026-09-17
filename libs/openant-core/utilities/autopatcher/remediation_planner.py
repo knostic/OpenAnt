@@ -5417,6 +5417,24 @@ def _recovery_reason_for_file(file: str, conformance: PatchConformanceReport) ->
     return "unknown"
 
 
+def _recovery_triggering_hunk_indices(file: str, conformance: PatchConformanceReport) -> "set[int]":
+    """Exactly the hunk_index values, for `file`, that conformance itself
+    flagged as recovery-triggering -- the same per-hunk condition
+    _covered_hunks_for already gates on (target_coverage in
+    ("unexpected_file", "uncovered_target") or old_side_status ==
+    "old_side_no_match"), reused rather than redefined. An already-
+    approved_target/conformant hunk in the same file is never included:
+    it must not be eligible for Source Priority 1's old-side-anchor scan
+    merely because it shares a file with a genuinely failing hunk (see
+    _locate_old_side_in_file's own docstring -- "this file's own FAILING
+    hunks' own OLD-side content", not "any hunk touching this file")."""
+    return {
+        r.hunk_index for r in conformance.results
+        if r.file == file
+        and (r.target_coverage in ("unexpected_file", "uncovered_target") or r.old_side_status == "old_side_no_match")
+    }
+
+
 # ---------------------------------------------------------------------------
 # Slice 4 patch-ready recovery window -- keeps two concepts that the rest of
 # this module deliberately conflates for Slices 1-3 (where it is harmless)
@@ -6086,6 +6104,17 @@ def recover_post_patch_source(
             continue
 
         hunks_for_file = file_hunks.get(file, [])
+        # Source Priority 1 (_locate_old_side_in_file, via
+        # _build_post_patch_window's try_old_side_anchor branch) must only
+        # ever scan the hunks that actually triggered recovery for this
+        # file -- never an already-approved_target/conformant hunk that
+        # merely happens to share the file and appear earlier in the patch
+        # body. Identifier extraction below is intentionally UNCHANGED:
+        # it still reads every hunk in the file (tiers 2-4 are unaffected).
+        _failing_hunk_indices = _recovery_triggering_hunk_indices(file, conformance)
+        failing_hunks_for_file = [
+            h for i, h in enumerate(hunks_for_file) if i in _failing_hunk_indices
+        ]
         changed_identifiers: "list[str]" = []
         context_identifiers: "list[str]" = []
         seen_ids: set = set()
@@ -6120,7 +6149,7 @@ def recover_post_patch_source(
                 continue
 
         window = _build_post_patch_window(
-            verified_file, identifiers, hunks_for_file, context,
+            verified_file, identifiers, failing_hunks_for_file, context,
             try_old_side_anchor=(trigger_reason == "uncovered_target"),
         )
 
