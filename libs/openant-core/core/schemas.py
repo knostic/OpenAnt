@@ -301,6 +301,9 @@ class EnhanceResult:
     # (which omits errors by construction).
     incomplete_count: int = 0
     total_units: int = 0
+    # #615: the degenerate-exit kind histogram (exit_kind's aggregate);
+    # the empty dict = no incompletes (the present-only serialization)
+    incomplete_summary: dict = field(default_factory=dict)
     usage: UsageInfo = field(default_factory=UsageInfo)
 
     def to_dict(self) -> dict:
@@ -315,6 +318,8 @@ class EnhanceResult:
             result["error_summary"] = self.error_summary
         result["incomplete_count"] = self.incomplete_count
         result["total_units"] = self.total_units
+        if self.incomplete_summary:
+            result["incomplete_summary"] = self.incomplete_summary
         return result
 
 

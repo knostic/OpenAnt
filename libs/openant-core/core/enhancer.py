@@ -170,6 +170,8 @@ def enhance_dataset(
     classifications = {}
     error_count = 0
     error_summary = {}
+    # #615: the degenerate-exit kind histogram (exit_kind's aggregate)
+    incomplete_summary = {}
     context_key = "agent_context" if mode == "agentic" else "llm_context"
 
     incomplete_count = 0
@@ -189,6 +191,10 @@ def enhance_dataset(
         # #293: the agent's degenerate exit is not a successful enhance
         if cls == "incomplete":
             incomplete_count += 1
+            # #615: WHICH degenerate exit — the four exits differ in kind
+            # and remedy (budget exhaustion vs cheap model behavior).
+            kind = ctx.get("exit_kind") or "unstamped"
+            incomplete_summary[kind] = incomplete_summary.get(kind, 0) + 1
 
     # Checkpoints are preserved as a permanent artifact alongside results.
     # Final summary (phase="done") is written by context_enhancer.
@@ -214,5 +220,8 @@ def enhance_dataset(
         # #611: the identity's own fields
         incomplete_count=incomplete_count,
         total_units=len(units),
+        # #615: the kind histogram (the empty dict serializes without the
+        # key via to_dict's present-only gate)
+        incomplete_summary=incomplete_summary,
         usage=usage,
     )

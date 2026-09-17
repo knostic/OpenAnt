@@ -574,6 +574,12 @@ def cmd_enhance(args):
             }
             if result.error_summary:
                 ctx.summary["error_summary"] = result.error_summary
+            # #615: the degenerate-exit kind histogram — FLAT, a sibling
+            # of the error_summary gate (NOT nested inside it: a zero-error
+            # run with incompletes carries the histogram too; the scanner's
+            # writer is the same shape)
+            if getattr(result, "incomplete_summary", None):
+                ctx.summary["incomplete_summary"] = result.incomplete_summary
             ctx.outputs = {
                 "enhanced_dataset_path": result.enhanced_dataset_path,
             }
