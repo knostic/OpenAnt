@@ -85,4 +85,5 @@ def test_the_helper_is_exception_safe():
     """A poisoned get_totals returns None — a usage read never kills the
     stage (the source pin of the try/except)."""
     src = (PROJECT_ROOT / "utilities" / "dynamic_tester" / "__init__.py").read_text()
-    assert "except Exception:  # noqa: BLE001 — a usage read must never kill the stage" in src
+    assert "a usage read must never kill the stage" in src  # ASCII-only pin
+    assert "except Exception" in src
