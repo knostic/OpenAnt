@@ -12,6 +12,7 @@ Supports reachability-aware classification to distinguish:
 """
 
 import json
+import sys
 from typing import Optional, Set, List
 
 from core.file_boundary import boundary_for_language
@@ -599,39 +600,61 @@ def enhance_unit_with_agent(
     unit["agent_context"] = result.to_dict()
 
     # Assemble additional code if functions were identified
+    # #614: the assembly is PRESERVE-ON-FAILURE — a raise here must never
+    # let the caller's except overwrite the completed, paid classification
+    # stored above (the context_enhancer handler replaced it with an error
+    # dict, destroying the verdict and its metadata). The completed
+    # context stays; the assembly failure is marked separately.
     if result.include_functions:
-        additional_code = []
-        additional_files = set()
+        try:
+            additional_code = []
+            additional_files = set()
 
-        for func_info in result.include_functions:
-            func_id = func_info.get("id", "")
-            func_data = index.get_function(func_id)
+            for func_info in result.include_functions:
+                func_id = func_info.get("id", "")
+                func_data = index.get_function(func_id)
 
-            if func_data and func_data.get("code"):
-                additional_code.append(func_data["code"])
+                if func_data and func_data.get("code"):
+                    additional_code.append(func_data["code"])
 
-                # Extract file path from func_id
-                colon_idx = func_id.rfind(":")
-                if colon_idx > 0:
-                    additional_files.add(func_id[:colon_idx])
+                    # Extract file path from func_id
+                    colon_idx = func_id.rfind(":")
+                    if colon_idx > 0:
+                        additional_files.add(func_id[:colon_idx])
 
-        # Append to primary_code with file boundaries
-        if additional_code:
-            # Emit the marker in the UNIT'S comment syntax. A `//` line injected
-            # into Python or Ruby source is a syntax error, and the downstream
-            # split would not find it in the form those parsers emit.
-            FILE_BOUNDARY = boundary_for_language(unit.get("language"))
-            current_code = unit["code"]["primary_code"]
-            assembled = current_code + FILE_BOUNDARY + FILE_BOUNDARY.join(additional_code)
-            unit["code"]["primary_code"] = assembled
-
-            # Update metadata
-            origin = unit["code"].get("primary_origin", {})
-            current_files = set(origin.get("files_included", []))
-            origin["files_included"] = list(current_files | additional_files)
-            origin["deps_inlined"] = True
-            origin["enhanced_length"] = len(assembled)
-            unit["code"]["primary_origin"] = origin
+            # Append to primary_code with file boundaries
+            if additional_code:
+                # Emit the marker in the UNIT'S comment syntax. A `//` line injected
+                # into Python or Ruby source is a syntax error, and the downstream
+                # split would not find it in the form those parsers emit.
+                FILE_BOUNDARY = boundary_for_language(unit.get("language"))
+                current_code = unit["code"]["primary_code"]
+                assembled = current_code + FILE_BOUNDARY + FILE_BOUNDARY.join(additional_code)
+                # #614 review: compute the metadata into locals FIRST and
+                # commit primary_code + primary_origin LAST — a raise in the
+                # metadata computation no longer leaves inlined code with
+                # deps_inlined unset (a partial state the wrap would swallow).
+                origin = unit["code"].get("primary_origin", {})
+                current_files = set(origin.get("files_included", []))
+                origin["files_included"] = list(current_files | additional_files)
+                origin["deps_inlined"] = True
+                origin["enhanced_length"] = len(assembled)
+                unit["code"]["primary_code"] = assembled
+                unit["code"]["primary_origin"] = origin
+        except Exception as exc:
+            # #614: PRESERVE the completed classification + its usage — the
+            # caller's except must never overwrite paid work with an error
+            # dict. The failure is marked INSIDE the stored context (a
+            # separate assembly_error key; the classification, the reasoning,
+            # the confidence, and the recorded usage all survive).
+            unit["agent_context"].setdefault("assembly_error", {
+                "exception_class": type(exc).__name__,
+                "message": str(exc)[:500],
+            })
+            print(f"[Enhance] assembly failed after a completed analysis "
+                  f"({type(exc).__name__}): {exc} — the classification is "
+                  "preserved; the additional code was not inlined",
+                  file=sys.stderr)
 
     return unit
 
