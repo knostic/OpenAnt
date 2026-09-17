@@ -630,14 +630,16 @@ def enhance_unit_with_agent(
                 FILE_BOUNDARY = boundary_for_language(unit.get("language"))
                 current_code = unit["code"]["primary_code"]
                 assembled = current_code + FILE_BOUNDARY + FILE_BOUNDARY.join(additional_code)
-                unit["code"]["primary_code"] = assembled
-
-                # Update metadata
+                # #614 review: compute the metadata into locals FIRST and
+                # commit primary_code + primary_origin LAST — a raise in the
+                # metadata computation no longer leaves inlined code with
+                # deps_inlined unset (a partial state the wrap would swallow).
                 origin = unit["code"].get("primary_origin", {})
                 current_files = set(origin.get("files_included", []))
                 origin["files_included"] = list(current_files | additional_files)
                 origin["deps_inlined"] = True
                 origin["enhanced_length"] = len(assembled)
+                unit["code"]["primary_code"] = assembled
                 unit["code"]["primary_origin"] = origin
         except Exception as exc:
             # #614: PRESERVE the completed classification + its usage — the

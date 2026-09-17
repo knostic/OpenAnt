@@ -186,3 +186,99 @@ def test_the_handler_preserves_an_assembly_error_context():
     src = (PROJECT_ROOT / "utilities" / "context_enhancer.py").read_text()
     assert 'if _preserved.get("assembly_error"):' in src
     assert 'unit["agent_context"] = _preserved' in src
+
+
+def test_the_handler_preserves_and_reclassifies(monkeypatch, tmp_path):
+    """BEHAVIORAL (the source-string pin retired): drive the REAL
+    ContextEnhancer.agentic enhance path (the closure's handler) with a
+    fake agent entry that stores a completed, assembly_error-marked
+    context and THEN raises (the future raise-after-store shape the
+    handler branch guards) — the context is preserved and the unit's
+    classification is the PRESERVED one (never the error dict)."""
+    import utilities.context_enhancer as ce_mod
+
+    def _fake_agent_entry(unit, index, binding, tracker=None,
+                          verbose=False, *a, **kw):
+        unit["agent_context"] = {
+            "security_classification": "security_control",
+            "classification_reasoning": "done",
+            "confidence": 0.8,
+            "assembly_error": {"exception_class": "RuntimeError",
+                               "message": "post-store raise"},
+        }
+        raise RuntimeError("post-store raise")
+
+    monkeypatch.setattr(ce_mod, "enhance_unit_with_agent",
+                        _fake_agent_entry)
+    # the index loader stub (the handler path never uses it)
+    monkeypatch.setattr(ce_mod, "load_index_from_file",
+                        lambda *a, **kw: type(
+                            "Ix", (), {
+                                "get_statistics": lambda s: {
+                                    "total_functions": 0,
+                                    "total_files": 0}})())
+
+    from types import SimpleNamespace
+
+    class _T:
+        def get_totals(self):
+            return {"total_calls": 0, "total_input_tokens": 0,
+                    "total_output_tokens": 0, "total_tokens": 0,
+                    "total_cost_usd": 0.0, "cost_incomplete": False,
+                    "unpriced_models": []}
+        def get_unit_usage(self):
+            return None
+        def add_prior_usage(self, *a, **kw):
+            pass
+
+    enhancer = ce_mod.ContextEnhancer.__new__(ce_mod.ContextEnhancer)
+    enhancer.binding = SimpleNamespace(provider_name="stub", model="m")
+    enhancer.tracker = _T()
+    enhancer._log = lambda *a, **kw: None
+
+    dataset = {"units": [{"id": "a.py:f", "unit_type": "function",
+                          "code": {"primary_code": "def f(): pass"},
+                          "route": {"file": "a.py", "name": "f"}}]}
+    enhancer.enhance_dataset_agentic(
+        dataset, str(tmp_path / "analyzer_output.json"),
+        str(tmp_path / "repo"), workers=1)
+    out_unit = dataset["units"][0]
+    # the PRESERVED context stays (never the error dict) — the
+    # classification is the completed one, the marker beside it
+    assert out_unit["agent_context"]["security_classification"] \
+        == "security_control"
+    assert "assembly_error" in out_unit["agent_context"]
+    assert "error" not in out_unit["agent_context"]
+
+
+def test_the_validator_rejects_a_nonstring_id():
+    """The schema's id: string — a dict element with a missing/non-string
+    id is rejected (the model self-corrects; the index lookup never sees
+    an unhashable id)."""
+    out = ToolExecutor(None)._finish({
+        "include_functions": [{"id": 42}], "usage_context": "ctx",
+        "security_classification": "neutral",
+        "classification_reasoning": "r", "confidence": 0.5,
+    })
+    assert "error" in out and "string id" in out["error"]
+
+
+def test_the_stats_gate_skips_undelivered_context():
+    """#614's stats gate: an assembly_error unit is a COMPLETED analysis
+    whose code was NOT inlined — units_with_context/functions_added must
+    not claim delivery that failed."""
+    from utilities.context_enhancer import ContextEnhancer
+    units = [
+        # delivered: no assembly_error, include_functions present
+        {"agent_context": {"security_classification": "neutral",
+                           "include_functions": [{"id": "a.py:f"}]}},
+        # completed but NOT delivered (the assembly failed)
+        {"agent_context": {"security_classification": "security_control",
+                           "include_functions": [{"id": "b.py:g"}],
+                           "assembly_error": {"exception_class":
+                                              "RuntimeError"}}},
+    ]
+    stats = ContextEnhancer._compute_agentic_stats(units)
+    assert stats["units_with_context"] == 1
+    assert stats["functions_added"] == 1
+    assert stats["security_controls_found"] == 1  # the verdict still counts
