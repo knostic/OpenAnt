@@ -1049,7 +1049,17 @@ class _SourceExcerptPlan(NamedTuple):
     classification anywhere else -- see EVIDENCE-01, where a caller that
     instead compared two RENDERED strings was fooled by a budget numeral
     embedded in an omission notice even though this same structural result
-    was byte-for-byte unchanged between the two calls being compared."""
+    was byte-for-byte unchanged between the two calls being compared.
+
+    `omitted_sizes` maps every `symbol_omitted`/`fallback_omitted` label to
+    the exact character length of the rendered block that didn't fit --
+    already computed in the same moment the candidate is omitted below,
+    just not previously retained. This is what lets a deterministic budget-
+    expansion loop (see build_planner_evidence_with_budget) decide, WITHOUT
+    re-rendering, whether any currently-omitted resolved candidate could
+    ever fit within the remaining legal context-budget windows -- so a
+    window is never requested (and, under policy="ask", a user is never
+    prompted) when it provably cannot help."""
 
     blocks: "tuple[str, ...]"
     included_labels: "frozenset[str]"
@@ -1057,6 +1067,12 @@ class _SourceExcerptPlan(NamedTuple):
     fallback_omitted: "tuple[str, ...]"
     read_failed: "tuple[str, ...]"
     budget: int
+    # No default: a NamedTuple field default is a single shared object
+    # reused by every instance that omits it, which would be an
+    # accidentally-shared mutable dict here -- every construction site
+    # (below, and _EMPTY_SOURCE_EXCERPT_PLAN) passes its own fresh dict
+    # explicitly instead.
+    omitted_sizes: "dict[str, int]"
 
 
 def _compute_source_excerpt_plan(
@@ -1112,6 +1128,7 @@ def _compute_source_excerpt_plan(
     symbol_omitted: "list[str]" = []
     fallback_omitted: "list[str]" = []
     read_failed: "list[str]" = []
+    omitted_sizes: "dict[str, int]" = {}
     running = 0
     seen: set = set()
     fallback_eligible: "list[str]" = []
@@ -1141,6 +1158,7 @@ def _compute_source_excerpt_plan(
             running += len(block)
         else:
             symbol_omitted.append(label)
+            omitted_sizes[label] = len(block)
 
     # Pass 2 -- full-file fallback, only for candidates with no resolved
     # symbol at all (never for one whose symbol excerpt was itself omitted
@@ -1159,12 +1177,43 @@ def _compute_source_excerpt_plan(
             running += len(block)
         else:
             fallback_omitted.append(path)
+            omitted_sizes[path] = len(block)
 
     return _SourceExcerptPlan(
         blocks=tuple(blocks), included_labels=frozenset(included_labels),
         symbol_omitted=tuple(symbol_omitted), fallback_omitted=tuple(fallback_omitted),
-        read_failed=tuple(read_failed), budget=_budget,
+        read_failed=tuple(read_failed), budget=_budget, omitted_sizes=omitted_sizes,
     )
+
+
+def _render_source_excerpt_plan(plan: "_SourceExcerptPlan") -> str:
+    """The ONLY renderer of a `_SourceExcerptPlan` into the Markdown block
+    Patch Generation/Strategy prompts embed -- both
+    `build_planner_source_excerpts` (existing public API) and
+    `_build_planner_evidence_result` (the shared primitive behind
+    `build_planner_evidence`/`build_planner_evidence_with_budget`) call
+    this and only this, so there is exactly one rendering implementation
+    regardless of caller."""
+    if not plan.blocks and not plan.symbol_omitted and not plan.fallback_omitted and not plan.read_failed:
+        return ""
+
+    lines = [_SOURCE_SUBHEADING, "", _SOURCE_DISCLAIMER]
+    if plan.blocks:
+        lines.append("")
+        lines.append("\n".join(plan.blocks).rstrip())
+
+    notes = []
+    if plan.symbol_omitted:
+        notes.append(f"symbol excerpt(s) omitted to stay within the {plan.budget}-character budget: {', '.join(plan.symbol_omitted)}")
+    if plan.fallback_omitted:
+        notes.append(f"full-file fallback(s) omitted to stay within the {plan.budget}-character budget: {', '.join(plan.fallback_omitted)}")
+    if plan.read_failed:
+        notes.append(f"source could not be read: {', '.join(plan.read_failed)}")
+    if notes:
+        lines.append("")
+        lines.extend(f"*{n}.*" for n in notes)
+
+    return "\n".join(lines) + "\n"
 
 
 def build_planner_source_excerpts(
@@ -1188,27 +1237,7 @@ def build_planner_source_excerpts(
         return ""
 
     plan = _compute_source_excerpt_plan(candidates, symbol_locations, repo_root, context, max_chars=max_chars)
-
-    if not plan.blocks and not plan.symbol_omitted and not plan.fallback_omitted and not plan.read_failed:
-        return ""
-
-    lines = [_SOURCE_SUBHEADING, "", _SOURCE_DISCLAIMER]
-    if plan.blocks:
-        lines.append("")
-        lines.append("\n".join(plan.blocks).rstrip())
-
-    notes = []
-    if plan.symbol_omitted:
-        notes.append(f"symbol excerpt(s) omitted to stay within the {plan.budget}-character budget: {', '.join(plan.symbol_omitted)}")
-    if plan.fallback_omitted:
-        notes.append(f"full-file fallback(s) omitted to stay within the {plan.budget}-character budget: {', '.join(plan.fallback_omitted)}")
-    if plan.read_failed:
-        notes.append(f"source could not be read: {', '.join(plan.read_failed)}")
-    if notes:
-        lines.append("")
-        lines.extend(f"*{n}.*" for n in notes)
-
-    return "\n".join(lines) + "\n"
+    return _render_source_excerpt_plan(plan)
 
 
 def _included_source_labels(
@@ -1253,6 +1282,111 @@ def _render_planner_evidence(understanding) -> str:
     return f"{_PLANNER_HEADING}\n\n{_PLANNER_DISCLAIMER}\n\n{rest}"
 
 
+_EMPTY_SOURCE_EXCERPT_PLAN = _SourceExcerptPlan(
+    blocks=(), included_labels=frozenset(), symbol_omitted=(), fallback_omitted=(),
+    read_failed=(), budget=0, omitted_sizes={},
+)
+
+
+class PlannerEvidenceResult(NamedTuple):
+    """Structured result of one Planner-evidence construction/rendering
+    call at a given character budget -- ties the rendered Markdown block
+    Strategy prompts embed to the SAME `_SourceExcerptPlan` that decided
+    it (see that type's own docstring: the one place source-fitting is
+    ever computed). `excerpt_plan.included_labels` IS the structural
+    source-coverage signature `resolved_source_coverage` already defines
+    -- no second coverage model is introduced here. Returned by both
+    `build_planner_evidence` (via `.rendered`, unchanged public contract)
+    and `build_planner_evidence_with_budget` (the full structured result,
+    used by both Strategy #1's own construction and the evidence-gap
+    Strategy fallback -- see pipeline.py)."""
+
+    rendered: str
+    excerpt_plan: "_SourceExcerptPlan"
+
+
+def _build_planner_evidence_result(
+    plan: RemediationPlanResult,
+    repo_root,
+    vulnerability_text: str,
+    context,
+    max_chars: "int | None" = None,
+) -> PlannerEvidenceResult:
+    """The one real implementation behind both `build_planner_evidence`'s
+    string return and `build_planner_evidence_with_budget`'s expansion
+    loop -- never a second resolve/verify/render pass. See
+    `build_planner_evidence`'s own docstring for the exact bridge contract
+    this reproduces; this function differs only in ALSO returning the
+    `_SourceExcerptPlan` that `build_planner_evidence` itself discards
+    after rendering.
+
+    Returns `PlannerEvidenceResult("", _EMPTY_SOURCE_EXCERPT_PLAN)` -- never
+    raises -- under every condition `build_planner_evidence` returns ""
+    for: no repo_root, nothing proposed, no candidates survive
+    verification, or any downstream step fails.
+    """
+    _empty = PlannerEvidenceResult(rendered="", excerpt_plan=_EMPTY_SOURCE_EXCERPT_PLAN)
+    if not repo_root or not (plan.target_files or plan.target_symbols):
+        return _empty
+    try:
+        root = Path(repo_root)
+        # Same file-verification pass build_planner_candidates itself does
+        # (and will redo, harmlessly, immediately below) -- computed here
+        # first so _resolve_planner_symbols can pass it through to
+        # _resolve_symbol_details as `verified_files`, giving a symbol the
+        # structured lookup can't resolve (e.g. a nested function the
+        # upstream analyzer never indexed) the same deterministic,
+        # file-scoped identifier fallback _verify_strategy_targets and
+        # _build_final_target_slice_inner already use -- never a wider
+        # search than these already-verified target_files.
+        verified_target_files: "list[str]" = []
+        seen_target_files: set = set()
+        for raw in plan.target_files:
+            vf = _verify_file(raw, root)
+            if vf and vf not in seen_target_files:
+                seen_target_files.add(vf)
+                verified_target_files.append(vf)
+
+        # Resolved exactly once here, then reused for both candidate
+        # construction (hit_line selection) and source-excerpt selection
+        # below -- never re-derived by a second lookup pass.
+        symbol_locations = _resolve_planner_symbols(plan, root, context, verified_files=verified_target_files)
+        candidates = build_planner_candidates(plan, root, context, symbol_locations=symbol_locations)
+        if not candidates:
+            return _empty
+
+        from .candidate_enrichment import enrich_candidates
+        from .candidate_selection import CandidateSelection
+        from .evidence_fusion import fuse_evidence
+
+        selection = CandidateSelection(
+            generated=list(candidates),
+            excluded_by_policy=[],
+            eligible=list(candidates),
+            selected=list(candidates),
+            excluded_by_cap=[],
+            max_candidates=len(candidates),
+        )
+        enrich_candidates(selection, root, vulnerability_text, context)
+        understanding = fuse_evidence(selection, investigation_context_available=context is not None)
+        structural = _render_planner_evidence(understanding)
+        if not structural:
+            return _empty
+
+        try:
+            excerpt_plan = _compute_source_excerpt_plan(
+                candidates, symbol_locations, root, context, max_chars=max_chars,
+            )
+        except Exception:
+            excerpt_plan = _EMPTY_SOURCE_EXCERPT_PLAN
+
+        source_block = _render_source_excerpt_plan(excerpt_plan)
+        rendered = f"{structural.rstrip()}\n\n{source_block}" if source_block else structural
+        return PlannerEvidenceResult(rendered=rendered, excerpt_plan=excerpt_plan)
+    except Exception:
+        return _empty
+
+
 def build_planner_evidence(
     plan: RemediationPlanResult,
     repo_root,
@@ -1279,64 +1413,127 @@ def build_planner_evidence(
     identical either way, so two calls that only differ in `max_chars`
     return identical text unless the larger budget actually let more
     verified source fit.
+
+    Signature and return type are unchanged from before
+    `_build_planner_evidence_result` existed -- this is now a one-line
+    delegation to it (see `build_planner_evidence_with_budget` for the
+    budget-aware sibling that needs the full structured result).
     """
-    if not repo_root or not (plan.target_files or plan.target_symbols):
-        return ""
-    try:
-        root = Path(repo_root)
-        # Same file-verification pass build_planner_candidates itself does
-        # (and will redo, harmlessly, immediately below) -- computed here
-        # first so _resolve_planner_symbols can pass it through to
-        # _resolve_symbol_details as `verified_files`, giving a symbol the
-        # structured lookup can't resolve (e.g. a nested function the
-        # upstream analyzer never indexed) the same deterministic,
-        # file-scoped identifier fallback _verify_strategy_targets and
-        # _build_final_target_slice_inner already use -- never a wider
-        # search than these already-verified target_files.
-        verified_target_files: "list[str]" = []
-        seen_target_files: set = set()
-        for raw in plan.target_files:
-            vf = _verify_file(raw, root)
-            if vf and vf not in seen_target_files:
-                seen_target_files.add(vf)
-                verified_target_files.append(vf)
+    return _build_planner_evidence_result(plan, repo_root, vulnerability_text, context, max_chars=max_chars).rendered
 
-        # Resolved exactly once here, then reused for both candidate
-        # construction (hit_line selection) and source-excerpt selection
-        # below -- never re-derived by a second lookup pass.
-        symbol_locations = _resolve_planner_symbols(plan, root, context, verified_files=verified_target_files)
-        candidates = build_planner_candidates(plan, root, context, symbol_locations=symbol_locations)
-        if not candidates:
-            return ""
 
-        from .candidate_enrichment import enrich_candidates
-        from .candidate_selection import CandidateSelection
-        from .evidence_fusion import fuse_evidence
+def build_planner_evidence_with_budget(
+    plan: RemediationPlanResult,
+    repo_root,
+    vulnerability_text: str,
+    context,
+    *,
+    budget_controller=None,
+    base_max_chars: "int | None" = None,
+) -> PlannerEvidenceResult:
+    """Deterministic, no-LLM-call Planner-evidence construction with bounded
+    context-budget expansion -- the ONE shared implementation used by both
+    Strategy #1's own evidence construction and the evidence-gap Strategy
+    fallback (see pipeline.py's `_run_repository_analysis_and_remediation_
+    planning` and `_run_evidence_gap_strategy_fallback`). Neither caller
+    implements its own budget-growth logic; both call this.
 
-        selection = CandidateSelection(
-            generated=list(candidates),
-            excluded_by_policy=[],
-            eligible=list(candidates),
-            selected=list(candidates),
-            excluded_by_cap=[],
-            max_candidates=len(candidates),
+    `budget_controller=None` (the default) reproduces
+    `_build_planner_evidence_result`'s exact single-render behavior at
+    `base_max_chars` (or `evidence_fusion.DEFAULT_MAX_CHARS` if that is
+    also None) -- byte-identical to calling `build_planner_evidence` once,
+    no expansion loop entered at all. This is what makes every existing
+    caller that doesn't pass a controller unaffected.
+
+    With a real `budget_controller`, uses the stage key "planner_evidence"
+    -- deliberately NOT "final_target_slice" (Slice 2/3/4's key): that
+    stage's own base window size (FINAL_TARGET_SLICE_MAX_CHARS) differs
+    from this one's (DEFAULT_MAX_CHARS), and ContextBudgetController locks
+    a stage's window_size in on first registration (see
+    ContextBudgetController._stage) -- sharing a key across two different
+    base sizes would silently corrupt whichever stage registered second.
+    A distinct key also keeps this evidence-construction budget from
+    competing with Guided Context's own, separate acquisition budget for
+    the same run.
+
+    Expansion loop, run entirely before any LLM call:
+      1. Render at the stage's current effective budget.
+      2. If nothing is budget-omitted (`excerpt_plan.omitted_sizes` empty),
+         stop -- there is nothing more to acquire.
+      3. Deterministically check, from the exact sizes `omitted_sizes`
+         already recorded (no re-render needed), whether AT LEAST ONE
+         currently-omitted resolved candidate could fit within the
+         remaining LEGAL window allowance (`budget_controller.max_windows`
+         minus windows already used for this stage). If none could ever
+         fit, stop WITHOUT requesting an extension -- a window (and, under
+         policy="ask", an interactive prompt) is never spent on a
+         candidate that provably cannot benefit from it.
+      4. Otherwise request exactly one more window
+         (`budget_controller.request_extension`). If denied (policy
+         forbids it, or the hard `max_windows` cap is already reached),
+         stop -- existing fail-closed behavior.
+      5. Re-render deterministically at the new, larger ceiling.
+      6. If `included_labels` grew relative to the previous render, STOP
+         and return this improved result -- handing off to the LLM-calling
+         consumer with materially new evidence is the point; this does not
+         keep growing further just because some OTHER, still-omitted
+         candidate remains uncovered.
+      7. If `included_labels` did NOT grow, but step 3's reachability
+         check still holds (a known omitted candidate remains reachable
+         within what legal budget is left), loop back to step 3 and keep
+         going -- this is the corrected behavior: a symbol that needs
+         several successive windows before it fits must not be abandoned
+         after only one non-improving attempt.
+      8. If it did not grow and no omitted candidate remains reachable,
+         stop (defensive backstop; the step-3 check should already have
+         caught this).
+
+    No LLM call happens anywhere in this function -- every iteration is a
+    deterministic re-render of already-resolved, already-verified
+    candidates. Whole-symbol-or-omit rendering is preserved unchanged
+    (see `_compute_source_excerpt_plan`): this never truncates or windows
+    a candidate's source, it only changes how large a ceiling the SAME
+    whole-block-or-omit decision is made against.
+    """
+    from .evidence_fusion import DEFAULT_MAX_CHARS
+
+    base = base_max_chars if base_max_chars is not None else DEFAULT_MAX_CHARS
+    if budget_controller is None:
+        return _build_planner_evidence_result(plan, repo_root, vulnerability_text, context, max_chars=base)
+
+    _STAGE = "planner_evidence"
+    ceiling = budget_controller.effective_budget(_STAGE, base)
+    result = _build_planner_evidence_result(plan, repo_root, vulnerability_text, context, max_chars=ceiling)
+    budget_controller.record_used(_STAGE, len(result.rendered))
+
+    while True:
+        omitted_sizes = result.excerpt_plan.omitted_sizes
+        if not omitted_sizes:
+            return result
+
+        windows_used = ceiling // base
+        windows_left = budget_controller.max_windows - windows_used
+        max_reachable_ceiling = ceiling + windows_left * base
+        if not any(size <= max_reachable_ceiling for size in omitted_sizes.values()):
+            return result  # no remaining legal window allowance could ever include any omitted candidate
+
+        before_labels = result.excerpt_plan.included_labels
+        approved = budget_controller.request_extension(
+            _STAGE, base,
+            reason="symbol_or_fallback_omitted",
+            affected_targets=sorted(omitted_sizes),
         )
-        enrich_candidates(selection, root, vulnerability_text, context)
-        understanding = fuse_evidence(selection, investigation_context_available=context is not None)
-        structural = _render_planner_evidence(understanding)
-        if not structural:
-            return ""
+        if not approved:
+            return result  # policy denies expansion, or the hard max_windows cap is already reached
 
-        try:
-            source_block = build_planner_source_excerpts(
-                candidates, symbol_locations, root, context, max_chars=max_chars,
-            )
-        except Exception:
-            source_block = ""
+        ceiling = budget_controller.effective_budget(_STAGE, base)
+        candidate = _build_planner_evidence_result(plan, repo_root, vulnerability_text, context, max_chars=ceiling)
+        budget_controller.record_used(_STAGE, len(candidate.rendered))
 
-        return f"{structural.rstrip()}\n\n{source_block}" if source_block else structural
-    except Exception:
-        return ""
+        if candidate.excerpt_plan.included_labels != before_labels:
+            return candidate  # new structural coverage -- stop and hand off
+
+        result = candidate  # no new coverage yet, but still reachable -- keep expanding
 
 
 def resolved_source_coverage(

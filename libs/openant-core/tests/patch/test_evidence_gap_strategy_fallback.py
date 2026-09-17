@@ -98,41 +98,53 @@ class TestEvidenceGapFallbackTrigger:
 # at call time (same pattern as test_planner_claim_verifier_orchestration.py).
 # ---------------------------------------------------------------------------
 
+def _evidence_result(rendered, labels=()):
+    """A PlannerEvidenceResult stand-in for mocking
+    remediation_planner.build_planner_evidence_with_budget -- the ONE
+    shared function both Strategy #1's own construction and the
+    evidence-gap fallback now call (see EVIDENCE-01 and the unified
+    Planner-evidence context-expansion design). `labels` is the
+    structural source-coverage signature (`excerpt_plan.included_labels`)
+    -- what "new evidence acquired" is decided from, never rendered text."""
+    from utilities.autopatcher.remediation_planner import PlannerEvidenceResult, _SourceExcerptPlan
+    return PlannerEvidenceResult(
+        rendered=rendered,
+        excerpt_plan=_SourceExcerptPlan(
+            blocks=(rendered,) if rendered else (),
+            included_labels=frozenset(labels),
+            symbol_omitted=(), fallback_omitted=(), read_failed=(),
+            budget=4_000, omitted_sizes={},
+        ),
+    )
+
+
+_EMPTY_BASELINE = _evidence_result("", [])
+
+
 def _run_fallback(**overrides):
     kwargs = dict(
         plan_result=_plan(), repo_root="/tmp/repo", vulnerability_text=_VULN_TEXT,
         investigation_context=None,
         budget_controller=None, llm=mock.MagicMock(),
         repo_grounding_ctx="", repository_understanding_ctx="", discovery_plan_ctx="",
+        baseline_planner_evidence_result=_EMPTY_BASELINE,
     )
     kwargs.update(overrides)
     return _run_evidence_gap_strategy_fallback(**kwargs)
 
 
-def _patch_coverage(*side_effect):
-    """Mocks remediation_planner.resolved_source_coverage -- the
-    structural before/after signature _run_evidence_gap_strategy_fallback
-    now gates on (see EVIDENCE-01) -- at its SOURCE module, matching this
-    file's existing pattern for build_planner_evidence/
-    generate_remediation_strategy (both are local, function-body imports
-    inside the function under test, so mocking pipeline.<name> would not
-    intercept them). `side_effect` supplies the (before, after) pair the
-    two calls inside one _run_evidence_gap_strategy_fallback invocation
-    will see, in order."""
-    return mock.patch(
-        "utilities.autopatcher.remediation_planner.resolved_source_coverage",
-        side_effect=list(side_effect),
-    )
-
-
-_COVERAGE_UNCHANGED = (frozenset({"a.py:A"}), frozenset({"a.py:A"}))
-_COVERAGE_GREW = (frozenset(), frozenset({"a.py:A"}))
-
-
 class TestRunEvidenceGapStrategyFallback:
+    """Mocks remediation_planner.build_planner_evidence_with_budget --
+    the ONE shared function both Strategy #1's own construction and this
+    fallback now call -- at its SOURCE module (a local, function-body
+    import inside the function under test, so mocking pipeline.<name>
+    would not intercept it; mocking the source module's attribute does,
+    since the local import re-fetches it at call time -- same pattern as
+    test_planner_claim_verifier_orchestration.py)."""
+
     def test_no_planner_targets_skips_without_calling_anything(self):
         with (
-            mock.patch("utilities.autopatcher.remediation_planner.build_planner_evidence") as spy_evidence,
+            mock.patch("utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget") as spy_evidence,
             mock.patch("utilities.autopatcher.remediation_planner.generate_remediation_strategy") as spy_strategy,
         ):
             result = _run_fallback(
@@ -145,7 +157,7 @@ class TestRunEvidenceGapStrategyFallback:
 
     def test_no_repo_root_skips_without_calling_anything(self):
         with (
-            mock.patch("utilities.autopatcher.remediation_planner.build_planner_evidence") as spy_evidence,
+            mock.patch("utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget") as spy_evidence,
             mock.patch("utilities.autopatcher.remediation_planner.generate_remediation_strategy") as spy_strategy,
         ):
             result = _run_fallback(repo_root=None)
@@ -154,36 +166,39 @@ class TestRunEvidenceGapStrategyFallback:
         assert result["rerun_performed"] is False
 
     def test_identical_coverage_skips_rerun_deterministically(self):
-        """Structural source coverage unchanged between the default and
-        enlarged budgets -- the larger budget genuinely found nothing
-        new -- must not trigger a pointless second Strategy call, and must
-        not even build the full rendered evidence (build_planner_evidence)
-        for a result that would be discarded anyway. This is the exact,
-        sole mechanism 'new evidence actually acquired' is determined by
-        (see EVIDENCE-01: comparing RENDERED TEXT here was the bug)."""
+        """Structural source coverage unchanged relative to what Strategy
+        #1's own construction already saw (baseline_planner_evidence_result)
+        -- must not trigger a pointless second Strategy call. This is the
+        exact, sole mechanism 'new evidence actually acquired' is decided
+        by (see EVIDENCE-01: comparing RENDERED TEXT was the bug)."""
+        baseline = _evidence_result("thin evidence", ["a.py:A"])
         with (
-            _patch_coverage(*_COVERAGE_UNCHANGED),
-            mock.patch("utilities.autopatcher.remediation_planner.build_planner_evidence") as spy_evidence,
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=_evidence_result("thin evidence", ["a.py:A"]),
+            ) as spy_evidence,
             mock.patch("utilities.autopatcher.remediation_planner.generate_remediation_strategy") as spy_strategy,
         ):
-            result = _run_fallback()
-        spy_evidence.assert_not_called()
+            result = _run_fallback(baseline_planner_evidence_result=baseline)
+        spy_evidence.assert_called_once()
         spy_strategy.assert_not_called()
         assert result["evidence_acquired"] is False
         assert result["rerun_performed"] is False
         assert result["skip_reason"] == "no_new_evidence"
 
     def test_empty_new_evidence_skips_rerun(self):
-        """Coverage genuinely changed, but the full rendered evidence
-        build still came back empty (e.g. the structural/narrative half
-        failed independently of the source-excerpt half) -- a defensive
+        """Coverage genuinely changed relative to the baseline, but the
+        full rendered evidence build still came back empty -- a defensive
         path distinct from 'coverage never changed' above."""
+        baseline = _evidence_result("thin evidence", ["a.py:A"])
         with (
-            _patch_coverage(*_COVERAGE_GREW),
-            mock.patch("utilities.autopatcher.remediation_planner.build_planner_evidence", return_value="") as spy_evidence,
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=_evidence_result("", []),
+            ) as spy_evidence,
             mock.patch("utilities.autopatcher.remediation_planner.generate_remediation_strategy") as spy_strategy,
         ):
-            result = _run_fallback()
+            result = _run_fallback(baseline_planner_evidence_result=baseline)
         spy_evidence.assert_called_once()
         spy_strategy.assert_not_called()
         assert result["rerun_performed"] is False
@@ -192,10 +207,9 @@ class TestRunEvidenceGapStrategyFallback:
     def test_different_coverage_calls_strategy_exactly_once(self):
         strategy_v2 = _strategy(evaluated=True, target_files=["a.py"], target_symbols=["A"])
         with (
-            _patch_coverage(*_COVERAGE_GREW),
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                return_value="enriched evidence -- more source than before",
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=_evidence_result("enriched evidence -- more source than before", ["a.py:A"]),
             ) as spy_evidence,
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
@@ -218,10 +232,9 @@ class TestRunEvidenceGapStrategyFallback:
         plan = _plan(target_files=["planner_only.py"], target_symbols=["PlannerOnlySymbol"])
         strategy_v2 = _strategy(evaluated=True, target_files=["real_target.py"], target_symbols=["RealTarget"])
         with (
-            _patch_coverage(*_COVERAGE_GREW),
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                return_value="enriched evidence",
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=_evidence_result("enriched evidence", ["planner_only.py"]),
             ),
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
@@ -238,36 +251,27 @@ class TestRunEvidenceGapStrategyFallback:
         """If coverage never changed, generate_remediation_strategy is
         never called at all, and strategy_result stays strictly None --
         never a hand-built substitute from Planner data."""
+        baseline = _evidence_result("thin", ["a.py:A"])
         with (
-            _patch_coverage(*_COVERAGE_UNCHANGED),
-            mock.patch("utilities.autopatcher.remediation_planner.build_planner_evidence") as spy_evidence,
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=_evidence_result("thin", ["a.py:A"]),
+            ) as spy_evidence,
             mock.patch("utilities.autopatcher.remediation_planner.generate_remediation_strategy") as spy_strategy,
         ):
-            result = _run_fallback()
-        spy_evidence.assert_not_called()
+            result = _run_fallback(baseline_planner_evidence_result=baseline)
+        spy_evidence.assert_called_once()
         spy_strategy.assert_not_called()
         assert result["strategy_result"] is None
 
-    def test_coverage_acquisition_failure_degrades_without_raising(self):
-        """resolved_source_coverage itself is documented never to raise,
+    def test_acquisition_failure_degrades_without_raising(self):
+        """build_planner_evidence_with_budget is documented never to raise,
         but this function's own outer try/except must still degrade
         safely if it somehow did (defense in depth, mirroring every other
         best-effort section in this module)."""
         with mock.patch(
-            "utilities.autopatcher.remediation_planner.resolved_source_coverage",
+            "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
             side_effect=RuntimeError("boom"),
-        ):
-            result = _run_fallback()
-        assert result["rerun_performed"] is False
-        assert result["skip_reason"].startswith("acquisition_failed")
-
-    def test_evidence_build_failure_degrades_without_raising(self):
-        with (
-            _patch_coverage(*_COVERAGE_GREW),
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                side_effect=RuntimeError("boom"),
-            ),
         ):
             result = _run_fallback()
         assert result["rerun_performed"] is False
@@ -275,10 +279,9 @@ class TestRunEvidenceGapStrategyFallback:
 
     def test_strategy_failure_degrades_without_raising(self):
         with (
-            _patch_coverage(*_COVERAGE_GREW),
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                return_value="enriched evidence",
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=_evidence_result("enriched evidence", ["a.py:A"]),
             ),
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
@@ -292,10 +295,9 @@ class TestRunEvidenceGapStrategyFallback:
     def test_model_unavailable_error_propagates(self):
         from utilities.autopatcher.pipeline import ModelUnavailableError
         with (
-            _patch_coverage(*_COVERAGE_GREW),
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                return_value="enriched evidence",
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=_evidence_result("enriched evidence", ["a.py:A"]),
             ),
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
@@ -305,41 +307,15 @@ class TestRunEvidenceGapStrategyFallback:
             with pytest.raises(ModelUnavailableError):
                 _run_fallback()
 
-    def test_uses_final_target_slice_budget_not_default(self):
-        """Acquisition reuses the Final-Target Slice ceiling, never a new
-        budget constant -- for BOTH the structural coverage call and the
-        full evidence build."""
-        from utilities.autopatcher.remediation_planner import FINAL_TARGET_SLICE_MAX_CHARS
-        with (
-            _patch_coverage(*_COVERAGE_GREW) as spy_coverage,
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                return_value="enriched evidence",
-            ) as spy_evidence,
-            mock.patch(
-                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
-                return_value=_strategy(evaluated=True, target_files=["a.py"]),
-            ),
-        ):
-            _run_fallback()
-        _, kwargs = spy_evidence.call_args
-        assert kwargs.get("max_chars") == FINAL_TARGET_SLICE_MAX_CHARS
-        # The "after" coverage call (the second of the two) uses the same ceiling.
-        _, after_kwargs = spy_coverage.call_args_list[1]
-        assert after_kwargs.get("max_chars") == FINAL_TARGET_SLICE_MAX_CHARS
-
-    def test_budget_controller_extension_is_respected(self):
-        """`--max-context-budget-windows` is never bypassed or raised by
-        this fallback -- it reuses whatever ceiling the run's own
-        budget_controller already allows, for BOTH the structural coverage
-        call and the full evidence build."""
+    def test_budget_controller_is_passed_through_unchanged(self):
+        """`--max-context-budget-windows` is never bypassed -- the run's own
+        budget_controller is passed straight through to the shared helper,
+        which alone decides how much ceiling growth policy allows."""
         budget_controller = mock.MagicMock()
-        budget_controller.effective_budget.return_value = 25_000
         with (
-            _patch_coverage(*_COVERAGE_GREW) as spy_coverage,
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                return_value="enriched evidence",
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=_evidence_result("enriched evidence", ["a.py:A"]),
             ) as spy_evidence,
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
@@ -348,10 +324,7 @@ class TestRunEvidenceGapStrategyFallback:
         ):
             _run_fallback(budget_controller=budget_controller)
         _, kwargs = spy_evidence.call_args
-        assert kwargs.get("max_chars") == 25_000
-        _, after_kwargs = spy_coverage.call_args_list[1]
-        assert after_kwargs.get("max_chars") == 25_000
-        budget_controller.effective_budget.assert_called_once_with("final_target_slice", mock.ANY)
+        assert kwargs.get("budget_controller") is budget_controller
 
 
 # ---------------------------------------------------------------------------
@@ -374,10 +347,12 @@ class TestFullPipelineWiring:
                 "utilities.autopatcher.remediation_planner.generate_remediation_plan",
                 return_value=_plan(target_files=["target.py"], target_symbols=["Target"]),
             ),
-            _patch_coverage(*_COVERAGE_GREW),
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                side_effect=["thin evidence", "enriched evidence"],
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                side_effect=[
+                    _evidence_result("thin evidence", []),
+                    _evidence_result("enriched evidence", ["target.py:Target"]),
+                ],
             ) as spy_evidence,
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
@@ -412,10 +387,9 @@ class TestFullPipelineWiring:
                 "utilities.autopatcher.remediation_planner.generate_remediation_plan",
                 return_value=_plan(),
             ),
-            _patch_coverage(*_COVERAGE_GREW),
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                side_effect=["thin evidence", "enriched evidence"],
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                side_effect=[_evidence_result("thin evidence", []), _evidence_result("enriched evidence", ["a.py:A"])],
             ),
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
@@ -435,8 +409,8 @@ class TestFullPipelineWiring:
                 return_value=_plan(),
             ),
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                return_value="thin evidence",
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=_evidence_result("thin evidence", []),
             ) as spy_evidence,
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
@@ -458,8 +432,8 @@ class TestFullPipelineWiring:
                 return_value=_plan(target_files=["target.py"], target_symbols=["Target"]),
             ),
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                return_value="evidence",
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=_evidence_result("evidence", ["target.py:Target"]),
             ) as spy_evidence,
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
@@ -495,8 +469,8 @@ class TestExistingBehaviorRegressionWhenNoTrigger:
                 return_value=_plan(target_files=["target.py"], target_symbols=["Target"]),
             ),
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                return_value="evidence",
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=_evidence_result("evidence", ["target.py:Target"]),
             ),
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
@@ -513,7 +487,7 @@ class TestExecutionArtifactObservability:
     -- and must never expose Planner's retrieval seeds as if they were an
     authoritative target list."""
 
-    def _run_with_recorder(self, tmp_path, strategy_side_effect, evidence_side_effect, coverage_side_effect=_COVERAGE_GREW):
+    def _run_with_recorder(self, tmp_path, strategy_side_effect, evidence_side_effect):
         import json
         from utilities.autopatcher.execution_recorder import ExecutionRecorder
 
@@ -525,13 +499,8 @@ class TestExecutionArtifactObservability:
                 "utilities.autopatcher.remediation_planner.generate_remediation_plan",
                 return_value=_plan(target_files=["target.py"], target_symbols=["Target"]),
             ),
-            # Unused (never consulted) whenever the fallback trigger itself
-            # never fires -- see test_fallback_metadata_recorded_when_not_
-            # triggered, which relies on Strategy #1 already having a
-            # target rather than on this mock's own values.
-            _patch_coverage(*coverage_side_effect),
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
                 side_effect=evidence_side_effect,
             ),
             mock.patch(
@@ -550,7 +519,8 @@ class TestExecutionArtifactObservability:
         strategy_v1 = _strategy(evaluated=True, target_files=[], target_symbols=[], insufficient_evidence=["gap"])
         strategy_v2 = _strategy(evaluated=True, target_files=["target.py"], target_symbols=["Target"])
         artifact = self._run_with_recorder(
-            tmp_path, [strategy_v1, strategy_v2], ["thin evidence", "enriched evidence"],
+            tmp_path, [strategy_v1, strategy_v2],
+            [_evidence_result("thin evidence", []), _evidence_result("enriched evidence", ["target.py:Target"])],
         )
         fallback = artifact["evidence_gap_fallback"]
         assert fallback["attempted"] is True
@@ -567,7 +537,9 @@ class TestExecutionArtifactObservability:
 
     def test_fallback_metadata_recorded_when_not_triggered(self, tmp_path):
         strategy_v1 = _strategy(evaluated=True, target_files=["target.py"], target_symbols=["Target"])
-        artifact = self._run_with_recorder(tmp_path, [strategy_v1], ["evidence"])
+        artifact = self._run_with_recorder(
+            tmp_path, [strategy_v1], [_evidence_result("evidence", ["target.py:Target"])],
+        )
         assert artifact["evidence_gap_fallback"] is None
 
 
@@ -627,10 +599,12 @@ class TestUrllib3TraceReplayRegression:
             # captured run where the larger budget genuinely recovered
             # previously-omitted source), rather than relying on the
             # fixture happening to be large enough to omit anything itself.
-            _patch_coverage(*_COVERAGE_GREW),
             mock.patch(
-                "utilities.autopatcher.remediation_planner.build_planner_evidence",
-                side_effect=["thin evidence -- HTTPConnectionPool.urlopen omitted", "enriched evidence -- Retry source recovered"],
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                side_effect=[
+                    _evidence_result("thin evidence -- HTTPConnectionPool.urlopen omitted", []),
+                    _evidence_result("enriched evidence -- Retry source recovered", ["retry.py:Retry"]),
+                ],
             ),
             mock.patch(
                 "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
@@ -701,13 +675,16 @@ def _make_investigation_context(functions, repo_path):
 # ---------------------------------------------------------------------------
 
 class TestEvidenceGapUsesStructuralCoverageNotRenderedText:
-    def test_symbol_omitted_at_both_budgets_is_not_reported_as_acquired(self, tmp_path):
-        """FALSE-POSITIVE REGRESSION: a symbol whose source exceeds even
-        the enlarged Final-Target-Slice budget is omitted at the default
-        budget AND still omitted at the enlarged budget -- the only
-        difference anywhere in the two rendered evidence blocks is the
-        budget numeral in the omission notice. Must NOT be reported as
-        newly acquired evidence, and must NOT trigger a Strategy #2 call."""
+    def test_symbol_omitted_at_both_calls_is_not_reported_as_acquired(self, tmp_path):
+        """FALSE-POSITIVE REGRESSION: with no budget_controller supplied
+        (the degenerate, always-safe case -- see build_planner_evidence_
+        with_budget's own docstring), both the baseline and the fallback's
+        fresh call render at the identical, unexpandable base budget --
+        must NOT be reported as newly acquired evidence, and must NOT
+        trigger a Strategy #2 call. (The separate "a resolved candidate
+        provably cannot fit within remaining legal windows" case is
+        covered directly at build_planner_evidence_with_budget's own level
+        in test_remediation_planner.py.)"""
         big_body = "\n".join(f"    line_{i} = {i}" for i in range(1, 1000))  # ~18,800 chars
         src = f"def big_function():\n{big_body}\n    return None\n"
         (tmp_path / "mod.py").write_text(src, encoding="utf-8")
@@ -717,25 +694,29 @@ class TestEvidenceGapUsesStructuralCoverageNotRenderedText:
         }, repo_path=tmp_path)
         plan_result = _plan(target_files=["mod.py"], target_symbols=["mod.py:big_function"])
 
-        from utilities.autopatcher.remediation_planner import build_planner_evidence
-        planner_evidence_ctx = build_planner_evidence(plan_result, tmp_path, _VULN_TEXT, context)
-        assert "omitted" in planner_evidence_ctx  # sanity: genuinely omitted at the default budget too
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        baseline = build_planner_evidence_with_budget(plan_result, tmp_path, _VULN_TEXT, context)
+        assert baseline.excerpt_plan.symbol_omitted  # sanity: genuinely omitted at the default budget
 
         result = _run_evidence_gap_strategy_fallback(
             plan_result=plan_result, repo_root=tmp_path, vulnerability_text=_VULN_TEXT,
             investigation_context=context,
             budget_controller=None, llm=None,
             repo_grounding_ctx="", repository_understanding_ctx="", discovery_plan_ctx="",
+            baseline_planner_evidence_result=baseline,
         )
         assert result["evidence_acquired"] is False
         assert result["rerun_performed"] is False
         assert result["skip_reason"] == "no_new_evidence"
 
     def test_symbol_genuinely_fits_at_enlarged_budget_is_reported_as_acquired(self, tmp_path):
-        """POSITIVE CONTROL: a symbol omitted at the default budget but
-        genuinely, fully included once the enlarged budget applies. This
-        protects legitimate bounded recovery from being collaterally
-        suppressed by the fix for the false positive above."""
+        """POSITIVE CONTROL: the baseline reflects a symbol omitted at the
+        base budget (as Strategy #1's own construction would see with no
+        expansion yet applied); the fallback, given a REAL policy="always"
+        ContextBudgetController, genuinely recovers it. This protects
+        legitimate bounded recovery from being collaterally suppressed by
+        the false-positive fix above -- exercised end-to-end against real
+        repository resolution, not a mocked string."""
         body = "\n".join(f"    line_{i} = {i}" for i in range(1, 300))  # ~5,000-6,000 chars
         src = f"def medium_function():\n{body}\n    return None\n"
         (tmp_path / "mod.py").write_text(src, encoding="utf-8")
@@ -745,15 +726,122 @@ class TestEvidenceGapUsesStructuralCoverageNotRenderedText:
         }, repo_path=tmp_path)
         plan_result = _plan(target_files=["mod.py"], target_symbols=["mod.py:medium_function"])
 
-        from utilities.autopatcher.remediation_planner import build_planner_evidence
-        planner_evidence_ctx = build_planner_evidence(plan_result, tmp_path, _VULN_TEXT, context)
-        assert "omitted" in planner_evidence_ctx  # sanity: genuinely omitted at the default budget
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        baseline = build_planner_evidence_with_budget(plan_result, tmp_path, _VULN_TEXT, context)
+        assert baseline.excerpt_plan.symbol_omitted  # sanity: genuinely omitted at the default budget
 
         result = _run_evidence_gap_strategy_fallback(
             plan_result=plan_result, repo_root=tmp_path, vulnerability_text=_VULN_TEXT,
             investigation_context=context,
-            budget_controller=None, llm=None,
+            budget_controller=ContextBudgetController(policy="always", max_windows=10), llm=None,
             repo_grounding_ctx="", repository_understanding_ctx="", discovery_plan_ctx="",
+            baseline_planner_evidence_result=baseline,
         )
         assert result["evidence_acquired"] is True
         assert result["rerun_performed"] is True
+
+
+class TestSharedHelperWiring:
+    """Strategy #1's own evidence construction and the evidence-gap
+    fallback call the exact SAME shared function
+    (remediation_planner.build_planner_evidence_with_budget), passing the
+    exact SAME run-scoped budget_controller object -- proving 'consistent
+    semantics' structurally (same object identity), not by re-deriving
+    behavior from two independent implementations."""
+
+    def test_strategy1_construction_passes_run_budget_controller(self, tmp_path):
+        budget_controller = mock.MagicMock()
+        empty_result = _evidence_result("", [])
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_plan",
+                return_value=_plan(),
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                return_value=empty_result,
+            ) as spy,
+        ):
+            pipeline_mod.run(
+                vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path),
+                budget_controller=budget_controller,
+            )
+        assert spy.call_count >= 1
+        _, kwargs = spy.call_args_list[0]
+        assert kwargs.get("budget_controller") is budget_controller
+
+    def test_fallback_construction_passes_same_run_budget_controller(self, tmp_path):
+        budget_controller = mock.MagicMock()
+        strategy_v1 = _strategy(
+            evaluated=True, target_files=[], target_symbols=[], insufficient_evidence=["gap"],
+        )
+        strategy_v2 = _strategy(evaluated=True, target_files=["target.py"], target_symbols=["Target"])
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_plan",
+                return_value=_plan(target_files=["target.py"], target_symbols=["Target"]),
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                side_effect=[_evidence_result("thin", []), _evidence_result("enriched", ["target.py:Target"])],
+            ) as spy,
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_strategy",
+                side_effect=[strategy_v1, strategy_v2],
+            ),
+        ):
+            pipeline_mod.run(
+                vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path),
+                budget_controller=budget_controller,
+            )
+        assert spy.call_count == 2
+        for call in spy.call_args_list:
+            assert call.kwargs.get("budget_controller") is budget_controller
+
+    def test_v2_authoritative_rebuild_passes_same_run_budget_controller(self, tmp_path):
+        """When the Planner Claim Verifier's revised (v2) plan becomes
+        authoritative, pipeline.py's own rebuild of _planner_evidence_result
+        for that revised plan must use the SAME run-scoped budget_controller
+        Strategy #1's own (pre-revision) construction used -- not a
+        controller-less rebuild that silently diverges from the rest of
+        the run's budget-aware evidence semantics."""
+        budget_controller = mock.MagicMock()
+        plan_v1 = RemediationPlanResult(
+            rendered="## Target Discovery Plan\n", target_files=["a.py"], target_symbols=["A"],
+            narrower_alternative_decision="REJECTED", narrower_alternative_considered="a narrower alternative",
+        )
+        plan_v2 = RemediationPlanResult(
+            rendered="## Target Discovery Plan (revised)\n", target_files=["a.py"], target_symbols=["A"],
+        )
+        verification_result = {
+            "verifier_v1": None, "verifier_v2": None, "mode_v1": "REJECTED", "mode_v2": None,
+            "revision_attempted": True, "forced_skip": False, "skip_reason": None,
+            "broadening_unresolved": False, "authoritative": "v2",
+            "revised_plan_result": plan_v2, "revised_plan_ctx": plan_v2.rendered,
+            "revised_planner_evidence_ctx": "plain, unbudgeted v2 evidence -- must not be used verbatim",
+        }
+        with (
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.generate_remediation_plan",
+                return_value=plan_v1,
+            ),
+            mock.patch(
+                "utilities.autopatcher.pipeline._run_planner_claim_verification",
+                return_value=verification_result,
+            ),
+            mock.patch(
+                "utilities.autopatcher.remediation_planner.build_planner_evidence_with_budget",
+                side_effect=[_evidence_result("v1 evidence", ["a.py:A"]), _evidence_result("v2 evidence", ["a.py:A"])],
+            ) as spy,
+        ):
+            pipeline_mod.run(
+                vulnerability_text=_VULN_TEXT, api_key="", repo_root=str(tmp_path),
+                budget_controller=budget_controller,
+            )
+        # Two calls: (1) Strategy #1's own pre-revision construction for
+        # plan_v1, (2) the v2-authoritative rebuild for plan_v2 -- both must
+        # share the exact same run-scoped controller object.
+        assert spy.call_count == 2
+        _, v2_kwargs = spy.call_args_list[1]
+        assert v2_kwargs.get("budget_controller") is budget_controller

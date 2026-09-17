@@ -2091,7 +2091,7 @@ class TestBuildPlannerEvidence:
             raise RuntimeError("boom")
 
         monkeypatch.setattr(
-            "utilities.autopatcher.remediation_planner.build_planner_source_excerpts", _boom
+            "utilities.autopatcher.remediation_planner._compute_source_excerpt_plan", _boom
         )
 
         plan = RemediationPlanResult(rendered="", target_files=["retry.py"], target_symbols=["retry.py:Retry.method"])
@@ -2155,6 +2155,172 @@ class TestBuildPlannerEvidence:
         assert "### Verified source from Planner-proposed candidates" in result
         # structural evidence still precedes the source subsection
         assert result.index("## Planner-Proposed Candidate Evidence") < result.index("### Verified source")
+
+
+def _big_function_fixture(tmp_path, n_lines, name="big_function"):
+    """A single resolved target symbol whose rendered source-excerpt block
+    size is precisely controllable via `n_lines` -- used to prove the
+    deterministic budget-expansion loop in build_planner_evidence_with_budget
+    requests exactly as many windows as are actually needed (and no more),
+    never fewer than are actually reachable."""
+    body = "\n".join(f"    line_{i} = {i}" for i in range(1, n_lines))
+    src = f"def {name}():\n{body}\n    return None\n"
+    (tmp_path / "mod.py").write_text(src, encoding="utf-8")
+    context = _make_context(
+        functions={f"mod.py:{name}": {"name": name, "startLine": 1, "endLine": len(src.splitlines()), "code": src}},
+        repo_path=tmp_path,
+    )
+    plan = RemediationPlanResult(rendered="", target_files=["mod.py"], target_symbols=[f"mod.py:{name}"])
+    return plan, context
+
+
+class TestBuildPlannerEvidenceWithBudget:
+    """build_planner_evidence_with_budget() -- the ONE shared, deterministic
+    Planner-evidence construction/expansion path used by both Strategy #1's
+    own construction and the evidence-gap Strategy fallback (see
+    pipeline.py). No LLM call happens anywhere in this function; every
+    expansion is a deterministic, no-LLM-call re-render, gated by
+    ContextBudgetController exactly as Slice 2/3/4 already are.
+
+    Fixture sizes (see _big_function_fixture), all well clear of their
+    threshold boundaries (>1,500-char margin either side) to avoid flaky
+    off-by-a-few-dozen-chars failures:
+      n=50   -> ~930 chars   (fits at the 4,000-char base budget)
+      n=320  -> ~5,960 chars (fits at 8,000; omitted at 4,000)
+      n=540  -> ~10,140 chars(fits at 12,000; omitted at 4,000 and 8,000)
+      n=3000 -> ~60,880 chars(exceeds even 10 windows x 4,000 = 40,000)
+    """
+
+    def test_no_controller_matches_build_planner_evidence_exactly(self, tmp_path):
+        from utilities.autopatcher.remediation_planner import (
+            build_planner_evidence, build_planner_evidence_with_budget,
+        )
+        plan, context = _big_function_fixture(tmp_path, 50)
+        expected = build_planner_evidence(plan, tmp_path, "vuln", context)
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=None,
+        )
+        assert result.rendered == expected
+        assert not result.excerpt_plan.symbol_omitted
+
+    def test_fits_initially_no_extension_requested(self, tmp_path):
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 50)
+        controller = ContextBudgetController(policy="always", max_windows=10)
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=controller,
+        )
+        assert not result.excerpt_plan.symbol_omitted
+        # The stage is still auto-registered by effective_budget() (an
+        # unrelated, pre-existing ContextBudgetController behavior -- see
+        # its own docstring), but zero extensions were ever requested.
+        state = controller.to_trace_dict()["stages"]["planner_evidence"]
+        assert state["approved_windows"] == 0
+        assert state["extension_requests"] == []
+
+    def test_one_extension_recovers_source(self, tmp_path):
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 320)
+        controller = ContextBudgetController(policy="always", max_windows=10)
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=controller,
+        )
+        assert not result.excerpt_plan.symbol_omitted
+        state = controller.to_trace_dict()["stages"]["planner_evidence"]
+        assert state["approved_windows"] == 1
+        assert len(state["extension_requests"]) == 1
+        assert state["extension_requests"][0]["approved"] is True
+
+    def test_two_extensions_required_no_premature_stop(self, tmp_path):
+        """The core corrected invariant: intermediate renders with UNCHANGED
+        included_labels must not stop expansion while a known omitted
+        resolved block is still reachable within remaining legal windows."""
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 540)
+        controller = ContextBudgetController(policy="always", max_windows=10)
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=controller,
+        )
+        assert not result.excerpt_plan.symbol_omitted
+        state = controller.to_trace_dict()["stages"]["planner_evidence"]
+        assert state["approved_windows"] == 2
+        assert len(state["extension_requests"]) == 2
+        assert all(r["approved"] for r in state["extension_requests"])
+
+    def test_unreachable_size_does_not_waste_extensions(self, tmp_path):
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 3000)
+        controller = ContextBudgetController(policy="always", max_windows=10)
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=controller,
+        )
+        assert result.excerpt_plan.symbol_omitted
+        stages = controller.to_trace_dict()["stages"]
+        assert stages.get("planner_evidence", {}).get("extension_requests", []) == []
+
+    def test_policy_never_no_expansion(self, tmp_path):
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 320)
+        controller = ContextBudgetController(policy="never", max_windows=10)
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=controller,
+        )
+        assert result.excerpt_plan.symbol_omitted
+
+    def test_max_windows_one_no_expansion_beyond_initial(self, tmp_path):
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 320)
+        controller = ContextBudgetController(policy="always", max_windows=1)
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=controller,
+        )
+        assert result.excerpt_plan.symbol_omitted
+
+    def test_max_windows_exhausted_before_fit_stops_deterministically(self, tmp_path):
+        """n=540 needs a 12,000-char ceiling (3 total windows) to fit.
+        Simulate a prior call against this SAME controller (e.g. Strategy
+        #1's own construction) having already spent every window this run
+        is allowed for "planner_evidence" -- this call must not loop,
+        must not request anything new (the reachability pre-check already
+        knows zero legal windows remain), and must return with the
+        candidate still omitted."""
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan, context = _big_function_fixture(tmp_path, 540)
+        controller = ContextBudgetController(policy="always", max_windows=2)
+        controller.effective_budget("planner_evidence", 4_000)  # registers the stage (1 window)
+        assert controller.request_extension("planner_evidence", 4_000, reason="prior_call") is True
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=controller,
+        )
+        assert result.excerpt_plan.symbol_omitted
+        state = controller.to_trace_dict()["stages"]["planner_evidence"]
+        assert state["approved_windows"] == 1  # only the pre-seeded one -- this call added none
+        assert not any(r["approved"] for r in state["extension_requests"][1:])
+
+    def test_unresolved_target_no_expansion(self, tmp_path):
+        """A target that never resolves to any real candidate produces no
+        omission at all (there is nothing to omit) -- it must never trigger
+        an extension request."""
+        from utilities.autopatcher.context_budget import ContextBudgetController
+        from utilities.autopatcher.remediation_planner import build_planner_evidence_with_budget
+        plan = RemediationPlanResult(
+            rendered="", target_files=["nonexistent.py"], target_symbols=["nonexistent.py:ghost"],
+        )
+        context = _make_context(functions={}, repo_path=tmp_path)
+        controller = ContextBudgetController(policy="always", max_windows=10)
+        result = build_planner_evidence_with_budget(
+            plan, tmp_path, "vuln", context, budget_controller=controller,
+        )
+        assert result.rendered == ""
+        stages = controller.to_trace_dict()["stages"]
+        assert stages.get("planner_evidence", {}).get("extension_requests", []) == []
 
 
 class TestBuildPlannerEvidenceMaxCharsOverride:
