@@ -1030,8 +1030,8 @@ def analyze_reachability(
             else:
                 print(
                     "[LLMReach] final summary write failed "
-                    "(summary left at pass-start state; the resume sweep "
-                    "may offer a needless resume): "
+                    "(summary left at its last per-batch state; the resume "
+                    "sweep may offer a needless resume): "
                     f"{exc}", file=sys.stderr)
             checkpoint_summary_write_failures += 1
 
