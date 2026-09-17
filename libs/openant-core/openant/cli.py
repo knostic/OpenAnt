@@ -566,6 +566,11 @@ def cmd_enhance(args):
                 "error_count": result.error_count,
                 "classifications": result.classifications,
                 "mode": args.mode,
+                # #611: the three-bucket identity's own fields — the SAME
+                # keys the scanner's step summary threads (both writers;
+                # getattr for stub-result callers like the limit test's)
+                "incomplete_count": getattr(result, "incomplete_count", 0),
+                "total_units": getattr(result, "total_units", 0),
             }
             if result.error_summary:
                 ctx.summary["error_summary"] = result.error_summary

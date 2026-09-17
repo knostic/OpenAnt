@@ -296,6 +296,11 @@ class EnhanceResult:
     error_count: int = 0
     error_summary: dict = field(default_factory=dict)
     classifications: dict = field(default_factory=dict)
+    # #611: the three-bucket identity's own fields — dropped before, the
+    # step report's shape was recoverable only by summing classifications
+    # (which omits errors by construction).
+    incomplete_count: int = 0
+    total_units: int = 0
     usage: UsageInfo = field(default_factory=UsageInfo)
 
     def to_dict(self) -> dict:
@@ -308,6 +313,8 @@ class EnhanceResult:
         }
         if self.error_summary:
             result["error_summary"] = self.error_summary
+        result["incomplete_count"] = self.incomplete_count
+        result["total_units"] = self.total_units
         return result
 
 
