@@ -108,10 +108,15 @@ def _unit_security_classification(unit):
     """
     agent_ctx = unit.get("agent_context")
     if isinstance(agent_ctx, dict) and agent_ctx.get("security_classification") is not None:
-        return agent_ctx.get("security_classification")
+        cls = agent_ctx["security_classification"]
+        # #611: the same string guard the row/predicate readers carry — a
+        # non-str stamp (hand-edited/foreign dataset) must never raise out
+        # of the census's set-membership test
+        return cls if isinstance(cls, str) else None
     llm_ctx = unit.get("llm_context")
     if isinstance(llm_ctx, dict) and llm_ctx.get("security_classification") is not None:
-        return llm_ctx.get("security_classification")
+        cls = llm_ctx["security_classification"]
+        return cls if isinstance(cls, str) else None
     return None
 
 

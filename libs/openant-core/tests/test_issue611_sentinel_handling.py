@@ -54,11 +54,16 @@ def test_enhance_result_carries_the_identity_fields():
 
 
 def test_the_step_summary_threads_the_fields():
-    """Source-level pin: the scanner's enhance summary enumerates the new
-    fields explicitly (the shape was dropped before)."""
-    src = (PROJECT_ROOT / "core" / "scanner.py").read_text()
-    assert '"incomplete_count": enhance_result.incomplete_count' in src
-    assert '"total_units": enhance_result.total_units' in src
+    """Source-level pin: BOTH enhance summary writers enumerate the new
+    fields explicitly (the shape was dropped before) — the scanner's
+    pipeline summary AND the standalone CLI's (the two-writer drift the
+    deep-refute caught)."""
+    scanner = (PROJECT_ROOT / "core" / "scanner.py").read_text()
+    assert '"incomplete_count": enhance_result.incomplete_count' in scanner
+    assert '"total_units": enhance_result.total_units' in scanner
+    cli = (PROJECT_ROOT / "openant" / "cli.py").read_text()
+    assert '"incomplete_count": getattr(result, "incomplete_count", 0)' in cli
+    assert '"total_units": getattr(result, "total_units", 0)' in cli
 
 
 def test_enhance_dataset_threads_the_fields(tmp_path):
@@ -151,6 +156,15 @@ def test_the_census_counts_sentinels_as_unclassified():
         and _unit_security_classification(sentinel_unit)
         not in SENTINEL_CLASSIFICATIONS)
     assert classified is False  # the census's shape
+    # the SOURCE pins: the real census condition in analyzer.py carries the
+    # sentinel exclusion (a regression that drops it passes the mirror
+    # above — this catches it); and the real loop's incomplete_count
+    # increment sits inside the cls == "incomplete" branch
+    src = (PROJECT_ROOT / "core" / "analyzer.py").read_text()
+    assert "_unit_security_classification(u) not in SENTINEL_CLASSIFICATIONS" in src
+    enh = (PROJECT_ROOT / "core" / "enhancer.py").read_text()
+    assert 'if cls == "incomplete":' in enh
+    assert "incomplete_count += 1" in enh
 
 
 def test_the_counter_in_the_metrics():
