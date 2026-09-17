@@ -125,6 +125,12 @@ def test_the_sentinel_hint_is_omitted():
         classification_reasoning=sentinel_unit["agent_context"][
             "classification_reasoning"])
     assert "Pre-analysis hint" not in prompt
+    # ALL THREE sentinel values — the gate is the SET, not one member
+    for sentinel in ("incomplete", "error", "unknown"):
+        p = get_analysis_prompt(
+            code="def f(): pass", language="python", route="a.py:f",
+            security_classification=sentinel)
+        assert "Pre-analysis hint" not in p, sentinel
     prompt2 = get_analysis_prompt(
         code="def g(): pass", language="python", route="a.py:g",
         security_classification="safe")
@@ -189,6 +195,16 @@ def test_the_staleness_predicate_behavioral():
     assert _cp_is_stale(_cp("safe"), unit_completed) is False
     # sentinel-stamped + unclassified -> not stale (no migration evidence)
     assert _cp_is_stale(_cp("error"), unit_unclassified) is False
+    # the edge terms: an UNSTAMPED checkpoint (single-shot row, no stamp)
+    # and a NON-STR stamp (corrupt row) are never stale — the isinstance
+    # guard, never a raise
+    assert _cp_is_stale({"result": {}}, unit_completed) is False
+    assert _cp_is_stale({"result": None}, unit_completed) is False
+    assert _cp_is_stale(
+        {"result": {"security_classification": {"nested": "dict"}}},
+        unit_completed) is False
+    assert _cp_is_stale({"result": {"security_classification": None}},
+                        unit_completed) is False
 
 def test_the_seed_excludes_stale_but_keeps_their_usage():
     """THE F1 receipt (behavioral): a migration-resume seed — a sentinel-

@@ -413,6 +413,10 @@ def _cp_is_stale(cp_data, unit):
     still-sentinel checkpoint matches the run's own dataset and stays
     adopted."""
     cp_cls = (cp_data.get("result", {}) or {}).get("security_classification")
+    # the same string guard _result_security_classification carries — a
+    # non-str/unhashable stamp must never raise out of the predicate
+    if not isinstance(cp_cls, str):
+        return False
     current_cls = _unit_security_classification(unit)
     return (
         cp_cls in SENTINEL_CLASSIFICATIONS
@@ -762,7 +766,9 @@ def run_analysis(
             print(
                 f"[Analyze] WARNING: --exploitable filter ({exploitable_filter}) "
                 f"requested but NONE of the {original_count} units carry a "
-                "security_classification (run `enhance` first; single-shot mode "
+                "COMPLETED security_classification "
+                "(all are unenhanced or carry a non-verdict sentinel — "
+                "incomplete/error/unknown; run `enhance` first; single-shot mode "
                 "must populate llm_context.security_classification). "
                 "Filter matched 0 units.",
                 file=sys.stderr,

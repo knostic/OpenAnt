@@ -3,6 +3,13 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-14] — The enhance non-verdicts: the sentinel contract (#611)
+
+### Fixed
+
+- **Enhancement non-verdicts stop leaking into analysis as verdicts.** The sentinel values (`incomplete`, `error`, `unknown` — now `SENTINEL_CLASSIFICATIONS` in the verdict taxonomy) are not verdicts: the Stage-1 prompt's "Pre-analysis hint" omits them entirely (a non-verdict presented to the model as a classification was the wrong channel; the durable signal is the per-row stamp); the `--exploitable` filter's loud census no longer counts a sentinel-stamped unit as classified (an all-sentinel dataset fires the warning — the same un-enhanced shape; the warning text names both conditions); the metrics carry `enhance_unclassified_analyzed` (an input-provenance counter, not a third analyze state — #293 stands), placed after the consistency check's counts rebuild so it survives correction runs. `EnhanceResult` carries `incomplete_count` + `total_units` — the three-bucket identity (`total = enhanced + incomplete + errors`) is recoverable without summing `classifications` (which omits errors by construction); the scanner's step summary threads them. **The recovery blocker**: a sentinel-stamped analyze checkpoint re-analyzes when re-enhancement changes its classification to completed (the migration off the old hint policy); a still-sentinel checkpoint stays adopted (matching the run's own dataset); `_seed_summary` excludes the stale row from `completed` (the migration-resume double-count) while its usage still accumulates. Scope, disclosed: the counter's stamp is agentic-only today (the single-shot row carries no stamp); the counter publishes into `results.json`'s metrics only (not `AnalysisMetrics`/the step report/Go types); `incomplete_count` counts the `"incomplete"` bucket only (errors carry their own `error_count`) — the sentinel vocabulary and the identity buckets are two views of the same stage, documented as such.
+
+## [2026-09-14] — The degenerate exits get their own diagnostic channel (#615)
 ## [2026-09-14] — The errored unit's usage reaches the tracker (#616)
 
 ### Fixed
