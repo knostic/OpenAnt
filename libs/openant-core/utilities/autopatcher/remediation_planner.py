@@ -1038,13 +1038,34 @@ def _render_source_excerpt(path: str, label: "str | None", start: int, end: int,
     return f"{header}\n\n```python\n{source.rstrip()}\n```\n"
 
 
-def build_planner_source_excerpts(
+class _SourceExcerptPlan(NamedTuple):
+    """The complete, structural result of the Pass 1 / Pass 2 source-
+    fitting decision -- the ONE place that decision is ever computed.
+    `build_planner_source_excerpts` renders its string return value from
+    this and only this; `_included_source_labels` (and, through it,
+    `resolved_source_coverage`) reads only `.included_labels` from it.
+    There is deliberately no second implementation of Pass 1/Pass 2
+    ordering, budget arithmetic, source-reading, or included/omitted
+    classification anywhere else -- see EVIDENCE-01, where a caller that
+    instead compared two RENDERED strings was fooled by a budget numeral
+    embedded in an omission notice even though this same structural result
+    was byte-for-byte unchanged between the two calls being compared."""
+
+    blocks: "tuple[str, ...]"
+    included_labels: "frozenset[str]"
+    symbol_omitted: "tuple[str, ...]"
+    fallback_omitted: "tuple[str, ...]"
+    read_failed: "tuple[str, ...]"
+    budget: int
+
+
+def _compute_source_excerpt_plan(
     candidates: "list[RepositoryCandidate]",
     symbol_locations: "dict[str, _SymbolMatch]",
     repo_root: Path,
     context,
     max_chars: "int | None" = None,
-) -> str:
+) -> _SourceExcerptPlan:
     """
     Two deterministic passes over the already-verified Planner candidates
     (same order build_planner_candidates produced) -- no scoring, no
@@ -1067,8 +1088,8 @@ def build_planner_source_excerpts(
     budget, so a lower-priority fallback can never consume budget a
     higher-priority verified symbol still needed.
 
-    Best-effort throughout: any failure returns "" so the caller falls
-    back to structural evidence alone.
+    Never raises -- any failure is reflected as an empty/partial plan so
+    callers fall back to their own existing degradation.
 
     `max_chars=None` (the default, and every existing caller) preserves
     the exact prior behavior byte-for-byte: the shared budget is
@@ -1081,15 +1102,13 @@ def build_planner_source_excerpts(
     above (priority order, whole-block-or-omit, Pass 1 before Pass 2) is
     completely unaffected by which budget value is in force.
     """
-    if not candidates:
-        return ""
-
     if max_chars is None:
         from .evidence_fusion import DEFAULT_MAX_CHARS as _budget
     else:
         _budget = max_chars
 
     blocks: "list[str]" = []
+    included_labels: "set[str]" = set()
     symbol_omitted: "list[str]" = []
     fallback_omitted: "list[str]" = []
     read_failed: "list[str]" = []
@@ -1118,6 +1137,7 @@ def build_planner_source_excerpts(
         block = _render_source_excerpt(match.file, match.label, match.line, match.end_line, source)
         if running + len(block) <= _budget:
             blocks.append(block)
+            included_labels.add(label)
             running += len(block)
         else:
             symbol_omitted.append(label)
@@ -1135,30 +1155,81 @@ def build_planner_source_excerpts(
         block = _render_source_excerpt(path, None, 1, n_lines, full_text)
         if running + len(block) <= _budget:
             blocks.append(block)
+            included_labels.add(path)
             running += len(block)
         else:
             fallback_omitted.append(path)
 
-    if not blocks and not symbol_omitted and not fallback_omitted and not read_failed:
+    return _SourceExcerptPlan(
+        blocks=tuple(blocks), included_labels=frozenset(included_labels),
+        symbol_omitted=tuple(symbol_omitted), fallback_omitted=tuple(fallback_omitted),
+        read_failed=tuple(read_failed), budget=_budget,
+    )
+
+
+def build_planner_source_excerpts(
+    candidates: "list[RepositoryCandidate]",
+    symbol_locations: "dict[str, _SymbolMatch]",
+    repo_root: Path,
+    context,
+    max_chars: "int | None" = None,
+) -> str:
+    """Renders `_compute_source_excerpt_plan`'s result into the Markdown
+    block Patch Generation/Strategy prompts embed -- this function owns
+    ONLY rendering; the fitting decision itself lives entirely in
+    `_compute_source_excerpt_plan` (see that function's own docstring for
+    Pass 1/Pass 2 semantics). Signature and externally observable string
+    output are unchanged from before this was split in two.
+
+    Best-effort throughout: any failure returns "" so the caller falls
+    back to structural evidence alone.
+    """
+    if not candidates:
+        return ""
+
+    plan = _compute_source_excerpt_plan(candidates, symbol_locations, repo_root, context, max_chars=max_chars)
+
+    if not plan.blocks and not plan.symbol_omitted and not plan.fallback_omitted and not plan.read_failed:
         return ""
 
     lines = [_SOURCE_SUBHEADING, "", _SOURCE_DISCLAIMER]
-    if blocks:
+    if plan.blocks:
         lines.append("")
-        lines.append("\n".join(blocks).rstrip())
+        lines.append("\n".join(plan.blocks).rstrip())
 
     notes = []
-    if symbol_omitted:
-        notes.append(f"symbol excerpt(s) omitted to stay within the {_budget}-character budget: {', '.join(symbol_omitted)}")
-    if fallback_omitted:
-        notes.append(f"full-file fallback(s) omitted to stay within the {_budget}-character budget: {', '.join(fallback_omitted)}")
-    if read_failed:
-        notes.append(f"source could not be read: {', '.join(read_failed)}")
+    if plan.symbol_omitted:
+        notes.append(f"symbol excerpt(s) omitted to stay within the {plan.budget}-character budget: {', '.join(plan.symbol_omitted)}")
+    if plan.fallback_omitted:
+        notes.append(f"full-file fallback(s) omitted to stay within the {plan.budget}-character budget: {', '.join(plan.fallback_omitted)}")
+    if plan.read_failed:
+        notes.append(f"source could not be read: {', '.join(plan.read_failed)}")
     if notes:
         lines.append("")
         lines.extend(f"*{n}.*" for n in notes)
 
     return "\n".join(lines) + "\n"
+
+
+def _included_source_labels(
+    candidates: "list[RepositoryCandidate]",
+    symbol_locations: "dict[str, _SymbolMatch]",
+    repo_root: Path,
+    context,
+    max_chars: "int | None" = None,
+) -> "frozenset[str]":
+    """The set of candidate/symbol labels `build_planner_source_excerpts`'s
+    OWN fitting decision (`_compute_source_excerpt_plan`) actually included
+    as real source -- never rendered text. Two calls with different
+    `max_chars` values against the SAME candidates/symbol_locations are
+    directly comparable set-for-set: an unchanged set means the larger
+    budget fit nothing new, regardless of how any rendered omission notice
+    happens to be worded (see EVIDENCE-01)."""
+    if not candidates:
+        return frozenset()
+    return _compute_source_excerpt_plan(
+        candidates, symbol_locations, repo_root, context, max_chars=max_chars,
+    ).included_labels
 
 
 def _render_planner_evidence(understanding) -> str:
@@ -1266,6 +1337,60 @@ def build_planner_evidence(
         return f"{structural.rstrip()}\n\n{source_block}" if source_block else structural
     except Exception:
         return ""
+
+
+def resolved_source_coverage(
+    plan: RemediationPlanResult,
+    repo_root,
+    context,
+    max_chars: "int | None" = None,
+) -> "frozenset[str]":
+    """The structural "how much real, usable repository source would
+    build_planner_evidence's own source-excerpt selection actually
+    include for this Planner proposal, at this budget" signature.
+
+    Reuses the SAME verified-file/symbol resolution build_planner_evidence
+    performs (`_verify_file`, `_resolve_planner_symbols`,
+    `build_planner_candidates` -- never a second implementation of any of
+    them), feeding the SAME, single fitting implementation
+    `build_planner_source_excerpts` renders from
+    (`_compute_source_excerpt_plan`, via `_included_source_labels`) --
+    returning only its included-label set, never rendered text.
+
+    Exists so a caller deciding "did recovery at a larger budget actually
+    acquire new, usable evidence" can compare two calls' return values
+    directly (frozenset equality) instead of comparing rendered Markdown,
+    which embeds the budget ceiling itself inside its own omission-notice
+    text and therefore always differs across two different `max_chars`
+    values regardless of whether anything substantive changed (see
+    EVIDENCE-01). Does not itself build the rendered evidence block --
+    `build_planner_evidence` remains the only function that does, still
+    needed in full whenever a caller determines (via this function) that
+    real new evidence exists.
+
+    Returns `frozenset()` -- never raises -- under every condition
+    `build_planner_evidence` itself would have returned `""` for: no
+    `repo_root`, nothing proposed, or zero verified candidates."""
+    if not repo_root or not (plan.target_files or plan.target_symbols):
+        return frozenset()
+    try:
+        root = Path(repo_root)
+        verified_target_files: "list[str]" = []
+        seen_target_files: set = set()
+        for raw in plan.target_files:
+            vf = _verify_file(raw, root)
+            if vf and vf not in seen_target_files:
+                seen_target_files.add(vf)
+                verified_target_files.append(vf)
+
+        symbol_locations = _resolve_planner_symbols(plan, root, context, verified_files=verified_target_files)
+        candidates = build_planner_candidates(plan, root, context, symbol_locations=symbol_locations)
+        if not candidates:
+            return frozenset()
+
+        return _included_source_labels(candidates, symbol_locations, root, context, max_chars=max_chars)
+    except Exception:
+        return frozenset()
 
 
 # ---------------------------------------------------------------------------

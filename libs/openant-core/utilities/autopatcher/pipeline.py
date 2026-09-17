@@ -4512,7 +4512,7 @@ def _evidence_gap_fallback_trigger(strategy_result) -> bool:
 
 def _run_evidence_gap_strategy_fallback(
     *, plan_result, repo_root, vulnerability_text, investigation_context,
-    planner_evidence_ctx, budget_controller, llm,
+    budget_controller, llm,
     repo_grounding_ctx, repository_understanding_ctx, discovery_plan_ctx,
 ):
     """One-shot, bounded recovery attempted only when
@@ -4522,32 +4522,43 @@ def _run_evidence_gap_strategy_fallback(
     calls this function a second time in the same run regardless of what
     it returns.
 
-    Step 1 (deterministic, zero LLM calls): re-run the exact same
-    Planner-evidence bridge Stage 1 already ran
-    (`remediation_planner.build_planner_evidence`, using the SAME Planner
-    proposal and the SAME InvestigationContext -- no new repository parse,
-    no new candidate discovery), but at the larger, already-existing
-    Final-Target Slice ceiling
-    (`remediation_planner.FINAL_TARGET_SLICE_MAX_CHARS`, itself subject to
-    whatever `budget_controller` this run already has -- never a new
-    budget constant, never a change to `--max-context-budget-windows`)
-    instead of Stage 1's small, fixed, pre-Strategy budget. Planner's
+    "New evidence actually acquired" is determined from STRUCTURAL source
+    coverage, never from comparing two rendered Markdown strings (see
+    EVIDENCE-01: a rendered omission notice embeds the budget ceiling
+    itself -- "...omitted to stay within the {N}-character budget..." --
+    so two calls at different `max_chars` values always produce different
+    text even when the exact same symbol is omitted both times, which
+    used to make this function report `evidence_acquired=True` for a
+    recovery that recovered nothing).
+
+    Step 1 (deterministic, zero LLM calls): compute
+    `remediation_planner.resolved_source_coverage` -- the set of
+    candidate/symbol labels that would actually receive real, included
+    source -- at BOTH Stage 1's own small, fixed, pre-Strategy budget
+    (`max_chars=None`, reproducing exactly what Strategy #1's own
+    evidence was built from: the SAME Planner proposal and the SAME
+    InvestigationContext, no new repository parse, no new candidate
+    discovery) and the larger, already-existing Final-Target Slice
+    ceiling (`remediation_planner.FINAL_TARGET_SLICE_MAX_CHARS`, itself
+    subject to whatever `budget_controller` this run already has -- never
+    a new budget constant, never a change to `--max-context-budget-
+    windows`). An unchanged coverage set means the larger budget
+    genuinely couldn't fit anything Strategy #1 didn't already have -- a
+    second Strategy call would be pointless, so none is made (the full
+    rendered evidence is not even built in that case), and the caller's
+    existing fail-closed behavior applies unchanged. Planner's
     `target_files`/`target_symbols` are used here ONLY as the seeds that
-    bridge already verifies and reads source for -- nothing here
-    constructs a RemediationStrategyResult, FinalTargetSliceResult,
-    IntendedEdit, or EditReadinessResult from them.
+    `resolved_source_coverage`/`build_planner_evidence` already verify
+    and read source for -- nothing here constructs a
+    RemediationStrategyResult, FinalTargetSliceResult, IntendedEdit, or
+    EditReadinessResult from them.
 
-    "New evidence actually acquired" is determined the simplest possible
-    deterministic way: a byte-for-byte string comparison between the
-    freshly recomputed evidence text and the `planner_evidence_ctx`
-    Strategy #1 already saw. Identical (or empty) text means the larger
-    budget genuinely couldn't fit anything Strategy #1 didn't already
-    have -- a second Strategy call would be pointless, so none is made,
-    and the caller's existing fail-closed behavior applies unchanged.
-
-    Step 2 (one bounded LLM call, only if Step 1's text differs): call
-    `remediation_planner.generate_remediation_strategy` again -- same
-    function, same prompt/schema, unmodified -- with the enriched
+    Step 2 (one bounded LLM call, only if coverage genuinely changed):
+    build the full rendered evidence at the larger budget
+    (`remediation_planner.build_planner_evidence`, needed for Strategy
+    #2's actual prompt -- coverage alone is never sent to the model),
+    then call `remediation_planner.generate_remediation_strategy` again --
+    same function, same prompt/schema, unmodified -- with that enriched
     evidence. This is Final Strategy #2. Its result is the ONLY thing
     this function returns that the caller may treat as authoritative;
     Planner's own target_files/target_symbols are never returned here at
@@ -4562,12 +4573,13 @@ def _run_evidence_gap_strategy_fallback(
                                       uniform observability shape even if a
                                       future caller invokes this
                                       unconditionally.
-      evidence_acquired            : bool -- Step 1 produced text that
-                                      differs from `planner_evidence_ctx`.
+      evidence_acquired            : bool -- the structural source-coverage
+                                      signature genuinely differs between
+                                      the default and enlarged budgets.
       rerun_performed              : bool -- Step 2 (Strategy #2) was
                                       actually called.
-      enriched_planner_evidence_ctx: str | None -- Step 1's text, only when
-                                      evidence_acquired.
+      enriched_planner_evidence_ctx: str | None -- the enlarged rendered
+                                      evidence, only when evidence_acquired.
       strategy_result               : RemediationStrategyResult | None --
                                       Strategy #2's result, only when
                                       rerun_performed.
@@ -4587,7 +4599,9 @@ def _run_evidence_gap_strategy_fallback(
         return result
 
     try:
-        from .remediation_planner import build_planner_evidence, FINAL_TARGET_SLICE_MAX_CHARS
+        from .remediation_planner import (
+            build_planner_evidence, resolved_source_coverage, FINAL_TARGET_SLICE_MAX_CHARS,
+        )
         # Mirrors remediation_planner._effective_final_target_max exactly
         # (that helper is private to remediation_planner.py, so its two
         # lines are reproduced here rather than imported across the module
@@ -4597,6 +4611,14 @@ def _run_evidence_gap_strategy_fallback(
             budget_controller.effective_budget("final_target_slice", FINAL_TARGET_SLICE_MAX_CHARS)
             if budget_controller is not None else FINAL_TARGET_SLICE_MAX_CHARS
         )
+        before_coverage = resolved_source_coverage(plan_result, repo_root, investigation_context)
+        after_coverage = resolved_source_coverage(
+            plan_result, repo_root, investigation_context, max_chars=new_max_chars,
+        )
+        if after_coverage == before_coverage:
+            result["skip_reason"] = "no_new_evidence"
+            return result
+
         new_ctx = build_planner_evidence(
             plan_result, repo_root, vulnerability_text, investigation_context, max_chars=new_max_chars,
         )
@@ -4604,7 +4626,7 @@ def _run_evidence_gap_strategy_fallback(
         result["skip_reason"] = f"acquisition_failed:{type(exc).__name__}"
         return result
 
-    if not new_ctx or new_ctx == planner_evidence_ctx:
+    if not new_ctx:
         result["skip_reason"] = "no_new_evidence"
         return result
 
@@ -6826,7 +6848,6 @@ def run(
             repo_root=repo_root,
             vulnerability_text=vulnerability_text,
             investigation_context=_investigation_context,
-            planner_evidence_ctx=_planner_evidence_ctx,
             budget_controller=budget_controller,
             llm=llm,
             repo_grounding_ctx=_repo_code,
