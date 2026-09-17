@@ -521,12 +521,16 @@ def analyze_reachability(
     # ------------------------------------------------------------------
     checkpoint = None
     # #603: the stage-local running usage — the DELTA from this function's
-    # entry (the step_context semantics exactly: a snapshot of the global
+    # entry (the step_context semantics: a snapshot of the global
     # tracker's totals at entry, and every publication reports
     # current-minus-baseline). The global tracker is cumulative (prior
     # phases' spend included), so a naive totals read would double-count
-    # with the step report and the earlier phases' summaries; the delta
-    # makes the terminal summary equal the step report by construction.
+    # with the step report and the earlier phases' summaries. The
+    # terminal summary equals the step report's delta while the windows
+    # between the two snapshots (step_context's start vs this entry)
+    # stay spend-free — they are co-located, not one shared boundary
+    # (a future LLM call between them would need a pin; none exists
+    # today).
     _usage_baseline = None
     if tracker is not None:
         try:
@@ -899,8 +903,12 @@ def analyze_reachability(
                                    and not record_units):
             # #603: the failed/unrecovered batches are the billed-but-empty
             # cases whose spend the live summary exists to show — the
-            # publication fires BEFORE the continue (the best-effort shape
-            # of the tail).
+            # publication fires BEFORE the continue. DELIBERATELY
+            # UNCOUNTED on failure (the #599 counters cover the
+            # pass-start/final writes only — the persistent-failure
+            # case; a transient mid-loop write failure is invisible BY
+            # DESIGN: a per-batch counter would fire N times for one
+            # disk-full episode and drown the loud signal).
             if checkpoint is not None:
                 try:
                     checkpoint.write_summary(
@@ -968,8 +976,11 @@ def analyze_reachability(
         # #603: the per-batch publication — after EVERY attempted batch
         # (the dropped/failed outcomes included; this tail runs for each)
         # so the running summary tracks the live spend. Exception-safe: a
-        # publication failure must never mask the pass (the #599 counters
-        # own the summary-write failure signal).
+        # publication failure must never mask the pass. DELIBERATELY
+        # UNCOUNTED on failure (the same policy as the pre-continue
+        # site — the #599 counters cover the pass-start/final writes,
+        # the persistent-failure case; a transient mid-loop failure is
+        # invisible by design).
         if checkpoint is not None:
             try:
                 checkpoint.write_summary(

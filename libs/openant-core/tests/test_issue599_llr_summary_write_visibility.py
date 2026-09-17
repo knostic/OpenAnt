@@ -12,10 +12,14 @@ The fix mirrors the siblings' if/else idiom at both sites with PHASE-NAMED
 messages, and counts the failures into ``checkpoint_summary_write_failures``
 (the step-report stats) — visible in the artifact without any callback.
 
-The write-failure tests use a DELEGATING fake keyed on call order: llr
-makes exactly two ``write_summary`` calls per pass (pass-start, final),
-and the recorded phase sequence is asserted BEFORE the raise keying, so
-call-order drift cannot silently retarget the injection.
+The write-failure tests use a DELEGATING fake keyed on the recorded
+phase sequence: since #603 the pass writes the summary at pass start,
+after every attempted batch (deliberately uncounted best-effort), and at
+termination — the failure injection keys on ``phase`` (the final write
+is the ``phase == "done"`` call), so call-count drift cannot silently
+retarget the injection. The #599 counters cover the pass-start/final
+writes only; the per-batch refreshes are the silent best-effort class
+by design.
 
 Fully offline ($0).
 """

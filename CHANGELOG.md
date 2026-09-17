@@ -3,6 +3,12 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-15] — The llr checkpoint summaries publish the stage-local running usage (#603)
+
+### Fixed
+
+- **The LLM-reachability checkpoint summaries were usage-blind.** Both writes per pass (start and end) passed `usage=None` — the stage-local running cost was invisible to any summary-reading consumer mid-stage (~$8 over 41 minutes in the referenced run while summary-derived cost sums held the app-context step's $0.03; the terminal step report retained the tracked cost — the loss was live visibility). The summaries now publish at **three points**: pass start (after the prior-usage injection, so the first snapshot carries the adopted spend), **after every attempted batch** — including the failed/dropped/unrecovered-split paths that `continue` past record persistence (the billed-but-empty cases the live summary exists to show) — and at termination. The published figure is the **delta from the function's entry** (a `get_totals` snapshot at entry — the step-context semantics; the global tracker is cumulative, so a naive totals read would double-count with the step report and the earlier phases' summaries); the #216 markers and the #605 accounting-error counter survive the publication (run-cumulative). The per-batch refreshes are deliberately **uncounted** on failure (the #599 counters cover the pass-start/final writes — the persistent-failure case; a per-batch counter would fire N times for one disk-full episode and drown the loud signal). Publication failures (OSError) never mask the pass.
+
 ## [2026-09-15] — A completed paid classification survives a post-result assembly failure (#614)
 
 ### Fixed
