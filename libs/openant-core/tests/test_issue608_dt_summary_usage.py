@@ -20,16 +20,28 @@ already printed it) — two channels, two figures, both correct.
 
 import re
 import sys
+
+import pytest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utilities.llm_client import TokenTracker  # noqa: E402
+from utilities.llm_client import (  # noqa: E402
+    TokenTracker,
+    reset_global_tracker,
+)
 
 
-
+@pytest.fixture(autouse=True)
+def _clean_tracker():
+    """The singleton tracker resets before AND after every test (the repo's
+    convention for singleton-touching tests) — these tests seed real
+    spend on the global tracker."""
+    reset_global_tracker()
+    yield
+    reset_global_tracker()
 
 
 def test_every_write_site_passes_usage():
@@ -105,11 +117,10 @@ def test_the_resumed_pass_start_carries_the_restored_spend(tmp_path,
     import json as _json
     import core.dynamic_tester as cd
     import utilities.dynamic_tester as dt
-    from utilities.llm_client import reset_global_tracker, get_global_tracker
+    from utilities.llm_client import get_global_tracker
     from tests.test_issue333_dyn_test_cost_delta import _NoopAdapter
     from utilities.llm import PhaseBinding
 
-    reset_global_tracker()
     tracker = get_global_tracker()
     # an EARLIER phase's spend on the shared tracker (the exclusion half)
     tracker.add_prior_usage(5000, 5000, 2.5)
@@ -195,11 +206,10 @@ def test_a_failed_baseline_snapshot_publishes_none(tmp_path, monkeypatch):
     import json as _json
     import core.dynamic_tester as cd
     import utilities.dynamic_tester as dt
-    from utilities.llm_client import reset_global_tracker, get_global_tracker
+    from utilities.llm_client import get_global_tracker
     from tests.test_issue333_dyn_test_cost_delta import _NoopAdapter
     from utilities.llm import PhaseBinding
 
-    reset_global_tracker()
     get_global_tracker().add_prior_usage(5000, 5000, 2.5)  # earlier phases
 
     pipeline = tmp_path / "pipeline_output.json"
@@ -214,12 +224,6 @@ def test_a_failed_baseline_snapshot_publishes_none(tmp_path, monkeypatch):
             "impact": "i", "suggested_fix": "f",
         }],
     }))
-
-    class _PoisonedTotals:
-        def __getattr__(self, name):
-            if name == "get_totals":
-                raise RuntimeError("tracker exploded")
-            raise AttributeError(name)
 
     class _FakeRegistry:
         def get(self, phase):
@@ -243,21 +247,19 @@ def test_a_failed_baseline_snapshot_publishes_none(tmp_path, monkeypatch):
     monkeypatch.setattr(cd.shutil, "which",
                         lambda n: "/usr/bin/docker" if n == "docker"
                         else None)
-    # poison the GLOBAL tracker's get_totals — a TRANSIENT mid-stage failure:
-    # the first call (the step wrapper's entry snapshot, core/dynamic_tester.py:47)
-    # succeeds; every later read raises. The summary baseline then reads None
-    # and publishes usage=None (never a cumulative misread as a delta).
-    _real_get_totals = type(dt.get_global_tracker()).get_totals
-    _calls = {"n": 0}
-
-    def _flaky_get_totals(self):
-        _calls["n"] += 1
-        if _calls["n"] == 1:
-            return _real_get_totals(self)
-        raise RuntimeError("tracker exploded mid-stage")
+    # poison the GLOBAL tracker's get_totals for the whole run. The DIRECT
+    # entry (no step wrapper: usage_baseline stays None, the #333 console
+    # refresh is skipped) makes the _summary_baseline snapshot at
+    # __init__.py the FIRST get_totals reader: it raises, the baseline is
+    # None, and every publication carries usage=None (the honest absence —
+    # never the run-cumulative misread as a stage delta). The module's
+    # plain attribute reads (total_cost_usd at :240) and get_unit_usage
+    # never call get_totals, so nothing else can raise first.
+    def _exploding_get_totals(self):
+        raise RuntimeError("tracker exploded")
 
     monkeypatch.setattr(type(dt.get_global_tracker()), "get_totals",
-                        _flaky_get_totals)
+                        _exploding_get_totals)
     try:
         dt.run_dynamic_tests(pipeline_output_path=str(pipeline),
                              output_dir=str(tmp_path / "out"),

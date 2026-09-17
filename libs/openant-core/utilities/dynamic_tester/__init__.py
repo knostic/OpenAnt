@@ -313,6 +313,8 @@ def run_dynamic_tests(
                                   - _summary_baseline.get("total_cost_usd", 0.0), 6),
             }
             # #216: the incomplete-cost markers survive; #605: the counter.
+            # (Run-cumulative — the accepted trade in step_report.py:147-163,
+            # the same parenthetical the llr sibling carries.)
             if t.get("cost_incomplete"):
                 u["cost_incomplete"] = True
                 u["unpriced_models"] = t.get("unpriced_models") or []
