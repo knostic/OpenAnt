@@ -270,12 +270,16 @@ def test_gemini_http_options_timeout_is_declared():
     """#604: the timeout-parity field (GUARD — the SDK field exists
     independent of our wiring; the ADAPTER's use is pinned by the #604
     capture test): the adapter maps request_timeout seconds to
-    HttpOptions.timeout milliseconds — the field name is load-bearing
-    (a rename silently drops the deadline back to genai's unbounded
-    None)."""
+    HttpOptions.timeout milliseconds — the field name AND its
+    millisecond unit are load-bearing (a rename silently drops the
+    deadline back to genai's unbounded None; a unit change to seconds
+    silently makes every deadline 1000x too long — the description
+    substring pins the unit)."""
     from google.genai import types as genai_types
 
     assert "timeout" in genai_types.HttpOptions.model_fields
+    assert "milliseconds" in genai_types.HttpOptions.model_fields[
+        "timeout"].description
 
 
 def test_gemini_finish_reason_members_back_both_adapter_maps():

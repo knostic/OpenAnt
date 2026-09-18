@@ -334,15 +334,18 @@ def reset_warning_state() -> None:
     # (adapters resolve lazily inside get_adapter_class), so a failure here
     # means a genuinely broken package — and a silent except would un-wire
     # the reset, making the warning's tests order-dependent (the exact
-    # hazard this wiring exists to prevent).
+    # hazard this wiring exists to prevent). ORDER (#609 review): the
+    # #605 counter zeroes FIRST — a broken-package import failure must
+    # never leave the accounting counter un-zeroed (the two lifecycles
+    # are the same per-scan window, but the zero is unconditional).
+    with _accounting_errors_lock:
+        _accounting_errors = 0
+
     _registry_mod = importlib.import_module("utilities.llm.registry")
     _registry_reset = getattr(_registry_mod,
                               "reset_unconsumed_timeout_warning", None)
     if callable(_registry_reset):
         _registry_reset()
-
-    with _accounting_errors_lock:
-        _accounting_errors = 0
 
 
 def reset_global_tracker():

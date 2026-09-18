@@ -303,6 +303,11 @@ def test_real_transport_read_timeout_fires():
         assert "timed out" in str(exc).lower(), (
             "the redacted message must carry the read-timeout text "
             f"(discrimination vs connect-refused), got: {exc}")
+            # NOTE (#604 review): the substring is CPython's socket error
+            # text surfaced via httpcore → httpx → the redacted message —
+            # an implementation-detail dependency the F2 redaction contract
+            # forces (the raw exception is never chained); a runner whose
+            # httpcore words differ breaks HERE, not silently.
         assert isinstance(exc.__cause__, RedactedCause), (
             "the transport clause must keep redacted_cause_from (the F2 "
             "contract) — the raw httpx exception is never chained")
