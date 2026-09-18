@@ -16,7 +16,8 @@ import sys
 from typing import Optional, Set, List
 
 from core.file_boundary import boundary_for_language
-from ..llm_client import TokenTracker, get_global_tracker
+from ..llm_client import (TokenTracker, get_global_tracker,
+                          record_accounting_error)
 from ..llm import (
     Message,
     PhaseBinding,
@@ -299,15 +300,100 @@ class ContextAgent:
                     messages=messages,
                 )
             except Exception as exc:
+                # #609: a failed attempt's spend must not vanish from
+                # accounting. The exits record via record_call; the raise
+                # did not, so the tracker and every summary/checkpoint
+                # under-reported the provider's real bill. Mirror the
+                # #616 idiom (finding_verifier.py's error-path record):
+                # fold the raising turn's tokens when the exception
+                # carries them (#537: an LLMResponseError's rejected reply
+                # was billed), zero-token guard (a turn-1 connection
+                # failure billed nothing — no $0 record, no spurious
+                # unpriced marker), and a None per-turn entry for the
+                # raising turn (the list length equals the turns billed).
+                # #609 review: the coercions are GUARDED — a foreign
+                # exception with a non-int-coercible token attr must not
+                # replace the original (the ENG-1 class; in-tree carriers
+                # int-coerce at construction, this is the belt).
+                try:
+                    exc_in = int(getattr(exc, "input_tokens", 0) or 0)
+                    exc_out = int(getattr(exc, "output_tokens", 0) or 0)
+                except Exception:
+                    exc_in = exc_out = 0
+                attempt_cost = 0.0
+                attempt_unpriced = None
+                if (total_input_tokens or total_output_tokens
+                        or exc_in or exc_out):
+                    # ENG-1 (#609 pre-code check): an accounting failure
+                    # here must never replace the original exception —
+                    # its retryability class (rate_limit vs connection vs
+                    # structural) is what the enhance retry loop keys on.
+                    # The guard is load-bearing, not hygiene: a poisoned
+                    # pricing dict would otherwise reclassify a transient
+                    # rate limit as a non-retryable KeyError.
+                    try:
+                        call_record = self.tracker.record_call(
+                            model=self.binding.model,
+                            input_tokens=total_input_tokens + exc_in,
+                            output_tokens=total_output_tokens + exc_out,
+                            pricing=lookup_pricing(self.binding),
+                            usage_details=per_turn_usage_details
+                            + ([None] if (exc_in or exc_out) else []),
+                        )
+                        # the reads live INSIDE the guard's try: a double
+                        # returning None from record_call must hit the
+                        # guard, not turn into an AttributeError that
+                        # replaces the original exception.
+                        attempt_cost = call_record.get("cost_usd", 0.0)
+                        attempt_unpriced = sorted(getattr(
+                            getattr(self.tracker, "_thread_local", None),
+                            "unit_unpriced", set())) or None
+                    except Exception:
+                        # #609/#605: the swallowed accounting failure must be
+                        # LOUD in the artifacts, not just stderr — tick the
+                        # accounting-error counter so get_totals()/the step
+                        # reports carry the marker (never a complete-looking
+                        # artifact). The import is module-level: an import
+                        # failure here would replace the original exception
+                        # (the ENG-1 class). The print is itself guarded: a
+                        # closed/encoding-broken stderr raising HERE would
+                        # replace the original exception — the exact class
+                        # this handler exists to prevent.
+                        try:
+                            record_accounting_error()
+                        except Exception:
+                            pass  # the counter is module-level: unreachable
+                                  # in-tree; a poisoned registry module is the
+                                  # concern — the original error outranks it
+                        try:
+                            print(f"[agent] accounting record failed for the "
+                                  f"failed attempt of {unit_id}: "
+                                  f"{sys.exc_info()[0].__name__} (the tracker "
+                                  f"has no record of this attempt; "
+                                  f"agent_state carries its tokens but "
+                                  f"cost_usd=0.0 and no unpriced marker; the "
+                                  f"original error is re-raised)",
+                                  file=sys.stderr)
+                        except Exception:
+                            pass  # stderr unavailable — the #605 counter is
+                                  # the durable signal
                 # Attach agent state so the caller knows how far we got.
                 # Covers LLMRateLimitError (adapter has already reported
-                # to the global rate limiter) and anything else.
+                # to the global rate limiter) and anything else. #609:
+                # the state carries the SAME numbers the tracker recorded
+                # (tokens incl. the raising turn's; priced cost; the #216
+                # unpriced marker, present-only) so the enhance summary,
+                # checkpoints, and resume fold what the tracker has.
                 exc.agent_state = {
                     "iteration": iterations,
                     "max_iterations": MAX_ITERATIONS,
-                    "tokens_used": total_input_tokens + total_output_tokens,
-                    "input_tokens": total_input_tokens,
-                    "output_tokens": total_output_tokens,
+                    "tokens_used": (total_input_tokens + exc_in)
+                    + (total_output_tokens + exc_out),
+                    "input_tokens": total_input_tokens + exc_in,
+                    "output_tokens": total_output_tokens + exc_out,
+                    "cost_usd": attempt_cost,
+                    **({"unpriced_models": attempt_unpriced}
+                       if attempt_unpriced else {}),
                 }
                 raise
 
