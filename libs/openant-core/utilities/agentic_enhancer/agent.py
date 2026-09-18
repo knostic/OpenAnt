@@ -311,8 +311,15 @@ class ContextAgent:
                 # failure billed nothing — no $0 record, no spurious
                 # unpriced marker), and a None per-turn entry for the
                 # raising turn (the list length equals the turns billed).
-                exc_in = int(getattr(exc, "input_tokens", 0) or 0)
-                exc_out = int(getattr(exc, "output_tokens", 0) or 0)
+                # #609 review: the coercions are GUARDED — a foreign
+                # exception with a non-int-coercible token attr must not
+                # replace the original (the ENG-1 class; in-tree carriers
+                # int-coerce at construction, this is the belt).
+                try:
+                    exc_in = int(getattr(exc, "input_tokens", 0) or 0)
+                    exc_out = int(getattr(exc, "output_tokens", 0) or 0)
+                except Exception:
+                    exc_in = exc_out = 0
                 attempt_cost = 0.0
                 attempt_unpriced = None
                 if (total_input_tokens or total_output_tokens

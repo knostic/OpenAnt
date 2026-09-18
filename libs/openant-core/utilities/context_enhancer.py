@@ -718,13 +718,24 @@ class ContextEnhancer:
             the verifier's phase-scoped shape (finding_verifier.py): the
             #216 marker comes from THIS stage's unpriced set only, never
             unioned with the global tracker (enhance runs same-process
-            after other phases; a union would import their markers)."""
+            after other phases; a union would import their markers).
+            #609 review (deep-refute): the #605 accounting-error counter
+            folds HERE too — the sibling builders (llm_reachability.py:560,
+            dynamic_tester:321) carry it; without it, an inner-guard firing
+            (the agent's record attempt failed) leaves THIS stage's summary
+            complete-looking while the step report carries the marker —
+            run-cumulative, the accepted step_report.py:147-163 trade."""
             usage = {"input_tokens": _summary_input_tokens,
                      "output_tokens": _summary_output_tokens,
                      "cost_usd": round(_summary_cost_usd, 6)}
             if _summary_unpriced:
                 usage["cost_incomplete"] = True
                 usage["unpriced_models"] = sorted(_summary_unpriced)
+            from utilities.llm_client import _accounting_error_count
+            _errs = _accounting_error_count()
+            if _errs:
+                usage["accounting_errors"] = _errs
+                usage["cost_incomplete"] = True
             return usage
 
         if checkpoint_dir:

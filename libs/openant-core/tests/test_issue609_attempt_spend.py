@@ -221,7 +221,7 @@ def test_record_failure_preserves_original_exception():
         LLMRateLimitError("rate limited", retry_after=0))
     agent = ContextAgent(index=RepositoryIndex({}, repo_path=None),
                          binding=_binding(adapter), tracker=_PoisonTracker())
-    with pytest.raises(LLMRateLimitError):
+    with pytest.raises(LLMRateLimitError) as excinfo:
         agent.analyze_unit(unit_id="a.py:f", unit_type="function",
                            primary_code="def f(): ...",
                            static_deps=[], static_callers=[])
@@ -231,6 +231,9 @@ def test_record_failure_preserves_original_exception():
     # guarded record_call attempt is all this run can tick (a double-tick
     # regression must fail here, matching the #605 pins).
     assert get_global_tracker().get_totals()["accounting_errors"] == 1
+    # the stderr text's claim, pinned: the attempt's TOKENS survive on
+    # agent_state even when the cost record failed (cost_usd=0.0)
+    assert excinfo.value.agent_state["input_tokens"] == 100
     reset_warning_state()
 
 
