@@ -342,10 +342,12 @@ def reset_warning_state() -> None:
         _accounting_errors = 0
 
     _registry_mod = importlib.import_module("utilities.llm.registry")
-    _registry_reset = getattr(_registry_mod,
-                              "reset_unconsumed_timeout_warning", None)
-    if callable(_registry_reset):
-        _registry_reset()
+    # the DIRECT call, not getattr(..., None) + callable() — a registry-side
+    # rename must fail LOUD here (AttributeError at scan start), never
+    # silently degrade the warning from per-scan to per-process (the exact
+    # hazard the adjacent comment names; the silent-None fallback
+    # contradicted it — the panel seat's catch)
+    _registry_mod.reset_unconsumed_timeout_warning()
 
 
 def reset_global_tracker():

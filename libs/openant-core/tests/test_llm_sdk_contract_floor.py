@@ -278,8 +278,9 @@ def test_gemini_http_options_timeout_is_declared():
     from google.genai import types as genai_types
 
     assert "timeout" in genai_types.HttpOptions.model_fields
-    assert "milliseconds" in genai_types.HttpOptions.model_fields[
-        "timeout"].description
+    _desc = genai_types.HttpOptions.model_fields[
+        "timeout"].description or ""
+    assert "milliseconds" in _desc
 
 
 def test_gemini_finish_reason_members_back_both_adapter_maps():

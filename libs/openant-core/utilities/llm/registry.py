@@ -171,16 +171,19 @@ _unconsumed_timeout_warned: set[str] = set()
 _unconsumed_timeout_warned_lock = threading.Lock()
 
 
-def _warn_unconsumed_timeout(provider_type: str) -> None:
+def _warn_unconsumed_timeout(provider_name: str, provider_type: str) -> None:
     with _unconsumed_timeout_warned_lock:
         if provider_type in _unconsumed_timeout_warned:
             return
         _unconsumed_timeout_warned.add(provider_type)
+    # #604 review: BOTH the entry name and the type — with two same-type
+    # providers the type alone cannot tell the user WHICH entry to fix.
     sys.stderr.write(
-        "warning: request_timeout is not consumed by provider type "
-        f"{provider_type!r} — it declares no `request_timeout` constructor "
-        "kwarg. An adapter adopts the knob by declaring the kwarg. Remove "
-        "`request_timeout` from that provider entry to silence this.\n"
+        "warning: request_timeout is not consumed by provider entry "
+        f"{provider_name!r} (type {provider_type!r}) — that type declares "
+        "no `request_timeout` constructor kwarg. An adapter adopts the "
+        "knob by declaring the kwarg. Remove `request_timeout` from "
+        "that provider entry to silence this.\n"
     )
 
 
@@ -223,7 +226,7 @@ def build_adapter(provider: ProviderConfig) -> LLMAdapter:
                 adapter_cls.__init__).parameters:
             kwargs["request_timeout"] = provider.request_timeout
         else:
-            _warn_unconsumed_timeout(provider.type)
+            _warn_unconsumed_timeout(provider.name, provider.type)
     try:
         return adapter_cls(**kwargs)
     except Exception as exc:  # noqa: BLE001 — re-raise as typed
