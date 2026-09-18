@@ -327,6 +327,19 @@ def reset_warning_state() -> None:
         reset = getattr(mod, "reset_warnings", None)
         if callable(reset):
             reset()
+    # #604: the registry's unconsumed-knob one-time warning rides the same
+    # per-scan lifecycle (lazy import: registry imports modules that import
+    # this one — only safe at call time, never at module import). No
+    # ImportError guard: registry has no optional third-party imports
+    # (adapters resolve lazily inside get_adapter_class), so a failure here
+    # means a genuinely broken package — and a silent except would un-wire
+    # the reset, making the warning's tests order-dependent (the exact
+    # hazard this wiring exists to prevent).
+    _registry_mod = importlib.import_module("utilities.llm.registry")
+    _registry_reset = getattr(_registry_mod,
+                              "reset_unconsumed_timeout_warning", None)
+    if callable(_registry_reset):
+        _registry_reset()
 
     with _accounting_errors_lock:
         _accounting_errors = 0

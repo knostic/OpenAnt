@@ -116,7 +116,7 @@ The wizard writes `~/.config/openant/config.json` for you, but you can edit it d
   "llm_providers": {
     "anthropic": {"type": "anthropic", "api_key": "sk-ant-..."},
     "openai":    {"type": "openai",    "api_key": "sk-proj-..."},
-    "google":    {"type": "google",    "api_key": "AIza..."}
+    "google":    {"type": "google",    "api_key": "AIza...", "request_timeout": 600}
   },
   "llm_configs": {
     "my-llm": {
@@ -131,6 +131,8 @@ The wizard writes `~/.config/openant/config.json` for you, but you can edit it d
   }
 }
 ```
+
+`llm_providers[name].request_timeout` (seconds, positive integer or null) sets the adapter's per-request HTTP timeout — consumed by the google provider type (the only one whose SDK default is unbounded); other types warn loudly at startup if it is set.
 
 Providers accept a custom `base_url` for OpenAI-compatible / Anthropic-compatible proxies (vLLM, Bedrock, internal gateways); OpenRouter has its own first-class `openrouter` provider type. The `openant-default` config (Claude across all phases) is built in and always available regardless of file contents.
 

@@ -266,6 +266,18 @@ def test_gemini_retry_options_attempts_is_declared():
     assert "attempts" in genai_types.HttpRetryOptions.model_fields
 
 
+def test_gemini_http_options_timeout_is_declared():
+    """#604: the timeout-parity field (GUARD — the SDK field exists
+    independent of our wiring; the ADAPTER's use is pinned by the #604
+    capture test): the adapter maps request_timeout seconds to
+    HttpOptions.timeout milliseconds — the field name is load-bearing
+    (a rename silently drops the deadline back to genai's unbounded
+    None)."""
+    from google.genai import types as genai_types
+
+    assert "timeout" in genai_types.HttpOptions.model_fields
+
+
 def test_gemini_finish_reason_members_back_both_adapter_maps():
     """Every raw name in BOTH google maps must exist as a FinishReason member
     at the installed version — the sets are built by getattr and silently
