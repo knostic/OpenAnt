@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -161,6 +162,38 @@ def resolve_provider(cf: ConfigFile, name: str) -> ProviderConfig:
 # Adapter instantiation
 # ---------------------------------------------------------------------------
 
+# #604: one-time-PER-TYPE warning when a config sets request_timeout on a
+# provider type whose adapter does not consume it. Silent-ignoring config a
+# user explicitly wrote would violate the no-silent-drops rule (the bedrock
+# api_key warning is the in-tree precedent). Keyed by TYPE (not a global
+# flag): a config setting the knob on two unconsuming types names both.
+_unconsumed_timeout_warned: set[str] = set()
+_unconsumed_timeout_warned_lock = threading.Lock()
+
+
+def _warn_unconsumed_timeout(provider_name: str, provider_type: str) -> None:
+    with _unconsumed_timeout_warned_lock:
+        if provider_type in _unconsumed_timeout_warned:
+            return
+        _unconsumed_timeout_warned.add(provider_type)
+    # #604 review: BOTH the entry name and the type — with two same-type
+    # providers the type alone cannot tell the user WHICH entry to fix.
+    sys.stderr.write(
+        "warning: request_timeout is not consumed by provider entry "
+        f"{provider_name!r} (type {provider_type!r}) — that type declares "
+        "no `request_timeout` constructor kwarg. An adapter adopts the "
+        "knob by declaring the kwarg. Remove `request_timeout` from "
+        "that provider entry to silence this.\n"
+    )
+
+
+def reset_unconsumed_timeout_warning() -> None:
+    """Test hook: re-arm the per-type one-time warnings (wired into
+    ``llm_client.reset_warning_state`` so the suite's autouse fixtures
+    reset it with every other one-time warning)."""
+    with _unconsumed_timeout_warned_lock:
+        _unconsumed_timeout_warned.clear()
+
 
 def build_adapter(provider: ProviderConfig) -> LLMAdapter:
     """Construct an adapter instance from a ProviderConfig.
@@ -171,15 +204,31 @@ def build_adapter(provider: ProviderConfig) -> LLMAdapter:
     raises ``ValueError``). Catch those here and re-raise as
     :class:`LLMAuthError` so the user sees OpenAnt's message
     naming the problematic provider rather than the SDK's generic one.
+
+    #604: ``request_timeout`` (seconds) is threaded CAPABILITY-
+    conditionally — passed iff the adapter class declares the kwarg
+    (``inspect.signature``), else the one-time warning above. The
+    membership check cannot drift from the constructor (a declared
+    attribute could), and a ``**kwargs`` constructor does NOT list the
+    kwarg, so an undeclared consumer still warns (fail-visible).
     """
+    import inspect
+
     from .adapter import LLMAuthError
 
     adapter_cls = get_adapter_class(provider.type)
+    kwargs: dict = {
+        "api_key": provider.api_key,
+        "base_url": provider.base_url,
+    }
+    if provider.request_timeout is not None:
+        if "request_timeout" in inspect.signature(
+                adapter_cls.__init__).parameters:
+            kwargs["request_timeout"] = provider.request_timeout
+        else:
+            _warn_unconsumed_timeout(provider.name, provider.type)
     try:
-        return adapter_cls(
-            api_key=provider.api_key,
-            base_url=provider.base_url,
-        )
+        return adapter_cls(**kwargs)
     except Exception as exc:  # noqa: BLE001 — re-raise as typed
         raise LLMAuthError(
             f"Failed to construct adapter for provider {provider.name!r} "
