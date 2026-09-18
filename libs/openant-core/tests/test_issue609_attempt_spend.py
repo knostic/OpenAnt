@@ -178,8 +178,10 @@ def test_agent_response_error_tokens_recorded():
 
 
 def test_agent_turn1_failure_records_nothing():
-    """GREEN (regression lock): a turn-1 connection raise billed nothing -
-    the zero-token guard writes NO $0 record and no unpriced marker."""
+    """A turn-1 connection raise billed nothing - the zero-token guard
+    writes NO $0 record and no unpriced marker (RED at base on the
+    agent_state cost_usd key — base attached no cost field; the record
+    guard itself is the new behavior)."""
     reset_warning_state()
     adapter = _ScriptedAdapter(
         {"fake-model": {"input": 3.0, "output": 15.0}},
@@ -197,11 +199,13 @@ def test_agent_turn1_failure_records_nothing():
 
 
 def test_record_failure_preserves_original_exception():
-    """GREEN (regression lock for the #609 inner guard): if the accounting
-    record itself raises inside the except, the ORIGINAL exception survives
-    - its retryability class must not be silently reclassified - and the
-    swallowed failure is LOUD in the artifacts (#605: the accounting-error
-    counter ticks, never a complete-looking artifact)."""
+    """The #609 inner guard: if the accounting record itself raises inside
+    the except, the ORIGINAL exception survives - its retryability class
+    must not be silently reclassified - and the swallowed failure is LOUD
+    in the artifacts (#605: the accounting-error counter ticks, never a
+    complete-looking artifact). RED at base: the accounting_errors key
+    exists only when record_accounting_error fires — base's raise path
+    never calls the tracker, so the assertion KeyErrors."""
     from utilities.agentic_enhancer.agent import ContextAgent
     from utilities.agentic_enhancer.repository_index import RepositoryIndex
     from utilities.llm_client import get_global_tracker

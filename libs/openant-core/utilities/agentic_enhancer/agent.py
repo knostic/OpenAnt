@@ -348,15 +348,28 @@ class ContextAgent:
                         # reports carry the marker (never a complete-looking
                         # artifact). The import is module-level: an import
                         # failure here would replace the original exception
-                        # (the ENG-1 class).
-                        record_accounting_error()
-                        print(f"[agent] accounting record failed for the "
-                              f"failed attempt of {unit_id}: "
-                              f"{sys.exc_info()[0].__name__} (the tracker has "
-                              f"no record of this attempt; agent_state carries "
-                              f"its tokens but cost_usd=0.0 and no unpriced "
-                              f"marker; the original error is re-raised)",
-                              file=sys.stderr)
+                        # (the ENG-1 class). The print is itself guarded: a
+                        # closed/encoding-broken stderr raising HERE would
+                        # replace the original exception — the exact class
+                        # this handler exists to prevent.
+                        try:
+                            record_accounting_error()
+                        except Exception:
+                            pass  # the counter is module-level: unreachable
+                                  # in-tree; a poisoned registry module is the
+                                  # concern — the original error outranks it
+                        try:
+                            print(f"[agent] accounting record failed for the "
+                                  f"failed attempt of {unit_id}: "
+                                  f"{sys.exc_info()[0].__name__} (the tracker "
+                                  f"has no record of this attempt; "
+                                  f"agent_state carries its tokens but "
+                                  f"cost_usd=0.0 and no unpriced marker; the "
+                                  f"original error is re-raised)",
+                                  file=sys.stderr)
+                        except Exception:
+                            pass  # stderr unavailable — the #605 counter is
+                                  # the durable signal
                 # Attach agent state so the caller knows how far we got.
                 # Covers LLMRateLimitError (adapter has already reported
                 # to the global rate limiter) and anything else. #609:

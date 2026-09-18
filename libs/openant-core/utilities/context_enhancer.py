@@ -736,7 +736,12 @@ class ContextEnhancer:
             # Count errors and sum usage from already-loaded checkpoints
             _ckpt_map = self._id_keyed_checkpoint_map(checkpoint_dir)
             for unit in units:
-                uid = unit.get("id", "")
+                # #609: the checkpoint map keys on the SAVED id (the save
+                # stamps unit.get("id", "unknown")) — the seed reads with
+                # the SAME default, so the wipe/save/prior keys agree (the
+                # "" default diverged: an id-less unit's saved "unknown"
+                # key would never match here).
+                uid = unit.get("id", "unknown")
                 cp_file = _ckpt_map.get(uid)
                 if not cp_file:
                     continue
