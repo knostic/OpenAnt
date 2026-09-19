@@ -18,19 +18,20 @@ this contract:
 - `protected` is its OWN key (the lossy safe-fold is gone — the summary
   template has a Protected row and used to print 0 where metrics said 414).
 
-SCOPE (honest): this reconciles the buckets GIVEN a well-formed `metrics` dict. It
-does NOT repair an upstream mis-partition: `analyzer._count_verdicts` drops any row
-whose verdict is unrecognized (neither a known bucket nor verdict=="ERROR") from
-ALL buckets, so metrics built from such rows already have sum(buckets) < total. That
-pre-existing gap is documented by `test_count_verdicts_drops_unrecognized_verdict`
-below and is explicitly out of F13's scope.
+SCOPE (honest): this reconciles the buckets GIVEN a well-formed `metrics` dict.
+An upstream mis-partition would surface here as sum(buckets) < total — #427
+closed the one that mattered (`_count_verdicts` buckets an unrecognized
+verdict to `errors`; the partition test below pins it), and #623 closed the
+legacy-value drop (insufficient_context folds to inconclusive).
 
 #316/#324 UPDATE: the NEITHER-KEY shape (a result with no `verdict` and no
 `finding`) is no longer dropped — `_normalize_result` stamps the one error
 shape at the producer, and `_count_verdicts` routes the shape to `errors`
 (the legacy singular-"error" default could never match the "errors" key).
-Unrecognized VERDICT strings (e.g. "SOMETHING_WEIRD") and the mapped-but-
-bucketless `insufficient_context` remain the documented gap above.
+Unrecognized VERDICT strings (e.g. "SOMETHING_WEIRD") bucket to `errors`
+(#427). #623 UPDATE: the mapped-but-bucketless `insufficient_context` is no
+longer a gap — it folds to `inconclusive`'s legacy synonym at every
+counting sink, so the reconciliation holds for it too.
 """
 import json
 import sys
