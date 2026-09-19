@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from core.schemas import VerifyResult
-from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+from core.verdict_taxonomy import FINDING_VERDICT_ORDER, fold_legacy_finding
 from core import tracking
 from core.checkpoint import StepCheckpoint
 from core.progress import ProgressReporter
@@ -480,7 +480,8 @@ def _count_verification_outcomes(verified_results: list) -> dict:
         # touching `verification.agree`), so the direction computation below
         # runs for BOTH branches: a consistency-driven change is as much a
         # Stage-2 change as a disagreement.
-        finding = str(r.get("finding") or r.get("verdict", "")).lower()
+        finding = fold_legacy_finding(
+            str(r.get("finding") or r.get("verdict", "")).lower())
         if verification.get("agree", False):
             counts["agreed"] += 1
             if finding in ("vulnerable", "bypassable"):
@@ -578,12 +579,33 @@ def _write_verified_results(
             continue
         # Canonical read: lowercase a PRESENT finding too (not only the
         # verdict/default), so a verdict-only result is classified correctly.
-        finding = str(r.get("finding") or r.get("verdict") or "error").lower()
+        # #623: the legacy INSUFFICIENT_CONTEXT value folds to inconclusive
+        # here too (its analyze-side synonym — the same four-consumer
+        # agreement; previously this ladder SILENTLY DROPPED the row: no
+        # bucket matched and the elif caught only ERROR, so the #284
+        # partition leaked it). The row's own values are never rewritten.
+        finding = fold_legacy_finding(
+            str(r.get("finding") or r.get("verdict") or "error").lower())
         if finding in counts:
             counts[finding] += 1
-        elif r.get("verdict") == "ERROR":
+        elif r.get("verdict") == "ERROR" or finding == "error":
             # Retained (#284's correction): legacy/foreign records carrying
-            # the uppercase ERROR verdict still bucket to errors.
+            # the uppercase ERROR verdict still bucket to errors. #623: the
+            # half-stamped ``finding == "error"`` WITHOUT verdict == "ERROR"
+            # joins them — _count_verdicts has handled exactly this twin
+            # (analyzer.py) since #316/#324; leaving it dropped here was the
+            # same silent-drop class this fix closes. NOTE: this elif also
+            # flips the both-keys shape {verdict: ERROR, finding:
+            # insufficient_context} from errors to inconclusive (the fold
+            # runs first, finding-first like the analyzer's counter) —
+            # resume still retries it (analyze_result_is_error is
+            # verdict-first, ERROR wins), the documented transient class.
+            counts["errors"] += 1
+        else:
+            # #623: the terminal else mirrors _count_verdicts' #427
+            # catch-all — an unrecognized non-empty finding is a malformed
+            # row, an ERROR in the metrics (never a silent drop); the #284
+            # partition closes for every shape now.
             counts["errors"] += 1
 
     output["metrics"] = {"total": len(merged_results), **counts}

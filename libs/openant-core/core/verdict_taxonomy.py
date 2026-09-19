@@ -60,10 +60,50 @@ SEVERITY_FINDING_VERDICTS = ("vulnerable", "bypassable")
 # whitelist — a non-empty verdict outside this set is unrecognized model
 # output and routes to the error accounting (mirroring the finding-key fix
 # #426 applied to the same garbage-reply class).
+# #623 — the three roles of the legacy ``INSUFFICIENT_CONTEXT`` value,
+# post-alignment (all three are consistent, none is obvious):
+#   1. a LEGACY SYNONYM of ``inconclusive`` at every counting/display sink
+#      (the metrics fold, the verify recount, the HTML report aggregates —
+#      the row's own stored values are NEVER rewritten);
+#   2. still an ACCEPTED verdict at ingestion (``_normalize_result``'s map
+#      and the corrector's mapping keep producing it, recover-only) and for
+#      resume (``analyze_result_is_error`` adopts it as completed);
+#   3. NON-CANONICAL at the #427 kept-finding gate (``_CANONICAL_FINDINGS``
+#      excludes it — a ``{"verdict": <garbage>, "finding":
+#      "insufficient_context"}`` row routes to the error shape).
 STAGE1_VERDICTS = frozenset({
     "VULNERABLE", "SAFE", "PROTECTED", "BYPASSABLE", "INCONCLUSIVE",
     "INSUFFICIENT_CONTEXT", "ERROR",
 })
+
+# --- #623: the Stage-1 prompt's own verdict vocabulary (D3's one-home form) --
+# The exact set the analysis prompt offers the model (``finding`` values,
+# lowercase). THE alignment target: the JSON rescue schema renders its enum
+# from this constant (a rescue repairs structure, never vocabulary — the
+# pre-#623 schema offered a mismatched 3-value enum forcing protected and
+# inconclusive verdicts into wrong buckets). The prompt's own TEXT is never
+# rendered from this (the analyze fingerprint hashes prompt texts — a byte
+# change re-pays every checkpoint; the schema is outside the fingerprint).
+# BYPASSABLE is deliberately absent: it originates in the Stage-2 finish
+# enum, not the Stage-1 prompt — offering it in a Stage-1 rescue would let
+# the rescue *upgrade* a reply into a verify-only verdict.
+STAGE1_PROMPT_FINDINGS = ("safe", "protected", "vulnerable", "inconclusive")
+
+# --- #623: the legacy-value fold (ONE home; the inlined-copy failure mode) --
+# The pre-#623 rescue schema asked for INSUFFICIENT_CONTEXT, a verdict the
+# Stage-1 prompt never offered — rescued rows carry it on disk forever
+# (rows are never rewritten; provenance preserved). Every counting/display
+# sink folds it to inconclusive's synonym THROUGH THIS ONE FUNCTION — four
+# hand-inlined copies of the same two-line fold is exactly the drift shape
+# this module's own docstring warns against (a fifth sink would miss one).
+LEGACY_FINDING_SYNONYMS = {"insufficient_context": "inconclusive"}
+
+
+def fold_legacy_finding(finding: str) -> str:
+    """Fold a legacy synonym finding to its canonical form (identity for
+    everything else). Callers pass the CANONICAL finding-first read — never
+    the raw verdict (the #331 stale-finding net reads the finding)."""
+    return LEGACY_FINDING_SYNONYMS.get(finding, finding)
 
 # --- Stage-2 verification verdicts -------------------------------------------
 # ``core/reporter.py`` maps the Stage-2 ``verification`` dict onto these.

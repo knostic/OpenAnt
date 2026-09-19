@@ -30,7 +30,7 @@ import os
 from datetime import datetime
 
 from dotenv import load_dotenv
-from core.verdict_taxonomy import FINDING_VERDICT_ORDER, ERROR_VERDICT
+from core.verdict_taxonomy import fold_legacy_finding, FINDING_VERDICT_ORDER, ERROR_VERDICT
 from utilities.file_io import normalize_results, read_json
 from utilities.llm import (
     build_phase_registry,
@@ -56,6 +56,15 @@ def extract_file(unit_id: str) -> str:
     if ':' in unit_id:
         return unit_id.rsplit(':', 1)[0]
     return unit_id
+
+
+def _display_verdict(verdict: str) -> str:
+    """#623: fold the legacy INSUFFICIENT_CONTEXT value to inconclusive's
+    synonym at the display reads (both the per-row listing and the aggregate
+    counts) so this report is self-consistent with the metrics fold. The
+    row's stored values keep the legacy verdict for provenance. The fold
+    itself lives in core.verdict_taxonomy (the one-home rule)."""
+    return fold_legacy_finding(verdict)
 
 
 def get_verdict_priority(verdict: str) -> int:
@@ -169,7 +178,12 @@ def prepare_findings_summary(experiment: dict, dataset: dict) -> list:
             'unit_id': route_key,
             # Fall back to raw ``verdict`` when ``finding`` is absent (see
             # verdict-count site below); keeps finding-less vulns actionable.
-            'verdict': str(result.get('finding') or result.get('verdict', '')).lower(),
+            # #623: the legacy INSUFFICIENT_CONTEXT value folds to
+            # inconclusive's synonym at the display read (the aggregate site
+            # below folds the same way; the row's stored values keep the
+            # legacy verdict for provenance).
+            'verdict': _display_verdict(
+                str(result.get('finding') or result.get('verdict', '')).lower()),
             'attack_vector': result.get('attack_vector', ''),
             'stage1_reasoning': result.get('reasoning') or '',
             'stage2_explanation': verification.get('explanation', ''),
@@ -339,6 +353,10 @@ def generate_html_report(
         # ``finding`` key, else finding-less vulnerable results are dropped from
         # the count. Mirrors the canonical read in reporter.py / verifier.py.
         verdict = str(result.get('finding') or result.get('verdict', '')).lower()
+        # #623: the legacy INSUFFICIENT_CONTEXT value is inconclusive's
+        # legacy synonym at every display aggregate (the cli.py twin) — the
+        # row's stored values keep the legacy verdict for provenance.
+        verdict = _display_verdict(verdict)
         file_path = extract_file(route_key)
         unit = units_by_id.get(route_key, {})
         # #326 (wave r1): agentic mode (the default) writes agent_context;

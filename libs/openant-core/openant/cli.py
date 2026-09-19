@@ -30,7 +30,7 @@ from core.language_selection import (
     report_exclusions,
     select_languages,
 )
-from core.verdict_taxonomy import FINDING_VERDICT_ORDER
+from core.verdict_taxonomy import FINDING_VERDICT_ORDER, fold_legacy_finding
 from utilities.file_io import normalize_results, read_json
 
 
@@ -1119,6 +1119,12 @@ def cmd_report_data(args):
                 # absent, else finding-less vulnerable results are dropped from
                 # the count. Mirrors the canonical read in reporter.py.
                 verdict = str(result.get("finding") or result.get("verdict", "")).lower()
+                # #623: the legacy INSUFFICIENT_CONTEXT value is inconclusive's
+                # legacy synonym at every display aggregate — folding the read
+                # keeps THIS display self-consistent (grouping, chart, counts,
+                # actionable all agree, matching the metrics fold); the row's
+                # stored values keep the legacy verdict for provenance.
+                verdict = fold_legacy_finding(verdict)
                 file_path = route_key.rsplit(":", 1)[0] if ":" in route_key else route_key
                 unit = units_by_id.get(route_key, {})
                 verification = result.get("verification") or {}
