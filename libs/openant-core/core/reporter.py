@@ -602,9 +602,9 @@ def build_pipeline_output(
                if isinstance(finding.get("consistency_update"), dict) else {}),
             # #215 (partial repair): the two FINDING-SEMANTIC transit
             # fields — confidence (float 0.0-1.0 per the verdict schema,
-            # json_corrector.py:32; NOT analysis_core.py:181's error-shape
+            # json_corrector's _VULN_SCHEMA; NOT analysis_core.py's error-shape
             # default) and json_corrected (provenance: the finding's JSON
-            # was model-repaired, json_corrector.py:278) — populated
+            # was model-repaired, json_corrector's vuln_mode normalization) — populated
             # upstream, surviving into results_verified.json, previously
             # DROPPED by this fixed-key record. Present-only: absent
             # upstream stays absent (never a fabricated 0/False — a REAL
