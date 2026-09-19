@@ -124,6 +124,14 @@ class AnalysisMetrics:
     verified: int = 0
     stage2_agreed: int = 0
     stage2_disagreed: int = 0
+    # #622: the protected split of stage2_disagreed — non-partition
+    # telemetry beside stage2_agreed/stage2_disagreed (do NOT sum it into
+    # any verdict-partition identity). The envelope carries only the
+    # POST-fold ``protected``, so the Go display cannot derive the split
+    # from existing fields — this field is the carrier (#510's inconclusive
+    # sibling did not need one: ``inconclusive`` existed as a rendered
+    # bucket; ``protected`` is pre-fold here).
+    stage2_disagreed_protected: int = 0
     # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
     # (degenerate path or adapter error). These are preserved Stage-1
     # potential vulnerabilities awaiting manual review — they must NOT be
@@ -328,19 +336,22 @@ class EnhanceResult:
 # ---------------------------------------------------------------------------
 
 def verify_step_summary(result: "VerifyResult") -> dict:
-    """The verify step-report summary (issue #300; ten fields since #302).
+    """The verify step-report summary (issue #300; twelve fields since #622).
 
     Shared by every construction site — core/scanner.py (the pipeline),
     openant/cli.py's chained analyze --verify, and standalone openant
     verify — so the sites cannot drift. The reconciliation counters bound:
-    agreed + disagreed + disagreed_inconclusive + needs_review +
-    error_count accounts for every findings_input finding except the
-    disagreed-but-still-vulnerable case, which increments only
+    agreed + disagreed + disagreed_inconclusive + disagreed_protected +
+    needs_review + error_count accounts for every findings_input finding
+    except the disagreed-but-still-vulnerable case, which increments only
     confirmed_vulnerabilities (see core/verifier.py
     _count_verification_outcomes) — the counters are therefore a bound
     (<=), not exact equality. #509: ``disagreed_inconclusive`` is the
     disagreement arm whose corrected finding is ``inconclusive`` — the
     verifier could NOT confirm it, so it must never fold into ``safe``.
+    #622: ``disagreed_protected`` is the sibling whose corrected finding is
+    ``protected`` (protected-by-controls) — threaded to metrics.protected,
+    never folded into ``safe``.
     """
     return {
         "findings_input": result.findings_input,
@@ -348,6 +359,9 @@ def verify_step_summary(result: "VerifyResult") -> dict:
         "agreed": result.agreed,
         "disagreed": result.disagreed,
         "disagreed_inconclusive": result.disagreed_inconclusive,
+        # #622: the protected-correction sibling joins the shared summary
+        # (and the reconciliation bound above).
+        "disagreed_protected": result.disagreed_protected,
         "confirmed_vulnerabilities": result.confirmed_vulnerabilities,
         "needs_review": result.needs_review,
         "error_count": result.error_count,
@@ -381,6 +395,12 @@ class VerifyResult:
     # they never fold into ``safe`` (the ->inconclusive arm of the
     # #374/#381 family).
     disagreed_inconclusive: int = 0
+    # #622: disagreements whose corrected finding is ``protected`` —
+    # protected-by-controls, materially different from inherently-safe
+    # code. Counted separately so the scanner threads them into
+    # ``protected`` and they never fold into ``safe`` (the ->protected
+    # sibling of the #509/#510 inconclusive arm).
+    disagreed_protected: int = 0
     confirmed_vulnerabilities: int = 0
     # PR #69 F5: findings whose Stage-2 verification could not COMPLETE
     # (degenerate path or adapter error). Counted separately so the scanner
@@ -404,7 +424,7 @@ class VerifyResult:
 
     def step_summary(self) -> dict:
         """The verify step-report summary (issue #300): the shared
-        construction every site uses (ten fields since #302)."""
+        construction every site uses (twelve fields since #622)."""
         return verify_step_summary(self)
 
     def to_dict(self) -> dict:
@@ -414,6 +434,13 @@ class VerifyResult:
             "findings_verified": self.findings_verified,
             "agreed": self.agreed,
             "disagreed": self.disagreed,
+            # #622: BOTH reclassification siblings join the envelope — this
+            # dict is the Go "Disagreed (eliminated)" display's source
+            # (cli.py's two envelopes -> PrintVerifySummary); an omitted
+            # sibling makes the companion lines unrenderable and the
+            # "eliminated" number silently narrower than its parts.
+            "disagreed_inconclusive": self.disagreed_inconclusive,
+            "disagreed_protected": self.disagreed_protected,
             "confirmed_vulnerabilities": self.confirmed_vulnerabilities,
             "needs_review": self.needs_review,
             "error_count": self.error_count,

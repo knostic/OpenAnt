@@ -73,6 +73,11 @@ def test_direction_counts_downgrades():
     ])
     assert counts["downgraded"] == 2
     assert counts["upgraded"] == 0
+    # #622 additive: the two downgrades split — the safe correction keeps the
+    # residual ``disagreed`` (safe to fold into safe), the protected one gets
+    # its own bucket (protected-by-controls, threaded to metrics.protected).
+    assert counts["disagreed"] == 1
+    assert counts["disagreed_protected"] == 1
 
 
 def test_direction_counts_upgrades_and_neutrals():

@@ -430,7 +430,7 @@ def build_pipeline_output(
     confirmed_before_dedup = len(confirmed)
     confirmed = _dedup_caller_callee(confirmed, all_results, call_graph_path)
     # #423 (wave r1): the disclosure/metrics overlap, split by the recount's
-    # own predicates (verifier.py:497-513) — the confirmed rows the recount
+    # own predicates (the _write_verified_results recount in verifier.py) — the confirmed rows the recount
     # ALSO buckets into errors / needs_review, counted once (in vulnerable,
     # via the findings list) and subtracted from those buckets.
     _k_overlap_error = sum(1 for c in confirmed if c.get("error"))
