@@ -358,6 +358,12 @@ def verify_step_summary(result: "VerifyResult") -> dict:
         # confirmed_vulnerabilities and downgraded.
         "downgraded": result.downgraded,
         "upgraded": result.upgraded,
+        # #621: the attacker-model descriptor the verify step actually used,
+        # present-only (the step report is the carrier for the standalone
+        # build-output/report lanes — the #600 discovery precedent). The
+        # summary's server-rendered Methodology reads it verbatim.
+        **({"attacker_model": result.attacker_model}
+           if getattr(result, "attacker_model", None) else {}),
     }
 
 
@@ -390,6 +396,11 @@ class VerifyResult:
     downgraded: int = 0
     upgraded: int = 0
     usage: UsageInfo = field(default_factory=UsageInfo)
+    # #621: the attacker-model descriptor the verification actually used,
+    # stamped at verify time by the same selector the prompts consume (the
+    # summary's server-rendered Methodology reads it verbatim). None on the
+    # zero-findings early return and every path that never ran verification.
+    attacker_model: dict | None = None
 
     def step_summary(self) -> dict:
         """The verify step-report summary (issue #300): the shared

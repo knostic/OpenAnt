@@ -773,6 +773,21 @@ def _discovery_from_step_reports(step_reports):
                 return block
     return None
 
+def _attacker_model_from_step_reports(step_reports):
+    """#621: the attacker-model descriptor recorded by the verify step's
+    summary — forwarded to the standalone build-output/report pipeline-output
+    constructions exactly the #600 discovery way (the step report is the
+    carrier; no re-derivation). BEST-EFFORT: absent summary (verify skipped /
+    never ran / an old scan) stays absent — present-only downstream, rendered
+    "not recorded" by the summary's honest-absence rule."""
+    for sr in step_reports or []:
+        if isinstance(sr, dict) and sr.get("step") == "verify":
+            summary = sr.get("summary") or {}
+            block = summary.get("attacker_model")
+            if isinstance(block, dict) and block:
+                return block
+    return None
+
 def cmd_build_output(args):
     """Build pipeline_output.json from analysis results."""
     from core.reporter import build_pipeline_output
@@ -800,6 +815,7 @@ def cmd_build_output(args):
                 processing_level=args.processing_level,
                 step_reports=step_reports,
                 discovery=_discovery_from_step_reports(step_reports),
+                attacker_model=_attacker_model_from_step_reports(step_reports),
             )
 
             ctx.outputs = {"pipeline_output_path": path}
@@ -929,6 +945,7 @@ def cmd_report(args):
                     repo_name=args.repo_name,
                     step_reports=step_reports,
                     discovery=_discovery_from_step_reports(step_reports),
+                    attacker_model=_attacker_model_from_step_reports(step_reports),
                 )
 
             if fmt == "html":

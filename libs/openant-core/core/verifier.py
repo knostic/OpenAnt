@@ -46,6 +46,49 @@ except ImportError:
     load_context = None
 
 
+def _verify_template_texts():
+    """#621: verify's checkpoint template identity — the renderers whose
+    digests form ``templates_sha``.
+
+    Master folded ONLY the static SYSTEM prompt; the user template's builtin
+    personas (and the CLI local-access rule) were never hashed, so a resumed
+    scan adopted verdicts rendered under a superseded persona — the exact
+    blind spot of #621's fix. The two DIRECT renders render with
+    ``app_context=None`` (backend_identity doctrine: per-scan LLM output
+    never enters the key); the remaining members are the module constants and
+    frozen-fixture renders the None render cannot reach — the two non-None
+    user-prompt personas, the three system-prompt context arms, and the
+    context-block and full-prompt renders over two frozen fixtures (the
+    fixture prompts also carry the ROUTING: a discriminator edit that
+    re-routes a fixture re-pays verify, closing the "the persona existed but
+    was never selected" half of #621 for future edits).
+    """
+    from prompts.verification_prompts import (
+        get_verification_system_prompt,
+        get_verification_prompt,
+        PERSONA_REMOTE_ONLY,
+        PERSONA_UNTRUSTED_INPUT,
+        SYSTEM_ARM_THREAT_MODEL,
+        SYSTEM_ARM_REMOTE_ONLY,
+        SYSTEM_ARM_UNTRUSTED_INPUT,
+        _builtin_context_digest_renders,
+        _builtin_persona_digest_renders,
+    )
+    return [
+        lambda: get_verification_system_prompt(None),
+        lambda: get_verification_prompt(
+            code="", finding="", attack_vector="", reasoning="",
+            app_context=None),
+        lambda: PERSONA_REMOTE_ONLY,
+        lambda: PERSONA_UNTRUSTED_INPUT,
+        lambda: SYSTEM_ARM_THREAT_MODEL,
+        lambda: SYSTEM_ARM_REMOTE_ONLY,
+        lambda: SYSTEM_ARM_UNTRUSTED_INPUT,
+        lambda: "\x00".join(_builtin_context_digest_renders()),
+        lambda: "\x00".join(_builtin_persona_digest_renders()),
+    ]
+
+
 def run_verification(
     results_path: str,
     output_dir: str,
@@ -160,6 +203,13 @@ def run_verification(
     if app_context_path and HAS_APP_CONTEXT and os.path.exists(app_context_path):
         app_context = load_context(Path(app_context_path))
         print(f"[Verify] App context: {app_context.application_type}", file=sys.stderr)
+    # #621: the attacker-model descriptor stamped on the verify result at
+    # verify time — the summary's server-rendered Methodology reads it
+    # verbatim (single producer: the same selector the prompts consume).
+    # Always stamped: a verify with NO context rendered the browser persona,
+    # and that is the honest descriptor for it.
+    from prompts.verification_prompts import attacker_model_descriptor
+    attacker_model = attacker_model_descriptor(app_context)
 
     # If no code_by_route in experiment file, build from results
     if not code_by_route:
@@ -180,17 +230,18 @@ def run_verification(
     # I2 adopt gate. Runs AFTER the checkpoint.dir override above (line ~88 sets
     # ``verify_checkpoints``, not the StepCheckpoint default) and BEFORE
     # verify_batch's checkpoint.load(), so a backend swap archives the stale
-    # verify checkpoints aside instead of adopting them. The static verify
-    # system prompt is rendered with app_context=None. The producing analyze
+    # verify checkpoints aside instead of adopting them. The verify templates
+    # are rendered with app_context=None (backend_identity doctrine; #621
+    # folded the user template's None render + the persona constants in via
+    # _verify_template_texts — a template change now re-pays verify, the
+    # documented policy for template changes). The producing analyze
     # run's fingerprint is folded into verify's KEY: a verify checkpoint written
     # against analyze run A is NOT adopted once results.json carries analyze run
     # B (a model swap). This closes the finding where verify adopts a stale
     # checkpoint and ``finding_verifier.py`` ``r["finding"] = cp_data["finding"]``
     # overwrites the fresh Stage-1 verdict.
     from core.backend_identity import fingerprint_for_binding, render_template_texts
-    from prompts.verification_prompts import get_verification_system_prompt
-    _verify_texts = render_template_texts(
-        [lambda: get_verification_system_prompt(None)])
+    _verify_texts = render_template_texts(_verify_template_texts())
     checkpoint.sync_identity(fingerprint_for_binding(
         verify_binding, _verify_texts,
         extra_key={
@@ -325,6 +376,9 @@ def run_verification(
         downgraded=_counts.get("downgraded", 0),
         upgraded=_counts.get("upgraded", 0),
         usage=tracking.get_usage(),
+        # #621: the descriptor the summary renders verbatim (None when no
+        # context existed — the honest absence, rendered "not recorded").
+        attacker_model=attacker_model,
     )
 
 

@@ -329,6 +329,10 @@ def build_pipeline_output(
     # #600: the discovery block (the excluded dirs NAMED, per language) —
     # present-only beside coverage.
     discovery: dict | None = None,
+    # #621: the attacker-model descriptor the verify step stamped (the
+    # summary's server-rendered Methodology reads it verbatim). Present-only:
+    # None (verify never ran / old callers) stays absent in the artifact.
+    attacker_model: dict | None = None,
 ) -> tuple[str, int]:
     """Build ``pipeline_output.json`` from analysis results.
 
@@ -821,6 +825,10 @@ def build_pipeline_output(
         # Which path supplied the security model (Plan DoD #9). Additive key;
         # Go consumers use comma-ok access so it is safe to add.
         "context_source": context_source,
+        # #621: the attacker-model descriptor, present-only (stamped at verify
+        # time; absent when verification never ran or an old caller wrote
+        # the artifact). The summary renders the honest absence, never a guess.
+        **({"attacker_model": attacker_model} if attacker_model else {}),
         **(
             {"threat_model_sha256": threat_model_sha256}
             if threat_model_sha256
