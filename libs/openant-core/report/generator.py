@@ -427,7 +427,88 @@ def _reachability_header(pipeline_data: dict) -> str:
 _SUMMARY_SERVER_SECTIONS = (
     "Pipeline Statistics", "Per-Step Durations", "Per-Step Costs",
     "Results", "Confirmed Vulnerabilities", "Not Confirmed",
+    # #621: the methodology (incl. the attacker-model line) is a
+    # security-model fact — deterministic from pipeline_output.json, never
+    # LLM-transcribed (the R5/#535 doctrines; the old hardcoded template
+    # line claimed a browser attacker for every app type, even when Stage 2
+    # never ran).
+    "Methodology",
 )
+
+
+
+
+def _summary_methodology_block(pipeline_data: dict) -> str:
+    """#621: the deterministic Methodology section for SUMMARY_REPORT.md.
+
+    The attacker-model line used to be hardcoded template text ("Remote
+    attacker with browser access...") rendered for every application type —
+    even when Stage 2 never ran, and even when the actual persona was a
+    threat model's declared profiles or (#621) an attacker who supplies the
+    untrusted input. Same doctrine as _context_provenance_header (R5) and
+    #535: a security-model fact is rendered from ``pipeline_output.json``
+    WITHOUT the LLM, so a hostile repo file cannot steer it and the model
+    cannot mis-transcribe it. The descriptor is stamped at verify time by the
+    same selector the prompts consume; the summary NEVER re-derives it.
+
+    Honest-absence rules, three branches: verify in ``skipped_steps`` with
+    reason ``no_candidates``/``not_requested`` → "Stage 2 did not run";
+    reason ``failed`` (run_verification raised, possibly mid-run) → "Stage 2
+    failed to complete"; a verify that ran but carries no descriptor → "not
+    recorded". Accepted residuals, owned: (a) pre-#6xx artifacts always wrote
+    ``skipped_steps=[]``, and (b) the standalone build-output/report lanes
+    (openant/cli.py) do not forward ``skipped_steps`` at all — on both, the
+    skip branches are unreachable and a skipped/failed verify renders "not
+    recorded". Honest absence either way, never a guess; also "not recorded"
+    is the steady state for a zero-candidate standalone verify (the early
+    return precedes the descriptor stamp).
+    """
+    stats = (pipeline_data.get("pipeline_stats")
+             if isinstance(pipeline_data, dict) else None)
+    stats = stats if isinstance(stats, dict) else {}
+    skipped = stats.get("skipped_steps")
+    verify_skipped = any(
+        isinstance(entry, dict) and entry.get("step") == "verify"
+        for entry in (skipped or [])
+    )
+    am = (pipeline_data.get("attacker_model")
+          if isinstance(pipeline_data, dict) else None)
+    attacker = am.get("attacker") if isinstance(am, dict) else None
+
+    lines = [
+        "## Methodology",
+        "",
+        "Two-stage analysis:",
+        "1. Stage 1: LLM-based vulnerability detection on filtered code units",
+        "2. Stage 2: Attacker simulation to verify exploitability",
+        "",
+    ]
+    if verify_skipped:
+        # "failed" means run_verification raised (possibly mid-run, some
+        # checkpoints written) — "did not run" would understate it.
+        reason = next(
+            (entry.get("reason") for entry in (skipped or [])
+             if isinstance(entry, dict) and entry.get("step") == "verify"),
+            None)
+        if reason == "failed":
+            lines.append(
+                "Stage 2 failed to complete; no attacker model was applied "
+                "to this scan's findings.")
+        else:
+            lines.append(
+                "Stage 2 did not run on this scan; no attacker model was "
+                "applied.")
+    elif isinstance(attacker, str) and attacker.strip():
+        # The descriptor embeds boundary names that can be repo-authored on
+        # the manual path — cap the rendered line so a hostile OPENANT.json
+        # cannot balloon the deliverable's deterministic section.
+        text = attacker.strip()
+        if len(text) > 300:
+            text = text[:297] + "..."
+        lines.append(f"Attacker model: {text}")
+    else:
+        lines.append("Attacker model: not recorded by this scan.")
+    return "\n".join(lines) + "\n\n"
 
 
 
@@ -692,7 +773,8 @@ def generate_summary_report(
     # blocks after the deterministic headers.
     text = _strip_server_sections(text)
     text = _strip_summary_placeholders(text)
-    server_blocks = (_summary_statistics_block(pipeline_data)
+    server_blocks = (_summary_methodology_block(pipeline_data)
+                     + _summary_statistics_block(pipeline_data)
                      + _summary_tables_block(pipeline_data))
     # Splice the server blocks AFTER the model's H1/metadata block (the
     # banners may precede the title; whole H2 sections may not — the #535

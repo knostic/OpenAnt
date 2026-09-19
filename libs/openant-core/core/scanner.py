@@ -1202,6 +1202,11 @@ def scan_repository(
         or analyze_result.metrics.bypassable > 0
     )
 
+    # #621: the verify step stamps the attacker-model descriptor on its
+    # result (the summary's server-rendered Methodology reads it verbatim);
+    # None on every path that did not run verification.
+    attacker_model = None
+
     if verify and has_findings:
         from core.verifier import run_verification
 
@@ -1241,6 +1246,7 @@ def scan_repository(
 
                 result.verified_results_path = verify_result.verified_results_path
                 active_results_path = verify_result.verified_results_path
+                attacker_model = getattr(verify_result, "attacker_model", None)
 
                 print(f"  Confirmed: {verify_result.confirmed_vulnerabilities} vulnerabilities",
                       file=sys.stderr)
@@ -1348,6 +1354,9 @@ def scan_repository(
             # report skips are recorded later and remain in scan.report.json.
             skipped_steps=list(result.skipped_steps),
             skipped_step_reasons=dict(result.skipped_step_reasons),
+            # #621: the attacker-model descriptor the verify step stamped —
+            # present-only (None when verify never ran stays absent).
+            attacker_model=attacker_model,
         )
 
         ctx.outputs = {"pipeline_output_path": pipeline_output_path}
