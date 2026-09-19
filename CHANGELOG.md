@@ -3,6 +3,14 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-19] — Stage-2 disagreements corrected to `protected` keep their destination category (#622)
+
+### Fixed
+
+- **A Stage-2 correction to `protected` (protected-by-controls) read as inherently-safe code in every summary metric.** Such a disagreement fell through the residual `disagreed` arm of the outcome counter, the scanner folded ALL `disagreed` into `safe`, and the Go display rendered it under "false positives eliminated" — while the verified-results recount counted it `protected` all along (the scanner fold was the only divergence; on the referenced run the scanner reported protected 20 / safe 1544 while the recount carried protected 22 / safe 1542). #509 recorded the open question; #510 fixed only the `inconclusive` sibling.
+- The fix threads a **`disagreed_protected` bucket** following #510's pattern: the counter's arm (before the residual), `VerifyResult` (both construction sites), the shared `verify_step_summary` (now twelve fields; the reconciliation bound gains the bucket), the scanner fold — `protected` now grows by the split and `safe` keeps only the residual (corrected-to-safe-or-unrecognised) — a new non-partition `AnalysisMetrics.stage2_disagreed_protected` telemetry field (the envelope carries only the post-fold `protected`, so the Go display cannot derive the split; #510's sibling did not need one — the asymmetry is deliberate), the `[Verify]` stderr line, the scan summary's `Verified:` line, and the adjudication-coverage breakdown (both reclassification siblings named; the parts sum exactly to the numerator).
+- **The Go display explains the split at all three sites**: "False positives eliminated" is joined by "Reclassified protected (verified protected-by-controls)"; the verify summary gains companion lines for BOTH siblings (a protected-by-controls correction is not an eliminated false positive, and an explicitly-unconfirmable one is not either); the V2 scan summary states the split disjointly ("not counted in disagreed"). `VerifyResult.to_dict` — the Go verify display's source — now carries both siblings (the #509 sibling's omission there was the same defect, latent since #510). Old artifacts render identically (absent keys are 0; every companion is gated).
+- Known residual, scoped: an agreed record the consistency pass rewrites to `protected` lands in `agreed` and reaches no scanner partition bucket (the recount counts it protected) — the disagreement arm is #622's scope; sourcing the scanner's post-verify partition from the recount it already owns is the follow-up that retires the class. The residual `disagreed` arm still folds unrecognised verdict strings to safe (pre-existing, now disclosed in the counter's docstring).
 ## [2026-09-19] — The Stage-2 persona contract for untrusted-input contexts (#621)
 
 ### Fixed

@@ -177,6 +177,7 @@ def run_verification(
             agreed=0,
             disagreed=0,
             disagreed_inconclusive=0,
+            disagreed_protected=0,
             confirmed_vulnerabilities=0,
             # #302: the denominator survives the zero-findings early return —
             # a clean scan's scope statement is "adjudicated 0 of N", never
@@ -321,8 +322,9 @@ def run_verification(
     needs_review = _counts["needs_review"]
     error_count = _counts["error_count"]
 
-    print(f"\n[Verify] Results: {agreed} agreed, {disagreed} disagreed "
-          f"({_counts['disagreed_inconclusive']} to inconclusive), "
+    print(f"\n[Verify] Results: {agreed} agreed, {disagreed} disagreed to safe "
+          f"({_counts['disagreed_inconclusive']} to inconclusive, "
+          f"{_counts['disagreed_protected']} to protected), "
           f"{needs_review} need manual review, "
           f"{confirmed_vulnerabilities} confirmed vulnerabilities", file=sys.stderr)
     if error_count:
@@ -367,6 +369,9 @@ def run_verification(
         agreed=agreed,
         disagreed=disagreed,
         disagreed_inconclusive=_counts["disagreed_inconclusive"],
+        # #622: the protected-correction sibling — threaded to
+        # metrics.protected, never folded into safe.
+        disagreed_protected=_counts["disagreed_protected"],
         confirmed_vulnerabilities=confirmed_vulnerabilities,
         needs_review=needs_review,
         error_count=error_count,
@@ -402,6 +407,12 @@ def _adjudication_coverage_line(*, counts: dict, verified_results: list,
     (printed as such — the buckets are not additive). Deliberately NOT a
     persisted bucket (a new VerifyResult/schema field would be #284's
     territory and a schema surface).
+    Reconciliation: the completed-adjudication buckets — agreed + disagreed +
+    confirmed-still-vulnerable + reclassified-inconclusive (#509) +
+    reclassified-protected (#622) — sum EXACTLY to the headline numerator
+    ``adjudicated``; ``errored`` and ``needs_review`` are the EXCLUDED
+    remainder (subtracted from the verified pool to form the numerator X;
+    they remain in the denominator Y, the Stage-2 candidates in).
     """
     adjudicated = len(verified_results) - counts["needs_review"] - counts["error_count"]
     refused = sum(
@@ -427,6 +438,8 @@ def _adjudication_coverage_line(*, counts: dict, verified_results: list,
         f"Adjudicated {adjudicated}/{candidates_total} ({pct_str}%): "
         f"agreed {counts['agreed']}, disagreed {counts['disagreed']}, "
         f"confirmed-still-vulnerable {confirmed_only}, "
+        f"reclassified-inconclusive {counts['disagreed_inconclusive']}, "
+        f"reclassified-protected {counts['disagreed_protected']}, "
         f"errored {counts['error_count']} (incl. refused {refused}), "
         f"needs_review {counts['needs_review']}"
     )
@@ -435,7 +448,7 @@ def _adjudication_coverage_line(*, counts: dict, verified_results: list,
 def _count_verification_outcomes(verified_results: list) -> dict:
     """Bucket verified results into agreed / disagreed / needs_review / error.
 
-    PR #69 F5/L4 — the four buckets are mutually exclusive and, crucially,
+    PR #69 F5/L4 — the buckets are mutually exclusive and, crucially,
     keep "incomplete" and "errored" findings OUT of the path that the scanner
     later folds into ``safe`` (``safe += disagreed``):
 
@@ -446,9 +459,21 @@ def _count_verification_outcomes(verified_results: list) -> dict:
                            potential vuln awaiting manual triage.
       * ``agreed``       — Stage 2 completed and agreed; if the final finding is
                            vulnerable/bypassable it is a confirmed vulnerability.
-      * ``disagreed``    — Stage 2 completed and actively disagreed (e.g.
-                           downgraded the verdict). ONLY this bucket is safe to
-                           fold into ``safe`` downstream.
+      * ``disagreed``    — Stage 2 completed and actively disagreed with a
+                           corrected verdict of ``safe`` OR an unrecognised
+                           verdict string (the residual arm — anything not
+                           vulnerable/bypassable/inconclusive/protected).
+                           ONLY this bucket is safe to fold into ``safe``
+                           downstream. NOTE the off-enum residual: a garbage
+                           corrected verdict still lands here and reads as
+                           safe — pre-existing behaviour, disclosed.
+      * ``disagreed_inconclusive`` — #509/#510: the corrected finding is
+                           ``inconclusive`` — threaded to metrics.inconclusive,
+                           never folded into safe.
+      * ``disagreed_protected`` — #622: the corrected finding is ``protected``
+                           (protected-by-controls — materially different from
+                           inherently-safe code). Threaded to
+                           metrics.protected, never folded into safe.
     """
     counts = {
         "agreed": 0,
@@ -456,6 +481,9 @@ def _count_verification_outcomes(verified_results: list) -> dict:
         # #509: disagreements whose corrected finding is ``inconclusive`` —
         # threaded to metrics.inconclusive, never folded into safe.
         "disagreed_inconclusive": 0,
+        # #622: disagreements whose corrected finding is ``protected`` —
+        # threaded to metrics.protected, never folded into safe.
+        "disagreed_protected": 0,
         "needs_review": 0,
         "confirmed_vulnerabilities": 0,
         "error_count": 0,
@@ -503,6 +531,17 @@ def _count_verification_outcomes(verified_results: list) -> dict:
                 # would reclassify an explicitly-unconfirmable finding as
                 # safe in the aggregate metrics. Its own bucket.
                 counts["disagreed_inconclusive"] += 1
+            elif finding == "protected":
+                # #622: the verifier disagreed and corrected the verdict to
+                # ``protected`` — the unit is protected-by-controls,
+                # materially different from inherently-safe code. Falling
+                # through to the residual ``disagreed`` arm would (a) fold
+                # it into ``safe`` at the scanner and (b) render it "false
+                # positives eliminated" Go-side — losing the destination
+                # category from every summary (#509 recorded the open
+                # question; #510 fixed only the inconclusive sibling). Its
+                # own bucket, threaded to metrics.protected.
+                counts["disagreed_protected"] += 1
             else:
                 counts["disagreed"] += 1
         # #302: direction. `verdict` is the UN-overwritten Stage-1 original;
