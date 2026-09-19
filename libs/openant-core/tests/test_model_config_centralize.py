@@ -153,11 +153,29 @@ _EXPECTED_ANTHROPIC_CURRENT = {
     "claude-opus-4-8": {"input": 5.00, "output": 25.00},
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
     "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
+    # #601/#610: the direct-anthropic records added 2026-09-18 — every
+    # rate independently sourced (Anthropic's live pricing page; the live
+    # OpenRouter catalogue corroborates where it serves the model). The
+    # sonnet-5 rate is the page's introductory-made-standard price (the
+    # scheduled 2026-09-01 increase to $3/$15 did not occur).
+    "claude-sonnet-5": {"input": 2.00, "output": 10.00},
+    "claude-opus-5": {"input": 5.00, "output": 25.00},
+    "claude-fable-5": {"input": 10.00, "output": 50.00},
+    "claude-fable-5-1": {"input": 10.00, "output": 50.00},
+    "claude-mythos-5": {"input": 10.00, "output": 50.00},
+    "claude-mythos-5-1": {"input": 10.00, "output": 50.00},
+    "claude-opus-4-7": {"input": 5.00, "output": 25.00},
 }
 _RETIRED_OR_UNKNOWN_ANTHROPIC = {
     "claude-opus-4-20250514",
     "claude-opus-4-6",
     "claude-sonnet-4-20250514",
+    # #610: SDK-listed with NO published price row on Anthropic's page —
+    # deliberately unpriced (the registry's unknown/null form); pinned
+    # OMITTED here, and its EXISTENCE pinned in
+    # test_issue601_registry_completion.py (the omission assert alone
+    # cannot distinguish deliberately-unpriced from never-existed).
+    "claude-mythos-preview",
 }
 _EXPECTED_OPENAI = {
     "gpt-4o": {"input": 2.50, "output": 10.00},

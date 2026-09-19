@@ -3,6 +3,15 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-18] — The registry carries direct-anthropic records for the current Claude generation (#601, #610)
+
+### Added
+
+- **Seven priced direct-`anthropic` records** (every rate independently sourced: Anthropic's live pricing page 2026-09-18, corroborated by OpenRouter's live catalogue the same day where it serves the model): `claude-sonnet-5` $2/$10 (the page's introductory-made-standard note — the scheduled 2026-09-01 increase did not occur), `claude-opus-5` $5/$25, `claude-fable-5` $10/$50, `claude-fable-5-1` $10/$50, `claude-mythos-5` $10/$50 (limited availability — the glasswing program; the direct page is the single source; OpenRouter does not serve the Mythos models), `claude-mythos-5-1` $10/$50 (same), `claude-opus-4-7` $5/$25. A config naming any of these under provider `anthropic` previously recorded **$0 + `cost_incomplete`** (the #216 fail-visible path working as designed — the registry completeness gap was the issue).
+- **`claude-mythos-preview` as the registry's `unknown`/null form** — SDK-listed (the Anthropic SDK's model literals, `types/model.py`) with **no published price row** on Anthropic's page (referenced only in tokenizer/long-context notes; glasswing-gated; not on OpenRouter): deliberately unpriced rather than mirrored from a sibling. Its #216 treatment is byte-identical to total absence; the record makes the deliberate absence machine-readable.
+- **Two OpenRouter records** (`anthropic/claude-fable-5.1`, `anthropic/claude-opus-4.7` — the live catalogue rates, which agree with the new direct records; adjacent completeness work: the #601 failure shape for ids OpenRouter serves but the registry never recorded).
+- User-visible side effect: the `openant setup llm` wizard's known-models hint for the anthropic provider grows from three to ten ids (the seven priced additions; the unknown/null mythos-preview is filtered out by the wizard's current-only rule). The Mythos entries are limited-availability — a wizard pick of one fails loudly at the pre-save probe, never silently.
+
 ## [2026-09-18] — The Google adapter's requests carry a finite deadline (a 600 s parity default, config-threaded) (#604)
 
 ### Changed
