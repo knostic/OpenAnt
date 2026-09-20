@@ -1268,16 +1268,24 @@ def scan_repository(
                     # #509: a Stage-2 disagreement corrected to
                     # ``inconclusive`` is an explicitly-unconfirmable finding —
                     # it threads into inconclusive, NEVER into safe (the
-                    # plain-disagreement fold above covers only genuine
+                    # plain-disagreement fold below covers only genuine
                     # downgrades to safe).
                     inconclusive=analyze_result.metrics.inconclusive
                     + verify_result.disagreed_inconclusive,
-                    protected=analyze_result.metrics.protected,
+                    # #622: a disagreement corrected to ``protected`` is
+                    # protected-by-controls — the destination category
+                    # reaches the scan metrics (the recount always counted
+                    # it here; the scanner fold was the only divergence).
+                    protected=analyze_result.metrics.protected
+                    + verify_result.disagreed_protected,
+                    # #622: the residual ``disagreed`` (corrected to safe or
+                    # an unrecognised verdict) is ALL that folds into safe.
                     safe=analyze_result.metrics.safe + verify_result.disagreed,
                     errors=analyze_result.metrics.errors + verify_result.error_count,
                     verified=verify_result.findings_verified,
                     stage2_agreed=verify_result.agreed,
                     stage2_disagreed=verify_result.disagreed,
+                    stage2_disagreed_protected=verify_result.disagreed_protected,
                     needs_review=verify_result.needs_review,
                 )
             except Exception as e:
@@ -2066,9 +2074,17 @@ def _print_summary(result: ScanResult) -> None:
               f"(verification incomplete)", file=sys.stderr)
     print(f"  Errors:         {result.metrics.errors}", file=sys.stderr)
     if result.metrics.verified:
-        print(f"  Verified:       {result.metrics.verified} "
-              f"({result.metrics.stage2_agreed} agreed, "
-              f"{result.metrics.stage2_disagreed} disagreed)", file=sys.stderr)
+        # #622: the disagreement split, composed as ONE line — the residual
+        # `disagreed` excludes the reclassifications, so the companion must
+        # state them (a bare shrinking number is the issue's own failure
+        # class) without implying a subset of the figure beside it.
+        line = (f"  Verified:       {result.metrics.verified} "
+                f"({result.metrics.stage2_agreed} agreed, "
+                f"{result.metrics.stage2_disagreed} disagreed to safe")
+        if result.metrics.stage2_disagreed_protected:
+            line += (f"; {result.metrics.stage2_disagreed_protected} "
+                     f"reclassified protected-by-controls")
+        print(line + ")", file=sys.stderr)
     print(f"  Cost:           ${result.usage.total_cost_usd:.4f}", file=sys.stderr)
     print(f"  Output:         {result.output_dir}", file=sys.stderr)
     if result.skipped_steps:

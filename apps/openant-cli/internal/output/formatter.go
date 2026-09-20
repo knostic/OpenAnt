@@ -104,6 +104,10 @@ func PrintScanSummary(data map[string]any) {
 	unclear := intFromAny(metrics["inconclusive"])
 	verified := intFromAny(metrics["verified"])
 	falsePos := intFromAny(metrics["stage2_disagreed"])
+	// #622: the protected split of the disagreed count — a correction to
+	// protected-by-controls is NOT a false positive; without the companion
+	// line the "eliminated" number silently shrinks when they split out.
+	reclassifiedProtected := intFromAny(metrics["stage2_disagreed_protected"])
 
 	PrintKeyValue("Total units analyzed", fmt.Sprintf("%d", total))
 
@@ -128,6 +132,10 @@ func PrintScanSummary(data map[string]any) {
 
 	if falsePos > 0 {
 		PrintKeyValue("False positives eliminated", fmt.Sprintf("%d", falsePos))
+	}
+	if reclassifiedProtected > 0 {
+		PrintKeyValue("Reclassified protected (verified protected-by-controls)",
+			fmt.Sprintf("%d", reclassifiedProtected))
 	}
 
 	// Usage info
@@ -294,6 +302,12 @@ func PrintVerifySummary(data map[string]any) {
 	agreed := intFromAny(data["agreed"])
 	disagreed := intFromAny(data["disagreed"])
 	confirmed := intFromAny(data["confirmed_vulnerabilities"])
+	// #622: the reclassification siblings ride the VerifyResult.to_dict
+	// envelope — the companion lines keep "Disagreed (eliminated)" honest
+	// (a protected-by-controls correction is not an eliminated false
+	// positive, and an explicitly-unconfirmable one is not either).
+	reclassifiedProtected := intFromAny(data["disagreed_protected"])
+	reclassifiedInconclusive := intFromAny(data["disagreed_inconclusive"])
 
 	PrintKeyValue("Findings input", fmt.Sprintf("%d", input))
 	PrintKeyValue("Findings verified", fmt.Sprintf("%d", verified))
@@ -303,6 +317,14 @@ func PrintVerifySummary(data map[string]any) {
 	}
 	if disagreed > 0 {
 		green.Printf("  Disagreed (eliminated): %d\n", disagreed)
+	}
+	if reclassifiedProtected > 0 {
+		green.Printf("  Reclassified protected (verified protected-by-controls): %d\n",
+			reclassifiedProtected)
+	}
+	if reclassifiedInconclusive > 0 {
+		yellow.Printf("  Reclassified inconclusive (explicitly unconfirmable): %d\n",
+			reclassifiedInconclusive)
 	}
 
 	fmt.Println()
@@ -461,6 +483,14 @@ func PrintScanSummaryV2(data map[string]any) {
 		disagreed := intFromAny(metrics["stage2_disagreed"])
 		PrintKeyValue("Verified (Stage 2)", fmt.Sprintf("%d (%d agreed, %d disagreed)",
 			verified, agreed, disagreed))
+		// #622: the companion line states the split DISJOINTLY — the
+		// reclassified figure is carved OUT of the disagreed count above,
+		// so "of which" would wrongly imply a subset.
+		if reclassifiedProtected := intFromAny(metrics["stage2_disagreed_protected"]); reclassifiedProtected > 0 {
+			PrintKeyValue("Reclassified protected",
+				fmt.Sprintf("%d (verified protected-by-controls; not counted in disagreed)",
+					reclassifiedProtected))
+		}
 	}
 
 	// Usage info
