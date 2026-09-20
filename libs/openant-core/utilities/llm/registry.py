@@ -171,6 +171,38 @@ _unconsumed_timeout_warned: set[str] = set()
 _unconsumed_timeout_warned_lock = threading.Lock()
 
 
+_warned_unconsumed_thinking: set[tuple[str, str]] = set()
+_thinking_warn_lock = threading.Lock()
+
+
+def _warn_unconsumed_thinking(provider_name: str, adapter_type: str) -> None:
+    """#625: one-time-per-(provider, type) stderr warning when a phase
+    sets a thinking policy but the adapter class does not consume the
+    kwarg — the request would silently carry no thinking key. Duplicated
+    (not generalized) from the #604 warn-set: generalizing touches the
+    #604 pins and llm_client's reset tuple atomically — a deliberate,
+    # separate refactor."""
+    key = (provider_name, adapter_type)
+    should_warn = False
+    with _thinking_warn_lock:
+        if key not in _warned_unconsumed_thinking:
+            _warned_unconsumed_thinking.add(key)
+            should_warn = True
+    if should_warn:
+        sys.stderr.write(
+            f"warning: a phase sets a thinking policy for provider "
+            f"{provider_name!r} (type {adapter_type!r}), but that adapter "
+            f"does not consume it — the requests will carry no thinking "
+            f"key.\n"
+        )
+
+
+def reset_unconsumed_thinking_warning() -> None:
+    """Test hook: re-arm the one-time #625 warning."""
+    with _thinking_warn_lock:
+        _warned_unconsumed_thinking.clear()
+
+
 def _warn_unconsumed_timeout(provider_name: str, provider_type: str) -> None:
     with _unconsumed_timeout_warned_lock:
         if provider_type in _unconsumed_timeout_warned:
@@ -195,7 +227,8 @@ def reset_unconsumed_timeout_warning() -> None:
         _unconsumed_timeout_warned.clear()
 
 
-def build_adapter(provider: ProviderConfig) -> LLMAdapter:
+def build_adapter(provider: ProviderConfig,
+                  thinking: Optional[dict] = None) -> LLMAdapter:
     """Construct an adapter instance from a ProviderConfig.
 
     Adapter constructors typically raise provider-native exceptions
@@ -227,6 +260,19 @@ def build_adapter(provider: ProviderConfig) -> LLMAdapter:
             kwargs["request_timeout"] = provider.request_timeout
         else:
             _warn_unconsumed_timeout(provider.name, provider.type)
+    # #625: the per-phase thinking policy threads the same capability-
+    # conditional way — an adapter that declares ``thinking`` consumes it;
+    # any other type (bedrock's duplicated request-build, openai, google)
+    # warns ONCE per type (fail-visible, never a silent ignore). Bedrock
+    # deliberately does not adopt it in this change (its own complete());
+    # its reuse of _response_to_unified means the dropped-block count
+    # DOES reach it.
+    if thinking is not None:
+        if "thinking" in inspect.signature(
+                adapter_cls.__init__).parameters:
+            kwargs["thinking"] = thinking
+        else:
+            _warn_unconsumed_thinking(provider.name, provider.type)
     try:
         return adapter_cls(**kwargs)
     except Exception as exc:  # noqa: BLE001 — re-raise as typed
@@ -259,6 +305,15 @@ class PhaseBinding:
     # users (SDK default endpoint) → fingerprint unchanged, zero re-pay. Sanitized
     # (userinfo/query/fragment stripped) before it ever enters the KEY / sidecar.
     base_url: Optional[str] = None
+    # #625: the phase's EFFECTIVE request-side thinking policy (the
+    # per-phase config, post-gate). None = the request carries no thinking
+    # key (the byte-identical default) AND the fingerprint extra stays
+    # absent (zero re-pay for default users, exactly like base_url). The
+    # fingerprint fold rides extra_key only-when-set — the #242 exclusion
+    # rationale was CONDITIONAL (truncation records as ERROR, never
+    # adopted); a thinking policy changes ORDINARY SUCCESSES, so a resumed
+    # scan must not adopt cross-policy verdicts.
+    thinking: Optional[dict] = None
 
 
 class PhaseRegistry:
@@ -351,37 +406,76 @@ def probe_registry_or_raise(registry: PhaseRegistry) -> None:
         raise
 
 
+TOOL_PHASES = ("enhance", "verify")
+
+
+def _canonical_thinking(thinking: Optional[dict]) -> Optional[str]:
+    """#625: the hashable canonical form of a thinking policy for the
+    adapter-tuple key (None stays None — the default tuple)."""
+    return json.dumps(thinking, sort_keys=True) if thinking else None
+
+
 def build_phase_registry(
     cf: ConfigFile, llm_config: LLMConfig
 ) -> PhaseRegistry:
     """Eagerly instantiate every adapter the llm-config needs.
 
-    One adapter per unique provider name (not per phase). Phases that
-    share a provider reuse the same adapter instance — which is
-    correct because adapters are stateless dispatchers and the SDK
-    clients underneath are thread-safe.
+    One adapter per unique (provider, thinking) tuple (not per phase):
+    phases that share a provider AND policy reuse the same adapter
+    instance — correct because adapters are stateless dispatchers and
+    the SDK clients underneath are thread-safe. #625: a thinking-
+    configured phase and a default phase behind the same provider get
+    DISTINCT adapters (their request dicts differ).
     """
+    # #625 (the panel round): the tool-phase gate fires BEFORE any adapter
+    # is built — a thinking-configured tool phase on a non-consuming
+    # provider must see the ConfigError, not a spurious unconsumed-knob
+    # warning first.
+    for phase, ref in llm_config.phases.items():
+        if (ref.thinking is not None
+                and ref.thinking.get("type") != "disabled"
+                and phase in TOOL_PHASES):
+            raise ConfigError(
+                f"llm-config {llm_config.name!r}: phase {phase!r} sets a "
+                f"thinking policy, but {phase} is a tool-calling phase — "
+                "the platform requires thinking blocks echoed back with "
+                "tool results, which this pipeline does not yet support "
+                "(the loops carry text and tool-use only). Configure "
+                "thinking on a single-turn phase (analyze, report, "
+                "llm_reach, dynamic_test) or remove the key.")
+
     # First pass: pick out the unique provider names referenced.
     unique_providers: dict[str, ProviderConfig] = {}
     for ref in llm_config.phases.values():
         if ref.provider not in unique_providers:
             unique_providers[ref.provider] = resolve_provider(cf, ref.provider)
 
-    # Second pass: instantiate one adapter per provider.
-    adapters: dict[str, LLMAdapter] = {
-        name: build_adapter(provider)
-        for name, provider in unique_providers.items()
-    }
+    # #625 Second pass: one adapter per (provider, thinking) tuple — a
+    # thinking-configured phase and a default phase behind the SAME
+    # provider need DIFFERENT request dicts, and adapters are stateless
+    # dispatchers, so the tuple key preserves the one-adapter-per-shape
+    # economy while honoring both policies.
+    adapters: dict[tuple, LLMAdapter] = {}
+    for ref in llm_config.phases.values():
+        provider = unique_providers[ref.provider]
+        key = (ref.provider, _canonical_thinking(ref.thinking))
+        if key not in adapters:
+            adapters[key] = build_adapter(
+                provider, thinking=ref.thinking)
 
-    # Third pass: build phase bindings reusing the per-provider adapters.
+    # #625 Third pass: build phase bindings (the tool-phase GATE fired in
+    # the pre-build pass above; the ADAPTER-level tool backstop in
+    # anthropic.complete is the exhaustive half — the gate is the
+    # early-UX half for the phases that ALWAYS tool-call).
     bindings: dict[str, PhaseBinding] = {}
     for phase, ref in llm_config.phases.items():
         bindings[phase] = PhaseBinding(
             phase=phase,
-            adapter=adapters[ref.provider],
+            adapter=adapters[(ref.provider, _canonical_thinking(ref.thinking))],
             model=ref.model,
             provider_name=ref.provider,
             base_url=unique_providers[ref.provider].base_url,
+            thinking=ref.thinking,
         )
 
     # Tool-support gating (plan §5): enhance + verify require an
@@ -392,11 +486,8 @@ def build_phase_registry(
     return PhaseRegistry(bindings=bindings, config_name=llm_config.name)
 
 
-_TOOL_PHASES = ("enhance", "verify")
-
-
 def _check_tool_support(bindings: dict[str, PhaseBinding]) -> None:
-    for phase in _TOOL_PHASES:
+    for phase in TOOL_PHASES:
         binding = bindings[phase]
         if not binding.adapter.supports_tools:
             raise ConfigError(

@@ -85,6 +85,27 @@ _warned_block_kinds: set[str] = set()
 _warned_block_kinds_lock = threading.Lock()
 
 
+# #625: the per-kind dropped-block diagnostic, run-cumulative, process-
+# global. The stderr warning above stays (the once-per-kind signal); this
+# counter is the PERSISTED half — the per-call usage records die with the
+# process, so a count that stops there is invisible in artifacts. It flows
+# the #216/#605 marker path (get_totals present-only -> the step reports ->
+# scan.report.json), zeroing on the per-scan reset (reset_warnings).
+_dropped_block_counts: dict[str, int] = {}
+_dropped_block_lock = threading.Lock()
+
+
+def _count_dropped_block(kind: str) -> None:
+    with _dropped_block_lock:
+        _dropped_block_counts[kind] = _dropped_block_counts.get(kind, 0) + 1
+
+
+def get_dropped_block_counts() -> dict[str, int]:
+    """A snapshot of the per-kind dropped-block counts (read-side)."""
+    with _dropped_block_lock:
+        return dict(_dropped_block_counts)
+
+
 def _warn_unknown_block_kind(kind: str, *, adapter: str = "AnthropicAdapter") -> None:
     """One-time stderr warning when the response carries a content-block
     kind the adapter doesn't translate, so a dropped block isn't silent."""
@@ -108,6 +129,10 @@ def reset_warnings() -> None:
         _warned_stop_reasons.clear()
     with _warned_block_kinds_lock:
         _warned_block_kinds.clear()
+    # #625: the per-kind dropped-block counter rides the same per-scan
+    # lifecycle (the #605 counter precedent — zeroed by reset_warning_state).
+    with _dropped_block_lock:
+        _dropped_block_counts.clear()
 
 
 class AnthropicAdapter:
@@ -133,6 +158,7 @@ class AnthropicAdapter:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_retries: int = 5,
+        thinking: Optional[dict] = None,
         _client: Optional[anthropic.Anthropic] = None,
     ):
         """Construct the adapter.
@@ -148,7 +174,16 @@ class AnthropicAdapter:
                 limiter handles 429-coordinated backoff on top.
             _client: Injected SDK instance for testing. Production
                 callers should not pass this.
+            thinking: #625 — the per-phase request-side thinking policy
+                (``{"type": ...}``; the SDK's own dict shape). ``None``
+                (the default) = the request carries NO thinking key —
+                the byte-identical default path (the #242 instrument
+                lesson). Set BEFORE the ``_client`` early-return so the
+                injected-client tests observe the policy.
         """
+        # #625: stored before the injected-client early-return (the #604
+        # google.py positional-contract lesson).
+        self._thinking = thinking
         if _client is not None:
             self._client = _client
             return
@@ -184,6 +219,39 @@ class AnthropicAdapter:
             request["system"] = system
         if tools:
             request["tools"] = [_tool_to_anthropic(t) for t in tools]
+        # #625: the request-side thinking policy — None carries NO key
+        # (byte-identical); the explicit-disabled dict IS a distinct
+        # request. The pre-flight: enabled requires budget_tokens >= 1024
+        # AND < max_tokens — a budget that cannot fit THIS call's cap
+        # fails LOUD before the request is paid (never clamped: clamping
+        # is a silent instrument change).
+        if self._thinking is not None:
+            # #625 (the panel round): the adapter-level tool backstop —
+            # EXHAUSTIVE by construction where the phase-name list is a
+            # hand-kept shadow. The platform requires thinking blocks
+            # echoed back with tool results; the three-kind contract and
+            # every loop's text/tool-use history filter cannot honor it,
+            # so ANY thinking policy (except explicit disabled) on a
+            # tool-carrying call fails LOUD here, before the paid turn-1.
+            # This covers the phase the build-time list cannot name
+            # (app_context drives BOTH a single-turn path and the
+            # threat-model repo-explorer tool loop).
+            if tools and self._thinking.get("type") != "disabled":
+                raise LLMResponseError(
+                    "a thinking policy cannot ride a tool-carrying call — "
+                    "the platform requires thinking blocks echoed back "
+                    "with tool results, which this pipeline does not yet "
+                    "support (the tool-phase gate names the phases; this "
+                    "guard covers every other tools= call site)")
+            if (self._thinking.get("type") == "enabled"
+                    and self._thinking.get("budget_tokens", 0) >= max_tokens):
+                raise LLMResponseError(
+                    f"thinking budget_tokens "
+                    f"({self._thinking['budget_tokens']}) must be < this "
+                    f"call's max_tokens ({max_tokens}) — the platform "
+                    f"rejects the request; lower the budget or raise the "
+                    f"call's token cap")
+            request["thinking"] = dict(self._thinking)
 
         # Cooperate with the cross-worker backoff before issuing the
         # call — same pattern the legacy AnthropicClient used, now
@@ -226,6 +294,14 @@ class AnthropicAdapter:
         # Cheapest valid request: 1-token cap, single "hi" message.
         # Probing the actual configured model (not a hardcoded
         # haiku) catches typo'd model IDs at init, per plan §5.
+        #
+        # #625 (documented residual): the probe DELIBERATELY carries NO
+        # thinking key — enabled requires budget_tokens >= 1024 AND <
+        # max_tokens, which a 1-token probe cannot satisfy. The probe
+        # tests the TRANSPORT; an invalid thinking policy (a shape the
+        # server rejects for the model) surfaces at the FIRST real call
+        # as a typed LLMResponseError, never mid-scan silently — the
+        # parse-time validation catches the client-side shapes first.
         #
         # Note: this path deliberately does NOT call
         # ``rate_limiter.wait_if_needed()`` the way ``complete()``
@@ -340,6 +416,7 @@ def _response_to_unified(
     ``AnthropicAdapter``.
     """
     content_blocks: list[ContentBlock] = []
+    dropped: dict[str, int] = {}
     for block in response.content:
         kind = getattr(block, "type", None)
         if kind == "text":
@@ -360,6 +437,13 @@ def _response_to_unified(
             # dropped "refusal" paired with a benign stop_reason could
             # read as an empty success.
             _warn_unknown_block_kind(str(kind), adapter=adapter)
+            # #625: the per-kind count — the persisted diagnostic (the
+            # per-call record dies with the process; this counter reaches
+            # the step reports via get_totals). PER-KIND by design: a
+            # routine kind (thinking, when enabled) must not bury a
+            # dropped refusal in a scalar total.
+            _count_dropped_block(str(kind))
+            dropped[str(kind)] = dropped.get(str(kind), 0) + 1
 
     # R4-5: a usage-less response (rare, but seen on some proxies and on
     # error-shaped 200s) must not AttributeError here — the downstream
@@ -430,6 +514,10 @@ def _response_to_unified(
         input_tokens=getattr(usage, "input_tokens", 0),
         output_tokens=getattr(usage, "output_tokens", 0),
         usage_details=_extract_usage_details(usage),
+        # #625: the per-response half of the dropped-block diagnostic
+        # (present-only: None when nothing dropped — the default path
+        # stays byte-identical).
+        dropped_blocks=dropped or None,
         # R2-C: an unknown/abnormal stop_reason defaults to "max_tokens" (not
         # "end_turn") — as the warning above notes, treating a refusal/abnormal
         # termination as end_turn masks false negatives. Known values (end_turn/

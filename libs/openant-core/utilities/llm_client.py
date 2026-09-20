@@ -329,6 +329,11 @@ class TokenTracker:
             _errs = _accounting_error_count()
             if _errs:
                 out["accounting_errors"] = _errs
+            # #625: the per-kind dropped-block counts, present-only (the
+            # #605 discipline — a clean run serializes byte-identically).
+            _dropped = get_dropped_block_totals()
+            if _dropped:
+                out["dropped_blocks"] = dict(_dropped)
             return out
 
 
@@ -340,6 +345,19 @@ _global_tracker = TokenTracker()
 def get_global_tracker() -> TokenTracker:
     """Get the global token tracker instance."""
     return _global_tracker
+
+
+def get_dropped_block_totals() -> dict:
+    """#625: the run-cumulative per-kind dropped-block counts (the #605
+    accessor shape — lazy import; an absent provider module reads empty).
+    ImportError only: a broader catch would silently un-wire the counter
+    on a rename (the #604 direct-call discipline 40 lines below names the
+    hazard)."""
+    try:
+        from utilities.llm.providers.anthropic import get_dropped_block_counts
+        return get_dropped_block_counts()
+    except ImportError:
+        return {}
 
 
 def reset_warning_state() -> None:
@@ -386,6 +404,9 @@ def reset_warning_state() -> None:
     # hazard the adjacent comment names; the silent-None fallback
     # contradicted it — the panel seat's catch)
     _registry_mod.reset_unconsumed_timeout_warning()
+    # #625: the thinking-knob's unconsumed warning rides the same lifecycle
+    # (DIRECT call, same reasoning).
+    _registry_mod.reset_unconsumed_thinking_warning()
 
 
 def reset_global_tracker():

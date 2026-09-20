@@ -103,6 +103,12 @@ class PhaseRef:
 
     provider: str
     model: str
+    # #625: the per-phase request-side thinking policy — a MODEL/phase
+    # property, deliberately NOT provider-level (the #604 transport knob's
+    # granularity). None (the default) = the request carries NO thinking
+    # key — the byte-identical default path (the #242 instrument lesson).
+    # An explicit {"type": "disabled"} is a DIFFERENT request than absence.
+    thinking: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -310,6 +316,70 @@ def _parse_configs(raw: dict) -> dict[str, LLMConfig]:
     return out
 
 
+def _parse_thinking(config_name: str, phase: str, value) -> Optional[dict]:
+    """#625: parse/validate a phase's thinking policy — the SDK's own dict
+    shape, never an invented vocabulary (the D3 explicit-total-mapping rule):
+      * {"type": "adaptive"}                       (server-gated; the newer
+        models only — the SERVER rejects it loudly for older models, which
+        is the source of truth; NO client-side model allowlist — the model
+        table moved twice in one generation, a hand-kept shadow would rot)
+      * {"type": "enabled", "budget_tokens": N}    (N int, >= 1024, never
+        bool/float — the _positive_int_or_none discipline)
+      * {"type": "disabled"}
+    None/absent = the request carries no key (the default). Unknown types
+    and unknown keys are LOUD (a mid-scan API 400 is the worst surfacing).
+    """
+    if value is None:
+        return None
+    where = (f"config.json: llm-config {config_name!r} phase {phase!r} "
+             f"thinking")
+    if not isinstance(value, dict):
+        raise ConfigError(
+            f"{where}: expected an object like "
+            f'{{"type": "enabled", "budget_tokens": N}}, '
+            f"got {type(value).__name__}")
+    vtype = value.get("type")
+    if vtype == "adaptive":
+        allowed = {"type"}
+    elif vtype == "enabled":
+        allowed = {"type", "budget_tokens"}
+    elif vtype == "disabled":
+        allowed = {"type"}
+    else:
+        raise ConfigError(
+            f'{where}: unknown type {vtype!r} — expected "adaptive", '
+            f'"enabled", or "disabled"')
+    unknown = set(value) - allowed
+    if unknown:
+        raise ConfigError(
+            f"{where}: unknown key(s) {sorted(unknown)} — allowed: "
+            f"{sorted(allowed)}")
+    parsed: dict = {"type": vtype}
+    if vtype == "enabled":
+        budget = value.get("budget_tokens")
+        if isinstance(budget, bool) or not isinstance(budget, int) \
+                or budget < 1024:
+            raise ConfigError(
+                f"{where}: 'budget_tokens' must be an integer >= 1024 "
+                f"(the platform floor), got {budget!r}")
+        # #625 (the panel round): the phase's binding is called at
+        # HETEROGENEOUS caps (the main calls at 20000; the JSON-correction
+        # and consistency sub-calls that ride the SAME binding at 8192 and
+        # 4096) — a budget above the SMALLEST known cap passes the main
+        # call and then hard-fails every sub-call (and the consistency
+        # pass's bare except would swallow it SILENTLY). Bound at parse
+        # time, loudly, naming the phase it already has.
+        if budget >= 4096:
+            raise ConfigError(
+                f"{where}: 'budget_tokens' must be < 4096 — the phase's "
+                f"binding also serves sub-calls capped at 4096/8192 "
+                f"(JSON correction, stage-1 consistency), and a larger "
+                f"budget would fail those requests mid-scan. Lower the "
+                f"budget or use {{\"type\": \"adaptive\"}}.")
+        parsed["budget_tokens"] = budget
+    return parsed
+
+
 def _parse_phase_ref(config_name: str, phase: str, entry) -> PhaseRef:
     if not isinstance(entry, dict):
         raise ConfigError(
@@ -328,7 +398,8 @@ def _parse_phase_ref(config_name: str, phase: str, entry) -> PhaseRef:
             f"config.json: llm-config {config_name!r} phase {phase!r}: "
             f"'model' must be a non-empty string"
         )
-    return PhaseRef(provider=provider, model=model)
+    thinking = _parse_thinking(config_name, phase, entry.get("thinking"))
+    return PhaseRef(provider=provider, model=model, thinking=thinking)
 
 
 def _validate_phase_references(cf: ConfigFile) -> None:
@@ -430,10 +501,15 @@ def _serialise_provider(p: ProviderConfig) -> dict:
 
 
 def _serialise_config(c: LLMConfig) -> dict:
-    return {
-        phase: {"provider": ref.provider, "model": ref.model}
-        for phase, ref in c.phases.items()
-    }
+    out = {}
+    for phase, ref in c.phases.items():
+        entry = {"provider": ref.provider, "model": ref.model}
+        # #625: present-only — the default serialises byte-identically; an
+        # explicit disabled SURVIVES the round trip (absent != disabled).
+        if ref.thinking is not None:
+            entry["thinking"] = dict(ref.thinking)
+        out[phase] = entry
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -566,9 +566,17 @@ def _analyze_fingerprint(binding, ctx_sha=None) -> dict:
     # text). None (no context / a pre-#546 artifact) leaves the key
     # member absent-equivalent; a changed derivation archives the stale
     # records and re-pays.
+    # #625: the phase's EFFECTIVE thinking policy joins the identity
+    # ONLY-when-set — None leaves the digest byte-identical (zero re-pay
+    # for default users, exactly like ctx_sha). The #242 gen-params
+    # exclusion was CONDITIONAL (truncation records as ERROR, never
+    # adopted); a thinking policy changes ORDINARY SUCCESSES, so a
+    # resumed scan must not adopt cross-policy verdicts.
+    _extra = {"ctx_sources_sha256": ctx_sha} if ctx_sha else {}
+    if getattr(binding, "thinking", None) is not None:
+        _extra["thinking"] = dict(binding.thinking)
     return fingerprint_for_binding(
-        binding, texts,
-        extra_key=({"ctx_sources_sha256": ctx_sha} if ctx_sha else None))
+        binding, texts, extra_key=(_extra or None))
 
 
 def _archive_stale_results(output_dir: str, current_fp: str) -> None:
@@ -984,6 +992,11 @@ def run_analysis(
         "dataset": os.path.basename(dataset_path),
         "model": binding.model,
         "provider": binding.provider_name,
+        # #625: the effective thinking policy beside the model/provider —
+        # the checkpoint-decision surface (the fingerprint fold's
+        # step-report half). Present-only.
+        **({"thinking": dict(binding.thinking)}
+           if getattr(binding, "thinking", None) is not None else {}),
         "timestamp": datetime.now().isoformat(),
         "metrics": {
             "total": len(units),

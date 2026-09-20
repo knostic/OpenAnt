@@ -621,8 +621,13 @@ def analyze_reachability(
                 # the per-prompt app-context block stays excluded (the
                 # narration non-determinism trap); the SOURCES hash
                 # invalidates the stale records when the derivation changes.
-                extra_key=({"ctx_sources_sha256": _ctx_sha}
-                          if _ctx_sha else None),
+                # #625: the effective thinking policy, ONLY-when-set
+                # (None leaves the digest unchanged — zero re-pay).
+                extra_key=(
+                    {**({"ctx_sources_sha256": _ctx_sha} if _ctx_sha else {}),
+                     **({"thinking": dict(binding.thinking)}
+                        if getattr(binding, "thinking", None) is not None
+                        else {})} or None),
             )
             checkpoint.sync_identity(llr_fp)
             prior_records = checkpoint.load()

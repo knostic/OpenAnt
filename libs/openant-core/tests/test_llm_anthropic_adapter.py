@@ -231,8 +231,11 @@ class TestResponseTranslation:
 
     def test_unknown_block_kind_silently_dropped(self):
         # A future "thinking" block from Anthropic shouldn't crash
-        # the pipeline; the adapter drops unknown kinds (with no log)
-        # so phases that don't know about them keep working.
+        # the pipeline; the adapter drops unknown kinds — with a
+        # one-time stderr warning (M6) and, since #625, a PER-KIND
+        # count on the result and in the persisted step-report surface
+        # (never silent: a dropped "refusal" beside a benign
+        # stop_reason is the security-relevant case).
         def respond(**kw):
             return SimpleNamespace(
                 content=[

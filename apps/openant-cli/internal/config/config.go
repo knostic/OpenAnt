@@ -406,11 +406,32 @@ func (c *Config) WriteLLMConfig(
 		c.raw["llm_configs"] = cfgSection
 	}
 	phaseMap := map[string]any{}
+	// #625: the existing phase entries (staged locals — chained one-value
+	// type assertions on absent sections would panic).
+	existingConfig, _ := cfgSection[name].(map[string]any)
+	if existingConfig == nil {
+		existingConfig = map[string]any{}
+	}
 	for phase, ref := range phases {
-		phaseMap[phase] = map[string]any{
+		entry := map[string]any{
 			"provider": ref.Provider,
 			"model":    ref.Model,
 		}
+		// #625: preserve hand-authored sibling keys on the phase entry
+		// (e.g. a thinking policy) — the same merge discipline the
+		// provider entries above carry; a rebuild-only loop would DROP
+		// the operator's keys on every `setup llm` re-run.
+		if existingPhase, ok := existingConfig[phase].(map[string]any); ok {
+			for k, v := range existingPhase {
+				if k == "provider" || k == "model" {
+					continue
+				}
+				if _, dupe := entry[k]; !dupe {
+					entry[k] = v
+				}
+			}
+		}
+		phaseMap[phase] = entry
 	}
 	cfgSection[name] = phaseMap
 

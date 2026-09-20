@@ -208,6 +208,17 @@ class CompletionResult:
         raw: Provider-native response object, kept for adapter-side
             diagnostics. Pipeline code MUST NOT depend on this — it
             varies by provider and breaks the abstraction.
+        dropped_blocks: #625 — PER-KIND counts of response content blocks
+            the adapter could not translate (thinking; refusal; future
+            kinds), the reconciliation diagnostic for the delivered-vs-
+            billed gap (the usage rides either way). ADAPTER-COMPUTED —
+            deliberately NOT in ``usage_details`` (that field is the
+            #211 provider-verbatim bill-reconciliation channel; a
+            synthetic key would poison it). Per-KIND, never a scalar: a
+            routine kind (thinking, when enabled) must not bury the
+            security-relevant kind (a dropped refusal beside a benign
+            stop_reason). Present-only — ``None`` when nothing dropped,
+            so the default path stays byte-identical.
     """
 
     content: tuple[ContentBlock, ...]
@@ -218,6 +229,8 @@ class CompletionResult:
     # After ``raw`` so the pre-existing positional contract
     # (content, input, output, stop_reason, raw) is unchanged.
     usage_details: dict | None = field(default=None, repr=False)
+    # #625: after ``usage_details`` (the same appended-after discipline).
+    dropped_blocks: dict | None = field(default=None, repr=False)
 
     def __post_init__(self):
         # Accept list for ergonomic construction by adapters; freeze

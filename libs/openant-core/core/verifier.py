@@ -258,6 +258,13 @@ def run_verification(
             # checkpoints specifically (no scheme bump; the extra_key
             # mechanism is the pre-existing plumbing).
             "gen_params": {"max_tokens": MAX_TOKENS_PER_RESPONSE},
+            # #625: the phase's effective thinking policy, ONLY-when-set
+            # (None leaves the digest unchanged) — the same fold class
+            # as gen_params; the tool-phase gate keeps thinking OFF
+            # verify in this release, but the fold is wired for the
+            # follow-up that unlocks tool phases.
+            **({"thinking": dict(verify_binding.thinking)}
+               if getattr(verify_binding, "thinking", None) is not None else {}),
             # Union-diff checkpoint (20 submitted, 2026-08-29): #291's input
             # caps are part of the verify conversation's identity exactly
             # like the output budget — a resumed run must not adopt

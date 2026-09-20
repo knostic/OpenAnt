@@ -635,6 +635,10 @@ def scan_repository(
             "dataset_path": active_dataset_path,
             "model": llm_reach_binding.model,
             "provider": llm_reach_binding.provider_name,
+            # #625: the effective policy, present-only (the analyze twin).
+            **({"thinking": dict(llm_reach_binding.thinking)}
+               if getattr(llm_reach_binding, "thinking", None) is not None
+               else {}),
         }) as ctx:
             try:
                 dataset = read_json(active_dataset_path)
@@ -1154,6 +1158,11 @@ def scan_repository(
         "model": analyze_binding.model,
         "provider": analyze_binding.provider_name,
         "limit": limit,
+        # #625: the effective policy, present-only — the default step
+        # report stays byte-identical; the recorded value is the
+        # POST-GATE policy (what actually rides the wire).
+        **({"thinking": dict(analyze_binding.thinking)}
+           if getattr(analyze_binding, "thinking", None) is not None else {}),
     }) as ctx:
         analyze_result = run_analysis(
             dataset_path=active_dataset_path,

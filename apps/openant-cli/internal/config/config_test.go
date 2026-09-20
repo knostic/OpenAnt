@@ -508,3 +508,38 @@ func TestWriteLLMConfigOverwritesExistingProvider(t *testing.T) {
 		t.Errorf("provider key not rotated: got %q, want sk-new", got.APIKey)
 	}
 }
+
+// #625: the phase-entry merge — a hand-authored sibling key (e.g. a
+// thinking policy) must survive a same-name `setup llm` re-run (the
+// provider-merge pattern applied to phases).
+func TestWriteLLMConfigPreservesPhaseSiblingKeys(t *testing.T) {
+	c := &Config{}
+	c.WriteLLMConfig("my-cfg", map[string]LLMPhaseRef{
+		"analyze": {Provider: "p", Model: "old-model"},
+	}, map[string]ProviderEntry{
+		"p": {Type: "anthropic", APIKey: "k"},
+	}, false)
+
+	// The operator hand-authors a thinking policy on the phase entry.
+	c.raw["llm_configs"].(map[string]any)["my-cfg"].(map[string]any)["analyze"].(map[string]any)["thinking"] =
+		map[string]any{"type": "adaptive"}
+
+	// A wizard re-run with NEW provider/model values must preserve it.
+	c.WriteLLMConfig("my-cfg", map[string]LLMPhaseRef{
+		"analyze": {Provider: "p", Model: "new-model"},
+	}, map[string]ProviderEntry{
+		"p": {Type: "anthropic", APIKey: "k"},
+	}, false)
+
+	analyze := c.raw["llm_configs"].(map[string]any)["my-cfg"].(map[string]any)["analyze"].(map[string]any)
+	if analyze["model"] != "new-model" {
+		t.Fatalf("the fresh value must win, got %v", analyze["model"])
+	}
+	thinking, ok := analyze["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("the hand-authored thinking key was dropped: %v", analyze)
+	}
+	if thinking["type"] != "adaptive" {
+		t.Fatalf("the thinking value changed: %v", thinking)
+	}
+}
