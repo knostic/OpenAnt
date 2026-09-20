@@ -21,14 +21,26 @@ import json
 import sys
 from typing import List, Optional
 
+from core.verdict_taxonomy import STAGE1_PROMPT_FINDINGS
 from .llm import PhaseBinding, simple_text
 
 
-# Default (analyze/verify) schema. The corrector is also called by the enhance
-# and review phases whose output shapes have NO verdict — those callers pass
-# their own ``schema`` so the extraction prompt asks for the correct shape.
+# Default (Stage-1 vocabulary) schema — #623: the enum renders from
+# ``STAGE1_PROMPT_FINDINGS`` (core/verdict_taxonomy.py), the exact set the
+# analysis prompt offers, so a rescue REPAIRS STRUCTURE, NEVER VOCABULARY
+# (the pre-#623 literal offered VULNERABLE|SAFE|INSUFFICIENT_CONTEXT — a
+# mismatched 3-value enum that could force a protected/inconclusive reply
+# into a wrong bucket and offered a verdict the prompt never asks for).
+# Callers on this default path: the Stage-1 analyze rescue
+# (core/analysis_core.py) and the context-corrector's Stage-1 re-analysis
+# rescue (utilities/context_corrector.py) — both Stage-1-prompt vocabulary.
+# The enhance/review phases pass their own ``schema`` (no verdict); the
+# verify stage's finish shape is ``_VERIFY_SCHEMA`` below. The legacy
+# INSUFFICIENT_CONTEXT value stays ACCEPTED downstream (the finding->verdict
+# mapping below is recover-only); it is only no longer ASKED for.
 _VULN_SCHEMA = """{
-    "verdict": "VULNERABLE" | "SAFE" | "INSUFFICIENT_CONTEXT",
+    "verdict": """ + " | ".join(
+    f'"{v.upper()}"' for v in STAGE1_PROMPT_FINDINGS) + """,
     "confidence": 0.0-1.0,
     "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
     "vulnerabilities": [

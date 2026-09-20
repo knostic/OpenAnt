@@ -3,6 +3,14 @@
 
 All notable changes to OpenAnt are documented in this file.
 
+## [2026-09-19] — The rescue schema asks the calling phase's vocabulary, and the legacy INSUFFICIENT_CONTEXT value is one answer everywhere (#623)
+
+### Fixed
+
+- **The JSON rescue schema offered a verdict enum the Stage-1 prompt never does.** A malformed Stage-1 reply rescued under `VULNERABLE | SAFE | INSUFFICIENT_CONTEXT` was a forced choice from a mismatched enum — the rescue could change meaning, not merely repair JSON (a protected or inconclusive reply had no legal rescue destination, and the schema offered a verdict the pipeline's own prompt never asks for). The schema's enum now **renders from the shared `STAGE1_PROMPT_FINDINGS` constant** (core/verdict_taxonomy.py — the exact set the analysis prompt offers); the legacy `INSUFFICIENT_CONTEXT` value is no longer *asked for* but stays *accepted* downstream (every mapping is recover-only). The constant is the alignment target, never the prompt's text source — the analyze fingerprint hashes prompt texts, and the schema sits outside it.
+- **The legacy `INSUFFICIENT_CONTEXT` value hit four consumers that disagreed**: the analyzer summary counted it completed (#293), resume adopted it as a legal verdict (`STAGE1_VERDICTS`), the metrics fold counted it **errors** (#427's catch-all), and the verify recount **silently dropped** it (no bucket, no else) — the same row was three different answers in one report. The value now folds to `inconclusive`'s legacy synonym **at every counting and display sink through one function** (`fold_legacy_finding` — the metrics fold, the verify recount, the Stage-2 outcome counter's unreachable legacy arm, the CLI and HTML display reads); the row's own stored values are **never rewritten** (provenance preserved; resume adoption unchanged; the #284 partition closes for the legacy row). The recount also gained the terminal else mirroring the #427 catch-all (an unrecognized non-empty finding is an error in the metrics, never a silent drop) and the half-stamped `finding == "error"` twin `_count_verdicts` has handled since #316/#324.
+- The CSV export deliberately keeps the **stored** values verbatim (a provenance export) — the legacy spelling survives there while the HTML/CLI displays fold it, with nothing programmatic recomputing buckets from the CSV. Known residuals, scoped: rows rescued under the pre-#623 enum keep their old buckets (the schema is outside the fingerprint — only future rescues are aligned); `stage1_consistency`'s own 3-value adjudication enum (a non-rescue surface) and the rescue schema's *shape* mismatch (it asks a `verdict` key, the prompt asks `finding`) are named follow-ups.
+
 ## [2026-09-19] — The usage line says what it counts: completions and records (#624)
 
 ### Fixed
