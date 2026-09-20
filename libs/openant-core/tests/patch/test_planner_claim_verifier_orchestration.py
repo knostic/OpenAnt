@@ -191,6 +191,31 @@ class TestPolicyMatrix:
 
 
 # ---------------------------------------------------------------------------
+# Revision evidence parity
+#
+# The single bounded revision call must not be asked to resolve a
+# CONTRADICTED verdict with LESS repository evidence than the verifier that
+# raised the contradiction already had. Both the pre-Planner evidence_so_far
+# (independent grounding + vulnerability-class pattern guidance) and the
+# verified planner_evidence_ctx (the Planner-proposed candidates the verifier
+# actually reasoned over) must reach the revision -- one must never silently
+# replace the other.
+# ---------------------------------------------------------------------------
+
+class TestRevisionEvidenceParity:
+    def test_revision_receives_both_pre_planner_and_verified_planner_evidence(self):
+        revised = _plan(narrower="revised: selected the narrower mechanism", rendered="## revised plan\n")
+        _result, _spy_verify, spy_revise, _spy_evidence = _run(
+            _plan(), [_verdict("CONTRADICTED", contradiction="the guard was ignored"), _verdict("SUPPORTED")],
+            revised_plan_result=revised,
+        )
+        _revise_args, revise_kwargs = spy_revise.call_args
+        code_context = revise_kwargs.get("code_context", "")
+        assert "evidence so far" in code_context
+        assert "verified evidence" in code_context
+
+
+# ---------------------------------------------------------------------------
 # Decision-aware mode dispatch (_dispatch_narrower_mode + threading into
 # _run_planner_claim_verification's v1/v2 verifier calls)
 # ---------------------------------------------------------------------------

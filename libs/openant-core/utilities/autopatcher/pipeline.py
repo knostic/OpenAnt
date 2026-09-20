@@ -4345,9 +4345,22 @@ def _run_planner_claim_verification(
     try:
         result["revision_attempted"] = True
         _hint = _build_planner_verification_hint(verifier_v1, mode)
+        # Revision evidence parity: the one bounded revision call must not
+        # be asked to resolve a CONTRADICTED verdict with LESS repository
+        # evidence than verifier_v1 itself just used to raise it.
+        # `evidence_so_far` (pre-Planner grounding + pattern guidance) and
+        # `planner_evidence_ctx` (the verified Planner-proposed-candidate
+        # evidence verifier_v1 was actually given) are both already
+        # independently bounded by their own existing construction -- this
+        # only concatenates the two, exactly like `_evidence_so_far` itself
+        # is already built from multiple optional sections elsewhere in
+        # this module.
+        _revision_context = "\n\n".join(
+            p for p in [evidence_so_far, planner_evidence_ctx] if p and p.strip()
+        )
         try:
             revised_plan_result = generate_remediation_plan(
-                vulnerability_text, llm, code_context=evidence_so_far,
+                vulnerability_text, llm, code_context=_revision_context,
                 retry_hint=_hint, stage=_PLAN_REVISION_STAGE,
             )
         except ModelUnavailableError:
