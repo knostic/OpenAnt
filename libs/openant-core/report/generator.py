@@ -80,9 +80,16 @@ def _merge_usage(usages: list[dict]) -> dict:
     #211 pass-through: per-completion ``usage_details`` (when any completion
     captured provider detail fields) are carried VERBATIM as a list — same
     shape the agentic loops record — never summed, never in cost.
+    #624: the merged list DROPS no-detail completions (unlike the agentic
+    lists' None entries), so ``len(usage_details)`` may be less than
+    ``completions`` on this aggregate path — the ``completions`` count (the
+    tracker record's turn figure) is the authoritative one.
     """
     merged = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
     _unpriced: list[str] = []
+    # #624: the completions the merged spend covers — the report phase
+    # records ONE aggregate tracker record; this count is its turn figure.
+    merged["completions"] = len(usages)
     for u in usages:
         if u.get("cost_incomplete"):
             merged["cost_incomplete"] = True

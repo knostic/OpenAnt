@@ -524,6 +524,8 @@ class FindingVerifier:
                         pricing=lookup_pricing(self.binding),
                         usage_details=per_turn_usage_details
                         + ([None] if (exc_in or exc_out) else []),
+                        turns=len(per_turn_usage_details
+                        + ([None] if (exc_in or exc_out) else [])),
                     )
                 raise
 
@@ -562,6 +564,7 @@ class FindingVerifier:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
                 return VerificationResult(
                     agree=False,
@@ -624,6 +627,7 @@ class FindingVerifier:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
                 return VerificationResult(
                     agree=False,
@@ -642,6 +646,7 @@ class FindingVerifier:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
                 return self._parse_finish_result(
                     finish_result, finding, iterations,
@@ -665,6 +670,7 @@ class FindingVerifier:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
                 # Fail-safe (R4-7): see the :380 path above. Don't auto-agree;
                 # keep the Stage-1 verdict surfaced for human triage.
@@ -686,6 +692,7 @@ class FindingVerifier:
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
             usage_details=per_turn_usage_details,
+            turns=len(per_turn_usage_details),
         )
         # Fail-safe (R4-7): exhausting the iteration budget is not agreement.
         # Don't auto-agree; keep the Stage-1 verdict surfaced for human triage.
@@ -1623,6 +1630,12 @@ class FindingVerifier:
                         output_tokens=total_output_tokens,
                         pricing=lookup_pricing(self.binding),
                         usage_details=usage_details,
+                        # #624: the conversation's billed turns — the list
+                        # the caller accumulated (None entries here are
+                        # turns whose provider supplied no detail, not
+                        # raising turns — the raising path records at its
+                        # own site above).
+                        turns=len(usage_details) if usage_details is not None else 1,
                     )
                     return self._parse_finish_result(
                         result, original_finding, iterations,

@@ -104,6 +104,11 @@ class TokenTracker:
             self.total_input_tokens = 0
             self.total_output_tokens = 0
             self.total_cost_usd = 0.0
+            # #624: the turn total — one per-record count of the LLM
+            # completions whose usage reached the tracker (a conversation
+            # record carries its billed turns; a single completion
+            # carries 1).
+            self.total_turns = 0
             # #216: models dispatched without a pricing record (their cost
             # contributes $0 — the run's cost figure is incomplete).
             self._unpriced_models: set[str] = set()
@@ -121,6 +126,7 @@ class TokenTracker:
         *,
         pricing: dict[str, float] | None = None,
         usage_details: dict | list | None = None,
+        turns: int | None = None,
     ) -> dict:
         """
         Record a single LLM call.
@@ -146,10 +152,28 @@ class TokenTracker:
                 formula (whether a provider's ``completion_tokens``
                 already includes reasoning differs by route — summing
                 would double-count on including routes).
+            turns: #624 — the number of LLM completions this record
+                covers: 1 (the default) for a single completion
+                (``usage_details`` dict/None); REQUIRED for an agentic
+                conversation record (``usage_details`` list) — the count
+                of billed turns (the list length, including the ``None``
+                entry for a raising turn that billed — #537/#609).
+                A pure count: never in the cost formula (pricing is
+                token-only), never injected by ``add_prior_usage`` (the
+                resumed-run population matches ``total_calls``).
 
         Returns:
             Dict with call details including cost.
         """
+        # #624: the guard runs FIRST — a contract-violating call (a
+        # per-turn list without its turn declaration) must leave ZERO
+        # tracker footprint (no unpriced-marker, no warning slot consumed,
+        # no partial state).
+        if isinstance(usage_details, list) and turns is None:
+            raise ValueError(
+                "record_call: usage_details is a per-turn list but "
+                "turns was not passed — a conversation record must "
+                "declare its billed-turn count (#624)")
         if pricing is None:
             # #598: an omitted/missing ``pricing`` is UNKNOWN pricing — the
             # #216 loud path below. The legacy Anthropic-catalogue
@@ -174,11 +198,19 @@ class TokenTracker:
             output_cost = (output_tokens / 1_000_000) * pricing["output"]
             total_cost = input_cost + output_cost
 
+        # #624: the turns identity — the guard above already rejected an
+        # undeclared list; a single completion defaults to 1.
+        if isinstance(usage_details, list):
+            record_turns = turns
+        else:
+            record_turns = turns if turns is not None else 1
+
         call_record = {
             "model": model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cost_usd": round(total_cost, 6),
+            "turns": record_turns,
             # #211 pass-through capture: stored VERBATIM (absent when the
             # provider supplied none — never a fabricated empty dict; in the
             # per-turn list form, turns without details appear as None
@@ -192,6 +224,7 @@ class TokenTracker:
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
             self.total_cost_usd += total_cost
+            self.total_turns += record_turns
 
         # Accumulate to thread-local unit tracking if active
         tl = self._thread_local
@@ -262,6 +295,9 @@ class TokenTracker:
                 "total_output_tokens": self.total_output_tokens,
                 "total_tokens": self.total_input_tokens + self.total_output_tokens,
                 "total_cost_usd": round(self.total_cost_usd, 6),
+                # #624: the completion count the records cover (one per
+                # single completion, the billed turns per conversation).
+                "total_turns": self.total_turns,
                 # #216: the cost figure is INCOMPLETE when any dispatched
                 # model had no pricing (its tokens counted, its dollars $0).
                 "cost_incomplete": bool(self._unpriced_models),
@@ -283,6 +319,8 @@ class TokenTracker:
                 "total_output_tokens": self.total_output_tokens,
                 "total_tokens": self.total_input_tokens + self.total_output_tokens,
                 "total_cost_usd": round(self.total_cost_usd, 6),
+                # #624: the completion count (see get_summary).
+                "total_turns": self.total_turns,
                 "cost_incomplete": bool(self._unpriced_models),
                 "unpriced_models": sorted(self._unpriced_models),
             }

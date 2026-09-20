@@ -1265,6 +1265,9 @@ def _record_usage_in_tracker(usage: dict, binding):
                 # #211 pass-through capture: verbatim when the generator's
                 # usage dict carries it; never in the cost math.
                 usage_details=usage.get("usage_details"),
+                # #624: the aggregate record covers the report phase's
+                # completions (the merged count), never silently 1.
+                turns=usage.get("completions", 1),
             )
     except Exception as exc:
         # #605: the drop is COUNTED and NAMED, never silent — the report
@@ -1296,6 +1299,9 @@ def _usage_to_info(usage: dict):
     from core.schemas import UsageInfo
     return UsageInfo(
         total_calls=1,
+        # #624: the aggregate record's turn figure — the same completions
+        # count the tracker record carries (never 0 < calls).
+        total_turns=usage.get("completions", 1),
         total_input_tokens=usage.get("input_tokens", 0),
         total_output_tokens=usage.get("output_tokens", 0),
         total_tokens=usage.get("total_tokens", 0),

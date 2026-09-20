@@ -96,6 +96,14 @@ class ParseResult:
 class UsageInfo:
     """Token usage and cost summary."""
     total_calls: int = 0
+    # #624: the completion count the records cover (a single-completion
+    # record carries 1; a conversation record its billed turns). A STATED
+    # additive-field decision — asdict means every RESULT ENVELOPE gains
+    # the key (Go decoders ignore unknown keys; old artifacts read as 0).
+    # Step reports and scan.report.json do NOT (their token_usage blocks
+    # are field-picked from explicit key lists). Never in the cost formula
+    # (pricing is token-only).
+    total_turns: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_tokens: int = 0

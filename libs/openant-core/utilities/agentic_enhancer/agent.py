@@ -339,6 +339,8 @@ class ContextAgent:
                             pricing=lookup_pricing(self.binding),
                             usage_details=per_turn_usage_details
                             + ([None] if (exc_in or exc_out) else []),
+                            turns=len(per_turn_usage_details
+                            + ([None] if (exc_in or exc_out) else [])),
                         )
                         # the reads live INSIDE the guard's try: a double
                         # returning None from record_call must hit the
@@ -425,6 +427,7 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
                 return AgentResult(
                     include_functions=[],
@@ -501,6 +504,7 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
                 return AgentResult(
                     include_functions=[],
@@ -532,6 +536,7 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
 
                 return AgentResult(
@@ -575,6 +580,7 @@ class ContextAgent:
                     output_tokens=total_output_tokens,
                     pricing=lookup_pricing(self.binding),
                     usage_details=per_turn_usage_details,
+                    turns=len(per_turn_usage_details),
                 )
                 return AgentResult(
                     include_functions=[],
@@ -608,6 +614,7 @@ class ContextAgent:
             output_tokens=total_output_tokens,
             pricing=lookup_pricing(self.binding),
             usage_details=per_turn_usage_details,
+            turns=len(per_turn_usage_details),
         )
 
         return AgentResult(
