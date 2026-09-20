@@ -1002,11 +1002,12 @@ def _classify_challenger(challenger: dict) -> dict:
     # never inspects finding text itself, only the already-computed count.
     #
     # Deliberately reduces certainty ONLY (VERIFIED_FIXED ->
-    # INSUFFICIENT_EVIDENCE), never RESIDUAL_VULNERABILITY: an unresolved
-    # validation gap is an absence of sufficient verification, not
-    # affirmative evidence the vulnerability remains -- inferring the
-    # latter would itself communicate stronger certainty than this evidence
-    # supports, in the opposite direction.
+    # INSUFFICIENT_EVIDENCE) here -- an unresolved validation gap is an
+    # absence of sufficient verification, not affirmative evidence the
+    # vulnerability remains, so THIS branch alone never promotes it to
+    # RESIDUAL_VULNERABILITY. See the separate, symmetric reconciliation
+    # below for the mirror-image case: a self-reported RESIDUAL_VULNERABILITY
+    # verdict that is itself unsupported by any demonstrated defect.
     #
     # Deliberately excludes confirmed_defect_count/behavioral_defect_count:
     # both already have deterministic blocking behavior via the existing
@@ -1023,6 +1024,42 @@ def _classify_challenger(challenger: dict) -> dict:
     # entirely benign observations -- including it here would make
     # VERIFIED_FIXED practically unreachable, not merely more conservative.
     if result.get("verification_status") == "VERIFIED_FIXED" and result["validation_gap_count"] > 0:
+        result["verification_status"] = "INSUFFICIENT_EVIDENCE"
+        result["still_vulnerable"] = True
+
+    # Symmetric reconciliation (a second, generically-shaped regression: a
+    # raw Challenger response asserted verification_status=
+    # "RESIDUAL_VULNERABILITY" while its OWN structured findings contained
+    # zero confirmed_defect and zero behavioral_defect -- i.e. no finding
+    # the classifier recognizes as a demonstrated defect actually supports
+    # that residual claim; every finding was plausible_risk/validation_gap/
+    # generic: a hypothesis, an unverified concern, or a hardening note).
+    # RESIDUAL_VULNERABILITY is a claim that the supplied evidence
+    # affirmatively demonstrates a specific remaining bypass; an unsupported
+    # claim like that overstates the evidence in exactly the same
+    # structural way the VERIFIED_FIXED branch above already corrects for --
+    # this is that branch's mirror image, not a new policy.
+    #
+    # Gated on the ABSENCE of confirmed_defect_count AND
+    # behavioral_defect_count (never validation_gap_count/plausible_risk_count
+    # directly, and never finding text itself): a response may legitimately
+    # report a genuine, demonstrated residual defect ALONGSIDE additional
+    # validation gaps or hypotheses -- in that case RESIDUAL_VULNERABILITY
+    # must remain authoritative, so at least one demonstrated/confirmed
+    # defect of either kind always short-circuits this branch regardless of
+    # how many uncertainty-class findings coexist with it.
+    #
+    # Never promotes to VERIFIED_FIXED -- only ever settles on
+    # INSUFFICIENT_EVIDENCE, the strictly weaker of the two remaining
+    # tri-state values. still_vulnerable is reasserted True here (both
+    # RESIDUAL_VULNERABILITY and INSUFFICIENT_EVIDENCE already project it,
+    # so this is a no-op in practice) for the same explicit fail-closed
+    # clarity as the branch above.
+    if (
+        result.get("verification_status") == "RESIDUAL_VULNERABILITY"
+        and result["confirmed_defect_count"] == 0
+        and result["behavioral_defect_count"] == 0
+    ):
         result["verification_status"] = "INSUFFICIENT_EVIDENCE"
         result["still_vulnerable"] = True
 
@@ -7156,6 +7193,21 @@ def run(
     _post_patch_ctx = _s4["_post_patch_ctx"]
     _investigated_patch = _s4["_investigated_patch"]
 
+    # Post-Patch Recovery evidence parity: when a regenerated patch was
+    # accepted (_regen_ok), `_run_patch_generation_and_investigation`
+    # already built `_recovery_context` -- the enriched context (real
+    # source Recovery re-verified) actually used to produce that accepted
+    # regeneration -- and it is already present in `_s4` via that
+    # function's own `return locals()`. Neither local exists in `_s4` on
+    # any path where recovery never triggered or was not accepted, so
+    # `.get(...)` defaults both to "recovery had no effect here",
+    # preserving the exact prior `code_context`-only behavior in every
+    # other case. No new acquisition, no new budget: this only reuses a
+    # value already computed once, upstream.
+    _regen_ok = _s4.get("_regen_ok", False)
+    _recovery_context = _s4.get("_recovery_context") if _regen_ok else None
+    _challenger_base_context = _recovery_context if _recovery_context else code_context
+
     # Batch B2: finish S4's INITIAL execution -- `patch` and the full
     # investigation triple are settled at this exact point (before the
     # Challenger call below, and well before the repair loop can replace
@@ -7196,13 +7248,13 @@ def run(
                 # instead of needing to reconstruct S1-S3's context itself.
                 # Zero behavior change: purely additive artifact content.
                 "code_context": code_context,
-                "challenger_context": code_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else ""),
+                "challenger_context": _challenger_base_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else ""),
                 "vulnerability_text": vulnerability_text,
             },
             extra={"canonical_contract_scope": "full"},
         )
 
-    challenger_context = code_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else "")
+    challenger_context = _challenger_base_context + (("\n\n" + _post_patch_ctx) if _post_patch_ctx.strip() else "")
 
     # No-candidate-patch early stop: once Patch Generation has definitively
     # ended without a valid candidate, every remaining patch-dependent

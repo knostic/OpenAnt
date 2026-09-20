@@ -2143,6 +2143,111 @@ class TestSlice4PipelineIntegration:
 
 
 # ---------------------------------------------------------------------------
+# Evidence parity at the Post-Patch Recovery -> Challenger boundary.
+#
+# When a regenerated patch is accepted (_regen_ok), the enriched evidence
+# Recovery verified to produce that acceptance must reach Challenger --
+# Challenger must not fall back to the context frozen before Recovery ran.
+#
+# Self-contained (does not reuse TestSlice4PipelineIntegration._run): that
+# helper's mocked LLM answers everything up front, but proving THIS
+# invariant requires evidence that only becomes available partway through
+# the run (after Planner-Proposed Candidate Evidence has already been
+# rendered, at Planning time) -- otherwise a marker placed in a Planner-
+# named file's static content would reach Challenger via that unrelated,
+# always-present channel regardless of whether this boundary is fixed,
+# proving nothing. The marker is written to disk only when the
+# `remediation_strategy` stage fires -- strictly after Planner Evidence's
+# one-time render, strictly before Post-Patch Recovery re-reads the file
+# from disk to verify the recovered target.
+# ---------------------------------------------------------------------------
+
+class TestPostPatchRecoveryEvidenceReachesChallenger:
+    _MARKER = "RECOVERY_ONLY_MARKER_9f3c2a"
+
+    def _run(self, tmp_path):
+        (tmp_path / "mod.py").write_text("CONST_A = 1\n", encoding="utf-8")
+        (tmp_path / "other.py").write_text("X = 1\n", encoding="utf-8")
+
+        def llm_side_effect(system_prompt, user_message, stage="unknown"):
+            if stage == "remediation_planning":
+                return json.dumps({
+                    "remediation_mechanism": "fix it", "target_files": ["mod.py", "other.py"],
+                    "target_symbols": [], "security_invariant": "stub", "required_edits": [],
+                    "approaches_to_avoid": [], "explicit_unknowns": [],
+                })
+            if stage == "remediation_strategy":
+                # Final Strategy narrows to mod.py only -- other.py keeps
+                # its prior support from Target Discovery above (so
+                # Recovery's eligibility gate still passes) but is no
+                # longer a covered target, so the first patch touching it
+                # is "uncovered_target" and Recovery must trigger. The
+                # marker is written here, deliberately after Planner
+                # Evidence's one-time render.
+                (tmp_path / "other.py").write_text(f"X = 1  # {self._MARKER}\n", encoding="utf-8")
+                return json.dumps({
+                    "extended_mechanism": None, "target_files": ["mod.py"],
+                    "target_symbols": ["mod.py:CONST_A"], "required_edits": ["stub edit"],
+                    "rejected_targets": [], "security_invariant": "stub", "insufficient_evidence": [],
+                })
+            return "{}"
+
+        mock_llm = mock.MagicMock()
+        mock_llm.complete.side_effect = llm_side_effect
+
+        bad_patch = (
+            f"--- a/other.py\n+++ b/other.py\n@@ -1,1 +1,1 @@\n"
+            f"-X = 1  # {self._MARKER}\n+X = 2  # {self._MARKER}\n"
+        )
+        good_patch = (
+            f"--- a/other.py\n+++ b/other.py\n@@ -1,1 +1,1 @@\n"
+            f"-X = 1  # {self._MARKER}\n+X = 99  # {self._MARKER}\n"
+        )
+
+        def _gen_patch_raw_side_effect(vulnerability_text, llm, code_context="", retry_hint="", stage="patch_generation"):
+            return bad_patch
+
+        def _gen_patch_side_effect(vulnerability_text, llm, code_context="", retry_hint=""):
+            return good_patch
+
+        captured_challenger_contexts: list = []
+
+        def _capture_challenger(vulnerability_text, patch, llm, code_context=""):
+            captured_challenger_contexts.append(code_context)
+            return {}
+
+        with (
+            mock.patch("utilities.autopatcher.pipeline.LLMClient", return_value=mock_llm),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch_raw", side_effect=_gen_patch_raw_side_effect),
+            mock.patch("utilities.autopatcher.pipeline.generate_patch", side_effect=_gen_patch_side_effect) as mock_gen,
+            mock.patch("utilities.autopatcher.pipeline.review_patch", return_value="ok"),
+            mock.patch("utilities.autopatcher.pipeline.challenge_patch", side_effect=_capture_challenger) as mock_challenge,
+            mock.patch("utilities.autopatcher.pipeline.score_confidence", return_value="score: 7"),
+            mock.patch("utilities.autopatcher.pipeline.LightweightImpactAnalyzer"),
+            mock.patch("utilities.autopatcher.patch_hygiene.check_patch", return_value=[]),
+        ):
+            from utilities.autopatcher.pipeline import run
+            run("some vulnerability", api_key="", repo_root=str(tmp_path))
+
+        return mock_gen, mock_challenge, captured_challenger_contexts
+
+    def test_challenger_receives_recovery_verified_evidence_not_stale_context(self, tmp_path):
+        mock_gen, mock_challenge, captured_challenger_contexts = self._run(tmp_path)
+
+        # Sanity: this is genuinely the accepted-regeneration path this
+        # invariant is about, not some other skip/eligibility-failure branch.
+        assert mock_gen.call_count == 1  # Recovery's regeneration call ran exactly once.
+        assert mock_challenge.called
+        assert len(captured_challenger_contexts) == 1
+
+        assert self._MARKER in captured_challenger_contexts[0], (
+            "Challenger did not receive the recovery-verified evidence for the "
+            "accepted regenerated patch -- it fell back to the context frozen "
+            "before Post-Patch Recovery ran."
+        )
+
+
+# ---------------------------------------------------------------------------
 # build_post_patch_recovery_hint wording -- must accurately distinguish
 # WHY recovery triggered rather than sharing one "could not be verified"
 # claim across unexpected_file / uncovered_target / old_side_no_match.

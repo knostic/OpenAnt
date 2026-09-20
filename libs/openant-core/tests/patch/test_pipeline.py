@@ -2583,22 +2583,6 @@ class TestVerifiedFixedValidationGapReconciliation:
         assert result["verification_status"] == "VERIFIED_FIXED"
         assert result["still_vulnerable"] is False
 
-    def test_residual_vulnerability_with_validation_gap_is_unaffected(self):
-        """Case 4: the reconciliation only ever touches VERIFIED_FIXED --
-        RESIDUAL_VULNERABILITY must pass through unchanged regardless of
-        validation_gap_count."""
-        from utilities.autopatcher.pipeline import _classify_challenger
-
-        challenger = self._challenger(
-            "RESIDUAL_VULNERABILITY", True,
-            potential_issues=["Cannot verify whether the consuming code normalizes this value as shown"],
-        )
-        result = _classify_challenger(challenger)
-
-        assert result["validation_gap_count"] > 0
-        assert result["verification_status"] == "RESIDUAL_VULNERABILITY"
-        assert result["still_vulnerable"] is True
-
     def test_insufficient_evidence_with_validation_gap_is_unaffected(self):
         """Case 5: already INSUFFICIENT_EVIDENCE stays INSUFFICIENT_EVIDENCE
         regardless of validation_gap_count -- no double-reconciliation."""
@@ -2801,6 +2785,163 @@ class TestVerifiedFixedValidationGapReconciliation:
         assert rec["why"].startswith("adversarial review flagged high-confidence risk indicators")
         assert "insufficient" not in rec["reason"].lower()
         assert "could not be sufficiently verified" not in rec["why"]
+
+
+# ---------------------------------------------------------------------------
+# _classify_challenger: RESIDUAL_VULNERABILITY unsupported-by-any-demonstrated-
+# defect consistency reconciliation (a second, generically-shaped regression:
+# a raw Challenger response asserted verification_status=
+# "RESIDUAL_VULNERABILITY" while its OWN structured findings contained zero
+# confirmed_defect and zero behavioral_defect -- no finding the classifier
+# recognizes as a demonstrated defect actually supports that residual claim;
+# every finding was plausible_risk/validation_gap/generic). This is the
+# mirror image of TestVerifiedFixedValidationGapReconciliation above, gated
+# on the ABSENCE of any demonstrated defect rather than the PRESENCE of a
+# validation gap, so a genuine demonstrated residual defect coexisting with
+# validation gaps/hypotheses must leave RESIDUAL_VULNERABILITY untouched.
+# ---------------------------------------------------------------------------
+
+class TestResidualVulnerabilityUnsupportedDefectReconciliation:
+    @staticmethod
+    def _challenger(verification_status, still_vulnerable, edge_cases=None, potential_issues=None):
+        return {
+            "verification_status": verification_status,
+            "still_vulnerable": still_vulnerable,
+            "edge_cases": edge_cases or [],
+            "potential_issues": potential_issues or [],
+            "summary": "",
+        }
+
+    def test_residual_vulnerability_unsupported_by_any_defect_becomes_insufficient_evidence(self):
+        """Case A: RESIDUAL_VULNERABILITY with zero confirmed/behavioral
+        defects and only uncertainty-class findings (plausible_risk,
+        validation_gap) must reconcile to INSUFFICIENT_EVIDENCE --
+        still_vulnerable stays True (fail-closed; both statuses already
+        project it)."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger(
+            "RESIDUAL_VULNERABILITY", True,
+            edge_cases=["Some minor edge case that is not a defect or a verification gap"],
+            potential_issues=["Cannot verify whether the consuming code normalizes this value as shown"],
+        )
+        result = _classify_challenger(challenger)
+
+        assert result["confirmed_defect_count"] == 0
+        assert result["behavioral_defect_count"] == 0
+        assert result["validation_gap_count"] > 0
+        assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert result["still_vulnerable"] is True
+
+    def test_residual_vulnerability_with_confirmed_defect_and_validation_gap_is_unaffected(self):
+        """Case B (control): a genuine confirmed_defect finding alongside an
+        additional validation_gap finding must leave RESIDUAL_VULNERABILITY
+        authoritative -- the reconciliation must never discard an actually
+        demonstrated residual defect merely because uncertainty findings
+        also coexist with it in the same response."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger(
+            "RESIDUAL_VULNERABILITY", True,
+            potential_issues=[
+                "The patch is still vulnerable to the same attack vector",
+                "Cannot verify whether the consuming code normalizes this value as shown",
+            ],
+        )
+        result = _classify_challenger(challenger)
+
+        assert result["confirmed_defect_count"] == 1
+        assert result["validation_gap_count"] == 1
+        assert result["verification_status"] == "RESIDUAL_VULNERABILITY"
+        assert result["still_vulnerable"] is True
+
+    def test_residual_vulnerability_with_behavioral_defect_and_validation_gap_is_unaffected(self):
+        """Case B variant: a demonstrated behavioral_defect (not just
+        confirmed_defect) also counts as supporting evidence and must
+        equally block the reconciliation."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger(
+            "RESIDUAL_VULNERABILITY", True,
+            potential_issues=[
+                "The patch now rejects a previously valid input value",
+                "Cannot verify whether the consuming code normalizes this value as shown",
+            ],
+        )
+        result = _classify_challenger(challenger)
+
+        assert result["confirmed_defect_count"] == 0
+        assert result["behavioral_defect_count"] == 1
+        assert result["validation_gap_count"] == 1
+        assert result["verification_status"] == "RESIDUAL_VULNERABILITY"
+        assert result["still_vulnerable"] is True
+
+    def test_residual_vulnerability_with_no_findings_at_all_becomes_insufficient_evidence(self):
+        """Boundary: RESIDUAL_VULNERABILITY with literally no edge_cases or
+        potential_issues at all is the most extreme case of "no demonstrated
+        defect supports this claim" and must also reconcile."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger("RESIDUAL_VULNERABILITY", True)
+        result = _classify_challenger(challenger)
+
+        assert result["confirmed_defect_count"] == 0
+        assert result["behavioral_defect_count"] == 0
+        assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert result["still_vulnerable"] is True
+
+    def test_verified_fixed_reconciliation_unaffected_by_new_branch(self):
+        """Non-interference: the pre-existing VERIFIED_FIXED + validation_gap
+        reconciliation must still fire exactly as before -- this new branch
+        is additive, never a replacement."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger(
+            "VERIFIED_FIXED", False,
+            potential_issues=["Cannot verify whether the consuming code normalizes this value as shown"],
+        )
+        result = _classify_challenger(challenger)
+
+        assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert result["still_vulnerable"] is True
+
+    def test_insufficient_evidence_is_not_reclassified_by_new_branch(self):
+        """Non-interference: this new branch only ever matches a raw
+        RESIDUAL_VULNERABILITY status -- an already-INSUFFICIENT_EVIDENCE
+        response is untouched regardless of its finding counts."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger(
+            "INSUFFICIENT_EVIDENCE", True,
+            potential_issues=["Cannot verify whether the consuming code normalizes this value as shown"],
+        )
+        result = _classify_challenger(challenger)
+
+        assert result["confirmed_defect_count"] == 0
+        assert result["verification_status"] == "INSUFFICIENT_EVIDENCE"
+        assert result["still_vulnerable"] is True
+
+    def test_malformed_unknown_status_is_unaffected_by_new_branch(self):
+        """Non-interference: verification_status=None (unknown/legacy/
+        malformed) is left exactly as-is -- this branch only ever matches
+        the exact literal "RESIDUAL_VULNERABILITY"."""
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        challenger = self._challenger(None, True)
+        result = _classify_challenger(challenger)
+
+        assert result["verification_status"] is None
+        assert result["still_vulnerable"] is True
+
+    def test_no_repository_specific_strings_in_reconciliation(self):
+        """The new branch added to _classify_challenger must contain no
+        repository- or CVE-specific production logic."""
+        import inspect
+        from utilities.autopatcher.pipeline import _classify_challenger
+
+        source = inspect.getsource(_classify_challenger)
+        for needle in ("FATE", "CVE-", "weight", "split_maskdict", "sitename", "hetero", "guest"):
+            assert needle not in source
 
 
 # ---------------------------------------------------------------------------
