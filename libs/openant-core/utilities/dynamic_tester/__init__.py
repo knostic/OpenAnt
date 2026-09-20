@@ -295,6 +295,9 @@ def run_dynamic_tests(
                                                 usage_baseline["tokens"])
             usage_baseline["calls"] = _tot.get("total_calls",
                                                usage_baseline["calls"])
+            # #624: the turns refresh — same phase-scoping contract.
+            usage_baseline["turns"] = _tot.get("total_turns",
+                                               usage_baseline.get("turns", 0))
 
     def _summary_usage():
         # #608: a baseline that could not be snapshotted publishes usage=None

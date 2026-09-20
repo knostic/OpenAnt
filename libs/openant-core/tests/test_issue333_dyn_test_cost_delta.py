@@ -147,6 +147,14 @@ def test_console_phase_line_excludes_the_restored_checkpoints(tmp_path, monkeypa
     spend."""
     import core.dynamic_tester as cd
     tracker = get_global_tracker()
+    # #624: a PRIOR phase's real records (the turns dimension of the #333
+    # contract — a baseline holder missing the turns key would print the
+    # RUN-cumulative turns as this phase's delta, the #214 defect in the
+    # new field; these records are what makes that visible).
+    tracker.reset()
+    tracker.record_call("m", 100, 50, pricing={"input": 1.0, "output": 1.0})
+    tracker.record_call("m", 100, 50, pricing={"input": 1.0, "output": 1.0},
+                        usage_details=[{"a": 1}, {"a": 1}], turns=2)
 
     # 10 restored checkpoints' worth of prior spend, injected by the loop.
     pipeline = tmp_path / "pipeline_output.json"
@@ -204,3 +212,8 @@ def test_console_phase_line_excludes_the_restored_checkpoints(tmp_path, monkeypa
     # ONLY the retry's $0.03 — the restored $0.60 stays in its original
     # run's line (double-counted before: the line read $0.63).
     assert "$0.0300" in line, f"the console phase line includes restored spend: {line}"
+    # #624: the prior phase's 2 records / 3 completions are EXCLUDED —
+    # the phase delta is 0/0, never the run-cumulative turns (a dropped
+    # turns key in the holder or the rebuild would print 3 here).
+    assert "0 completions (0 records)" in line, (
+        f"the turns delta must be phase-scoped: {line}")
