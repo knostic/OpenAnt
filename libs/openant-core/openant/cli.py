@@ -459,6 +459,7 @@ def cmd_generate_context(args):
     from core.schemas import success, error
     from core.step_report import step_context
     from utilities.llm import (
+        binding_policy_summary,
         build_phase_registry,
         load_config_file,
         probe_registry_or_raise,
@@ -484,6 +485,9 @@ def cmd_generate_context(args):
                 cf, resolve_llm_config(cf, getattr(args, "llm_config", None))
             )
             probe_registry_or_raise(registry)
+            # #625: the effective policy rides the step's inputs — built
+            # here because the registry exists only inside this block.
+            ctx.inputs["llm"] = binding_policy_summary(registry, "app_context")
             app_context = generate_application_context(
                 Path(args.repo),
                 registry.get("app_context"),

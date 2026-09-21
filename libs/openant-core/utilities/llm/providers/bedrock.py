@@ -139,14 +139,15 @@ class BedrockAdapter:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_retries: int = 5,
+        thinking: Optional[dict] = None,
         _client: Optional[anthropic.AnthropicBedrock] = None,
     ):
         """Construct the adapter.
 
         Args:
             api_key: IGNORED (one-time warning when set). Bedrock has no
-                API-key auth in the pinned SDK; credentials come from
-                the standard AWS chain. Accepted so the registry can
+                API-key auth in the pinned SDK; credentials come from the
+                standard AWS chain. Accepted so the registry can
                 construct every adapter with the same two kwargs.
             base_url: Full endpoint override (VPC endpoint, gateway).
                 ``None`` means the SDK's regional default
@@ -154,9 +155,16 @@ class BedrockAdapter:
             max_retries: Forwarded to the SDK. The SDK's built-in retry
                 covers transient network blips; our rate limiter
                 handles 429-coordinated backoff on top.
+            thinking: #625 — the request-side thinking policy, passed
+                VERBATIM as the request's ``thinking`` value when set.
+                ``None`` (the default) sends NO thinking parameter — the
+                instrument stays byte-identical to the pre-#625 request.
             _client: Injected SDK instance for testing. Production
                 callers should not pass this.
         """
+        # The effective policy, readable by the checkpoint fingerprint
+        # (backend_identity) and the step-report policy summary (#625).
+        self.thinking = thinking
         if api_key is not None:
             _warn_api_key_ignored()
         if _client is not None:
@@ -206,6 +214,10 @@ class BedrockAdapter:
             request["system"] = system
         if tools:
             request["tools"] = [_tool_to_anthropic(t) for t in tools]
+        # #625: the configured thinking policy, verbatim. Absent ⇒ NO key —
+        # the default request is byte-identical to the pre-#625 shape.
+        if self.thinking is not None:
+            request["thinking"] = self.thinking
 
         # Cooperate with the cross-worker backoff before issuing the
         # call — same pattern as the other adapters (see _ratelimit.py).

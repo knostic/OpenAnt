@@ -218,6 +218,12 @@ class CompletionResult:
     # After ``raw`` so the pre-existing positional contract
     # (content, input, output, stop_reason, raw) is unchanged.
     usage_details: dict | None = field(default=None, repr=False)
+    # #625: dropped-block diagnostic — a COUNT of response content blocks
+    # the translation dropped (by kind), present-only. A count, NEVER a
+    # token split: usage cannot split thinking, so reconciliation is
+    # "delivered content vs N dropped blocks alongside the forwarded
+    # usage", not a fabricated per-kind token attribution.
+    dropped_block_kinds: dict | None = field(default=None, repr=False)
 
     def __post_init__(self):
         # Accept list for ergonomic construction by adapters; freeze
