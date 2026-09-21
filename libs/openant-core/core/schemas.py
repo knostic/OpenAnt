@@ -461,7 +461,7 @@ class VerifyResult:
         # attacker_model present-only exactly like verify_step_summary
         # (the shared construction, line 387): an omitted key drops the
         # methodology line from the standalone lane the shared lane keeps.
-        if self.attacker_model is not None:
+        if self.attacker_model:
             d["attacker_model"] = self.attacker_model
         return d
 

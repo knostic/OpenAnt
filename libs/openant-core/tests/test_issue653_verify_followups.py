@@ -64,22 +64,50 @@ class TestItem1ThirdDigestFixture:
 
 
 class TestItem2StdoutAttackerModel:
-    def test_to_dict_carries_attacker_model(self):
-        """RED at base: to_dict omits the attacker_model the step summary
-        carries — the standalone-verify stdout lane drops it."""
+    def _minimal_verify_result(self, **overrides):
+        """A minimally-constructed VerifyResult (the dataclass fields the
+        to_dict path reads; attacker_model defaults None)."""
         from core.schemas import VerifyResult
-        import dataclasses
-        fields = {f.name for f in dataclasses.fields(VerifyResult)}
-        assert "attacker_model" in fields
-        # the step summary's construction names it present-only; to_dict must too
-        import inspect
-        from core.schemas import verify_step_summary
-        src = inspect.getsource(verify_step_summary)
-        assert "attacker_model" in src
-        to_dict_src = inspect.getsource(VerifyResult.to_dict)
-        assert "attacker_model" in to_dict_src, (
-            "VerifyResult.to_dict (the standalone stdout envelope's source) "
-            "must carry attacker_model present-only, like verify_step_summary")
+        from datetime import datetime, timezone
+        defaults = dict(
+            verified_results_path="/tmp/verified.json",
+            findings_input=0,
+            findings_verified=0,
+            agreed=0,
+            disagreed=0,
+            disagreed_inconclusive=0,
+            disagreed_protected=0,
+            confirmed_vulnerabilities=0,
+            needs_review=0,
+            error_count=0,
+            units_analyzed_total=0,
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_to_dict_carries_attacker_model(self):
+        """BEHAVIORAL (the T1 round-1 fix: the source-inspection form was
+        vacuous — satisfied by the comment alone): a stamped descriptor
+        rides the standalone stdout envelope; the unstamped case omits
+        the key (present-only, matching verify_step_summary's truthiness)."""
+        stamped = self._minimal_verify_result(
+            attacker_model={"kind": "remote_only", "attacker": "..."})
+        assert stamped.to_dict()["attacker_model"] == {
+            "kind": "remote_only", "attacker": "..."}, (
+            "a stamped attacker_model must ride to_dict — the standalone "
+            "stdout envelope's methodology line")
+
+    def test_to_dict_omits_attacker_model_when_absent(self):
+        unstamped = self._minimal_verify_result()  # attacker_model=None
+        assert "attacker_model" not in unstamped.to_dict(), (
+            "present-only: the unstamped envelope carries no fabricated key")
+
+    def test_to_dict_truthiness_matches_step_summary(self):
+        """F3: to_dict's presence check uses the same truthiness as
+        verify_step_summary ({} → omitted, not carried as a fabricated
+        empty dict)."""
+        empty_stamped = self._minimal_verify_result(attacker_model={})
+        assert "attacker_model" not in empty_stamped.to_dict()
 
 
 class TestItem3DegenerateWebAppDescriptor:

@@ -255,7 +255,16 @@ def get_verification_system_prompt(app_context: "ApplicationContext" = None) -> 
     if app_context and app_context.has_threat_model():
         base_prompt += SYSTEM_ARM_THREAT_MODEL
     elif app_context and app_context.suppress_local_only():
-        base_prompt += SYSTEM_ARM_REMOTE_ONLY
+        if str(getattr(app_context, "application_type", "")) == "web_app":
+            # #653: the web_app arm — the capabilities are the same
+            # (remote, browser, no local CLI); the framing is the browser.
+            base_prompt += """
+
+IMPORTANT: This is a web application. Its remote surface is the browser.
+You must exploit this as a REMOTE attacker. If the only way to trigger the vulnerability requires
+operator-local access a browser user cannot reach, it is NOT exploitable in this class."""
+        else:
+            base_prompt += SYSTEM_ARM_REMOTE_ONLY
     elif _is_untrusted_input_context(app_context):
         # #621: the system prompt mirrors the user prompt's persona lattice
         # (a supply-persona user prompt under a generic-attacker system
@@ -320,9 +329,19 @@ def _format_builtin_app_context_for_verification(app_context: "ApplicationContex
         lines.append("")
 
     if app_context.suppress_local_only():
-        lines.append("**CRITICAL:** This is a CLI tool/library. Users have local filesystem access.")
-        lines.append("A vulnerability requires a REMOTE attacker to exploit it.")
-        lines.append("If the 'attack' requires running CLI commands locally, it's NOT a vulnerability.")
+        # #653: the degenerate web_app (all-trusted boundaries, no remote
+        # trigger) reaches this suppress branch too — but its framing is
+        # the browser, not the operator's local filesystem. The digest
+        # moves in the same PR (the third fixture), so the #621
+        # keep-the-text-stable rationale does not hold it here.
+        if str(getattr(app_context, "application_type", "")) == "web_app":
+            lines.append("**CRITICAL:** This is a web application. Its remote surface is the browser.")
+            lines.append("A vulnerability requires a REMOTE attacker to exploit it.")
+            lines.append("If the 'attack' requires operator-local access that a browser user cannot reach, it is out of scope.")
+        else:
+            lines.append("**CRITICAL:** This is a CLI tool/library. Users have local filesystem access.")
+            lines.append("A vulnerability requires a REMOTE attacker to exploit it.")
+            lines.append("If the 'attack' requires running CLI commands locally, it's NOT a vulnerability.")
         lines.append("")
 
     return "\n".join(lines)
@@ -436,10 +455,15 @@ Context:
     local_access_rule = (
         ""
         if (app_context is not None and app_context.has_threat_model())
-        else ("\n- If this is a CLI tool/library and the attack requires "
-              "local access, it is NOT a vulnerability."
-              if (app_context is None or app_context.suppress_local_only())
-              else "")
+        else ("\n- If this is a web application and the attack requires "
+              "operator-local access a browser user cannot reach, it is NOT a vulnerability."
+              if (app_context is not None
+                  and app_context.suppress_local_only()
+                  and str(getattr(app_context, "application_type", "")) == "web_app")
+              else ("\n- If this is a CLI tool/library and the attack requires "
+                    "local access, it is NOT a vulnerability."
+                    if (app_context is None or app_context.suppress_local_only())
+                    else ""))
     )
 
     # `reasoning` is Stage-1 LLM output (untrusted). It was interpolated raw
