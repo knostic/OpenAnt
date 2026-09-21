@@ -75,7 +75,12 @@ def test_bedrock_records_agree_with_direct_records():
     bedrock = pricing_map("bedrock")
     direct = pricing_map("anthropic")
     for bedrock_id, direct_id, _dotted in _BEDROCK_CURRENT:
-        assert bedrock[bedrock_id] == direct[direct_id], (
+        # pair-compare (the #626 cross-PR composition): direct-anthropic
+        # entries may carry additive cache multipliers the bedrock records
+        # lack — the pinned value is the RATE pair, not the whole dict.
+        assert (bedrock[bedrock_id]["input"],
+                bedrock[bedrock_id]["output"]) == (
+            direct[direct_id]["input"], direct[direct_id]["output"]), (
             f"{bedrock_id} must resolve under provider bedrock at the "
             f"direct rate (agrees with the {direct_id} record)")
 
