@@ -33,6 +33,8 @@ unchanged — no thinking key in the request unless configured):
 from __future__ import annotations
 
 import sys
+
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -43,6 +45,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import anthropic  # noqa: E402
 
+from utilities.llm import LLMResponseError, ToolDef  # noqa: E402
 from utilities.llm.config import parse_config, ProviderConfig  # noqa: E402
 from utilities.llm.providers.anthropic import (  # noqa: E402
     AnthropicAdapter,
@@ -228,3 +231,34 @@ def test_binding_policy_summary_exposes_effective_policy():
     summary = binding_policy_summary(registry, "enhance")
     assert summary == {"provider": "ant", "model": "claude-test",
                        "thinking": _THINKING}
+
+
+# ---------------------------------------------------------------------------
+# T1 retro guard (2026-09-21): thinking + tools must fail loudly at build
+# time — the loop echo filters thinking blocks from the echoed assistant
+# turn, so a paid iteration-1 would be followed by an iteration-2 400.
+# ---------------------------------------------------------------------------
+
+
+def test_thinking_with_tools_refuses_loudly_before_the_paid_call():
+    adapter, client = _stub_anthropic(thinking=_THINKING)
+    with pytest.raises(LLMResponseError, match="thinking\\+tools"):
+        adapter.complete(model="claude-test", system=None, messages=[],
+                         max_tokens=10, tools=[ToolDef(
+                             name="t", description="d", input_schema={})])
+    client.messages.create.assert_not_called()
+
+
+def test_disabled_thinking_with_tools_is_allowed():
+    adapter, client = _stub_anthropic(thinking={"type": "disabled"})
+    adapter.complete(model="claude-test", system=None, messages=[],
+                     max_tokens=10, tools=[ToolDef(
+                         name="t", description="d", input_schema={})])
+    assert "thinking" in client.messages.create.call_args.kwargs
+
+
+def test_thinking_without_tools_is_allowed():
+    adapter, client = _stub_anthropic(thinking=_THINKING)
+    adapter.complete(model="claude-test", system=None, messages=[],
+                     max_tokens=10)
+    assert client.messages.create.call_args.kwargs["thinking"] == _THINKING

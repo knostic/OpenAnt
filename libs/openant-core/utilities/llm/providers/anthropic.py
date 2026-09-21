@@ -203,6 +203,23 @@ class AnthropicAdapter:
         if self.thinking is not None:
             request["thinking"] = self.thinking
 
+        # #625 T1 guard (2026-09-21, the retro bug-hunt finding): a
+        # thinking-enabled request WITH tools requires the thinking blocks
+        # preserved on the echoed assistant turn (Anthropic's documented
+        # contract) — this adapter's loop echo filters to text/tool-use, so
+        # iteration 2 would 400 AFTER paying for iteration 1. Refuse the
+        # combination loudly at build time instead of paying for the
+        # failure; the full preserved-blocks handling is a separate change.
+        if (tools and self.thinking is not None
+                and self.thinking.get("type") not in (None, "disabled")):
+            raise LLMResponseError(
+                f"AnthropicAdapter refuses thinking+tools: thinking blocks must be "
+                "preserved on the echoed assistant turn for multi-turn tool "
+                "loops, and this adapter's loop echo does not carry them "
+                "(iteration 2 would fail after iteration 1 is billed). "
+                "Remove `thinking` from the provider entry for tool-using "
+                "phases, or set it to {\"type\": \"disabled\"}.")
+
         # Cooperate with the cross-worker backoff before issuing the
         # call — same pattern the legacy AnthropicClient used, now
         # shared with the OpenAI and Google adapters (see _ratelimit.py).
