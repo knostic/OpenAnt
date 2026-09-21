@@ -436,7 +436,7 @@ class VerifyResult:
         return verify_step_summary(self)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "verified_results_path": self.verified_results_path,
             "findings_input": self.findings_input,
             "findings_verified": self.findings_verified,
@@ -457,6 +457,13 @@ class VerifyResult:
             "upgraded": self.upgraded,
             "usage": self.usage.to_dict(),
         }
+        # #653: the standalone-verify stdout envelope's source — carry the
+        # attacker_model present-only exactly like verify_step_summary
+        # (the shared construction, line 387): an omitted key drops the
+        # methodology line from the standalone lane the shared lane keeps.
+        if self.attacker_model is not None:
+            d["attacker_model"] = self.attacker_model
+        return d
 
 
 # ---------------------------------------------------------------------------

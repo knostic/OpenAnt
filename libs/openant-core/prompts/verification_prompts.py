@@ -111,9 +111,22 @@ def _builtin_context_digest_renders() -> list[str]:
         trust_boundaries={"digest_source": "untrusted"},
         requires_remote_trigger=True,
     )
+    # #653: the third routing class — a degenerate web_app (all-trusted
+    # boundaries, no remote trigger): _is_untrusted_input_context is False
+    # (the web_app exclusion) and suppress_local_only is True, but the
+    # descriptor must NOT call it a CLI tool/library. Without this fixture,
+    # a routing change re-routing a web_app is invisible to the checkpoint
+    # fold (the exact #621 failure mode, one class wider).
+    web_app_fixture = ApplicationContext(
+        application_type="web_app",
+        purpose="digest fixture",
+        trust_boundaries={"http_body": "trusted", "http_headers": "trusted"},
+        requires_remote_trigger=False,
+    )
     return [
         _format_builtin_app_context_for_verification(suppress_fixture),
         _format_builtin_app_context_for_verification(untrusted_fixture),
+        _format_builtin_app_context_for_verification(web_app_fixture),
     ]
 
 
@@ -137,6 +150,15 @@ def _builtin_persona_digest_renders() -> list[str]:
         trust_boundaries={"digest_source": "untrusted"},
         requires_remote_trigger=True,
     )
+    # #653: the web_app fixture joins the persona renders (three routing
+    # classes, not two) — the routing-coverage half of the digest fold.
+    from context.application_context import ApplicationContext
+    web_app_fixture = ApplicationContext(
+        application_type="web_app",
+        purpose="digest fixture",
+        trust_boundaries={"http_body": "trusted", "http_headers": "trusted"},
+        requires_remote_trigger=False,
+    )
     return [
         get_verification_prompt(
             code="", finding="", attack_vector="", reasoning="",
@@ -144,6 +166,9 @@ def _builtin_persona_digest_renders() -> list[str]:
         get_verification_prompt(
             code="", finding="", attack_vector="", reasoning="",
             app_context=untrusted_fixture),
+        get_verification_prompt(
+            code="", finding="", attack_vector="", reasoning="",
+            app_context=web_app_fixture),
     ]
 
 
@@ -184,12 +209,23 @@ def attacker_model_descriptor(app_context: "ApplicationContext") -> dict:
                 "admin credentials, no CLI access."),
         }
     if app_context is not None and app_context.suppress_local_only():
+        # #653: the "local access is the operator's own" framing is right
+        # for a CLI tool/library whose inputs are operator-controlled — a
+        # web_app reaching this branch (all-trusted boundaries, no remote
+        # trigger) is DEGENERATE: its remote surface is the browser, not
+        # an operator's local access, and calling it a CLI tool mis-states
+        # the methodology on every degenerate web_app scan.
+        is_web = str(getattr(app_context, "application_type", "")) == "web_app"
         return {
             "kind": "remote_only",
             "attacker": (
                 "Remote attacker with browser access, no server-side "
-                "access, no admin credentials; this CLI tool/library's "
-                "local access is the operator's own."),
+                "access, no admin credentials"
+                + (" — this web application's remote surface is the "
+                   "browser; no operator-local access applies."
+                   if is_web else
+                   "; this CLI tool/library's local access is the "
+                   "operator's own.")),
         }
     return {
         "kind": "browser_only",
