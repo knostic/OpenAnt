@@ -240,8 +240,12 @@ def test_binding_policy_summary_exposes_effective_policy():
 # ---------------------------------------------------------------------------
 
 
-def test_thinking_with_tools_refuses_loudly_before_the_paid_call():
-    adapter, client = _stub_anthropic(thinking=_THINKING)
+_GUARD_ADAPTERS = [_stub_anthropic, _stub_bedrock]
+
+
+@pytest.mark.parametrize("_stub", _GUARD_ADAPTERS, ids=["anthropic", "bedrock"])
+def test_thinking_with_tools_refuses_loudly_before_the_paid_call(_stub):
+    adapter, client = _stub(thinking=_THINKING)
     with pytest.raises(LLMResponseError, match="thinking\\+tools"):
         adapter.complete(model="claude-test", system=None, messages=[],
                          max_tokens=10, tools=[ToolDef(
@@ -249,16 +253,18 @@ def test_thinking_with_tools_refuses_loudly_before_the_paid_call():
     client.messages.create.assert_not_called()
 
 
-def test_disabled_thinking_with_tools_is_allowed():
-    adapter, client = _stub_anthropic(thinking={"type": "disabled"})
+@pytest.mark.parametrize("_stub", _GUARD_ADAPTERS, ids=["anthropic", "bedrock"])
+def test_disabled_thinking_with_tools_is_allowed(_stub):
+    adapter, client = _stub(thinking={"type": "disabled"})
     adapter.complete(model="claude-test", system=None, messages=[],
                      max_tokens=10, tools=[ToolDef(
                          name="t", description="d", input_schema={})])
     assert "thinking" in client.messages.create.call_args.kwargs
 
 
-def test_thinking_without_tools_is_allowed():
-    adapter, client = _stub_anthropic(thinking=_THINKING)
+@pytest.mark.parametrize("_stub", _GUARD_ADAPTERS, ids=["anthropic", "bedrock"])
+def test_thinking_without_tools_is_allowed(_stub):
+    adapter, client = _stub(thinking=_THINKING)
     adapter.complete(model="claude-test", system=None, messages=[],
                      max_tokens=10)
     assert client.messages.create.call_args.kwargs["thinking"] == _THINKING
