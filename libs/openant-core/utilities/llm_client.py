@@ -90,7 +90,25 @@ def _warn_unknown_pricing(model: str) -> None:
 class TokenTracker:
     """
     Tracks token usage and costs across LLM calls.
+
+    #626 cache accounting: the provider-supplied cache usage fields
+    (captured verbatim per #211) feed the cost formula AT THEIR OWN RATES
+    when the model's pricing record carries cache multipliers
+    (``cache_read`` / ``cache_write``, multipliers of the base input rate);
+    they stay OUT of ``total_input_tokens`` (cached and uncached input are
+    separate line items — the billing-reconciliation shape). Cache usage on
+    a record WITHOUT multipliers marks the run ``cost_incomplete`` and
+    names the model in ``unpriced_cache_models`` — a cached run must never
+    read as a silently-cheap complete one.
     """
+
+    # The cross-provider field shapes, normalized: every provider's
+    # "tokens served from cache" and "tokens written to cache" spelling.
+    _CACHE_READ_FIELDS = ("cache_read_input_tokens",     # anthropic / bedrock
+                          "cached_tokens",               # openai / openrouter
+                          "cached_content_token_count")  # google
+    _CACHE_WRITE_FIELDS = ("cache_creation_input_tokens",  # anthropic / bedrock
+                            "cache_write_tokens")          # openai chat
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -112,6 +130,14 @@ class TokenTracker:
             # #216: models dispatched without a pricing record (their cost
             # contributes $0 — the run's cost figure is incomplete).
             self._unpriced_models: set[str] = set()
+            # #626: models whose cache usage appeared but whose pricing
+            # record carries no cache multipliers (the cache portion is
+            # unpriceable — incomplete, never $0-silent).
+            self._unpriced_cache_models: set[str] = set()
+            # #626: the cache line items (separate from input/output —
+            # the billing-reconciliation totals).
+            self.total_cache_read_tokens = 0
+            self.total_cache_write_tokens = 0
 
     @property
     def total_tokens(self) -> int:
@@ -174,6 +200,24 @@ class TokenTracker:
                 "record_call: usage_details is a per-turn list but "
                 "turns was not passed — a conversation record must "
                 "declare its billed-turn count (#624)")
+        # #626: normalize the cache usage out of usage_details (dict or
+        # per-turn list; None entries are absent turns by the #211 contract).
+        cache_read = 0
+        cache_write = 0
+        _detail_rows = (usage_details if isinstance(usage_details, list)
+                        else [usage_details])
+        for _row in _detail_rows:
+            if not isinstance(_row, dict):
+                continue
+            for _f in self._CACHE_READ_FIELDS:
+                _v = _row.get(_f)
+                if isinstance(_v, int) and _v > 0:
+                    cache_read += _v
+            for _f in self._CACHE_WRITE_FIELDS:
+                _v = _row.get(_f)
+                if isinstance(_v, int) and _v > 0:
+                    cache_write += _v
+        has_cache_usage = cache_read > 0 or cache_write > 0
         if pricing is None:
             # #598: an omitted/missing ``pricing`` is UNKNOWN pricing — the
             # #216 loud path below. The legacy Anthropic-catalogue
@@ -197,6 +241,26 @@ class TokenTracker:
             input_cost = (input_tokens / 1_000_000) * pricing["input"]
             output_cost = (output_tokens / 1_000_000) * pricing["output"]
             total_cost = input_cost + output_cost
+            # #626: the cache portion, priced at its own multipliers of the
+            # base input rate. Present cache usage WITHOUT multipliers
+            # (below) keeps the tokens counted, the cache cost $0, and the
+            # run marked incomplete — never a silent $0-complete read.
+            if has_cache_usage:
+                if "cache_read" in pricing or "cache_write" in pricing:
+                    cache_cost = 0.0
+                    if cache_read:
+                        cache_cost += (cache_read / 1_000_000) * pricing[
+                            "input"] * pricing.get("cache_read", 0.0)
+                    if cache_write:
+                        cache_cost += (cache_write / 1_000_000) * pricing[
+                            "input"] * pricing.get("cache_write", 0.0)
+                    total_cost += cache_cost
+                else:
+                    with self._lock:
+                        self._unpriced_cache_models.add(model)
+                    tl = self._thread_local
+                    if hasattr(tl, "unit_unpriced"):
+                        tl.unit_unpriced.add(model)
 
         # #624: the turns identity — the guard above already rejected an
         # undeclared list; a single completion defaults to 1.
@@ -211,6 +275,10 @@ class TokenTracker:
             "output_tokens": output_tokens,
             "cost_usd": round(total_cost, 6),
             "turns": record_turns,
+            # #626: the cache line items (present-only — a call with no
+            # cache usage is byte-identical to the pre-#626 record shape).
+            **({"cache_read_tokens": cache_read} if cache_read else {}),
+            **({"cache_write_tokens": cache_write} if cache_write else {}),
             # #211 pass-through capture: stored VERBATIM (absent when the
             # provider supplied none — never a fabricated empty dict; in the
             # per-turn list form, turns without details appear as None
@@ -225,6 +293,13 @@ class TokenTracker:
             self.total_output_tokens += output_tokens
             self.total_cost_usd += total_cost
             self.total_turns += record_turns
+            # #626: cached input is a SEPARATE line item — never folded
+            # into total_input_tokens (the uncached/cached split is the
+            # billing-reconciliation shape).
+            if cache_read:
+                self.total_cache_read_tokens += cache_read
+            if cache_write:
+                self.total_cache_write_tokens += cache_write
 
         # Accumulate to thread-local unit tracking if active
         tl = self._thread_local
@@ -299,8 +374,10 @@ class TokenTracker:
                 # single completion, the billed turns per conversation).
                 "total_turns": self.total_turns,
                 # #216: the cost figure is INCOMPLETE when any dispatched
-                # model had no pricing (its tokens counted, its dollars $0).
-                "cost_incomplete": bool(self._unpriced_models),
+                # model had no pricing (its tokens counted, its dollars $0)
+                # — #626: or cached usage the record could not price.
+                "cost_incomplete": bool(self._unpriced_models
+                                        or self._unpriced_cache_models),
                 "unpriced_models": sorted(self._unpriced_models),
                 "calls": list(self.calls),
             }
@@ -321,9 +398,18 @@ class TokenTracker:
                 "total_cost_usd": round(self.total_cost_usd, 6),
                 # #624: the completion count (see get_summary).
                 "total_turns": self.total_turns,
-                "cost_incomplete": bool(self._unpriced_models),
+                "cost_incomplete": bool(self._unpriced_models
+                                        or self._unpriced_cache_models),
                 "unpriced_models": sorted(self._unpriced_models),
             }
+            # #626: present-only — a run with no cache usage serializes
+            # byte-identical to the pre-#626 totals.
+            if self.total_cache_read_tokens:
+                out["total_cache_read_tokens"] = self.total_cache_read_tokens
+            if self.total_cache_write_tokens:
+                out["total_cache_write_tokens"] = self.total_cache_write_tokens
+            if self._unpriced_cache_models:
+                out["unpriced_cache_models"] = sorted(self._unpriced_cache_models)
             # #605: present-only — a healthy run's totals serialize
             # byte-identical to pre-#605.
             _errs = _accounting_error_count()

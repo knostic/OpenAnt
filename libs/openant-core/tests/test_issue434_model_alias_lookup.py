@@ -39,9 +39,9 @@ def test_pricing_map_resolves_the_live_failure_spellings():
     the OpenRouter spelling.)"""
     or_map = pricing_map("openrouter")
     # haiku: registered as anthropic/claude-haiku-4.5, spelled bare-dashed live
-    assert or_map.get("claude-haiku-4-5") == {"input": 1.0, "output": 5.0}
+    assert ((or_map).get("claude-haiku-4-5") or {}).get("input") == 1.0 and ((or_map).get("claude-haiku-4-5") or {}).get("output") == 5.0  # 626: pair-compare (cache keys are additive)
     an_map = pricing_map("anthropic")
-    assert an_map.get("claude-haiku-4-5-20251001") == {"input": 1.0, "output": 5.0}
+    assert ((an_map).get("claude-haiku-4-5-20251001") or {}).get("input") == 1.0 and ((an_map).get("claude-haiku-4-5-20251001") or {}).get("output") == 5.0  # 626: pair-compare (cache keys are additive)
     # opus-5 / sonnet-5: registered slashed, spelled bare live
     assert or_map.get("claude-opus-5") is not None
     assert or_map.get("claude-sonnet-5") is not None
@@ -51,12 +51,12 @@ def test_pricing_map_resolves_dotted_and_dashed_both_ways():
     """The version may be dotted (OpenRouter convention) or dashed (the
     registry's own convention) — both resolve."""
     or_map = pricing_map("openrouter")
-    assert or_map.get("anthropic/claude-haiku-4.5") == {"input": 1.0, "output": 5.0}
-    assert or_map.get("anthropic/claude-haiku-4-5") == {"input": 1.0, "output": 5.0}
+    assert ((or_map).get("anthropic/claude-haiku-4.5") or {}).get("input") == 1.0 and ((or_map).get("anthropic/claude-haiku-4.5") or {}).get("output") == 5.0  # 626: pair-compare (cache keys are additive)
+    assert ((or_map).get("anthropic/claude-haiku-4-5") or {}).get("input") == 1.0 and ((or_map).get("anthropic/claude-haiku-4-5") or {}).get("output") == 5.0  # 626: pair-compare (cache keys are additive)
     an_map = pricing_map("anthropic")
     # the dated record answers its date-stripped and dotted spellings
-    assert an_map.get("claude-haiku-4-5") == {"input": 1.0, "output": 5.0}
-    assert an_map.get("claude-haiku-4.5") == {"input": 1.0, "output": 5.0}
+    assert ((an_map).get("claude-haiku-4-5") or {}).get("input") == 1.0 and ((an_map).get("claude-haiku-4-5") or {}).get("output") == 5.0  # 626: pair-compare (cache keys are additive)
+    assert ((an_map).get("claude-haiku-4.5") or {}).get("input") == 1.0 and ((an_map).get("claude-haiku-4.5") or {}).get("output") == 5.0  # 626: pair-compare (cache keys are additive)
 
 
 def test_gemini_37_family_is_priced():
@@ -66,7 +66,7 @@ def test_gemini_37_family_is_priced():
     for provider in ("google", "openrouter"):
         m = pricing_map(provider)
         key = "gemini-3.7-flash" if provider == "google" else "google/gemini-3.7-flash"
-        assert m.get(key) == {"input": 0.75, "output": 3.75}, (provider, key)
+        assert m.get(key, {}).get("input") == 0.75 and m.get(key, {}).get("output") == 3.75, (provider, key)  # 626: pair-compare
     rec = find_model("google/gemini-3.7-flash")
     assert rec is not None and rec["price"] == {"input": 0.75, "output": 3.75}
 

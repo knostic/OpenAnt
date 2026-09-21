@@ -163,7 +163,17 @@ def pricing_map(provider: str) -> dict[str, dict[str, float]]:
     out: dict[str, dict[str, float]] = {}
     for rec in recs:  # pass 1: exact keys win
         price = rec["price"]
-        out[rec["id"]] = {"input": float(price["input"]), "output": float(price["output"])}
+        entry = {"input": float(price["input"]), "output": float(price["output"])}
+        # #626: cache multipliers (read / write, as multipliers of the base
+        # input rate) ride the entry when the record carries them; a record
+        # without them prices cached usage as INCOMPLETE (the tracker's
+        # unpriced-cache path), never $0.
+        cache = rec.get("cache")
+        if isinstance(cache, dict) and cache.get("read") is not None:
+            entry["cache_read"] = float(cache["read"])
+            if cache.get("write") is not None:
+                entry["cache_write"] = float(cache["write"])
+        out[rec["id"]] = entry
     for rec in recs:  # pass 2: aliases fill absent keys only
         entry = out[rec["id"]]
         for alias in _alias_spellings(rec["id"]):
