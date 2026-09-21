@@ -424,7 +424,7 @@ def test_verify_template_digest_includes_persona_constants():
     from prompts.verification_prompts import (  # noqa: PLC0415
         _builtin_context_digest_renders, _builtin_persona_digest_renders)
     assert len(_builtin_context_digest_renders()) == 3  # #653: web_app routing class joins the fold
-    assert len(_builtin_persona_digest_renders()) == 3
+    assert len(_builtin_persona_digest_renders()) == 4  # #653: + the web_app system arm
 
     original_renders = vp._builtin_context_digest_renders
     try:

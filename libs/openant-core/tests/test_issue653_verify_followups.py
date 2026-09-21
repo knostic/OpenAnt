@@ -124,4 +124,78 @@ def test_three_digest_fixtures_not_two():
     """The digest helpers carry THREE routing classes after the fix
     (was: two)."""
     assert len(_builtin_context_digest_renders()) == 3
-    assert len(_builtin_persona_digest_renders()) == 3
+    assert len(_builtin_persona_digest_renders()) == 4  # 3 user prompts + the web_app system arm
+
+
+class TestPromptTextsBehavioral:
+    """T1 round-2 N2: the three web_app prompt-text branches are PINNED
+    behaviorally (the round-1 disease one level up — presence-only tests
+    passed with the branches deleted)."""
+
+    def _web(self):
+        return ApplicationContext(
+            application_type="web_app", purpose="digest fixture",
+            trust_boundaries={"http_body": "trusted"},
+            requires_remote_trigger=False)
+
+    def _cli(self):
+        return ApplicationContext(
+            application_type="cli_tool", purpose="digest fixture",
+            trust_boundaries={"x": "trusted"},
+            requires_remote_trigger=False)
+
+    def test_web_app_user_prompt_says_web_app(self):
+        from prompts.verification_prompts import get_verification_prompt
+        r = get_verification_prompt(
+            code="", finding="", attack_vector="", reasoning="",
+            app_context=self._web())
+        assert "web application" in r.lower(), "the CRITICAL block must say web application"
+        assert "CLI tool" not in r, "the web_app render must not carry the CLI-tool framing"
+
+    def test_web_app_system_prompt_says_web_app(self):
+        from prompts.verification_prompts import (
+            get_verification_system_prompt, SYSTEM_ARM_REMOTE_ONLY_WEB)
+        s = get_verification_system_prompt(self._web())
+        assert "web application" in s.lower(), "the system arm must say web application"
+        assert "CLI tool" not in s, "the web_app system arm must not carry the CLI framing"
+        assert SYSTEM_ARM_REMOTE_ONLY_WEB in s, "the hoisted constant is the arm actually served"
+
+    def test_web_app_persona_is_web(self):
+        from prompts.verification_prompts import PERSONA_REMOTE_ONLY_WEB, get_verification_prompt
+        r = get_verification_prompt(
+            code="", finding="", attack_vector="", reasoning="",
+            app_context=self._web())
+        assert PERSONA_REMOTE_ONLY_WEB in r, "the web_app persona must be the web constant"
+        assert "being the user who runs the application" not in r.lower(), (
+            "the CLI persona's 'user who runs the application' rationale is "
+            "false for a web app")
+
+    def test_cli_tool_renders_unchanged(self):
+        from prompts.verification_prompts import (
+            get_verification_prompt, get_verification_system_prompt,
+            PERSONA_REMOTE_ONLY, SYSTEM_ARM_REMOTE_ONLY)
+        user = get_verification_prompt(
+            code="", finding="", attack_vector="", reasoning="",
+            app_context=self._cli())
+        system = get_verification_system_prompt(self._cli())
+        assert "CLI tool" in user, "the cli_tool render keeps the CLI framing"
+        assert SYSTEM_ARM_REMOTE_ONLY in system, "the cli_tool system arm keeps the CLI constant"
+        assert PERSONA_REMOTE_ONLY in user, "the cli_tool persona keeps the CLI constant"
+        assert "web application" not in user.lower(), "the cli_tool render gains no web framing"
+
+    def test_web_app_system_arm_in_fold(self):
+        """N1's pin: mutating the web_app arm's constant MOVES templates_sha."""
+        from core.verifier import _verify_template_texts
+        texts = [r() for r in _verify_template_texts()]
+        assert any("web application" in r.lower() for r in texts), (
+            "the fold carries the web_app system arm")
+        # the web_app system-prompt render is in the fold: the digest
+        # moved from the 2-fixture era (the third fixture + the arm join
+        # in the same fold — the #621 contract extended)
+        from prompts.verification_prompts import _builtin_persona_digest_renders
+        renders = _builtin_persona_digest_renders()
+        assert len(renders) == 4, (
+            "the persona renders: 3 user prompts + the web_app system prompt "
+            "(the fold-visible arm)")
+        system_in_renders = any("web application" in r.lower() for r in renders)
+        assert system_in_renders, "the web_app system arm is fold-visible"

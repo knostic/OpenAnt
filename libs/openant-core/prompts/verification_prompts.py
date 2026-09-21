@@ -36,6 +36,14 @@ You must find a way to trigger this vulnerability REMOTELY. If the only attack p
 - Being the user who runs the application
 
 Then the vulnerability is NOT EXPLOITABLE by you, because local users can already do anything on their own machine."""
+PERSONA_REMOTE_ONLY_WEB = """You are an attacker on the internet. You have a browser and nothing else.
+No server access, no admin credentials, no ability to modify files on the server, and NO ABILITY TO RUN CLI COMMANDS.
+
+You must find a way to trigger this vulnerability REMOTELY, through the web. If the only attack path requires:
+- Operator-local access a browser user cannot reach
+- Shell access to the server
+
+Then the vulnerability is NOT EXPLOITABLE by you."""
 
 PERSONA_UNTRUSTED_INPUT = """You are an attacker who supplies the untrusted input this application processes.
 You can deliver crafted input through: {supply_list}.
@@ -57,6 +65,11 @@ SYSTEM_ARM_REMOTE_ONLY = """
 IMPORTANT: This is a CLI tool or library. The user running this code has local filesystem access.
 You must exploit this as a REMOTE attacker. If the only way to trigger the vulnerability is by
 running CLI commands locally, it is NOT exploitable - the user can already access the filesystem."""
+SYSTEM_ARM_REMOTE_ONLY_WEB = """
+
+IMPORTANT: This is a web application. Its remote surface is the browser.
+You must exploit this as a REMOTE attacker. If the only way to trigger the vulnerability is by
+reaching operator-local access a browser user cannot reach, it is NOT exploitable in this class."""
 
 SYSTEM_ARM_UNTRUSTED_INPUT = """
 
@@ -152,6 +165,9 @@ def _builtin_persona_digest_renders() -> list[str]:
     )
     # #653: the web_app fixture joins the persona renders (three routing
     # classes, not two) — the routing-coverage half of the digest fold.
+    # The web_app SYSTEM ARM + PERSONA render in the same fold: an inline
+    # literal at the system-prompt site was invisible to templates_sha
+    # (the T1 round-2 mutation finding — the exact #621 failure mode).
     from context.application_context import ApplicationContext
     web_app_fixture = ApplicationContext(
         application_type="web_app",
@@ -169,6 +185,9 @@ def _builtin_persona_digest_renders() -> list[str]:
         get_verification_prompt(
             code="", finding="", attack_vector="", reasoning="",
             app_context=web_app_fixture),
+        # the web_app system arm + persona join the fold so a wording
+        # change re-pays verify (the #621 contract, extended to the arm).
+        get_verification_system_prompt(web_app_fixture),
     ]
 
 
@@ -256,13 +275,10 @@ def get_verification_system_prompt(app_context: "ApplicationContext" = None) -> 
         base_prompt += SYSTEM_ARM_THREAT_MODEL
     elif app_context and app_context.suppress_local_only():
         if str(getattr(app_context, "application_type", "")) == "web_app":
-            # #653: the web_app arm — the capabilities are the same
-            # (remote, browser, no local CLI); the framing is the browser.
-            base_prompt += """
-
-IMPORTANT: This is a web application. Its remote surface is the browser.
-You must exploit this as a REMOTE attacker. If the only way to trigger the vulnerability requires
-operator-local access a browser user cannot reach, it is NOT exploitable in this class."""
+            # #653: the web_app arm — module-level constant so the
+            # checkpoint fold can hash it (an inline literal is invisible
+            # to templates_sha; the #621 failure mode, one class wider).
+            base_prompt += SYSTEM_ARM_REMOTE_ONLY_WEB
         else:
             base_prompt += SYSTEM_ARM_REMOTE_ONLY
     elif _is_untrusted_input_context(app_context):
@@ -428,8 +444,14 @@ Context:
         # pre-#621 render (verify's checkpoint identity hashes this arm).
         attacker_description = PERSONA_BROWSER_ONLY
     elif app_context.suppress_local_only():
-        # All-trusted CLI/library: byte-identical to the pre-#621 render.
-        attacker_description = PERSONA_REMOTE_ONLY
+        # All-trusted CLI/library: byte-identical to the pre-#621 render
+        # (#653: a web_app reaching this branch gets the web persona —
+        # the CLI rationale's "being the user who runs the application"
+        # is false for a web app).
+        if str(getattr(app_context, "application_type", "")) == "web_app":
+            attacker_description = PERSONA_REMOTE_ONLY_WEB
+        else:
+            attacker_description = PERSONA_REMOTE_ONLY
     elif _is_untrusted_input_context(app_context):
         # #621: the untrusted-input class — a parser/CLI/library whose attack
         # surface IS the attacker-supplied input. The browser-only persona
