@@ -29,12 +29,30 @@ _TP = _CORE / "parsers" / "ruby" / "test_pipeline.py"
 
 
 def _load_pipeline():
+    # #627: snapshot at ENTRY - the exec imports must not leak. The
+    # pipeline scripts import their machinery under BARE module names
+    # (function_extractor, call_graph_builder, ...) resolved against the
+    # parser dir on sys.path - left in sys.modules, they poison every
+    # later same-named import (the python parse_repository got the C
+    # FunctionExtractor; 12 order-dependent failures under
+    # `pytest tests/parsers`). Restore BOTH sys.path and sys.modules
+    # around the exec: new keys removed, replaced keys restored.
+    _saved_path = list(sys.path)
+    _saved_modules = dict(sys.modules)
     for p in (str(_TP.parent), str(_CORE)):
         if p not in sys.path:
             sys.path.insert(0, p)
     spec = importlib.util.spec_from_file_location("isolated_ruby_test_pipeline", _TP)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path[:] = _saved_path
+        for _name, _mod in list(sys.modules.items()):
+            if _name not in _saved_modules:
+                del sys.modules[_name]
+            elif _saved_modules[_name] is not _mod:
+                sys.modules[_name] = _saved_modules[_name]
     return mod
 
 
