@@ -502,8 +502,13 @@ def scan_repository(
     if generate_context and HAS_APP_CONTEXT:
         print(_step_label("Generating application context..."), file=sys.stderr)
 
+        app_context_binding = registry.get("app_context")
         with step_context("app-context", output_dir, inputs={
             "repo_path": repo_path,
+            # #625: the effective policy, present-only (the analyze twin).
+            **({"thinking": dict(app_context_binding.thinking)}
+               if getattr(app_context_binding, "thinking", None) is not None
+               else {}),
         }) as ctx:
             # A threat model committed to the scanned repo is authoritative and
             # short-circuits generation. Loaded OUTSIDE the try below on
@@ -540,7 +545,7 @@ def scan_repository(
             else:
                 try:
                     context = generate_application_context(
-                        Path(repo_path), registry.get("app_context")
+                        Path(repo_path), app_context_binding
                     )
                     app_context_path = os.path.join(
                         output_dir, "application_context.json"
@@ -1073,11 +1078,16 @@ def scan_repository(
 
         enhanced_path = os.path.join(output_dir, "dataset_enhanced.json")
 
+        enhance_binding = registry.get("enhance")
         with step_context("enhance", output_dir, inputs={
             "dataset_path": active_dataset_path,
             "analyzer_output_path": parse_result.analyzer_output_path,
             "repo_path": repo_path,
             "mode": enhance_mode,
+            # #625: the effective policy, present-only (the analyze twin).
+            **({"thinking": dict(enhance_binding.thinking)}
+               if getattr(enhance_binding, "thinking", None) is not None
+               else {}),
         }) as ctx:
             # Enhance is OPTIONAL: a failure here must not discard the completed
             # parse work. Catch-and-continue (matching app-context /
@@ -1221,9 +1231,14 @@ def scan_repository(
 
         print(_step_label("Running verification (Stage 2)..."), file=sys.stderr)
 
+        verify_binding = registry.get("verify")
         with step_context("verify", output_dir, inputs={
             "results_path": analyze_result.results_path,
             "analyzer_output_path": parse_result.analyzer_output_path,
+            # #625: the effective policy, present-only (the analyze twin).
+            **({"thinking": dict(verify_binding.thinking)}
+               if getattr(verify_binding, "thinking", None) is not None
+               else {}),
         }) as ctx:
             # Verify is OPTIONAL: a failure here must not discard completed
             # parse/analyze work (step_context re-raises otherwise).
@@ -1245,7 +1260,7 @@ def scan_repository(
                 ctx.summary = verify_step_summary(verify_result)
                 # #302: the same-model note — banner + step summary
                 _same_model = same_model_verification_note(
-                    registry.get("analyze"), registry.get("verify"))
+                    registry.get("analyze"), verify_binding)
                 if _same_model:
                     ctx.summary["same_model_verification"] = True
                     print(f"  [Note] {_same_model}", file=sys.stderr)
@@ -1395,8 +1410,13 @@ def scan_repository(
 
             print(_step_label("Running dynamic tests (Docker)..."), file=sys.stderr)
 
+            dynamic_test_binding = registry.get("dynamic_test")
             with step_context("dynamic-test", output_dir, inputs={
                 "pipeline_output_path": pipeline_output_path,
+                # #625: the effective policy, present-only (the analyze twin).
+                **({"thinking": dict(dynamic_test_binding.thinking)}
+                   if getattr(dynamic_test_binding, "thinking", None)
+                   is not None else {}),
             }) as ctx:
                 # Dynamic test is OPTIONAL: a failure here must not discard
                 # completed work (step_context re-raises otherwise).
@@ -1449,8 +1469,13 @@ def scan_repository(
 
         print(_step_label("Generating reports..."), file=sys.stderr)
 
+        report_binding = registry.get("report")
         with step_context("report", output_dir, inputs={
             "pipeline_output_path": pipeline_output_path,
+            # #625: the effective policy, present-only (the analyze twin).
+            **({"thinking": dict(report_binding.thinking)}
+               if getattr(report_binding, "thinking", None) is not None
+               else {}),
         }) as ctx:
             report_dir = os.path.join(output_dir, "report")
             os.makedirs(report_dir, exist_ok=True)

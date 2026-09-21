@@ -227,6 +227,19 @@ def reset_unconsumed_timeout_warning() -> None:
         _unconsumed_timeout_warned.clear()
 
 
+def _declares_thinking_kwarg(adapter_cls) -> bool:
+    """#625: the single source of truth for whether an adapter class
+    consumes the thinking knob — ``build_adapter`` threads the policy iff
+    this holds, and the phase binding records an EFFECTIVE policy iff it
+    holds (a non-consuming adapter must never report a policy its
+    requests never carried; the one-time build warning stays the only
+    surface for the unconsumed knob)."""
+    import inspect
+
+    return "thinking" in inspect.signature(
+        adapter_cls.__init__).parameters
+
+
 def build_adapter(provider: ProviderConfig,
                   thinking: Optional[dict] = None) -> LLMAdapter:
     """Construct an adapter instance from a ProviderConfig.
@@ -268,8 +281,7 @@ def build_adapter(provider: ProviderConfig,
     # its reuse of _response_to_unified means the dropped-block count
     # DOES reach it.
     if thinking is not None:
-        if "thinking" in inspect.signature(
-                adapter_cls.__init__).parameters:
+        if _declares_thinking_kwarg(adapter_cls):
             kwargs["thinking"] = thinking
         else:
             _warn_unconsumed_thinking(provider.name, provider.type)
@@ -469,13 +481,21 @@ def build_phase_registry(
     # early-UX half for the phases that ALWAYS tool-call).
     bindings: dict[str, PhaseBinding] = {}
     for phase, ref in llm_config.phases.items():
+        adapter = adapters[(ref.provider, _canonical_thinking(ref.thinking))]
         bindings[phase] = PhaseBinding(
             phase=phase,
-            adapter=adapters[(ref.provider, _canonical_thinking(ref.thinking))],
+            adapter=adapter,
             model=ref.model,
             provider_name=ref.provider,
             base_url=unique_providers[ref.provider].base_url,
-            thinking=ref.thinking,
+            # #625 follow-up: EFFECTIVE, not requested — an adapter whose
+            # class does not declare the kwarg never sends the policy, so
+            # the binding (the fingerprint-extra and step-input source of
+            # truth) must not report one; the build warning is the only
+            # surface for the unconsumed knob, and default users are
+            # unaffected (absent → absent).
+            thinking=ref.thinking
+            if _declares_thinking_kwarg(type(adapter)) else None,
         )
 
     # Tool-support gating (plan §5): enhance + verify require an

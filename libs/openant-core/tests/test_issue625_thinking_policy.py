@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # libs/openant-cor
 
 import utilities.llm.providers.anthropic as anth  # noqa: E402
 import utilities.llm.registry as registry_mod  # noqa: E402
+from utilities.llm.registry import PhaseBinding  # noqa: E402
 from unittest.mock import MagicMock  # noqa: E402
 
 import anthropic as _anthropic_sdk  # noqa: E402
@@ -323,7 +324,6 @@ def test_the_totals_flow_present_only():
 
 def test_fingerprint_fold_only_when_set():
     from core.backend_identity import fingerprint_for_binding
-    from utilities.llm.registry import PhaseBinding
     from core.analyzer import _analyze_fingerprint
 
     class _A:
@@ -357,7 +357,6 @@ def test_fingerprint_fold_only_when_set():
 
 
 def test_binding_default_thinking_is_none():
-    from utilities.llm.registry import PhaseBinding
 
     class _A:
         name = "fake"

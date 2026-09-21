@@ -11,7 +11,13 @@ import utilities.llm.providers.anthropic as anth  # noqa: E402
 import utilities.llm.registry as registry_mod  # noqa: E402
 from tests.test_issue625_thinking_policy import (  # noqa: E402
     _ALL_PHASES)
-from utilities.llm.config import ConfigError, LLMConfig, PhaseRef  # noqa: E402
+from utilities.llm.config import (  # noqa: E402
+    ConfigError,
+    ConfigFile,
+    LLMConfig,
+    PhaseRef,
+    ProviderConfig,
+)
 
 
 def test_unconsumed_thinking_warning_fires_once(capsys):
@@ -19,10 +25,9 @@ def test_unconsumed_thinking_warning_fires_once(capsys):
     ONCE per (provider, type) — the #604 unconsumed-knob mirror, with the
     stderr receipts (the r2 catch: the earlier row was vacuous)."""
     import utilities.llm_client as llc  # noqa: PLC0415
-    import utilities.llm.config as cfg_mod  # noqa: PLC0415
     llc.reset_warning_state()
-    cf = cfg_mod.ConfigFile(llm_providers={
-        "g": cfg_mod.ProviderConfig(name="g", type="google",
+    cf = ConfigFile(llm_providers={
+        "g": ProviderConfig(name="g", type="google",
                                     api_key="dummy-key")})
     r = registry_mod.build_adapter(
         cf.llm_providers["g"], thinking={"type": "adaptive"})
@@ -47,10 +52,9 @@ def test_gated_phase_on_nonconsuming_provider_raises_without_warning(capsys):
     tool phase on a NON-consuming provider raises the ConfigError WITHOUT
     the spurious unconsumed-knob warning first (the ordering pin)."""
     import utilities.llm_client as llc  # noqa: PLC0415
-    import utilities.llm.config as cfg_mod  # noqa: PLC0415
     llc.reset_warning_state()
-    cf = cfg_mod.ConfigFile(llm_providers={
-        "g": cfg_mod.ProviderConfig(name="g", type="google",
+    cf = ConfigFile(llm_providers={
+        "g": ProviderConfig(name="g", type="google",
                                     api_key="dummy-key")})
     phases = {p: PhaseRef(provider="g", model="m") for p in _ALL_PHASES}
     phases["verify"] = PhaseRef(provider="g", model="m",
