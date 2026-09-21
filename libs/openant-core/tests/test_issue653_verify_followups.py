@@ -184,11 +184,43 @@ class TestPromptTextsBehavioral:
         assert "web application" not in user.lower(), "the cli_tool render gains no web framing"
 
     def test_web_app_system_arm_in_fold(self):
-        """N1's pin: mutating the web_app arm's constant MOVES templates_sha."""
+        """N1's pin (mutation-hardened after round 3's N4: the presence-only
+        form passed with the arm's render deleted): mutating the web_app
+        arm's CONSTANT moves the folded texts; mutating the web_app PERSONA
+        moves them too."""
+        import prompts.verification_prompts as vp
         from core.verifier import _verify_template_texts
-        texts = [r() for r in _verify_template_texts()]
-        assert any("web application" in r.lower() for r in texts), (
-            "the fold carries the web_app system arm")
+        base = [r() for r in _verify_template_texts()]
+
+        arm = vp.SYSTEM_ARM_REMOTE_ONLY_WEB
+        try:
+            vp.SYSTEM_ARM_REMOTE_ONLY_WEB = arm + "\n# mutated"
+            mutated = [r() for r in _verify_template_texts()]
+        finally:
+            vp.SYSTEM_ARM_REMOTE_ONLY_WEB = arm
+        assert mutated != base, (
+            "mutating the web_app system arm must move the fold — an arm "
+            "invisible to templates_sha is the #621 failure mode")
+
+        persona = vp.PERSONA_REMOTE_ONLY_WEB
+        try:
+            vp.PERSONA_REMOTE_ONLY_WEB = persona + "\n# mutated"
+            mutated2 = [r() for r in _verify_template_texts()]
+        finally:
+            vp.PERSONA_REMOTE_ONLY_WEB = persona
+        assert mutated2 != base, (
+            "mutating the web_app persona must move the fold")
+
+        # the arm text itself appears in the renders (not satisfied by the
+        # user-prompt render at index 2 — the round-3 escape)
+        from prompts.verification_prompts import (
+            _builtin_persona_digest_renders, SYSTEM_ARM_REMOTE_ONLY_WEB,
+            PERSONA_REMOTE_ONLY_WEB)
+        renders = _builtin_persona_digest_renders()
+        assert any(SYSTEM_ARM_REMOTE_ONLY_WEB in r for r in renders), (
+            "the system arm's own text is in the fold renders")
+        assert any(PERSONA_REMOTE_ONLY_WEB in r for r in renders), (
+            "the web persona's own text is in the fold renders")
         # the web_app system-prompt render is in the fold: the digest
         # moved from the 2-fixture era (the third fixture + the arm join
         # in the same fold — the #621 contract extended)
