@@ -133,6 +133,7 @@ class AnthropicAdapter:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_retries: int = 5,
+        thinking: Optional[dict] = None,
         _client: Optional[anthropic.Anthropic] = None,
     ):
         """Construct the adapter.
@@ -144,11 +145,24 @@ class AnthropicAdapter:
                 default (api.anthropic.com). Required when pointing
                 at OpenRouter or any other Anthropic-compat endpoint.
             max_retries: Forwarded to the SDK. The SDK's built-in
-                retry covers transient network blips; our rate
-                limiter handles 429-coordinated backoff on top.
+                retry covers transient network blips; our rate limiter
+                handles 429-coordinated backoff on top.
+            thinking: #625 — the request-side thinking policy, passed
+                VERBATIM as the request's ``thinking`` value when set
+                (the SDK validates the shape; the newer SDKs accept
+                adaptive, older enabled/disabled with a budget).
+                ``None`` (the default) sends NO thinking parameter —
+                the instrument stays byte-identical to the pre-#625
+                request (#242: changing the default changes the
+                instrument; verdict behavior must be evaluated
+                separately, never mixed with a usage-accounting
+                change).
             _client: Injected SDK instance for testing. Production
                 callers should not pass this.
         """
+        # The effective policy, readable by the checkpoint fingerprint
+        # (backend_identity) and the step-report policy summary (#625).
+        self.thinking = thinking
         if _client is not None:
             self._client = _client
             return
@@ -184,6 +198,27 @@ class AnthropicAdapter:
             request["system"] = system
         if tools:
             request["tools"] = [_tool_to_anthropic(t) for t in tools]
+        # #625: the configured thinking policy, verbatim. Absent ⇒ NO key —
+        # the default request is byte-identical to the pre-#625 shape.
+        if self.thinking is not None:
+            request["thinking"] = self.thinking
+
+        # #625 T1 guard (2026-09-21, the retro bug-hunt finding): a
+        # thinking-enabled request WITH tools requires the thinking blocks
+        # preserved on the echoed assistant turn (Anthropic's documented
+        # contract) — this adapter's loop echo filters to text/tool-use, so
+        # iteration 2 would 400 AFTER paying for iteration 1. Refuse the
+        # combination loudly at build time instead of paying for the
+        # failure; the full preserved-blocks handling is a separate change.
+        if (tools and self.thinking is not None
+                and self.thinking.get("type") not in (None, "disabled")):
+            raise LLMResponseError(
+                f"AnthropicAdapter refuses thinking+tools: thinking blocks must be "
+                "preserved on the echoed assistant turn for multi-turn tool "
+                "loops, and this adapter's loop echo does not carry them "
+                "(iteration 2 would fail after iteration 1 is billed). "
+                "Remove `thinking` from the provider entry for tool-using "
+                "phases, or set it to {\"type\": \"disabled\"}.")
 
         # Cooperate with the cross-worker backoff before issuing the
         # call — same pattern the legacy AnthropicClient used, now
@@ -340,6 +375,7 @@ def _response_to_unified(
     ``AnthropicAdapter``.
     """
     content_blocks: list[ContentBlock] = []
+    dropped_block_kinds: dict[str, int] = {}
     for block in response.content:
         kind = getattr(block, "type", None)
         if kind == "text":
@@ -359,7 +395,11 @@ def _response_to_unified(
             # symptom isn't silent. For a security tool, a silently
             # dropped "refusal" paired with a benign stop_reason could
             # read as an empty success.
+            # #625: count it per kind — the dropped-block diagnostic (a
+            # count, never a token split; usage cannot split thinking).
             _warn_unknown_block_kind(str(kind), adapter=adapter)
+            dropped_block_kinds[str(kind)] = (
+                dropped_block_kinds.get(str(kind), 0) + 1)
 
     # R4-5: a usage-less response (rare, but seen on some proxies and on
     # error-shaped 200s) must not AttributeError here — the downstream
@@ -430,6 +470,8 @@ def _response_to_unified(
         input_tokens=getattr(usage, "input_tokens", 0),
         output_tokens=getattr(usage, "output_tokens", 0),
         usage_details=_extract_usage_details(usage),
+        # #625: present-only diagnostic (None when nothing was dropped).
+        dropped_block_kinds=dropped_block_kinds or None,
         # R2-C: an unknown/abnormal stop_reason defaults to "max_tokens" (not
         # "end_turn") — as the warning above notes, treating a refusal/abnormal
         # termination as end_turn masks false negatives. Known values (end_turn/

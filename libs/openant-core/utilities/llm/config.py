@@ -95,6 +95,15 @@ class ProviderConfig:
     # the only one whose SDK default is UNBOUNDED); a provider type that
     # does not consume it warns loudly at build time, never silently.
     request_timeout: Optional[int] = None
+    # #625: request-side thinking policy (None = the adapter sends NO
+    # thinking parameter — the default instrument, unchanged). When set, the
+    # dict is passed VERBATIM as the SDK request's ``thinking`` value (the
+    # provider/model validates the shape: the newer SDKs accept adaptive;
+    # older accepts enabled/disabled with a budget). Consumed by the adapters
+    # that declare a ``thinking`` constructor kwarg (anthropic + bedrock
+    # today); a provider type that does not consume it warns loudly at
+    # build time, never silently.
+    thinking: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -273,12 +282,24 @@ def _parse_providers(raw: dict) -> dict[str, ProviderConfig]:
             )
         request_timeout = _positive_int_or_none(
             entry.get("request_timeout"), name)
+        # #625: verbatim dict pass-through (None when absent). The
+        # provider-side SDK validates the shape — we do not second-guess
+        # it here (a wrong shape fails loudly at request time, with the
+        # provider's own error naming the field).
+        thinking = entry.get("thinking")
+        if thinking is not None and not isinstance(thinking, dict):
+            raise ConfigError(
+                f"config.json: provider {name!r}: 'thinking' must be a "
+                f"JSON object (the SDK thinking parameter), got "
+                f"{type(thinking).__name__}"
+            )
         out[name] = ProviderConfig(
             name=name,
             type=ptype,
             api_key=_optional_str(entry.get("api_key")),
             base_url=_optional_str(entry.get("base_url")),
             request_timeout=request_timeout,
+            thinking=thinking,
         )
     return out
 

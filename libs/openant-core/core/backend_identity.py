@@ -209,6 +209,15 @@ def fingerprint_for_binding(binding, template_texts, *,
     adapter = getattr(binding, "adapter", None)
     adapter_type = getattr(adapter, "name", None) or (
         type(adapter).__name__ if adapter is not None else "unknown")
+    # #625: a CONFIGURED thinking policy is part of the run's identity — a
+    # resumed run under a different policy is a different instrument and must
+    # not adopt checkpoints produced under the old one. ``None`` (the default,
+    # unchanged policy) folds NOTHING: the digest matches the pre-#625 KEY
+    # byte-for-byte, so default-config checkpoints survive the upgrade.
+    thinking = getattr(adapter, "thinking", None)
+    if thinking is not None:
+        extra_key = dict(extra_key or {})
+        extra_key["thinking_policy"] = thinking
     return build_fingerprint(
         phase=binding.phase,
         model=binding.model,

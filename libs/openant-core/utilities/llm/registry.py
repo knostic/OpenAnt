@@ -195,6 +195,51 @@ def reset_unconsumed_timeout_warning() -> None:
         _unconsumed_timeout_warned.clear()
 
 
+# #625: same one-time-PER-TYPE contract for the thinking policy knob.
+_unconsumed_thinking_warned: set[str] = set()
+_unconsumed_thinking_warned_lock = threading.Lock()
+
+
+def _warn_unconsumed_thinking(provider_name: str, provider_type: str) -> None:
+    with _unconsumed_thinking_warned_lock:
+        if provider_type in _unconsumed_thinking_warned:
+            return
+        _unconsumed_thinking_warned.add(provider_type)
+    sys.stderr.write(
+        "warning: thinking is not consumed by provider entry "
+        f"{provider_name!r} (type {provider_type!r}) — that type declares "
+        "no `thinking` constructor kwarg. An adapter adopts the "
+        "knob by declaring the kwarg. Remove `thinking` from "
+        "that provider entry to silence this.\n"
+    )
+
+
+def reset_unconsumed_thinking_warning() -> None:
+    """Test hook: re-arm the #625 thinking one-time warnings (same wiring
+    contract as ``reset_unconsumed_timeout_warning``)."""
+    with _unconsumed_thinking_warned_lock:
+        _unconsumed_thinking_warned.clear()
+
+
+def binding_policy_summary(registry, phase: str) -> dict:
+    """#625: the effective LLM policy for a phase, for step-report inputs.
+
+    ``{"provider": name, "model": id, "thinking": policy-or-None}`` — what a
+    comparison reader or a checkpoint decision needs to see next to a
+    step's usage: WHICH instrument produced it. The thinking value is the
+    adapter's configured policy (``None`` = the default, unchanged
+    instrument). Reading it off the ADAPTER (not the config) means the
+    record states what was actually in effect, including after gateway
+    re-wrapping.
+    """
+    binding = registry.get(phase)
+    return {
+        "provider": binding.provider_name,
+        "model": binding.model,
+        "thinking": getattr(binding.adapter, "thinking", None),
+    }
+
+
 def build_adapter(provider: ProviderConfig) -> LLMAdapter:
     """Construct an adapter instance from a ProviderConfig.
 
@@ -227,6 +272,15 @@ def build_adapter(provider: ProviderConfig) -> LLMAdapter:
             kwargs["request_timeout"] = provider.request_timeout
         else:
             _warn_unconsumed_timeout(provider.name, provider.type)
+    # #625: identical capability-conditional threading for the thinking
+    # policy — passed iff the adapter declares the kwarg, else the
+    # one-time-per-type warning. Never silently dropped.
+    if provider.thinking is not None:
+        if "thinking" in inspect.signature(
+                adapter_cls.__init__).parameters:
+            kwargs["thinking"] = provider.thinking
+        else:
+            _warn_unconsumed_thinking(provider.name, provider.type)
     try:
         return adapter_cls(**kwargs)
     except Exception as exc:  # noqa: BLE001 — re-raise as typed

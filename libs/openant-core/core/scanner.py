@@ -327,6 +327,7 @@ def scan_repository(
     # keys / typo'd model IDs / unreachable endpoints surface here as
     # a clean LLMError rather than mid-scan.
     from utilities.llm import (
+        binding_policy_summary,
         build_phase_registry,
         load_config_file,
         probe_registry_or_raise,
@@ -504,6 +505,7 @@ def scan_repository(
 
         with step_context("app-context", output_dir, inputs={
             "repo_path": repo_path,
+            "llm": binding_policy_summary(registry, "app_context"),
         }) as ctx:
             # A threat model committed to the scanned repo is authoritative and
             # short-circuits generation. Loaded OUTSIDE the try below on
@@ -635,6 +637,7 @@ def scan_repository(
             "dataset_path": active_dataset_path,
             "model": llm_reach_binding.model,
             "provider": llm_reach_binding.provider_name,
+            "llm": binding_policy_summary(registry, "llm_reach"),
         }) as ctx:
             try:
                 dataset = read_json(active_dataset_path)
@@ -1074,6 +1077,7 @@ def scan_repository(
             "analyzer_output_path": parse_result.analyzer_output_path,
             "repo_path": repo_path,
             "mode": enhance_mode,
+            "llm": binding_policy_summary(registry, "enhance"),
         }) as ctx:
             # Enhance is OPTIONAL: a failure here must not discard the completed
             # parse work. Catch-and-continue (matching app-context /
@@ -1153,6 +1157,7 @@ def scan_repository(
         "dataset_path": active_dataset_path,
         "model": analyze_binding.model,
         "provider": analyze_binding.provider_name,
+        "llm": binding_policy_summary(registry, "analyze"),
         "limit": limit,
     }) as ctx:
         analyze_result = run_analysis(
@@ -1215,6 +1220,7 @@ def scan_repository(
         with step_context("verify", output_dir, inputs={
             "results_path": analyze_result.results_path,
             "analyzer_output_path": parse_result.analyzer_output_path,
+            "llm": binding_policy_summary(registry, "verify"),
         }) as ctx:
             # Verify is OPTIONAL: a failure here must not discard completed
             # parse/analyze work (step_context re-raises otherwise).
@@ -1388,6 +1394,7 @@ def scan_repository(
 
             with step_context("dynamic-test", output_dir, inputs={
                 "pipeline_output_path": pipeline_output_path,
+                "llm": binding_policy_summary(registry, "dynamic_test"),
             }) as ctx:
                 # Dynamic test is OPTIONAL: a failure here must not discard
                 # completed work (step_context re-raises otherwise).
@@ -1442,6 +1449,7 @@ def scan_repository(
 
         with step_context("report", output_dir, inputs={
             "pipeline_output_path": pipeline_output_path,
+            "llm": binding_policy_summary(registry, "report"),
         }) as ctx:
             report_dir = os.path.join(output_dir, "report")
             os.makedirs(report_dir, exist_ok=True)

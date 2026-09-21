@@ -386,6 +386,8 @@ def reset_warning_state() -> None:
     # hazard the adjacent comment names; the silent-None fallback
     # contradicted it — the panel seat's catch)
     _registry_mod.reset_unconsumed_timeout_warning()
+    # #625: same contract for the thinking knob's one-time warning.
+    _registry_mod.reset_unconsumed_thinking_warning()
 
 
 def reset_global_tracker():
