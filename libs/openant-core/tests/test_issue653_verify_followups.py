@@ -68,7 +68,6 @@ class TestItem2StdoutAttackerModel:
         """A minimally-constructed VerifyResult (the dataclass fields the
         to_dict path reads; attacker_model defaults None)."""
         from core.schemas import VerifyResult
-        from datetime import datetime, timezone
         defaults = dict(
             verified_results_path="/tmp/verified.json",
             findings_input=0,
