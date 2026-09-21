@@ -214,6 +214,61 @@
       "retrieved": "2026-07-31"
     },
     {
+      "id": "anthropic.claude-sonnet-5",
+      "provider": "bedrock",
+      "status": "current",
+      "price": {
+        "input": 2.0,
+        "output": 10.0
+      },
+      "source": "current-generation Bedrock serving: plain anthropic.* model id, NO us./global. inference-profile twins — Anthropic's legacy Bedrock guide omits these models from its model table because \"they do not have ARN-versioned model IDs\" (platform.claude.com/docs/en/build-with-claude/claude-on-amazon-bedrock-legacy, fetched 2026-09-21); id from the Supported models table of the Claude in Amazon Bedrock integration doc (platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock, fetched 2026-09-21); price = the direct Anthropic rate re-verified 2026-09-21 (platform.claude.com/docs/en/about-claude/pricing: Sonnet 5 $2/$10, the page's note that this launch price is now the STANDARD price) — Bedrock GLOBAL-endpoint pricing carries no premium (the 10% regional premium is an endpoint choice, not a model-id variant, so id-level pricing carries the global rate); no live-account list-inference-profiles verification performed (no AWS credentials in the authoring environment) — the id is vendor-documented, not account-verified",
+      "retrieved": "2026-09-21"
+    },
+    {
+      "id": "anthropic.claude-opus-5",
+      "provider": "bedrock",
+      "status": "current",
+      "price": {
+        "input": 5.0,
+        "output": 25.0
+      },
+      "source": "current-generation Bedrock serving: plain anthropic.* model id, NO us./global. inference-profile twins — Anthropic's legacy Bedrock guide omits these models from its model table because \"they do not have ARN-versioned model IDs\" (platform.claude.com/docs/en/build-with-claude/claude-on-amazon-bedrock-legacy, fetched 2026-09-21); id from the Supported models table of the Claude in Amazon Bedrock integration doc (platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock, fetched 2026-09-21); price = the direct Anthropic rate re-verified 2026-09-21 (platform.claude.com/docs/en/about-claude/pricing: Opus 5 $5/$25) — Bedrock GLOBAL-endpoint pricing carries no premium (the 10% regional premium is an endpoint choice, not a model-id variant, so id-level pricing carries the global rate); no live-account list-inference-profiles verification performed (no AWS credentials in the authoring environment) — the id is vendor-documented, not account-verified",
+      "retrieved": "2026-09-21"
+    },
+    {
+      "id": "anthropic.claude-fable-5",
+      "provider": "bedrock",
+      "status": "current",
+      "price": {
+        "input": 10.0,
+        "output": 50.0
+      },
+      "source": "current-generation Bedrock serving: plain anthropic.* model id, NO us./global. inference-profile twins — Anthropic's legacy Bedrock guide omits these models from its model table because \"they do not have ARN-versioned model IDs\" (platform.claude.com/docs/en/build-with-claude/claude-on-amazon-bedrock-legacy, fetched 2026-09-21); id from the Supported models table of the Claude in Amazon Bedrock integration doc (platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock, fetched 2026-09-21); price = the direct Anthropic rate re-verified 2026-09-21 (platform.claude.com/docs/en/about-claude/pricing: Fable 5 $10/$50) — Bedrock GLOBAL-endpoint pricing carries no premium (the 10% regional premium is an endpoint choice, not a model-id variant, so id-level pricing carries the global rate); no live-account list-inference-profiles verification performed (no AWS credentials in the authoring environment) — the id is vendor-documented, not account-verified",
+      "retrieved": "2026-09-21"
+    },
+    {
+      "id": "anthropic.claude-fable-5-1",
+      "provider": "bedrock",
+      "status": "current",
+      "price": {
+        "input": 10.0,
+        "output": 50.0
+      },
+      "source": "sibling sweep (the #607 gap class): same Supported models table as the -5 trio — Claude Fable 5.1 | anthropic.claude-fable-5-1 | Open (platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock, fetched 2026-09-21), and per the legacy guide it too has no ARN-versioned ids; price = the direct Anthropic rate re-verified 2026-09-21 (platform.claude.com/docs/en/about-claude/pricing: Fable 5.1 $10/$50) — Bedrock GLOBAL-endpoint pricing carries no premium (id-level pricing carries the global rate); no live-account verification performed — the id is vendor-documented, not account-verified",
+      "retrieved": "2026-09-21"
+    },
+    {
+      "id": "anthropic.claude-opus-4-7",
+      "provider": "bedrock",
+      "status": "current",
+      "price": {
+        "input": 5.0,
+        "output": 25.0
+      },
+      "source": "sibling sweep (the #607 gap class): same Supported models table — Claude Opus 4.7 | anthropic.claude-opus-4-7 | Open (platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock, fetched 2026-09-21), and per the legacy guide it too has no ARN-versioned ids; price = the direct Anthropic rate re-verified 2026-09-21 (platform.claude.com/docs/en/about-claude/pricing: Opus 4.7 $5/$25) — Bedrock GLOBAL-endpoint pricing carries no premium (id-level pricing carries the global rate); no live-account verification performed — the id is vendor-documented, not account-verified",
+      "retrieved": "2026-09-21"
+    },
+    {
       "id": "gpt-4o",
       "provider": "openai",
       "status": "current",
