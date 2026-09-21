@@ -195,7 +195,10 @@ def test_extras_and_names_parse():
     exact pins, floor lines, and inline comments (the httpx2 NOTE line)."""
     floors = _floors_from_pyproject(
         (CORE_ROOT / "pyproject.toml").read_text())
-    assert floors["anthropic"] == Version("0.40.0")
+    # the floor follows the live file (#625: 0.40.0 -> 0.47.0 — the
+    # thinking kwarg does not exist before 0.47.0 and every call would
+    # TypeError per-unit)
+    assert floors["anthropic"] == Version("0.47.0")
     assert floors["pydantic"] == Version("2.0.0")
     pins = _pins_from_requirements((CORE_ROOT / "requirements.txt").read_text())
     # the pin follows the live file (renovate bump #475: 1.2.0 -> 1.3.0)

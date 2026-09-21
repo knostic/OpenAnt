@@ -318,6 +318,20 @@ class LLMRefusalError(LLMResponseError):
     """
 
 
+class ThinkingPolicyRejectedError(LLMError):
+    """#625: the provider rejected the thinking policy itself.
+
+    Raised on a 400 that names ``thinking`` on an adapter constructed
+    WITH a policy (enabled/adaptive/disabled) — a config/provider
+    mismatch, not a per-unit defect: every subsequent call carries the
+    identical policy and would fail identically, so fanning it out as
+    per-unit ERROR rows paints an all-error scan green (the exit-0
+    shape the pre-merge review arc's replay caught). Deliberately NOT
+    an LLMResponseError subclass: the per-unit catch-alls must let it
+    escape; the phase-level handlers mark the step errored.
+    """
+
+
 # ---------------------------------------------------------------------------
 # The adapter protocol
 # ---------------------------------------------------------------------------

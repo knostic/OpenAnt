@@ -53,6 +53,13 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
     # #605: a failed START snapshot must not become a fabricated zero
     # baseline — the delta is unavailable, not zero.
     _accounting_error = start_cost is None
+    # #625: the dropped-block baseline for the per-step DELTA — the
+    # process-global counter is run-cumulative; this step's report must
+    # carry only what THIS step dropped (a raw snapshot would re-report
+    # every earlier step's drops, and summing those across steps
+    # overcounts by the prefix).
+    from utilities.llm_client import get_dropped_block_totals
+    _start_dropped = dict(get_dropped_block_totals() or {})
 
     try:
         yield report
@@ -139,12 +146,14 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
                     end_snapshot["unpriced_models"]
             # #625 (the panel round's asymmetry catch): the error branch
             # rebuilds token_usage wholesale — the per-kind dropped-block
-            # counts must surface HERE too (an accounting error and
-            # dropped blocks are not mutually exclusive).
+            # DELTA must surface HERE too (an accounting error and
+            # dropped blocks are not mutually exclusive). The counter is
+            # in-process, so the delta is available even when the
+            # tracker's token baseline is not.
             from utilities.llm_client import get_dropped_block_totals
-            _dropped = get_dropped_block_totals()
+            _dropped = _dropped_delta(get_dropped_block_totals(), _start_dropped)
             if _dropped:
-                report.token_usage["dropped_blocks"] = dict(_dropped)
+                report.token_usage["dropped_blocks"] = _dropped
         else:
             report.cost_usd = round(end_cost - start_cost, 6)
             report.token_usage = {
@@ -169,20 +178,36 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
                 # dropped spend — both markers, never one without the other.
                 report.token_usage["accounting_error"] = True
                 report.token_usage["cost_incomplete"] = True
-            # #625: the per-kind dropped-block diagnostic reaches the
+            # #625: the per-kind dropped-block DELTA reaches the
             # persisted surface (the tracker's call records die with the
-            # process; the step report is where the reconciliation lives).
-            # Present-only — the same discipline as accounting_error.
+            # process; the step report is where the reconciliation lives)
+            # — only the kinds THIS step dropped, present-only, the same
+            # discipline as accounting_error.
             from utilities.llm_client import get_dropped_block_totals
-            _dropped = get_dropped_block_totals()
+            _dropped = _dropped_delta(get_dropped_block_totals(), _start_dropped)
             if _dropped:
-                report.token_usage["dropped_blocks"] = dict(_dropped)
+                report.token_usage["dropped_blocks"] = _dropped
         report.write(output_dir)
         print(
             f"[{step}] Report: {output_dir}/{step}.report.json "
             f"({report.duration_seconds}s, ${report.cost_usd:.4f})",
             file=sys.stderr,
         )
+
+
+def _dropped_delta(end: dict | None, start: dict) -> dict:
+    """#625: the per-step delta of the run-cumulative dropped-block
+    counter — only kinds that increased THIS step, never the prefix (a
+    later step must not re-report an earlier step's drops; a counter
+    reset mid-step reads as the fresh count, never negative)."""
+    if not end:
+        return {}
+    delta: dict = {}
+    for kind, count in end.items():
+        d = count - start.get(kind, 0)
+        if d > 0:
+            delta[kind] = d
+    return delta
 
 
 def _snapshot_usage() -> tuple[float | None, dict | None]:

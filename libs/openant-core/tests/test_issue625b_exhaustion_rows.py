@@ -75,10 +75,10 @@ def test_step_report_success_branch_surfaces_dropped_blocks(tmp_path):
     import utilities.llm_client as llc  # noqa: PLC0415
     from core.step_report import step_context  # noqa: PLC0415
     llc.reset_warning_state()
-    anth._count_dropped_block("refusal")
     try:
         with step_context("analyze", str(tmp_path), inputs={}) as ctx:
             ctx.summary = {"ok": True}
+            anth._count_dropped_block("refusal")
         report = Path(tmp_path, "analyze.report.json").read_text()
         assert '"dropped_blocks"' in report, (
             "the per-kind count reaches the persisted step report")
@@ -94,7 +94,6 @@ def test_step_report_error_branch_surfaces_dropped_blocks(tmp_path, monkeypatch)
     import utilities.llm_client as llc  # noqa: PLC0415
     from core import step_report as sr  # noqa: PLC0415
     llc.reset_warning_state()
-    anth._count_dropped_block("thinking")
 
     import core.tracking as tracking_mod  # noqa: PLC0415
 
@@ -105,6 +104,7 @@ def test_step_report_error_branch_surfaces_dropped_blocks(tmp_path, monkeypatch)
         with sr.step_context(
                 "analyze", str(tmp_path), inputs={}) as ctx:
             ctx.summary = {"ok": True}
+            anth._count_dropped_block("thinking")
         report = Path(tmp_path, "analyze.report.json").read_text()
         assert '"accounting_error": true' in report, (
             "the poisoned snapshot must mark the step errored")

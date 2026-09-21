@@ -2048,6 +2048,22 @@ def _write_scan_report(
             **({"accounting_error": True}
                if any(sr.get("token_usage", {}).get("accounting_error")
                       for sr in step_reports) else {}),
+            # #625: the per-step dropped-block DELTAS aggregate by SUM —
+            # the scan-level reconciliation surface (each step report
+            # carries only its own drops, so the sum is exact; never sum
+            # run-cumulative snapshots).
+            **({"dropped_blocks": {
+                _kind: sum(
+                    (sr.get("token_usage", {}).get("dropped_blocks") or {})
+                    .get(_kind, 0)
+                    for sr in step_reports)
+                for _kind in sorted({
+                    _k for sr in step_reports
+                    for _k in (sr.get("token_usage", {})
+                               .get("dropped_blocks") or {})
+                })
+            }} if any(sr.get("token_usage", {}).get("dropped_blocks")
+                      for sr in step_reports) else {}),
         },
     )
 

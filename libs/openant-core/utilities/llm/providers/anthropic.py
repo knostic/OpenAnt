@@ -46,6 +46,7 @@ from ..adapter import (
     LLMNotFoundError,
     LLMRateLimitError,
     LLMRefusalError,
+    ThinkingPolicyRejectedError,
     LLMResponseError,
     Message,
     StopReason,
@@ -89,8 +90,14 @@ _warned_block_kinds_lock = threading.Lock()
 # global. The stderr warning above stays (the once-per-kind signal); this
 # counter is the PERSISTED half — the per-call usage records die with the
 # process, so a count that stops there is invisible in artifacts. It flows
-# the #216/#605 marker path (get_totals present-only -> the step reports ->
-# scan.report.json), zeroing on the per-scan reset (reset_warnings).
+# get_totals-present-only into the step reports as PER-STEP DELTAS (the
+# step snapshots the counter at entry and writes the increase), and
+# scan.report.json aggregates those deltas by SUM — never sum the raw
+# cumulative snapshots (they re-report earlier steps' drops). The counter
+# zeroes on the per-scan reset (reset_warnings); it is invocation-scoped,
+# NOT resume-persistent (a resumed run's fresh step reports carry only
+# the resumed invocation's drops — the historical counts stay in the
+# archived step reports).
 _dropped_block_counts: dict[str, int] = {}
 _dropped_block_lock = threading.Lock()
 
@@ -284,6 +291,16 @@ class AnthropicAdapter:
                 retry_after = _retry_after_from(exc)
                 report_rate_limit(retry_after)
                 raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
+            # #625: a 400 that names `thinking` on a policy-configured
+            # adapter is a config/provider mismatch — FATAL, never a
+            # per-unit error (every unit would fail identically and the
+            # scan would read green with an all-ERROR analyze step).
+            if (status == 400 and self._thinking is not None
+                    and "thinking" in str(exc).lower()):
+                raise ThinkingPolicyRejectedError(
+                    f"the provider rejected the configured thinking policy "
+                    f"({self._thinking!r}): {redact_secrets(str(exc))}"
+                ) from redacted_cause_from(exc)
             # Everything else (400, 422, 500, ...) is a structural
             # response problem from the pipeline's perspective.
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)

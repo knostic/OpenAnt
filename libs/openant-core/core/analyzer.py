@@ -34,6 +34,7 @@ from utilities.llm import (
     load_config_file,
     resolve_llm_config,
 )
+from utilities.llm.adapter import ThinkingPolicyRejectedError
 from utilities.file_io import read_json, write_json
 from utilities.json_corrector import JSONCorrector
 from utilities.llm import DEFAULT_MAX_TOKENS
@@ -223,6 +224,13 @@ def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_contex
             "usage": tracker.get_unit_usage(),
         }
 
+    except ThinkingPolicyRejectedError:
+        # #625: fatal by design — the provider rejected the policy
+        # itself; every subsequent unit would fail identically, and a
+        # per-unit ERROR row would paint the scan green. Escapes the
+        # per-unit catch-all so the phase-level handler marks the step
+        # errored.
+        raise
     except Exception as e:
         elapsed = time.monotonic() - start
         worker = threading.current_thread().name
