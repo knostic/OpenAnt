@@ -174,10 +174,14 @@ class TokenTracker:
                 read/write tokens) VERBATIM — a dict for a single call,
                 or a list of per-turn dicts for an agentic loop. Stored
                 on the call record for reconciliation against a provider
-                bill; NEVER summed into totals and NEVER in the cost
-                formula (whether a provider's ``completion_tokens``
-                already includes reasoning differs by route — summing
-                would double-count on including routes).
+                bill. #626 deliberately AMENDED the blanket exclusion for
+                the CACHE fields: they now price at their own multipliers
+                and total as separate line items (never into
+                total_input_tokens). The REASONING fields remain outside
+                the cost formula verbatim (whether a provider's
+                ``completion_tokens`` already includes reasoning differs
+                by route — summing would double-count on including
+                routes).
             turns: #624 — the number of LLM completions this record
                 covers: 1 (the default) for a single completion
                 (``usage_details`` dict/None); REQUIRED for an agentic
@@ -246,16 +250,27 @@ class TokenTracker:
             # (below) keeps the tokens counted, the cache cost $0, and the
             # run marked incomplete — never a silent $0-complete read.
             if has_cache_usage:
-                if "cache_read" in pricing or "cache_write" in pricing:
-                    cache_cost = 0.0
-                    if cache_read:
+                # T8 fix (2026-09-21, the retro probe): each side prices
+                # ONLY with its own multiplier — a one-sided record (read
+                # present, write absent) must not price the missing side at
+                # $0.0 and read complete; the used-but-unpriced side marks
+                # the run incomplete and names the model.
+                cache_cost = 0.0
+                unpriced_side = False
+                if cache_read:
+                    if "cache_read" in pricing:
                         cache_cost += (cache_read / 1_000_000) * pricing[
-                            "input"] * pricing.get("cache_read", 0.0)
-                    if cache_write:
+                            "input"] * pricing["cache_read"]
+                    else:
+                        unpriced_side = True
+                if cache_write:
+                    if "cache_write" in pricing:
                         cache_cost += (cache_write / 1_000_000) * pricing[
-                            "input"] * pricing.get("cache_write", 0.0)
-                    total_cost += cache_cost
-                else:
+                            "input"] * pricing["cache_write"]
+                    else:
+                        unpriced_side = True
+                total_cost += cache_cost
+                if unpriced_side:
                     with self._lock:
                         self._unpriced_cache_models.add(model)
                     tl = self._thread_local
@@ -364,7 +379,7 @@ class TokenTracker:
             Dict with totals and per-call breakdown
         """
         with self._lock:
-            return {
+            out = {
                 "total_calls": len(self.calls),
                 "total_input_tokens": self.total_input_tokens,
                 "total_output_tokens": self.total_output_tokens,
@@ -381,6 +396,15 @@ class TokenTracker:
                 "unpriced_models": sorted(self._unpriced_models),
                 "calls": list(self.calls),
             }
+            # #626/T8: the same present-only cache line items get_totals
+            # carries (the reconciliation surfaces must agree).
+            if self.total_cache_read_tokens:
+                out["total_cache_read_tokens"] = self.total_cache_read_tokens
+            if self.total_cache_write_tokens:
+                out["total_cache_write_tokens"] = self.total_cache_write_tokens
+            if self._unpriced_cache_models:
+                out["unpriced_cache_models"] = sorted(self._unpriced_cache_models)
+            return out
 
     def get_totals(self) -> dict:
         """

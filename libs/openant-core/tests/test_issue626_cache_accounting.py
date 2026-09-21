@@ -140,3 +140,25 @@ def test_no_cache_usage_byte_identical_shape():
               "unpriced_cache_models"):
         assert k not in totals
     assert "cache_read_tokens" not in t.calls[0]
+
+
+def test_one_sided_multipliers_do_not_price_the_missing_side():
+    """T8 probe (2026-09-21): a record with cache_read but no cache_write
+    must not price 50k write tokens at $0.0 with cost_incomplete=False —
+    the used-but-unpriced side marks the run incomplete and names the
+    model (the promise stated in the PR's own comment)."""
+    t = TokenTracker()
+    t.record_call(
+        model="m", input_tokens=10, output_tokens=10,
+        pricing={"input": 2.0, "output": 10.0, "cache_read": 0.1},
+        usage_details={"cache_read_input_tokens": 1_000,
+                       "cache_creation_input_tokens": 50_000})
+    totals = t.get_totals()
+    assert "m" in totals["unpriced_cache_models"], (
+        "the write side lacks its multiplier — the run must be marked "
+        "incomplete, not priced at $0")
+    assert totals["cost_incomplete"]
+    assert totals["total_cache_write_tokens"] == 50_000
+    summary = t.get_summary()
+    assert summary.get("total_cache_read_tokens") == 1_000
+    assert summary.get("unpriced_cache_models") == ["m"]

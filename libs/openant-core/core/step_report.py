@@ -200,6 +200,8 @@ def _snapshot_usage() -> tuple[float | None, dict | None]:
             snap["cache_read"] = usage.total_cache_read_tokens
         if usage.total_cache_write_tokens:
             snap["cache_write"] = usage.total_cache_write_tokens
+        if usage.unpriced_cache_models:
+            snap["unpriced_cache_models"] = usage.unpriced_cache_models
         return usage.total_cost_usd, snap
     except Exception as exc:
         # #605: a failed snapshot is a SENTINEL, never a complete-looking
