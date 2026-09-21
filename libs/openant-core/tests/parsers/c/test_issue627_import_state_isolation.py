@@ -8,8 +8,10 @@ failing files together, and the full suite passed.
 Root cause (bisected to the poisoning file
 ``tests/parsers/c/test_empty_seed_keep_all.py``): it execs
 ``parsers/c/test_pipeline.py`` for its ``CPipelineTest``, and that
-module — like ``parsers/python/parse_repository.py`` and every parser's
-pipeline script — imports its parser machinery under BARE module names
+module — like ``parsers/python/parse_repository.py`` and the PHP and
+Ruby pipeline scripts (Go, JavaScript, and Swift use qualified
+imports; their loaders leak sys.path state but do not poison the
+bare-name cache) — imports its parser machinery under BARE module names
 (``function_extractor``, ``call_graph_builder``, ``repository_scanner``,
 ``unit_generator``) via a ``sys.path`` entry. The exec leaves the C
 versions in ``sys.modules``; a later ``parse_repository(language="python")``
@@ -18,10 +20,10 @@ statistics lack ``standalone_functions`` — the resolution-shaped failures.
 
 The full suite passes only because some earlier test happens to import the
 PYTHON bare names first — order decides the winner, which is exactly the
-flakiness class. The fix is loader isolation (snapshot/restore
-``sys.modules`` + ``sys.path`` around the exec — the per-test state reset
-the issue's direction names), applied to BOTH exec sites (the c loader
-here, and the zig loader that mirrors it).
+flakiness class. The fix is loader isolation (snapshot/restore of ``sys.path`` and
+``sys.modules`` at loader ENTRY, around the exec — new keys removed,
+replaced keys restored), applied to the loaders whose pipelines import
+bare names: c, zig, php, ruby.
 
 Contract pinned here (self-contained — the poisoning is reproduced
 WITHIN one test, so no invocation order is required to see it):
