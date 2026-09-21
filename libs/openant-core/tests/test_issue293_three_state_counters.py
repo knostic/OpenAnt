@@ -19,9 +19,14 @@ Contract locked here (the issue's suggested test 4):
 - an incomplete verification no longer stamps the false "Changed from X to
   X" note (Stage-1 verdict preserved == X);
 - the analyzer callback buckets `inconclusive` / `insufficient_context`
-  (stable enum findings) as incomplete, not completed — driven through the
-  REAL run_analysis closure (stubbed _run_detection) for both fresh and
-  resumed (restore-seeded) runs, and enhance's restore seeding likewise.
+  (stable enum findings) as completed per the #293 adjudication (the
+  analyzer's own comment: completed verdicts, not incomplete) — driven
+  through the REAL run_analysis closure (stubbed _run_detection) for both
+  fresh and resumed (restore-seeded) runs, and enhance's restore seeding
+  likewise. (#623: this file's docstring previously said "incomplete" —
+  the code asserts completed; this test drives the `inconclusive` row —
+  the `insufficient_context` sibling's counting is pinned in
+  test_issue623_rescue_enum_alignment.py.)
 
 Deliberately NOT covered here: experiment.py's harness metric
 (verifications_incomplete) — harness-only code the issue itself lists "for

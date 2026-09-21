@@ -84,7 +84,7 @@ def budget_retry_cap(index: int, budget_set: set, binding=None) -> int | None:
 from core.analysis_core import (
     analyze_unit,
 )
-from core.verdict_taxonomy import SENTINEL_CLASSIFICATIONS
+from core.verdict_taxonomy import fold_legacy_finding, SENTINEL_CLASSIFICATIONS
 
 # Import application context (optional)
 try:
@@ -530,9 +530,20 @@ def _count_verdicts(results):
             # malformed shape (#324; null/empty verdicts): an error, not a
             # silent drop.
             counts["errors"] += 1
-        elif finding.lower() in counts:
-            counts[finding.lower()] += 1
-        elif verdict == "ERROR" or finding.lower() == "error":
+            continue
+        # #623: the legacy INSUFFICIENT_CONTEXT value is INCONCLUSIVE's
+        # legacy synonym at every counting sink (a rescue-schema artifact the
+        # Stage-1 prompt never offered) — completed per #293, resumed as
+        # legal (analyze_result_is_error's STAGE1_VERDICTS admits it), and
+        # previously folded to ``errors`` HERE by the #427 catch-all while
+        # the summary counted it completed: four consumers, four answers.
+        # Counted as inconclusive now (the row's own stored values are NEVER
+        # rewritten — raw_finding/verdict keep the provenance; resume
+        # adoption unchanged).
+        _f = fold_legacy_finding(finding.lower())
+        if _f in counts:
+            counts[_f] += 1
+        elif verdict == "ERROR" or _f == "error":
             # finding=="error" without verdict=="ERROR" (a legacy
             # half-stamped row): agree with analyze_result_is_error, which
             # classifies it as an error.
