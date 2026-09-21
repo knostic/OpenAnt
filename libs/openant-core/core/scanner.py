@@ -32,7 +32,7 @@ from core import tracking
 from utilities.llm_client import get_global_tracker
 from utilities.child_interp import resolved_core_path
 from utilities.file_io import read_json, write_json
-from utilities.llm.adapter import LLMAuthError
+from utilities.llm.adapter import LLMAuthError, ThinkingPolicyRejectedError
 
 # Import app context generator (optional)
 try:
@@ -1034,6 +1034,12 @@ def scan_repository(
                 # The designed abort: bad credentials surface loudly, never
                 # degrade into a skip (a silently-skipped reachability pass
                 # reads as a clean run to a credential-less user).
+                raise
+            except ThinkingPolicyRejectedError:
+                # #625 (review-arc D1): the LLR phase's own re-raise —
+                # same fail-closed contract as the analyze step: the scan
+                # must not continue on a seeded set the policy rejected
+                # (the under-seeded analyze would pay and read green).
                 raise
             except Exception as exc:
                 # #268 (wave catch): the body mutates result.units_count

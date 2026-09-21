@@ -76,7 +76,7 @@ def test_unrelated_400_stays_response_error():
     except ThinkingPolicyRejectedError:
         raise AssertionError("a 400 not naming thinking is NOT policy-fatal")
     except LLMResponseError:
-        pass
+        pass  # expected: a 400 not naming thinking keeps its structural class
 
 
 def test_thinking_named_400_without_policy_stays_response_error():
@@ -87,7 +87,7 @@ def test_thinking_named_400_without_policy_stays_response_error():
     except ThinkingPolicyRejectedError:
         raise AssertionError("no configured policy → not policy-fatal")
     except LLMResponseError:
-        pass
+        pass  # expected: no configured policy, the 400 stays structural
 
 
 def test_process_unit_lets_the_rejection_escape():
@@ -119,7 +119,7 @@ def test_process_unit_lets_the_rejection_escape():
 def test_dropped_blocks_are_per_step_deltas(tmp_path):
     from core.step_report import step_context
     from utilities.llm_client import reset_warning_state
-    from utilities.llm.providers.anthropic import _count_dropped_block
+    import utilities.llm.providers.anthropic as anth
 
     reset_warning_state()
     out = str(tmp_path)
@@ -129,9 +129,9 @@ def test_dropped_blocks_are_per_step_deltas(tmp_path):
 
     with step_context("two", out, inputs={}) as ctx:
         ctx.summary = {}
-        _count_dropped_block("thinking")
-        _count_dropped_block("thinking")
-        _count_dropped_block("refusal")
+        anth._count_dropped_block("thinking")
+        anth._count_dropped_block("thinking")
+        anth._count_dropped_block("refusal")
 
     one = json.loads(Path(out, "one.report.json").read_text())
     two = json.loads(Path(out, "two.report.json").read_text())
@@ -144,7 +144,7 @@ def test_dropped_blocks_are_per_step_deltas(tmp_path):
 
     with step_context("three", out, inputs={}) as ctx:
         ctx.summary = {}
-        _count_dropped_block("thinking")
+        anth._count_dropped_block("thinking")
     with step_context("four", out, inputs={}) as ctx:
         ctx.summary = {}
     four = json.loads(Path(out, "four.report.json").read_text())
@@ -215,3 +215,21 @@ def test_llm_reach_fold_present_and_digest_sensitive():
         extra_key={"thinking": {"type": "adaptive"}})
     assert d_none["key_digest"] != d_set["key_digest"], (
         "a policy change must invalidate llm-reachability checkpoints")
+
+
+def test_llr_rejection_is_fatal_not_a_swallowed_batch():
+    """Review-arc D1: the LLR phase re-raises the policy rejection (the
+    per-batch catch-all swallowed it — every batch failing identically
+    read as 'partial' while the scan continued under-seeded)."""
+    import core.llm_reachability as llr_mod
+    import inspect as _inspect
+    src = _inspect.getsource(llr_mod)
+    assert "except ThinkingPolicyRejectedError:" in src, (
+        "the LLR attempt must re-raise the rejection before the "
+        "generic per-batch catch-all")
+    src_scanner = _inspect.getsource(
+        __import__("core.scanner", fromlist=["x"]))
+    assert src_scanner.count(
+        "except ThinkingPolicyRejectedError:") >= 1, (
+        "the scanner's LLR guard must let the rejection escape the "
+        "catch-and-continue (same fail-closed contract as analyze)")

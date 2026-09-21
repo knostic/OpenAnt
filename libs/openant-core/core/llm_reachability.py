@@ -463,6 +463,7 @@ def analyze_reachability(
 
     # Lazy import so this module stays usable when callers explicitly
     # provide a binding and never want the registry fallback above.
+    from utilities.llm.adapter import ThinkingPolicyRejectedError
     from utilities.llm import (LLMAuthError, TextBlock, simple_completion,
                             DEFAULT_MAX_TOKENS)
 
@@ -745,6 +746,15 @@ def analyze_reachability(
             # Auth failures are fatal and recur on every batch — surface
             # them instead of burying them as a per-batch "failed" line,
             # so the caller can stop and tell the user the key is bad.
+            raise
+        except ThinkingPolicyRejectedError:
+            # #625 (review-arc D1): a rejected thinking policy is the
+            # same deterministic-recurs-on-every-batch class as auth —
+            # a config/provider mismatch, never a per-batch transient.
+            # Swallowing it under-seeds the scan (every batch fails, 0
+            # promotions) while the step reads "partial" and the envelope
+            # "success" — the phase that decides what gets analyzed must
+            # fail closed like analyze does.
             raise
         except Exception as exc:  # noqa: BLE001 — advisory stage; never crash pipeline
             # #569 x #558 composition (the review follow-up): a DETERMINISTIC
