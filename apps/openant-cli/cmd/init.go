@@ -237,15 +237,7 @@ func runInit(cmd *cobra.Command, args []string) {
 	}
 
 	// Write scan-run meta.json reflecting the decision.
-	meta := config.NewScanMeta(
-		decision.Kind,
-		project.CommitSHA,
-		git.CurrentBranch(repoPath),
-		initLanguage,
-	)
-	meta.Base = decision.Base
-	meta.Scope = decision.Scope
-	if err := config.SaveScanMeta(name, project.CommitSHAShort, initLanguage, meta); err != nil {
+	if err := writeInitScanMeta(name, project, decision, git.CurrentBranch(repoPath), initLanguage); err != nil {
 		output.PrintWarning(fmt.Sprintf("Failed to write scan meta: %s", err))
 	}
 
@@ -305,4 +297,21 @@ func gitRevParseLocal(repoPath, ref string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// writeInitScanMeta records init's pending scan decision in the run's
+// meta.json (#664: keyed on the init language — the same key scan reads
+// via project.Language). Extracted from runInit so the write site is
+// directly guardable (the linkage gate's finding: the inline site had no
+// test that fails when its key is wrong).
+func writeInitScanMeta(name string, project *config.Project, decision modeDecision, branch, initLanguage string) error {
+	meta := config.NewScanMeta(
+		decision.Kind,
+		project.CommitSHA,
+		branch,
+		initLanguage,
+	)
+	meta.Base = decision.Base
+	meta.Scope = decision.Scope
+	return config.SaveScanMeta(name, project.CommitSHAShort, initLanguage, meta)
 }

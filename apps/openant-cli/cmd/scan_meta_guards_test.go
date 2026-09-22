@@ -123,3 +123,31 @@ func TestAdoptionGuardRejectsLanguageMismatch(t *testing.T) {
 		t.Fatalf("python's pending record was modified: %v %+v", err2, py)
 	}
 }
+
+// Guard (h) (the linkage gate's own finding): init's ACTUAL write site —
+// writeInitScanMeta must key and stamp the init language (the same key
+// scan reads via project.Language). Drives the extracted helper directly,
+// so mutating its key or stamp fails here.
+func TestInitWriteSiteKeysOnProjectLanguage(t *testing.T) {
+	withTempHome(t)
+	name := "p"
+	initLanguage := "python"
+	project := config.NewProject(name, "", t.TempDir(), "git", initLanguage, "current0000")
+	if err := config.SaveProject(project); err != nil {
+		t.Fatal(err)
+	}
+	decision := modeDecision{Kind: config.ScanKindDiff, Base: "from-init", Scope: "callers"}
+	if err := writeInitScanMeta(name, project, decision, "main", initLanguage); err != nil {
+		t.Fatal(err)
+	}
+	// the invariant: the write key == the project's persisted language ==
+	// meta.Language (opus's L). A mutation of the helper's key breaks the
+	// handoff — scan reads project.Language and must find the record.
+	got, err := config.LoadScanMeta(name, project.CommitSHAShort, project.Language)
+	if err != nil {
+		t.Fatalf("init's pending record is not at the key scan reads: %v", err)
+	}
+	if got.Base != "from-init" || got.Scope != "callers" || got.Language != initLanguage {
+		t.Fatalf("init's record lost its decision or stamp: %+v", got)
+	}
+}
