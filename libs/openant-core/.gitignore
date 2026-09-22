@@ -1,1 +1,2 @@
 # the generate-context step report is a run artifact (writes beside the output file; the output defaults to CWD — any run from the core tree dirties the checkout). #666: untracked + ignored.
+generate-context.report.json
