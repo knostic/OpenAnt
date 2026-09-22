@@ -119,11 +119,11 @@ class TestItem3DegenerateWebAppDescriptor:
             f"got: {descriptor['attacker']!r}")
 
 
-def test_three_digest_fixtures_not_two():
-    """The digest helpers carry THREE routing classes after the fix
-    (was: two)."""
-    assert len(_builtin_context_digest_renders()) == 3
-    assert len(_builtin_persona_digest_renders()) == 4  # 3 user prompts + the web_app system arm
+def test_four_digest_fixtures_not_three():
+    """The digest helpers carry FOUR routing classes after the #653 §1
+    follow-up (was: three — the untrusted-web class joined #670's set)."""
+    assert len(_builtin_context_digest_renders()) == 4
+    assert len(_builtin_persona_digest_renders()) == 5  # 4 user prompts + the web_app system arm
 
 
 class TestPromptTextsBehavioral:
@@ -225,8 +225,51 @@ class TestPromptTextsBehavioral:
         # in the same fold — the #621 contract extended)
         from prompts.verification_prompts import _builtin_persona_digest_renders
         renders = _builtin_persona_digest_renders()
-        assert len(renders) == 4, (
-            "the persona renders: 3 user prompts + the web_app system prompt "
-            "(the fold-visible arm)")
+        assert len(renders) == 5, (
+            "the persona renders: 4 user prompts (incl. the untrusted web "
+            "app) + the web_app system prompt (the fold-visible arm)")
         system_in_renders = any("web application" in r.lower() for r in renders)
         assert system_in_renders, "the web_app system arm is fold-visible"
+
+
+def test_untrusted_web_app_routing_moves_the_digest():
+    """The #653 §1 class: a routing edit that re-routes an UNTRUSTED web
+    app (the web_app exclusion in _is_untrusted_input_context) must move
+    templates_sha — resumed scans must not adopt verdicts produced under
+    the superseded routing. The all-trusted fixture covers the degenerate
+    class only; this is the discriminator's own branch."""
+    from context.application_context import ApplicationContext
+    from core.backend_identity import templates_digest
+    from core.verifier import _verify_template_texts
+    from prompts.verification_prompts import _is_untrusted_input_context
+
+    untrusted_web = ApplicationContext(
+        application_type="web_app",
+        purpose="digest fixture",
+        trust_boundaries={"http_body": "untrusted"},
+        requires_remote_trigger=True,
+    )
+    # the live routing today: the web_app exclusion keeps an untrusted
+    # web app on the browser persona
+    assert _is_untrusted_input_context(untrusted_web) is False
+    base = templates_digest([r() for r in _verify_template_texts()])
+
+    original = _is_untrusted_input_context
+
+    def _mutant(ctx):
+        # remove the web_app exclusion — the untrusted web app re-routes
+        # to the untrusted-input persona
+        return bool(ctx is not None and ctx.untrusted_boundaries())
+
+    from prompts import verification_prompts as vp
+    vp._is_untrusted_input_context = _mutant
+    try:
+        assert _mutant(untrusted_web) is True, (
+            "the mutant really re-routes the untrusted web app")
+        mutated = templates_digest([r() for r in _verify_template_texts()])
+    finally:
+        vp._is_untrusted_input_context = original
+    assert mutated != base, (
+        "a routing edit that changes an untrusted web app's live persona "
+        "must move templates_sha (the #653 §1 guard)"
+    )

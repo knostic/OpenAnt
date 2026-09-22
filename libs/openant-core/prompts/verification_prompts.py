@@ -136,10 +136,23 @@ def _builtin_context_digest_renders() -> list[str]:
         trust_boundaries={"http_body": "trusted", "http_headers": "trusted"},
         requires_remote_trigger=False,
     )
+    # #653 §1: the UNTRUSTED web app — the discriminator's own branch.
+    # The exclusion in _is_untrusted_input_context keeps it on the browser
+    # persona today; a routing edit that removes the exclusion re-routes it
+    # to the untrusted-input persona, and THAT edit is what the fold must
+    # catch (the all-trusted fixture above covers only the degenerate
+    # class — suppress_local_only fires before the discriminator).
+    web_app_untrusted_fixture = ApplicationContext(
+        application_type="web_app",
+        purpose="digest fixture",
+        trust_boundaries={"http_body": "untrusted"},
+        requires_remote_trigger=True,
+    )
     return [
         _format_builtin_app_context_for_verification(suppress_fixture),
         _format_builtin_app_context_for_verification(untrusted_fixture),
         _format_builtin_app_context_for_verification(web_app_fixture),
+        _format_builtin_app_context_for_verification(web_app_untrusted_fixture),
     ]
 
 
@@ -175,6 +188,16 @@ def _builtin_persona_digest_renders() -> list[str]:
         trust_boundaries={"http_body": "trusted", "http_headers": "trusted"},
         requires_remote_trigger=False,
     )
+    # #653 §1: the untrusted web app joins the persona renders too — the
+    # routing edit this fixture exists to catch changes WHICH persona the
+    # class renders, so the user-prompt render must be in the fold for
+    # the re-route to move the digest.
+    web_app_untrusted_fixture = ApplicationContext(
+        application_type="web_app",
+        purpose="digest fixture",
+        trust_boundaries={"http_body": "untrusted"},
+        requires_remote_trigger=True,
+    )
     return [
         get_verification_prompt(
             code="", finding="", attack_vector="", reasoning="",
@@ -185,6 +208,9 @@ def _builtin_persona_digest_renders() -> list[str]:
         get_verification_prompt(
             code="", finding="", attack_vector="", reasoning="",
             app_context=web_app_fixture),
+        get_verification_prompt(
+            code="", finding="", attack_vector="", reasoning="",
+            app_context=web_app_untrusted_fixture),
         # the web_app system arm + persona join the fold so a wording
         # change re-pays verify (the #621 contract, extended to the arm).
         get_verification_system_prompt(web_app_fixture),
