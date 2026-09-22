@@ -137,7 +137,7 @@ func TestInitWriteSiteKeysOnProjectLanguage(t *testing.T) {
 		t.Fatal(err)
 	}
 	decision := modeDecision{Kind: config.ScanKindDiff, Base: "from-init", Scope: "callers"}
-	if err := writeInitScanMeta(name, project, decision, "main", initLanguage); err != nil {
+	if err := writeInitScanMeta(name, project, decision, "main"); err != nil {
 		t.Fatal(err)
 	}
 	// the invariant: the write key == the project's persisted language ==
