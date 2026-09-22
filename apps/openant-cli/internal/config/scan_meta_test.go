@@ -36,10 +36,10 @@ func TestSaveLoadScanMetaRoundTrip(t *testing.T) {
 		AnalyzerVersion: "0.1.0",
 		Model:           "opus",
 	}
-	if err := SaveScanMeta("test/proj", "abc123de", want); err != nil {
+	if err := SaveScanMeta("test/proj", "abc123de", "test_lang", want); err != nil {
 		t.Fatalf("SaveScanMeta: %v", err)
 	}
-	got, err := LoadScanMeta("test/proj", "abc123de")
+	got, err := LoadScanMeta("test/proj", "abc123de", "test_lang")
 	if err != nil {
 		t.Fatalf("LoadScanMeta: %v", err)
 	}
@@ -51,18 +51,19 @@ func TestSaveLoadScanMetaRoundTrip(t *testing.T) {
 func TestSaveScanMetaWritesAtPredictablePath(t *testing.T) {
 	home := withTempHome(t)
 	m := &ScanMeta{Kind: ScanKindFull, Commit: "x", StartedAt: "2026-04-28T00:00:00Z", Status: ScanStatusRunning, Language: "python"}
-	if err := SaveScanMeta("p", "shortsha", m); err != nil {
+	if err := SaveScanMeta("p", "shortsha", "go", m); err != nil {
 		t.Fatalf("SaveScanMeta: %v", err)
 	}
-	expected := filepath.Join(home, ".openant", "projects", "p", "scans", "shortsha", "meta.json")
+	// #664: the per-language path (not the legacy sha-level)
+	expected := filepath.Join(home, ".openant", "projects", "p", "scans", "shortsha", "go", "meta.json")
 	if _, err := os.Stat(expected); err != nil {
-		t.Fatalf("meta.json not at expected path %s: %v", expected, err)
+		t.Fatalf("meta.json not at expected per-language path %s: %v", expected, err)
 	}
 }
 
 func TestLoadScanMetaMissing(t *testing.T) {
 	withTempHome(t)
-	_, err := LoadScanMeta("never/initialized", "deadbeef")
+	_, err := LoadScanMeta("never/initialized", "deadbeef", "go")
 	if err == nil {
 		t.Fatal("expected error loading missing meta, got nil")
 	}
@@ -86,10 +87,10 @@ func TestLatestScanMetaReturnsNewestSuccess(t *testing.T) {
 		Status:    ScanStatusSuccess,
 		Language:  "python",
 	}
-	if err := SaveScanMeta("p", "older0000", older); err != nil {
+	if err := SaveScanMeta("p", "older0000", "go", older); err != nil {
 		t.Fatal(err)
 	}
-	if err := SaveScanMeta("p", "newer1111", newer); err != nil {
+	if err := SaveScanMeta("p", "newer1111", "go", newer); err != nil {
 		t.Fatal(err)
 	}
 
@@ -117,7 +118,7 @@ func TestLatestScanMetaSkipsFailedAndLegacyDirs(t *testing.T) {
 		StartedAt: time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339),
 		Status:    ScanStatusSuccess, Language: "python",
 	}
-	if err := SaveScanMeta("p", "goodshort", good); err != nil {
+	if err := SaveScanMeta("p", "goodshort", "go", good); err != nil {
 		t.Fatal(err)
 	}
 
@@ -127,7 +128,7 @@ func TestLatestScanMetaSkipsFailedAndLegacyDirs(t *testing.T) {
 		StartedAt: time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339),
 		Status:    ScanStatusFailed, Language: "python",
 	}
-	if err := SaveScanMeta("p", "failedshrt", failed); err != nil {
+	if err := SaveScanMeta("p", "failedshrt", "go", failed); err != nil {
 		t.Fatal(err)
 	}
 
@@ -163,15 +164,15 @@ func TestLatestScanMetaNoProject(t *testing.T) {
 func TestFinalizeScanMetaSetsTerminalStatus(t *testing.T) {
 	withTempHome(t)
 	m := NewScanMeta(ScanKindFull, "abc", "master", "python")
-	if err := SaveScanMeta("p", "abcshort", m); err != nil {
+	if err := SaveScanMeta("p", "abcshort", "go", m); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := FinalizeScanMeta("p", "abcshort", ScanStatusSuccess); err != nil {
+	if err := FinalizeScanMeta("p", "abcshort", "go", ScanStatusSuccess); err != nil {
 		t.Fatalf("FinalizeScanMeta: %v", err)
 	}
 
-	got, err := LoadScanMeta("p", "abcshort")
+	got, err := LoadScanMeta("p", "abcshort", "go")
 	if err != nil {
 		t.Fatalf("LoadScanMeta: %v", err)
 	}
@@ -188,7 +189,7 @@ func TestFinalizeScanMetaSetsTerminalStatus(t *testing.T) {
 
 func TestFinalizeScanMetaIsNoOpWhenMissing(t *testing.T) {
 	withTempHome(t)
-	if err := FinalizeScanMeta("never/seen", "deadbeef", ScanStatusSuccess); err != nil {
+	if err := FinalizeScanMeta("never/seen", "deadbeef", "go", ScanStatusSuccess); err != nil {
 		t.Errorf("expected no error finalizing missing meta, got %v", err)
 	}
 }

@@ -417,7 +417,7 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 
 	// Reuse init's pending decision when no flags override it.
 	if !flagsPassed && ctx != nil && ctx.Project != nil {
-		existing, err := config.LoadScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, "")
+		existing, err := config.LoadScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, ctx.Project.Language)
 		if err == nil && existing.Status == config.ScanStatusRunning {
 			return modeDecision{Kind: existing.Kind, Base: existing.Base, Scope: existing.Scope}, nil
 		}
