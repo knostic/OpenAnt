@@ -238,8 +238,8 @@ func runScan(cmd *cobra.Command, args []string) {
 	// detection so that any PR-mode checkout happens first and the scan
 	// dir is up-to-date.
 	manifestOpts := diffOpts{}
-		// #668: PR is stamp-only (the fetch already happened in selectMode); it does NOT set opts.pr (which means "fetch this")
-		manifestOpts.prNumber = decision.PR
+	// #668: PR is stamp-only (the fetch already happened in selectMode); it does NOT set opts.pr (which means "fetch this")
+	manifestOpts.prNumber = decision.PR
 	if decision.Kind == config.ScanKindDiff {
 		manifestOpts.base = decision.Base
 		manifestOpts.scope = decision.Scope
