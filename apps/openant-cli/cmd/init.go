@@ -200,6 +200,39 @@ func runInit(cmd *cobra.Command, args []string) {
 		commitSHA = "nogit"
 	}
 
+	// #669: selectMode runs BEFORE the project save — the PR fetch may
+	// rewrite the working tree (FetchPR checks out pr-head), and the
+	// project identity + scan-dir key + meta.json must all point at the
+	// commit that was actually checked out, not the pre-checkout HEAD.
+	decision, err := selectMode(modeOpts{
+		full:        initFull,
+		incremental: initIncremental,
+		diffBase:    initDiffBase,
+		pr:          initPR,
+		scope:       initDiffScope,
+		projectName: name,
+		repoPath:    repoPath,
+	})
+	if err != nil {
+		output.PrintError(err.Error())
+		os.Exit(2)
+	}
+
+	// #669: if the PR fetch moved the tree, re-resolve the commit SHA
+	// so the project, the scan dir, and the meta all name the scanned tree.
+	if isGit && initPR > 0 {
+		sha, warn, err := resolveLocalCommit(repoPath, "")
+		if err != nil {
+			output.PrintWarning(fmt.Sprintf(
+				"PR checkout moved the tree but the post-checkout SHA could not be re-resolved: %s — the project identity names the pre-checkout commit", err))
+		} else {
+			if warn != "" {
+				output.PrintWarning(warn)
+			}
+			commitSHA = sha
+		}
+	}
+
 	// Create project
 	project := config.NewProject(name, repoURL, repoPath, source, initLanguage, commitSHA)
 
@@ -218,22 +251,6 @@ func runInit(cmd *cobra.Command, args []string) {
 	if err := os.MkdirAll(scanDir, 0755); err != nil {
 		output.PrintError(fmt.Sprintf("Failed to create scan directory: %s", err))
 		os.Exit(1)
-	}
-
-	// Decide full vs incremental. selectMode handles flag validation,
-	// baseline lookup, TTY prompt, and non-TTY error.
-	decision, err := selectMode(modeOpts{
-		full:        initFull,
-		incremental: initIncremental,
-		diffBase:    initDiffBase,
-		pr:          initPR,
-		scope:       initDiffScope,
-		projectName: name,
-		repoPath:    repoPath,
-	})
-	if err != nil {
-		output.PrintError(err.Error())
-		os.Exit(2)
 	}
 
 	// Write scan-run meta.json reflecting the decision.
