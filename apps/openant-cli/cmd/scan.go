@@ -400,7 +400,7 @@ func finalizeScanMetaIfProject(ctx *projectContext, status string) {
 	if ctx == nil || ctx.Project == nil {
 		return
 	}
-	if err := config.FinalizeScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, scanLanguage, status); err != nil {
+	if err := config.FinalizeScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, ctx.Project.Language, status); err != nil {
 		output.PrintWarning(fmt.Sprintf("Failed to update scan meta: %s", err))
 	}
 }
@@ -453,7 +453,7 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 		)
 		meta.Base = decision.Base
 		meta.Scope = decision.Scope
-		if err := config.SaveScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, scanLanguage, meta); err != nil {
+		if err := config.SaveScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, ctx.Project.Language, meta); err != nil {
 			output.PrintWarning(fmt.Sprintf("Failed to write scan meta: %s", err))
 		}
 	}
