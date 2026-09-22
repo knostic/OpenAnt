@@ -228,11 +228,6 @@ func LatestScanMeta(projectName string) (*ScanMeta, string, error) {
 			if err != nil {
 				continue
 			}
-			lang := m.Language
-			if lang == "" {
-				lang = le.Name()
-			}
-			seenLangs[lang] = true
 			if m.Status != ScanStatusSuccess {
 				continue
 			}
@@ -240,6 +235,14 @@ func LatestScanMeta(projectName string) (*ScanMeta, string, error) {
 			if err != nil {
 				continue
 			}
+			// F-A (#664 review): only a per-language SUCCESS may suppress
+			// the legacy copy — a failed/running rescan in the same
+			// language is NOT the same run as the legacy success.
+			lang := m.Language
+			if lang == "" {
+				lang = le.Name()
+			}
+			seenLangs[lang] = true
 			candidates = append(candidates, candidate{shortSHA: e.Name(), meta: m, ts: ts})
 		}
 		// legacy sha-level meta (pre-#664) — competes as a candidate

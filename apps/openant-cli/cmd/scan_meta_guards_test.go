@@ -88,3 +88,38 @@ func TestScanLanguageOverrideWritesOwnRecord(t *testing.T) {
 		t.Fatalf("python's record was modified by the go run: %+v", py)
 	}
 }
+
+// Guard (g) (F-C, #664 review): the adoption guard — a pending decision
+// written by init under the PIN must not be adopted by a run whose
+// language differs. Fails when the guard condition is removed.
+func TestAdoptionGuardRejectsLanguageMismatch(t *testing.T) {
+	withTempHome(t)
+	// init's pending diff decision under the pin "python"
+	meta := config.NewScanMeta(config.ScanKindDiff, "current", "main", "python")
+	meta.Base = "from-init"
+	meta.Scope = "callers"
+	if err := config.SaveScanMeta("p", "currshort", "python", meta); err != nil {
+		t.Fatal(err)
+	}
+	savedFull, savedIncremental, savedDiffBase, savedPR, savedStaged := scanFull, scanIncremental, scanDiffBase, scanPR, scanStaged
+	savedLang := scanLanguage
+	defer func() {
+		scanFull, scanIncremental, scanDiffBase, scanPR, scanStaged = savedFull, savedIncremental, savedDiffBase, savedPR, savedStaged
+		scanLanguage = savedLang
+	}()
+	scanFull, scanIncremental, scanDiffBase, scanPR, scanStaged = false, false, "", 0, false
+	scanLanguage = "go" // the run's language differs from the pin
+	ctx := &projectContext{Project: &config.Project{Name: "p", CommitSHAShort: "currshort", Language: "python"}}
+	got, err := resolveScanMode(ctx, t.TempDir())
+	// Either selectMode errors (non-interactive, no baseline) or it
+	// re-decides — either proves non-adoption. What must NOT happen:
+	// adopting python's Base/Scope for a go run.
+	if err == nil && got.Base == "from-init" {
+		t.Fatalf("python's pending decision was adopted for a go run: %+v", got)
+	}
+	// and python's record is untouched by the non-adoption
+	py, err2 := config.LoadScanMeta("p", "currshort", "python")
+	if err2 != nil || py.Base != "from-init" || py.Status != config.ScanStatusRunning {
+		t.Fatalf("python's pending record was modified: %v %+v", err2, py)
+	}
+}

@@ -117,13 +117,14 @@ func TestLatestScanMetaLegacyNotShadowedByPerLang(t *testing.T) {
 	}
 }
 
-// Guard (d): the migrated legacy record does not double-resolve. When the
-// legacy success WAS migrated to a per-language record of the same
-// language, the legacy copy is dropped from the walk (identity dedup, not
-// shadowing).
+// Guard (d): once the legacy success was migrated to a per-language
+// record of the same language, the legacy copy is DROPPED from the walk —
+// even when the legacy copy is newer (a stale re-run of a pre-#664
+// binary). The per-language record is the live one. Without the identity
+// dedup the newer legacy copy would win.
 func TestLatestScanMetaMigratedLegacyDeduped(t *testing.T) {
 	withTempHome(t)
-	legacy := &ScanMeta{Kind: ScanKindFull, Commit: "x", StartedAt: "2026-04-28T00:00:00Z", Status: ScanStatusSuccess, Language: "python"}
+	legacy := &ScanMeta{Kind: ScanKindFull, Commit: "x", StartedAt: "2026-05-30T00:00:00Z", Status: ScanStatusSuccess, Language: "python"}
 	if err := SaveScanMeta("p", "sha1", "", legacy); err != nil {
 		t.Fatal(err)
 	}
@@ -137,6 +138,33 @@ func TestLatestScanMetaMigratedLegacyDeduped(t *testing.T) {
 	}
 	if m == nil {
 		t.Fatal("the migrated record should still resolve")
+	}
+	if m.StartedAt != "2026-04-28T00:00:00Z" {
+		t.Fatalf("the stale legacy copy won resolution: StartedAt=%s — the migrated per-language record is the live one", m.StartedAt)
+	}
+}
+
+// Guard (f) (F-A, #664 review): a FAILED same-language rescan must not
+// shadow the legacy success — the default upgrade path.
+func TestLatestScanMetaLegacyNotShadowedBySameLangFailure(t *testing.T) {
+	withTempHome(t)
+	legacy := &ScanMeta{Kind: ScanKindFull, Commit: "x", StartedAt: "2026-04-28T00:00:00Z", Status: ScanStatusSuccess, Language: "python"}
+	if err := SaveScanMeta("p", "sha1", "", legacy); err != nil {
+		t.Fatal(err)
+	}
+	failed := &ScanMeta{Kind: ScanKindFull, Commit: "x", StartedAt: "2026-04-29T00:00:00Z", Status: ScanStatusFailed, Language: "python"}
+	if err := SaveScanMeta("p", "sha1", "python", failed); err != nil {
+		t.Fatal(err)
+	}
+	m, sha, err := LatestScanMeta("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m == nil || sha == "" {
+		t.Fatal("the legacy python success was shadowed by a FAILED python rescan — the #664 complaint, recreated in the default upgrade path")
+	}
+	if m.Status != ScanStatusSuccess {
+		t.Fatalf("resolved a non-success: %+v", m)
 	}
 }
 

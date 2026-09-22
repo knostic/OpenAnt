@@ -163,7 +163,7 @@ func TestLatestScanMetaNoProject(t *testing.T) {
 
 func TestFinalizeScanMetaSetsTerminalStatus(t *testing.T) {
 	withTempHome(t)
-	m := NewScanMeta(ScanKindFull, "abc", "master", "python")
+	m := NewScanMeta(ScanKindFull, "abc", "master", "go")
 	if err := SaveScanMeta("p", "abcshort", "go", m); err != nil {
 		t.Fatal(err)
 	}
