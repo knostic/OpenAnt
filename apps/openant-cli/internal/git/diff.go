@@ -1,6 +1,7 @@
 package git
 
 import (
+	"os"
 	"bufio"
 	"bytes"
 	"encoding/json"
@@ -115,12 +116,20 @@ func FetchPR(repoPath string, prNumber int, stderr *bytes.Buffer) (string, error
 		return "", fmt.Errorf("gh pr view returned empty baseRefName for PR %d", prNumber)
 	}
 
-	prSpec := fmt.Sprintf("pull/%d/head:pr-head", prNumber)
+	// #665: the PR head fetches into a UNIQUE non-branch ref (not a
+	// fixed "pr-head" branch that every invocation shares). The checkout
+	// is DETACHED — a detached checkout never blocks a re-fetch and
+	// never leaves a branch behind. NO defer: the caller (runScan) and
+	// the Python engine read the tree AFTER FetchPR returns, so any
+	// defer-based restore would fire before the scan reads the tree.
+	// The checkout persists until the caller moves the tree.
+	prRef := fmt.Sprintf("refs/openant/pr/%d/%d", prNumber, os.Getpid())
+	prSpec := fmt.Sprintf("pull/%d/head:%s", prNumber, prRef)
 	if err := runGit(repoPath, stderr, "fetch", "origin", prSpec, "--force"); err != nil {
 		return "", fmt.Errorf("git fetch %s: %w", prSpec, err)
 	}
-	if err := runGit(repoPath, stderr, "checkout", "pr-head"); err != nil {
-		return "", fmt.Errorf("git checkout pr-head: %w", err)
+	if err := runGit(repoPath, stderr, "checkout", "--detach", prRef); err != nil {
+		return "", fmt.Errorf("git checkout --detach %s: %w", prRef, err)
 	}
 	// Best-effort fetch of the base ref. If it's already local this is a no-op.
 	_ = runGit(repoPath, stderr, "fetch", "origin", meta.BaseRefName)
