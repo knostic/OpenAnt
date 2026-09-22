@@ -5543,6 +5543,7 @@ def _build_post_patch_window(
     file_hunks_for_file: "list",
     context,
     try_old_side_anchor: bool,
+    boundary_identifier: "str | None" = None,
 ) -> "_PostPatchWindow | None":
     """Resolve ONE contiguous, patch-ready recovery window for
     `verified_file`, per the Source priority Slice 4 recovery follows:
@@ -5570,6 +5571,27 @@ def _build_post_patch_window(
        unit's own bounds.
     5. (the caller's own fallback, not built here) a small, bounded
        full-file read via the existing build_final_target_slice.
+
+    `boundary_identifier` (default None, preserving this function's exact
+    prior behavior for every existing caller) names the ONE identifier --
+    the current recovery attempt's own already-approved RecoveryTarget
+    identity, never an ordinary diff-derived guess (see
+    recover_post_patch_source) -- that, if and only if resolution reaches
+    it AND it resolves to a small function/method/class-kind match whose
+    tier 4 would otherwise return the exact whole body with zero
+    surrounding lines, instead reads a symmetric POST_PATCH_WINDOW_
+    CONTEXT_LINES-padded window around that same real span (same
+    `_padded_line_range`-shaped arithmetic and `read_file_section`
+    primitive every other padded branch here already uses). This never
+    touches resolution for any OTHER identifier, and never widens what
+    tier 4 returns when `boundary_identifier` is None or isn't reached --
+    see _wrap_post_patch_window for why this widened SOURCE never widens
+    approved TARGET AUTHORITY: the resulting window's own distinct
+    source_kind renders under a heading deliberately excluded from
+    check_patch_target_conformance's EDIT-TARGET-role parsing, so it can
+    never itself enlarge the approved boundary a hunk's position is
+    checked against -- it only gives Patch Generation real repository
+    text to construct a verifiable hunk with.
 
     Returns None when nothing above resolves -- the caller then falls
     back to tier 5."""
@@ -5601,6 +5623,30 @@ def _build_post_patch_window(
         if match.kind == "function" and match.func_id:
             full_source = index.get_function_code(match.func_id)
             if full_source and len(full_source) <= _POST_PATCH_SMALL_ENCLOSING_UNIT_CHARS:
+                if identifier == boundary_identifier and boundary_identifier is not None and match.end_line is not None:
+                    # This IS the current recovery attempt's own approved
+                    # target identity (never an ordinary identifier -- see
+                    # this function's own docstring): its exact body is
+                    # already known/approved evidence, so returning it
+                    # unpadded here adds nothing toward proving a
+                    # boundary-adjacent insertion's real position (see
+                    # _insertion_only_covers_target's own boundary-
+                    # adjacency rule). Read a symmetric padded window
+                    # around the SAME real span instead; falls through to
+                    # the unpadded whole-body return below if that read
+                    # is ever unavailable, never failing this identifier
+                    # outright.
+                    boundary_start = max(1, match.line - POST_PATCH_WINDOW_CONTEXT_LINES)
+                    boundary_end = match.end_line + POST_PATCH_WINDOW_CONTEXT_LINES
+                    boundary_source = index.read_file_section(verified_file, boundary_start, boundary_end)
+                    if boundary_source:
+                        return _PostPatchWindow(
+                            file=verified_file, label=match.label,
+                            target_start=match.line, target_end=match.end_line,
+                            start=boundary_start, end=_rendered_end_line(boundary_start, boundary_source),
+                            source=boundary_source,
+                            enclosing_symbol=match.label, source_kind="boundary_context",
+                        )
                 return _PostPatchWindow(
                     file=verified_file, label=match.label,
                     target_start=match.line, target_end=match.end_line,
@@ -5705,8 +5751,31 @@ def _wrap_post_patch_window(window: _PostPatchWindow, verified_file: str) -> Fin
     target_conformance's own _edit_target_source_for_file already reads
     back as EDIT-TARGET-role content, so a subsequent regeneration
     re-check recognizes this window's code exactly like any other target
-    definition, without needing a new header form."""
-    text = _render_definition_block(window.file, window.label, window.start, window.end, window.source)
+    definition, without needing a new header form.
+
+    EXCEPT for `source_kind == "boundary_context"` (the ONE window shape
+    _build_post_patch_window's own `boundary_identifier` branch can
+    produce -- see its docstring): that window's own start/end
+    deliberately span WIDER than the target's own real (target_start,
+    target_end) span, so rendering it under "Target definition" would
+    hand check_patch_target_conformance's _edit_target_line_ranges_for_
+    file a wider approved range than the target genuinely has -- silently
+    widening insertion-only boundary authority (see
+    _insertion_only_covers_target), never this function's job to do.
+    Rendered under a heading deliberately absent from
+    _EDIT_TARGET_HEADING_PREFIXES instead (the SAME mechanism Category 2
+    already uses to render real evidence without EDIT-TARGET-role
+    status): Patch Generation still sees this real repository text when
+    constructing its regenerated hunk, but it never itself enlarges what
+    a hunk's position is authorized against -- only the target's own
+    existing, unwidened Target definition block (already rendered before
+    Patch Generation ever ran, whenever a RecoveryTarget carries a
+    resolved symbol identity at all) does that, exactly as before this
+    function existed."""
+    heading_label = "Boundary context" if window.source_kind == "boundary_context" else "Target definition"
+    text = _render_definition_block(
+        window.file, window.label, window.start, window.end, window.source, heading_label=heading_label,
+    )
     return FinalTargetSliceResult(
         rendered=text, covered_target_files=[verified_file], covered_target_symbols=[],
         uncovered_target_files=[], uncovered_target_symbols=[],
@@ -6127,7 +6196,30 @@ def recover_post_patch_source(
                         continue
                     seen_ids.add(tok)
                     (changed_identifiers if changed else context_identifiers).append(tok)
-        identifiers = changed_identifiers + context_identifiers
+
+        # This attempt's own already-approved RecoveryTarget identity
+        # (never a diff-derived guess) participates as an explicit
+        # candidate at exactly one priority: after every changed-line
+        # identifier (the strongest signal -- something the generated
+        # diff is actually introducing or editing) and before every
+        # context-line identifier (the weakest signal -- often just an
+        # incidental token, e.g. a type-comment class name, that happens
+        # to appear near a failing hunk without being causally related to
+        # it). `None` whenever this attempt has no resolved symbol
+        # identity (kind == "file"), leaving `identifiers` exactly as
+        # before. Deduplicated against whichever bucket already names it
+        # -- moved out of `context_identifiers` into this one priority
+        # slot rather than appearing twice; never pulled out of
+        # `changed_identifiers`, which already outranks it.
+        boundary_identifier = target.identity if (target.kind == "symbol" and target.identity) else None
+        if boundary_identifier is not None:
+            if boundary_identifier in context_identifiers:
+                context_identifiers.remove(boundary_identifier)
+            identifiers = changed_identifiers + (
+                [] if boundary_identifier in changed_identifiers else [boundary_identifier]
+            ) + context_identifiers
+        else:
+            identifiers = changed_identifiers + context_identifiers
 
         total_remaining = _effective_final_target_max(budget_controller) - len(current_slice.rendered)
         available = min(budget_remaining, total_remaining)
@@ -6151,6 +6243,7 @@ def recover_post_patch_source(
         window = _build_post_patch_window(
             verified_file, identifiers, failing_hunks_for_file, context,
             try_old_side_anchor=(trigger_reason == "uncovered_target"),
+            boundary_identifier=boundary_identifier,
         )
 
         if window is not None:

@@ -2353,3 +2353,183 @@ class TestSlice4Genericity:
         pipeline_slice_4_text = pipeline_text[pidx:eidx]
         for term in forbidden:
             assert term not in pipeline_slice_4_text, f"{term!r} found in pipeline.py's Slice 4 section"
+
+
+# ---------------------------------------------------------------------------
+# RecoveryTarget-identity evidence priority -- a failing insertion hunk's
+# extracted, diff-derived identifiers may resolve to something that merely
+# happens to appear in nearby, unrelated diff context (e.g. a type
+# annotation), rather than to this attempt's own already-approved
+# RecoveryTarget symbol. recover_post_patch_source now makes that approved
+# identity an explicit candidate -- after every changed-line identifier,
+# before every context-line identifier -- so an incidental identifier can
+# no longer "win" resolution merely by being tried first. The window this
+# produces is deliberately WIDER than the target's own natural span (real
+# boundary lines on each side), but must never itself widen what
+# check_patch_target_conformance treats as that target's approved boundary
+# -- see TestBoundaryContextEvidenceDoesNotWidenAuthority below for the
+# control proving that separately.
+# ---------------------------------------------------------------------------
+
+class TestRecoveryPrefersApprovedTargetIdentity:
+    def test_recovery_prefers_approved_target_identity_over_incidental_context_identifier(self, tmp_path):
+        """An insertion-only hunk's own declared old-side anchor does not
+        exist anywhere in the repository (old_side_no_match), so Source
+        Priority 1 (old-side-anchor recovery) is a guaranteed no-op and
+        identifier resolution is all that remains. None of the hunk's own
+        changed-line identifiers (the new symbol it introduces) resolve to
+        anything real. A SEPARATE, unrelated hunk in the same file happens
+        to touch a real, unrelated symbol (`other_symbol`) whose bare name
+        appears as ordinary context text -- today, being the first
+        identifier (of any kind) that resolves at all, it wins recovery's
+        identifier resolution outright, even though this attempt's own
+        RecoveryTarget names a different, already-approved symbol
+        (`target_func`) that never appears as literal text in the diff at
+        all (mirroring a real regression: a leading-underscore identifier
+        is invisible to this module's own identifier-extraction regexes,
+        so an approved target can be a diff-derived identifier candidate
+        SET member of exactly zero, extraction-wise, even while it is
+        already fully known via the RecoveryTarget itself).
+
+        Recovery must resolve THIS attempt's own approved target identity,
+        not the incidental unrelated symbol, and the resulting source must
+        contain real repository text immediately adjacent to the approved
+        target's own boundary -- exactly the evidence a regenerated,
+        boundary-adjacent insertion hunk would need to become verifiable.
+        """
+        from utilities.autopatcher.remediation_planner import (
+            PatchConformanceReport, RecoveryTarget, recover_post_patch_source,
+        )
+
+        lines = [f"FILLER_{i:03d} = 0\n" for i in range(1, 60)]
+        lines[10] = "def other_symbol():\n"
+        lines[11] = "    return 99\n"
+        lines[15] = 'BOUNDARY_BEFORE_TARGET = "adjacent-before"\n'
+        lines[16] = "def target_func(x):\n"
+        lines[17] = "    y = x + 1\n"
+        lines[18] = "    return y\n"
+        lines[19] = 'BOUNDARY_AFTER_TARGET = "adjacent-after"\n'
+        (tmp_path / "mod.py").write_text("".join(lines), encoding="utf-8")
+
+        context = _make_context(functions={
+            "mod.py:other_symbol": {
+                "name": "other_symbol", "className": None, "startLine": 11, "endLine": 12,
+                "code": "def other_symbol():\n    return 99\n",
+            },
+            "mod.py:target_func": {
+                "name": "target_func", "className": None, "startLine": 17, "endLine": 19,
+                "code": "def target_func(x):\n    y = x + 1\n    return y\n",
+            },
+        }, repo_path=tmp_path)
+
+        conformance = PatchConformanceReport(
+            results=[], all_conformant=False, edited_files=["mod.py"],
+            unexpected_files=[], uncovered_files=[], no_match_files=["mod.py"],
+        )
+        patch = (
+            "--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -1,3 +1,7 @@\n"
+            " GHOST_CONTEXT_ONE\n"
+            " GHOST_CONTEXT_TWO\n"
+            " GHOST_CONTEXT_THREE\n"
+            "+def new_helper():\n"
+            "+    return 1\n"
+            "+\n"
+            "+\n"
+            "@@ -11,2 +11,2 @@\n"
+            " def other_symbol():\n"
+            "-    return 99\n"
+            "+    return 100\n"
+        )
+
+        result = recover_post_patch_source(
+            _make_strategy(), str(tmp_path), context, _make_slice_result(), conformance, patch,
+            recovery_targets=[RecoveryTarget(file="mod.py", kind="symbol", identity="target_func")],
+        )
+
+        assert result.attempts[0].success is True
+        assert "target_func" in result.attempts[0].identifiers_considered, (
+            "the approved target identity must participate as a candidate even "
+            "though it never appears as literal text in the diff"
+        )
+        assert result.attempts[0].resolved_target == "target_func", (
+            "recovery must prefer this attempt's own approved target identity "
+            "over an unrelated identifier that merely happens to appear in "
+            "nearby, unrelated diff context"
+        )
+        assert "BOUNDARY_BEFORE_TARGET" in result.slice_result.rendered
+        assert "BOUNDARY_AFTER_TARGET" in result.slice_result.rendered
+
+
+# ---------------------------------------------------------------------------
+# Authority control -- the wider boundary-context evidence
+# TestRecoveryPrefersApprovedTargetIdentity proves recovery now selects must
+# never itself expand what check_patch_target_conformance treats as an
+# approved target's own boundary. Evidence availability and edit
+# authorization are, and must remain, separate.
+# ---------------------------------------------------------------------------
+
+class TestBoundaryContextEvidenceDoesNotWidenAuthority:
+    def test_boundary_context_window_does_not_relax_exact_boundary_rule(self, tmp_path):
+        """A genuinely-outside-boundary insertion (two real lines before
+        the approved target's own first line -- the same exact-boundary
+        control TestInsertionOnlyBoundaryAdjacency already proves for the
+        unwidened case) must remain uncovered/non-conformant even when
+        the wider boundary-context window this module now builds for an
+        approved symbol is present in the very same rendered slice."""
+        from utilities.autopatcher.diff_hunk_repair import repair_hunk_headers
+        from utilities.autopatcher.remediation_planner import (
+            _build_post_patch_window, _merge_slice_results, _wrap_post_patch_window,
+            build_final_target_slice, check_patch_target_conformance,
+        )
+
+        lines = [f"FILLER_{i:03d} = 0\n" for i in range(1, 60)]
+        lines[19] = "def target_func(x):\n"
+        lines[20] = "    y = x + 1\n"
+        lines[21] = "    return y\n"
+        (tmp_path / "mod.py").write_text("".join(lines), encoding="utf-8")
+
+        func_code = "def target_func(x):\n    y = x + 1\n    return y\n"
+        context = _make_context(functions={
+            "mod.py:target_func": {"name": "target_func", "className": None, "startLine": 20, "endLine": 22, "code": func_code},
+        }, repo_path=tmp_path)
+        strategy = _make_strategy(target_files=["mod.py"], target_symbols=["mod.py:target_func"])
+        ready_edits = [_make_ready_edit("mod.py", "mod.py:target_func")]
+
+        natural_slice = build_final_target_slice(strategy, str(tmp_path), context)
+
+        boundary_window = _build_post_patch_window(
+            "mod.py", ["target_func"], [], context,
+            try_old_side_anchor=False, boundary_identifier="target_func",
+        )
+        assert boundary_window is not None
+        assert boundary_window.source_kind == "boundary_context"
+        merged_slice = _merge_slice_results(
+            natural_slice, _wrap_post_patch_window(boundary_window, "mod.py"), strategy,
+        )
+        # The wider boundary-context text (real lines beyond the target's
+        # own natural span) is now present in the merged evidence...
+        assert "FILLER_018" in merged_slice.rendered
+
+        # ...but this insertion sits two REAL lines before the target's
+        # own boundary (line 18, not the allowed line 20) -- genuinely
+        # verified, genuinely outside the exact allowance.
+        patch = (
+            "--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -18,2 +18,4 @@\n"
+            " FILLER_018 = 0\n"
+            "+def helper():\n"
+            "+    return 1\n"
+            " FILLER_019 = 0\n"
+        )
+        patch, meta = repair_hunk_headers(patch, repo_root=tmp_path)
+        assert meta.relocations[0].relocation_reason == "unique_match"
+
+        report = check_patch_target_conformance(patch, meta.relocations, ready_edits, merged_slice)
+        assert report.results[0].old_side_status == "old_side_verified"
+        assert report.results[0].target_coverage == "uncovered_target", (
+            "boundary-context evidence must never widen the approved target's "
+            "own boundary -- an insertion genuinely outside it stays rejected "
+            "even though wider real repository text is now available"
+        )
+        assert report.all_conformant is False
