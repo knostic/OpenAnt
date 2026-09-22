@@ -648,11 +648,13 @@ def _extract_usage_details_chat(usage: Any) -> Optional[dict]:
     Copies ``completion_tokens_details.reasoning_tokens`` and
     ``prompt_tokens_details.cached_tokens`` / ``cache_write_tokens``
     VERBATIM when present; ``None`` when the provider reported none
-    (absent ≠ 0). NEVER feeds the cost formula: OpenAI documents
+    (absent ≠ 0). The reasoning fields stay OUT of the cost formula: OpenAI documents
     ``completion_tokens`` as already INCLUDING reasoning tokens, so
-    summing would double-count — the captured fields exist for
-    reconciliation against a provider bill, and OpenRouter (which
-    reuses this unifier) surfaces the same detail fields.
+    summing would double-count — those stay captured for
+    reconciliation only. #626: the CACHE fields DO price — as INCLUSIVE
+    subsets of ``prompt_tokens`` (the tracker subtracts the priced
+    portion, never billing twice). OpenRouter (which reuses this
+    unifier) surfaces the same detail fields.
     """
     if usage is None:
         return None

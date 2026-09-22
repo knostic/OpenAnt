@@ -158,6 +158,12 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
                 report.token_usage["cost_incomplete"] = True
                 report.token_usage["unpriced_models"] = end_snapshot.get(
                     "unpriced_models", [])
+                # F661-2 (2026-09-22): the cache-unpriced ids too — a
+                # cache-only incompleteness must name its model (#216's
+                # name-the-model, extended to the cache path).
+                if end_snapshot.get("unpriced_cache_models"):
+                    report.token_usage["unpriced_cache_models"] = \
+                        end_snapshot["unpriced_cache_models"]
             # #605: a mid-run accounting drop (another phase's hand-off)
             # surfaces here too — the marker is run-cumulative through the
             # tracker totals, the same accepted trade as #216's.
