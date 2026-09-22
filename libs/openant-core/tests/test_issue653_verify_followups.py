@@ -187,7 +187,7 @@ class TestPromptTextsBehavioral:
         form passed with the arm's render deleted): mutating the web_app
         arm's CONSTANT moves the folded texts; mutating the web_app PERSONA
         moves them too."""
-        import prompts.verification_prompts as vp
+        from prompts import verification_prompts as vp
         from core.verifier import _verify_template_texts
         base = [r() for r in _verify_template_texts()]
 
