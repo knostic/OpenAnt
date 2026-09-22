@@ -453,10 +453,13 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 	// Record the decision in meta.json status=running if we have a project.
 	// finalizeScanMetaIfProject will flip it terminal when the pipeline ends.
 	// #664 review (M2): the record keys on AND stamps the run's effective
-	// language (the flag-overridable scanLanguage — the same component the
-	// artifacts land under), not the project's pinned language. Keying on
-	// the pin made `scan -l go` on a python-pinned project overwrite
-	// python's record with the go run's terminal status.
+	// language (the flag-overridable scanLanguage), not the project's
+	// pinned language. Keying on the pin made `scan -l go` on a
+	// python-pinned project overwrite python's record with the go run's
+	// terminal status. NOTE: the ARTIFACT routing is a separate, unsolved
+	// surface — scanOutput still defaults to ctx.ScanDir (the PIN), so
+	// `scan -l go` lands artifacts under python/ while this record lands
+	// under go/ (issue #667 tracks that alignment).
 	if ctx != nil && ctx.Project != nil {
 		meta := config.NewScanMeta(
 			decision.Kind,
