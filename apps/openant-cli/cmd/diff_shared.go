@@ -11,10 +11,11 @@ import (
 
 // diffOpts collects the diff-mode flags that scan/parse/diff all share.
 type diffOpts struct {
-	base   string
-	pr     int
-	staged bool
-	scope  string
+	base     string
+	pr       int
+	prNumber int // #668: stamp-only (already-resolved PR; excluded from validate()/isSet())
+	staged   bool
+	scope    string
 }
 
 // isSet reports whether any diff flag was provided.
@@ -90,7 +91,11 @@ func prepareDiffManifest(repoPath, outputDir string, opts diffOpts) (string, err
 				fmt.Fprintf(os.Stderr, "PR #%d: base=%s (fetched and checked out pr-head)\n", opts.pr, baseRef)
 			}
 		}
-		built, err := git.BuildManifest(repoPath, baseRef, opts.scope, opts.pr)
+		stampPR := opts.pr
+		if stampPR == 0 {
+			stampPR = opts.prNumber // #668: the resolved PR (from modeDecision.PR), not a fetch request
+		}
+		built, err := git.BuildManifest(repoPath, baseRef, opts.scope, stampPR)
 		if err != nil {
 			return "", fmt.Errorf("build diff manifest: %w", err)
 		}
