@@ -1,12 +1,12 @@
 package git
 
 import (
-	"os"
 	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"github.com/knostic/open-ant-cli/internal/remoteurl"
+	"os"
 	"os/exec"
 	"regexp"
 	"sort"
