@@ -205,7 +205,7 @@ func resolveStepDiffOpts(ctx *projectContext, flagBase string, flagPR int, flagS
 	if ctx == nil || ctx.Project == nil {
 		return diffOpts{}, nil
 	}
-	meta, err := config.LoadScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort)
+	meta, err := config.LoadScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, "")
 	if err != nil {
 		// No meta (legacy / not yet inited under new scheme) — silent full.
 		return diffOpts{}, nil

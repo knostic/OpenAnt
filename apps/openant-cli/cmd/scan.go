@@ -400,7 +400,7 @@ func finalizeScanMetaIfProject(ctx *projectContext, status string) {
 	if ctx == nil || ctx.Project == nil {
 		return
 	}
-	if err := config.FinalizeScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, status); err != nil {
+	if err := config.FinalizeScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, scanLanguage, status); err != nil {
 		output.PrintWarning(fmt.Sprintf("Failed to update scan meta: %s", err))
 	}
 }
@@ -417,7 +417,7 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 
 	// Reuse init's pending decision when no flags override it.
 	if !flagsPassed && ctx != nil && ctx.Project != nil {
-		existing, err := config.LoadScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort)
+		existing, err := config.LoadScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, "")
 		if err == nil && existing.Status == config.ScanStatusRunning {
 			return modeDecision{Kind: existing.Kind, Base: existing.Base, Scope: existing.Scope}, nil
 		}
@@ -453,7 +453,7 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 		)
 		meta.Base = decision.Base
 		meta.Scope = decision.Scope
-		if err := config.SaveScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, meta); err != nil {
+		if err := config.SaveScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, scanLanguage, meta); err != nil {
 			output.PrintWarning(fmt.Sprintf("Failed to write scan meta: %s", err))
 		}
 	}

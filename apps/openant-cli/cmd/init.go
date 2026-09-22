@@ -245,7 +245,7 @@ func runInit(cmd *cobra.Command, args []string) {
 	)
 	meta.Base = decision.Base
 	meta.Scope = decision.Scope
-	if err := config.SaveScanMeta(name, project.CommitSHAShort, meta); err != nil {
+	if err := config.SaveScanMeta(name, project.CommitSHAShort, initLanguage, meta); err != nil {
 		output.PrintWarning(fmt.Sprintf("Failed to write scan meta: %s", err))
 	}
 

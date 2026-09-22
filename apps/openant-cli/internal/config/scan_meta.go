@@ -69,22 +69,37 @@ func ScanRunDir(projectName, shortSHA string) (string, error) {
 }
 
 // scanMetaPath returns the path to meta.json for a given run.
-func scanMetaPath(projectName, shortSHA string) (string, error) {
+func scanMetaPath(projectName, shortSHA, language string) (string, error) {
 	runDir, err := ScanRunDir(projectName, shortSHA)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(runDir, scanMetaFilename), nil
+	if language == "" {
+		return filepath.Join(runDir, scanMetaFilename), nil
+	}
+	return filepath.Join(runDir, language, scanMetaFilename), nil
+}
+
+// scanMetaDir returns the directory the meta.json lives in (#664: per-language).
+func scanMetaDir(projectName, shortSHA, language string) (string, error) {
+	runDir, err := ScanRunDir(projectName, shortSHA)
+	if err != nil {
+		return "", err
+	}
+	if language == "" {
+		return runDir, nil
+	}
+	return filepath.Join(runDir, language), nil
 }
 
 // SaveScanMeta writes meta.json atomically (temp + rename) into the run dir.
 // Creates the run dir if missing.
-func SaveScanMeta(projectName, shortSHA string, m *ScanMeta) error {
-	runDir, err := ScanRunDir(projectName, shortSHA)
+func SaveScanMeta(projectName, shortSHA, language string, m *ScanMeta) error {
+	metaDir, err := scanMetaDir(projectName, shortSHA, language)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
 		return fmt.Errorf("create scan run dir: %w", err)
 	}
 
@@ -94,8 +109,8 @@ func SaveScanMeta(projectName, shortSHA string, m *ScanMeta) error {
 	}
 	data = append(data, '\n')
 
-	finalPath := filepath.Join(runDir, scanMetaFilename)
-	tmp, err := os.CreateTemp(runDir, scanMetaFilename+".tmp.*")
+	finalPath := filepath.Join(metaDir, scanMetaFilename)
+	tmp, err := os.CreateTemp(metaDir, scanMetaFilename+".tmp.*")
 	if err != nil {
 		return fmt.Errorf("create temp meta file: %w", err)
 	}
@@ -118,8 +133,8 @@ func SaveScanMeta(projectName, shortSHA string, m *ScanMeta) error {
 
 // LoadScanMeta reads meta.json for a given run. Returns os.ErrNotExist
 // (wrapped) when missing — callers can treat that as "legacy / no meta".
-func LoadScanMeta(projectName, shortSHA string) (*ScanMeta, error) {
-	path, err := scanMetaPath(projectName, shortSHA)
+func LoadScanMeta(projectName, shortSHA, language string) (*ScanMeta, error) {
+	path, err := scanMetaPath(projectName, shortSHA, language)
 	if err != nil {
 		return nil, err
 	}
@@ -172,9 +187,34 @@ func LatestScanMeta(projectName string) (*ScanMeta, string, error) {
 		if !e.IsDir() {
 			continue
 		}
-		m, err := LoadScanMeta(projectName, e.Name())
+		// #664: walk the language subdirs first (per-language metas)
+		shaDir := filepath.Join(scansDir, e.Name())
+		foundPerLang := false
+		langEntries, _ := os.ReadDir(shaDir)
+		for _, le := range langEntries {
+			if !le.IsDir() {
+				continue
+			}
+			m, err := LoadScanMeta(projectName, e.Name(), le.Name())
+			if err != nil {
+				continue
+			}
+			foundPerLang = true
+			if m.Status != ScanStatusSuccess {
+				continue
+			}
+			ts, err := time.Parse(time.RFC3339, m.StartedAt)
+			if err != nil {
+				continue
+			}
+			candidates = append(candidates, candidate{shortSHA: e.Name(), meta: m, ts: ts})
+		}
+		if foundPerLang {
+			continue // per-language metas found; skip the legacy sha-level read
+		}
+		// legacy sha-level meta (pre-#664)
+		m, err := LoadScanMeta(projectName, e.Name(), "")
 		if err != nil {
-			// Missing or malformed — treat as legacy and skip.
 			continue
 		}
 		if m.Status != ScanStatusSuccess {
@@ -213,13 +253,13 @@ func NewScanMeta(kind, commit, branch, language string) *ScanMeta {
 // FinishedAt to now, and saves. No-ops (returning nil) when meta.json does
 // not exist — callers may invoke this on legacy runs or ad-hoc scans where
 // no meta was ever written.
-func FinalizeScanMeta(projectName, shortSHA, status string) error {
-	m, err := LoadScanMeta(projectName, shortSHA)
+func FinalizeScanMeta(projectName, shortSHA, language, status string) error {
+	m, err := LoadScanMeta(projectName, shortSHA, language)
 	if err != nil {
 		// Treat missing meta as a no-op so ad-hoc scans don't error here.
 		return nil
 	}
 	m.Status = status
 	m.FinishedAt = time.Now().UTC().Format(time.RFC3339)
-	return SaveScanMeta(projectName, shortSHA, m)
+	return SaveScanMeta(projectName, shortSHA, language, m)
 }
