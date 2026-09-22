@@ -238,6 +238,7 @@ func runScan(cmd *cobra.Command, args []string) {
 	// detection so that any PR-mode checkout happens first and the scan
 	// dir is up-to-date.
 	manifestOpts := diffOpts{}
+	manifestOpts.pr = decision.PR // #668: the scan path stamps the PR number
 	if decision.Kind == config.ScanKindDiff {
 		manifestOpts.base = decision.Base
 		manifestOpts.scope = decision.Scope
