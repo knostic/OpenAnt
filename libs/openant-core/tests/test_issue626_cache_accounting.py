@@ -120,7 +120,7 @@ def test_usageinfo_carries_cache_fields():
     t.record_call(model="claude-sonnet-5", input_tokens=10, output_tokens=10,
                   pricing=_SONNET_PRICING,
                   usage_details={"cache_read_input_tokens": 1_000})
-    import utilities.llm_client as lc
+    from utilities import llm_client as lc
     old = lc.get_global_tracker()
     lc._global_tracker = t
     try:
