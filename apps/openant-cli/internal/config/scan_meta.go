@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -34,8 +35,9 @@ type DiffStats struct {
 	UnitsTotal    int `json:"units_total"`
 }
 
-// ScanMeta describes a single scan-run. One file per scan-run dir at
-// ~/.openant/projects/<name>/scans/<short_sha>/meta.json.
+// ScanMeta describes a single scan-run. One file per language per run dir:
+// ~/.openant/projects/<name>/scans/<short_sha>/<language>/meta.json
+// (#664; a legacy sha-level meta.json may remain from pre-#664 runs).
 //
 // The dir is the source of truth for "what scans exist on this project";
 // project.json carries only static identity. To find the latest run, walk
@@ -58,8 +60,10 @@ type ScanMeta struct {
 // ScanRunDir returns the per-run directory (without the language subdir).
 // ~/.openant/projects/<name>/scans/<short_sha>/
 //
-// meta.json lives here. Language-specific dataset/report output continues
-// to live at <run-dir>/<language>/ via ScanDir.
+// Language-specific artifacts (dataset, reports) live at
+// <run-dir>/<language>/ via ScanDir, and #664 moves meta.json there too:
+// <run-dir>/<language>/meta.json. A legacy sha-level meta.json
+// (pre-#664) may still exist at <run-dir>/meta.json.
 func ScanRunDir(projectName, shortSHA string) (string, error) {
 	projDir, err := ProjectDir(projectName)
 	if err != nil {
@@ -69,6 +73,19 @@ func ScanRunDir(projectName, shortSHA string) (string, error) {
 }
 
 // scanMetaPath returns the path to meta.json for a given run.
+// validLanguageKey: the language becomes a path component under the run
+// dir, so it must be a single safe element (#664 review: -l is a flag
+// value; "../.." must not escape the project tree).
+func validLanguageKey(language string) bool {
+	if language == "" || language == "." || language == ".." {
+		return false
+	}
+	if filepath.Base(language) != language {
+		return false
+	}
+	return !strings.ContainsRune(language, '/')
+}
+
 func scanMetaPath(projectName, shortSHA, language string) (string, error) {
 	runDir, err := ScanRunDir(projectName, shortSHA)
 	if err != nil {
@@ -76,6 +93,9 @@ func scanMetaPath(projectName, shortSHA, language string) (string, error) {
 	}
 	if language == "" {
 		return filepath.Join(runDir, scanMetaFilename), nil
+	}
+	if !validLanguageKey(language) {
+		return "", fmt.Errorf("invalid language %q: must be a single path element", language)
 	}
 	return filepath.Join(runDir, language, scanMetaFilename), nil
 }
@@ -85,6 +105,9 @@ func scanMetaDir(projectName, shortSHA, language string) (string, error) {
 	runDir, err := ScanRunDir(projectName, shortSHA)
 	if err != nil {
 		return "", err
+	}
+	if language != "" && !validLanguageKey(language) {
+		return "", fmt.Errorf("invalid language %q: must be a single path element", language)
 	}
 	if language == "" {
 		return runDir, nil
@@ -187,9 +210,15 @@ func LatestScanMeta(projectName string) (*ScanMeta, string, error) {
 		if !e.IsDir() {
 			continue
 		}
-		// #664: walk the language subdirs first (per-language metas)
+		// #664: per-language metas and the legacy sha-level meta are a
+		// UNION of candidates, not a fallback chain — a running/failed
+		// per-language record must not shadow a legacy success at the
+		// same sha (the upgrader's last known-good scan). The legacy
+		// record is dropped only when a per-language record at this sha
+		// carries the same owning language (the migrated form of the
+		// same run). Status filtering happens per-candidate.
 		shaDir := filepath.Join(scansDir, e.Name())
-		foundPerLang := false
+		seenLangs := map[string]bool{}
 		langEntries, _ := os.ReadDir(shaDir)
 		for _, le := range langEntries {
 			if !le.IsDir() {
@@ -199,7 +228,11 @@ func LatestScanMeta(projectName string) (*ScanMeta, string, error) {
 			if err != nil {
 				continue
 			}
-			foundPerLang = true
+			lang := m.Language
+			if lang == "" {
+				lang = le.Name()
+			}
+			seenLangs[lang] = true
 			if m.Status != ScanStatusSuccess {
 				continue
 			}
@@ -209,22 +242,15 @@ func LatestScanMeta(projectName string) (*ScanMeta, string, error) {
 			}
 			candidates = append(candidates, candidate{shortSHA: e.Name(), meta: m, ts: ts})
 		}
-		if foundPerLang {
-			continue // per-language metas found; skip the legacy sha-level read
+		// legacy sha-level meta (pre-#664) — competes as a candidate
+		// unless the same run was migrated to a per-language record
+		if m, err := LoadScanMeta(projectName, e.Name(), ""); err == nil && m.Status == ScanStatusSuccess {
+			if !seenLangs[m.Language] {
+				if ts, terr := time.Parse(time.RFC3339, m.StartedAt); terr == nil {
+					candidates = append(candidates, candidate{shortSHA: e.Name(), meta: m, ts: ts})
+				}
+			}
 		}
-		// legacy sha-level meta (pre-#664)
-		m, err := LoadScanMeta(projectName, e.Name(), "")
-		if err != nil {
-			continue
-		}
-		if m.Status != ScanStatusSuccess {
-			continue
-		}
-		ts, err := time.Parse(time.RFC3339, m.StartedAt)
-		if err != nil {
-			continue
-		}
-		candidates = append(candidates, candidate{shortSHA: e.Name(), meta: m, ts: ts})
 	}
 	if len(candidates) == 0 {
 		return nil, "", nil

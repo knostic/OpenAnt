@@ -32,7 +32,7 @@ func TestSaveLoadScanMetaRoundTrip(t *testing.T) {
 		StartedAt:       "2026-04-28T11:53:30Z",
 		FinishedAt:      "2026-04-28T11:55:12Z",
 		Status:          ScanStatusSuccess,
-		Language:        "python",
+		Language:        "test_lang",
 		AnalyzerVersion: "0.1.0",
 		Model:           "opus",
 	}
@@ -50,7 +50,7 @@ func TestSaveLoadScanMetaRoundTrip(t *testing.T) {
 
 func TestSaveScanMetaWritesAtPredictablePath(t *testing.T) {
 	home := withTempHome(t)
-	m := &ScanMeta{Kind: ScanKindFull, Commit: "x", StartedAt: "2026-04-28T00:00:00Z", Status: ScanStatusRunning, Language: "python"}
+	m := &ScanMeta{Kind: ScanKindFull, Commit: "x", StartedAt: "2026-04-28T00:00:00Z", Status: ScanStatusRunning, Language: "go"}
 	if err := SaveScanMeta("p", "shortsha", "go", m); err != nil {
 		t.Fatalf("SaveScanMeta: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestLatestScanMetaReturnsNewestSuccess(t *testing.T) {
 		Commit:    "older",
 		StartedAt: time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339),
 		Status:    ScanStatusSuccess,
-		Language:  "python",
+		Language:  "go",
 	}
 	newer := &ScanMeta{
 		Kind:      ScanKindDiff,
@@ -85,7 +85,7 @@ func TestLatestScanMetaReturnsNewestSuccess(t *testing.T) {
 		Scope:     "changed_functions",
 		StartedAt: time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339),
 		Status:    ScanStatusSuccess,
-		Language:  "python",
+		Language:  "go",
 	}
 	if err := SaveScanMeta("p", "older0000", "go", older); err != nil {
 		t.Fatal(err)
@@ -116,7 +116,7 @@ func TestLatestScanMetaSkipsFailedAndLegacyDirs(t *testing.T) {
 	good := &ScanMeta{
 		Kind: ScanKindFull, Commit: "good",
 		StartedAt: time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339),
-		Status:    ScanStatusSuccess, Language: "python",
+		Status:    ScanStatusSuccess, Language: "go",
 	}
 	if err := SaveScanMeta("p", "goodshort", "go", good); err != nil {
 		t.Fatal(err)
@@ -126,7 +126,7 @@ func TestLatestScanMetaSkipsFailedAndLegacyDirs(t *testing.T) {
 	failed := &ScanMeta{
 		Kind: ScanKindFull, Commit: "failed",
 		StartedAt: time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339),
-		Status:    ScanStatusFailed, Language: "python",
+		Status:    ScanStatusFailed, Language: "go",
 	}
 	if err := SaveScanMeta("p", "failedshrt", "go", failed); err != nil {
 		t.Fatal(err)
