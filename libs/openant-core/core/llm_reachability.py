@@ -761,8 +761,8 @@ def analyze_reachability(
                 dropped_batches += 1
                 batches_truncated += 1
                 units_not_reviewed += len(sub_batch)
-                msg = f"{label} truncated (budget exhausted: the model spent "
-                f"the output cap before emitting content): {exc}"
+                msg = (f"{label} truncated (budget exhausted: the model spent "
+                       f"the output cap before emitting content): {exc}")
                 if on_error:
                     on_error(msg)
                 else:

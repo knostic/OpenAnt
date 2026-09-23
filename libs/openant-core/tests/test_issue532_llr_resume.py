@@ -868,6 +868,33 @@ class TestIssue558SplitRetry:
         assert stats["batches_failed"] == 0
         assert stats.get("batches_truncated") == 2
 
+    def test_budget_exhausted_message_carries_the_tail(self):
+        """#715: the truncation message is one parenthesized f-string —
+        the tail (output cap + the exception text) reached the operator
+        channel, not just the opening clause. Guards against a re-detach
+        (a bare second f-string line evaluates and discards)."""
+        stats: dict = {}
+        from utilities.llm.adapter import LLMResponseError
+
+        class AlwaysBudgetMsgAdapter(FakeAdapter):
+            def complete(self, *, model, system, messages, max_tokens,
+                         tools=None):
+                raise LLMResponseError(
+                    "OpenAIAdapter returned an empty completion (no text "
+                    "or tool calls; finish_reason='length'); the output "
+                    "budget was consumed before any visible content")
+
+        adapter = AlwaysBudgetMsgAdapter()
+        errors: list = []
+        signals = analyze_reachability(
+            {"units": [_make_unit("a:f1"), _make_unit("b:f2")]},
+            binding=_binding(adapter), batch_size=2,
+            tracker=FakeTracker(), stats=stats, on_error=errors.append)
+        assert signals == []
+        assert any(
+            "before emitting content" in e and "output budget was "
+            "consumed" in e for e in errors), errors
+
     def test_odd_size_batch_splits_three_plus_two(self):
         """mid = (len+1)//2 on an ODD batch: 5 units split 3+2 (the
         untested arithmetic the #575 review named — pinned here)."""
