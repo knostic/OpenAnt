@@ -366,7 +366,6 @@ def test_process_unit_places_error_info_on_the_inner_result(monkeypatch, tmp_pat
 # classification that never happens" for the other two providers).
 def test_anthropic_raise_site_passes_the_kind():
     import httpx
-    import json as _json
     import anthropic as _anthropic
     from utilities.llm.providers import anthropic as _ap
 
