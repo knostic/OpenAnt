@@ -244,6 +244,12 @@ def is_retryable_error(error_info: dict | str | None) -> bool:
         # LLM response (unparseable JSON): re-generating the completion often
         # yields well-formed output, so it is treated as transient here.
         if error_type in ("rate_limit", "connection", "timeout", "parse_error"):
+            # #663: a 429 that is a QUOTA (hard limit: entitlement exhausted,
+            # a daily cap, an enforced spend cap) is not transient — backoff
+            # does not restore access, and retrying burns calls for nothing.
+            if (error_type == "rate_limit"
+                    and error_info.get("kind") == "quota"):
+                return False
             return True
 
         # #292: the transient empty-completion raise is honoured on the DICT

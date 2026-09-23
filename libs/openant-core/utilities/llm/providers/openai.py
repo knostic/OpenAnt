@@ -288,7 +288,8 @@ def _map_openai_exception(exc: Exception, *, report_rl: bool) -> "LLMError":
         retry_after = _retry_after_from(exc)
         if report_rl:
             report_rate_limit(retry_after)
-        return LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after)
+        return LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
+                                  kind=_rate_limit_kind(exc))
     if isinstance(exc, openai.NotFoundError):
         return LLMNotFoundError(redact_secrets(str(exc)))
     if isinstance(exc, openai.APIConnectionError):
@@ -974,6 +975,51 @@ def _response_to_unified(
         stop_reason=_OPENAI_FINISH_REASONS.get(raw_finish, "max_tokens"),
         raw=response,
     )
+
+
+#663: OpenAI's documented hard-limit codes — a 429 carrying one of these
+# is a QUOTA (backoff does not restore access), not a throughput throttle.
+# Source: platform.openai.com/docs/guides/error-codes (429 billing codes).
+_OPENAI_QUOTA_MARKERS = (
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+)
+
+
+def _rate_limit_kind(exc: Any) -> str:
+    """Classify an OpenAI 429 as throttle vs quota from the error body.
+
+    The SDK's RateLimitError carries the parsed body; the code/type fields
+    name the hard-limit family explicitly. Defaults to throttle (a 429
+    without a hard-limit marker is the short-window rate cap).
+    """
+    # T1 round-1 (F1): the openai SDK UNWRAPS the body at construction
+    # (_make_status_error: data = body.get("error", body)) -- exc.body IS
+    # the inner error dict, with no "error" key. Read the inner shape (and
+    # the SDK's code/type attrs as the belt-and-braces).
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if not isinstance(err, dict):
+            err = body  # the unwrapped real shape
+        for marker in _OPENAI_QUOTA_MARKERS:
+            if (err.get("code") == marker or err.get("type") == marker):
+                return "quota"
+        code = err.get("code")
+        if isinstance(code, str):
+            for marker in _OPENAI_QUOTA_MARKERS:
+                if marker in code:
+                    return "quota"
+    for attr in ("code", "type"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, str):
+            for marker in _OPENAI_QUOTA_MARKERS:
+                if marker in val:
+                    return "quota"
+    return "throttle"
 
 
 def _retry_after_from(exc: Any) -> Optional[float]:

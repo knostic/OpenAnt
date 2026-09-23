@@ -105,6 +105,10 @@ def _build_error_info(exc: Exception) -> dict:
         info["type"] = "connection"
     elif isinstance(exc, LLMRateLimitError):
         info["type"] = "rate_limit"
+        # #663: the throttle/quota split rides the dict — a quota (a hard
+        # limit: entitlement exhausted, a daily cap, a spend cap) is NOT
+        # retryable; a throttle (short-window throughput) is.
+        info["kind"] = getattr(exc, "kind", "throttle")
         if exc.retry_after is not None:
             info["retry_after"] = exc.retry_after
     elif isinstance(exc, LLMAuthError):

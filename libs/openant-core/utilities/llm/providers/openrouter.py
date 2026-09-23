@@ -158,7 +158,13 @@ def _classify_error(exc: Exception, *, report_429: bool) -> Exception:
         retry_after = _retry_after_from(exc)
         if report_429:
             report_rate_limit(retry_after)
-        return LLMRateLimitError(message, retry_after=retry_after)
+        # #663: OpenRouter's free-tier per-day cap is a QUOTA (the docs
+        # name the daily reset as the only recovery; short backoff is
+        # ineffective). The 402 credit family already raises
+        # LLMAuthError below.
+        kind = "quota" if any(m in message.lower() for m in
+                              ("per-day", "per day", "daily limit")) else "throttle"
+        return LLMRateLimitError(message, retry_after=retry_after, kind=kind)
     if isinstance(exc, openai.NotFoundError):
         return LLMNotFoundError(message + _MODEL_ID_HINT)
     if isinstance(exc, openai.APIConnectionError):

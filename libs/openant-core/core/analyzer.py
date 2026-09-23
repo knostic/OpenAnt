@@ -37,6 +37,7 @@ from utilities.llm import (
 from utilities.file_io import read_json, write_json
 from utilities.json_corrector import JSONCorrector
 from utilities.llm import DEFAULT_MAX_TOKENS
+from utilities.context_enhancer import _build_error_info
 from utilities.rate_limiter import (
     get_rate_limiter,
     is_budget_exhausted_error,
@@ -233,12 +234,21 @@ def _process_unit(binding: PhaseBinding, unit, index, json_corrector, app_contex
                 "verdict": "ERROR",
                 "finding": "error",
                 "error": str(e),
+                # #663 (audit round): the STRUCTURED error rides the INNER
+                # result dict -- run_analysis stores THIS dict into
+                # results[i], so the retry decision (which prefers
+                # error_info over the string) actually sees the kind.
+                "error_info": _build_error_info(e),
             },
             "route_key": uid,
             "code_for_route": "",
             "finding": "error",
             "elapsed": elapsed,
             "error": str(e),
+            # #663 (T1 round-1 F4): the STRUCTURED error rides alongside the
+            # string -- the retry decision prefers it (the kind-carrying
+            # dict), while every string consumer keeps its shape.
+            "error_info": _build_error_info(e),
             "worker": worker,
             "usage": tracker.get_unit_usage(),
         }
@@ -879,7 +889,7 @@ def run_analysis(
     # Auto-retry failed units with transient errors (rate limit, connection, timeout, 5xx)
     retryable_indices = [
         i for i, r in enumerate(results)
-        if r and is_retryable_error(r.get("error"))
+        if r and is_retryable_error(r.get("error_info") or r.get("error"))
     ]
     # #569 (choice c): the deterministic budget-exhaustion empties (the
     # length-stop class #561 named) retry ONCE at a RAISED cap — a same-cap

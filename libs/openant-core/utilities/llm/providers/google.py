@@ -349,8 +349,12 @@ class GoogleAdapter:
                 raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
             if code == 429:
                 retry_after = _retry_after_from(exc)
+                kind, g_delay = _google_429_details(exc)
+                if retry_after is None:
+                    retry_after = g_delay  # #663: RetryInfo carries the wait
                 report_rate_limit(retry_after)
-                raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
+                raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
+                                        kind=kind) from redacted_cause_from(exc)
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.ServerError as exc:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
@@ -395,7 +399,11 @@ class GoogleAdapter:
                 raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
             if code == 429:
                 retry_after = _retry_after_from(exc)
-                raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
+                kind, g_delay = _google_429_details(exc)
+                if retry_after is None:
+                    retry_after = g_delay  # #663: RetryInfo carries the wait
+                raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
+                                        kind=kind) from redacted_cause_from(exc)
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except genai_errors.ServerError as exc:
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
@@ -641,6 +649,54 @@ def _http_code_from(exc: Any) -> Optional[int]:
     if isinstance(code, int):
         return code
     return None
+
+
+def _google_429_details(exc: Any) -> tuple[str, Optional[float]]:
+    """Classify a genai 429 from its structured details (#663).
+
+    Google's 429 (RESOURCE_EXHAUSTED) is EITHER a short-window throttle
+    (RPM/TPM -- bounded backoff helps) OR a hard quota (a daily cap, an
+    explicitly-enforced zero -- backoff does not restore access). The
+    discriminator lives in the error details, NEVER in the prose:
+    - QuotaFailure.violations[].quotaId carrying "PerDay" -> quota;
+    - RetryInfo.retryDelay ("12s") -> a throttle with a KNOWN wait,
+      surfaced as retry_after (Google's 429s never carry the header);
+    - bare RESOURCE_EXHAUSTED with neither -> throttle (the vendor's own
+      troubleshooting doc: exponential backoff).
+    """
+    # T1 round-1 (F3): the genai SDK sets APIError.details = the ENTIRE
+    # response JSON ({"error": {...}}) -- there is no .error/._error attr.
+    body = getattr(exc, "_error", None) or getattr(exc, "error", None)
+    details = None
+    if isinstance(body, dict):
+        details = body.get("details")
+    if not isinstance(details, list):
+        raw = getattr(exc, "details", None)  # the full response dict
+        if isinstance(raw, dict):
+            inner = raw.get("error")
+            if isinstance(inner, dict):
+                details = inner.get("details")
+    if not isinstance(details, list):
+        return "throttle", None
+    retry_after = None
+    for d in details:
+        if not isinstance(d, dict):
+            continue
+        dtype = d.get("@type", "")
+        if "QuotaFailure" in dtype:
+            violations = d.get("violations") or []
+            for v in violations:
+                quota_id = str(v.get("quotaId", ""))
+                if "PerDay" in quota_id or "perday" in quota_id.lower():
+                    return "quota", None
+        elif "RetryInfo" in dtype:
+            delay = str(d.get("retryDelay", ""))
+            if delay.endswith("s"):
+                try:
+                    retry_after = float(delay[:-1])
+                except ValueError:
+                    pass
+    return "throttle", retry_after
 
 
 def _retry_after_from(exc: Any) -> Optional[float]:
