@@ -359,3 +359,51 @@ def test_process_unit_places_error_info_on_the_inner_result(monkeypatch, tmp_pat
         "mis-placement makes the retry decision dead wiring (the audit "
         "round's finding)")
     assert "429" in inner.get("error", "")
+
+
+# The raise-site guards (the separate-audit round's L1: only openai's
+# raise site was guarded — "a helper that is never wired is a
+# classification that never happens" for the other two providers).
+def test_anthropic_raise_site_passes_the_kind():
+    import httpx
+    import json as _json
+    import anthropic as _anthropic
+    from utilities.llm.providers import anthropic as _ap
+
+    body = {"type": "error",
+            "error": {"type": "rate_limit_error",
+                      "message": "You have reached your enforced spend limit.",
+                      "details": {"error_code": "enforced_spend_limit_reached"}}}
+    resp = httpx.Response(429, headers={"content-type": "application/json"},
+                          json=body, request=httpx.Request("POST", "https://x"))
+    exc = _anthropic.Anthropic(api_key="test")._make_status_error_from_response(resp)
+    out = _ap._anthropic_rate_limit_kind(exc)
+    assert out == "quota", (
+        "the anthropic raise site must classify the spend cap as quota — "
+        "the helper reads the SDK-rendered body; an unwired raise site is "
+        "the classification never happening")
+
+
+def test_google_raise_site_passes_the_kind():
+    """Drive the genai SDK's own raise path: the exception the adapter's
+    except-clause actually catches, classified through the helper."""
+    import httpx
+    from google.genai import errors as _gerr
+    from utilities.llm.providers.google import _google_429_details
+
+    body = {"error": {"code": 429, "message": "Resource exhausted",
+                      "status": "RESOURCE_EXHAUSTED",
+                      "details": [
+                          {"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                           "violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel"}]},
+                      ]}}
+    resp = httpx.Response(429, headers={"content-type": "application/json"},
+                          json=body, request=httpx.Request("POST", "https://x"))
+    try:
+        _gerr.APIError.raise_for_response(resp)
+        raise AssertionError("the SDK did not raise on a 429")
+    except _gerr.ClientError as exc:
+        kind, _ = _google_429_details(exc)
+    assert kind == "quota", (
+        "the google raise site must classify the daily quota — the helper "
+        "reads the SDK's .details (the full response dict)")
