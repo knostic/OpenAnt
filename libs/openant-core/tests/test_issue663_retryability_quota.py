@@ -239,7 +239,6 @@ def test_openai_raise_site_passes_the_kind():
     """Drive _map_openai_exception (both chat + responses paths share it)
     with a REAL SDK RateLimitError carrying insufficient_quota."""
     import httpx
-    import json as _json
     import openai as _openai
     from utilities.llm.providers import openai as _oa
 
