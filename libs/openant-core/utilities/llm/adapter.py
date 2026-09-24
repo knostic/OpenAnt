@@ -255,11 +255,21 @@ class LLMRateLimitError(LLMError):
     Attributes:
         retry_after: Seconds to wait before retrying, if the
             provider reported one. ``None`` means "we don't know".
+        kind: ``"throttle"`` (the default — a short-window throughput
+            cap; bounded backoff helps) or ``"quota"`` (#663: a hard
+            limit — credits/usage entitlement exhausted, a daily quota,
+            an enforced spend cap. Backoff does not restore access;
+            retrying burns calls and latency for nothing, so these are
+            NOT retryable).
     """
 
-    def __init__(self, message: str, *, retry_after: Optional[float] = None):
+    def __init__(self, message: str, *, retry_after: Optional[float] = None,
+                 kind: str = "throttle"):
         super().__init__(message)
         self.retry_after = retry_after
+        if kind not in ("throttle", "quota"):
+            raise ValueError(f"unknown rate-limit kind: {kind!r}")
+        self.kind = kind
 
 
 class LLMConnectionError(LLMError):

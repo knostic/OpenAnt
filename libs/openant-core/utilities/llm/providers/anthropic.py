@@ -235,8 +235,15 @@ class AnthropicAdapter:
             raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except anthropic.RateLimitError as exc:
             retry_after = _retry_after_from(exc)
-            report_rate_limit(retry_after)
-            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after) from redacted_cause_from(exc)
+            kind = _anthropic_rate_limit_kind(exc)
+            # #716 hunt defect 3: a QUOTA never arms the all-worker backoff —
+            # the global pause clears short-window throttles; a quota's
+            # recovery is never "wait N seconds" (it stalled every worker
+            # for 30s while the entitlement stayed exhausted).
+            if kind != "quota":
+                report_rate_limit(retry_after)
+            raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
+                                    kind=kind) from redacted_cause_from(exc)
         except anthropic.NotFoundError as exc:
             raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except anthropic.APIConnectionError as exc:
@@ -479,6 +486,38 @@ def _response_to_unified(
         stop_reason=_ANTHROPIC_STOP_REASONS.get(raw_stop, "max_tokens"),
         raw=response,
     )
+
+
+def _anthropic_rate_limit_kind(exc: Any) -> str:
+    """Classify an Anthropic 429 from its error body (#663).
+
+    Anthropic's 429 is normally the short-window rate_limit_error (a
+    throttle), BUT the enforced spend cap surfaces as the SAME 429 type
+    with error.details.error_code == "enforced_spend_limit_reached"
+    (docs: platform.claude.com/docs/en/api/rate-limits#reaching-your-
+    spend-cap) — a hard limit backoff cannot restore. The 400
+    usage-limits and 402 billing shapes already raise non-rate-limit
+    classes and are unaffected.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            # T1 round-1 (F2): the documented shape carries details as a
+            # DICT ({"error_code": "enforced_spend_limit_reached"}); the
+            # list form is accepted too (older/observed variants).
+            details = err.get("details")
+            shapes = []
+            if isinstance(details, dict):
+                shapes = [details]
+            elif isinstance(details, list):
+                shapes = [d for d in details if isinstance(d, dict)]
+            for d in shapes:
+                ec = d.get("error_code")
+                if (ec == "enforced_spend_limit_reached"
+                        or "enforced_spend_limit" in str(ec or "")):
+                    return "quota"
+    return "throttle"
 
 
 def _retry_after_from(exc: Any) -> Optional[float]:
