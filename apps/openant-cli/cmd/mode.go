@@ -36,6 +36,7 @@ type modeDecision struct {
 	Base   string // ref used for diff (may be a SHA or named ref)
 	Scope  string
 	Staged bool
+	PR     int // #668: stamp-only (the resolved PR; does not trigger a fetch)
 }
 
 // errBaselineNonInteractive is returned when init/scan is invoked without
@@ -80,7 +81,7 @@ func selectMode(o modeOpts) (modeDecision, error) {
 		if err != nil {
 			return modeDecision{}, err
 		}
-		return modeDecision{Kind: config.ScanKindDiff, Base: baseRef, Scope: scope}, nil
+		return modeDecision{Kind: config.ScanKindDiff, Base: baseRef, Scope: scope, PR: o.pr}, nil
 	}
 
 	if o.diffBase != "" {
