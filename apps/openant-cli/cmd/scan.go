@@ -398,11 +398,13 @@ func runScan(cmd *cobra.Command, args []string) {
 // finalizeScanMetaIfProject updates the scan-run meta.json with a terminal
 // status when the scan ran against a known project. Ad-hoc scans without
 // project context have no meta.json and are silently skipped.
+// #664 review (M2): finalizes the record the scan WROTE — keyed on the
+// run's effective language, matching the SaveScanMeta site.
 func finalizeScanMetaIfProject(ctx *projectContext, status string) {
 	if ctx == nil || ctx.Project == nil {
 		return
 	}
-	if err := config.FinalizeScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, status); err != nil {
+	if err := config.FinalizeScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, scanLanguage, status); err != nil {
 		output.PrintWarning(fmt.Sprintf("Failed to update scan meta: %s", err))
 	}
 }
@@ -418,10 +420,21 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 	flagsPassed := scanFull || scanIncremental || scanDiffBase != "" || scanPR > 0 || scanStaged
 
 	// Reuse init's pending decision when no flags override it.
+	// #664 review (M3): adopt only when the pending record belongs to
+	// THIS run's language (init wrote it under the pin; a `scan -l go`
+	// on a python-pinned project must not adopt — nor later overwrite —
+	// python's record). Language-keyed loading makes the record's own
+	// language the only adopt condition: a record reaches this check
+	// only through the language-scoped path, so its language must match
+	// the scan's (legacy pre-language records are unreachable for
+	// language-carrying projects — their upgrade path is init's decision,
+	// not adoption).
 	if !flagsPassed && ctx != nil && ctx.Project != nil {
-		existing, err := config.LoadScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort)
+		existing, err := config.LoadScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, ctx.Project.Language)
 		if err == nil && existing.Status == config.ScanStatusRunning {
-			return modeDecision{Kind: existing.Kind, Base: existing.Base, Scope: existing.Scope}, nil
+			if existing.Language == scanLanguage {
+				return modeDecision{Kind: existing.Kind, Base: existing.Base, Scope: existing.Scope}, nil
+			}
 		}
 	}
 
@@ -446,16 +459,24 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 
 	// Record the decision in meta.json status=running if we have a project.
 	// finalizeScanMetaIfProject will flip it terminal when the pipeline ends.
+	// #664 review (M2): the record keys on AND stamps the run's effective
+	// language (the flag-overridable scanLanguage), not the project's
+	// pinned language. Keying on the pin made `scan -l go` on a
+	// python-pinned project overwrite python's record with the go run's
+	// terminal status. NOTE: the ARTIFACT routing is a separate, unsolved
+	// surface — scanOutput still defaults to ctx.ScanDir (the PIN), so
+	// `scan -l go` lands artifacts under python/ while this record lands
+	// under go/ (issue #667 tracks that alignment).
 	if ctx != nil && ctx.Project != nil {
 		meta := config.NewScanMeta(
 			decision.Kind,
 			ctx.Project.CommitSHA,
 			git.CurrentBranch(repoPath),
-			ctx.Project.Language,
+			scanLanguage,
 		)
 		meta.Base = decision.Base
 		meta.Scope = decision.Scope
-		if err := config.SaveScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, meta); err != nil {
+		if err := config.SaveScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, scanLanguage, meta); err != nil {
 			output.PrintWarning(fmt.Sprintf("Failed to write scan meta: %s", err))
 		}
 	}

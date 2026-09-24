@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -34,8 +35,9 @@ type DiffStats struct {
 	UnitsTotal    int `json:"units_total"`
 }
 
-// ScanMeta describes a single scan-run. One file per scan-run dir at
-// ~/.openant/projects/<name>/scans/<short_sha>/meta.json.
+// ScanMeta describes a single scan-run. One file per language per run dir:
+// ~/.openant/projects/<name>/scans/<short_sha>/<language>/meta.json
+// (#664; a legacy sha-level meta.json may remain from pre-#664 runs).
 //
 // The dir is the source of truth for "what scans exist on this project";
 // project.json carries only static identity. To find the latest run, walk
@@ -58,8 +60,10 @@ type ScanMeta struct {
 // ScanRunDir returns the per-run directory (without the language subdir).
 // ~/.openant/projects/<name>/scans/<short_sha>/
 //
-// meta.json lives here. Language-specific dataset/report output continues
-// to live at <run-dir>/<language>/ via ScanDir.
+// Language-specific artifacts (dataset, reports) live at
+// <run-dir>/<language>/ via ScanDir, and #664 moves meta.json there too:
+// <run-dir>/<language>/meta.json. A legacy sha-level meta.json
+// (pre-#664) may still exist at <run-dir>/meta.json.
 func ScanRunDir(projectName, shortSHA string) (string, error) {
 	projDir, err := ProjectDir(projectName)
 	if err != nil {
@@ -69,22 +73,56 @@ func ScanRunDir(projectName, shortSHA string) (string, error) {
 }
 
 // scanMetaPath returns the path to meta.json for a given run.
-func scanMetaPath(projectName, shortSHA string) (string, error) {
+// validLanguageKey: the language becomes a path component under the run
+// dir, so it must be a single safe element (#664 review: -l is a flag
+// value; "../.." must not escape the project tree).
+func validLanguageKey(language string) bool {
+	if language == "" || language == "." || language == ".." {
+		return false
+	}
+	if filepath.Base(language) != language {
+		return false
+	}
+	return !strings.ContainsRune(language, '/')
+}
+
+func scanMetaPath(projectName, shortSHA, language string) (string, error) {
 	runDir, err := ScanRunDir(projectName, shortSHA)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(runDir, scanMetaFilename), nil
+	if language == "" {
+		return filepath.Join(runDir, scanMetaFilename), nil
+	}
+	if !validLanguageKey(language) {
+		return "", fmt.Errorf("invalid language %q: must be a single path element", language)
+	}
+	return filepath.Join(runDir, language, scanMetaFilename), nil
+}
+
+// scanMetaDir returns the directory the meta.json lives in (#664: per-language).
+func scanMetaDir(projectName, shortSHA, language string) (string, error) {
+	runDir, err := ScanRunDir(projectName, shortSHA)
+	if err != nil {
+		return "", err
+	}
+	if language != "" && !validLanguageKey(language) {
+		return "", fmt.Errorf("invalid language %q: must be a single path element", language)
+	}
+	if language == "" {
+		return runDir, nil
+	}
+	return filepath.Join(runDir, language), nil
 }
 
 // SaveScanMeta writes meta.json atomically (temp + rename) into the run dir.
 // Creates the run dir if missing.
-func SaveScanMeta(projectName, shortSHA string, m *ScanMeta) error {
-	runDir, err := ScanRunDir(projectName, shortSHA)
+func SaveScanMeta(projectName, shortSHA, language string, m *ScanMeta) error {
+	metaDir, err := scanMetaDir(projectName, shortSHA, language)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
 		return fmt.Errorf("create scan run dir: %w", err)
 	}
 
@@ -94,8 +132,8 @@ func SaveScanMeta(projectName, shortSHA string, m *ScanMeta) error {
 	}
 	data = append(data, '\n')
 
-	finalPath := filepath.Join(runDir, scanMetaFilename)
-	tmp, err := os.CreateTemp(runDir, scanMetaFilename+".tmp.*")
+	finalPath := filepath.Join(metaDir, scanMetaFilename)
+	tmp, err := os.CreateTemp(metaDir, scanMetaFilename+".tmp.*")
 	if err != nil {
 		return fmt.Errorf("create temp meta file: %w", err)
 	}
@@ -118,8 +156,8 @@ func SaveScanMeta(projectName, shortSHA string, m *ScanMeta) error {
 
 // LoadScanMeta reads meta.json for a given run. Returns os.ErrNotExist
 // (wrapped) when missing — callers can treat that as "legacy / no meta".
-func LoadScanMeta(projectName, shortSHA string) (*ScanMeta, error) {
-	path, err := scanMetaPath(projectName, shortSHA)
+func LoadScanMeta(projectName, shortSHA, language string) (*ScanMeta, error) {
+	path, err := scanMetaPath(projectName, shortSHA, language)
 	if err != nil {
 		return nil, err
 	}
@@ -172,19 +210,50 @@ func LatestScanMeta(projectName string) (*ScanMeta, string, error) {
 		if !e.IsDir() {
 			continue
 		}
-		m, err := LoadScanMeta(projectName, e.Name())
-		if err != nil {
-			// Missing or malformed — treat as legacy and skip.
-			continue
+		// #664: per-language metas and the legacy sha-level meta are a
+		// UNION of candidates, not a fallback chain — a running/failed
+		// per-language record must not shadow a legacy success at the
+		// same sha (the upgrader's last known-good scan). The legacy
+		// record is dropped only when a per-language record at this sha
+		// carries the same owning language (the migrated form of the
+		// same run). Status filtering happens per-candidate.
+		shaDir := filepath.Join(scansDir, e.Name())
+		seenLangs := map[string]bool{}
+		langEntries, _ := os.ReadDir(shaDir)
+		for _, le := range langEntries {
+			if !le.IsDir() {
+				continue
+			}
+			m, err := LoadScanMeta(projectName, e.Name(), le.Name())
+			if err != nil {
+				continue
+			}
+			if m.Status != ScanStatusSuccess {
+				continue
+			}
+			ts, err := time.Parse(time.RFC3339, m.StartedAt)
+			if err != nil {
+				continue
+			}
+			// F-A (#664 review): only a per-language SUCCESS may suppress
+			// the legacy copy — a failed/running rescan in the same
+			// language is NOT the same run as the legacy success.
+			lang := m.Language
+			if lang == "" {
+				lang = le.Name()
+			}
+			seenLangs[lang] = true
+			candidates = append(candidates, candidate{shortSHA: e.Name(), meta: m, ts: ts})
 		}
-		if m.Status != ScanStatusSuccess {
-			continue
+		// legacy sha-level meta (pre-#664) — competes as a candidate
+		// unless the same run was migrated to a per-language record
+		if m, err := LoadScanMeta(projectName, e.Name(), ""); err == nil && m.Status == ScanStatusSuccess {
+			if !seenLangs[m.Language] {
+				if ts, terr := time.Parse(time.RFC3339, m.StartedAt); terr == nil {
+					candidates = append(candidates, candidate{shortSHA: e.Name(), meta: m, ts: ts})
+				}
+			}
 		}
-		ts, err := time.Parse(time.RFC3339, m.StartedAt)
-		if err != nil {
-			continue
-		}
-		candidates = append(candidates, candidate{shortSHA: e.Name(), meta: m, ts: ts})
 	}
 	if len(candidates) == 0 {
 		return nil, "", nil
@@ -213,13 +282,13 @@ func NewScanMeta(kind, commit, branch, language string) *ScanMeta {
 // FinishedAt to now, and saves. No-ops (returning nil) when meta.json does
 // not exist — callers may invoke this on legacy runs or ad-hoc scans where
 // no meta was ever written.
-func FinalizeScanMeta(projectName, shortSHA, status string) error {
-	m, err := LoadScanMeta(projectName, shortSHA)
+func FinalizeScanMeta(projectName, shortSHA, language, status string) error {
+	m, err := LoadScanMeta(projectName, shortSHA, language)
 	if err != nil {
 		// Treat missing meta as a no-op so ad-hoc scans don't error here.
 		return nil
 	}
 	m.Status = status
 	m.FinishedAt = time.Now().UTC().Format(time.RFC3339)
-	return SaveScanMeta(projectName, shortSHA, m)
+	return SaveScanMeta(projectName, shortSHA, language, m)
 }

@@ -90,9 +90,9 @@ func TestSelectModeIncrementalUsesLatestSuccess(t *testing.T) {
 		Commit:    "fullsha",
 		StartedAt: time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339),
 		Status:    config.ScanStatusSuccess,
-		Language:  "python",
+		Language:  "go",
 	}
-	if err := config.SaveScanMeta("p", "fullshrt", prev); err != nil {
+	if err := config.SaveScanMeta("p", "fullshrt", "go", prev); err != nil {
 		t.Fatal(err)
 	}
 
@@ -216,12 +216,12 @@ func TestResolveStepDiffOptsExplicitFlagsWin(t *testing.T) {
 		Scope:     "callers",
 		StartedAt: "2026-04-28T00:00:00Z",
 		Status:    config.ScanStatusRunning,
-		Language:  "python",
+		Language:  "go",
 	}
-	if err := config.SaveScanMeta("p", "currshort", prev); err != nil {
+	if err := config.SaveScanMeta("p", "currshort", "go", prev); err != nil {
 		t.Fatal(err)
 	}
-	ctx := &projectContext{Project: &config.Project{Name: "p", CommitSHAShort: "currshort"}}
+	ctx := &projectContext{Project: &config.Project{Name: "p", CommitSHAShort: "currshort", Language: "go"}}
 
 	got, err := resolveStepDiffOpts(ctx, "explicit-base", 0, "")
 	if err != nil {
@@ -241,12 +241,12 @@ func TestResolveStepDiffOptsFallsBackToMeta(t *testing.T) {
 		Scope:     "callers",
 		StartedAt: "2026-04-28T00:00:00Z",
 		Status:    config.ScanStatusRunning,
-		Language:  "python",
+		Language:  "go",
 	}
-	if err := config.SaveScanMeta("p", "currshort", prev); err != nil {
+	if err := config.SaveScanMeta("p", "currshort", "go", prev); err != nil {
 		t.Fatal(err)
 	}
-	ctx := &projectContext{Project: &config.Project{Name: "p", CommitSHAShort: "currshort"}}
+	ctx := &projectContext{Project: &config.Project{Name: "p", CommitSHAShort: "currshort", Language: "go"}}
 
 	got, err := resolveStepDiffOpts(ctx, "", 0, "")
 	if err != nil {
@@ -267,12 +267,12 @@ func TestResolveStepDiffOptsFullMetaIsSilentFull(t *testing.T) {
 		Commit:    "current",
 		StartedAt: "2026-04-28T00:00:00Z",
 		Status:    config.ScanStatusSuccess,
-		Language:  "python",
+		Language:  "go",
 	}
-	if err := config.SaveScanMeta("p", "currshort", prev); err != nil {
+	if err := config.SaveScanMeta("p", "currshort", "go", prev); err != nil {
 		t.Fatal(err)
 	}
-	ctx := &projectContext{Project: &config.Project{Name: "p", CommitSHAShort: "currshort"}}
+	ctx := &projectContext{Project: &config.Project{Name: "p", CommitSHAShort: "currshort", Language: "go"}}
 
 	got, err := resolveStepDiffOpts(ctx, "", 0, "")
 	if err != nil {
