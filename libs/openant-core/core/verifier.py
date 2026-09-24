@@ -58,7 +58,7 @@ def _verify_template_texts():
     never enters the key); the remaining members are the module constants and
     frozen-fixture renders the None render cannot reach — the two non-None
     user-prompt personas, the three system-prompt context arms, and the
-    context-block and full-prompt renders over two frozen fixtures (the
+    context-block and full-prompt renders over four frozen fixtures (the
     fixture prompts also carry the ROUTING: a discriminator edit that
     re-routes a fixture re-pays verify, closing the "the persona existed but
     was never selected" half of #621 for future edits).
