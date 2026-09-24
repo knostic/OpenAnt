@@ -352,7 +352,9 @@ class GoogleAdapter:
                 kind, g_delay = _google_429_details(exc)
                 if retry_after is None:
                     retry_after = g_delay  # #663: RetryInfo carries the wait
-                report_rate_limit(retry_after)
+                # #716 hunt defect 3: quota never arms the all-worker pause
+                if kind != "quota":
+                    report_rate_limit(retry_after)
                 raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
                                         kind=kind) from redacted_cause_from(exc)
             raise LLMResponseError(redact_secrets(str(exc))) from redacted_cause_from(exc)
@@ -687,7 +689,12 @@ def _google_429_details(exc: Any) -> tuple[str, Optional[float]]:
             violations = d.get("violations") or []
             for v in violations:
                 quota_id = str(v.get("quotaId", ""))
-                if "PerDay" in quota_id or "perday" in quota_id.lower():
+                # An explicitly-enforced zero is a quota whatever the
+                # metric's window: the entitlement IS the zero — backoff
+                # cannot restore it (the docstring's own promise, read).
+                quota_value = str(v.get("quotaValue", "")).strip()
+                if ("PerDay" in quota_id or "perday" in quota_id.lower()
+                        or quota_value in ("0", "0.0")):
                     return "quota", None
         elif "RetryInfo" in dtype:
             delay = str(d.get("retryDelay", ""))

@@ -406,3 +406,91 @@ def test_google_raise_site_passes_the_kind():
     assert kind == "quota", (
         "the google raise site must classify the daily quota — the helper "
         "reads the SDK's .details (the full response dict)")
+
+
+# --------------------------------------------------------------------------
+# The stage-1 deep-code defects (the independent hunt's findings, the fix
+# arcs' RED pins): quotaValue unread, the silent skip, the global backoff.
+# --------------------------------------------------------------------------
+def test_google_hard_zero_quota_value_classifies_quota():
+    """The docstring promises 'an explicitly-enforced zero -> quota'; the
+    classifier must READ quotaValue — a hard zero (entitlement exhausted)
+    is a quota even when the quotaId names a per-minute metric."""
+    from utilities.llm.providers.google import _google_429_details
+    body = {"error": {"code": 429, "message": "Resource exhausted",
+                      "status": "RESOURCE_EXHAUSTED",
+                      "details": [{"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                                   "violations": [{"quotaId": "GenerateRequestsPerMinutePerProject",
+                                                   "quotaValue": "0"}]}]}}
+    kind, _ = _google_429_details(type("E", (), {"error": body["error"]})())
+    assert kind == "quota", (
+        "quotaValue '0' (an explicitly-enforced zero) must classify as "
+        "quota — backoff cannot restore a zero entitlement; retrying it "
+        "burns a call per unit for nothing")
+
+
+def _drive_anthropic_429(monkeypatch, body, headers=None):
+    """The shared seam: the adapter's real complete() over a _client whose
+    SDK call raises the rendered 429; returns (caught_exc, armed_list)."""
+    import asyncio
+    import httpx
+    import anthropic as _anthropic
+    from utilities.llm.adapter import Message, TextBlock
+    from utilities.llm.providers import anthropic as _ap
+
+    armed = []
+    monkeypatch.setattr(_ap, "report_rate_limit", lambda ra: armed.append(ra))
+
+    resp = httpx.Response(429, headers={"content-type": "application/json",
+                                        **(headers or {})},
+                          json=body, request=httpx.Request("POST", "https://x"))
+    exc = _anthropic.Anthropic(api_key="test")._make_status_error_from_response(resp)
+
+    class _Messages:
+        def create(self, **kw):
+            raise exc
+
+    class _Client:
+        messages = _Messages()
+
+    adapter = _ap.AnthropicAdapter(api_key="test", _client=_Client())
+
+    async def _call():
+        return await adapter.complete(
+            model="m", system="s", messages=[Message(role="user", content=[TextBlock(text="x")])],
+            max_tokens=8)
+
+    try:
+        asyncio.run(_call())
+        raise AssertionError("the 429 never propagated")
+    except _ap.LLMRateLimitError:
+        pass
+    return armed
+
+
+def test_quota_429_does_not_arm_the_global_backoff(monkeypatch):
+    """A quota 429 must NOT arm the all-worker throttle backoff: the
+    global pause exists to clear a SHORT-WINDOW throttle; a quota's
+    recovery is never 'wait N seconds' (the in-run crawl the hunt named)."""
+    body = {"type": "error",
+            "error": {"type": "rate_limit_error",
+                      "message": "You have reached your enforced spend limit.",
+                      "details": {"error_code": "enforced_spend_limit_reached"}}}
+    armed = _drive_anthropic_429(monkeypatch, body)
+    assert armed == [], (
+        "a quota (spend-cap) 429 armed the GLOBAL backoff — the all-worker "
+        "pause cannot restore an exhausted entitlement; it only stalls "
+        "every remaining unit for 30s")
+
+
+def test_throttle_429_arms_the_global_backoff(monkeypatch):
+    """The control arm: a GENUINE throttle still arms the limiter — the
+    isolation removes ONLY the quota case (everything-fixed-minus-X)."""
+    body = {"type": "error",
+            "error": {"type": "rate_limit_error",
+                      "message": "Number of requests has exceeded your "
+                                 "rate limit."}}
+    armed = _drive_anthropic_429(monkeypatch, body, headers={"retry-after": "7"})
+    assert armed and armed[0] == 7.0, (
+        "a genuine throttle (retry-after 7) must still arm the global "
+        "backoff — the quota isolation must not touch throttle handling")

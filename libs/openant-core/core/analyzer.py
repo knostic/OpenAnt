@@ -891,6 +891,24 @@ def run_analysis(
         i for i, r in enumerate(results)
         if r and is_retryable_error(r.get("error_info") or r.get("error"))
     ]
+    # #716 hunt defect 2 (the incomplete-scan contract): units that leave
+    # analysis unretried are COUNTED, not silently dropped — 'not analyzed'
+    # must never read as 'safe' on the operator channel.
+    _retryable_set = set(retryable_indices)
+    _skipped_err = [i for i, r in enumerate(results)
+                    if r and (r.get("error_info") or r.get("error"))
+                    and i not in _retryable_set]
+    if _skipped_err:
+        _quota_n = sum(
+            1 for i in _skipped_err
+            if isinstance(results[i].get("error_info"), dict)
+            and results[i]["error_info"].get("kind") == "quota")
+        _other_n = len(_skipped_err) - _quota_n
+        _detail = (f"{_quota_n} quota-exhausted"
+                   + (f", {_other_n} other non-retryable" if _other_n else ""))
+        print(f"[Analyze] {len(_skipped_err)} unit(s) not retried "
+              f"({_detail}) — error rows carry the per-unit reason",
+              file=sys.stderr)
     # #569 (choice c): the deterministic budget-exhaustion empties (the
     # length-stop class #561 named) retry ONCE at a RAISED cap — a same-cap
     # re-roll of a budget exhaustion is a coin flip; the raised cap attacks

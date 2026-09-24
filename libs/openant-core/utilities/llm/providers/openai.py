@@ -286,10 +286,12 @@ def _map_openai_exception(exc: Exception, *, report_rl: bool) -> "LLMError":
         return LLMAuthError(redact_secrets(str(exc)))
     if isinstance(exc, openai.RateLimitError):
         retry_after = _retry_after_from(exc)
-        if report_rl:
+        kind = _rate_limit_kind(exc)
+        # #716 hunt defect 3: quota never arms the all-worker pause
+        if report_rl and kind != "quota":
             report_rate_limit(retry_after)
         return LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
-                                  kind=_rate_limit_kind(exc))
+                                  kind=kind)
     if isinstance(exc, openai.NotFoundError):
         return LLMNotFoundError(redact_secrets(str(exc)))
     if isinstance(exc, openai.APIConnectionError):

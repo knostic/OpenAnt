@@ -235,9 +235,15 @@ class AnthropicAdapter:
             raise LLMAuthError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except anthropic.RateLimitError as exc:
             retry_after = _retry_after_from(exc)
-            report_rate_limit(retry_after)
+            kind = _anthropic_rate_limit_kind(exc)
+            # #716 hunt defect 3: a QUOTA never arms the all-worker backoff —
+            # the global pause clears short-window throttles; a quota's
+            # recovery is never "wait N seconds" (it stalled every worker
+            # for 30s while the entitlement stayed exhausted).
+            if kind != "quota":
+                report_rate_limit(retry_after)
             raise LLMRateLimitError(redact_secrets(str(exc)), retry_after=retry_after,
-                                    kind=_anthropic_rate_limit_kind(exc)) from redacted_cause_from(exc)
+                                    kind=kind) from redacted_cause_from(exc)
         except anthropic.NotFoundError as exc:
             raise LLMNotFoundError(redact_secrets(str(exc))) from redacted_cause_from(exc)
         except anthropic.APIConnectionError as exc:
