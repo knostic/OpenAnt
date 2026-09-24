@@ -221,6 +221,11 @@ func runInit(cmd *cobra.Command, args []string) {
 	// #669: if the PR fetch moved the tree, re-resolve the commit SHA
 	// so the project, the scan dir, and the meta all name the scanned tree.
 	if isGit && initPR > 0 {
+		// The body's promised guard: an explicit --commit is never silently
+		// overridden by the PR checkout — it is ignored WITH the warning.
+		if initCommit != "" {
+			output.PrintWarning("--commit ignored: the PR checkout determines the stamped SHA")
+		}
 		sha, warn, err := resolveLocalCommit(repoPath, "")
 		if err != nil {
 			output.PrintWarning(fmt.Sprintf(
