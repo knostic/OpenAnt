@@ -78,13 +78,22 @@ func renderCostBlock(usage map[string]any) {
 		costLabel = "Cost (incomplete — at least one model unpriced)"
 	}
 	PrintKeyValue(costLabel, fmt.Sprintf("$%.4f", cost))
-	if len(unpriced) > 0 {
-		ids := make([]string, 0, len(unpriced))
-		for _, u := range unpriced {
-			if id, ok := u.(string); ok {
-				ids = append(ids, id)
-			}
+	ids := make([]string, 0, len(unpriced))
+	for _, u := range unpriced {
+		if id, ok := u.(string); ok {
+			ids = append(ids, id)
 		}
+	}
+	// F661-2 (the #626 review): a cache-only incompleteness carries its
+	// ids under unpriced_cache_models — without this read the terminal
+	// printed "at least one model unpriced" with NO model named.
+	cacheUnpriced, _ := usage["unpriced_cache_models"].([]any)
+	for _, u := range cacheUnpriced {
+		if id, ok := u.(string); ok {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) > 0 {
 		PrintKeyValue("Unpriced models", strings.Join(ids, ", "))
 	}
 }

@@ -144,6 +144,13 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
                 "output_tokens": end_snapshot.get("output", 0) - start_tokens.get("output", 0),
                 "total_tokens": end_snapshot.get("total", 0) - start_tokens.get("total", 0),
             }
+            # #626: the step's cache deltas (present-only).
+            for _ck in ("cache_read", "cache_write"):
+                if _ck in end_snapshot or _ck in start_tokens:
+                    _delta = (end_snapshot.get(_ck, 0)
+                              - start_tokens.get(_ck, 0))
+                    if _delta:
+                        report.token_usage[_ck] = _delta
             # #216: a step whose cost is incomplete (any call on an unpriced
             # model) must say so IN the artifact — OR the end snapshot's marker
             # (run-cumulative, so a step after unpriced spend also flags).
@@ -151,6 +158,12 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
                 report.token_usage["cost_incomplete"] = True
                 report.token_usage["unpriced_models"] = end_snapshot.get(
                     "unpriced_models", [])
+                # F661-2 (2026-09-22): the cache-unpriced ids too — a
+                # cache-only incompleteness must name its model (#216's
+                # name-the-model, extended to the cache path).
+                if end_snapshot.get("unpriced_cache_models"):
+                    report.token_usage["unpriced_cache_models"] = \
+                        end_snapshot["unpriced_cache_models"]
             # #605: a mid-run accounting drop (another phase's hand-off)
             # surfaces here too — the marker is run-cumulative through the
             # tracker totals, the same accepted trade as #216's.
@@ -180,13 +193,22 @@ def _snapshot_usage() -> tuple[float | None, dict | None]:
     try:
         from core.tracking import get_usage
         usage = get_usage()
-        return usage.total_cost_usd, {
+        snap = {
             "input": usage.total_input_tokens,
             "output": usage.total_output_tokens,
             "total": usage.total_tokens,
             "cost_incomplete": usage.cost_incomplete,
             "unpriced_models": usage.unpriced_models,
         }
+        # #626: the cache line items, present-only (a no-cache run's
+        # snapshot shape is byte-identical to the pre-#626 one).
+        if usage.total_cache_read_tokens:
+            snap["cache_read"] = usage.total_cache_read_tokens
+        if usage.total_cache_write_tokens:
+            snap["cache_write"] = usage.total_cache_write_tokens
+        if usage.unpriced_cache_models:
+            snap["unpriced_cache_models"] = usage.unpriced_cache_models
+        return usage.total_cost_usd, snap
     except Exception as exc:
         # #605: a failed snapshot is a SENTINEL, never a complete-looking
         # zero — the caller must skip the subtraction (a fabricated baseline

@@ -141,7 +141,9 @@ def test_b_consumers_import_without_cycle():
 # A hand-maintained mirror of the registry's CURRENT rates (NOT a frozen
 # pre-refactor snapshot: #344 corrected claude-opus-4-8 to the live rate —
 # every deliberate price change is a three-place edit: models.json, this
-# mirror, and any record_call-math pin).
+# mirror, and any record_call-math pin). #626: the mirror pins the
+# input/output RATES — pricing entries may additionally carry cache
+# multipliers (pair-compare, not dict-compare).
 # Post-cutover, pricing_map("anthropic") OMITS retired/unknown ids (null-priced
 # in config/models.json), so the adapter table and MODEL_PRICING expose only the
 # CURRENT models. The retired ids were priced in the old dict but must never
@@ -225,15 +227,21 @@ def test_c_pricing_maps_match_pre_refactor_snapshot():
 
     def _assert_snapshot(provider, expected):
         got = pricing_map(provider)
+        # #626: pair-compare — entries may carry additive cache multipliers.
         for k, v in expected.items():
-            assert got[k] == v, (provider, k, got.get(k), v)
+            assert (got[k]["input"], got[k]["output"]) == (v["input"], v["output"]), (
+                provider, k, got.get(k), v)
         allowed_alias_keys = set()
         for rid in expected:
             allowed_alias_keys.update(_alias_spellings(rid))
         for k in got:
             if k not in expected:
                 assert k in allowed_alias_keys, (provider, k)
-                assert got[k] in expected.values(), (provider, k, got[k])
+                for v in expected.values():
+                    if (got[k].get("input"), got[k].get("output")) == (v["input"], v["output"]):
+                        break
+                else:
+                    raise AssertionError((provider, k, got[k]))
 
     _assert_snapshot("anthropic", _EXPECTED_ANTHROPIC_CURRENT)
     for retired in _RETIRED_OR_UNKNOWN_ANTHROPIC:
@@ -251,14 +259,15 @@ def test_c_consumers_resolve_to_pre_refactor_values():
     from utilities.context_enhancer import CONTEXT_ENHANCEMENT_MODEL_LEGACY
 
     # #434: subset semantics — the maps gained alias spellings; the exact
-    # keys keep their exact values.
+    # keys keep their exact values. #626: pair-compare (cache multipliers
+    # are additive on the anthropic entries).
     for k, v in _EXPECTED_ANTHROPIC_CURRENT.items():
-        assert MODEL_PRICING[k] == v, k
-        assert AnthropicAdapter.pricing[k] == v, k
+        assert (MODEL_PRICING[k]["input"], MODEL_PRICING[k]["output"]) == (v["input"], v["output"]), k
+        assert (AnthropicAdapter.pricing[k]["input"], AnthropicAdapter.pricing[k]["output"]) == (v["input"], v["output"]), k
     for k, v in _EXPECTED_OPENAI.items():
-        assert OpenAIAdapter.pricing[k] == v, k
+        assert (OpenAIAdapter.pricing[k]["input"], OpenAIAdapter.pricing[k]["output"]) == (v["input"], v["output"]), k
     for k, v in _EXPECTED_GOOGLE.items():
-        assert GoogleAdapter.pricing[k] == v, k
+        assert (GoogleAdapter.pricing[k]["input"], GoogleAdapter.pricing[k]["output"]) == (v["input"], v["output"]), k
     assert CONTEXT_ENHANCEMENT_MODEL_LEGACY == _EXPECTED_LEGACY_ENHANCE
 
     resolved = {p: OPENANT_DEFAULT.phases[p].model for p in _EXPECTED_PHASE_MODELS}
