@@ -421,11 +421,16 @@ func resolveScanMode(ctx *projectContext, repoPath string) (modeDecision, error)
 	// #664 review (M3): adopt only when the pending record belongs to
 	// THIS run's language (init wrote it under the pin; a `scan -l go`
 	// on a python-pinned project must not adopt — nor later overwrite —
-	// python's record). Legacy records (Language "") are adoptable.
+	// python's record). Language-keyed loading makes the record's own
+	// language the only adopt condition: a record reaches this check
+	// only through the language-scoped path, so its language must match
+	// the scan's (legacy pre-language records are unreachable for
+	// language-carrying projects — their upgrade path is init's decision,
+	// not adoption).
 	if !flagsPassed && ctx != nil && ctx.Project != nil {
 		existing, err := config.LoadScanMeta(ctx.Project.Name, ctx.Project.CommitSHAShort, ctx.Project.Language)
 		if err == nil && existing.Status == config.ScanStatusRunning {
-			if existing.Language == "" || existing.Language == scanLanguage {
+			if existing.Language == scanLanguage {
 				return modeDecision{Kind: existing.Kind, Base: existing.Base, Scope: existing.Scope}, nil
 			}
 		}
